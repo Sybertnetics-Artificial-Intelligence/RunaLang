@@ -1,0 +1,839 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FILE_PATH - Typed Filesystem Path Primitive
+==============================================================================
+
+A FilePath is a typed wrapper around a path string. Distinguishing
+FilePath from String at the type level prevents an entire class of
+mix-ups where arbitrary user input is fed to filesystem APIs (path
+traversal, command injection via shell metacharacters, etc.) and forces
+callers to acknowledge "this string represents a filesystem path".
+
+References:
+- POSIX.1-2024 IEEE Std 1003.1 (pathname resolution)
+- Windows: docs.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+- Rust std::path::Path / std::path::PathBuf (canonical typed-path API)
+- Python pathlib.PurePath / pathlib.Path (canonical typed-path API)
+
+Internal representation:
+We store every path using forward-slash (POSIX) separators internally
+and translate to platform conventions at the system-call boundary. This
+matches the design of Java NIO and Python pathlib and removes the need
+to special-case Windows backslashes in every internal helper.
+
+Memory layout for FilePath (24 bytes):
+  offset 0:  data pointer    (Integer, 8 bytes) - null-terminated path
+  offset 8:  byte_length      (Integer, 8 bytes)
+  offset 16: is_absolute      (Integer, 8 bytes) 1 = absolute, 0 = relative
+
+Absoluteness rules:
+- Unix: starts with '/'
+- Windows-style ingested at boundary: 'C:\' or '\\?\' becomes '/c/...'
+  for internal storage; the original drive letter is preserved as the
+  first path segment.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StrCore
+
+Constant FILEPATH_HEADER_SIZE as Integer is 24
+Constant FILEPATH_OFFSET_DATA as Integer is 0
+Constant FILEPATH_OFFSET_LENGTH as Integer is 8
+Constant FILEPATH_OFFSET_ABSOLUTE as Integer is 16
+
+Constant FILEPATH_SEPARATOR as Integer is 47
+
+Note: ============================================================================
+Note: INTERNAL HELPERS
+Note: ============================================================================
+
+Process called "filepath_internal_is_separator" takes c as Integer returns Integer:
+    Note: Both forward and back slash count as separators in input
+    Note: parsing (we normalize to forward slash internally).
+    If c is equal to 47:
+        Return 1
+    End If
+    If c is equal to 92:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "filepath_internal_is_drive_letter" takes c as Integer returns Integer:
+    If c is greater than or equal to 65:
+        If c is less than or equal to 90:
+            Return 1
+        End If
+    End If
+    If c is greater than or equal to 97:
+        If c is less than or equal to 122:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "filepath_internal_alloc_copy" takes src_buf as Integer, len as Integer returns Integer:
+    Let buf be allocate(len plus 1)
+    If buf is equal to 0:
+        Return 0
+    End If
+    If len is greater than 0:
+        Memory.memory_copy(buf, src_buf, len)
+    End If
+    Memory.memory_set_byte(buf, len, 0)
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: CONSTRUCTION
+Note: ============================================================================
+
+Process called "filepath_from_string" takes str as Integer returns Integer:
+    @Reasoning
+        Constructs a FilePath from a null-terminated string. Backslashes
+        are normalized to forward slashes. Drive-letter prefixes
+        ("C:\") are rewritten to "/c/" for uniform internal handling
+        with original casing preserved as the first segment.
+    @End Reasoning
+    @Implementation
+        Steps:
+          1. Measure length, allocate scratch buffer.
+          2. Detect drive-letter prefix or UNC prefix; emit "/c/" form.
+          3. Copy remaining bytes, replacing '\\' with '/'.
+          4. Mark is_absolute when leading char is '/' (after normalization).
+    @End Implementation
+    @Performance_Hints
+        Single pass over input.
+    @End Performance_Hints
+    @Security_Scope
+        Does NOT canonicalize "." or ".." here - that is the explicit
+        contract of filepath_canonicalize. This proc is a constructor:
+        what you typed is what you get (with separator normalization).
+    @End Security_Scope
+
+    If str is equal to 0:
+        Return 0
+    End If
+    Let in_len be StrCore.string_length(str)
+    Let header be allocate(FILEPATH_HEADER_SIZE)
+    If header is equal to 0:
+        Return 0
+    End If
+
+    Note: Scratch buffer worst case = in_len + 1 for empty paths and same size for
+    Note: drive-letter rewrites we replace 2 chars with 3 so worst case = in_len + 2.
+    Let max_out be in_len plus 3
+    Let out_buf be allocate(max_out plus 1)
+    If out_buf is equal to 0:
+        deallocate(header)
+        Return 0
+    End If
+
+    Let in_pos be 0
+    Let out_pos be 0
+    Let is_abs be 0
+
+    If in_len is greater than or equal to 2:
+        Let c0 be Memory.memory_get_byte(str, 0)
+        Let c1 be Memory.memory_get_byte(str, 1)
+        If filepath_internal_is_drive_letter(c0) is equal to 1:
+            If c1 is equal to 58:
+                Note: Windows drive letter "X:" - rewrite to "/x/" form
+                Memory.memory_set_byte(out_buf, out_pos, 47)
+                Set out_pos to out_pos plus 1
+                Let lower_letter be c0
+                If c0 is greater than or equal to 65:
+                    If c0 is less than or equal to 90:
+                        Set lower_letter to c0 plus 32
+                    End If
+                End If
+                Memory.memory_set_byte(out_buf, out_pos, lower_letter)
+                Set out_pos to out_pos plus 1
+                Memory.memory_set_byte(out_buf, out_pos, 47)
+                Set out_pos to out_pos plus 1
+                Set in_pos to 2
+                Set is_abs to 1
+                Note: Skip optional separator after drive
+                If in_pos is less than in_len:
+                    Let post_drive be Memory.memory_get_byte(str, in_pos)
+                    If filepath_internal_is_separator(post_drive) is equal to 1:
+                        Set in_pos to in_pos plus 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    If is_abs is equal to 0:
+        If in_len is greater than 0:
+            Let first_c be Memory.memory_get_byte(str, 0)
+            If filepath_internal_is_separator(first_c) is equal to 1:
+                Set is_abs to 1
+            End If
+        End If
+    End If
+
+    While in_pos is less than in_len:
+        Let c be Memory.memory_get_byte(str, in_pos)
+        If filepath_internal_is_separator(c) is equal to 1:
+            Memory.memory_set_byte(out_buf, out_pos, 47)
+        Otherwise:
+            Memory.memory_set_byte(out_buf, out_pos, c)
+        End If
+        Set out_pos to out_pos plus 1
+        Set in_pos to in_pos plus 1
+    End While
+    Memory.memory_set_byte(out_buf, out_pos, 0)
+
+    Memory.memory_set_pointer(header, FILEPATH_OFFSET_DATA, out_buf)
+    Memory.memory_set_integer(header, FILEPATH_OFFSET_LENGTH, out_pos)
+    Memory.memory_set_integer(header, FILEPATH_OFFSET_ABSOLUTE, is_abs)
+    Return header
+End Process
+
+Process called "filepath_destroy" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let data be Memory.memory_get_pointer(p, FILEPATH_OFFSET_DATA)
+    If data is not equal to 0:
+        deallocate(data)
+    End If
+    deallocate(p)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS
+Note: ============================================================================
+
+Process called "filepath_to_string" takes p as Integer returns Integer:
+    Note: Returns the borrowed internal path string. Caller MUST NOT free.
+    If p is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(p, FILEPATH_OFFSET_DATA)
+End Process
+
+Process called "filepath_length" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_integer(p, FILEPATH_OFFSET_LENGTH)
+End Process
+
+Process called "filepath_is_absolute" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_integer(p, FILEPATH_OFFSET_ABSOLUTE)
+End Process
+
+Process called "filepath_is_relative" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let absol be Memory.memory_get_integer(p, FILEPATH_OFFSET_ABSOLUTE)
+    If absol is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PATH MANIPULATION
+Note: ============================================================================
+
+Process called "filepath_join" takes p as Integer, segment as Integer returns Integer:
+    @Reasoning
+        Joins a single segment onto p. If segment is itself absolute,
+        it REPLACES p (matching Python pathlib and Rust std::path
+        semantics). Otherwise we insert a separator between p and the
+        segment unless p already ends with one.
+    @End Reasoning
+    @Implementation
+        Build the combined string then run through filepath_from_string
+        to normalize.
+    @End Implementation
+    @Performance_Hints
+        O(|p| + |segment|).
+    @End Performance_Hints
+    @Security_Scope
+        No traversal check here; callers needing safety should follow
+        with filepath_canonicalize and verify the result is still
+        within the expected base directory.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    If segment is equal to 0:
+        Note: Joining nothing returns a copy of p
+        Let data_p be Memory.memory_get_pointer(p, FILEPATH_OFFSET_DATA)
+        Return filepath_from_string(data_p)
+    End If
+
+    Let p_len be Memory.memory_get_integer(p, FILEPATH_OFFSET_LENGTH)
+    Let p_data be Memory.memory_get_pointer(p, FILEPATH_OFFSET_DATA)
+    Let s_len be StrCore.string_length(segment)
+
+    If s_len is equal to 0:
+        Let data_p2 be p_data
+        Return filepath_from_string(data_p2)
+    End If
+
+    Note: If segment is absolute (starts with '/' or contains 'X:' prefix),
+    Note: replace rather than append.
+    Let first_seg be Memory.memory_get_byte(segment, 0)
+    If filepath_internal_is_separator(first_seg) is equal to 1:
+        Return filepath_from_string(segment)
+    End If
+    If s_len is greater than or equal to 2:
+        Let s0 be Memory.memory_get_byte(segment, 0)
+        Let s1 be Memory.memory_get_byte(segment, 1)
+        If filepath_internal_is_drive_letter(s0) is equal to 1:
+            If s1 is equal to 58:
+                Return filepath_from_string(segment)
+            End If
+        End If
+    End If
+
+    Note: Compose: p + '/' + segment
+    Let needs_sep be 1
+    If p_len is greater than 0:
+        Let last_c be Memory.memory_get_byte(p_data, p_len minus 1)
+        If last_c is equal to 47:
+            Set needs_sep to 0
+        End If
+    End If
+    Let total be p_len plus s_len
+    If needs_sep is equal to 1:
+        Set total to total plus 1
+    End If
+    Let scratch be allocate(total plus 1)
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let w be 0
+    If p_len is greater than 0:
+        Memory.memory_copy(scratch, p_data, p_len)
+        Set w to p_len
+    End If
+    If needs_sep is equal to 1:
+        Memory.memory_set_byte(scratch, w, 47)
+        Set w to w plus 1
+    End If
+    Memory.memory_copy(scratch plus w, segment, s_len)
+    Memory.memory_set_byte(scratch, total, 0)
+    Let result be filepath_from_string(scratch)
+    deallocate(scratch)
+    Return result
+End Process
+
+Process called "filepath_parent" takes p as Integer returns Integer:
+    @Reasoning
+        Returns the parent of p (the path minus its last segment). For
+        the root path "/" parent is "/" (matches POSIX dirname). For
+        an empty or single-segment relative path, parent is ".".
+    @End Reasoning
+    @Implementation
+        Scan from the end for the last '/'. The parent ends at that
+        position (or the position immediately after a root slash).
+    @End Implementation
+    @Performance_Hints
+        O(|p|) but typically short since most paths are not deeply
+        nested.
+    @End Performance_Hints
+    @Security_Scope
+        Pure transformation; never escapes to absolute.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Let data be Memory.memory_get_pointer(p, FILEPATH_OFFSET_DATA)
+    Let len be Memory.memory_get_integer(p, FILEPATH_OFFSET_LENGTH)
+    Let is_abs be Memory.memory_get_integer(p, FILEPATH_OFFSET_ABSOLUTE)
+
+    If len is equal to 0:
+        Let dot be allocate(2)
+        If dot is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(dot, 0, 46)
+        Memory.memory_set_byte(dot, 1, 0)
+        Let out_p be filepath_from_string(dot)
+        deallocate(dot)
+        Return out_p
+    End If
+
+    Note: Strip trailing slashes (keep one slash if absolute root)
+    Let scan_end be len
+    Let stripping be 1
+    While stripping is equal to 1:
+        If scan_end is less than or equal to 1:
+            Set stripping to 0
+        Otherwise:
+            Let bc be Memory.memory_get_byte(data, scan_end minus 1)
+            If bc is equal to 47:
+                Set scan_end to scan_end minus 1
+            Otherwise:
+                Set stripping to 0
+            End If
+        End If
+    End While
+
+    Note: Find last '/' before scan_end
+    Let last_slash be -1
+    Let k be scan_end minus 1
+    Let searching be 1
+    While searching is equal to 1:
+        If k is less than 0:
+            Set searching to 0
+        Otherwise:
+            Let kc be Memory.memory_get_byte(data, k)
+            If kc is equal to 47:
+                Set last_slash to k
+                Set searching to 0
+            Otherwise:
+                Set k to k minus 1
+            End If
+        End If
+    End While
+
+    If last_slash is less than 0:
+        Note: Relative path with no separators - parent is "."
+        Let dot2 be allocate(2)
+        Memory.memory_set_byte(dot2, 0, 46)
+        Memory.memory_set_byte(dot2, 1, 0)
+        Let out_d be filepath_from_string(dot2)
+        deallocate(dot2)
+        Return out_d
+    End If
+
+    If last_slash is equal to 0:
+        If is_abs is equal to 1:
+            Note: Path is "/x" - parent is "/"
+            Let root be allocate(2)
+            Memory.memory_set_byte(root, 0, 47)
+            Memory.memory_set_byte(root, 1, 0)
+            Let out_r be filepath_from_string(root)
+            deallocate(root)
+            Return out_r
+        End If
+    End If
+
+    Let parent_len be last_slash
+    Let parent_buf be allocate(parent_len plus 1)
+    If parent_buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(parent_buf, data, parent_len)
+    Memory.memory_set_byte(parent_buf, parent_len, 0)
+    Let result be filepath_from_string(parent_buf)
+    deallocate(parent_buf)
+    Return result
+End Process
+
+Process called "filepath_filename" takes p as Integer returns Integer:
+    @Reasoning
+        Returns the final segment of p as a newly-allocated null-
+        terminated string. Returns an empty string for paths ending in
+        a separator (a "directory" path with no trailing filename).
+    @End Reasoning
+    @Implementation
+        Scan from end for last separator; copy bytes after it.
+    @End Implementation
+    @Performance_Hints
+        O(|p|).
+    @End Performance_Hints
+    @Security_Scope
+        Safe; never reads past the path buffer.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Let data be Memory.memory_get_pointer(p, FILEPATH_OFFSET_DATA)
+    Let len be Memory.memory_get_integer(p, FILEPATH_OFFSET_LENGTH)
+    If len is equal to 0:
+        Let empty be allocate(1)
+        If empty is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(empty, 0, 0)
+        Return empty
+    End If
+    Let k be len minus 1
+    Let last_slash be -1
+    Let searching be 1
+    While searching is equal to 1:
+        If k is less than 0:
+            Set searching to 0
+        Otherwise:
+            Let kc be Memory.memory_get_byte(data, k)
+            If kc is equal to 47:
+                Set last_slash to k
+                Set searching to 0
+            Otherwise:
+                Set k to k minus 1
+            End If
+        End If
+    End While
+    Let start be last_slash plus 1
+    Let name_len be len minus start
+    Let out be allocate(name_len plus 1)
+    If out is equal to 0:
+        Return 0
+    End If
+    If name_len is greater than 0:
+        Memory.memory_copy(out, data plus start, name_len)
+    End If
+    Memory.memory_set_byte(out, name_len, 0)
+    Return out
+End Process
+
+Process called "filepath_extension" takes p as Integer returns Integer:
+    @Reasoning
+        Returns the file extension (the substring after the last '.'
+        in the filename portion), or an empty string if there is no
+        extension. Dotfiles like ".bashrc" have no extension.
+    @End Reasoning
+    @Implementation
+        Get filename, scan from end for '.'; if found and not at
+        position 0 of the filename, return the suffix WITHOUT the dot.
+    @End Implementation
+    @Performance_Hints
+        O(|filename|).
+    @End Performance_Hints
+    @Security_Scope
+        Safe.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Let fname be filepath_filename(p)
+    If fname is equal to 0:
+        Return 0
+    End If
+    Let flen be StrCore.string_length(fname)
+    Let k be flen minus 1
+    Let last_dot be -1
+    Let scanning be 1
+    While scanning is equal to 1:
+        If k is less than 0:
+            Set scanning to 0
+        Otherwise:
+            Let kc be Memory.memory_get_byte(fname, k)
+            If kc is equal to 46:
+                Set last_dot to k
+                Set scanning to 0
+            Otherwise:
+                Set k to k minus 1
+            End If
+        End If
+    End While
+    If last_dot is less than or equal to 0:
+        deallocate(fname)
+        Let empty be allocate(1)
+        If empty is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(empty, 0, 0)
+        Return empty
+    End If
+    Let ext_start be last_dot plus 1
+    Let ext_len be flen minus ext_start
+    Let out be allocate(ext_len plus 1)
+    If out is equal to 0:
+        deallocate(fname)
+        Return 0
+    End If
+    Memory.memory_copy(out, fname plus ext_start, ext_len)
+    Memory.memory_set_byte(out, ext_len, 0)
+    deallocate(fname)
+    Return out
+End Process
+
+Process called "filepath_stem" takes p as Integer returns Integer:
+    @Reasoning
+        Returns the filename without its extension. For "report.tar.gz"
+        stem is "report.tar" (matching Python pathlib).
+    @End Reasoning
+    @Implementation
+        Filename then truncate before the last '.', if any.
+    @End Implementation
+    @Performance_Hints
+        O(|filename|).
+    @End Performance_Hints
+    @Security_Scope
+        Safe.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Let fname be filepath_filename(p)
+    If fname is equal to 0:
+        Return 0
+    End If
+    Let flen be StrCore.string_length(fname)
+    Let k be flen minus 1
+    Let last_dot be -1
+    Let scanning be 1
+    While scanning is equal to 1:
+        If k is less than 0:
+            Set scanning to 0
+        Otherwise:
+            Let kc be Memory.memory_get_byte(fname, k)
+            If kc is equal to 46:
+                Set last_dot to k
+                Set scanning to 0
+            Otherwise:
+                Set k to k minus 1
+            End If
+        End If
+    End While
+    If last_dot is less than or equal to 0:
+        Return fname
+    End If
+    Let stem_len be last_dot
+    Let out be allocate(stem_len plus 1)
+    If out is equal to 0:
+        deallocate(fname)
+        Return 0
+    End If
+    Memory.memory_copy(out, fname, stem_len)
+    Memory.memory_set_byte(out, stem_len, 0)
+    deallocate(fname)
+    Return out
+End Process
+
+Note: ============================================================================
+Note: CANONICALIZATION
+Note: ============================================================================
+
+Process called "filepath_canonicalize" takes p as Integer returns Integer:
+    @Reasoning
+        Resolves '.' and '..' in the path syntactically. Does NOT touch
+        the filesystem (no symlink expansion) - that responsibility
+        belongs to a higher OS-aware layer. This is the safe baseline
+        that callers use to prevent path-traversal attacks before any
+        FS call.
+    @End Reasoning
+    @Implementation
+        Tokenize on '/', walk segments:
+          - empty (consecutive slashes) -> skip
+          - "." -> skip
+          - ".." -> pop last segment if any (and not at root)
+          - other -> push
+        Rebuild the path with single separators.
+    @End Implementation
+    @Performance_Hints
+        O(|p|). Uses a per-call stack of segment offsets.
+    @End Performance_Hints
+    @Security_Scope
+        After this transformation, the resulting path contains no '.'
+        or '..' segments. Callers checking that a user-supplied path
+        stays within a sandbox should canonicalize first, then verify
+        the result starts with the expected base prefix.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Let data be Memory.memory_get_pointer(p, FILEPATH_OFFSET_DATA)
+    Let len be Memory.memory_get_integer(p, FILEPATH_OFFSET_LENGTH)
+    Let is_abs be Memory.memory_get_integer(p, FILEPATH_OFFSET_ABSOLUTE)
+
+    If len is equal to 0:
+        Let empty be allocate(1)
+        Memory.memory_set_byte(empty, 0, 0)
+        Let out_e be filepath_from_string(empty)
+        deallocate(empty)
+        Return out_e
+    End If
+
+    Note: Allocate stack of segment (start, length) pairs sized at len/2 + 1.
+    Let cap be (len divided by 2) plus 2
+    Let stack_starts be allocate(cap multiplied by 8)
+    If stack_starts is equal to 0:
+        Return 0
+    End If
+    Let stack_lens be allocate(cap multiplied by 8)
+    If stack_lens is equal to 0:
+        deallocate(stack_starts)
+        Return 0
+    End If
+    Let stack_count be 0
+
+    Let pos be 0
+    Note: Skip leading separators (they are encoded by is_abs)
+    Let skipping be 1
+    While skipping is equal to 1:
+        If pos is greater than or equal to len:
+            Set skipping to 0
+        Otherwise:
+            Let lead_c be Memory.memory_get_byte(data, pos)
+            If lead_c is equal to 47:
+                Set pos to pos plus 1
+            Otherwise:
+                Set skipping to 0
+            End If
+        End If
+    End While
+
+    Note: Token loop
+    Let scanning be 1
+    While scanning is equal to 1:
+        If pos is greater than or equal to len:
+            Set scanning to 0
+        Otherwise:
+            Let seg_start be pos
+            Let inner be 1
+            While inner is equal to 1:
+                If pos is greater than or equal to len:
+                    Set inner to 0
+                Otherwise:
+                    Let ic be Memory.memory_get_byte(data, pos)
+                    If ic is equal to 47:
+                        Set inner to 0
+                    Otherwise:
+                        Set pos to pos plus 1
+                    End If
+                End If
+            End While
+            Let seg_len be pos minus seg_start
+            Note: Skip the '/' for next loop
+            If pos is less than len:
+                Set pos to pos plus 1
+            End If
+
+            If seg_len is equal to 0:
+                Note: Empty segment from consecutive slashes - skip
+                Set scanning to scanning
+            Otherwise:
+                If seg_len is equal to 1:
+                    Let only_byte be Memory.memory_get_byte(data, seg_start)
+                    If only_byte is equal to 46:
+                        Note: "." segment - skip
+                        Set scanning to scanning
+                    Otherwise:
+                        Memory.memory_set_integer(stack_starts, stack_count multiplied by 8, seg_start)
+                        Memory.memory_set_integer(stack_lens, stack_count multiplied by 8, seg_len)
+                        Set stack_count to stack_count plus 1
+                    End If
+                Otherwise:
+                    If seg_len is equal to 2:
+                        Let b0 be Memory.memory_get_byte(data, seg_start)
+                        Let b1 be Memory.memory_get_byte(data, seg_start plus 1)
+                        If b0 is equal to 46:
+                            If b1 is equal to 46:
+                                Note: ".." - pop if possible
+                                If stack_count is greater than 0:
+                                    Set stack_count to stack_count minus 1
+                                Otherwise:
+                                    If is_abs is equal to 0:
+                                        Note: Relative with too many ".." - preserve it
+                                        Memory.memory_set_integer(stack_starts, stack_count multiplied by 8, seg_start)
+                                        Memory.memory_set_integer(stack_lens, stack_count multiplied by 8, seg_len)
+                                        Set stack_count to stack_count plus 1
+                                    End If
+                                End If
+                            Otherwise:
+                                Memory.memory_set_integer(stack_starts, stack_count multiplied by 8, seg_start)
+                                Memory.memory_set_integer(stack_lens, stack_count multiplied by 8, seg_len)
+                                Set stack_count to stack_count plus 1
+                            End If
+                        Otherwise:
+                            Memory.memory_set_integer(stack_starts, stack_count multiplied by 8, seg_start)
+                            Memory.memory_set_integer(stack_lens, stack_count multiplied by 8, seg_len)
+                            Set stack_count to stack_count plus 1
+                        End If
+                    Otherwise:
+                        Memory.memory_set_integer(stack_starts, stack_count multiplied by 8, seg_start)
+                        Memory.memory_set_integer(stack_lens, stack_count multiplied by 8, seg_len)
+                        Set stack_count to stack_count plus 1
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Note: Compute output length: optional leading '/' + segments joined by '/'.
+    Let out_len be 0
+    If is_abs is equal to 1:
+        Set out_len to 1
+    End If
+    Let s be 0
+    While s is less than stack_count:
+        Let slen be Memory.memory_get_integer(stack_lens, s multiplied by 8)
+        Set out_len to out_len plus slen
+        If s is less than (stack_count minus 1):
+            Set out_len to out_len plus 1
+        End If
+        Set s to s plus 1
+    End While
+    If out_len is equal to 0:
+        Note: Empty path becomes "." for relative, "/" for absolute already handled
+        If is_abs is equal to 0:
+            Let dot_buf be allocate(2)
+            Memory.memory_set_byte(dot_buf, 0, 46)
+            Memory.memory_set_byte(dot_buf, 1, 0)
+            deallocate(stack_starts)
+            deallocate(stack_lens)
+            Let out_d be filepath_from_string(dot_buf)
+            deallocate(dot_buf)
+            Return out_d
+        End If
+    End If
+
+    Let out_buf be allocate(out_len plus 1)
+    If out_buf is equal to 0:
+        deallocate(stack_starts)
+        deallocate(stack_lens)
+        Return 0
+    End If
+    Let w be 0
+    If is_abs is equal to 1:
+        Memory.memory_set_byte(out_buf, 0, 47)
+        Set w to 1
+    End If
+    Let i2 be 0
+    While i2 is less than stack_count:
+        Let st be Memory.memory_get_integer(stack_starts, i2 multiplied by 8)
+        Let ln be Memory.memory_get_integer(stack_lens, i2 multiplied by 8)
+        Memory.memory_copy(out_buf plus w, data plus st, ln)
+        Set w to w plus ln
+        If i2 is less than (stack_count minus 1):
+            Memory.memory_set_byte(out_buf, w, 47)
+            Set w to w plus 1
+        End If
+        Set i2 to i2 plus 1
+    End While
+    Memory.memory_set_byte(out_buf, out_len, 0)
+
+    deallocate(stack_starts)
+    deallocate(stack_lens)
+    Let result be filepath_from_string(out_buf)
+    deallocate(out_buf)
+    Return result
+End Process

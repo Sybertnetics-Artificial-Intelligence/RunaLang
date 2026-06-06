@@ -1,0 +1,393 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+MUTEX<T> - Typed mutex that protects a single inner value.
+
+This is a Rust-style "data inside the lock" mutex. The protected value is
+owned by the mutex; access requires acquiring the lock, which returns a
+guard. Releasing the guard releases the lock.
+
+Mutex structure layout (40 bytes):
+  offset 0:  inner_mutex_ptr (8 bytes)  - underlying sync_core mutex
+  offset 8:  value_ptr       (8 bytes)  - owned value pointer
+  offset 16: poisoned        (8 bytes)  - 1 if poisoned (panic while holding)
+  offset 24: tracking_id     (8 bytes)  - debug deadlock-detection id (0 = none)
+  offset 32: track_acq_order (8 bytes)  - acquisition counter for tracking
+
+Guard structure layout (24 bytes):
+  offset 0:  mutex_ref (8 bytes) - back-reference to the parent mutex
+  offset 8:  value_ptr (8 bytes) - cached value pointer (same as mutex's)
+  offset 16: active    (8 bytes) - 1 while guard is live, 0 after release
+
+Dependencies:
+- threading/sync_core.runa
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+
+Note: ============================================================================
+Note: Layout constants
+Note: ============================================================================
+
+Constant MUTEX_OFF_INNER as Integer is 0
+Constant MUTEX_OFF_VALUE as Integer is 8
+Constant MUTEX_OFF_POISONED as Integer is 16
+Constant MUTEX_OFF_TRACK_ID as Integer is 24
+Constant MUTEX_OFF_TRACK_ORDER as Integer is 32
+Constant MUTEX_STRUCT_SIZE as Integer is 40
+
+Constant GUARD_OFF_MUTEX as Integer is 0
+Constant GUARD_OFF_VALUE as Integer is 8
+Constant GUARD_OFF_ACTIVE as Integer is 16
+Constant GUARD_STRUCT_SIZE as Integer is 24
+
+Note: Return codes
+Constant MUTEX_OK as Integer is 1
+Constant MUTEX_ERR_INVALID as Integer is 0
+Constant MUTEX_ERR_POISONED as Integer is -1
+Constant MUTEX_ERR_LOCKED as Integer is -2
+
+Note: ============================================================================
+Note: Deadlock detection (debug)
+Note: ============================================================================
+
+Note:
+Lock acquisition tracking uses a global monotonic counter. Each mutex
+remembers the global order at which it was last acquired by the current
+thread. If a thread acquires lock A then lock B then later tries to
+acquire A again while still holding B, the acquisition order strictly
+decreases - that is the canonical AB-BA deadlock pattern. Per-thread
+lock-stack tracking is out of scope here; the global counter records
+sequence ids that debug builds correlate against in logs to detect the
+decrease.
+:End Note
+
+Constant DEADLOCK_TRACKING_GLOBAL_COUNTER_SIZE as Integer is 8
+Note: Global tracking counter is lazily allocated.
+
+Process called "deadlock_tracking_counter_allocate" returns Integer:
+    Let p be proc allocate from Memory with DEADLOCK_TRACKING_GLOBAL_COUNTER_SIZE
+    If p is equal to 0:
+        Return 0
+    End If
+    proc atomic_store_seq_cst from Atomic with p, 0
+    Return p
+End Process
+
+Note: ============================================================================
+Note: Lifecycle
+Note: ============================================================================
+
+@Reasoning
+Mutex<T> takes an initial value pointer and stores it inside the mutex. The
+mutex owns the lock primitive and the value pointer (but not the value's
+backing memory if the caller manages it externally).
+@End Reasoning
+
+@Implementation
+Allocate the 40-byte mutex record, allocate the underlying sync_core mutex,
+write fields, return the mutex handle.
+@End Implementation
+
+@Performance_Hints
+Construction is O(1) plus the platform mutex creation cost.
+@End Performance_Hints
+
+@Security_Scope
+The initial value pointer must remain valid for the lifetime of the mutex.
+@End Security_Scope
+
+Process called "mutex_create" takes initial_value_ptr as Integer returns Integer:
+    Let m be proc allocate from Memory with MUTEX_STRUCT_SIZE
+    If m is equal to 0:
+        Return 0
+    End If
+
+    Let inner be proc mutex_create from Sync
+    If inner is equal to 0:
+        proc deallocate from Memory with m
+        Return 0
+    End If
+
+    proc memory_set_int64 from Mem with m, MUTEX_OFF_INNER, inner
+    proc memory_set_int64 from Mem with m, MUTEX_OFF_VALUE, initial_value_ptr
+    proc memory_set_int64 from Mem with m, MUTEX_OFF_POISONED, 0
+    proc memory_set_int64 from Mem with m, MUTEX_OFF_TRACK_ID, 0
+    proc memory_set_int64 from Mem with m, MUTEX_OFF_TRACK_ORDER, 0
+
+    Return m
+End Process
+
+@Reasoning
+Consume the mutex and recover the inner value pointer. Used during
+shutdown when no other threads can hold the lock. Frees the underlying
+synchronization primitives and the mutex record.
+@End Reasoning
+
+@Implementation
+Acquire the lock to ensure no holders, then destroy the inner mutex and
+free the record. Returns the cached value pointer.
+@End Implementation
+
+@Performance_Hints
+O(1) plus platform mutex destruction.
+@End Performance_Hints
+
+@Security_Scope
+The caller becomes responsible for the returned value pointer's memory.
+@End Security_Scope
+
+Process called "mutex_into_inner" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let inner be proc memory_get_int64 from Mem with m, MUTEX_OFF_INNER
+    proc mutex_lock from Sync with inner
+    Let value_ptr be proc memory_get_int64 from Mem with m, MUTEX_OFF_VALUE
+    proc mutex_unlock from Sync with inner
+    proc mutex_destroy from Sync with inner
+    proc deallocate from Memory with m
+    Return value_ptr
+End Process
+
+@Reasoning
+Destroy a mutex unconditionally. Assumes the caller knows no thread holds
+the lock; primarily for cleanup paths. Returns MUTEX_OK on success.
+@End Reasoning
+
+@Implementation
+Destroy the inner mutex and free the record. Does NOT free the protected
+value's underlying memory.
+@End Implementation
+
+@Performance_Hints
+O(1) plus platform mutex destruction.
+@End Performance_Hints
+
+@Security_Scope
+Misuse (destroying while a thread holds the lock) is a logic error.
+@End Security_Scope
+
+Process called "mutex_destroy" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return MUTEX_ERR_INVALID
+    End If
+    Let inner be proc memory_get_int64 from Mem with m, MUTEX_OFF_INNER
+    proc mutex_destroy from Sync with inner
+    proc deallocate from Memory with m
+    Return MUTEX_OK
+End Process
+
+Note: ============================================================================
+Note: Guard helpers
+Note: ============================================================================
+
+Process called "guard_create" takes mutex_ref as Integer, value_ptr as Integer returns Integer:
+    Let g be proc allocate from Memory with GUARD_STRUCT_SIZE
+    If g is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with g, GUARD_OFF_MUTEX, mutex_ref
+    proc memory_set_int64 from Mem with g, GUARD_OFF_VALUE, value_ptr
+    proc memory_set_int64 from Mem with g, GUARD_OFF_ACTIVE, 1
+    Return g
+End Process
+
+Process called "guard_value" takes g as Integer returns Integer:
+    If g is equal to 0:
+        Return 0
+    End If
+    Let active be proc memory_get_int64 from Mem with g, GUARD_OFF_ACTIVE
+    If active is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with g, GUARD_OFF_VALUE
+End Process
+
+Process called "guard_set_value" takes g as Integer, new_value_ptr as Integer returns Integer:
+    If g is equal to 0:
+        Return MUTEX_ERR_INVALID
+    End If
+    Let active be proc memory_get_int64 from Mem with g, GUARD_OFF_ACTIVE
+    If active is equal to 0:
+        Return MUTEX_ERR_INVALID
+    End If
+
+    Let mutex_ref be proc memory_get_int64 from Mem with g, GUARD_OFF_MUTEX
+    proc memory_set_int64 from Mem with mutex_ref, MUTEX_OFF_VALUE, new_value_ptr
+    proc memory_set_int64 from Mem with g, GUARD_OFF_VALUE, new_value_ptr
+    Return MUTEX_OK
+End Process
+
+Note: ============================================================================
+Note: Lock operations
+Note: ============================================================================
+
+@Reasoning
+Acquire the mutex and return a guard. Blocks until the lock is acquired. If
+the mutex is poisoned (last holder panicked), the guard still permits
+access but the caller can query mutex_is_poisoned() to decide whether to
+trust the data.
+@End Reasoning
+
+@Implementation
+Lock the inner sync_core mutex, allocate a guard structure pointing back
+at the mutex, return the guard pointer. Guard must be released by calling
+mutex_release_guard.
+@End Implementation
+
+@Performance_Hints
+Uncontended lock acquisition is one mutex lock + one allocation. For
+ultra-hot paths consider using sync_core.mutex_lock directly with manual
+release.
+@End Performance_Hints
+
+@Security_Scope
+The returned guard MUST be released exactly once via mutex_release_guard.
+@End Security_Scope
+
+Process called "mutex_lock" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let inner be proc memory_get_int64 from Mem with m, MUTEX_OFF_INNER
+    Let lock_rc be proc mutex_lock from Sync with inner
+    If lock_rc is equal to 0:
+        Return 0
+    End If
+    Let value_ptr be proc memory_get_int64 from Mem with m, MUTEX_OFF_VALUE
+    Let g be proc guard_create with m, value_ptr
+    If g is equal to 0:
+        proc mutex_unlock from Sync with inner
+        Return 0
+    End If
+    Return g
+End Process
+
+@Reasoning
+Non-blocking lock attempt. Returns a guard if the lock was acquired, 0 if
+the lock is already held by another thread.
+@End Reasoning
+
+@Implementation
+Try-lock the inner mutex. On success allocate and return a guard. On
+failure return 0.
+@End Implementation
+
+@Performance_Hints
+Bounded-time; safe for use in non-blocking algorithms.
+@End Performance_Hints
+
+@Security_Scope
+Returned guard, if non-zero, must be released exactly once.
+@End Security_Scope
+
+Process called "mutex_try_lock" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let inner be proc memory_get_int64 from Mem with m, MUTEX_OFF_INNER
+    Let try_rc be proc mutex_try_lock from Sync with inner
+    If try_rc is not equal to 1:
+        Return 0
+    End If
+    Let value_ptr be proc memory_get_int64 from Mem with m, MUTEX_OFF_VALUE
+    Let g be proc guard_create with m, value_ptr
+    If g is equal to 0:
+        proc mutex_unlock from Sync with inner
+        Return 0
+    End If
+    Return g
+End Process
+
+@Reasoning
+Release a guard, unlocking the parent mutex. The guard becomes invalid
+after this call.
+@End Reasoning
+
+@Implementation
+Mark guard inactive, unlock the parent mutex's inner lock, free the guard.
+@End Implementation
+
+@Performance_Hints
+O(1) plus platform mutex unlock cost.
+@End Performance_Hints
+
+@Security_Scope
+Double-release is detected via the active flag and is a no-op.
+@End Security_Scope
+
+Process called "mutex_release_guard" takes g as Integer returns Integer:
+    If g is equal to 0:
+        Return MUTEX_ERR_INVALID
+    End If
+    Let active be proc memory_get_int64 from Mem with g, GUARD_OFF_ACTIVE
+    If active is equal to 0:
+        Return MUTEX_ERR_INVALID
+    End If
+
+    proc memory_set_int64 from Mem with g, GUARD_OFF_ACTIVE, 0
+
+    Let m be proc memory_get_int64 from Mem with g, GUARD_OFF_MUTEX
+    If m is not equal to 0:
+        Let inner be proc memory_get_int64 from Mem with m, MUTEX_OFF_INNER
+        proc mutex_unlock from Sync with inner
+    End If
+
+    proc deallocate from Memory with g
+    Return MUTEX_OK
+End Process
+
+Note: ============================================================================
+Note: Poisoning
+Note: ============================================================================
+
+@Reasoning
+A mutex is considered poisoned if a thread panicked while holding it.
+Poisoning is informational; subsequent lockers can still access the data
+but should be aware it may be in an inconsistent state.
+@End Reasoning
+
+@Implementation
+A flag bit in the mutex record. Set with mutex_poison, queried with
+mutex_is_poisoned.
+@End Implementation
+
+@Performance_Hints
+Plain memory access; no synchronization overhead since callers should only
+query while holding the lock.
+@End Performance_Hints
+
+@Security_Scope
+Caller is responsible for poisoning the mutex from their panic handler.
+@End Security_Scope
+
+Process called "mutex_poison" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return MUTEX_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with m, MUTEX_OFF_POISONED, 1
+    Return MUTEX_OK
+End Process
+
+Process called "mutex_is_poisoned" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with m, MUTEX_OFF_POISONED
+End Process
+
+Process called "mutex_clear_poison" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return MUTEX_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with m, MUTEX_OFF_POISONED, 0
+    Return MUTEX_OK
+End Process

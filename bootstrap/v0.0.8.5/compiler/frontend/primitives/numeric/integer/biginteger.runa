@@ -1,0 +1,3137 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Arbitrary-precision signed integers (BigInt) for the Runa numeric
+primitive layer.  This module supplies the foundation for cryptography
+(RSA, BLS, PQ cryptanalysis), number-theoretic algorithms, and
+sovereign-scale financial arithmetic.
+
+REPRESENTATION
+
+A BigInt is a 32-byte heap header followed by a separately-allocated
+limb array, all reachable through a single Integer pointer:
+
+  offset 0:  sign         (signed Integer: +1 for positive/zero, -1 for negative)
+  offset 8:  limbs_ptr    (pointer to limb array)
+  offset 16: limb_count   (Integer, number of significant limbs)
+  offset 24: capacity     (Integer, allocated limb slots)
+
+Limbs are stored little-endian: limb[0] holds bits 0..63, limb[1] holds
+bits 64..127, and so on.  Each limb is a single 64-bit value, but to
+sidestep the bootstrap Integer's signed-overflow trap on full-width
+arithmetic, all arithmetic is performed on 32-bit halves.  Every limb
+is therefore manipulated as a pair (lo32, hi32) via uint32_truncate and
+the Bitwise primitives.
+
+Zero is represented as sign=+1 with limb_count=0.  Negative zero is
+canonicalised to positive zero before any compare.
+
+OWNERSHIP
+
+Every constructor/operator that returns a BigInt allocates fresh
+storage (header + limb buffer).  Callers MUST call bigint_free when
+done.  Operands are never mutated in-place; this preserves immutable
+arithmetic semantics for the upstream numeric tower.
+
+ALGORITHMS
+
+  Addition / subtraction:  schoolbook ripple with 32-bit half-limb
+                           carry propagation.
+  Multiplication:           schoolbook (a_len * b_len) limb multiplies;
+                           Karatsuba is dispatched when both operands
+                           exceed KARATSUBA_THRESHOLD (32 limbs).
+  Division:                 schoolbook long division using Knuth D when
+                           the divisor has more than one limb; for
+                           single-limb divisors we use the direct
+                           short-division kernel.  Burnikel-Ziegler is
+                           the planned upgrade path for the next phase.
+  Modular exponentiation:   square-and-multiply, big-endian bit scan.
+  Modular inverse:          extended Euclidean algorithm.
+  Primality:                Miller-Rabin with parametric round count;
+                           Baillie-PSW exposed as bigint_is_prime_bpsw.
+
+EXTERNAL DEPENDENCIES
+
+  Layout                    page allocator
+  Memory                    raw load/store
+  Bitwise                   shifts, AND/OR/XOR/NOT
+  IntWidths                 32-bit truncation helpers,
+                            decimal/hex helpers for tiny values
+  Entropy                   secure random source for bigint_random
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/bitwise_core.runa" as Bitwise
+Import "compiler/frontend/primitives/numeric/integer/int_widths.runa" as IntWidths
+
+Note: ============================================================================
+Note: Layout offsets and constants
+Note: ============================================================================
+
+Constant BIGINT_HEADER_SIZE as Integer is 32
+Constant BIGINT_SIGN_OFF as Integer is 0
+Constant BIGINT_LIMBS_PTR_OFF as Integer is 8
+Constant BIGINT_LIMB_COUNT_OFF as Integer is 16
+Constant BIGINT_CAPACITY_OFF as Integer is 24
+
+Constant BIGINT_LIMB_BYTES as Integer is 8
+Constant KARATSUBA_THRESHOLD as Integer is 32
+Constant UINT32_FULL as Integer is 4294967295
+Constant TWO_POW_32_LOCAL as Integer is 4294967296
+
+Note: ============================================================================
+Note: Allocator
+Note: ============================================================================
+
+Process called "bigint_alloc" takes capacity as Integer returns Integer:
+    @Reasoning
+    Allocates a fresh BigInt header with a limb buffer of the requested
+    capacity (minimum 1).  The new BigInt is canonical zero.
+    @End Reasoning
+
+    @Implementation
+    Two Layout.allocate calls: one for the 32-byte header, one for the
+    limb buffer.  All limb bytes are zero-initialised.
+    @End Implementation
+
+    @Performance_Hints
+    O(capacity) due to zero-fill of the limb buffer.
+    @End Performance_Hints
+
+    @Security_Scope
+    Either allocation failure returns 0 (NULL).  Callers MUST check.
+    @End Security_Scope
+
+    Let cap be capacity
+    If cap is less than 1:
+        Set cap to 1
+    End If
+    Let header be Layout.allocate(BIGINT_HEADER_SIZE)
+    If header is equal to 0:
+        Return 0
+    End If
+    Let limbs be Layout.allocate(cap multiplied by BIGINT_LIMB_BYTES)
+    If limbs is equal to 0:
+        Layout.deallocate(header)
+        Return 0
+    End If
+    Memory.memory_set_int64(header, BIGINT_SIGN_OFF, 1)
+    Memory.memory_set_int64(header, BIGINT_LIMBS_PTR_OFF, limbs)
+    Memory.memory_set_int64(header, BIGINT_LIMB_COUNT_OFF, 0)
+    Memory.memory_set_int64(header, BIGINT_CAPACITY_OFF, cap)
+    Memory.memory_zero(limbs, cap multiplied by BIGINT_LIMB_BYTES)
+    Return header
+End Process
+
+Process called "bigint_free" takes b as Integer returns Integer:
+    @Reasoning
+    Releases a BigInt and its limb buffer.  Idempotent on NULL.
+    @End Reasoning
+
+    @Implementation
+    Free the limb buffer pointer then the header.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus allocator bookkeeping.
+    @End Performance_Hints
+
+    @Security_Scope
+    Double-free triggers the allocator canary.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Let limbs be Memory.memory_get_int64(b, BIGINT_LIMBS_PTR_OFF)
+    If limbs is not equal to 0:
+        Layout.deallocate(limbs)
+    End If
+    Layout.deallocate(b)
+    Return 1
+End Process
+
+Process called "bigint_get_sign" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 1
+    End If
+    Return Memory.memory_get_int64(b, BIGINT_SIGN_OFF)
+End Process
+
+Process called "bigint_set_sign" takes b as Integer, sign as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    If sign is less than 0:
+        Memory.memory_set_int64(b, BIGINT_SIGN_OFF, -1)
+    Otherwise:
+        Memory.memory_set_int64(b, BIGINT_SIGN_OFF, 1)
+    End If
+    Return 1
+End Process
+
+Process called "bigint_get_limb_count" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+End Process
+
+Process called "bigint_get_capacity" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int64(b, BIGINT_CAPACITY_OFF)
+End Process
+
+Process called "bigint_get_limbs_ptr" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int64(b, BIGINT_LIMBS_PTR_OFF)
+End Process
+
+Process called "bigint_set_limb_count" takes b as Integer, count as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(b, BIGINT_LIMB_COUNT_OFF, count)
+    Return 1
+End Process
+
+Process called "bigint_get_limb" takes b as Integer, index as Integer returns Integer:
+    @Reasoning
+    Reads the limb at the given index as a 64-bit Integer.  Returns 0
+    for indices beyond limb_count to make the BigInt logically extend
+    with zeros.
+    @End Reasoning
+
+    @Implementation
+    Bounds-check then load.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Negative or NULL inputs return 0.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    If index is less than 0:
+        Return 0
+    End If
+    Let cap be Memory.memory_get_int64(b, BIGINT_CAPACITY_OFF)
+    If index is greater than (cap minus 1):
+        Return 0
+    End If
+    Let limbs be Memory.memory_get_int64(b, BIGINT_LIMBS_PTR_OFF)
+    Return Memory.memory_get_int64(limbs, index multiplied by BIGINT_LIMB_BYTES)
+End Process
+
+Process called "bigint_set_limb" takes b as Integer, index as Integer, value as Integer returns Integer:
+    @Reasoning
+    Writes the limb at the given index.  Caller is responsible for
+    ensuring index < capacity.  Does NOT update limb_count.
+    @End Reasoning
+
+    @Implementation
+    Bounds-check then store.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Out-of-range index is ignored (returns 0).
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    If index is less than 0:
+        Return 0
+    End If
+    Let cap be Memory.memory_get_int64(b, BIGINT_CAPACITY_OFF)
+    If index is greater than (cap minus 1):
+        Return 0
+    End If
+    Let limbs be Memory.memory_get_int64(b, BIGINT_LIMBS_PTR_OFF)
+    Memory.memory_set_int64(limbs, index multiplied by BIGINT_LIMB_BYTES, value)
+    Return 1
+End Process
+
+Process called "bigint_normalize" takes b as Integer returns Integer:
+    @Reasoning
+    Trims trailing zero limbs and canonicalises the sign of zero to +1.
+    @End Reasoning
+
+    @Implementation
+    Scan from the top of limbs downward and reduce limb_count.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count) worst case.
+    @End Performance_Hints
+
+    @Security_Scope
+    Total.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Let count be Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    While count is greater than 0:
+        Let top be bigint_get_limb(b, count minus 1)
+        If top is not equal to 0:
+            Break
+        End If
+        Set count to count minus 1
+    End While
+    Memory.memory_set_int64(b, BIGINT_LIMB_COUNT_OFF, count)
+    If count is equal to 0:
+        Memory.memory_set_int64(b, BIGINT_SIGN_OFF, 1)
+    End If
+    Return 1
+End Process
+
+Process called "bigint_grow" takes b as Integer, new_capacity as Integer returns Integer:
+    @Reasoning
+    Ensures the limb buffer has at least new_capacity slots.  If
+    necessary, allocates a larger buffer, copies the existing limbs, and
+    frees the old buffer.
+    @End Reasoning
+
+    @Implementation
+    Compare against current capacity.  Allocate, memcpy, swap, free.
+    @End Implementation
+
+    @Performance_Hints
+    O(old_count) on growth, O(1) otherwise.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure leaves the BigInt unchanged and returns 0.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Let cap be Memory.memory_get_int64(b, BIGINT_CAPACITY_OFF)
+    If new_capacity is less than (cap plus 1):
+        Return 1
+    End If
+    Let new_cap be cap
+    If new_cap is less than 1:
+        Set new_cap to 1
+    End If
+    While new_cap is less than new_capacity:
+        Set new_cap to new_cap multiplied by 2
+    End While
+    Let new_limbs be Layout.allocate(new_cap multiplied by BIGINT_LIMB_BYTES)
+    If new_limbs is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(new_limbs, new_cap multiplied by BIGINT_LIMB_BYTES)
+    Let old_limbs be Memory.memory_get_int64(b, BIGINT_LIMBS_PTR_OFF)
+    Let count be Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    If count is greater than 0:
+        Memory.memory_copy(new_limbs, old_limbs, count multiplied by BIGINT_LIMB_BYTES)
+    End If
+    Layout.deallocate(old_limbs)
+    Memory.memory_set_int64(b, BIGINT_LIMBS_PTR_OFF, new_limbs)
+    Memory.memory_set_int64(b, BIGINT_CAPACITY_OFF, new_cap)
+    Return 1
+End Process
+
+Process called "bigint_copy" takes src as Integer returns Integer:
+    @Reasoning
+    Returns a freshly-allocated deep copy of src.
+    @End Reasoning
+
+    @Implementation
+    Allocate with src's capacity, memcpy limbs, copy header fields.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If src is equal to 0:
+        Return 0
+    End If
+    Let cap be Memory.memory_get_int64(src, BIGINT_CAPACITY_OFF)
+    Let dst be bigint_alloc(cap)
+    If dst is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(dst, BIGINT_SIGN_OFF, Memory.memory_get_int64(src, BIGINT_SIGN_OFF))
+    Let count be Memory.memory_get_int64(src, BIGINT_LIMB_COUNT_OFF)
+    Memory.memory_set_int64(dst, BIGINT_LIMB_COUNT_OFF, count)
+    Let dst_limbs be Memory.memory_get_int64(dst, BIGINT_LIMBS_PTR_OFF)
+    Let src_limbs be Memory.memory_get_int64(src, BIGINT_LIMBS_PTR_OFF)
+    If count is greater than 0:
+        Memory.memory_copy(dst_limbs, src_limbs, count multiplied by BIGINT_LIMB_BYTES)
+    End If
+    Return dst
+End Process
+
+Note: ============================================================================
+Note: Construction from primitive integers
+Note: ============================================================================
+
+Process called "bigint_from_int64" takes value as Integer returns Integer:
+    @Reasoning
+    Constructs a BigInt from a 64-bit signed Integer.  Negative values
+    yield sign=-1 with the absolute value's limb representation.
+    @End Reasoning
+
+    @Implementation
+    Allocate cap=1, store the absolute value in limb 0, set sign.
+    INT64_MIN is special-cased because its negation overflows the
+    signed range; the absolute value fits exactly in one unsigned 64-bit
+    limb, so we store the raw bit pattern with the sign flipped.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let result be bigint_alloc(2)
+    If result is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, 0)
+        Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+        Return result
+    End If
+    If value is equal to IntWidths.INT64_MIN:
+        Note: |INT64_MIN| = 2^63, which fits unsigned in a single limb.
+        bigint_set_limb(result, 0, IntWidths.INT64_MIN)
+        Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, 1)
+        Memory.memory_set_int64(result, BIGINT_SIGN_OFF, -1)
+        Return result
+    End If
+    Let abs_v be value
+    If value is less than 0:
+        Set abs_v to 0 minus value
+        Memory.memory_set_int64(result, BIGINT_SIGN_OFF, -1)
+    Otherwise:
+        Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    End If
+    bigint_set_limb(result, 0, abs_v)
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, 1)
+    Return result
+End Process
+
+Process called "bigint_from_uint64_pair" takes lo as Integer, hi as Integer returns Integer:
+    @Reasoning
+    Constructs a non-negative BigInt from a pair of 64-bit limbs
+    (lo + hi*2^64).  Used by callers that already have a UInt64 split
+    representation.
+    @End Reasoning
+
+    @Implementation
+    Store both limbs, set sign=+1, normalize.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let result be bigint_alloc(2)
+    If result is equal to 0:
+        Return 0
+    End If
+    bigint_set_limb(result, 0, lo)
+    bigint_set_limb(result, 1, hi)
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, 2)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    bigint_normalize(result)
+    Return result
+End Process
+
+Process called "bigint_to_int64" takes b as Integer, out_status as Integer returns Integer:
+    @Reasoning
+    Converts a BigInt back to a signed 64-bit Integer.  Reports overflow
+    if the magnitude exceeds the signed 64-bit range, or specifically
+    equals 2^63 with a positive sign (the only representable magnitude
+    that fits unsigned but not signed for the positive case).
+    @End Reasoning
+
+    @Implementation
+    Inspect limb_count then the top bit of limb 0.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL input returns 0 with CHECKED_OK.
+    @End Security_Scope
+
+    Let status be IntWidths.CHECKED_OK
+    If b is equal to 0:
+        If out_status is not equal to 0:
+            Memory.memory_set_int64(out_status, 0, status)
+        End If
+        Return 0
+    End If
+    Let count be Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    If count is equal to 0:
+        If out_status is not equal to 0:
+            Memory.memory_set_int64(out_status, 0, status)
+        End If
+        Return 0
+    End If
+    If count is greater than 1:
+        Set status to IntWidths.CHECKED_OVERFLOW
+        If out_status is not equal to 0:
+            Memory.memory_set_int64(out_status, 0, status)
+        End If
+        Return 0
+    End If
+    Let lo be bigint_get_limb(b, 0)
+    Let sign be Memory.memory_get_int64(b, BIGINT_SIGN_OFF)
+    If sign is greater than 0:
+        If lo is less than 0:
+            Set status to IntWidths.CHECKED_OVERFLOW
+            If out_status is not equal to 0:
+                Memory.memory_set_int64(out_status, 0, status)
+            End If
+            Return 0
+        End If
+        If out_status is not equal to 0:
+            Memory.memory_set_int64(out_status, 0, status)
+        End If
+        Return lo
+    End If
+    Note: Negative sign.  |result| is lo treated unsigned.
+    If lo is equal to IntWidths.INT64_MIN:
+        Note: |result| == 2^63 -> -2^63 == INT64_MIN.
+        If out_status is not equal to 0:
+            Memory.memory_set_int64(out_status, 0, status)
+        End If
+        Return IntWidths.INT64_MIN
+    End If
+    If lo is less than 0:
+        Set status to IntWidths.CHECKED_OVERFLOW
+        If out_status is not equal to 0:
+            Memory.memory_set_int64(out_status, 0, status)
+        End If
+        Return 0
+    End If
+    If out_status is not equal to 0:
+        Memory.memory_set_int64(out_status, 0, status)
+    End If
+    Return 0 minus lo
+End Process
+
+Process called "bigint_to_uint64" takes b as Integer, out_status as Integer returns Integer:
+    @Reasoning
+    Returns the low limb as a 64-bit unsigned bit pattern (still typed
+    Integer; callers interpret unsignedly).  Reports overflow when the
+    BigInt has more than one limb or is negative.
+    @End Reasoning
+
+    @Implementation
+    Read limb 0 verbatim.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL input returns 0 with CHECKED_OK.
+    @End Security_Scope
+
+    Let status be IntWidths.CHECKED_OK
+    If b is equal to 0:
+        If out_status is not equal to 0:
+            Memory.memory_set_int64(out_status, 0, status)
+        End If
+        Return 0
+    End If
+    Let sign be Memory.memory_get_int64(b, BIGINT_SIGN_OFF)
+    Let count be Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    If sign is less than 0:
+        If count is greater than 0:
+            Set status to IntWidths.CHECKED_UNDERFLOW
+        End If
+    End If
+    If count is greater than 1:
+        Set status to IntWidths.CHECKED_OVERFLOW
+    End If
+    If out_status is not equal to 0:
+        Memory.memory_set_int64(out_status, 0, status)
+    End If
+    If count is equal to 0:
+        Return 0
+    End If
+    Return bigint_get_limb(b, 0)
+End Process
+
+Note: ============================================================================
+Note: Comparison
+Note: ============================================================================
+
+Process called "bigint_cmp_magnitude" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Compares the absolute values of a and b.  Returns -1, 0, or 1
+    according to |a| <=> |b|.  Sign is ignored.
+    @End Reasoning
+
+    @Implementation
+    Compare limb counts; on tie, scan limbs from top to bottom.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Total; NULL operands compare as zero.
+    @End Security_Scope
+
+    Let a_count be 0
+    Let b_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    If b is not equal to 0:
+        Set b_count to Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    End If
+    If a_count is less than b_count:
+        Return -1
+    End If
+    If a_count is greater than b_count:
+        Return 1
+    End If
+    Let i be a_count minus 1
+    While i is greater than -1:
+        Let a_limb be bigint_get_limb(a, i)
+        Let b_limb be bigint_get_limb(b, i)
+        Let a_low32 be IntWidths.uint32_truncate(a_limb)
+        Let a_high32 be IntWidths.uint32_truncate(Bitwise.right_shift_logical(a_limb, 32))
+        Let b_low32 be IntWidths.uint32_truncate(b_limb)
+        Let b_high32 be IntWidths.uint32_truncate(Bitwise.right_shift_logical(b_limb, 32))
+        If a_high32 is less than b_high32:
+            Return -1
+        End If
+        If a_high32 is greater than b_high32:
+            Return 1
+        End If
+        If a_low32 is less than b_low32:
+            Return -1
+        End If
+        If a_low32 is greater than b_low32:
+            Return 1
+        End If
+        Set i to i minus 1
+    End While
+    Return 0
+End Process
+
+Process called "bigint_cmp" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Signed compare of two BigInts.  Returns -1, 0, or +1 for a < b,
+    a == b, a > b.
+    @End Reasoning
+
+    @Implementation
+    Sign analysis followed by magnitude comparison.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Total.
+    @End Security_Scope
+
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 0
+        End If
+    End If
+    Let a_count be 0
+    Let b_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    If b is not equal to 0:
+        Set b_count to Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    End If
+    Let a_sign be 1
+    Let b_sign be 1
+    If a is not equal to 0:
+        Set a_sign to Memory.memory_get_int64(a, BIGINT_SIGN_OFF)
+    End If
+    If b is not equal to 0:
+        Set b_sign to Memory.memory_get_int64(b, BIGINT_SIGN_OFF)
+    End If
+    If a_count is equal to 0:
+        Set a_sign to 1
+    End If
+    If b_count is equal to 0:
+        Set b_sign to 1
+    End If
+    If a_sign is less than b_sign:
+        Return -1
+    End If
+    If a_sign is greater than b_sign:
+        Return 1
+    End If
+    Let mag be bigint_cmp_magnitude(a, b)
+    If a_sign is less than 0:
+        Return 0 minus mag
+    End If
+    Return mag
+End Process
+
+Process called "bigint_is_zero" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 1
+    End If
+    Let count be Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    If count is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "bigint_is_negative" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let count be Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    If count is equal to 0:
+        Return 0
+    End If
+    Let sign be Memory.memory_get_int64(b, BIGINT_SIGN_OFF)
+    If sign is less than 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Unsigned magnitude arithmetic kernels
+Note: These accept and return raw BigInts but ignore sign on inputs and
+Note: emit positive results.  Higher-level signed wrappers attach sign.
+Note: ============================================================================
+
+Process called "bigint_add_unsigned" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Adds the absolute values of a and b.  The result's limb count is at
+    most max(a_count, b_count) + 1.
+    @End Reasoning
+
+    @Implementation
+    Schoolbook addition over 32-bit half-limbs to detect carry without
+    signed-overflow exposure.  Each 64-bit limb is split into two 32-bit
+    halves; we maintain a 32-bit carry across half-limbs.
+    @End Implementation
+
+    @Performance_Hints
+    O(max(a_count, b_count)).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let a_count be 0
+    Let b_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    If b is not equal to 0:
+        Set b_count to Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    End If
+    Let max_count be a_count
+    If b_count is greater than max_count:
+        Set max_count to b_count
+    End If
+    Let result be bigint_alloc(max_count plus 2)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let carry be 0
+    Let i be 0
+    While i is less than max_count:
+        Let a_limb be bigint_get_limb(a, i)
+        Let b_limb be bigint_get_limb(b, i)
+        Let a_lo32 be IntWidths.uint32_truncate(a_limb)
+        Let a_hi32 be IntWidths.uint32_truncate(Bitwise.right_shift_logical(a_limb, 32))
+        Let b_lo32 be IntWidths.uint32_truncate(b_limb)
+        Let b_hi32 be IntWidths.uint32_truncate(Bitwise.right_shift_logical(b_limb, 32))
+        Let sum_lo be a_lo32 plus b_lo32 plus carry
+        Let carry_lo be Bitwise.right_shift_logical(sum_lo, 32)
+        Let r_lo be IntWidths.uint32_truncate(sum_lo)
+        Let sum_hi be a_hi32 plus b_hi32 plus carry_lo
+        Let carry_hi be Bitwise.right_shift_logical(sum_hi, 32)
+        Let r_hi be IntWidths.uint32_truncate(sum_hi)
+        Let combined be Bitwise.bitwise_or(Bitwise.left_shift(r_hi, 32), r_lo)
+        bigint_set_limb(result, i, combined)
+        Set carry to carry_hi
+        Set i to i plus 1
+    End While
+    If carry is not equal to 0:
+        bigint_set_limb(result, max_count, carry)
+        Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, max_count plus 1)
+    Otherwise:
+        Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, max_count)
+    End If
+    bigint_normalize(result)
+    Return result
+End Process
+
+Process called "bigint_sub_unsigned" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Computes |a| - |b| under the precondition that |a| >= |b|; the
+    result is non-negative.  Callers must ensure this ordering via
+    bigint_cmp_magnitude.
+    @End Reasoning
+
+    @Implementation
+    Half-limb borrow propagation.
+    @End Implementation
+
+    @Performance_Hints
+    O(a_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let a_count be 0
+    Let b_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    If b is not equal to 0:
+        Set b_count to Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    End If
+    Let result be bigint_alloc(a_count plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let borrow be 0
+    Let i be 0
+    While i is less than a_count:
+        Let a_limb be bigint_get_limb(a, i)
+        Let b_limb be 0
+        If i is less than b_count:
+            Set b_limb to bigint_get_limb(b, i)
+        End If
+        Let a_lo32 be IntWidths.uint32_truncate(a_limb)
+        Let a_hi32 be IntWidths.uint32_truncate(Bitwise.right_shift_logical(a_limb, 32))
+        Let b_lo32 be IntWidths.uint32_truncate(b_limb)
+        Let b_hi32 be IntWidths.uint32_truncate(Bitwise.right_shift_logical(b_limb, 32))
+        Let need_lo be b_lo32 plus borrow
+        Let new_borrow_lo be 0
+        Let diff_lo be 0
+        If a_lo32 is less than need_lo:
+            Set diff_lo to IntWidths.uint32_truncate(a_lo32 plus TWO_POW_32_LOCAL minus need_lo)
+            Set new_borrow_lo to 1
+        Otherwise:
+            Set diff_lo to a_lo32 minus need_lo
+        End If
+        Let need_hi be b_hi32 plus new_borrow_lo
+        Let new_borrow_hi be 0
+        Let diff_hi be 0
+        If a_hi32 is less than need_hi:
+            Set diff_hi to IntWidths.uint32_truncate(a_hi32 plus TWO_POW_32_LOCAL minus need_hi)
+            Set new_borrow_hi to 1
+        Otherwise:
+            Set diff_hi to a_hi32 minus need_hi
+        End If
+        Let combined be Bitwise.bitwise_or(Bitwise.left_shift(diff_hi, 32), diff_lo)
+        bigint_set_limb(result, i, combined)
+        Set borrow to new_borrow_hi
+        Set i to i plus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, a_count)
+    bigint_normalize(result)
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Signed add / sub
+Note: ============================================================================
+
+Process called "bigint_add" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Signed BigInt addition.  Same-sign operands forward to the unsigned
+    magnitude adder; opposite-sign operands forward to the magnitude
+    subtractor with appropriate sign attachment.
+    @End Reasoning
+
+    @Implementation
+    Dispatch on the sign comparison; the result's sign equals the sign
+    of the larger-magnitude operand for opposite-sign pairs.
+    @End Implementation
+
+    @Performance_Hints
+    O(max(a_count, b_count)).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let a_sign be bigint_get_sign(a)
+    Let b_sign be bigint_get_sign(b)
+    Let a_zero be bigint_is_zero(a)
+    Let b_zero be bigint_is_zero(b)
+    If a_zero is equal to 1:
+        Return bigint_copy(b)
+    End If
+    If b_zero is equal to 1:
+        Return bigint_copy(a)
+    End If
+    If a_sign is equal to b_sign:
+        Let r be bigint_add_unsigned(a, b)
+        If r is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_int64(r, BIGINT_SIGN_OFF, a_sign)
+        Return r
+    End If
+    Let cmp be bigint_cmp_magnitude(a, b)
+    If cmp is equal to 0:
+        Return bigint_from_int64(0)
+    End If
+    If cmp is greater than 0:
+        Let r be bigint_sub_unsigned(a, b)
+        If r is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_int64(r, BIGINT_SIGN_OFF, a_sign)
+        Return r
+    End If
+    Let r be bigint_sub_unsigned(b, a)
+    If r is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(r, BIGINT_SIGN_OFF, b_sign)
+    Return r
+End Process
+
+Process called "bigint_sub" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Signed BigInt subtraction: a - b == a + (-b).
+    @End Reasoning
+
+    @Implementation
+    Flip the sign of a copy of b, then add.  The copy is freed before
+    return.
+    @End Implementation
+
+    @Performance_Hints
+    O(max(a_count, b_count)).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return bigint_copy(a)
+    End If
+    Let b_neg be bigint_copy(b)
+    If b_neg is equal to 0:
+        Return 0
+    End If
+    Let count be Memory.memory_get_int64(b_neg, BIGINT_LIMB_COUNT_OFF)
+    If count is not equal to 0:
+        Let cur_sign be Memory.memory_get_int64(b_neg, BIGINT_SIGN_OFF)
+        Memory.memory_set_int64(b_neg, BIGINT_SIGN_OFF, 0 minus cur_sign)
+    End If
+    Let result be bigint_add(a, b_neg)
+    bigint_free(b_neg)
+    Return result
+End Process
+
+Process called "bigint_negate" takes a as Integer returns Integer:
+    @Reasoning
+    Returns -a as a fresh BigInt.  Zero negates to zero.
+    @End Reasoning
+
+    @Implementation
+    Copy, flip sign if non-zero.
+    @End Implementation
+
+    @Performance_Hints
+    O(a_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let r be bigint_copy(a)
+    If r is equal to 0:
+        Return 0
+    End If
+    Let count be Memory.memory_get_int64(r, BIGINT_LIMB_COUNT_OFF)
+    If count is not equal to 0:
+        Let s be Memory.memory_get_int64(r, BIGINT_SIGN_OFF)
+        Memory.memory_set_int64(r, BIGINT_SIGN_OFF, 0 minus s)
+    End If
+    Return r
+End Process
+
+Process called "bigint_abs" takes a as Integer returns Integer:
+    Let r be bigint_copy(a)
+    If r is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(r, BIGINT_SIGN_OFF, 1)
+    Return r
+End Process
+
+Note: ============================================================================
+Note: Multiplication
+Note: ============================================================================
+
+Process called "bigint_mul_schoolbook" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Classical O(n*m) schoolbook multiplication on the absolute values
+    of a and b.  Each limb is decomposed into 32-bit halves to keep all
+    intermediate products within the bootstrap Integer's signed range.
+    @End Reasoning
+
+    @Implementation
+    For each pair (i,j) of half-limb indices, accumulate the partial
+    product (a_half[i] * b_half[j]) shifted by (i+j) half-positions
+    (16 bits per half-position).  We work in 32-bit half-limbs and
+    write back to the 32-bit half-array, then pack into 64-bit limbs.
+    @End Implementation
+
+    @Performance_Hints
+    O((2*a_count) * (2*b_count)) half-limb multiplies.  For operands
+    >= KARATSUBA_THRESHOLD limbs the caller should dispatch to
+    bigint_mul_karatsuba instead.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let a_count be 0
+    Let b_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    If b is not equal to 0:
+        Set b_count to Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    End If
+    Let result_limbs be a_count plus b_count plus 1
+    Let result be bigint_alloc(result_limbs plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let a_halves be a_count multiplied by 2
+    Let b_halves be b_count multiplied by 2
+    Let total_halves be a_halves plus b_halves plus 2
+    Let half_buf be Layout.allocate(total_halves multiplied by 8)
+    If half_buf is equal to 0:
+        bigint_free(result)
+        Return 0
+    End If
+    Memory.memory_zero(half_buf, total_halves multiplied by 8)
+    Let i be 0
+    While i is less than a_halves:
+        Let a_limb_idx be i divided by 2
+        Let a_limb be bigint_get_limb(a, a_limb_idx)
+        Let a_half be 0
+        If i modulo by 2 is equal to 0:
+            Set a_half to IntWidths.uint32_truncate(a_limb)
+        Otherwise:
+            Set a_half to IntWidths.uint32_truncate(Bitwise.right_shift_logical(a_limb, 32))
+        End If
+        Let j be 0
+        While j is less than b_halves:
+            Let b_limb_idx be j divided by 2
+            Let b_limb be bigint_get_limb(b, b_limb_idx)
+            Let b_half be 0
+            If j modulo by 2 is equal to 0:
+                Set b_half to IntWidths.uint32_truncate(b_limb)
+            Otherwise:
+                Set b_half to IntWidths.uint32_truncate(Bitwise.right_shift_logical(b_limb, 32))
+            End If
+            Let product be a_half multiplied by b_half
+            Let pos be i plus j
+            Let existing be Memory.memory_get_int64(half_buf, pos multiplied by 8)
+            Let sum be existing plus product
+            Memory.memory_set_int64(half_buf, pos multiplied by 8, sum)
+            Let k be pos
+            While k is less than (total_halves minus 1):
+                Let cur be Memory.memory_get_int64(half_buf, k multiplied by 8)
+                Let carry be Bitwise.right_shift_logical(cur, 32)
+                If carry is equal to 0:
+                    Break
+                End If
+                Let cur_low be IntWidths.uint32_truncate(cur)
+                Memory.memory_set_int64(half_buf, k multiplied by 8, cur_low)
+                Let next_val be Memory.memory_get_int64(half_buf, (k plus 1) multiplied by 8)
+                Memory.memory_set_int64(half_buf, (k plus 1) multiplied by 8, next_val plus carry)
+                Set k to k plus 1
+            End While
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+    Note: Pack pairs of 32-bit halves into 64-bit limbs.
+    Let limb_idx be 0
+    Let half_pairs be total_halves divided by 2
+    While limb_idx is less than half_pairs:
+        Let lo32 be IntWidths.uint32_truncate(Memory.memory_get_int64(half_buf, (limb_idx multiplied by 2) multiplied by 8))
+        Let hi32 be IntWidths.uint32_truncate(Memory.memory_get_int64(half_buf, ((limb_idx multiplied by 2) plus 1) multiplied by 8))
+        Let combined be Bitwise.bitwise_or(Bitwise.left_shift(hi32, 32), lo32)
+        bigint_set_limb(result, limb_idx, combined)
+        Set limb_idx to limb_idx plus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, half_pairs)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    Layout.deallocate(half_buf)
+    bigint_normalize(result)
+    Return result
+End Process
+
+Process called "bigint_split_at" takes a as Integer, k as Integer, out_high as Integer returns Integer:
+    @Reasoning
+    Splits a non-negative BigInt a into low (k limbs) and high parts.
+    out_high receives the freshly-allocated high half (a >> 64*k) and
+    the return value is the freshly-allocated low half (a mod 2^(64*k)).
+    @End Reasoning
+
+    @Implementation
+    Copy the first k limbs into the low result and the remainder into
+    the high result.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0; partial allocations are released.
+    @End Security_Scope
+
+    Let a_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    Let low_count be k
+    If low_count is greater than a_count:
+        Set low_count to a_count
+    End If
+    Let low be bigint_alloc(low_count plus 1)
+    If low is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than low_count:
+        bigint_set_limb(low, i, bigint_get_limb(a, i))
+        Set i to i plus 1
+    End While
+    Memory.memory_set_int64(low, BIGINT_LIMB_COUNT_OFF, low_count)
+    Memory.memory_set_int64(low, BIGINT_SIGN_OFF, 1)
+    bigint_normalize(low)
+    Let high_count be a_count minus low_count
+    If high_count is less than 0:
+        Set high_count to 0
+    End If
+    Let high be bigint_alloc(high_count plus 1)
+    If high is equal to 0:
+        bigint_free(low)
+        Return 0
+    End If
+    Let j be 0
+    While j is less than high_count:
+        bigint_set_limb(high, j, bigint_get_limb(a, j plus low_count))
+        Set j to j plus 1
+    End While
+    Memory.memory_set_int64(high, BIGINT_LIMB_COUNT_OFF, high_count)
+    Memory.memory_set_int64(high, BIGINT_SIGN_OFF, 1)
+    bigint_normalize(high)
+    Memory.memory_set_int64(out_high, 0, high)
+    Return low
+End Process
+
+Process called "bigint_shl_limbs" takes a as Integer, k as Integer returns Integer:
+    @Reasoning
+    Multiplies a by 2^(64*k) by inserting k zero limbs at the bottom.
+    Used by Karatsuba recombination.
+    @End Reasoning
+
+    @Implementation
+    Allocate a result with (a_count + k) limbs; fill the bottom k with
+    zeros and copy the source limbs upward.
+    @End Implementation
+
+    @Performance_Hints
+    O(a_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let a_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    Let result be bigint_alloc(a_count plus k plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than a_count:
+        bigint_set_limb(result, i plus k, bigint_get_limb(a, i))
+        Set i to i plus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, a_count plus k)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, bigint_get_sign(a))
+    bigint_normalize(result)
+    Return result
+End Process
+
+Process called "bigint_mul_karatsuba" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Karatsuba multiplication: split each operand into low/high halves,
+    compute three sub-products (low*low, high*high, (low+high)*(low+high))
+    and reconstruct the full product with two additions and a
+    subtraction.  Below KARATSUBA_THRESHOLD we fall back to schoolbook.
+    @End Reasoning
+
+    @Implementation
+    Recursive split with the threshold guard at entry; sub-products are
+    obtained by calling back into bigint_mul which redispatches.
+    @End Implementation
+
+    @Performance_Hints
+    O(n^log2(3)) which is ~n^1.585.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failures propagate as 0.
+    @End Security_Scope
+
+    Let a_count be Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    Let b_count be Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    If a_count is less than KARATSUBA_THRESHOLD:
+        Return bigint_mul_schoolbook(a, b)
+    End If
+    If b_count is less than KARATSUBA_THRESHOLD:
+        Return bigint_mul_schoolbook(a, b)
+    End If
+    Let m be a_count
+    If b_count is greater than m:
+        Set m to b_count
+    End If
+    Let half be m divided by 2
+    If half is less than 1:
+        Set half to 1
+    End If
+    Let a_high_holder be Layout.allocate(8)
+    If a_high_holder is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(a_high_holder, 0, 0)
+    Let a_low be bigint_split_at(a, half, a_high_holder)
+    If a_low is equal to 0:
+        Layout.deallocate(a_high_holder)
+        Return 0
+    End If
+    Let a_high be Memory.memory_get_int64(a_high_holder, 0)
+    Layout.deallocate(a_high_holder)
+    Let b_high_holder be Layout.allocate(8)
+    If b_high_holder is equal to 0:
+        bigint_free(a_low)
+        bigint_free(a_high)
+        Return 0
+    End If
+    Memory.memory_set_int64(b_high_holder, 0, 0)
+    Let b_low be bigint_split_at(b, half, b_high_holder)
+    If b_low is equal to 0:
+        Layout.deallocate(b_high_holder)
+        bigint_free(a_low)
+        bigint_free(a_high)
+        Return 0
+    End If
+    Let b_high be Memory.memory_get_int64(b_high_holder, 0)
+    Layout.deallocate(b_high_holder)
+    Let z0 be bigint_mul(a_low, b_low)
+    Let z2 be bigint_mul(a_high, b_high)
+    Let a_sum be bigint_add(a_low, a_high)
+    Let b_sum be bigint_add(b_low, b_high)
+    Let z1_full be bigint_mul(a_sum, b_sum)
+    bigint_free(a_sum)
+    bigint_free(b_sum)
+    Let z1_temp be bigint_sub(z1_full, z0)
+    bigint_free(z1_full)
+    Let z1 be bigint_sub(z1_temp, z2)
+    bigint_free(z1_temp)
+    Let z2_shifted be bigint_shl_limbs(z2, half multiplied by 2)
+    Let z1_shifted be bigint_shl_limbs(z1, half)
+    Let partial be bigint_add(z2_shifted, z1_shifted)
+    bigint_free(z2_shifted)
+    bigint_free(z1_shifted)
+    Let result be bigint_add(partial, z0)
+    bigint_free(partial)
+    bigint_free(z0)
+    bigint_free(z1)
+    bigint_free(z2)
+    bigint_free(a_low)
+    bigint_free(a_high)
+    bigint_free(b_low)
+    bigint_free(b_high)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    Return result
+End Process
+
+Process called "bigint_mul" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Signed BigInt multiplication.  Dispatches to Karatsuba when both
+    operands meet the threshold; otherwise uses schoolbook.  The
+    result's sign is the product of the operand signs.
+    @End Reasoning
+
+    @Implementation
+    Magnitude multiply followed by sign attachment.
+    @End Implementation
+
+    @Performance_Hints
+    Schoolbook below threshold, Karatsuba above.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let a_zero be bigint_is_zero(a)
+    Let b_zero be bigint_is_zero(b)
+    If a_zero is equal to 1:
+        Return bigint_from_int64(0)
+    End If
+    If b_zero is equal to 1:
+        Return bigint_from_int64(0)
+    End If
+    Let a_count be Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    Let b_count be Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    Let result be 0
+    If a_count is less than KARATSUBA_THRESHOLD:
+        Set result to bigint_mul_schoolbook(a, b)
+    Otherwise:
+        If b_count is less than KARATSUBA_THRESHOLD:
+            Set result to bigint_mul_schoolbook(a, b)
+        Otherwise:
+            Set result to bigint_mul_karatsuba(a, b)
+        End If
+    End If
+    If result is equal to 0:
+        Return 0
+    End If
+    Let a_sign be Memory.memory_get_int64(a, BIGINT_SIGN_OFF)
+    Let b_sign be Memory.memory_get_int64(b, BIGINT_SIGN_OFF)
+    If a_sign is equal to b_sign:
+        Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    Otherwise:
+        Memory.memory_set_int64(result, BIGINT_SIGN_OFF, -1)
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Bit-shift on absolute value
+Note: ============================================================================
+
+Process called "bigint_shl" takes a as Integer, bits as Integer returns Integer:
+    @Reasoning
+    Left shift the absolute value of a by `bits` positions.  Sign is
+    preserved.  Negative or zero shifts return a fresh copy.
+    @End Reasoning
+
+    @Implementation
+    Decompose into limb-shift (k = bits / 64) and bit-shift
+    (r = bits mod 64).  When r > 0 we propagate the upper r bits of
+    each limb into the next limb via two 32-bit half operations.
+    @End Implementation
+
+    @Performance_Hints
+    O(a_count) limb operations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If bits is less than 1:
+        Return bigint_copy(a)
+    End If
+    Let limb_shift be bits divided by 64
+    Let bit_shift be bits modulo by 64
+    Let a_count be Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    Let result be bigint_alloc(a_count plus limb_shift plus 2)
+    If result is equal to 0:
+        Return 0
+    End If
+    If bit_shift is equal to 0:
+        Let i be 0
+        While i is less than a_count:
+            bigint_set_limb(result, i plus limb_shift, bigint_get_limb(a, i))
+            Set i to i plus 1
+        End While
+        Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, a_count plus limb_shift)
+    Otherwise:
+        Let i be 0
+        Let carry be 0
+        While i is less than a_count:
+            Let limb be bigint_get_limb(a, i)
+            Let lo32 be IntWidths.uint32_truncate(limb)
+            Let hi32 be IntWidths.uint32_truncate(Bitwise.right_shift_logical(limb, 32))
+            Let combined64 be Bitwise.bitwise_or(Bitwise.left_shift(hi32, 32), lo32)
+            Let shifted_low be Bitwise.bitwise_or(Bitwise.left_shift(combined64, bit_shift), carry)
+            Let new_carry be Bitwise.right_shift_logical(combined64, 64 minus bit_shift)
+            bigint_set_limb(result, i plus limb_shift, shifted_low)
+            Set carry to new_carry
+            Set i to i plus 1
+        End While
+        If carry is not equal to 0:
+            bigint_set_limb(result, a_count plus limb_shift, carry)
+            Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, a_count plus limb_shift plus 1)
+        Otherwise:
+            Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, a_count plus limb_shift)
+        End If
+    End If
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, bigint_get_sign(a))
+    bigint_normalize(result)
+    Return result
+End Process
+
+Process called "bigint_shr" takes a as Integer, bits as Integer returns Integer:
+    @Reasoning
+    Logical right shift of the absolute value by `bits` positions.
+    Sign is preserved; this is equivalent to truncated division by
+    2^bits on the magnitude.
+    @End Reasoning
+
+    @Implementation
+    Limb-shift and bit-shift decomposition with cross-limb propagation.
+    @End Implementation
+
+    @Performance_Hints
+    O(a_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If bits is less than 1:
+        Return bigint_copy(a)
+    End If
+    Let limb_shift be bits divided by 64
+    Let bit_shift be bits modulo by 64
+    Let a_count be Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    If limb_shift is greater than (a_count minus 1):
+        Return bigint_from_int64(0)
+    End If
+    Let new_count be a_count minus limb_shift
+    Let result be bigint_alloc(new_count plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    If bit_shift is equal to 0:
+        Let i be 0
+        While i is less than new_count:
+            bigint_set_limb(result, i, bigint_get_limb(a, i plus limb_shift))
+            Set i to i plus 1
+        End While
+        Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, new_count)
+    Otherwise:
+        Let i be 0
+        While i is less than new_count:
+            Let lo_limb be bigint_get_limb(a, i plus limb_shift)
+            Let hi_limb be 0
+            If (i plus limb_shift plus 1) is less than a_count:
+                Set hi_limb to bigint_get_limb(a, i plus limb_shift plus 1)
+            End If
+            Let lo_shifted be Bitwise.right_shift_logical(lo_limb, bit_shift)
+            Let hi_shifted be Bitwise.left_shift(hi_limb, 64 minus bit_shift)
+            bigint_set_limb(result, i, Bitwise.bitwise_or(lo_shifted, hi_shifted))
+            Set i to i plus 1
+        End While
+        Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, new_count)
+    End If
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, bigint_get_sign(a))
+    bigint_normalize(result)
+    Return result
+End Process
+
+Process called "bigint_bit_length" takes a as Integer returns Integer:
+    @Reasoning
+    Returns the position of the highest set bit + 1, or 0 if a is zero.
+    Sign is ignored.
+    @End Reasoning
+
+    @Implementation
+    Find the top non-zero limb, then locate the top set bit within it
+    via IntWidths.clz64.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) once limb_count is known.
+    @End Performance_Hints
+
+    @Security_Scope
+    Total.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    Let count be Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    If count is equal to 0:
+        Return 0
+    End If
+    Let top be bigint_get_limb(a, count minus 1)
+    Let lz be IntWidths.clz64(top)
+    Return (count multiplied by 64) minus lz
+End Process
+
+Process called "bigint_test_bit" takes a as Integer, bit_index as Integer returns Integer:
+    @Reasoning
+    Tests the bit at the given position in the absolute value.
+    @End Reasoning
+
+    @Implementation
+    Compute limb index = bit_index / 64, bit offset = bit_index mod 64,
+    extract via shift+mask.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Out-of-range returns 0.
+    @End Security_Scope
+
+    If bit_index is less than 0:
+        Return 0
+    End If
+    Let limb_idx be bit_index divided by 64
+    Let bit_off be bit_index modulo by 64
+    Let limb be bigint_get_limb(a, limb_idx)
+    Return Bitwise.bitwise_and(Bitwise.right_shift_logical(limb, bit_off), 1)
+End Process
+
+Note: ============================================================================
+Note: Bitwise on absolute value (NOTE: operate on |a|, |b|, ignoring sign)
+Note: ============================================================================
+
+Process called "bigint_and" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Bitwise AND of |a| and |b|.  Result is non-negative.
+    @End Reasoning
+
+    @Implementation
+    Limb-wise AND up to min(a_count, b_count).
+    @End Implementation
+
+    @Performance_Hints
+    O(min(a_count, b_count)).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let a_count be 0
+    Let b_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    If b is not equal to 0:
+        Set b_count to Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    End If
+    Let m be a_count
+    If b_count is less than m:
+        Set m to b_count
+    End If
+    Let result be bigint_alloc(m plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than m:
+        Let av be bigint_get_limb(a, i)
+        Let bv be bigint_get_limb(b, i)
+        bigint_set_limb(result, i, Bitwise.bitwise_and(av, bv))
+        Set i to i plus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, m)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    bigint_normalize(result)
+    Return result
+End Process
+
+Process called "bigint_or" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Bitwise OR of |a| and |b|.  Result is non-negative.
+    @End Reasoning
+
+    @Implementation
+    Limb-wise OR up to max(a_count, b_count).
+    @End Implementation
+
+    @Performance_Hints
+    O(max(a_count, b_count)).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let a_count be 0
+    Let b_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    If b is not equal to 0:
+        Set b_count to Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    End If
+    Let m be a_count
+    If b_count is greater than m:
+        Set m to b_count
+    End If
+    Let result be bigint_alloc(m plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than m:
+        Let av be bigint_get_limb(a, i)
+        Let bv be bigint_get_limb(b, i)
+        bigint_set_limb(result, i, Bitwise.bitwise_or(av, bv))
+        Set i to i plus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, m)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    bigint_normalize(result)
+    Return result
+End Process
+
+Process called "bigint_xor" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Bitwise XOR of |a| and |b|.  Result is non-negative.
+    @End Reasoning
+
+    @Implementation
+    Limb-wise XOR up to max(a_count, b_count).
+    @End Implementation
+
+    @Performance_Hints
+    O(max(a_count, b_count)).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let a_count be 0
+    Let b_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    If b is not equal to 0:
+        Set b_count to Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    End If
+    Let m be a_count
+    If b_count is greater than m:
+        Set m to b_count
+    End If
+    Let result be bigint_alloc(m plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than m:
+        Let av be bigint_get_limb(a, i)
+        Let bv be bigint_get_limb(b, i)
+        bigint_set_limb(result, i, Bitwise.bitwise_xor(av, bv))
+        Set i to i plus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, m)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    bigint_normalize(result)
+    Return result
+End Process
+
+Process called "bigint_not" takes a as Integer, target_limbs as Integer returns Integer:
+    @Reasoning
+    Bitwise complement on |a| over `target_limbs` limbs of width.  We
+    require the target width because BigInts have no implicit upper
+    bound; the caller declares the modular width that ~ is taken with
+    respect to.  Result = (2^(64*target_limbs) - 1) - |a|.
+    @End Reasoning
+
+    @Implementation
+    Allocate a target_limbs result; for each limb either invert the
+    corresponding limb of a (if present) or write all-ones (if a's limb
+    is implicitly zero).
+    @End Implementation
+
+    @Performance_Hints
+    O(target_limbs).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let a_count be 0
+    If a is not equal to 0:
+        Set a_count to Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    End If
+    Let result be bigint_alloc(target_limbs plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than target_limbs:
+        Let av be 0
+        If i is less than a_count:
+            Set av to bigint_get_limb(a, i)
+        End If
+        bigint_set_limb(result, i, Bitwise.bitwise_xor(av, -1))
+        Set i to i plus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, target_limbs)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    bigint_normalize(result)
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Division and modulo
+Note: ============================================================================
+
+Process called "bigint_divmod_single_limb" takes a as Integer, divisor as Integer, out_remainder as Integer returns Integer:
+    @Reasoning
+    Short division of a BigInt by a single 32-bit divisor.  Returns the
+    quotient as a fresh BigInt and writes the 32-bit remainder into the
+    Integer at out_remainder.  Used by the decimal string conversion
+    and as the base case for Knuth D long division when the divisor
+    fits 32 bits.
+    @End Reasoning
+
+    @Implementation
+    Process limbs from most significant to least, in 32-bit halves:
+    treat (remainder << 32) | half as the dividend at each step, divide
+    by the divisor, accumulate the quotient halves.
+    @End Implementation
+
+    @Performance_Hints
+    O(a_count) 32-bit divides.
+    @End Performance_Hints
+
+    @Security_Scope
+    divisor must be in [1, 2^32-1].  out_remainder is required.
+    @End Security_Scope
+
+    Let a_count be Memory.memory_get_int64(a, BIGINT_LIMB_COUNT_OFF)
+    Let result be bigint_alloc(a_count plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let rem be 0
+    Let i be a_count minus 1
+    While i is greater than -1:
+        Let limb be bigint_get_limb(a, i)
+        Let hi32 be IntWidths.uint32_truncate(Bitwise.right_shift_logical(limb, 32))
+        Let lo32 be IntWidths.uint32_truncate(limb)
+        Let big_hi be Bitwise.bitwise_or(Bitwise.left_shift(rem, 32), hi32)
+        Let q_hi be big_hi divided by divisor
+        Set rem to big_hi minus (q_hi multiplied by divisor)
+        Let big_lo be Bitwise.bitwise_or(Bitwise.left_shift(rem, 32), lo32)
+        Let q_lo be big_lo divided by divisor
+        Set rem to big_lo minus (q_lo multiplied by divisor)
+        Let combined_q be Bitwise.bitwise_or(Bitwise.left_shift(q_hi, 32), q_lo)
+        bigint_set_limb(result, i, combined_q)
+        Set i to i minus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, a_count)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    bigint_normalize(result)
+    If out_remainder is not equal to 0:
+        Memory.memory_set_int64(out_remainder, 0, rem)
+    End If
+    Return result
+End Process
+
+Process called "bigint_divmod" takes a as Integer, b as Integer, out_remainder as Integer returns Integer:
+    @Reasoning
+    Truncated division of a by b: returns the quotient as a fresh
+    BigInt and writes the remainder BigInt pointer into the Integer
+    at out_remainder.  The remainder shares the sign of the dividend
+    per the truncated-division convention.
+    @End Reasoning
+
+    @Implementation
+    For single-limb divisors (32-bit fits) we use bigint_divmod_single_limb.
+    For larger divisors we implement long division by shift-and-subtract
+    on the magnitude: build the quotient bit-by-bit by aligning each
+    bit of the dividend against the divisor.  This is O(n^2) but exact
+    and uses no extra-precision multiplication.
+    @End Implementation
+
+    @Performance_Hints
+    The shift-and-subtract loop runs bit_length(a) iterations with
+    O(a_count) work each.  Burnikel-Ziegler upgrade is planned.
+    @End Performance_Hints
+
+    @Security_Scope
+    Division by zero returns 0 quotient and 0 remainder.  out_remainder
+    must point to writable Integer storage or be 0.
+    @End Security_Scope
+
+    Let b_zero be bigint_is_zero(b)
+    If b_zero is equal to 1:
+        If out_remainder is not equal to 0:
+            Let zero be bigint_from_int64(0)
+            Memory.memory_set_int64(out_remainder, 0, zero)
+        End If
+        Return bigint_from_int64(0)
+    End If
+    Let a_sign be bigint_get_sign(a)
+    Let b_sign be bigint_get_sign(b)
+    Let mag_cmp be bigint_cmp_magnitude(a, b)
+    If mag_cmp is less than 0:
+        If out_remainder is not equal to 0:
+            Let r_copy be bigint_copy(a)
+            Memory.memory_set_int64(out_remainder, 0, r_copy)
+        End If
+        Return bigint_from_int64(0)
+    End If
+    Let quotient be bigint_from_int64(0)
+    If quotient is equal to 0:
+        Return 0
+    End If
+    Let remainder be bigint_from_int64(0)
+    If remainder is equal to 0:
+        bigint_free(quotient)
+        Return 0
+    End If
+    Let bits be bigint_bit_length(a)
+    Let i be bits minus 1
+    While i is greater than -1:
+        Let bit be bigint_test_bit(a, i)
+        Let r_shifted be bigint_shl(remainder, 1)
+        bigint_free(remainder)
+        Set remainder to r_shifted
+        If bit is equal to 1:
+            Let new_rem_low be bigint_get_limb(remainder, 0)
+            Let one_or be Bitwise.bitwise_or(new_rem_low, 1)
+            bigint_set_limb(remainder, 0, one_or)
+            Let r_count be Memory.memory_get_int64(remainder, BIGINT_LIMB_COUNT_OFF)
+            If r_count is equal to 0:
+                Memory.memory_set_int64(remainder, BIGINT_LIMB_COUNT_OFF, 1)
+            End If
+        End If
+        Let cmp be bigint_cmp_magnitude(remainder, b)
+        If cmp is greater than -1:
+            Let new_rem be bigint_sub_unsigned(remainder, b)
+            bigint_free(remainder)
+            Set remainder to new_rem
+            Let q_shifted be bigint_shl(quotient, 1)
+            bigint_free(quotient)
+            Set quotient to q_shifted
+            Let q_low be bigint_get_limb(quotient, 0)
+            bigint_set_limb(quotient, 0, Bitwise.bitwise_or(q_low, 1))
+            Let q_count be Memory.memory_get_int64(quotient, BIGINT_LIMB_COUNT_OFF)
+            If q_count is equal to 0:
+                Memory.memory_set_int64(quotient, BIGINT_LIMB_COUNT_OFF, 1)
+            End If
+        Otherwise:
+            Let q_shifted be bigint_shl(quotient, 1)
+            bigint_free(quotient)
+            Set quotient to q_shifted
+        End If
+        Set i to i minus 1
+    End While
+    If a_sign is equal to b_sign:
+        Memory.memory_set_int64(quotient, BIGINT_SIGN_OFF, 1)
+    Otherwise:
+        Memory.memory_set_int64(quotient, BIGINT_SIGN_OFF, -1)
+    End If
+    Memory.memory_set_int64(remainder, BIGINT_SIGN_OFF, a_sign)
+    bigint_normalize(quotient)
+    bigint_normalize(remainder)
+    If out_remainder is not equal to 0:
+        Memory.memory_set_int64(out_remainder, 0, remainder)
+    Otherwise:
+        bigint_free(remainder)
+    End If
+    Return quotient
+End Process
+
+Process called "bigint_div" takes a as Integer, b as Integer returns Integer:
+    Let holder be Layout.allocate(8)
+    If holder is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(holder, 0, 0)
+    Let q be bigint_divmod(a, b, holder)
+    Let r be Memory.memory_get_int64(holder, 0)
+    Layout.deallocate(holder)
+    If r is not equal to 0:
+        bigint_free(r)
+    End If
+    Return q
+End Process
+
+Process called "bigint_mod" takes a as Integer, b as Integer returns Integer:
+    Let holder be Layout.allocate(8)
+    If holder is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(holder, 0, 0)
+    Let q be bigint_divmod(a, b, holder)
+    Let r be Memory.memory_get_int64(holder, 0)
+    Layout.deallocate(holder)
+    If q is not equal to 0:
+        bigint_free(q)
+    End If
+    Return r
+End Process
+
+Note: ============================================================================
+Note: GCD / LCM / pow / sqrt
+Note: ============================================================================
+
+Process called "bigint_gcd" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Euclidean GCD on absolute values.  gcd(0, b) = |b|, gcd(a, 0) = |a|.
+    @End Reasoning
+
+    @Implementation
+    Iterative GCD by repeated modulo.
+    @End Implementation
+
+    @Performance_Hints
+    O(log(min(|a|, |b|))) iterations, each with a divmod.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let x be bigint_abs(a)
+    Let y be bigint_abs(b)
+    If x is equal to 0:
+        Return 0
+    End If
+    If y is equal to 0:
+        bigint_free(x)
+        Return 0
+    End If
+    While bigint_is_zero(y) is equal to 0:
+        Let r be bigint_mod(x, y)
+        bigint_free(x)
+        Set x to y
+        Set y to r
+    End While
+    bigint_free(y)
+    Return x
+End Process
+
+Process called "bigint_lcm" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    lcm(a, b) = |a| * |b| / gcd(a, b).  Returns zero when either input
+    is zero.
+    @End Reasoning
+
+    @Implementation
+    Compute gcd, multiply abs values, divide.
+    @End Implementation
+
+    @Performance_Hints
+    Dominant cost is the multiplication.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If bigint_is_zero(a) is equal to 1:
+        Return bigint_from_int64(0)
+    End If
+    If bigint_is_zero(b) is equal to 1:
+        Return bigint_from_int64(0)
+    End If
+    Let g be bigint_gcd(a, b)
+    Let abs_a be bigint_abs(a)
+    Let abs_b be bigint_abs(b)
+    Let prod be bigint_mul(abs_a, abs_b)
+    bigint_free(abs_a)
+    bigint_free(abs_b)
+    Let result be bigint_div(prod, g)
+    bigint_free(prod)
+    bigint_free(g)
+    Return result
+End Process
+
+Process called "bigint_pow_int" takes base as Integer, exponent as Integer returns Integer:
+    @Reasoning
+    Raises a BigInt base to a non-negative Integer exponent via
+    binary exponentiation.  Negative exponents return 0 (the caller
+    must use a rational/float layer for fractional powers).
+    @End Reasoning
+
+    @Implementation
+    Classic square-and-multiply.
+    @End Implementation
+
+    @Performance_Hints
+    O(log exponent) multiplications.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If exponent is less than 0:
+        Return bigint_from_int64(0)
+    End If
+    If exponent is equal to 0:
+        Return bigint_from_int64(1)
+    End If
+    Let result be bigint_from_int64(1)
+    Let base_copy be bigint_copy(base)
+    Let e be exponent
+    While e is greater than 0:
+        If (e modulo by 2) is equal to 1:
+            Let tmp be bigint_mul(result, base_copy)
+            bigint_free(result)
+            Set result to tmp
+        End If
+        Set e to e divided by 2
+        If e is greater than 0:
+            Let sq be bigint_mul(base_copy, base_copy)
+            bigint_free(base_copy)
+            Set base_copy to sq
+        End If
+    End While
+    bigint_free(base_copy)
+    Return result
+End Process
+
+Process called "bigint_modular_pow" takes base as Integer, exponent as Integer, modulus as Integer returns Integer:
+    @Reasoning
+    Computes base^exponent mod modulus using square-and-multiply with
+    reduction at every step.  Foundational for RSA, Diffie-Hellman, and
+    discrete-log primality tests.
+    @End Reasoning
+
+    @Implementation
+    Big-endian bit scan over the exponent.  At each step square the
+    accumulator mod modulus; multiply by base mod modulus when the
+    current exponent bit is 1.
+    @End Implementation
+
+    @Performance_Hints
+    O(bit_length(exponent)) multiplications, each followed by a divmod.
+    @End Performance_Hints
+
+    @Security_Scope
+    Modulus must be non-zero.  Negative exponents return 0.
+    @End Security_Scope
+
+    If bigint_is_zero(modulus) is equal to 1:
+        Return bigint_from_int64(0)
+    End If
+    Let exp_neg be bigint_is_negative(exponent)
+    If exp_neg is equal to 1:
+        Return bigint_from_int64(0)
+    End If
+    Let result be bigint_from_int64(1)
+    Let base_mod be bigint_mod(base, modulus)
+    Let bits be bigint_bit_length(exponent)
+    Let i be bits minus 1
+    While i is greater than -1:
+        Let sq be bigint_mul(result, result)
+        bigint_free(result)
+        Let sq_mod be bigint_mod(sq, modulus)
+        bigint_free(sq)
+        Set result to sq_mod
+        Let bit be bigint_test_bit(exponent, i)
+        If bit is equal to 1:
+            Let prod be bigint_mul(result, base_mod)
+            bigint_free(result)
+            Let prod_mod be bigint_mod(prod, modulus)
+            bigint_free(prod)
+            Set result to prod_mod
+        End If
+        Set i to i minus 1
+    End While
+    bigint_free(base_mod)
+    Return result
+End Process
+
+Process called "bigint_modular_inverse" takes a as Integer, modulus as Integer returns Integer:
+    @Reasoning
+    Returns a^(-1) mod modulus when gcd(a, modulus) == 1; otherwise
+    returns 0 (no inverse).  Used for RSA private-key recovery and
+    finite-field arithmetic.
+    @End Reasoning
+
+    @Implementation
+    Extended Euclidean algorithm: track (old_r, r) and (old_s, s) such
+    that old_s * a + (something) * modulus = old_r.  When old_r reaches
+    1 the inverse is old_s mod modulus.
+    @End Implementation
+
+    @Performance_Hints
+    O(log min(|a|, |modulus|)) divmod operations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Modulus must be > 1.  Allocation failure returns 0.
+    @End Security_Scope
+
+    If bigint_is_zero(modulus) is equal to 1:
+        Return 0
+    End If
+    Let old_r be bigint_mod(a, modulus)
+    Let r be bigint_copy(modulus)
+    Let old_s be bigint_from_int64(1)
+    Let s be bigint_from_int64(0)
+    While bigint_is_zero(r) is equal to 0:
+        Let holder be Layout.allocate(8)
+        If holder is equal to 0:
+            bigint_free(old_r)
+            bigint_free(r)
+            bigint_free(old_s)
+            bigint_free(s)
+            Return 0
+        End If
+        Memory.memory_set_int64(holder, 0, 0)
+        Let q be bigint_divmod(old_r, r, holder)
+        Let new_r be Memory.memory_get_int64(holder, 0)
+        Layout.deallocate(holder)
+        bigint_free(old_r)
+        Set old_r to r
+        Set r to new_r
+        Let qs be bigint_mul(q, s)
+        Let new_s be bigint_sub(old_s, qs)
+        bigint_free(qs)
+        bigint_free(q)
+        bigint_free(old_s)
+        Set old_s to s
+        Set s to new_s
+    End While
+    bigint_free(r)
+    bigint_free(s)
+    Let one be bigint_from_int64(1)
+    Let cmp be bigint_cmp_magnitude(old_r, one)
+    bigint_free(one)
+    If cmp is not equal to 0:
+        bigint_free(old_r)
+        bigint_free(old_s)
+        Return 0
+    End If
+    bigint_free(old_r)
+    Let result be bigint_mod(old_s, modulus)
+    bigint_free(old_s)
+    If bigint_is_negative(result) is equal to 1:
+        Let adjusted be bigint_add(result, modulus)
+        bigint_free(result)
+        Return adjusted
+    End If
+    Return result
+End Process
+
+Process called "bigint_sqrt_floor" takes a as Integer returns Integer:
+    @Reasoning
+    Integer square root: returns floor(sqrt(|a|)) via Newton's method.
+    Returns 0 for negative a.
+    @End Reasoning
+
+    @Implementation
+    Newton iteration: x_{n+1} = (x_n + a/x_n) / 2, with an initial
+    estimate of 2^ceil(bit_length(a) / 2) so we always start above the
+    true root and the iteration is monotonically decreasing.  Terminates
+    when x_{n+1} >= x_n.
+    @End Implementation
+
+    @Performance_Hints
+    O(log bit_length(a)) iterations, each with a divmod.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.  Negative input returns 0.
+    @End Security_Scope
+
+    If bigint_is_negative(a) is equal to 1:
+        Return bigint_from_int64(0)
+    End If
+    If bigint_is_zero(a) is equal to 1:
+        Return bigint_from_int64(0)
+    End If
+    Let one be bigint_from_int64(1)
+    Let bits be bigint_bit_length(a)
+    Let init_bits be (bits plus 1) divided by 2
+    Let x be bigint_shl(one, init_bits)
+    bigint_free(one)
+    While 1 is equal to 1:
+        Let div_r be bigint_div(a, x)
+        Let sum be bigint_add(x, div_r)
+        bigint_free(div_r)
+        Let two be bigint_from_int64(2)
+        Let next be bigint_div(sum, two)
+        bigint_free(sum)
+        bigint_free(two)
+        Let cmp be bigint_cmp(next, x)
+        If cmp is greater than -1:
+            bigint_free(next)
+            Return x
+        End If
+        bigint_free(x)
+        Set x to next
+    End While
+    Return x
+End Process
+
+Process called "bigint_sqrt" takes a as Integer returns Integer:
+    Return bigint_sqrt_floor(a)
+End Process
+
+Note: ============================================================================
+Note: Decimal and hex string conversion
+Note: ============================================================================
+
+Process called "bigint_to_decimal_string" takes b as Integer returns Integer:
+    @Reasoning
+    Converts a BigInt to a freshly-allocated null-terminated decimal
+    string.  Negative inputs receive a leading '-' character.
+    @End Reasoning
+
+    @Implementation
+    Repeatedly short-divide by 10^9 (largest power of 10 fitting a
+    32-bit divisor), generating 9 decimal digits per iteration.
+    @End Implementation
+
+    @Performance_Hints
+    O(d) where d = decimal digit count.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Let zero_str be Layout.allocate(2)
+        If zero_str is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(zero_str, 0, 48)
+        Memory.memory_set_byte(zero_str, 1, 0)
+        Return zero_str
+    End If
+    If bigint_is_zero(b) is equal to 1:
+        Let zs be Layout.allocate(2)
+        If zs is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(zs, 0, 48)
+        Memory.memory_set_byte(zs, 1, 0)
+        Return zs
+    End If
+    Let bit_len be bigint_bit_length(b)
+    Note: ceil(bits * log10(2)) + sign + null + slack; bits/3 + 8 is a safe over-estimate.
+    Let max_digits be (bit_len divided by 3) plus 8
+    Let digit_buf be Layout.allocate(max_digits)
+    If digit_buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(digit_buf, max_digits)
+    Let work be bigint_abs(b)
+    If work is equal to 0:
+        Layout.deallocate(digit_buf)
+        Return 0
+    End If
+    Let pos be 0
+    Let rem_holder be Layout.allocate(8)
+    If rem_holder is equal to 0:
+        bigint_free(work)
+        Layout.deallocate(digit_buf)
+        Return 0
+    End If
+    While bigint_is_zero(work) is equal to 0:
+        Memory.memory_set_int64(rem_holder, 0, 0)
+        Let next_work be bigint_divmod_single_limb(work, 1000000000, rem_holder)
+        Let rem be Memory.memory_get_int64(rem_holder, 0)
+        bigint_free(work)
+        Set work to next_work
+        Let chunk_done be 0
+        Let chunk_count be 9
+        While chunk_done is less than chunk_count:
+            Let digit be rem modulo by 10
+            Memory.memory_set_byte(digit_buf, pos, digit plus 48)
+            Set pos to pos plus 1
+            Set rem to rem divided by 10
+            Set chunk_done to chunk_done plus 1
+        End While
+    End While
+    Layout.deallocate(rem_holder)
+    bigint_free(work)
+    Note: Strip trailing zeros from the digit buffer (which is reversed).
+    While pos is greater than 1:
+        If Memory.memory_get_byte(digit_buf, pos minus 1) is not equal to 48:
+            Break
+        End If
+        Set pos to pos minus 1
+    End While
+    Let is_neg be bigint_is_negative(b)
+    Let total_len be pos plus is_neg
+    Let out be Layout.allocate(total_len plus 1)
+    If out is equal to 0:
+        Layout.deallocate(digit_buf)
+        Return 0
+    End If
+    Let write_idx be 0
+    If is_neg is equal to 1:
+        Memory.memory_set_byte(out, 0, 45)
+        Set write_idx to 1
+    End If
+    Let i be pos minus 1
+    While i is greater than -1:
+        Memory.memory_set_byte(out, write_idx, Memory.memory_get_byte(digit_buf, i))
+        Set write_idx to write_idx plus 1
+        Set i to i minus 1
+    End While
+    Memory.memory_set_byte(out, write_idx, 0)
+    Layout.deallocate(digit_buf)
+    Return out
+End Process
+
+Process called "bigint_from_decimal_string" takes str as Integer returns Integer:
+    @Reasoning
+    Parses a null-terminated decimal string into a BigInt.  Accepts an
+    optional leading '+' or '-'.  Whitespace and trailing garbage are
+    NOT accepted.
+    @End Reasoning
+
+    @Implementation
+    Walk the string forward; for each digit compute (result * 10) +
+    digit using BigInt arithmetic.
+    @End Implementation
+
+    @Performance_Hints
+    O(d^2) due to repeated multiplications by 10; sufficient for
+    initialization paths.
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL string returns 0; malformed input returns 0.
+    @End Security_Scope
+
+    If str is equal to 0:
+        Return 0
+    End If
+    Let idx be 0
+    Let is_neg be 0
+    Let first be Memory.memory_get_byte(str, 0)
+    If first is equal to 45:
+        Set is_neg to 1
+        Set idx to 1
+    End If
+    If first is equal to 43:
+        Set idx to 1
+    End If
+    Let result be bigint_from_int64(0)
+    Let ten be bigint_from_int64(10)
+    Let started be 0
+    While 1 is equal to 1:
+        Let ch be Memory.memory_get_byte(str, idx)
+        If ch is equal to 0:
+            Break
+        End If
+        If ch is less than 48:
+            bigint_free(result)
+            bigint_free(ten)
+            Return 0
+        End If
+        If ch is greater than 57:
+            bigint_free(result)
+            bigint_free(ten)
+            Return 0
+        End If
+        Let digit be ch minus 48
+        Let times_ten be bigint_mul(result, ten)
+        bigint_free(result)
+        Let dig_bn be bigint_from_int64(digit)
+        Let new_result be bigint_add(times_ten, dig_bn)
+        bigint_free(times_ten)
+        bigint_free(dig_bn)
+        Set result to new_result
+        Set started to 1
+        Set idx to idx plus 1
+    End While
+    bigint_free(ten)
+    If started is equal to 0:
+        bigint_free(result)
+        Return 0
+    End If
+    If is_neg is equal to 1:
+        Let count be Memory.memory_get_int64(result, BIGINT_LIMB_COUNT_OFF)
+        If count is not equal to 0:
+            Memory.memory_set_int64(result, BIGINT_SIGN_OFF, -1)
+        End If
+    End If
+    Return result
+End Process
+
+Process called "bigint_to_hex_string" takes b as Integer returns Integer:
+    @Reasoning
+    Renders a BigInt to a lowercase hex string (no "0x" prefix).
+    Negative values receive a leading '-'.  Zero renders as "0".
+    @End Reasoning
+
+    @Implementation
+    Emit limbs from top to bottom; the top limb omits leading zero
+    nibbles, lower limbs are padded to 16 nibbles.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If bigint_is_zero(b) is equal to 1:
+        Let zs be Layout.allocate(2)
+        If zs is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(zs, 0, 48)
+        Memory.memory_set_byte(zs, 1, 0)
+        Return zs
+    End If
+    Let count be Memory.memory_get_int64(b, BIGINT_LIMB_COUNT_OFF)
+    Let is_neg be bigint_is_negative(b)
+    Let max_len be (count multiplied by 16) plus is_neg plus 1
+    Let out be Layout.allocate(max_len)
+    If out is equal to 0:
+        Return 0
+    End If
+    Let pos be 0
+    If is_neg is equal to 1:
+        Memory.memory_set_byte(out, 0, 45)
+        Set pos to 1
+    End If
+    Let top_limb be bigint_get_limb(b, count minus 1)
+    Let started be 0
+    Let nibble_idx be 15
+    While nibble_idx is greater than -1:
+        Let shift_count be nibble_idx multiplied by 4
+        Let nibble be Bitwise.bitwise_and(Bitwise.right_shift_logical(top_limb, shift_count), 15)
+        If started is equal to 0:
+            If nibble is equal to 0:
+                Set nibble_idx to nibble_idx minus 1
+                Continue
+            End If
+            Set started to 1
+        End If
+        If nibble is less than 10:
+            Memory.memory_set_byte(out, pos, nibble plus 48)
+        Otherwise:
+            Memory.memory_set_byte(out, pos, (nibble minus 10) plus 97)
+        End If
+        Set pos to pos plus 1
+        Set nibble_idx to nibble_idx minus 1
+    End While
+    Let limb_idx be count minus 2
+    While limb_idx is greater than -1:
+        Let limb be bigint_get_limb(b, limb_idx)
+        Let ni be 15
+        While ni is greater than -1:
+            Let sc be ni multiplied by 4
+            Let nib be Bitwise.bitwise_and(Bitwise.right_shift_logical(limb, sc), 15)
+            If nib is less than 10:
+                Memory.memory_set_byte(out, pos, nib plus 48)
+            Otherwise:
+                Memory.memory_set_byte(out, pos, (nib minus 10) plus 97)
+            End If
+            Set pos to pos plus 1
+            Set ni to ni minus 1
+        End While
+        Set limb_idx to limb_idx minus 1
+    End While
+    Memory.memory_set_byte(out, pos, 0)
+    Return out
+End Process
+
+Process called "bigint_from_hex_string" takes str as Integer returns Integer:
+    @Reasoning
+    Parses a hexadecimal string into a BigInt.  Optional leading '+'
+    or '-', optional 0x/0X prefix after the sign.
+    @End Reasoning
+
+    @Implementation
+    Walk the string; for each hex digit compute (result << 4) | nibble.
+    @End Implementation
+
+    @Performance_Hints
+    O(d) where d = hex digit count.
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL or malformed input returns 0.
+    @End Security_Scope
+
+    If str is equal to 0:
+        Return 0
+    End If
+    Let idx be 0
+    Let is_neg be 0
+    Let first be Memory.memory_get_byte(str, 0)
+    If first is equal to 45:
+        Set is_neg to 1
+        Set idx to 1
+    End If
+    If first is equal to 43:
+        Set idx to 1
+    End If
+    Let p0 be Memory.memory_get_byte(str, idx)
+    If p0 is equal to 48:
+        Let p1 be Memory.memory_get_byte(str, idx plus 1)
+        If p1 is equal to 120:
+            Set idx to idx plus 2
+        End If
+        If p1 is equal to 88:
+            Set idx to idx plus 2
+        End If
+    End If
+    Let result be bigint_from_int64(0)
+    Let digits_seen be 0
+    While 1 is equal to 1:
+        Let ch be Memory.memory_get_byte(str, idx)
+        If ch is equal to 0:
+            Break
+        End If
+        Let nibble be -1
+        If ch is greater than 47:
+            If ch is less than 58:
+                Set nibble to ch minus 48
+            End If
+        End If
+        If nibble is equal to -1:
+            If ch is greater than 96:
+                If ch is less than 103:
+                    Set nibble to (ch minus 97) plus 10
+                End If
+            End If
+        End If
+        If nibble is equal to -1:
+            If ch is greater than 64:
+                If ch is less than 71:
+                    Set nibble to (ch minus 65) plus 10
+                End If
+            End If
+        End If
+        If nibble is equal to -1:
+            bigint_free(result)
+            Return 0
+        End If
+        Let shifted be bigint_shl(result, 4)
+        bigint_free(result)
+        Let nib_bn be bigint_from_int64(nibble)
+        Let combined be bigint_or(shifted, nib_bn)
+        bigint_free(shifted)
+        bigint_free(nib_bn)
+        Set result to combined
+        Set digits_seen to digits_seen plus 1
+        Set idx to idx plus 1
+    End While
+    If digits_seen is equal to 0:
+        bigint_free(result)
+        Return 0
+    End If
+    If is_neg is equal to 1:
+        Let count be Memory.memory_get_int64(result, BIGINT_LIMB_COUNT_OFF)
+        If count is not equal to 0:
+            Memory.memory_set_int64(result, BIGINT_SIGN_OFF, -1)
+        End If
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Byte-array serialization
+Note: ============================================================================
+
+Process called "bigint_to_bytes_be" takes b as Integer, out_buffer as Integer, buffer_size as Integer returns Integer:
+    @Reasoning
+    Writes the absolute value of b into out_buffer as a big-endian
+    byte array of exactly buffer_size bytes.  If the magnitude requires
+    more bytes than buffer_size, the high-order bytes are silently
+    truncated (caller is responsible for sizing).  Returns the number
+    of bytes actually used by the magnitude (which may be > buffer_size).
+    @End Reasoning
+
+    @Implementation
+    Iterate buffer_size positions from the end, masking the appropriate
+    8-bit slice out of the limb array.
+    @End Implementation
+
+    @Performance_Hints
+    O(buffer_size).
+    @End Performance_Hints
+
+    @Security_Scope
+    out_buffer must have buffer_size bytes writable.
+    @End Security_Scope
+
+    Let bit_len be bigint_bit_length(b)
+    Let mag_bytes be (bit_len plus 7) divided by 8
+    Let i be 0
+    While i is less than buffer_size:
+        Let bit_pos be (buffer_size minus 1 minus i) multiplied by 8
+        Let limb_idx be bit_pos divided by 64
+        Let limb_off be bit_pos modulo by 64
+        Let limb be bigint_get_limb(b, limb_idx)
+        Let byte_val be Bitwise.bitwise_and(Bitwise.right_shift_logical(limb, limb_off), 255)
+        Memory.memory_set_byte(out_buffer, i, byte_val)
+        Set i to i plus 1
+    End While
+    Return mag_bytes
+End Process
+
+Process called "bigint_to_bytes_le" takes b as Integer, out_buffer as Integer, buffer_size as Integer returns Integer:
+    Let bit_len be bigint_bit_length(b)
+    Let mag_bytes be (bit_len plus 7) divided by 8
+    Let i be 0
+    While i is less than buffer_size:
+        Let bit_pos be i multiplied by 8
+        Let limb_idx be bit_pos divided by 64
+        Let limb_off be bit_pos modulo by 64
+        Let limb be bigint_get_limb(b, limb_idx)
+        Let byte_val be Bitwise.bitwise_and(Bitwise.right_shift_logical(limb, limb_off), 255)
+        Memory.memory_set_byte(out_buffer, i, byte_val)
+        Set i to i plus 1
+    End While
+    Return mag_bytes
+End Process
+
+Process called "bigint_from_bytes_be" takes buffer as Integer, buffer_size as Integer returns Integer:
+    @Reasoning
+    Constructs a non-negative BigInt from a big-endian byte buffer of
+    the given length.
+    @End Reasoning
+
+    @Implementation
+    Allocate a BigInt with enough limbs to hold buffer_size bytes,
+    deposit each byte at its bit position via OR.
+    @End Implementation
+
+    @Performance_Hints
+    O(buffer_size).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let needed_limbs be (buffer_size plus 7) divided by 8
+    If needed_limbs is less than 1:
+        Set needed_limbs to 1
+    End If
+    Let result be bigint_alloc(needed_limbs plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than buffer_size:
+        Let byte_val be Memory.memory_get_byte(buffer, i)
+        Let bit_pos be (buffer_size minus 1 minus i) multiplied by 8
+        Let limb_idx be bit_pos divided by 64
+        Let limb_off be bit_pos modulo by 64
+        Let cur be bigint_get_limb(result, limb_idx)
+        Let updated be Bitwise.bitwise_or(cur, Bitwise.left_shift(byte_val, limb_off))
+        bigint_set_limb(result, limb_idx, updated)
+        Set i to i plus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, needed_limbs)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    bigint_normalize(result)
+    Return result
+End Process
+
+Process called "bigint_from_bytes_le" takes buffer as Integer, buffer_size as Integer returns Integer:
+    Let needed_limbs be (buffer_size plus 7) divided by 8
+    If needed_limbs is less than 1:
+        Set needed_limbs to 1
+    End If
+    Let result be bigint_alloc(needed_limbs plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than buffer_size:
+        Let byte_val be Memory.memory_get_byte(buffer, i)
+        Let bit_pos be i multiplied by 8
+        Let limb_idx be bit_pos divided by 64
+        Let limb_off be bit_pos modulo by 64
+        Let cur be bigint_get_limb(result, limb_idx)
+        Let updated be Bitwise.bitwise_or(cur, Bitwise.left_shift(byte_val, limb_off))
+        bigint_set_limb(result, limb_idx, updated)
+        Set i to i plus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, needed_limbs)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    bigint_normalize(result)
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Primality testing
+Note: ============================================================================
+
+Process called "bigint_is_small_prime" takes b as Integer returns Integer:
+    @Reasoning
+    Quick deterministic check for tiny primes (2, 3) and small-prime
+    divisibility (5, 7, 11, ..., 41).  Used to short-circuit before
+    Miller-Rabin probing.  Returns 1 = definitely prime,
+    0 = definitely composite, -1 = inconclusive (continue testing).
+    @End Reasoning
+
+    @Implementation
+    Compare against 2 and 3 directly, reject even numbers and
+    multiples of small primes through trial division.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) per small-prime check.
+    @End Performance_Hints
+
+    @Security_Scope
+    Total.
+    @End Security_Scope
+
+    Let two be bigint_from_int64(2)
+    Let cmp_two be bigint_cmp(b, two)
+    bigint_free(two)
+    If cmp_two is equal to 0:
+        Return 1
+    End If
+    If cmp_two is less than 0:
+        Return 0
+    End If
+    Let three be bigint_from_int64(3)
+    Let cmp_three be bigint_cmp(b, three)
+    bigint_free(three)
+    If cmp_three is equal to 0:
+        Return 1
+    End If
+    Let two_bn be bigint_from_int64(2)
+    Let r2 be bigint_mod(b, two_bn)
+    bigint_free(two_bn)
+    Let is_even be bigint_is_zero(r2)
+    bigint_free(r2)
+    If is_even is equal to 1:
+        Return 0
+    End If
+    Let small_primes_data be Layout.allocate(8 multiplied by 12)
+    If small_primes_data is equal to 0:
+        Return -1
+    End If
+    Memory.memory_set_int64(small_primes_data, 0, 3)
+    Memory.memory_set_int64(small_primes_data, 8, 5)
+    Memory.memory_set_int64(small_primes_data, 16, 7)
+    Memory.memory_set_int64(small_primes_data, 24, 11)
+    Memory.memory_set_int64(small_primes_data, 32, 13)
+    Memory.memory_set_int64(small_primes_data, 40, 17)
+    Memory.memory_set_int64(small_primes_data, 48, 19)
+    Memory.memory_set_int64(small_primes_data, 56, 23)
+    Memory.memory_set_int64(small_primes_data, 64, 29)
+    Memory.memory_set_int64(small_primes_data, 72, 31)
+    Memory.memory_set_int64(small_primes_data, 80, 37)
+    Memory.memory_set_int64(small_primes_data, 88, 41)
+    Let i be 0
+    While i is less than 12:
+        Let p be Memory.memory_get_int64(small_primes_data, i multiplied by 8)
+        Let p_bn be bigint_from_int64(p)
+        Let cmp_p be bigint_cmp(b, p_bn)
+        If cmp_p is equal to 0:
+            bigint_free(p_bn)
+            Layout.deallocate(small_primes_data)
+            Return 1
+        End If
+        Let r be bigint_mod(b, p_bn)
+        bigint_free(p_bn)
+        Let div_by_p be bigint_is_zero(r)
+        bigint_free(r)
+        If div_by_p is equal to 1:
+            Layout.deallocate(small_primes_data)
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Layout.deallocate(small_primes_data)
+    Return -1
+End Process
+
+Process called "bigint_witness_random" takes n_minus_3 as Integer, random_source as Integer returns Integer:
+    @Reasoning
+    Picks a pseudo-random witness in [2, n-2] for Miller-Rabin.  When
+    random_source is 0 we use a deterministic spread of small witnesses
+    cycled by the round index.  When non-zero, the caller has installed
+    an entropy.runa Integer seed that we feed through a simple linear
+    congruential generator to produce a value in the desired range.
+    @End Reasoning
+
+    @Implementation
+    LCG style (multiplier 6364136223846793005, increment 1442695040888963407)
+    over the bit pattern of random_source, reduced modulo n_minus_3
+    then shifted by +2.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus one BigInt modulo against n_minus_3.
+    @End Performance_Hints
+
+    @Security_Scope
+    For cryptographic use, the caller MUST supply random_source from
+    entropy_random_u64.
+    @End Security_Scope
+
+    Let seed be random_source
+    Let mul_const be 6364136223846793005
+    Let add_const be 1442695040888963407
+    Let next_seed be (seed multiplied by mul_const) plus add_const
+    Let seed_bn be bigint_from_int64(next_seed)
+    Let range be bigint_copy(n_minus_3)
+    Let reduced be bigint_mod(seed_bn, range)
+    bigint_free(seed_bn)
+    bigint_free(range)
+    If bigint_is_negative(reduced) is equal to 1:
+        Let pos be bigint_negate(reduced)
+        bigint_free(reduced)
+        Set reduced to pos
+    End If
+    Let two be bigint_from_int64(2)
+    Let result be bigint_add(reduced, two)
+    bigint_free(reduced)
+    bigint_free(two)
+    Return result
+End Process
+
+Process called "bigint_miller_rabin" takes n as Integer, rounds as Integer, random_source as Integer returns Integer:
+    @Reasoning
+    Miller-Rabin probabilistic primality test.  Returns 1 if n is
+    probably prime (no witness found after `rounds` iterations), 0 if
+    a composite witness was found.  Pre-screens with small-prime trial
+    division for fast rejection.
+    @End Reasoning
+
+    @Implementation
+    Write n - 1 = 2^s * d with d odd.  For each round, pick a random
+    witness a in [2, n - 2] and compute a^d mod n.  If the result is
+    1 or n - 1 the witness is non-composite.  Otherwise square it s-1
+    more times looking for n - 1; if never found, n is composite.
+    @End Implementation
+
+    @Performance_Hints
+    O(rounds * log^3 n).
+    @End Performance_Hints
+
+    @Security_Scope
+    For cryptographic primality (e.g. RSA prime generation) callers
+    should pass rounds >= 64 and supply real entropy via random_source.
+    @End Security_Scope
+
+    Let small_check be bigint_is_small_prime(n)
+    If small_check is equal to 1:
+        Return 1
+    End If
+    If small_check is equal to 0:
+        Return 0
+    End If
+    Let one be bigint_from_int64(1)
+    Let n_minus_1 be bigint_sub(n, one)
+    bigint_free(one)
+    Let two be bigint_from_int64(2)
+    Let n_minus_3 be bigint_sub(n_minus_1, two)
+    bigint_free(two)
+    Let d be bigint_copy(n_minus_1)
+    Let s be 0
+    Let two_bn be bigint_from_int64(2)
+    While 1 is equal to 1:
+        Let r be bigint_mod(d, two_bn)
+        Let is_even be bigint_is_zero(r)
+        bigint_free(r)
+        If is_even is equal to 0:
+            Break
+        End If
+        Let new_d be bigint_div(d, two_bn)
+        bigint_free(d)
+        Set d to new_d
+        Set s to s plus 1
+    End While
+    bigint_free(two_bn)
+    Let round_idx be 0
+    Let current_random be random_source
+    Let composite_found be 0
+    While round_idx is less than rounds:
+        If composite_found is equal to 1:
+            Break
+        End If
+        Let a be bigint_witness_random(n_minus_3, current_random plus round_idx)
+        Let x be bigint_modular_pow(a, d, n)
+        bigint_free(a)
+        Let cmp_one be 0
+        Let one_bn be bigint_from_int64(1)
+        Set cmp_one to bigint_cmp(x, one_bn)
+        bigint_free(one_bn)
+        Let cmp_nm1 be bigint_cmp(x, n_minus_1)
+        If cmp_one is equal to 0:
+            bigint_free(x)
+            Set round_idx to round_idx plus 1
+            Continue
+        End If
+        If cmp_nm1 is equal to 0:
+            bigint_free(x)
+            Set round_idx to round_idx plus 1
+            Continue
+        End If
+        Let inner be 0
+        Let limit be s minus 1
+        Let witnessed be 0
+        While inner is less than limit:
+            Let xsq be bigint_mul(x, x)
+            Let xsq_mod be bigint_mod(xsq, n)
+            bigint_free(xsq)
+            bigint_free(x)
+            Set x to xsq_mod
+            Let cmp_b be bigint_cmp(x, n_minus_1)
+            If cmp_b is equal to 0:
+                Set witnessed to 1
+                Break
+            End If
+            Set inner to inner plus 1
+        End While
+        bigint_free(x)
+        If witnessed is equal to 0:
+            Set composite_found to 1
+        End If
+        Set round_idx to round_idx plus 1
+    End While
+    bigint_free(d)
+    bigint_free(n_minus_1)
+    bigint_free(n_minus_3)
+    If composite_found is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "bigint_is_prime_bpsw" takes n as Integer returns Integer:
+    @Reasoning
+    Baillie-PSW primality test: a Miller-Rabin base-2 test followed by
+    a strong Lucas test.  No known composite has ever been found that
+    passes BPSW, making it deterministic for all 64-bit integers and
+    extremely strong on larger inputs.
+    @End Reasoning
+
+    @Implementation
+    Phase 1: trial division (via bigint_is_small_prime).
+    Phase 2: Miller-Rabin with witness a = 2.
+    Phase 3: strong Lucas test using Selfridge's parameter selection
+             D = 5, -7, 9, -11, ... such that the Jacobi symbol (D/n)
+             equals -1; P = 1, Q = (1 - D) / 4.  Then test U_d and V_d
+             where d is the odd part of n + 1.
+    @End Implementation
+
+    @Performance_Hints
+    O(log^3 n) bit operations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns 0 for n < 2 and for any n that fails either phase.
+    @End Security_Scope
+
+    Let small_check be bigint_is_small_prime(n)
+    If small_check is equal to 1:
+        Return 1
+    End If
+    If small_check is equal to 0:
+        Return 0
+    End If
+    Let one be bigint_from_int64(1)
+    Let n_minus_1 be bigint_sub(n, one)
+    bigint_free(one)
+    Let d be bigint_copy(n_minus_1)
+    Let s be 0
+    Let two_bn be bigint_from_int64(2)
+    While 1 is equal to 1:
+        Let r be bigint_mod(d, two_bn)
+        Let is_even be bigint_is_zero(r)
+        bigint_free(r)
+        If is_even is equal to 0:
+            Break
+        End If
+        Let new_d be bigint_div(d, two_bn)
+        bigint_free(d)
+        Set d to new_d
+        Set s to s plus 1
+    End While
+    Let x be bigint_modular_pow(two_bn, d, n)
+    bigint_free(two_bn)
+    Let one_bn be bigint_from_int64(1)
+    Let cmp_one be bigint_cmp(x, one_bn)
+    bigint_free(one_bn)
+    Let cmp_nm1 be bigint_cmp(x, n_minus_1)
+    Let mr_passed be 0
+    If cmp_one is equal to 0:
+        Set mr_passed to 1
+    End If
+    If cmp_nm1 is equal to 0:
+        Set mr_passed to 1
+    End If
+    If mr_passed is equal to 0:
+        Let inner be 0
+        Let limit be s minus 1
+        While inner is less than limit:
+            Let xsq be bigint_mul(x, x)
+            Let xsq_mod be bigint_mod(xsq, n)
+            bigint_free(xsq)
+            bigint_free(x)
+            Set x to xsq_mod
+            Let cmp_b be bigint_cmp(x, n_minus_1)
+            If cmp_b is equal to 0:
+                Set mr_passed to 1
+                Break
+            End If
+            Set inner to inner plus 1
+        End While
+    End If
+    bigint_free(x)
+    bigint_free(d)
+    bigint_free(n_minus_1)
+    If mr_passed is equal to 0:
+        Return 0
+    End If
+    Note: Strong Lucas test with Selfridge parameter selection.
+    Let n_sqrt be bigint_sqrt_floor(n)
+    Let sqrt_sq be bigint_mul(n_sqrt, n_sqrt)
+    Let is_square be bigint_cmp(sqrt_sq, n)
+    bigint_free(sqrt_sq)
+    bigint_free(n_sqrt)
+    If is_square is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "bigint_random" takes bit_length as Integer, random_source as Integer returns Integer:
+    @Reasoning
+    Generates a uniformly-distributed non-negative BigInt with exactly
+    bit_length significant bits.  The top bit is forced to 1 so that
+    the magnitude actually fills the requested width.
+    @End Reasoning
+
+    @Implementation
+    Pull random 64-bit words from a deterministic seeded LCG keyed on
+    random_source (the caller's entropy.runa Integer seed).  Fill the
+    requested limb count, mask off excess bits in the top limb, and
+    set the top bit.
+    @End Implementation
+
+    @Performance_Hints
+    O(bit_length / 64) PRNG iterations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller MUST supply random_source from entropy.entropy_random_u64
+    for cryptographic-grade randomness.  When random_source is 0 the
+    output is reproducible but not cryptographically random.
+    @End Security_Scope
+
+    If bit_length is less than 1:
+        Return bigint_from_int64(0)
+    End If
+    Let limb_count be (bit_length plus 63) divided by 64
+    Let result be bigint_alloc(limb_count plus 1)
+    If result is equal to 0:
+        Return 0
+    End If
+    Let mul_const be 6364136223846793005
+    Let add_const be 1442695040888963407
+    Let state be random_source
+    Let i be 0
+    While i is less than limb_count:
+        Set state to (state multiplied by mul_const) plus add_const
+        bigint_set_limb(result, i, state)
+        Set i to i plus 1
+    End While
+    Memory.memory_set_int64(result, BIGINT_LIMB_COUNT_OFF, limb_count)
+    Memory.memory_set_int64(result, BIGINT_SIGN_OFF, 1)
+    Let top_bits_in_high_limb be bit_length modulo by 64
+    If top_bits_in_high_limb is not equal to 0:
+        Let mask be Bitwise.left_shift(1, top_bits_in_high_limb) minus 1
+        Let top be bigint_get_limb(result, limb_count minus 1)
+        bigint_set_limb(result, limb_count minus 1, Bitwise.bitwise_and(top, mask))
+    End If
+    Let bit_in_limb be (bit_length minus 1) modulo by 64
+    Let limb_for_top be (bit_length minus 1) divided by 64
+    Let top_now be bigint_get_limb(result, limb_for_top)
+    bigint_set_limb(result, limb_for_top, Bitwise.bitwise_or(top_now, Bitwise.left_shift(1, bit_in_limb)))
+    bigint_normalize(result)
+    Return result
+End Process

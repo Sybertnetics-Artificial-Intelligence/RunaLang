@@ -1,0 +1,215 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+SINK<T> - Async write-side counterpart to Stream.
+
+A Sink<T> accepts pushed values. sink_send returns a Future that resolves
+when the sink has accepted the value (after backpressure, write
+buffering, or downstream propagation).
+
+Sink layout (32 bytes):
+  offset 0:  channel_ptr     (8 bytes)
+  offset 8:  state           (8 bytes) (0=open, 1=closed)
+  offset 16: capacity_hint   (8 bytes)
+  offset 24: callback_fn     (8 bytes) - optional on-flush callback
+
+Dependencies:
+- concurrency/channel.runa
+- concurrency/future_promise.runa
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/concurrency/channel.runa" as Chan
+Import "compiler/frontend/primitives/concurrency/future_promise.runa" as FP
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant SINK_OFF_CHANNEL as Integer is 0
+Constant SINK_OFF_STATE as Integer is 8
+Constant SINK_OFF_CAPACITY as Integer is 16
+Constant SINK_OFF_CALLBACK as Integer is 24
+Constant SINK_STRUCT_SIZE as Integer is 32
+
+Constant SINK_STATE_OPEN as Integer is 0
+Constant SINK_STATE_CLOSED as Integer is 1
+
+Constant SINK_OK as Integer is 1
+Constant SINK_ERR_INVALID as Integer is 0
+Constant SINK_ERR_CLOSED as Integer is -1
+
+@Reasoning
+Create a sink with the specified buffer capacity. Capacity 0 means
+unbounded (no backpressure); capacity > 0 means bounded (sink_send may
+block via the underlying channel).
+@End Reasoning
+
+@Implementation
+Allocate the record, create the channel with matching capacity.
+@End Implementation
+
+@Performance_Hints
+One alloc + one channel create.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "sink_create" takes capacity as Integer returns Integer:
+    Let s be proc allocate from Memory with SINK_STRUCT_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+    Let ch be proc channel_create from Chan with capacity
+    If ch is equal to 0:
+        proc deallocate from Memory with s
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with s, SINK_OFF_CHANNEL, ch
+    proc memory_set_int64 from Mem with s, SINK_OFF_STATE, SINK_STATE_OPEN
+    proc memory_set_int64 from Mem with s, SINK_OFF_CAPACITY, capacity
+    proc memory_set_int64 from Mem with s, SINK_OFF_CALLBACK, 0
+    Return s
+End Process
+
+Process called "sink_destroy" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return SINK_ERR_INVALID
+    End If
+    Let ch be proc memory_get_int64 from Mem with s, SINK_OFF_CHANNEL
+    If ch is not equal to 0:
+        proc channel_close from Chan with ch
+        proc channel_destroy from Chan with ch
+    End If
+    proc deallocate from Memory with s
+    Return SINK_OK
+End Process
+
+@Reasoning
+Set the optional on-acceptance callback. Invoked from sink_send after the
+value has been accepted into the buffer.
+@End Reasoning
+
+@Implementation
+Store the function pointer.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+callback_fn must remain valid until destroy.
+@End Security_Scope
+
+Process called "sink_set_on_accept" takes s as Integer, callback_fn as Integer returns Integer:
+    If s is equal to 0:
+        Return SINK_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with s, SINK_OFF_CALLBACK, callback_fn
+    Return SINK_OK
+End Process
+
+@Reasoning
+Push a value into the sink. Returns a Future<Integer> resolving to SINK_OK
+once accepted. The future resolves immediately on success or backpressure
+relief; or to a closed-error state if the sink was already closed.
+@End Reasoning
+
+@Implementation
+Create a promise + future pair. If sink is open, channel_send the value.
+On success resolve the promise with SINK_OK, invoke callback, return
+future. On failure resolve with SINK_ERR_CLOSED and return the future.
+@End Implementation
+
+@Performance_Hints
+Two allocs (promise + future) + one channel send.
+@End Performance_Hints
+
+@Security_Scope
+Returned future must be released via future_destroy.
+@End Security_Scope
+
+Process called "sink_send" takes s as Integer, value_ptr as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let state be proc memory_get_int64 from Mem with s, SINK_OFF_STATE
+    Let promise be proc promise_create from FP
+    If promise is equal to 0:
+        Return 0
+    End If
+    Let future be proc promise_get_future from FP with promise
+    If future is equal to 0:
+        proc promise_destroy from FP with promise
+        Return 0
+    End If
+
+    If state is equal to SINK_STATE_CLOSED:
+        proc promise_set_error from FP with promise, SINK_ERR_CLOSED, 0
+        proc promise_destroy from FP with promise
+        Return future
+    End If
+
+    Let ch be proc memory_get_int64 from Mem with s, SINK_OFF_CHANNEL
+    Let rc be proc channel_send from Chan with ch, value_ptr
+    If rc is equal to 1:
+        Let cb_fn be proc memory_get_int64 from Mem with s, SINK_OFF_CALLBACK
+        If cb_fn is not equal to 0:
+            proc fp_runtime_call_indirect_3 from FP with cb_fn, value_ptr, 0, 0
+        End If
+        proc promise_set_value from FP with promise, SINK_OK
+    Otherwise:
+        proc promise_set_error from FP with promise, SINK_ERR_CLOSED, 0
+    End If
+    proc promise_destroy from FP with promise
+    Return future
+End Process
+
+Process called "sink_close" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return SINK_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with s, SINK_OFF_STATE, SINK_STATE_CLOSED
+    Let ch be proc memory_get_int64 from Mem with s, SINK_OFF_CHANNEL
+    If ch is not equal to 0:
+        proc channel_close from Chan with ch
+    End If
+    Return SINK_OK
+End Process
+
+@Reasoning
+Pull-side helper: pop the next pending value from the sink's buffer.
+Useful when the consumer wants to drain the sink directly (without an
+intermediate Stream).
+@End Reasoning
+
+@Implementation
+Channel receive, translating return codes.
+@End Implementation
+
+@Performance_Hints
+One channel receive.
+@End Performance_Hints
+
+@Security_Scope
+out_value_holder must be writable 8-byte storage.
+@End Security_Scope
+
+Process called "sink_drain_next" takes s as Integer, out_value_holder as Integer returns Integer:
+    If s is equal to 0:
+        Return SINK_ERR_INVALID
+    End If
+    If out_value_holder is equal to 0:
+        Return SINK_ERR_INVALID
+    End If
+    Let ch be proc memory_get_int64 from Mem with s, SINK_OFF_CHANNEL
+    Let rc be proc channel_receive from Chan with ch, out_value_holder
+    If rc is equal to 1:
+        Return SINK_OK
+    End If
+    Return SINK_ERR_CLOSED
+End Process

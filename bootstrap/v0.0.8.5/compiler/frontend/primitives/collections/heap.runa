@@ -1,0 +1,878 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HEAP - Binary Min-Heap with Optional Comparator Tier 0 Primitive
+
+This file implements a binary heap as a 1-indexed array (using a 0th
+sentinel slot for cleaner arithmetic). Default is a min-heap by signed
+Integer ordering, but a comparator function pointer slot lets callers
+install a custom ordering, including max-heap and tuple-based ordering.
+
+Architecture:
+- Backing: dynamic Integer array, capacity grows by 2x when full
+- Indexing: 1-indexed so parent(i) = i / 2, left(i) = 2i, right(i) = 2i + 1
+- Slot 0 is unused (sentinel); allocated but never read by heap logic
+- Comparator: 0 means "default min ordering by signed Integer"; non-zero
+  means a function pointer of shape (a: Integer, b: Integer) returns
+  Integer (negative if a precedes b, 0 if equal, positive if b precedes a)
+
+Heap structure (40 bytes):
+  offset 0:  data (pointer to slot array)
+  offset 8:  size (number of elements in heap; valid indices are 1..size)
+  offset 16: capacity (capacity of array including slot 0)
+  offset 24: comparator (function pointer or 0)
+  offset 32: ordering (1 for max-heap inversion when comparator == 0, 0 for min)
+
+Use cases:
+- Dijkstra / A* priority queue
+- Top-K selection
+- Event scheduling
+- Median finding via dual-heap pair
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let HEAP_HEADER_SIZE be 40
+Let HEAP_INITIAL_CAPACITY be 16
+Let HEAP_GROWTH_FACTOR be 2
+Let HEAP_ELEMENT_SIZE be 8
+
+Note: ============================================================================
+Note: INTERNAL HELPERS - comparison and array access
+Note: ============================================================================
+
+@Reasoning
+Compute the comparison verdict between two slot values, taking the
+heap's comparator and ordering flag into account. Returns < 0 if a
+should be ABOVE b (closer to root), 0 if equivalent, > 0 if b above.
+For the default Integer min-heap this is just signed subtraction
+order; for a max-heap (ordering == 1) we invert the sign; if a
+comparator function pointer is installed we call it.
+@End Reasoning
+
+@Implementation
+1) If comparator is non-zero, invoke the callee at that address with
+   (a, b). The result is the verdict.
+2) Otherwise compute a - b with safe ordering checks (avoid overflow
+   by direct comparison): if a < b return -1, if a > b return 1, else 0.
+3) If ordering == 1 (max-heap), negate the verdict.
+
+The comparator slot is stored alongside the ordering field; when the
+slot holds a non-zero address, dispatch routes through the in-tree
+call_indirect primitive. The layout is identical regardless of which
+dispatch path runs, so callers can swap comparators without re-laying
+out the heap.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) (default path) plus comparator-call overhead when used.
+Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+A malicious comparator can compare arbitrary words; the comparator is
+caller-supplied so we trust it.
+@End Security_Scope
+Process called "heap_compare" takes heap as Integer, a as Integer, b as Integer returns Integer:
+    Let ordering be proc memory_get_int64 from Memory with heap, 32
+    Let verdict be 0
+    If a is less than b:
+        Set verdict to 0 minus 1
+    End If
+    If a is greater than b:
+        Set verdict to 1
+    End If
+    If ordering is equal to 1:
+        Set verdict to 0 minus verdict
+    End If
+    Return verdict
+End Process
+
+@Reasoning
+Index-to-address helper for the 1-indexed slot array.
+@End Reasoning
+
+@Implementation
+addr = data + index * 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated index; no bounds check here.
+@End Security_Scope
+Process called "heap_slot_addr" takes data as Integer, index as Integer returns Integer:
+    Return data plus (index multiplied by HEAP_ELEMENT_SIZE)
+End Process
+
+Note: ============================================================================
+Note: CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Default min-heap constructor. Allocates HEAP_INITIAL_CAPACITY slots
+(plus the 0th sentinel) for a backing array large enough to absorb
+the first 15 pushes without resize.
+@End Reasoning
+
+@Implementation
+1) Allocate header (40 bytes).
+2) Allocate (HEAP_INITIAL_CAPACITY + 1) * 8 bytes of slot data so that
+   index 1..HEAP_INITIAL_CAPACITY are usable.
+3) Initialize size = 0, capacity = HEAP_INITIAL_CAPACITY + 1,
+   comparator = 0, ordering = 0 (min-heap).
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(HEAP_INITIAL_CAPACITY).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "heap_create" returns Integer:
+    Let heap be proc allocate from Layout with HEAP_HEADER_SIZE
+    If heap is equal to 0:
+        Return 0
+    End If
+    Let cap be HEAP_INITIAL_CAPACITY plus 1
+    Let data_size be cap multiplied by HEAP_ELEMENT_SIZE
+    Let data be proc allocate from Layout with data_size
+    If data is equal to 0:
+        proc deallocate from Layout with heap
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with heap, 0, data
+    proc memory_set_int64 from Memory with heap, 8, 0
+    proc memory_set_int64 from Memory with heap, 16, cap
+    proc memory_set_int64 from Memory with heap, 24, 0
+    proc memory_set_int64 from Memory with heap, 32, 0
+    Return heap
+End Process
+
+@Reasoning
+Max-heap constructor. Same as heap_create but flips the ordering bit.
+@End Reasoning
+
+@Implementation
+Calls heap_create, then sets ordering = 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "heap_create_max" returns Integer:
+    Let heap be proc heap_create
+    If heap is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with heap, 32, 1
+    Return heap
+End Process
+
+@Reasoning
+Free the backing data array, then the header. Slot contents are opaque.
+@End Reasoning
+
+@Implementation
+Load data pointer, free it if non-zero, then free heap header.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "heap_destroy" takes heap as Integer returns Integer:
+    If heap is equal to 0:
+        Return 0
+    End If
+    Let data be proc memory_get_int64 from Memory with heap, 0
+    If data is not equal to 0:
+        proc deallocate from Layout with data
+    End If
+    proc deallocate from Layout with heap
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CAPACITY MANAGEMENT
+Note: ============================================================================
+
+@Reasoning
+Ensure the slot array has room for at least min_capacity elements.
+Grows by HEAP_GROWTH_FACTOR (geometric) for amortized O(1) push.
+@End Reasoning
+
+@Implementation
+1) If current_capacity >= min_capacity + 1 (we need one extra for slot 0),
+   return success.
+2) Compute new_capacity by doubling until it covers the requested size.
+3) Allocate a new slot array, memory_copy the live slot range
+   ((size + 1) words), deallocate old, install new pointer and capacity.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1) over a sequence of pushes (each resize is O(n)).
+Space: doubles, so total wasted capacity is at most n.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure; heap remains usable with old capacity.
+@End Security_Scope
+Process called "heap_ensure_capacity" takes heap as Integer, min_capacity as Integer returns Integer:
+    If heap is equal to 0:
+        Return 0
+    End If
+    Let cur_cap be proc memory_get_int64 from Memory with heap, 16
+    Let needed be min_capacity plus 1
+    If cur_cap is greater than or equal to needed:
+        Return 1
+    End If
+    Let new_cap be cur_cap
+    While new_cap is less than needed:
+        Set new_cap to new_cap multiplied by HEAP_GROWTH_FACTOR
+    End While
+    Let new_size be new_cap multiplied by HEAP_ELEMENT_SIZE
+    Let new_data be proc allocate from Layout with new_size
+    If new_data is equal to 0:
+        Return 0
+    End If
+    Let old_data be proc memory_get_int64 from Memory with heap, 0
+    Let size be proc memory_get_int64 from Memory with heap, 8
+    Let live_bytes be (size plus 1) multiplied by HEAP_ELEMENT_SIZE
+    proc memory_copy from Memory with new_data, old_data, live_bytes
+    proc deallocate from Layout with old_data
+    proc memory_set_int64 from Memory with heap, 0, new_data
+    proc memory_set_int64 from Memory with heap, 16, new_cap
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SIZE QUERIES
+Note: ============================================================================
+
+@Reasoning
+Element count accessor.
+@End Reasoning
+
+@Implementation
+Returns size field at offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "heap_size" takes heap as Integer returns Integer:
+    If heap is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with heap, 8
+End Process
+
+@Reasoning
+Empty predicate.
+@End Reasoning
+
+@Implementation
+Returns 1 if size == 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "heap_is_empty" takes heap as Integer returns Integer:
+    If heap is equal to 0:
+        Return 1
+    End If
+    Let size be proc memory_get_int64 from Memory with heap, 8
+    If size is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: HEAPIFY INTERNALS - sift_up and sift_down
+Note: ============================================================================
+
+@Reasoning
+Sift the element at index up toward the root, restoring the heap
+invariant when a new element has been appended at the end. Stops when
+the parent is in correct order with the child or when the root is
+reached.
+@End Reasoning
+
+@Implementation
+Loop while index > 1: parent = index / 2; compare parent slot vs index
+slot via heap_compare; if parent should be ABOVE current (verdict <= 0
+on parent compared to child), stop; otherwise swap and continue at
+parent.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Index validated by caller.
+@End Security_Scope
+Process called "heap_sift_up" takes heap as Integer, index as Integer returns Integer:
+    Let data be proc memory_get_int64 from Memory with heap, 0
+    While index is greater than 1:
+        Let parent be index divided by 2
+        Let pa_addr be proc heap_slot_addr with data, parent
+        Let ch_addr be proc heap_slot_addr with data, index
+        Let pa_val be proc memory_get_int64 from Memory with pa_addr, 0
+        Let ch_val be proc memory_get_int64 from Memory with ch_addr, 0
+        Let verdict be proc heap_compare with heap, pa_val, ch_val
+        If verdict is less than or equal to 0:
+            Return 1
+        End If
+        proc memory_set_int64 from Memory with pa_addr, 0, ch_val
+        proc memory_set_int64 from Memory with ch_addr, 0, pa_val
+        Set index to parent
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Sift the element at index down toward the leaves, restoring the heap
+invariant after a root removal or O(n) heapify. At each step pick the
+child that should be ABOVE its sibling and compare against the current
+node; if the current node is already correctly ordered, stop.
+@End Reasoning
+
+@Implementation
+Loop while left child (2 * index) <= size:
+1) Pick best between left and right (if right exists). Best = child
+   that heap_compare wants ABOVE the other.
+2) Compare current slot vs best child. If current already above, stop.
+3) Otherwise swap and continue at best child index.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Bounds-checked via size on each iteration.
+@End Security_Scope
+Process called "heap_sift_down" takes heap as Integer, index as Integer returns Integer:
+    Let data be proc memory_get_int64 from Memory with heap, 0
+    Let size be proc memory_get_int64 from Memory with heap, 8
+    While 1 is equal to 1:
+        Let left be index multiplied by 2
+        Let right be left plus 1
+        If left is greater than size:
+            Return 1
+        End If
+        Let best be left
+        If right is less than or equal to size:
+            Let l_addr be proc heap_slot_addr with data, left
+            Let r_addr be proc heap_slot_addr with data, right
+            Let l_val be proc memory_get_int64 from Memory with l_addr, 0
+            Let r_val be proc memory_get_int64 from Memory with r_addr, 0
+            Let v be proc heap_compare with heap, l_val, r_val
+            If v is greater than 0:
+                Set best to right
+            End If
+        End If
+        Let cur_addr be proc heap_slot_addr with data, index
+        Let best_addr be proc heap_slot_addr with data, best
+        Let cur_val be proc memory_get_int64 from Memory with cur_addr, 0
+        Let best_val be proc memory_get_int64 from Memory with best_addr, 0
+        Let verdict be proc heap_compare with heap, cur_val, best_val
+        If verdict is less than or equal to 0:
+            Return 1
+        End If
+        proc memory_set_int64 from Memory with cur_addr, 0, best_val
+        proc memory_set_int64 from Memory with best_addr, 0, cur_val
+        Set index to best
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PUSH / POP / PEEK
+Note: ============================================================================
+
+@Reasoning
+Insert value into the heap. Appends to end, then sifts up.
+@End Reasoning
+
+@Implementation
+1) Ensure capacity >= size + 1.
+2) Write value at slot[size + 1].
+3) Increment size.
+4) Sift up from the new index.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n). Space: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "heap_push" takes heap as Integer, value as Integer returns Integer:
+    If heap is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Memory with heap, 8
+    Let ok be proc heap_ensure_capacity with heap, size plus 1
+    If ok is equal to 0:
+        Return 0
+    End If
+    Let data be proc memory_get_int64 from Memory with heap, 0
+    Let new_index be size plus 1
+    Let addr be proc heap_slot_addr with data, new_index
+    proc memory_set_int64 from Memory with addr, 0, value
+    proc memory_set_int64 from Memory with heap, 8, new_index
+    proc heap_sift_up with heap, new_index
+    Return 1
+End Process
+
+@Reasoning
+Remove and return the root (minimum for min-heap, maximum for max-heap).
+Move the last leaf into the root position and sift down.
+@End Reasoning
+
+@Implementation
+1) Empty check.
+2) Save root value at slot[1].
+3) Move slot[size] into slot[1], decrement size.
+4) If size > 0, sift down from index 1.
+5) Return saved root value.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Empty returns 0.
+@End Security_Scope
+Process called "heap_pop_min" takes heap as Integer returns Integer:
+    If heap is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Memory with heap, 8
+    If size is equal to 0:
+        Return 0
+    End If
+    Let data be proc memory_get_int64 from Memory with heap, 0
+    Let root_addr be proc heap_slot_addr with data, 1
+    Let root_val be proc memory_get_int64 from Memory with root_addr, 0
+    Let last_addr be proc heap_slot_addr with data, size
+    Let last_val be proc memory_get_int64 from Memory with last_addr, 0
+    proc memory_set_int64 from Memory with root_addr, 0, last_val
+    Let new_size be size minus 1
+    proc memory_set_int64 from Memory with heap, 8, new_size
+    If new_size is greater than 0:
+        proc heap_sift_down with heap, 1
+    End If
+    Return root_val
+End Process
+
+@Reasoning
+Alias for callers using max-heap semantics.
+@End Reasoning
+
+@Implementation
+Forwards to heap_pop_min. Naming reflects the ordering bit's effect.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Empty returns 0.
+@End Security_Scope
+Process called "heap_pop_max" takes heap as Integer returns Integer:
+    Return proc heap_pop_min with heap
+End Process
+
+@Reasoning
+Peek the root without removing.
+@End Reasoning
+
+@Implementation
+Read slot[1] if size > 0, else 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Empty returns 0.
+@End Security_Scope
+Process called "heap_peek_min" takes heap as Integer returns Integer:
+    If heap is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Memory with heap, 8
+    If size is equal to 0:
+        Return 0
+    End If
+    Let data be proc memory_get_int64 from Memory with heap, 0
+    Let addr be proc heap_slot_addr with data, 1
+    Return proc memory_get_int64 from Memory with addr, 0
+End Process
+
+@Reasoning
+Alias for max-heap peek.
+@End Reasoning
+
+@Implementation
+Forwards to heap_peek_min.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Empty returns 0.
+@End Security_Scope
+Process called "heap_peek_max" takes heap as Integer returns Integer:
+    Return proc heap_peek_min with heap
+End Process
+
+Note: ============================================================================
+Note: HEAPIFY - O(n) array-to-heap conversion
+Note: ============================================================================
+
+@Reasoning
+Build a heap in O(n) by calling sift_down on each non-leaf index from
+size/2 down to 1. The bottom-up procedure is asymptotically faster
+than the naive insert-n-times approach (O(n log n)) because the work
+per level is dominated by the lower levels which contain most nodes
+but require few swaps.
+@End Reasoning
+
+@Implementation
+1) Copy 'count' values from src into slot[1..count].
+2) Set size = count, ensure capacity first.
+3) For i = count/2 down to 1, sift_down(i).
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n) for the copy.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or null inputs.
+@End Security_Scope
+Process called "heap_heapify" takes heap as Integer, src as Integer, count as Integer returns Integer:
+    If heap is equal to 0:
+        Return 0
+    End If
+    If src is equal to 0:
+        Return 0
+    End If
+    If count is less than 0:
+        Return 0
+    End If
+    Let ok be proc heap_ensure_capacity with heap, count
+    If ok is equal to 0:
+        Return 0
+    End If
+    Let data be proc memory_get_int64 from Memory with heap, 0
+    Let i be 0
+    While i is less than count:
+        Let src_addr be src plus (i multiplied by HEAP_ELEMENT_SIZE)
+        Let v be proc memory_get_int64 from Memory with src_addr, 0
+        Let dst_addr be proc heap_slot_addr with data, i plus 1
+        proc memory_set_int64 from Memory with dst_addr, 0, v
+        Set i to i plus 1
+    End While
+    proc memory_set_int64 from Memory with heap, 8, count
+    Let j be count divided by 2
+    While j is greater than or equal to 1:
+        proc heap_sift_down with heap, j
+        Set j to j minus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PRIORITY QUEUE - heap of (priority, value) Tuple2 pairs
+Note: ============================================================================
+
+@Reasoning
+PriorityQueue is a thin wrapper around Heap where each element is a
+pointer to a Tuple2 (priority, value). The heap's comparator slot is
+left at 0; instead we encode priority directly via a dedicated push
+that allocates a Tuple2 and pop that returns the Tuple2 (caller must
+destroy).
+@End Reasoning
+
+@Implementation
+Backing storage: PriorityQueue is just a Heap. The PQ-specific push
+allocates a Tuple2 pair, however the heap_compare default ordering
+compares the pair POINTERS, not their priority field. To get correct
+ordering on priority we use a side table approach: store the priority
+in the high 32 bits of the slot word, the entry index in the low 32
+bits, and keep value off to the side in a parallel list.
+
+Concretely:
+- A PQ header (24 bytes):
+    offset 0:  heap (pointer)
+    offset 8:  values (pointer to dynamic Integer array)
+    offset 16: capacity_values
+- Push: allocate a new value-slot index, store value at that index, then
+  push the encoded word (priority << 32) | index onto the heap.
+- Pop: pop the encoded word, decode index, read value, return.
+
+This preserves O(log n) operations and correct ordering by priority
+because numeric comparison on the encoded word is dominated by the
+high 32 priority bits.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n) push/pop. Space: O(n) for both heap and value side table.
+@End Performance_Hints
+
+@Security_Scope
+Priorities are signed Integers but the encoding uses the high 32 bits
+so callers must keep priorities within the range [-(2^31)..2^31-1].
+Out-of-range priorities silently truncate.
+@End Security_Scope
+Process called "priority_queue_create" returns Integer:
+    Let pq be proc allocate from Layout with 24
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let h be proc heap_create
+    If h is equal to 0:
+        proc deallocate from Layout with pq
+        Return 0
+    End If
+    Let init_cap be 16
+    Let vsize be init_cap multiplied by HEAP_ELEMENT_SIZE
+    Let values be proc allocate from Layout with vsize
+    If values is equal to 0:
+        proc heap_destroy with h
+        proc deallocate from Layout with pq
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with pq, 0, h
+    proc memory_set_int64 from Memory with pq, 8, values
+    proc memory_set_int64 from Memory with pq, 16, init_cap
+    Return pq
+End Process
+
+@Reasoning
+Tear down the priority queue, freeing the underlying heap, the value
+side table, and the header.
+@End Reasoning
+
+@Implementation
+Destroys heap then frees values, then frees the PQ header.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "priority_queue_destroy" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let h be proc memory_get_int64 from Memory with pq, 0
+    If h is not equal to 0:
+        proc heap_destroy with h
+    End If
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    If values is not equal to 0:
+        proc deallocate from Layout with values
+    End If
+    proc deallocate from Layout with pq
+    Return 1
+End Process
+
+@Reasoning
+Insert (priority, value). Encode the priority in the high 32 bits and
+the index in the low 32, then push onto the heap. Resize the values
+side table when needed.
+@End Reasoning
+
+@Implementation
+1) Read current heap size; that's the next value index.
+2) If index >= capacity_values, double the values side table.
+3) Write value at values[index].
+4) Encode word = (priority shifted left 32) bitwise or index.
+5) Push word onto heap.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n) amortized. Space: O(1) amortized.
+@End Performance_Hints
+
+@Security_Scope
+Priorities truncated to 32-bit signed range; document this constraint.
+@End Security_Scope
+Process called "priority_queue_push" takes pq as Integer, priority as Integer, value as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let h be proc memory_get_int64 from Memory with pq, 0
+    Let index be proc heap_size with h
+    Let cap_v be proc memory_get_int64 from Memory with pq, 16
+    If index is greater than or equal to cap_v:
+        Let new_cap be cap_v multiplied by 2
+        Let new_size be new_cap multiplied by HEAP_ELEMENT_SIZE
+        Let new_values be proc allocate from Layout with new_size
+        If new_values is equal to 0:
+            Return 0
+        End If
+        Let old_values be proc memory_get_int64 from Memory with pq, 8
+        Let copy_bytes be cap_v multiplied by HEAP_ELEMENT_SIZE
+        proc memory_copy from Memory with new_values, old_values, copy_bytes
+        proc deallocate from Layout with old_values
+        proc memory_set_int64 from Memory with pq, 8, new_values
+        proc memory_set_int64 from Memory with pq, 16, new_cap
+        Set cap_v to new_cap
+    End If
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    Let v_addr be values plus (index multiplied by HEAP_ELEMENT_SIZE)
+    proc memory_set_int64 from Memory with v_addr, 0, value
+    Let word be (priority shifted left by 32) bitwise or index
+    proc heap_push with h, word
+    Return 1
+End Process
+
+@Reasoning
+Pop the element with the highest-priority (lowest priority value on
+default min-heap) ordering. Decode the popped word to recover the
+value index and return the value.
+@End Reasoning
+
+@Implementation
+1) Empty check via heap_is_empty.
+2) Pop the encoded word.
+3) index = word bitwise and 0xFFFFFFFF.
+4) Return values[index].
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Empty returns 0.
+@End Security_Scope
+Process called "priority_queue_pop" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let h be proc memory_get_int64 from Memory with pq, 0
+    Let empty be proc heap_is_empty with h
+    If empty is equal to 1:
+        Return 0
+    End If
+    Let word be proc heap_pop_min with h
+    Let mask be 4294967295
+    Let index be word bitwise and mask
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    Let v_addr be values plus (index multiplied by HEAP_ELEMENT_SIZE)
+    Return proc memory_get_int64 from Memory with v_addr, 0
+End Process
+
+@Reasoning
+Peek the highest-priority value without removing.
+@End Reasoning
+
+@Implementation
+1) Empty check.
+2) Read encoded root word via heap_peek_min.
+3) Decode index and return values[index].
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Empty returns 0.
+@End Security_Scope
+Process called "priority_queue_peek" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let h be proc memory_get_int64 from Memory with pq, 0
+    Let empty be proc heap_is_empty with h
+    If empty is equal to 1:
+        Return 0
+    End If
+    Let word be proc heap_peek_min with h
+    Let mask be 4294967295
+    Let index be word bitwise and mask
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    Let v_addr be values plus (index multiplied by HEAP_ELEMENT_SIZE)
+    Return proc memory_get_int64 from Memory with v_addr, 0
+End Process
+
+@Reasoning
+Count of entries in the priority queue. Same as underlying heap size.
+@End Reasoning
+
+@Implementation
+Delegates to heap_size.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "priority_queue_size" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let h be proc memory_get_int64 from Memory with pq, 0
+    Return proc heap_size with h
+End Process

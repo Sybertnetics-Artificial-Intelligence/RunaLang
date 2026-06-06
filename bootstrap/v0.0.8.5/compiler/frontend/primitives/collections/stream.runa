@@ -1,0 +1,742 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+STREAM - Lazy Sequence Tier 0 Primitive
+
+This file implements a pull-based lazy sequence. Since the bootstrap
+stage1 does not yet expose first-class function values, we use a
+discriminated-union representation: each Stream carries an integer
+"kind" tag and a small set of integer parameters that fully define
+its behavior.
+
+Kinds:
+  1 = RANGE_INC      [start, end, step]   yields start, start+step, ... while value < end
+  2 = REPEAT_VAL     [value]              yields value forever
+  3 = ITERATE_ARITH  [seed, increment]    yields seed, seed+inc, seed+2*inc, ... (infinite)
+  4 = FROM_LIST      [list_ptr, index]    yields list elements starting at index
+  5 = TAKE           [src_stream, n_left]
+  6 = DROP           [src_stream, n_left]
+  7 = MAP_ADD        [src_stream, delta]  applies (x + delta)
+  8 = MAP_MUL        [src_stream, factor] applies (x * factor)
+  9 = FILTER_EQ      [src_stream, target] yields only elements equal to target
+ 10 = FILTER_GT      [src_stream, threshold]
+ 11 = FILTER_LT      [src_stream, threshold]
+ 12 = CONCAT         [src_a, src_b, phase] phase 0 = consuming a, 1 = consuming b
+ 13 = ZIP_ADD        [src_a, src_b]       yields a+b until either ends
+
+Stream record (48 bytes):
+  offset 0:  kind
+  offset 8:  param0
+  offset 16: param1
+  offset 24: param2
+  offset 32: refcount
+  offset 40: terminated flag (1 if stream has produced its last value)
+
+The integer-coded transforms cover the common Stream API surface
+(map/filter/take/drop/zip/concat) without requiring first-class
+closures.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Let STREAM_SIZE be 48
+Let STREAM_KIND_RANGE be 1
+Let STREAM_KIND_REPEAT be 2
+Let STREAM_KIND_ITERATE be 3
+Let STREAM_KIND_FROM_LIST be 4
+Let STREAM_KIND_TAKE be 5
+Let STREAM_KIND_DROP be 6
+Let STREAM_KIND_MAP_ADD be 7
+Let STREAM_KIND_MAP_MUL be 8
+Let STREAM_KIND_FILTER_EQ be 9
+Let STREAM_KIND_FILTER_GT be 10
+Let STREAM_KIND_FILTER_LT be 11
+Let STREAM_KIND_CONCAT be 12
+Let STREAM_KIND_ZIP_ADD be 13
+Let STREAM_END_SENTINEL be 0 minus 99999999999
+
+@Reasoning
+Allocate a fresh stream node.
+@End Reasoning
+
+@Implementation
+48-byte alloc; set kind/param0/param1/param2; refcount = 1, terminated
+= 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: 48 bytes.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_alloc" takes kind as Integer, p0 as Integer, p1 as Integer, p2 as Integer returns Integer:
+    Let s be proc allocate from Layout with STREAM_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with s, 0, kind
+    proc memory_set_int64 from Memory with s, 8, p0
+    proc memory_set_int64 from Memory with s, 16, p1
+    proc memory_set_int64 from Memory with s, 24, p2
+    proc memory_set_int64 from Memory with s, 32, 1
+    proc memory_set_int64 from Memory with s, 40, 0
+    Return s
+End Process
+
+@Reasoning
+Construct a half-open range stream [start, end) with step.
+@End Reasoning
+
+@Implementation
+RANGE_INC kind with params (start, end, step).
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: 48 bytes.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_range" takes start as Integer, end as Integer, step as Integer returns Integer:
+    If step is equal to 0:
+        Set step to 1
+    End If
+    Return proc stream_alloc with STREAM_KIND_RANGE, start, end, step
+End Process
+
+@Reasoning
+Infinite stream that repeats one value.
+@End Reasoning
+
+@Implementation
+REPEAT_VAL kind with params (value, 0, 0).
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_repeat" takes value as Integer returns Integer:
+    Return proc stream_alloc with STREAM_KIND_REPEAT, value, 0, 0
+End Process
+
+@Reasoning
+Infinite arithmetic sequence: seed, seed+inc, seed+2*inc, ...
+@End Reasoning
+
+@Implementation
+ITERATE_ARITH kind with params (seed, inc, 0).
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_iterate" takes seed as Integer, inc as Integer returns Integer:
+    Return proc stream_alloc with STREAM_KIND_ITERATE, seed, inc, 0
+End Process
+
+@Reasoning
+Stream from a list, in order.
+@End Reasoning
+
+@Implementation
+FROM_LIST kind with params (list_ptr, index = 0, 0).
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_from_list" takes list_ptr as Integer returns Integer:
+    Return proc stream_alloc with STREAM_KIND_FROM_LIST, list_ptr, 0, 0
+End Process
+
+@Reasoning
+Take at most n elements from source stream.
+@End Reasoning
+
+@Implementation
+TAKE wrapper around src with countdown.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) per construction.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_take" takes src as Integer, n as Integer returns Integer:
+    If src is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with src, 32
+        proc memory_set_int64 from Memory with src, 32, rc plus 1
+    End If
+    Return proc stream_alloc with STREAM_KIND_TAKE, src, n, 0
+End Process
+
+@Reasoning
+Drop the first n elements of source then continue.
+@End Reasoning
+
+@Implementation
+DROP wrapper; n is decremented on each consumption from source.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) per construction; O(n) per first pull.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_drop" takes src as Integer, n as Integer returns Integer:
+    If src is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with src, 32
+        proc memory_set_int64 from Memory with src, 32, rc plus 1
+    End If
+    Return proc stream_alloc with STREAM_KIND_DROP, src, n, 0
+End Process
+
+@Reasoning
+Map each value to (value + delta).
+@End Reasoning
+
+@Implementation
+MAP_ADD wrapper.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) per element when consumed.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_map_add" takes src as Integer, delta as Integer returns Integer:
+    If src is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with src, 32
+        proc memory_set_int64 from Memory with src, 32, rc plus 1
+    End If
+    Return proc stream_alloc with STREAM_KIND_MAP_ADD, src, delta, 0
+End Process
+
+@Reasoning
+Map each value to (value * factor).
+@End Reasoning
+
+@Implementation
+MAP_MUL wrapper.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) per element.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_map_mul" takes src as Integer, factor as Integer returns Integer:
+    If src is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with src, 32
+        proc memory_set_int64 from Memory with src, 32, rc plus 1
+    End If
+    Return proc stream_alloc with STREAM_KIND_MAP_MUL, src, factor, 0
+End Process
+
+@Reasoning
+Filter to elements equal to target.
+@End Reasoning
+
+@Implementation
+FILTER_EQ wrapper.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1) per yielded element, with skip-loop for filtering.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_filter_eq" takes src as Integer, target as Integer returns Integer:
+    If src is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with src, 32
+        proc memory_set_int64 from Memory with src, 32, rc plus 1
+    End If
+    Return proc stream_alloc with STREAM_KIND_FILTER_EQ, src, target, 0
+End Process
+
+@Reasoning
+Filter to elements greater than threshold.
+@End Reasoning
+
+@Implementation
+FILTER_GT wrapper.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1) per yielded element.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_filter_gt" takes src as Integer, threshold as Integer returns Integer:
+    If src is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with src, 32
+        proc memory_set_int64 from Memory with src, 32, rc plus 1
+    End If
+    Return proc stream_alloc with STREAM_KIND_FILTER_GT, src, threshold, 0
+End Process
+
+@Reasoning
+Filter to elements less than threshold.
+@End Reasoning
+
+@Implementation
+FILTER_LT wrapper.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1) per yielded element.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_filter_lt" takes src as Integer, threshold as Integer returns Integer:
+    If src is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with src, 32
+        proc memory_set_int64 from Memory with src, 32, rc plus 1
+    End If
+    Return proc stream_alloc with STREAM_KIND_FILTER_LT, src, threshold, 0
+End Process
+
+@Reasoning
+Concatenate two streams: yield a's values, then b's.
+@End Reasoning
+
+@Implementation
+CONCAT wrapper with phase = 0 (consuming a).
+@End Implementation
+
+@Performance_Hints
+Time: O(1) per element.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_concat" takes a as Integer, b as Integer returns Integer:
+    If a is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with a, 32
+        proc memory_set_int64 from Memory with a, 32, rc plus 1
+    End If
+    If b is not equal to 0:
+        Let rc2 be proc memory_get_int64 from Memory with b, 32
+        proc memory_set_int64 from Memory with b, 32, rc2 plus 1
+    End If
+    Return proc stream_alloc with STREAM_KIND_CONCAT, a, b, 0
+End Process
+
+@Reasoning
+Zip two streams by adding their elements pairwise.
+@End Reasoning
+
+@Implementation
+ZIP_ADD wrapper.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) per element.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "stream_zip_add" takes a as Integer, b as Integer returns Integer:
+    If a is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with a, 32
+        proc memory_set_int64 from Memory with a, 32, rc plus 1
+    End If
+    If b is not equal to 0:
+        Let rc2 be proc memory_get_int64 from Memory with b, 32
+        proc memory_set_int64 from Memory with b, 32, rc2 plus 1
+    End If
+    Return proc stream_alloc with STREAM_KIND_ZIP_ADD, a, b, 0
+End Process
+
+@Reasoning
+Pull the next element from the stream. Returns STREAM_END_SENTINEL
+when the stream is exhausted. The sentinel is INT64_MIN+1 so it
+cannot be a legitimate yielded value for any practical purpose.
+@End Reasoning
+
+@Implementation
+Dispatch on kind:
+- RANGE_INC: check current vs end; advance start; produce.
+- REPEAT_VAL: always yield param0.
+- ITERATE_ARITH: yield param0, then advance by param1.
+- FROM_LIST: read list[index], advance index; terminate at length.
+- TAKE: if n_left == 0, end; else pull from src, decrement n.
+- DROP: if n_left > 0, pull-and-discard n times then pull and yield.
+- MAP_ADD / MAP_MUL: pull from src, transform, yield.
+- FILTER_EQ / FILTER_GT / FILTER_LT: pull-skip-loop until predicate
+  satisfied or src ends.
+- CONCAT: pull from a until end, then b.
+- ZIP_ADD: pull one from each; end if either ends.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) amortized for most kinds; O(filter-skip-distance) for
+filters.
+@End Performance_Hints
+
+@Security_Scope
+Caller must hold a reference to the stream.
+@End Security_Scope
+Process called "stream_next" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return STREAM_END_SENTINEL
+    End If
+    Let terminated be proc memory_get_int64 from Memory with s, 40
+    If terminated is equal to 1:
+        Return STREAM_END_SENTINEL
+    End If
+    Let kind be proc memory_get_int64 from Memory with s, 0
+    If kind is equal to STREAM_KIND_RANGE:
+        Let cur be proc memory_get_int64 from Memory with s, 8
+        Let end be proc memory_get_int64 from Memory with s, 16
+        Let step be proc memory_get_int64 from Memory with s, 24
+        If cur is greater than or equal to end:
+            proc memory_set_int64 from Memory with s, 40, 1
+            Return STREAM_END_SENTINEL
+        End If
+        proc memory_set_int64 from Memory with s, 8, cur plus step
+        Return cur
+    End If
+    If kind is equal to STREAM_KIND_REPEAT:
+        Return proc memory_get_int64 from Memory with s, 8
+    End If
+    If kind is equal to STREAM_KIND_ITERATE:
+        Let cur be proc memory_get_int64 from Memory with s, 8
+        Let inc be proc memory_get_int64 from Memory with s, 16
+        proc memory_set_int64 from Memory with s, 8, cur plus inc
+        Return cur
+    End If
+    If kind is equal to STREAM_KIND_FROM_LIST:
+        Let list_ptr be proc memory_get_int64 from Memory with s, 8
+        Let idx be proc memory_get_int64 from Memory with s, 16
+        Let len be proc list_length from List with list_ptr
+        If idx is greater than or equal to len:
+            proc memory_set_int64 from Memory with s, 40, 1
+            Return STREAM_END_SENTINEL
+        End If
+        Let v be proc list_get from List with list_ptr, idx
+        proc memory_set_int64 from Memory with s, 16, idx plus 1
+        Return v
+    End If
+    If kind is equal to STREAM_KIND_TAKE:
+        Let src be proc memory_get_int64 from Memory with s, 8
+        Let n_left be proc memory_get_int64 from Memory with s, 16
+        If n_left is less than or equal to 0:
+            proc memory_set_int64 from Memory with s, 40, 1
+            Return STREAM_END_SENTINEL
+        End If
+        Let v be proc stream_next with src
+        If v is equal to STREAM_END_SENTINEL:
+            proc memory_set_int64 from Memory with s, 40, 1
+            Return STREAM_END_SENTINEL
+        End If
+        proc memory_set_int64 from Memory with s, 16, n_left minus 1
+        Return v
+    End If
+    If kind is equal to STREAM_KIND_DROP:
+        Let src be proc memory_get_int64 from Memory with s, 8
+        Let n_left be proc memory_get_int64 from Memory with s, 16
+        While n_left is greater than 0:
+            Let drop_v be proc stream_next with src
+            If drop_v is equal to STREAM_END_SENTINEL:
+                proc memory_set_int64 from Memory with s, 16, 0
+                proc memory_set_int64 from Memory with s, 40, 1
+                Return STREAM_END_SENTINEL
+            End If
+            Set n_left to n_left minus 1
+        End While
+        proc memory_set_int64 from Memory with s, 16, 0
+        Let v be proc stream_next with src
+        If v is equal to STREAM_END_SENTINEL:
+            proc memory_set_int64 from Memory with s, 40, 1
+        End If
+        Return v
+    End If
+    If kind is equal to STREAM_KIND_MAP_ADD:
+        Let src be proc memory_get_int64 from Memory with s, 8
+        Let delta be proc memory_get_int64 from Memory with s, 16
+        Let v be proc stream_next with src
+        If v is equal to STREAM_END_SENTINEL:
+            proc memory_set_int64 from Memory with s, 40, 1
+            Return STREAM_END_SENTINEL
+        End If
+        Return v plus delta
+    End If
+    If kind is equal to STREAM_KIND_MAP_MUL:
+        Let src be proc memory_get_int64 from Memory with s, 8
+        Let factor be proc memory_get_int64 from Memory with s, 16
+        Let v be proc stream_next with src
+        If v is equal to STREAM_END_SENTINEL:
+            proc memory_set_int64 from Memory with s, 40, 1
+            Return STREAM_END_SENTINEL
+        End If
+        Return v multiplied by factor
+    End If
+    If kind is equal to STREAM_KIND_FILTER_EQ:
+        Let src be proc memory_get_int64 from Memory with s, 8
+        Let target be proc memory_get_int64 from Memory with s, 16
+        While 1 is equal to 1:
+            Let v be proc stream_next with src
+            If v is equal to STREAM_END_SENTINEL:
+                proc memory_set_int64 from Memory with s, 40, 1
+                Return STREAM_END_SENTINEL
+            End If
+            If v is equal to target:
+                Return v
+            End If
+        End While
+    End If
+    If kind is equal to STREAM_KIND_FILTER_GT:
+        Let src be proc memory_get_int64 from Memory with s, 8
+        Let threshold be proc memory_get_int64 from Memory with s, 16
+        While 1 is equal to 1:
+            Let v be proc stream_next with src
+            If v is equal to STREAM_END_SENTINEL:
+                proc memory_set_int64 from Memory with s, 40, 1
+                Return STREAM_END_SENTINEL
+            End If
+            If v is greater than threshold:
+                Return v
+            End If
+        End While
+    End If
+    If kind is equal to STREAM_KIND_FILTER_LT:
+        Let src be proc memory_get_int64 from Memory with s, 8
+        Let threshold be proc memory_get_int64 from Memory with s, 16
+        While 1 is equal to 1:
+            Let v be proc stream_next with src
+            If v is equal to STREAM_END_SENTINEL:
+                proc memory_set_int64 from Memory with s, 40, 1
+                Return STREAM_END_SENTINEL
+            End If
+            If v is less than threshold:
+                Return v
+            End If
+        End While
+    End If
+    If kind is equal to STREAM_KIND_CONCAT:
+        Let phase be proc memory_get_int64 from Memory with s, 24
+        If phase is equal to 0:
+            Let a be proc memory_get_int64 from Memory with s, 8
+            Let v be proc stream_next with a
+            If v is not equal to STREAM_END_SENTINEL:
+                Return v
+            End If
+            proc memory_set_int64 from Memory with s, 24, 1
+            Let b be proc memory_get_int64 from Memory with s, 16
+            Let v2 be proc stream_next with b
+            If v2 is equal to STREAM_END_SENTINEL:
+                proc memory_set_int64 from Memory with s, 40, 1
+            End If
+            Return v2
+        End If
+        Let b be proc memory_get_int64 from Memory with s, 16
+        Let v be proc stream_next with b
+        If v is equal to STREAM_END_SENTINEL:
+            proc memory_set_int64 from Memory with s, 40, 1
+        End If
+        Return v
+    End If
+    If kind is equal to STREAM_KIND_ZIP_ADD:
+        Let a be proc memory_get_int64 from Memory with s, 8
+        Let b be proc memory_get_int64 from Memory with s, 16
+        Let va be proc stream_next with a
+        If va is equal to STREAM_END_SENTINEL:
+            proc memory_set_int64 from Memory with s, 40, 1
+            Return STREAM_END_SENTINEL
+        End If
+        Let vb be proc stream_next with b
+        If vb is equal to STREAM_END_SENTINEL:
+            proc memory_set_int64 from Memory with s, 40, 1
+            Return STREAM_END_SENTINEL
+        End If
+        Return va plus vb
+    End If
+    proc memory_set_int64 from Memory with s, 40, 1
+    Return STREAM_END_SENTINEL
+End Process
+
+@Reasoning
+Collect all elements of stream into the supplied list. Care must be
+taken: an infinite stream will run forever; callers should chain
+with stream_take first.
+@End Reasoning
+
+@Implementation
+Pull elements via stream_next until END_SENTINEL, appending each to
+out_list.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Caller must ensure the stream is finite.
+@End Security_Scope
+Process called "stream_collect_to_list" takes s as Integer, out_list as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    If out_list is equal to 0:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        Let v be proc stream_next with s
+        If v is equal to STREAM_END_SENTINEL:
+            Return 1
+        End If
+        proc list_append from List with out_list, v
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Release the stream and any child streams it holds.
+@End Reasoning
+
+@Implementation
+Iterative recursive release: decrement refcount; if zero, recurse
+into the stream's child references (param0 and param1 are pointers
+for combinators) by appending them to a work stack.
+@End Implementation
+
+@Performance_Hints
+Time: O(chain depth).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "stream_destroy" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let cap be 32
+    Let buf_bytes be cap multiplied by 8
+    Let buf be proc allocate from Layout with buf_bytes
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let sp be 0
+    proc memory_set_int64 from Memory with buf, 0, s
+    Set sp to 1
+    While sp is greater than 0:
+        Set sp to sp minus 1
+        Let off be sp multiplied by 8
+        Let node be proc memory_get_int64 from Memory with buf, off
+        Let rc be proc memory_get_int64 from Memory with node, 32
+        Let new_rc be rc minus 1
+        proc memory_set_int64 from Memory with node, 32, new_rc
+        If new_rc is equal to 0:
+            Let kind be proc memory_get_int64 from Memory with node, 0
+            Let has_p0 be 0
+            Let has_p1 be 0
+            If kind is greater than or equal to STREAM_KIND_TAKE:
+                Set has_p0 to 1
+            End If
+            If kind is equal to STREAM_KIND_CONCAT:
+                Set has_p1 to 1
+            End If
+            If kind is equal to STREAM_KIND_ZIP_ADD:
+                Set has_p1 to 1
+            End If
+            If has_p0 is equal to 1:
+                Let p0 be proc memory_get_int64 from Memory with node, 8
+                If p0 is not equal to 0:
+                    Let need be sp plus 1
+                    If need is greater than cap:
+                        Let new_cap be cap multiplied by 2
+                        Let new_bytes be new_cap multiplied by 8
+                        Let new_buf be proc allocate from Layout with new_bytes
+                        If new_buf is equal to 0:
+                            proc deallocate from Layout with buf
+                            Return 0
+                        End If
+                        Let copy_bytes be cap multiplied by 8
+                        proc memory_copy from Memory with new_buf, buf, copy_bytes
+                        proc deallocate from Layout with buf
+                        Set buf to new_buf
+                        Set cap to new_cap
+                    End If
+                    Let s_off be sp multiplied by 8
+                    proc memory_set_int64 from Memory with buf, s_off, p0
+                    Set sp to sp plus 1
+                End If
+            End If
+            If has_p1 is equal to 1:
+                Let p1 be proc memory_get_int64 from Memory with node, 16
+                If p1 is not equal to 0:
+                    Let need be sp plus 1
+                    If need is greater than cap:
+                        Let new_cap be cap multiplied by 2
+                        Let new_bytes be new_cap multiplied by 8
+                        Let new_buf be proc allocate from Layout with new_bytes
+                        If new_buf is equal to 0:
+                            proc deallocate from Layout with buf
+                            Return 0
+                        End If
+                        Let copy_bytes be cap multiplied by 8
+                        proc memory_copy from Memory with new_buf, buf, copy_bytes
+                        proc deallocate from Layout with buf
+                        Set buf to new_buf
+                        Set cap to new_cap
+                    End If
+                    Let s_off be sp multiplied by 8
+                    proc memory_set_int64 from Memory with buf, s_off, p1
+                    Set sp to sp plus 1
+                End If
+            End If
+            proc deallocate from Layout with node
+        End If
+    End While
+    proc deallocate from Layout with buf
+    Return 1
+End Process

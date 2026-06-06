@@ -1,0 +1,276 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+:End Note
+
+Note:
+==============================================================================
+Tax - Jurisdiction-aware tax rate types
+==============================================================================
+
+Represents a tax obligation defined by (tax_type, percentage, jurisdiction).
+Computation operates on Money values and returns a Money value of the same
+currency (tax is always denominated in the price's currency).
+
+Supported tax families:
+  - VAT       Value-added tax (EU + many non-EU jurisdictions)
+  - GST       Goods-and-services tax (UK/AU/CA/SG/IN/NZ)
+  - SalesTax  US state/local sales tax (Streamlined Sales Tax variants)
+  - Withholding   Tax withheld at source (dividends, royalties)
+  - Excise    Per-unit tax (alcohol, tobacco, fuel)
+  - ImportDuty    Customs duty on imports
+  - ExportDuty    Customs duty on exports
+
+Inclusive vs exclusive computation:
+  - Exclusive: gross = net + (net * rate)
+  - Inclusive: net = gross / (1 + rate), tax = gross - net
+
+References:
+  - EU VAT Directive 2006/112/EC
+  - UK VATA 1994
+  - OECD Model Tax Convention on Income and Capital
+  - US Streamlined Sales and Use Tax Agreement (SSUTA)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/numeric/decimal/ieee754_decimal64.runa" as Dec64
+Import "compiler/frontend/primitives/money/money.runa" as Money
+
+Constant TAX_TYPE_INVALID as Integer is 0
+Constant TAX_TYPE_VAT as Integer is 1
+Constant TAX_TYPE_GST as Integer is 2
+Constant TAX_TYPE_SALES_TAX as Integer is 3
+Constant TAX_TYPE_WITHHOLDING as Integer is 4
+Constant TAX_TYPE_EXCISE as Integer is 5
+Constant TAX_TYPE_IMPORT_DUTY as Integer is 6
+Constant TAX_TYPE_EXPORT_DUTY as Integer is 7
+
+Constant TAX_RATE_SIZE as Integer is 32
+Constant TAX_FIELD_TYPE as Integer is 0
+Constant TAX_FIELD_PERCENTAGE as Integer is 8
+Constant TAX_FIELD_JURISDICTION as Integer is 16
+Constant TAX_FIELD_RESERVED as Integer is 24
+
+Constant TAX_ROUND_DEFAULT as Integer is 0
+
+Process called "tax_rate_create" takes tax_type as Integer, percentage_dec64 as Integer, jurisdiction_str as Integer returns Integer:
+    @Reasoning
+    Builds a TaxRate record. The percentage is a Decimal64 representing
+    the rate (0.20 for 20% VAT, 0.0625 for 6.25% sales tax). The rate
+    handle is OWNED by the record. Jurisdiction is a borrowed pointer to
+    an ISO 3166 country code or sub-code (e.g. "DE", "US-CA", "EU").
+    @End Reasoning
+    @Implementation
+    Allocate TAX_RATE_SIZE bytes, store fields.
+    @End Implementation
+    @Performance_Hints
+    Single allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Validates tax_type is in valid range and percentage is non-zero.
+    A null jurisdiction is permitted (represents global/default rate).
+    @End Security_Scope
+
+    If tax_type is less than 1:
+        Return 0
+    End If
+    If tax_type is greater than TAX_TYPE_EXPORT_DUTY:
+        Return 0
+    End If
+    If percentage_dec64 is equal to 0:
+        Return 0
+    End If
+    Let t be Layout.allocate(TAX_RATE_SIZE)
+    If t is equal to 0:
+        Return 0
+    End If
+    MemoryCore.memory_set_int64(t, TAX_FIELD_TYPE, tax_type)
+    MemoryCore.memory_set_int64(t, TAX_FIELD_PERCENTAGE, percentage_dec64)
+    MemoryCore.memory_set_int64(t, TAX_FIELD_JURISDICTION, jurisdiction_str)
+    MemoryCore.memory_set_int64(t, TAX_FIELD_RESERVED, 0)
+    Return t
+End Process
+
+Process called "tax_rate_destroy" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Let pct be MemoryCore.memory_get_int64(t, TAX_FIELD_PERCENTAGE)
+    If pct is not equal to 0:
+        Dec64.dec64_destroy(pct)
+    End If
+    Layout.deallocate(t)
+    Return 1
+End Process
+
+Process called "tax_rate_get_type" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return TAX_TYPE_INVALID
+    End If
+    Return MemoryCore.memory_get_int64(t, TAX_FIELD_TYPE)
+End Process
+
+Process called "tax_rate_get_percentage" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(t, TAX_FIELD_PERCENTAGE)
+End Process
+
+Process called "tax_rate_get_jurisdiction" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(t, TAX_FIELD_JURISDICTION)
+End Process
+
+Process called "tax_compute" takes net_money as Integer, rate as Integer returns Integer:
+    @Reasoning
+    Computes the tax amount for a net (tax-exclusive) Money value. Returns
+    Money of the same currency representing the tax owed (net * percentage).
+    Used by exclusive-pricing flows (US retail, B2B EU invoices).
+    @End Reasoning
+    @Implementation
+    money_multiply_scalar with the percentage as the scalar.
+    @End Implementation
+    @Performance_Hints
+    One Decimal64 multiply + one Money allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Null-safe. Returns 0 on null Money or null rate.
+    @End Security_Scope
+
+    If net_money is equal to 0:
+        Return 0
+    End If
+    If rate is equal to 0:
+        Return 0
+    End If
+    Let pct be MemoryCore.memory_get_int64(rate, TAX_FIELD_PERCENTAGE)
+    If pct is equal to 0:
+        Return 0
+    End If
+    Return Money.money_multiply_scalar(net_money, pct)
+End Process
+
+Process called "tax_add_to_exclusive" takes net_money as Integer, rate as Integer returns Integer:
+    @Reasoning
+    Returns gross = net + (net * percentage). Used by retail systems that
+    quote prices tax-exclusive and add tax at checkout.
+    @End Reasoning
+    @Implementation
+    1. tax_amount = net * percentage.
+    2. gross = net + tax_amount.
+    3. Destroy intermediate tax_amount.
+    @End Implementation
+    @Performance_Hints
+    Two Decimal64 ops + multiple allocations. Hot paths should call
+    tax_compute and money_add directly and reuse intermediates.
+    @End Performance_Hints
+    @Security_Scope
+    Refuses null inputs.
+    @End Security_Scope
+
+    If net_money is equal to 0:
+        Return 0
+    End If
+    If rate is equal to 0:
+        Return 0
+    End If
+    Let tax_amt be tax_compute(net_money, rate)
+    If tax_amt is equal to 0:
+        Return 0
+    End If
+    Let gross be Money.money_add(net_money, tax_amt)
+    Money.money_destroy(tax_amt)
+    If gross is equal to 0:
+        Return 0
+    End If
+    Return gross
+End Process
+
+Process called "tax_extract_from_inclusive" takes gross_money as Integer, rate as Integer returns Integer:
+    @Reasoning
+    Returns net = gross / (1 + percentage). Used by EU VAT-inclusive
+    pricing: from a gross display price, extract the net amount that
+    appears on the invoice.
+    @End Reasoning
+    @Implementation
+    1. one_plus_rate = 1.0 + percentage (Decimal64).
+    2. net_amt_dec64 = gross.amount / one_plus_rate.
+    3. Wrap in Money with gross's currency.
+    @End Implementation
+    @Performance_Hints
+    Two Decimal64 ops (add + divide) + allocations.
+    @End Performance_Hints
+    @Security_Scope
+    Refuses null inputs. Refuses to invert when (1 + rate) is zero (i.e.
+    rate = -1; not a meaningful tax). The 1+rate check is performed by
+    dec64_div which surfaces NaN we treat as 0-sentinel.
+    @End Security_Scope
+
+    If gross_money is equal to 0:
+        Return 0
+    End If
+    If rate is equal to 0:
+        Return 0
+    End If
+    Let pct be MemoryCore.memory_get_int64(rate, TAX_FIELD_PERCENTAGE)
+    If pct is equal to 0:
+        Return 0
+    End If
+    Let one be Dec64.dec64_from_integer(1)
+    If one is equal to 0:
+        Return 0
+    End If
+    Let one_plus_pct be Dec64.dec64_add(one, pct, TAX_ROUND_DEFAULT)
+    Dec64.dec64_destroy(one)
+    If one_plus_pct is equal to 0:
+        Return 0
+    End If
+    If Dec64.dec64_is_zero(one_plus_pct) is equal to 1:
+        Dec64.dec64_destroy(one_plus_pct)
+        Return 0
+    End If
+    Let net be Money.money_divide_scalar(gross_money, one_plus_pct)
+    Dec64.dec64_destroy(one_plus_pct)
+    Return net
+End Process
+
+Process called "tax_extract_tax_from_inclusive" takes gross_money as Integer, rate as Integer returns Integer:
+    @Reasoning
+    Returns tax = gross - extract_net(gross). Convenience wrapper for the
+    common case where the caller wants the tax component of an inclusive
+    price.
+    @End Reasoning
+    @Implementation
+    Compute net via tax_extract_from_inclusive, then gross - net.
+    @End Implementation
+    @Performance_Hints
+    Two Decimal64 ops + multiple allocations.
+    @End Performance_Hints
+    @Security_Scope
+    Null-safe.
+    @End Security_Scope
+
+    If gross_money is equal to 0:
+        Return 0
+    End If
+    If rate is equal to 0:
+        Return 0
+    End If
+    Let net be tax_extract_from_inclusive(gross_money, rate)
+    If net is equal to 0:
+        Return 0
+    End If
+    Let tax_amount be Money.money_sub(gross_money, net)
+    Money.money_destroy(net)
+    If tax_amount is equal to 0:
+        Return 0
+    End If
+    Return tax_amount
+End Process

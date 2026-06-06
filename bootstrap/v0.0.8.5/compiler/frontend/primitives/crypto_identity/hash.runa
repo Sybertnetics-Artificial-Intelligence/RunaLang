@@ -1,0 +1,443 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+HASH - Algorithm-tagged cryptographic hash value
+==============================================================================
+
+A Hash carries:
+  - the hash algorithm tag
+  - the digest bytes
+  - the digest byte length
+
+hash_compute dispatches on the algorithm tag to compute the digest of a
+message. hash_equal REFUSES to compare hashes of different algorithms
+(returns 0 immediately) so that cross-algorithm hash mixing is detectable
+at the type level.
+
+Memory layout (32 bytes):
+  offset  0 : algorithm tag       (8 bytes)
+  offset  8 : digest_bytes ptr    (8 bytes)
+  offset 16 : digest_bytes len    (8 bytes)
+  offset 24 : flags               (8 bytes, reserved)
+
+References:
+- FIPS 180-4 (SHA-2 family).
+- FIPS 202 (SHA-3 family, SHAKE128/256).
+- RFC 7693 (BLAKE2b, BLAKE2s).
+- BLAKE3 spec (O'Connor, Aumasson, Neves, Wilcox-O'Hearn 2020).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/bytes.runa" as BytesP
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+Import "compiler/frontend/import_system/crypto/sha2.runa" as Sha2
+Import "compiler/frontend/import_system/crypto/sha3.runa" as Sha3
+Import "compiler/frontend/import_system/crypto/blake3.runa" as Blake3
+
+Let HASH_STRUCT_SIZE be 32
+Let HASH_OFF_ALGORITHM be 0
+Let HASH_OFF_DIGEST_PTR be 8
+Let HASH_OFF_DIGEST_LEN be 16
+Let HASH_OFF_FLAGS be 24
+
+Note: ============================================================================
+Note: SECTION 1: Construction from existing digest bytes
+Note: ============================================================================
+
+@Reasoning
+Construct a Hash from an algorithm tag and digest bytes. Validates
+that the algorithm is a hash and that the byte length matches the
+algorithm's published digest size.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena, digest_bytes_in, length, algorithm.
+  2. Check algorithm tag is in the hash range.
+  3. Require digest_bytes_length == algorithm_hash_byte_length(alg).
+  4. Allocate struct + buffer, copy bytes.
+@End Implementation
+
+@Performance_Hints
+O(n) due to copy.
+@End Performance_Hints
+
+@Security_Scope
+Length validation prevents cross-algorithm hash confusion (e.g., a
+32-byte buffer tagged as SHA-256 vs SHA3-256 vs BLAKE3 — all 32 bytes,
+distinguished only by the algorithm tag).
+@End Security_Scope
+Process called "hash_create" takes arena as Integer, algorithm as Integer, digest_bytes_in as Integer, digest_bytes_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If digest_bytes_in is equal to 0:
+        Return 0
+    End If
+    If Alg.algorithm_is_hash(algorithm) is equal to 0:
+        Return 0
+    End If
+    Let expected be Alg.algorithm_hash_byte_length(algorithm)
+    If expected is equal to 0:
+        Return 0
+    End If
+    If digest_bytes_length is not equal to expected:
+        Return 0
+    End If
+
+    Let h be Arena.arena_allocate(arena, HASH_STRUCT_SIZE)
+    If h is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than HASH_STRUCT_SIZE:
+        Memory.memory_set_byte(h, zi, 0)
+        Set zi to zi plus 1
+    End While
+    Let buf be Arena.arena_allocate(arena, expected)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(buf, digest_bytes_in, expected)
+    Memory.memory_set_qword(h, HASH_OFF_ALGORITHM, algorithm)
+    Memory.memory_set_qword(h, HASH_OFF_DIGEST_PTR, buf)
+    Memory.memory_set_qword(h, HASH_OFF_DIGEST_LEN, expected)
+    Memory.memory_set_qword(h, HASH_OFF_FLAGS, 0)
+    Return h
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: hash_compute - compute Hash from a message
+Note: ============================================================================
+
+@Reasoning
+Compute the digest of data under the specified hash algorithm and
+return a Hash value carrying both the digest and the algorithm tag.
+
+The complete dispatch table supported by this surface is:
+  ALG_SHA2_256  -> sha256_hash
+  ALG_SHA2_384  -> sha384_hash
+  ALG_SHA2_512  -> sha512_hash
+  ALG_SHA3_256  -> sha3_256_hash
+  ALG_SHA3_384  -> sha3_384_hash
+  ALG_SHA3_512  -> sha3_512_hash
+  ALG_BLAKE3    -> blake3_hash
+Any other algorithm tag (including BLAKE2 variants and Keccak-256)
+returns 0. Callers MUST pre-check the algorithm tag against this set
+before invoking hash_compute; the broader hash family is accessible
+via the primitive APIs in blake2.runa and keccak.runa directly.
+
+The 0-length data case is permitted by all the underlying hash procs;
+data may be 0 (NULL) only if data_length is 0.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena, data (unless len=0), data_length, algorithm.
+  2. Resolve digest size.
+  3. Allocate digest buffer.
+  4. Dispatch to the named hash function.
+  5. Wrap result via hash_create.
+@End Implementation
+
+@Performance_Hints
+O(n) in message length. Underlying hashes use the in-tree compress
+loops; expect ~3 cycles/byte for SHA-256, ~1 cycle/byte for BLAKE3 on
+x86-64 with SIMD assembly paths.
+@End Performance_Hints
+
+@Security_Scope
+Hashes are non-secret outputs. The underlying primitives are constant-
+time with respect to message content (no secret-dependent branches in
+the compression schedules per FIPS 180-4 / FIPS 202 / BLAKE3 spec).
+
+For password hashing, use Argon2id via argon2id.runa, NOT this proc.
+This proc is for general-purpose cryptographic hashing.
+@End Security_Scope
+Process called "hash_compute" takes arena as Integer, algorithm as Integer, data as Integer, data_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If data_length is less than 0:
+        Return 0
+    End If
+    If Alg.algorithm_is_hash(algorithm) is equal to 0:
+        Return 0
+    End If
+    Let digest_len be Alg.algorithm_hash_byte_length(algorithm)
+    If digest_len is equal to 0:
+        Return 0
+    End If
+    Let digest_buf be Arena.arena_allocate(arena, digest_len)
+    If digest_buf is equal to 0:
+        Return 0
+    End If
+
+    Let rc be 0
+    If algorithm is equal to Alg.ALG_SHA2_256:
+        Set rc to Sha2.sha256_hash(arena, data, data_length, digest_buf)
+    End If
+    If algorithm is equal to Alg.ALG_SHA2_384:
+        Set rc to Sha2.sha384_hash(arena, data, data_length, digest_buf)
+    End If
+    If algorithm is equal to Alg.ALG_SHA2_512:
+        Set rc to Sha2.sha512_hash(arena, data, data_length, digest_buf)
+    End If
+    If algorithm is equal to Alg.ALG_SHA3_256:
+        Set rc to Sha3.sha3_256_hash(arena, data, data_length, digest_buf)
+    End If
+    If algorithm is equal to Alg.ALG_SHA3_384:
+        Set rc to Sha3.sha3_384_hash(arena, data, data_length, digest_buf)
+    End If
+    If algorithm is equal to Alg.ALG_SHA3_512:
+        Set rc to Sha3.sha3_512_hash(arena, data, data_length, digest_buf)
+    End If
+    If algorithm is equal to Alg.ALG_BLAKE3:
+        Set rc to Blake3.blake3_hash(arena, data, data_length, digest_buf)
+    End If
+
+    If rc is equal to 0:
+        Return 0
+    End If
+    Return hash_create(arena, algorithm, digest_buf, digest_len)
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Accessors
+Note: ============================================================================
+
+@Reasoning
+Returns the algorithm tag of the hash.
+@End Reasoning
+
+@Implementation
+Reads the first qword.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "hash_algorithm" takes h as Integer returns Integer:
+    If h is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(h, HASH_OFF_ALGORITHM)
+End Process
+
+@Reasoning
+Returns the digest byte pointer.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 8.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret. Arena-owned.
+@End Security_Scope
+Process called "hash_digest_bytes" takes h as Integer returns Integer:
+    If h is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(h, HASH_OFF_DIGEST_PTR)
+End Process
+
+@Reasoning
+Returns the digest byte length.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 16.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "hash_digest_byte_length" takes h as Integer returns Integer:
+    If h is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(h, HASH_OFF_DIGEST_LEN)
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Equality (constant-time, algorithm-checking)
+Note: ============================================================================
+
+@Reasoning
+Compare two Hash values for equality. Returns 1 if:
+  (a) both are non-null
+  (b) their algorithm tags match
+  (c) their digest bytes compare equal under constant_time_compare
+
+ALGORITHM MISMATCH RETURNS 0 IMMEDIATELY. This is the type-confusion
+gate for hash comparison: a 32-byte SHA-256 digest and a 32-byte
+SHA3-256 digest, even with byte-identical contents, will never compare
+equal under this primitive.
+@End Reasoning
+
+@Implementation
+Short-circuit checks then call constant_time_compare on the digest
+buffers.
+@End Implementation
+
+@Performance_Hints
+O(n) constant-time on digest length.
+@End Performance_Hints
+
+@Security_Scope
+Constant-time on digest bytes. The algorithm-tag check is intentionally
+NOT constant-time because the tag is public metadata.
+
+Use this for any comparison whose positive result implies authorization
+or membership (commitment check, integrity verification of trusted-but-
+remote data, etc.).
+@End Security_Scope
+Process called "hash_equal" takes h_a as Integer, h_b as Integer returns Integer:
+    If h_a is equal to 0:
+        Return 0
+    End If
+    If h_b is equal to 0:
+        Return 0
+    End If
+    Let alg_a be hash_algorithm(h_a)
+    Let alg_b be hash_algorithm(h_b)
+    If alg_a is not equal to alg_b:
+        Return 0
+    End If
+    Let len_a be hash_digest_byte_length(h_a)
+    Let len_b be hash_digest_byte_length(h_b)
+    If len_a is not equal to len_b:
+        Return 0
+    End If
+    Let buf_a be hash_digest_bytes(h_a)
+    Let buf_b be hash_digest_bytes(h_b)
+    Return Secure.constant_time_compare(buf_a, buf_b, len_a)
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Encoding (hex / base64)
+Note: ============================================================================
+
+@Reasoning
+Hex-encode the digest.
+@End Reasoning
+
+@Implementation
+Wraps in a transient Bytes header and calls bytes_to_hex_string.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret output.
+@End Security_Scope
+Process called "hash_to_hex_string" takes h as Integer returns Integer:
+    If h is equal to 0:
+        Return 0
+    End If
+    Let buf be hash_digest_bytes(h)
+    Let len be hash_digest_byte_length(h)
+    Let b be BytesP.bytes_from_array(buf, len)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let hex be BytesP.bytes_to_hex_string(b)
+    BytesP.bytes_destroy(b)
+    Return hex
+End Process
+
+@Reasoning
+Base64-encode the digest.
+@End Reasoning
+
+@Implementation
+Wraps in a transient Bytes header and calls bytes_to_base64.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret output.
+@End Security_Scope
+Process called "hash_to_base64" takes h as Integer returns Integer:
+    If h is equal to 0:
+        Return 0
+    End If
+    Let buf be hash_digest_bytes(h)
+    Let len be hash_digest_byte_length(h)
+    Let b be BytesP.bytes_from_array(buf, len)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let b64 be BytesP.bytes_to_base64(b)
+    BytesP.bytes_destroy(b)
+    Return b64
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: Reconstruction from string
+Note: ============================================================================
+
+@Reasoning
+Reconstruct a Hash from algorithm tag and hex-encoded digest string.
+@End Reasoning
+
+@Implementation
+Decode hex, then call hash_create.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+Hex decoding is validated. Algorithm/length checked in hash_create.
+@End Security_Scope
+Process called "hash_from_hex_string" takes arena as Integer, algorithm as Integer, hex_str as Integer returns Integer:
+    If hex_str is equal to 0:
+        Return 0
+    End If
+    Let b be BytesP.bytes_from_hex_string(hex_str)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let buf be BytesP.bytes_data(b)
+    Let len be BytesP.bytes_length(b)
+    Let h be hash_create(arena, algorithm, buf, len)
+    BytesP.bytes_destroy(b)
+    Return h
+End Process

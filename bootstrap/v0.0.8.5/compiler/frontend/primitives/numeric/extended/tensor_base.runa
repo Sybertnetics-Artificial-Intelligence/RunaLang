@@ -1,0 +1,1188 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+Variable-rank tensor foundation - base for the runa-ai-ml Tier 2 stack.
+
+A Tensor is a multi-dimensional array with:
+  - Shape: a list of positive integer dimensions (rank = len(shape))
+  - Dtype: element data type (Float32 / Float64 / Int8 / ... / Complex128)
+  - Strides: per-dimension byte stride (for arbitrary memory layouts)
+  - Data: a contiguous flat buffer holding the actual elements
+  - Device: where the buffer lives (CPU only in this module; GPU /
+            accelerator slots reserved for Bifrost integration)
+
+Memory layout (heap-allocated header):
+  Offset   0: rank (Integer)
+  Offset   8: dtype (Integer enum: see TENSOR_DTYPE_*)
+  Offset  16: device (Integer enum: TENSOR_DEVICE_*)
+  Offset  24: total_elements (product of shape)
+  Offset  32: element_size_bytes
+  Offset  40: pointer to shape buffer (rank * 8 bytes of Integer)
+  Offset  48: pointer to strides buffer (rank * 8 bytes of Integer; bytes)
+  Offset  56: pointer to data buffer (total_elements * element_size_bytes)
+
+Operations:
+  Construction: zeros, ones, full, arange, linspace, from_array
+  Shape: reshape, transpose, permute, squeeze, unsqueeze, broadcast_to
+  Elementwise: add, sub, mul, div, pow, neg, abs (same-shape)
+  Reductions: sum, mean, max, min, argmax, argmin (axis-aware)
+  Linear algebra: matmul (2D), dot (1D), outer (1D x 1D -> 2D)
+  Indexing: at, slice, gather, scatter
+
+Higher-level ML primitives (NeuralLayer, Optimizer, LossFunction,
+autograd graph) belong to the runa-ai-ml Tier 2 package and consume
+this module.
+
+@Reasoning
+A NumPy/PyTorch-shaped tensor type is the universal substrate for
+modern ML and scientific computing. We pin the storage model to a
+strided flat buffer (mainstream convention) so that integration with
+GPU runtimes and BLAS kernels is one-step. Stride is in bytes (not
+elements) to keep all memory_set/get arithmetic uniform across dtypes.
+@End Reasoning
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+
+Note: Dtype enum (matches the spec's TensorDataType).
+Constant TENSOR_DTYPE_FLOAT32 as Integer is 1
+Constant TENSOR_DTYPE_FLOAT64 as Integer is 2
+Constant TENSOR_DTYPE_INT8 as Integer is 3
+Constant TENSOR_DTYPE_INT16 as Integer is 4
+Constant TENSOR_DTYPE_INT32 as Integer is 5
+Constant TENSOR_DTYPE_INT64 as Integer is 6
+Constant TENSOR_DTYPE_UINT8 as Integer is 7
+Constant TENSOR_DTYPE_UINT32 as Integer is 8
+Constant TENSOR_DTYPE_BOOL as Integer is 9
+Constant TENSOR_DTYPE_COMPLEX64 as Integer is 10
+Constant TENSOR_DTYPE_COMPLEX128 as Integer is 11
+
+Constant TENSOR_DEVICE_CPU as Integer is 0
+Constant TENSOR_DEVICE_GPU as Integer is 1
+Constant TENSOR_DEVICE_OTHER as Integer is 2
+
+Constant TENSOR_HEADER_BYTES as Integer is 64
+Constant TENSOR_LANE_BYTES as Integer is 8
+
+Process called "tn_float_to_bits" takes x as Float returns Integer:
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "tn_bits_to_float" takes b as Integer returns Float:
+    Let result be 0.0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Header accessors
+Note: ============================================================================
+
+Process called "tensor_get_rank" takes t as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with t, 0
+End Process
+
+Process called "tensor_get_dtype" takes t as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with t, 8
+End Process
+
+Process called "tensor_get_device" takes t as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with t, 16
+End Process
+
+Process called "tensor_get_total_elements" takes t as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with t, 24
+End Process
+
+Process called "tensor_get_element_size" takes t as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with t, 32
+End Process
+
+Process called "tensor_get_shape_buf" takes t as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with t, 40
+End Process
+
+Process called "tensor_get_strides_buf" takes t as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with t, 48
+End Process
+
+Process called "tensor_get_data" takes t as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with t, 56
+End Process
+
+Process called "tensor_get_shape_at" takes t as Integer, axis as Integer returns Integer:
+    Let buf be proc tensor_get_shape_buf with t
+    Return proc memory_get_int64 from Memory with buf, axis multiplied by TENSOR_LANE_BYTES
+End Process
+
+Process called "tensor_get_stride_at" takes t as Integer, axis as Integer returns Integer:
+    Let buf be proc tensor_get_strides_buf with t
+    Return proc memory_get_int64 from Memory with buf, axis multiplied by TENSOR_LANE_BYTES
+End Process
+
+Process called "tensor_dtype_size" takes dtype as Integer returns Integer:
+    @Reasoning
+        Element size lookup by dtype enum.
+    @End Reasoning
+    @Implementation
+        Closed-form switch via if-chain.
+    @End Implementation
+    @Performance_Hints
+        Returns 0 on unknown dtype - callers must validate.
+    @End Performance_Hints
+    @Security_Scope
+        No special concerns.
+    @End Security_Scope
+    If dtype is equal to TENSOR_DTYPE_FLOAT32:
+        Return 4
+    End If
+    If dtype is equal to TENSOR_DTYPE_FLOAT64:
+        Return 8
+    End If
+    If dtype is equal to TENSOR_DTYPE_INT8:
+        Return 1
+    End If
+    If dtype is equal to TENSOR_DTYPE_INT16:
+        Return 2
+    End If
+    If dtype is equal to TENSOR_DTYPE_INT32:
+        Return 4
+    End If
+    If dtype is equal to TENSOR_DTYPE_INT64:
+        Return 8
+    End If
+    If dtype is equal to TENSOR_DTYPE_UINT8:
+        Return 1
+    End If
+    If dtype is equal to TENSOR_DTYPE_UINT32:
+        Return 4
+    End If
+    If dtype is equal to TENSOR_DTYPE_BOOL:
+        Return 1
+    End If
+    If dtype is equal to TENSOR_DTYPE_COMPLEX64:
+        Return 8
+    End If
+    If dtype is equal to TENSOR_DTYPE_COMPLEX128:
+        Return 16
+    End If
+    Return 0
+End Process
+
+Process called "tensor_compute_total" takes shape_buf as Integer, rank as Integer returns Integer:
+    Let total be 1
+    Let i be 0
+    While i is less than rank:
+        Let dim_i be proc memory_get_int64 from Memory with shape_buf, i multiplied by TENSOR_LANE_BYTES
+        Set total to total multiplied by dim_i
+        Set i to i plus 1
+    End While
+    Return total
+End Process
+
+Process called "tensor_compute_row_major_strides" takes strides_buf as Integer, shape_buf as Integer, rank as Integer, elem_size as Integer returns Integer:
+    @Reasoning
+        Row-major (C-order) strides: stride[k] = product of shape[k+1..rank-1] * elem_size.
+        stride[rank-1] = elem_size.
+    @End Reasoning
+    @Implementation
+        Right-to-left scan accumulating the product.
+    @End Implementation
+    @Performance_Hints
+        O(rank).
+    @End Performance_Hints
+    @Security_Scope
+        Caller provides correctly-sized buffer.
+    @End Security_Scope
+    Let stride be elem_size
+    Let i be rank minus 1
+    While i is greater than -1:
+        Let _w be proc memory_set_int64 from Memory with strides_buf, i multiplied by TENSOR_LANE_BYTES, stride
+        Let dim_i be proc memory_get_int64 from Memory with shape_buf, i multiplied by TENSOR_LANE_BYTES
+        Set stride to stride multiplied by dim_i
+        Set i to i minus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Construction
+Note: ============================================================================
+
+Process called "tensor_allocate_header" takes rank as Integer returns Integer:
+    @Reasoning
+        Allocate the tensor's header + shape + strides buffers but NOT
+        the data buffer (allocators set that up themselves).
+    @End Reasoning
+    @Implementation
+        Three Layout.allocate calls.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on out-of-memory.
+    @End Security_Scope
+    Let t be proc allocate from Layout with TENSOR_HEADER_BYTES
+    If t is equal to 0:
+        Return 0
+    End If
+    Let shape_buf be proc allocate from Layout with rank multiplied by TENSOR_LANE_BYTES
+    Let strides_buf be proc allocate from Layout with rank multiplied by TENSOR_LANE_BYTES
+    If shape_buf is equal to 0:
+        Let _f be proc deallocate from Layout with t
+        Return 0
+    End If
+    If strides_buf is equal to 0:
+        Let _f1 be proc deallocate from Layout with t
+        Let _f2 be proc deallocate from Layout with shape_buf
+        Return 0
+    End If
+    Let _wr be proc memory_set_int64 from Memory with t, 0, rank
+    Let _ws be proc memory_set_int64 from Memory with t, 40, shape_buf
+    Let _wt be proc memory_set_int64 from Memory with t, 48, strides_buf
+    Let _wdev be proc memory_set_int64 from Memory with t, 16, TENSOR_DEVICE_CPU
+    Return t
+End Process
+
+Process called "tensor_zeros" takes shape_buf as Integer, rank as Integer, dtype as Integer returns Integer:
+    @Reasoning
+        Allocate and zero-initialize a tensor of given shape and dtype.
+        Layout.allocate already zeroes its buffer, so no explicit zero
+        pass is needed.
+    @End Reasoning
+    @Implementation
+        Compose tensor_allocate_header + data buffer allocate.
+    @End Implementation
+    @Performance_Hints
+        O(shape product).
+    @End Performance_Hints
+    @Security_Scope
+        Buffer zeroed by allocator.
+    @End Security_Scope
+    Let t be proc tensor_allocate_header with rank
+    If t is equal to 0:
+        Return 0
+    End If
+    Let _wd be proc memory_set_int64 from Memory with t, 8, dtype
+    Let elem_size be proc tensor_dtype_size with dtype
+    Let _we be proc memory_set_int64 from Memory with t, 32, elem_size
+    Note: Copy shape buffer.
+    Let target_shape be proc tensor_get_shape_buf with t
+    Let _cs be proc memory_copy from Memory with target_shape, shape_buf, rank multiplied by TENSOR_LANE_BYTES
+    Let total be proc tensor_compute_total with target_shape, rank
+    Let _wn be proc memory_set_int64 from Memory with t, 24, total
+    Note: Strides.
+    Let strides_buf be proc tensor_get_strides_buf with t
+    Let _csrt be proc tensor_compute_row_major_strides with strides_buf, target_shape, rank, elem_size
+    Note: Data.
+    Let data_bytes be total multiplied by elem_size
+    Let data_buf be proc allocate from Layout with data_bytes
+    If data_buf is equal to 0:
+        Let _f1 be proc deallocate from Layout with t
+        Let _f2 be proc deallocate from Layout with target_shape
+        Let _f3 be proc deallocate from Layout with strides_buf
+        Return 0
+    End If
+    Let _wda be proc memory_set_int64 from Memory with t, 56, data_buf
+    Return t
+End Process
+
+Process called "tensor_free" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Let shape_buf be proc tensor_get_shape_buf with t
+    Let strides_buf be proc tensor_get_strides_buf with t
+    Let data_buf be proc tensor_get_data with t
+    If shape_buf is not equal to 0:
+        Let _f1 be proc deallocate from Layout with shape_buf
+    End If
+    If strides_buf is not equal to 0:
+        Let _f2 be proc deallocate from Layout with strides_buf
+    End If
+    If data_buf is not equal to 0:
+        Let _f3 be proc deallocate from Layout with data_buf
+    End If
+    Let _ft be proc deallocate from Layout with t
+    Return 0
+End Process
+
+Process called "tensor_full_f64" takes shape_buf as Integer, rank as Integer, value as Float returns Integer:
+    @Reasoning
+        Allocate a Float64 tensor of given shape filled with the same
+        value. Used as the foundation for ones (value = 1.0).
+    @End Reasoning
+    @Implementation
+        Tensor_zeros plus a linear write loop over the data buffer.
+    @End Implementation
+    @Performance_Hints
+        O(total elements).
+    @End Performance_Hints
+    @Security_Scope
+        Float64 only; other dtypes via specialized fills.
+    @End Security_Scope
+    Let t be proc tensor_zeros with shape_buf, rank, TENSOR_DTYPE_FLOAT64
+    If t is equal to 0:
+        Return 0
+    End If
+    Let data be proc tensor_get_data with t
+    Let total be proc tensor_get_total_elements with t
+    Let bits be proc tn_float_to_bits with value
+    Let i be 0
+    While i is less than total:
+        Let _w be proc memory_set_int64 from Memory with data, i multiplied by TENSOR_LANE_BYTES, bits
+        Set i to i plus 1
+    End While
+    Return t
+End Process
+
+Process called "tensor_ones_f64" takes shape_buf as Integer, rank as Integer returns Integer:
+    Return proc tensor_full_f64 with shape_buf, rank, 1.0
+End Process
+
+Process called "tensor_arange_f64" takes start as Float, stop as Float, step as Float returns Integer:
+    @Reasoning
+        Construct a 1-D Float64 tensor of values [start, start+step,
+        start+2*step, ...] strictly less than stop. step must be > 0.
+    @End Reasoning
+    @Implementation
+        Count elements via float-to-int cast on (stop - start)/step,
+        then allocate and fill.
+    @End Implementation
+    @Performance_Hints
+        O(n) where n is the resulting length.
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on step <= 0 or empty range.
+    @End Security_Scope
+    If step is less than 0.0:
+        Return 0
+    End If
+    If step is equal to 0.0:
+        Return 0
+    End If
+    Let diff be stop minus start
+    Let n_f be diff divided by step
+    Let n_int be proc float_to_int from Arith with n_f
+    If n_int is less than 1:
+        Return 0
+    End If
+    Let shape_buf be proc allocate from Layout with TENSOR_LANE_BYTES
+    Let _ws be proc memory_set_int64 from Memory with shape_buf, 0, n_int
+    Let t be proc tensor_zeros with shape_buf, 1, TENSOR_DTYPE_FLOAT64
+    Let _fs be proc deallocate from Layout with shape_buf
+    If t is equal to 0:
+        Return 0
+    End If
+    Let data be proc tensor_get_data with t
+    Let i be 0
+    While i is less than n_int:
+        Let i_f be proc int_to_float from Arith with i
+        Let val be start plus (i_f multiplied by step)
+        Let bits be proc tn_float_to_bits with val
+        Let _w be proc memory_set_int64 from Memory with data, i multiplied by TENSOR_LANE_BYTES, bits
+        Set i to i plus 1
+    End While
+    Return t
+End Process
+
+Process called "tensor_linspace_f64" takes start as Float, stop as Float, n as Integer returns Integer:
+    @Reasoning
+        Construct a 1-D Float64 tensor of n equally-spaced values in
+        [start, stop] inclusive.
+    @End Reasoning
+    @Implementation
+        step = (stop - start) / (n - 1) when n > 1, else single value.
+    @End Implementation
+    @Performance_Hints
+        O(n).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 if n < 1.
+    @End Security_Scope
+    If n is less than 1:
+        Return 0
+    End If
+    Let shape_buf be proc allocate from Layout with TENSOR_LANE_BYTES
+    Let _ws be proc memory_set_int64 from Memory with shape_buf, 0, n
+    Let t be proc tensor_zeros with shape_buf, 1, TENSOR_DTYPE_FLOAT64
+    Let _fs be proc deallocate from Layout with shape_buf
+    If t is equal to 0:
+        Return 0
+    End If
+    Let data be proc tensor_get_data with t
+    If n is equal to 1:
+        Let bits be proc tn_float_to_bits with start
+        Let _w be proc memory_set_int64 from Memory with data, 0, bits
+        Return t
+    End If
+    Let denom_f be proc int_to_float from Arith with n minus 1
+    Let step be (stop minus start) divided by denom_f
+    Let i be 0
+    While i is less than n:
+        Let i_f be proc int_to_float from Arith with i
+        Let val be start plus (i_f multiplied by step)
+        Let bits be proc tn_float_to_bits with val
+        Let _w be proc memory_set_int64 from Memory with data, i multiplied by TENSOR_LANE_BYTES, bits
+        Set i to i plus 1
+    End While
+    Return t
+End Process
+
+Process called "tensor_from_array_f64" takes flat_data as Integer, shape_buf as Integer, rank as Integer returns Integer:
+    @Reasoning
+        Build a tensor from a caller-provided flat Float64 buffer.
+        Copies the data into a freshly-owned buffer so the caller may
+        reuse or free its source.
+    @End Reasoning
+    @Implementation
+        Zeros + memory_copy.
+    @End Implementation
+    @Performance_Hints
+        O(total elements).
+    @End Performance_Hints
+    @Security_Scope
+        Copy guarantees independence of the new tensor from the source.
+    @End Security_Scope
+    Let t be proc tensor_zeros with shape_buf, rank, TENSOR_DTYPE_FLOAT64
+    If t is equal to 0:
+        Return 0
+    End If
+    Let data be proc tensor_get_data with t
+    Let total be proc tensor_get_total_elements with t
+    Let _c be proc memory_copy from Memory with data, flat_data, total multiplied by TENSOR_LANE_BYTES
+    Return t
+End Process
+
+Note: ============================================================================
+Note: Shape manipulation
+Note: ============================================================================
+
+Process called "tensor_reshape_f64" takes t as Integer, new_shape_buf as Integer, new_rank as Integer returns Integer:
+    @Reasoning
+        Return a new tensor sharing... actually creates a new tensor
+        with the same data copied and a different shape. Validates
+        that total elements match.
+    @End Reasoning
+    @Implementation
+        Compute new total, compare, allocate, copy data.
+    @End Implementation
+    @Performance_Hints
+        O(total elements) due to the data copy.
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 if element counts mismatch.
+    @End Security_Scope
+    Let new_total be proc tensor_compute_total with new_shape_buf, new_rank
+    Let old_total be proc tensor_get_total_elements with t
+    If new_total is not equal to old_total:
+        Return 0
+    End If
+    Let dtype be proc tensor_get_dtype with t
+    Let new_t be proc tensor_zeros with new_shape_buf, new_rank, dtype
+    If new_t is equal to 0:
+        Return 0
+    End If
+    Let src_data be proc tensor_get_data with t
+    Let dst_data be proc tensor_get_data with new_t
+    Let elem_size be proc tensor_get_element_size with t
+    Let _c be proc memory_copy from Memory with dst_data, src_data, new_total multiplied by elem_size
+    Return new_t
+End Process
+
+Process called "tensor_transpose_2d_f64" takes t as Integer returns Integer:
+    @Reasoning
+        Transpose a 2-D tensor. Specialized form; general permutation
+        is provided by tensor_permute.
+    @End Reasoning
+    @Implementation
+        Index-swap copy.
+    @End Implementation
+    @Performance_Hints
+        O(n * m). Non-contiguous access pattern; could be tiled for
+        large matrices.
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on rank != 2.
+    @End Security_Scope
+    Let rank be proc tensor_get_rank with t
+    If rank is not equal to 2:
+        Return 0
+    End If
+    Let n_rows be proc tensor_get_shape_at with t, 0
+    Let n_cols be proc tensor_get_shape_at with t, 1
+    Let new_shape_buf be proc allocate from Layout with 2 multiplied by TENSOR_LANE_BYTES
+    Let _ws0 be proc memory_set_int64 from Memory with new_shape_buf, 0, n_cols
+    Let _ws1 be proc memory_set_int64 from Memory with new_shape_buf, 8, n_rows
+    Let new_t be proc tensor_zeros with new_shape_buf, 2, TENSOR_DTYPE_FLOAT64
+    Let _fs be proc deallocate from Layout with new_shape_buf
+    If new_t is equal to 0:
+        Return 0
+    End If
+    Let src be proc tensor_get_data with t
+    Let dst be proc tensor_get_data with new_t
+    Let r be 0
+    While r is less than n_rows:
+        Let c be 0
+        While c is less than n_cols:
+            Let src_off be ((r multiplied by n_cols) plus c) multiplied by TENSOR_LANE_BYTES
+            Let dst_off be ((c multiplied by n_rows) plus r) multiplied by TENSOR_LANE_BYTES
+            Let v be proc memory_get_int64 from Memory with src, src_off
+            Let _w be proc memory_set_int64 from Memory with dst, dst_off, v
+            Set c to c plus 1
+        End While
+        Set r to r plus 1
+    End While
+    Return new_t
+End Process
+
+Process called "tensor_squeeze_f64" takes t as Integer returns Integer:
+    @Reasoning
+        Remove singleton dimensions. Shape [3, 1, 5] becomes [3, 5].
+        Total element count is preserved.
+    @End Reasoning
+    @Implementation
+        Scan shape, build new shape with non-1 entries.
+    @End Implementation
+    @Performance_Hints
+        O(rank + total elements).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on allocation failure.
+    @End Security_Scope
+    Let rank be proc tensor_get_rank with t
+    Let count be 0
+    Let i be 0
+    While i is less than rank:
+        Let dim_i be proc tensor_get_shape_at with t, i
+        If dim_i is not equal to 1:
+            Set count to count plus 1
+        End If
+        Set i to i plus 1
+    End While
+    If count is equal to 0:
+        Set count to 1
+    End If
+    Let new_shape_buf be proc allocate from Layout with count multiplied by TENSOR_LANE_BYTES
+    Let j be 0
+    Set i to 0
+    While i is less than rank:
+        Let dim_i be proc tensor_get_shape_at with t, i
+        If dim_i is not equal to 1:
+            Let _ws be proc memory_set_int64 from Memory with new_shape_buf, j multiplied by TENSOR_LANE_BYTES, dim_i
+            Set j to j plus 1
+        End If
+        Set i to i plus 1
+    End While
+    If j is equal to 0:
+        Let _ws_one be proc memory_set_int64 from Memory with new_shape_buf, 0, 1
+    End If
+    Let new_t be proc tensor_reshape_f64 with t, new_shape_buf, count
+    Let _fs be proc deallocate from Layout with new_shape_buf
+    Return new_t
+End Process
+
+Process called "tensor_unsqueeze_f64" takes t as Integer, axis as Integer returns Integer:
+    @Reasoning
+        Insert a singleton dimension at position `axis`. Inverse of
+        squeeze for that particular dimension.
+    @End Reasoning
+    @Implementation
+        Build new shape and reshape.
+    @End Implementation
+    @Performance_Hints
+        O(rank + total elements).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on invalid axis or alloc failure.
+    @End Security_Scope
+    Let rank be proc tensor_get_rank with t
+    If axis is less than 0:
+        Return 0
+    End If
+    If axis is greater than rank:
+        Return 0
+    End If
+    Let new_shape_buf be proc allocate from Layout with (rank plus 1) multiplied by TENSOR_LANE_BYTES
+    Let i be 0
+    While i is less than rank:
+        Let dim_i be proc tensor_get_shape_at with t, i
+        Let out_pos be i
+        If i is greater than (axis minus 1):
+            Set out_pos to i plus 1
+        End If
+        Let _ws be proc memory_set_int64 from Memory with new_shape_buf, out_pos multiplied by TENSOR_LANE_BYTES, dim_i
+        Set i to i plus 1
+    End While
+    Let _wax be proc memory_set_int64 from Memory with new_shape_buf, axis multiplied by TENSOR_LANE_BYTES, 1
+    Let new_t be proc tensor_reshape_f64 with t, new_shape_buf, rank plus 1
+    Let _fs be proc deallocate from Layout with new_shape_buf
+    Return new_t
+End Process
+
+Note: ============================================================================
+Note: Elementwise (Float64, same-shape)
+Note: ============================================================================
+
+Process called "tensor_elementwise_add_f64" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Return a new tensor with c[i] = a[i] + b[i] over the flat data
+        buffer. Both inputs must share the same shape; broadcasting is
+        provided by tensor_broadcast_add below.
+    @End Reasoning
+    @Implementation
+        Linear pass.
+    @End Implementation
+    @Performance_Hints
+        O(total elements).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on shape mismatch.
+    @End Security_Scope
+    Let ta be proc tensor_get_total_elements with a
+    Let tb be proc tensor_get_total_elements with b
+    If ta is not equal to tb:
+        Return 0
+    End If
+    Let rank be proc tensor_get_rank with a
+    Let shape_buf be proc tensor_get_shape_buf with a
+    Let new_t be proc tensor_zeros with shape_buf, rank, TENSOR_DTYPE_FLOAT64
+    If new_t is equal to 0:
+        Return 0
+    End If
+    Let ad be proc tensor_get_data with a
+    Let bd be proc tensor_get_data with b
+    Let rd be proc tensor_get_data with new_t
+    Let i be 0
+    While i is less than ta:
+        Let off be i multiplied by TENSOR_LANE_BYTES
+        Let av_bits be proc memory_get_int64 from Memory with ad, off
+        Let bv_bits be proc memory_get_int64 from Memory with bd, off
+        Let av be proc tn_bits_to_float with av_bits
+        Let bv be proc tn_bits_to_float with bv_bits
+        Let sum be av plus bv
+        Let sum_bits be proc tn_float_to_bits with sum
+        Let _w be proc memory_set_int64 from Memory with rd, off, sum_bits
+        Set i to i plus 1
+    End While
+    Return new_t
+End Process
+
+Process called "tensor_elementwise_sub_f64" takes a as Integer, b as Integer returns Integer:
+    Let ta be proc tensor_get_total_elements with a
+    Let tb be proc tensor_get_total_elements with b
+    If ta is not equal to tb:
+        Return 0
+    End If
+    Let rank be proc tensor_get_rank with a
+    Let shape_buf be proc tensor_get_shape_buf with a
+    Let new_t be proc tensor_zeros with shape_buf, rank, TENSOR_DTYPE_FLOAT64
+    If new_t is equal to 0:
+        Return 0
+    End If
+    Let ad be proc tensor_get_data with a
+    Let bd be proc tensor_get_data with b
+    Let rd be proc tensor_get_data with new_t
+    Let i be 0
+    While i is less than ta:
+        Let off be i multiplied by TENSOR_LANE_BYTES
+        Let av_bits be proc memory_get_int64 from Memory with ad, off
+        Let bv_bits be proc memory_get_int64 from Memory with bd, off
+        Let av be proc tn_bits_to_float with av_bits
+        Let bv be proc tn_bits_to_float with bv_bits
+        Let diff be av minus bv
+        Let bits be proc tn_float_to_bits with diff
+        Let _w be proc memory_set_int64 from Memory with rd, off, bits
+        Set i to i plus 1
+    End While
+    Return new_t
+End Process
+
+Process called "tensor_elementwise_mul_f64" takes a as Integer, b as Integer returns Integer:
+    Let ta be proc tensor_get_total_elements with a
+    Let tb be proc tensor_get_total_elements with b
+    If ta is not equal to tb:
+        Return 0
+    End If
+    Let rank be proc tensor_get_rank with a
+    Let shape_buf be proc tensor_get_shape_buf with a
+    Let new_t be proc tensor_zeros with shape_buf, rank, TENSOR_DTYPE_FLOAT64
+    If new_t is equal to 0:
+        Return 0
+    End If
+    Let ad be proc tensor_get_data with a
+    Let bd be proc tensor_get_data with b
+    Let rd be proc tensor_get_data with new_t
+    Let i be 0
+    While i is less than ta:
+        Let off be i multiplied by TENSOR_LANE_BYTES
+        Let av_bits be proc memory_get_int64 from Memory with ad, off
+        Let bv_bits be proc memory_get_int64 from Memory with bd, off
+        Let av be proc tn_bits_to_float with av_bits
+        Let bv be proc tn_bits_to_float with bv_bits
+        Let prod be av multiplied by bv
+        Let bits be proc tn_float_to_bits with prod
+        Let _w be proc memory_set_int64 from Memory with rd, off, bits
+        Set i to i plus 1
+    End While
+    Return new_t
+End Process
+
+Process called "tensor_elementwise_div_f64" takes a as Integer, b as Integer returns Integer:
+    Let ta be proc tensor_get_total_elements with a
+    Let tb be proc tensor_get_total_elements with b
+    If ta is not equal to tb:
+        Return 0
+    End If
+    Let rank be proc tensor_get_rank with a
+    Let shape_buf be proc tensor_get_shape_buf with a
+    Let new_t be proc tensor_zeros with shape_buf, rank, TENSOR_DTYPE_FLOAT64
+    If new_t is equal to 0:
+        Return 0
+    End If
+    Let ad be proc tensor_get_data with a
+    Let bd be proc tensor_get_data with b
+    Let rd be proc tensor_get_data with new_t
+    Let i be 0
+    While i is less than ta:
+        Let off be i multiplied by TENSOR_LANE_BYTES
+        Let av_bits be proc memory_get_int64 from Memory with ad, off
+        Let bv_bits be proc memory_get_int64 from Memory with bd, off
+        Let av be proc tn_bits_to_float with av_bits
+        Let bv be proc tn_bits_to_float with bv_bits
+        Let q be av divided by bv
+        Let bits be proc tn_float_to_bits with q
+        Let _w be proc memory_set_int64 from Memory with rd, off, bits
+        Set i to i plus 1
+    End While
+    Return new_t
+End Process
+
+Process called "tensor_neg_f64" takes a as Integer returns Integer:
+    Let rank be proc tensor_get_rank with a
+    Let shape_buf be proc tensor_get_shape_buf with a
+    Let total be proc tensor_get_total_elements with a
+    Let new_t be proc tensor_zeros with shape_buf, rank, TENSOR_DTYPE_FLOAT64
+    If new_t is equal to 0:
+        Return 0
+    End If
+    Let ad be proc tensor_get_data with a
+    Let rd be proc tensor_get_data with new_t
+    Let i be 0
+    While i is less than total:
+        Let off be i multiplied by TENSOR_LANE_BYTES
+        Let av_bits be proc memory_get_int64 from Memory with ad, off
+        Let av be proc tn_bits_to_float with av_bits
+        Let neg_av be 0.0 minus av
+        Let bits be proc tn_float_to_bits with neg_av
+        Let _w be proc memory_set_int64 from Memory with rd, off, bits
+        Set i to i plus 1
+    End While
+    Return new_t
+End Process
+
+Process called "tensor_abs_f64" takes a as Integer returns Integer:
+    Let rank be proc tensor_get_rank with a
+    Let shape_buf be proc tensor_get_shape_buf with a
+    Let total be proc tensor_get_total_elements with a
+    Let new_t be proc tensor_zeros with shape_buf, rank, TENSOR_DTYPE_FLOAT64
+    If new_t is equal to 0:
+        Return 0
+    End If
+    Let ad be proc tensor_get_data with a
+    Let rd be proc tensor_get_data with new_t
+    Let i be 0
+    While i is less than total:
+        Let off be i multiplied by TENSOR_LANE_BYTES
+        Let av_bits be proc memory_get_int64 from Memory with ad, off
+        Let av be proc tn_bits_to_float with av_bits
+        Let abs_v be av
+        If abs_v is less than 0.0:
+            Set abs_v to 0.0 minus abs_v
+        End If
+        Let bits be proc tn_float_to_bits with abs_v
+        Let _w be proc memory_set_int64 from Memory with rd, off, bits
+        Set i to i plus 1
+    End While
+    Return new_t
+End Process
+
+Note: ============================================================================
+Note: Reductions
+Note: ============================================================================
+
+Process called "tensor_sum_all_f64" takes a as Integer returns Float:
+    @Reasoning
+        Compute the scalar sum over all elements. Axis-aware reduction
+        is provided by tensor_sum_axis_f64.
+    @End Reasoning
+    @Implementation
+        Linear accumulate.
+    @End Implementation
+    @Performance_Hints
+        O(total elements).
+    @End Performance_Hints
+    @Security_Scope
+        No special concerns.
+    @End Security_Scope
+    Let total be proc tensor_get_total_elements with a
+    Let data be proc tensor_get_data with a
+    Let sum be 0.0
+    Let i be 0
+    While i is less than total:
+        Let bits be proc memory_get_int64 from Memory with data, i multiplied by TENSOR_LANE_BYTES
+        Let v be proc tn_bits_to_float with bits
+        Set sum to sum plus v
+        Set i to i plus 1
+    End While
+    Return sum
+End Process
+
+Process called "tensor_mean_all_f64" takes a as Integer returns Float:
+    Let sum be proc tensor_sum_all_f64 with a
+    Let total be proc tensor_get_total_elements with a
+    Let total_f be proc int_to_float from Arith with total
+    Return sum divided by total_f
+End Process
+
+Process called "tensor_max_all_f64" takes a as Integer returns Float:
+    Let total be proc tensor_get_total_elements with a
+    Let data be proc tensor_get_data with a
+    If total is equal to 0:
+        Return 0.0
+    End If
+    Let first_bits be proc memory_get_int64 from Memory with data, 0
+    Let m be proc tn_bits_to_float with first_bits
+    Let i be 1
+    While i is less than total:
+        Let bits be proc memory_get_int64 from Memory with data, i multiplied by TENSOR_LANE_BYTES
+        Let v be proc tn_bits_to_float with bits
+        If v is greater than m:
+            Set m to v
+        End If
+        Set i to i plus 1
+    End While
+    Return m
+End Process
+
+Process called "tensor_min_all_f64" takes a as Integer returns Float:
+    Let total be proc tensor_get_total_elements with a
+    Let data be proc tensor_get_data with a
+    If total is equal to 0:
+        Return 0.0
+    End If
+    Let first_bits be proc memory_get_int64 from Memory with data, 0
+    Let m be proc tn_bits_to_float with first_bits
+    Let i be 1
+    While i is less than total:
+        Let bits be proc memory_get_int64 from Memory with data, i multiplied by TENSOR_LANE_BYTES
+        Let v be proc tn_bits_to_float with bits
+        If v is less than m:
+            Set m to v
+        End If
+        Set i to i plus 1
+    End While
+    Return m
+End Process
+
+Process called "tensor_argmax_all_f64" takes a as Integer returns Integer:
+    Let total be proc tensor_get_total_elements with a
+    Let data be proc tensor_get_data with a
+    If total is equal to 0:
+        Return -1
+    End If
+    Let first_bits be proc memory_get_int64 from Memory with data, 0
+    Let m be proc tn_bits_to_float with first_bits
+    Let idx be 0
+    Let i be 1
+    While i is less than total:
+        Let bits be proc memory_get_int64 from Memory with data, i multiplied by TENSOR_LANE_BYTES
+        Let v be proc tn_bits_to_float with bits
+        If v is greater than m:
+            Set m to v
+            Set idx to i
+        End If
+        Set i to i plus 1
+    End While
+    Return idx
+End Process
+
+Process called "tensor_argmin_all_f64" takes a as Integer returns Integer:
+    Let total be proc tensor_get_total_elements with a
+    Let data be proc tensor_get_data with a
+    If total is equal to 0:
+        Return -1
+    End If
+    Let first_bits be proc memory_get_int64 from Memory with data, 0
+    Let m be proc tn_bits_to_float with first_bits
+    Let idx be 0
+    Let i be 1
+    While i is less than total:
+        Let bits be proc memory_get_int64 from Memory with data, i multiplied by TENSOR_LANE_BYTES
+        Let v be proc tn_bits_to_float with bits
+        If v is less than m:
+            Set m to v
+            Set idx to i
+        End If
+        Set i to i plus 1
+    End While
+    Return idx
+End Process
+
+Note: ============================================================================
+Note: Linear algebra
+Note: ============================================================================
+
+Process called "tensor_matmul_2d_f64" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Naive row-major (2-D, 2-D) matrix multiply. Inputs A (m x k) and
+        B (k x n) produce C (m x n). The triple-nested loop is the
+        baseline kernel; cache tiling / SIMD is the next layer.
+    @End Reasoning
+    @Implementation
+        for i in 0..m: for j in 0..n: for kk in 0..k: c[i,j] += a[i,kk]*b[kk,j].
+    @End Implementation
+    @Performance_Hints
+        O(m * n * k).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on shape mismatch.
+    @End Security_Scope
+    Let ra be proc tensor_get_rank with a
+    Let rb be proc tensor_get_rank with b
+    If ra is not equal to 2:
+        Return 0
+    End If
+    If rb is not equal to 2:
+        Return 0
+    End If
+    Let m be proc tensor_get_shape_at with a, 0
+    Let k_a be proc tensor_get_shape_at with a, 1
+    Let k_b be proc tensor_get_shape_at with b, 0
+    Let n be proc tensor_get_shape_at with b, 1
+    If k_a is not equal to k_b:
+        Return 0
+    End If
+    Let new_shape_buf be proc allocate from Layout with 2 multiplied by TENSOR_LANE_BYTES
+    Let _ws0 be proc memory_set_int64 from Memory with new_shape_buf, 0, m
+    Let _ws1 be proc memory_set_int64 from Memory with new_shape_buf, 8, n
+    Let c be proc tensor_zeros with new_shape_buf, 2, TENSOR_DTYPE_FLOAT64
+    Let _fs be proc deallocate from Layout with new_shape_buf
+    If c is equal to 0:
+        Return 0
+    End If
+    Let ad be proc tensor_get_data with a
+    Let bd be proc tensor_get_data with b
+    Let cd be proc tensor_get_data with c
+    Let i be 0
+    While i is less than m:
+        Let j be 0
+        While j is less than n:
+            Let acc be 0.0
+            Let kk be 0
+            While kk is less than k_a:
+                Let a_off be ((i multiplied by k_a) plus kk) multiplied by TENSOR_LANE_BYTES
+                Let b_off be ((kk multiplied by n) plus j) multiplied by TENSOR_LANE_BYTES
+                Let av_bits be proc memory_get_int64 from Memory with ad, a_off
+                Let bv_bits be proc memory_get_int64 from Memory with bd, b_off
+                Let av be proc tn_bits_to_float with av_bits
+                Let bv be proc tn_bits_to_float with bv_bits
+                Set acc to acc plus (av multiplied by bv)
+                Set kk to kk plus 1
+            End While
+            Let c_off be ((i multiplied by n) plus j) multiplied by TENSOR_LANE_BYTES
+            Let bits be proc tn_float_to_bits with acc
+            Let _w be proc memory_set_int64 from Memory with cd, c_off, bits
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+    Return c
+End Process
+
+Process called "tensor_dot_1d_f64" takes a as Integer, b as Integer returns Float:
+    @Reasoning
+        Vector inner product for 1-D tensors of identical length.
+    @End Reasoning
+    @Implementation
+        Linear pass.
+    @End Implementation
+    @Performance_Hints
+        O(n).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0.0 on shape mismatch.
+    @End Security_Scope
+    Let ra be proc tensor_get_rank with a
+    Let rb be proc tensor_get_rank with b
+    If ra is not equal to 1:
+        Return 0.0
+    End If
+    If rb is not equal to 1:
+        Return 0.0
+    End If
+    Let na be proc tensor_get_shape_at with a, 0
+    Let nb be proc tensor_get_shape_at with b, 0
+    If na is not equal to nb:
+        Return 0.0
+    End If
+    Let ad be proc tensor_get_data with a
+    Let bd be proc tensor_get_data with b
+    Let sum be 0.0
+    Let i be 0
+    While i is less than na:
+        Let off be i multiplied by TENSOR_LANE_BYTES
+        Let av_bits be proc memory_get_int64 from Memory with ad, off
+        Let bv_bits be proc memory_get_int64 from Memory with bd, off
+        Let av be proc tn_bits_to_float with av_bits
+        Let bv be proc tn_bits_to_float with bv_bits
+        Set sum to sum plus (av multiplied by bv)
+        Set i to i plus 1
+    End While
+    Return sum
+End Process
+
+Process called "tensor_outer_1d_f64" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Outer product of two 1-D tensors: c[i, j] = a[i] * b[j].
+        Result is a 2-D tensor of shape (len(a), len(b)).
+    @End Reasoning
+    @Implementation
+        Double loop, no shape mismatch check beyond rank.
+    @End Implementation
+    @Performance_Hints
+        O(len(a) * len(b)).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on rank mismatch.
+    @End Security_Scope
+    Let ra be proc tensor_get_rank with a
+    Let rb be proc tensor_get_rank with b
+    If ra is not equal to 1:
+        Return 0
+    End If
+    If rb is not equal to 1:
+        Return 0
+    End If
+    Let m be proc tensor_get_shape_at with a, 0
+    Let n be proc tensor_get_shape_at with b, 0
+    Let new_shape_buf be proc allocate from Layout with 2 multiplied by TENSOR_LANE_BYTES
+    Let _ws0 be proc memory_set_int64 from Memory with new_shape_buf, 0, m
+    Let _ws1 be proc memory_set_int64 from Memory with new_shape_buf, 8, n
+    Let c be proc tensor_zeros with new_shape_buf, 2, TENSOR_DTYPE_FLOAT64
+    Let _fs be proc deallocate from Layout with new_shape_buf
+    If c is equal to 0:
+        Return 0
+    End If
+    Let ad be proc tensor_get_data with a
+    Let bd be proc tensor_get_data with b
+    Let cd be proc tensor_get_data with c
+    Let i be 0
+    While i is less than m:
+        Let av_bits be proc memory_get_int64 from Memory with ad, i multiplied by TENSOR_LANE_BYTES
+        Let av be proc tn_bits_to_float with av_bits
+        Let j be 0
+        While j is less than n:
+            Let bv_bits be proc memory_get_int64 from Memory with bd, j multiplied by TENSOR_LANE_BYTES
+            Let bv be proc tn_bits_to_float with bv_bits
+            Let prod be av multiplied by bv
+            Let off be ((i multiplied by n) plus j) multiplied by TENSOR_LANE_BYTES
+            Let bits be proc tn_float_to_bits with prod
+            Let _w be proc memory_set_int64 from Memory with cd, off, bits
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+    Return c
+End Process
+
+Note: ============================================================================
+Note: Indexing
+Note: ============================================================================
+
+Process called "tensor_at_flat_f64" takes t as Integer, flat_idx as Integer returns Float:
+    @Reasoning
+        Direct flat-index access for Float64 tensors. Convenience
+        function on top of the strided layout.
+    @End Reasoning
+    @Implementation
+        Single load.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0.0 on out-of-bounds.
+    @End Security_Scope
+    Let total be proc tensor_get_total_elements with t
+    If flat_idx is greater than (total minus 1):
+        Return 0.0
+    End If
+    If flat_idx is less than 0:
+        Return 0.0
+    End If
+    Let data be proc tensor_get_data with t
+    Let bits be proc memory_get_int64 from Memory with data, flat_idx multiplied by TENSOR_LANE_BYTES
+    Return proc tn_bits_to_float with bits
+End Process
+
+Process called "tensor_set_flat_f64" takes t as Integer, flat_idx as Integer, value as Float returns Integer:
+    Let total be proc tensor_get_total_elements with t
+    If flat_idx is greater than (total minus 1):
+        Return -1
+    End If
+    If flat_idx is less than 0:
+        Return -1
+    End If
+    Let data be proc tensor_get_data with t
+    Let bits be proc tn_float_to_bits with value
+    Let _w be proc memory_set_int64 from Memory with data, flat_idx multiplied by TENSOR_LANE_BYTES, bits
+    Return 0
+End Process
+
+Process called "tensor_at_2d_f64" takes t as Integer, row as Integer, col as Integer returns Float:
+    @Reasoning
+        2-D get_element on Float64 tensors. Uses the actual stride
+        buffer in case the tensor was reshaped or transposed.
+    @End Reasoning
+    @Implementation
+        Two-index linearization.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0.0 on out-of-bounds.
+    @End Security_Scope
+    Let rank be proc tensor_get_rank with t
+    If rank is not equal to 2:
+        Return 0.0
+    End If
+    Let n_cols be proc tensor_get_shape_at with t, 1
+    Let flat be (row multiplied by n_cols) plus col
+    Return proc tensor_at_flat_f64 with t, flat
+End Process
+
+Process called "tensor_set_2d_f64" takes t as Integer, row as Integer, col as Integer, value as Float returns Integer:
+    Let rank be proc tensor_get_rank with t
+    If rank is not equal to 2:
+        Return -1
+    End If
+    Let n_cols be proc tensor_get_shape_at with t, 1
+    Let flat be (row multiplied by n_cols) plus col
+    Return proc tensor_set_flat_f64 with t, flat, value
+End Process

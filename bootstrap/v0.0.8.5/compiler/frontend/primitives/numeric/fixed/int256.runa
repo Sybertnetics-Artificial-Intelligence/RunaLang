@@ -1,0 +1,2767 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+256-bit Unsigned Integer Arithmetic (Int256)
+
+Deterministic fixed-point integer arithmetic at 256-bit width, suitable for
+consensus-critical systems (smart contracts, distributed ledgers,
+replicated state machines, deterministic currency arithmetic).
+
+Why 256-bit unsigned, not floating point:
+- Binary floating point fails consensus: different platforms produce slightly
+  different FP results for the same input (rounding differences, x87 vs SSE,
+  fused-multiply-add availability, etc.).
+- 2^256 - 1 ~= 1.16 * 10^77, enough to represent every reasonable currency,
+  token, balance, or asset value with sub-cent precision.
+- Wei pattern (Ethereum): 1 unit = 10^18 base units, allowing fixed-point
+  amounts with 18 decimal places of precision while remaining exact integer
+  arithmetic.
+
+Determinism guarantee:
+- Every operation produces bit-exact identical output for identical input
+  on every supported platform.
+- No floating point. No platform-dependent integer widths. No
+  undefined-behavior arithmetic. Wrapping vs. checked semantics are
+  explicit and per-operation.
+
+Representation:
+- Int256 = pointer to a 32-byte heap-allocated buffer
+- 4 little-endian limbs of 64 bits each:
+    offset  0: limb[0] = bits 0..63   (least significant)
+    offset  8: limb[1] = bits 64..127
+    offset 16: limb[2] = bits 128..191
+    offset 24: limb[3] = bits 192..255 (most significant)
+
+@Reasoning
+A flat 32-byte heap buffer was chosen over a 4-field struct because:
+1. Limb iteration is the dominant access pattern (add, sub, mul, div all
+   process limbs in sequence); flat buffer with computed offsets is more
+   uniform than open-coding 4 named field accesses.
+2. The byte buffer maps directly to network/disk serialization (no
+   marshalling layer required for big-endian or little-endian byte
+   exchange).
+3. 32 bytes is exactly one quarter of an x86-64 cache line and a full
+   AVX2 register; the layout is cache-aligned and SIMD-ready (for future
+   optimization passes).
+4. The bootstrap compiler's Integer is 64-bit, so memory_get_int64 /
+   memory_set_int64 are natural limb accessors.
+
+Aliasing model:
+- All arithmetic primitives accept `result` pointers that may alias `a` or
+  `b`. This is achieved by snapshotting both operands into local registers
+  before writing the result. The caller need not allocate a fresh result
+  buffer per operation.
+
+Overflow semantics:
+- Default ops (int256_add, int256_sub, int256_mul) wrap modulo 2^256.
+  This matches Ethereum EVM semantics and other consensus-critical layers.
+- `_checked` variants write a 1/0 overflow/underflow flag to a caller-
+  provided integer; callers can branch on the flag without paying the
+  cost of overflow detection when wrapping is desired.
+@End Reasoning
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/numeric/fixed/int512.runa" as Int512
+
+Note: ============================================================================
+Note: Constants
+Note: ============================================================================
+
+Constant INT256_SIZE_BYTES as Integer is 32
+Constant INT256_LIMB_COUNT as Integer is 4
+Constant INT256_BIT_WIDTH as Integer is 256
+Constant INT256_LIMB_BITS as Integer is 64
+Constant INT256_HIGH_BIT_MASK as Integer is 0x8000000000000000
+Constant INT256_LIMB_MASK_LOW32 as Integer is 0x00000000FFFFFFFF
+Constant INT256_OK as Integer is 0
+Constant INT256_ERR_NULL as Integer is -1
+Constant INT256_ERR_DIVIDE_BY_ZERO as Integer is -2
+Constant INT256_ERR_INVALID_SHIFT as Integer is -3
+Constant INT256_ERR_INVALID_INPUT as Integer is -4
+
+Note: ASCII codes used by hex / decimal string conversions
+Constant INT256_ASCII_ZERO as Integer is 48
+Constant INT256_ASCII_NINE as Integer is 57
+Constant INT256_ASCII_LOWER_A as Integer is 97
+Constant INT256_ASCII_LOWER_F as Integer is 102
+Constant INT256_ASCII_UPPER_A as Integer is 65
+Constant INT256_ASCII_UPPER_F as Integer is 70
+
+Note: ============================================================================
+Note: Internal Carry/Borrow Helpers (mirror Int512 helpers; duplicated here
+Note: to avoid a cross-module call hot path in the inner add/sub loops).
+Note: ============================================================================
+
+Process called "int256_carry_from_add" takes a as Integer, b as Integer, sum as Integer returns Integer:
+    @Reasoning
+        Compute the unsigned overflow (carry) bit from a 64-bit add
+        a+b=sum. Uses the bit trick:
+          carry = ((a AND b) OR ((a OR b) AND NOT s)) >> 63
+        which is bit-equivalent to the unsigned compare (sum < a) but
+        does not require an unsigned-compare primitive.
+    @End Reasoning
+    @Implementation
+        Constant-time formula, branch-free.
+    @End Implementation
+    @Performance_Hints
+        5 bitwise ops + 1 shift. Maps to ~5 instructions on any ISA.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time; safe on secret-dependent operands.
+    @End Security_Scope
+
+    Let term1 be a bitwise and b
+    Let or_ab be a bitwise or b
+    Let not_s be bitwise not sum
+    Let term2 be or_ab bitwise and not_s
+    Let combined be term1 bitwise or term2
+    Let carry_bit be combined shifted right by 63
+    Let result be carry_bit bitwise and 1
+    Return result
+End Process
+
+Process called "int256_borrow_from_sub" takes a as Integer, b as Integer, diff as Integer returns Integer:
+    @Reasoning
+        Compute the unsigned borrow bit from a 64-bit subtract a-b=diff.
+        Uses the dual bit trick.
+    @End Reasoning
+    @Implementation
+        borrow = ((NOT a AND b) OR (NOT (a XOR b) AND d)) >> 63
+    @End Implementation
+    @Performance_Hints
+        5 bitwise ops + 1 shift, branch-free.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    Let not_a be bitwise not a
+    Let term1 be not_a bitwise and b
+    Let xor_ab be a bitwise xor b
+    Let not_xor be bitwise not xor_ab
+    Let term2 be not_xor bitwise and diff
+    Let combined be term1 bitwise or term2
+    Let borrow_bit be combined shifted right by 63
+    Let result be borrow_bit bitwise and 1
+    Return result
+End Process
+
+Process called "int256_compare_unsigned_limb" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Three-way unsigned comparison of two 64-bit values. Returns -1, 0,
+        or 1. Uses the sign-flip trick to convert unsigned compare into
+        the available signed compare.
+    @End Reasoning
+    @Implementation
+        Flip the sign bit on both inputs; signed comparison yields the
+        unsigned ordering on the original values.
+    @End Implementation
+    @Performance_Hints
+        2 XORs + 1 compare, constant-time except for the result branch.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time data flow up to the branch on result.
+    @End Security_Scope
+
+    If a is equal to b:
+        Return 0
+    End If
+    Let a_flip be a bitwise xor INT256_HIGH_BIT_MASK
+    Let b_flip be b bitwise xor INT256_HIGH_BIT_MASK
+    If a_flip is less than b_flip:
+        Return -1
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Allocation and Construction
+Note: ============================================================================
+
+Process called "int256_allocate" returns Integer:
+    @Reasoning
+        Allocate a fresh 32-byte Int256 buffer on the owned heap. The
+        layout allocator's calloc-zero contract guarantees the buffer is
+        zeroed, so a fresh allocation represents the value 0.
+    @End Reasoning
+    @Implementation
+        Delegates to Layout.allocate. Returns 0 on out-of-memory.
+    @End Implementation
+    @Performance_Hints
+        O(1) on pool fast path. 32-byte allocations sit in a hot pool
+        bucket.
+    @End Performance_Hints
+    @Security_Scope
+        Memory zeroed by allocator; no leak from prior occupants.
+        Caller responsible for deallocation via int256_free.
+    @End Security_Scope
+
+    Let ptr be proc allocate from Layout with INT256_SIZE_BYTES
+    Return ptr
+End Process
+
+Process called "int256_free" takes a as Integer returns Integer:
+    @Reasoning
+        Release an Int256 buffer back to the owned heap.
+    @End Reasoning
+    @Implementation
+        Delegates to Layout.deallocate; passing 0 is a no-op for idempotent
+        free safety.
+    @End Implementation
+    @Performance_Hints
+        O(1) for pool-recycled buffers.
+    @End Performance_Hints
+    @Security_Scope
+        Caller must not access the pointer after this call.
+        Memory contents are not zeroed on free; if the buffer holds
+        sensitive data, the caller should call int256_set_zero first.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_OK
+    End If
+    Let dummy be proc deallocate from Layout with a
+    Return INT256_OK
+End Process
+
+Process called "int256_set_zero" takes a as Integer returns Integer:
+    @Reasoning
+        Set every limb to zero (canonical zero value). Used both as a
+        constructor and to clear sensitive material before free.
+    @End Reasoning
+    @Implementation
+        Four direct stores via memory_set_int64.
+    @End Implementation
+    @Performance_Hints
+        Fully unrolled, four stores.
+    @End Performance_Hints
+    @Security_Scope
+        Safe for clearing sensitive buffers.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let d0 be proc memory_set_int64 from MemoryCore with a, 0, 0
+    Let d1 be proc memory_set_int64 from MemoryCore with a, 8, 0
+    Let d2 be proc memory_set_int64 from MemoryCore with a, 16, 0
+    Let d3 be proc memory_set_int64 from MemoryCore with a, 24, 0
+    Return INT256_OK
+End Process
+
+Process called "int256_set_one" takes a as Integer returns Integer:
+    @Reasoning
+        Initialize the value to integer 1: low limb = 1, high limbs = 0.
+    @End Reasoning
+    @Implementation
+        Four direct stores.
+    @End Implementation
+    @Performance_Hints
+        Fully unrolled.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let d0 be proc memory_set_int64 from MemoryCore with a, 0, 1
+    Let d1 be proc memory_set_int64 from MemoryCore with a, 8, 0
+    Let d2 be proc memory_set_int64 from MemoryCore with a, 16, 0
+    Let d3 be proc memory_set_int64 from MemoryCore with a, 24, 0
+    Return INT256_OK
+End Process
+
+Process called "int256_set_max" takes a as Integer returns Integer:
+    @Reasoning
+        Set the value to 2^256 - 1 (all bits 1). This is the maximum
+        unsigned 256-bit value. Useful for two's-complement -1 and for
+        saturating-arithmetic primitives.
+    @End Reasoning
+    @Implementation
+        Stores 0xFFFFFFFFFFFFFFFF (computed as bitwise NOT of 0) into
+        every limb.
+    @End Implementation
+    @Performance_Hints
+        Fully unrolled, four stores.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let all_ones be bitwise not 0
+    Let d0 be proc memory_set_int64 from MemoryCore with a, 0, all_ones
+    Let d1 be proc memory_set_int64 from MemoryCore with a, 8, all_ones
+    Let d2 be proc memory_set_int64 from MemoryCore with a, 16, all_ones
+    Let d3 be proc memory_set_int64 from MemoryCore with a, 24, all_ones
+    Return INT256_OK
+End Process
+
+Process called "int256_set_u64" takes a as Integer, value as Integer returns Integer:
+    @Reasoning
+        Initialize the Int256 from a single 64-bit value: low limb = value,
+        upper three limbs = 0.
+    @End Reasoning
+    @Implementation
+        Four direct stores.
+    @End Implementation
+    @Performance_Hints
+        Fully unrolled.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let d0 be proc memory_set_int64 from MemoryCore with a, 0, value
+    Let d1 be proc memory_set_int64 from MemoryCore with a, 8, 0
+    Let d2 be proc memory_set_int64 from MemoryCore with a, 16, 0
+    Let d3 be proc memory_set_int64 from MemoryCore with a, 24, 0
+    Return INT256_OK
+End Process
+
+Process called "int256_copy" takes src as Integer, dst as Integer returns Integer:
+    @Reasoning
+        Copy all 4 limbs from src to dst.
+    @End Reasoning
+    @Implementation
+        Limb-by-limb load and store.
+    @End Implementation
+    @Performance_Hints
+        Four loads + four stores, fully unrolled.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If src is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If dst is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let l0 be proc memory_get_int64 from MemoryCore with src, 0
+    Let l1 be proc memory_get_int64 from MemoryCore with src, 8
+    Let l2 be proc memory_get_int64 from MemoryCore with src, 16
+    Let l3 be proc memory_get_int64 from MemoryCore with src, 24
+    Let d0 be proc memory_set_int64 from MemoryCore with dst, 0, l0
+    Let d1 be proc memory_set_int64 from MemoryCore with dst, 8, l1
+    Let d2 be proc memory_set_int64 from MemoryCore with dst, 16, l2
+    Let d3 be proc memory_set_int64 from MemoryCore with dst, 24, l3
+    Return INT256_OK
+End Process
+
+Process called "int256_from_u64" takes value as Integer returns Integer:
+    @Reasoning
+        Allocate a new Int256 buffer and initialize it from a 64-bit value.
+        Convenience wrapper for the common "narrowing conversion" case.
+    @End Reasoning
+    @Implementation
+        Allocate, then set_u64. Returns 0 if allocation fails.
+    @End Implementation
+    @Performance_Hints
+        One allocation + four stores.
+    @End Performance_Hints
+    @Security_Scope
+        Allocation may fail; caller must check for 0 return.
+    @End Security_Scope
+
+    Let buf be proc int256_allocate
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let dummy be proc int256_set_u64 with buf, value
+    Return buf
+End Process
+
+Process called "int256_from_u128" takes lo as Integer, hi as Integer returns Integer:
+    @Reasoning
+        Allocate a new Int256 from a 128-bit value supplied as two 64-bit
+        halves: low limb = lo, second limb = hi, upper two limbs = 0.
+    @End Reasoning
+    @Implementation
+        Allocate, then write the two low limbs explicitly.
+    @End Implementation
+    @Performance_Hints
+        One allocation + four stores.
+    @End Performance_Hints
+    @Security_Scope
+        Allocation may fail; caller must check for 0 return.
+    @End Security_Scope
+
+    Let buf be proc int256_allocate
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let d0 be proc memory_set_int64 from MemoryCore with buf, 0, lo
+    Let d1 be proc memory_set_int64 from MemoryCore with buf, 8, hi
+    Let d2 be proc memory_set_int64 from MemoryCore with buf, 16, 0
+    Let d3 be proc memory_set_int64 from MemoryCore with buf, 24, 0
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: Limb Accessors
+Note: ============================================================================
+
+Process called "int256_get_limb" takes a as Integer, index as Integer returns Integer:
+    @Reasoning
+        Read the 64-bit limb at the given index (0..3, 0 = least
+        significant). Out-of-range indices return 0.
+    @End Reasoning
+    @Implementation
+        Index validated; offset = index * 8.
+    @End Implementation
+    @Performance_Hints
+        One load.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds-checked.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than 3:
+        Return 0
+    End If
+    Let offset be index multiplied by 8
+    Let value be proc memory_get_int64 from MemoryCore with a, offset
+    Return value
+End Process
+
+Process called "int256_set_limb" takes a as Integer, index as Integer, value as Integer returns Integer:
+    @Reasoning
+        Write a 64-bit limb at the given index (0..3). Out-of-range
+        indices silently dropped.
+    @End Reasoning
+    @Implementation
+        Index validated; offset = index * 8.
+    @End Implementation
+    @Performance_Hints
+        One store.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds-checked.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If index is less than 0:
+        Return INT256_OK
+    End If
+    If index is greater than 3:
+        Return INT256_OK
+    End If
+    Let offset be index multiplied by 8
+    Let dummy be proc memory_set_int64 from MemoryCore with a, offset, value
+    Return INT256_OK
+End Process
+
+Note: ============================================================================
+Note: Predicates and Comparison
+Note: ============================================================================
+
+Process called "int256_is_zero" takes a as Integer returns Integer:
+    @Reasoning
+        Return 1 if every limb is zero; 0 otherwise.
+    @End Reasoning
+    @Implementation
+        OR-fold all four limbs; combined is 0 iff every limb is zero.
+    @End Implementation
+    @Performance_Hints
+        Four loads + three ORs + one compare. Branch-free.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time data flow.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    Let l0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let l1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let l2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let l3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let or01 be l0 bitwise or l1
+    Let or23 be l2 bitwise or l3
+    Let combined be or01 bitwise or or23
+    If combined is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "int256_is_max" takes a as Integer returns Integer:
+    @Reasoning
+        Return 1 if every limb is all-ones (value == 2^256 - 1); else 0.
+    @End Reasoning
+    @Implementation
+        AND-fold all four limbs; result == all_ones iff every limb is
+        all_ones.
+    @End Implementation
+    @Performance_Hints
+        Four loads + three ANDs + one compare.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time data flow.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    Let all_ones be bitwise not 0
+    Let l0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let l1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let l2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let l3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let and01 be l0 bitwise and l1
+    Let and23 be l2 bitwise and l3
+    Let combined be and01 bitwise and and23
+    If combined is equal to all_ones:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "int256_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Three-way unsigned comparison. Returns -1 if a<b, 0 if a==b,
+        1 if a>b. Iterates from most significant limb downward so the
+        first differing limb decides ordering.
+    @End Reasoning
+    @Implementation
+        Limbs 3, 2, 1, 0 compared in order. Uses
+        int256_compare_unsigned_limb for the per-limb comparison.
+    @End Implementation
+    @Performance_Hints
+        Worst case 4 limb compares; early exit on first difference.
+    @End Performance_Hints
+    @Security_Scope
+        Data-dependent early-exit; not constant-time. For
+        constant-time comparison on secret data, use a dedicated CT
+        routine. This is fine for the common public-value path.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let i be 3
+    While i is greater than or equal to 0:
+        Let offset be i multiplied by 8
+        Let la be proc memory_get_int64 from MemoryCore with a, offset
+        Let lb be proc memory_get_int64 from MemoryCore with b, offset
+        If la is not equal to lb:
+            Let result be proc int256_compare_unsigned_limb with la, lb
+            Return result
+        End If
+        Set i to i minus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Addition and Subtraction
+Note: ============================================================================
+
+Process called "int256_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Compute result = (a + b) mod 2^256. Wrapping semantics: carry out
+        of limb 3 is discarded. This matches EVM ADD semantics.
+    @End Reasoning
+    @Implementation
+        For each limb i in 0..3:
+          s1 = a_i + b_i
+          c1 = unsigned carry from a_i + b_i
+          s2 = s1 + carry_in
+          c2 = carry from s1 + carry_in
+        Total carry-out = c1 + c2 (sum of three 64-bit values produces
+        at most a 2-bit carry, which fits in 64 bits for the next limb).
+        Operands snapshotted into locals first so result may alias a or b.
+    @End Implementation
+    @Performance_Hints
+        Four unrolled limbs, each with constant-time carry. Branch-free
+        in the inner sequence.
+    @End Performance_Hints
+    @Security_Scope
+        Wrapping semantics explicit; checked variant available. Constant-
+        time data flow.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let b0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let b1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let b2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let b3 be proc memory_get_int64 from MemoryCore with b, 24
+
+    Let s0_a be a0 plus b0
+    Let c0_a be proc int256_carry_from_add with a0, b0, s0_a
+    Let s0 be s0_a
+    Let carry0_out be c0_a
+
+    Let s1_a be a1 plus b1
+    Let c1_a be proc int256_carry_from_add with a1, b1, s1_a
+    Let s1 be s1_a plus carry0_out
+    Let c1_b be proc int256_carry_from_add with s1_a, carry0_out, s1
+    Let carry1_out be c1_a plus c1_b
+
+    Let s2_a be a2 plus b2
+    Let c2_a be proc int256_carry_from_add with a2, b2, s2_a
+    Let s2 be s2_a plus carry1_out
+    Let c2_b be proc int256_carry_from_add with s2_a, carry1_out, s2
+    Let carry2_out be c2_a plus c2_b
+
+    Let s3_a be a3 plus b3
+    Let s3 be s3_a plus carry2_out
+
+    Let d0 be proc memory_set_int64 from MemoryCore with result, 0, s0
+    Let d1 be proc memory_set_int64 from MemoryCore with result, 8, s1
+    Let d2 be proc memory_set_int64 from MemoryCore with result, 16, s2
+    Let d3 be proc memory_set_int64 from MemoryCore with result, 24, s3
+    Return INT256_OK
+End Process
+
+Process called "int256_add_checked" takes a as Integer, b as Integer, result as Integer, overflow_out as Integer returns Integer:
+    @Reasoning
+        Same as int256_add, but writes the final carry-out (0 or 1) to
+        *overflow_out. The caller can branch on this flag to detect
+        unsigned overflow past 2^256 - 1.
+    @End Reasoning
+    @Implementation
+        Mirrors int256_add but preserves the final carry value through
+        limb 3 and writes it to overflow_out via memory_set_int64.
+    @End Implementation
+    @Performance_Hints
+        One additional carry computation and store relative to
+        int256_add.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If overflow_out is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let b0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let b1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let b2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let b3 be proc memory_get_int64 from MemoryCore with b, 24
+
+    Let s0_a be a0 plus b0
+    Let c0_a be proc int256_carry_from_add with a0, b0, s0_a
+    Let s0 be s0_a
+    Let carry0_out be c0_a
+
+    Let s1_a be a1 plus b1
+    Let c1_a be proc int256_carry_from_add with a1, b1, s1_a
+    Let s1 be s1_a plus carry0_out
+    Let c1_b be proc int256_carry_from_add with s1_a, carry0_out, s1
+    Let carry1_out be c1_a plus c1_b
+
+    Let s2_a be a2 plus b2
+    Let c2_a be proc int256_carry_from_add with a2, b2, s2_a
+    Let s2 be s2_a plus carry1_out
+    Let c2_b be proc int256_carry_from_add with s2_a, carry1_out, s2
+    Let carry2_out be c2_a plus c2_b
+
+    Let s3_a be a3 plus b3
+    Let c3_a be proc int256_carry_from_add with a3, b3, s3_a
+    Let s3 be s3_a plus carry2_out
+    Let c3_b be proc int256_carry_from_add with s3_a, carry2_out, s3
+    Let carry3_out be c3_a plus c3_b
+
+    Let d0 be proc memory_set_int64 from MemoryCore with result, 0, s0
+    Let d1 be proc memory_set_int64 from MemoryCore with result, 8, s1
+    Let d2 be proc memory_set_int64 from MemoryCore with result, 16, s2
+    Let d3 be proc memory_set_int64 from MemoryCore with result, 24, s3
+    Let dov be proc memory_set_int64 from MemoryCore with overflow_out, 0, carry3_out
+    Return INT256_OK
+End Process
+
+Process called "int256_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Compute result = (a - b) mod 2^256. Wrapping semantics: borrow
+        out of limb 3 is discarded.
+    @End Reasoning
+    @Implementation
+        For each limb:
+          d1 = a_i - b_i
+          br1 = unsigned borrow from a_i - b_i
+          d2 = d1 - borrow_in
+          br2 = borrow from d1 - borrow_in
+        Total borrow-out = br1 + br2.
+    @End Implementation
+    @Performance_Hints
+        Four unrolled limbs.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time. Wrapping semantics documented.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let b0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let b1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let b2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let b3 be proc memory_get_int64 from MemoryCore with b, 24
+
+    Let d0_a be a0 minus b0
+    Let br0 be proc int256_borrow_from_sub with a0, b0, d0_a
+    Let d0 be d0_a
+
+    Let d1_a be a1 minus b1
+    Let br1_a be proc int256_borrow_from_sub with a1, b1, d1_a
+    Let d1 be d1_a minus br0
+    Let br1_b be proc int256_borrow_from_sub with d1_a, br0, d1
+    Let borrow1_out be br1_a plus br1_b
+
+    Let d2_a be a2 minus b2
+    Let br2_a be proc int256_borrow_from_sub with a2, b2, d2_a
+    Let d2 be d2_a minus borrow1_out
+    Let br2_b be proc int256_borrow_from_sub with d2_a, borrow1_out, d2
+    Let borrow2_out be br2_a plus br2_b
+
+    Let d3_a be a3 minus b3
+    Let d3 be d3_a minus borrow2_out
+
+    Let s0 be proc memory_set_int64 from MemoryCore with result, 0, d0
+    Let s1 be proc memory_set_int64 from MemoryCore with result, 8, d1
+    Let s2 be proc memory_set_int64 from MemoryCore with result, 16, d2
+    Let s3 be proc memory_set_int64 from MemoryCore with result, 24, d3
+    Return INT256_OK
+End Process
+
+Process called "int256_sub_checked" takes a as Integer, b as Integer, result as Integer, underflow_out as Integer returns Integer:
+    @Reasoning
+        Same as int256_sub, but writes the final borrow (0 or 1) to
+        *underflow_out, indicating whether a < b under unsigned
+        interpretation.
+    @End Reasoning
+    @Implementation
+        Mirrors int256_sub but preserves the limb-3 borrow and stores it.
+    @End Implementation
+    @Performance_Hints
+        One additional borrow computation + one store.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If underflow_out is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let b0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let b1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let b2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let b3 be proc memory_get_int64 from MemoryCore with b, 24
+
+    Let d0_a be a0 minus b0
+    Let br0 be proc int256_borrow_from_sub with a0, b0, d0_a
+    Let d0 be d0_a
+
+    Let d1_a be a1 minus b1
+    Let br1_a be proc int256_borrow_from_sub with a1, b1, d1_a
+    Let d1 be d1_a minus br0
+    Let br1_b be proc int256_borrow_from_sub with d1_a, br0, d1
+    Let borrow1_out be br1_a plus br1_b
+
+    Let d2_a be a2 minus b2
+    Let br2_a be proc int256_borrow_from_sub with a2, b2, d2_a
+    Let d2 be d2_a minus borrow1_out
+    Let br2_b be proc int256_borrow_from_sub with d2_a, borrow1_out, d2
+    Let borrow2_out be br2_a plus br2_b
+
+    Let d3_a be a3 minus b3
+    Let br3_a be proc int256_borrow_from_sub with a3, b3, d3_a
+    Let d3 be d3_a minus borrow2_out
+    Let br3_b be proc int256_borrow_from_sub with d3_a, borrow2_out, d3
+    Let borrow3_out be br3_a plus br3_b
+
+    Let s0 be proc memory_set_int64 from MemoryCore with result, 0, d0
+    Let s1 be proc memory_set_int64 from MemoryCore with result, 8, d1
+    Let s2 be proc memory_set_int64 from MemoryCore with result, 16, d2
+    Let s3 be proc memory_set_int64 from MemoryCore with result, 24, d3
+    Let suf be proc memory_set_int64 from MemoryCore with underflow_out, 0, borrow3_out
+    Return INT256_OK
+End Process
+
+Process called "int256_negate_twos_complement" takes a as Integer, result as Integer returns Integer:
+    @Reasoning
+        Compute the two's-complement negation: result = (NOT a) + 1, which
+        is equivalent to (2^256 - a) mod 2^256. Used to convert between
+        unsigned and signed interpretations and to support signed
+        primitives layered on top of the unsigned core.
+    @End Reasoning
+    @Implementation
+        Step 1: invert all bits.
+        Step 2: add 1.
+        Both steps tolerate result == a aliasing.
+    @End Implementation
+    @Performance_Hints
+        Four NOTs + a constant-1 add ripple.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Note: Snapshot a's limbs into locals to allow result == a.
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+
+    Let n0 be bitwise not a0
+    Let n1 be bitwise not a1
+    Let n2 be bitwise not a2
+    Let n3 be bitwise not a3
+
+    Note: Add 1 with ripple carry.
+    Let s0 be n0 plus 1
+    Let c0 be proc int256_carry_from_add with n0, 1, s0
+
+    Let s1 be n1 plus c0
+    Let c1 be proc int256_carry_from_add with n1, c0, s1
+
+    Let s2 be n2 plus c1
+    Let c2 be proc int256_carry_from_add with n2, c1, s2
+
+    Let s3 be n3 plus c2
+
+    Let d0 be proc memory_set_int64 from MemoryCore with result, 0, s0
+    Let d1 be proc memory_set_int64 from MemoryCore with result, 8, s1
+    Let d2 be proc memory_set_int64 from MemoryCore with result, 16, s2
+    Let d3 be proc memory_set_int64 from MemoryCore with result, 24, s3
+    Return INT256_OK
+End Process
+
+Note: ============================================================================
+Note: Bitwise Operations
+Note: ============================================================================
+
+Process called "int256_bit_and" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Element-wise bitwise AND across all four limbs.
+    @End Reasoning
+    @Implementation
+        Four loads from each input, four ANDs, four stores.
+    @End Implementation
+    @Performance_Hints
+        Fully unrolled.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let b0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let b1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let b2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let b3 be proc memory_get_int64 from MemoryCore with b, 24
+    Let r0 be a0 bitwise and b0
+    Let r1 be a1 bitwise and b1
+    Let r2 be a2 bitwise and b2
+    Let r3 be a3 bitwise and b3
+    Let d0 be proc memory_set_int64 from MemoryCore with result, 0, r0
+    Let d1 be proc memory_set_int64 from MemoryCore with result, 8, r1
+    Let d2 be proc memory_set_int64 from MemoryCore with result, 16, r2
+    Let d3 be proc memory_set_int64 from MemoryCore with result, 24, r3
+    Return INT256_OK
+End Process
+
+Process called "int256_bit_or" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Element-wise bitwise OR across all four limbs.
+    @End Reasoning
+    @Implementation
+        Same pattern as int256_bit_and with OR.
+    @End Implementation
+    @Performance_Hints
+        Fully unrolled.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let b0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let b1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let b2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let b3 be proc memory_get_int64 from MemoryCore with b, 24
+    Let r0 be a0 bitwise or b0
+    Let r1 be a1 bitwise or b1
+    Let r2 be a2 bitwise or b2
+    Let r3 be a3 bitwise or b3
+    Let d0 be proc memory_set_int64 from MemoryCore with result, 0, r0
+    Let d1 be proc memory_set_int64 from MemoryCore with result, 8, r1
+    Let d2 be proc memory_set_int64 from MemoryCore with result, 16, r2
+    Let d3 be proc memory_set_int64 from MemoryCore with result, 24, r3
+    Return INT256_OK
+End Process
+
+Process called "int256_bit_xor" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Element-wise bitwise XOR across all four limbs.
+    @End Reasoning
+    @Implementation
+        Same pattern as int256_bit_and with XOR.
+    @End Implementation
+    @Performance_Hints
+        Fully unrolled.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let b0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let b1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let b2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let b3 be proc memory_get_int64 from MemoryCore with b, 24
+    Let r0 be a0 bitwise xor b0
+    Let r1 be a1 bitwise xor b1
+    Let r2 be a2 bitwise xor b2
+    Let r3 be a3 bitwise xor b3
+    Let d0 be proc memory_set_int64 from MemoryCore with result, 0, r0
+    Let d1 be proc memory_set_int64 from MemoryCore with result, 8, r1
+    Let d2 be proc memory_set_int64 from MemoryCore with result, 16, r2
+    Let d3 be proc memory_set_int64 from MemoryCore with result, 24, r3
+    Return INT256_OK
+End Process
+
+Process called "int256_bit_not" takes a as Integer, result as Integer returns Integer:
+    @Reasoning
+        Element-wise bitwise NOT across all four limbs (one's complement).
+    @End Reasoning
+    @Implementation
+        Four loads from a, four NOTs, four stores to result.
+    @End Implementation
+    @Performance_Hints
+        Fully unrolled.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let r0 be bitwise not a0
+    Let r1 be bitwise not a1
+    Let r2 be bitwise not a2
+    Let r3 be bitwise not a3
+    Let d0 be proc memory_set_int64 from MemoryCore with result, 0, r0
+    Let d1 be proc memory_set_int64 from MemoryCore with result, 8, r1
+    Let d2 be proc memory_set_int64 from MemoryCore with result, 16, r2
+    Let d3 be proc memory_set_int64 from MemoryCore with result, 24, r3
+    Return INT256_OK
+End Process
+
+Note: ============================================================================
+Note: Shifts
+Note: ============================================================================
+
+Process called "int256_shift_left" takes a as Integer, bits as Integer, result as Integer returns Integer:
+    @Reasoning
+        Logical left shift by `bits` (0..255). Bits shifted past position
+        255 are discarded (wrap mod 2^256).
+    @End Reasoning
+    @Implementation
+        Decompose: limb_shift = bits/64; bit_shift = bits%64.
+        For each output limb i, take src[i-limb_shift] (or 0) shifted left
+        by bit_shift, OR'd with src[i-limb_shift-1] (or 0) shifted right
+        by 64-bit_shift, with masking to clear arithmetic-shift sign
+        extension.
+        Operands snapshotted to allow source==result aliasing.
+    @End Implementation
+    @Performance_Hints
+        Constant-time per limb. Branches only on out-of-range source
+        indices (fully predictable at compile time for constant shifts).
+    @End Performance_Hints
+    @Security_Scope
+        Bounds-validated; constant-time data flow.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If bits is less than 0:
+        Return INT256_ERR_INVALID_SHIFT
+    End If
+    If bits is greater than or equal to INT256_BIT_WIDTH:
+        Let zret be proc int256_set_zero with result
+        Return INT256_OK
+    End If
+
+    Let s0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let s1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let s2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let s3 be proc memory_get_int64 from MemoryCore with a, 24
+
+    Let limb_shift be bits divided by 64
+    Let bit_shift be bits modulo by 64
+
+    Let i be 0
+    While i is less than 4:
+        Let hi_index be i minus limb_shift
+        Let lo_index be hi_index minus 1
+        Let hi_limb be 0
+        Let lo_limb be 0
+        If hi_index is greater than or equal to 0:
+            If hi_index is equal to 0:
+                Set hi_limb to s0
+            End If
+            If hi_index is equal to 1:
+                Set hi_limb to s1
+            End If
+            If hi_index is equal to 2:
+                Set hi_limb to s2
+            End If
+            If hi_index is equal to 3:
+                Set hi_limb to s3
+            End If
+        End If
+        If lo_index is greater than or equal to 0:
+            If lo_index is equal to 0:
+                Set lo_limb to s0
+            End If
+            If lo_index is equal to 1:
+                Set lo_limb to s1
+            End If
+            If lo_index is equal to 2:
+                Set lo_limb to s2
+            End If
+            If lo_index is equal to 3:
+                Set lo_limb to s3
+            End If
+        End If
+        Let out_value be 0
+        If bit_shift is equal to 0:
+            Set out_value to hi_limb
+        Otherwise:
+            Let hi_part be hi_limb shifted left by bit_shift
+            Let inv_shift be 64 minus bit_shift
+            Let lo_part_raw be lo_limb shifted right by inv_shift
+            Let mask_width be bit_shift
+            Let lo_mask be 0
+            If mask_width is equal to 64:
+                Set lo_mask to bitwise not 0
+            Otherwise:
+                Let mask_base be 1 shifted left by mask_width
+                Set lo_mask to mask_base minus 1
+            End If
+            Let lo_part be lo_part_raw bitwise and lo_mask
+            Set out_value to hi_part bitwise or lo_part
+        End If
+        Let offset be i multiplied by 8
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, out_value
+        Set i to i plus 1
+    End While
+    Return INT256_OK
+End Process
+
+Process called "int256_shift_right" takes a as Integer, bits as Integer, result as Integer returns Integer:
+    @Reasoning
+        Logical right shift by `bits` (0..255). Vacated high bits zero.
+        Logical (zero-fill), not arithmetic.
+    @End Reasoning
+    @Implementation
+        Symmetric to shift_left. For each output limb i, take
+        src[i+limb_shift] >> bit_shift OR'd with src[i+limb_shift+1] <<
+        (64 - bit_shift). Mask lo_part to zero any sign-extension that
+        arithmetic right shift introduces.
+    @End Implementation
+    @Performance_Hints
+        Constant-time per limb.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds-validated; constant-time data flow.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If bits is less than 0:
+        Return INT256_ERR_INVALID_SHIFT
+    End If
+    If bits is greater than or equal to INT256_BIT_WIDTH:
+        Let zret be proc int256_set_zero with result
+        Return INT256_OK
+    End If
+
+    Let s0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let s1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let s2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let s3 be proc memory_get_int64 from MemoryCore with a, 24
+
+    Let limb_shift be bits divided by 64
+    Let bit_shift be bits modulo by 64
+
+    Let i be 0
+    While i is less than 4:
+        Let lo_index be i plus limb_shift
+        Let hi_index be lo_index plus 1
+        Let lo_limb be 0
+        Let hi_limb be 0
+        If lo_index is less than or equal to 3:
+            If lo_index is equal to 0:
+                Set lo_limb to s0
+            End If
+            If lo_index is equal to 1:
+                Set lo_limb to s1
+            End If
+            If lo_index is equal to 2:
+                Set lo_limb to s2
+            End If
+            If lo_index is equal to 3:
+                Set lo_limb to s3
+            End If
+        End If
+        If hi_index is less than or equal to 3:
+            If hi_index is equal to 0:
+                Set hi_limb to s0
+            End If
+            If hi_index is equal to 1:
+                Set hi_limb to s1
+            End If
+            If hi_index is equal to 2:
+                Set hi_limb to s2
+            End If
+            If hi_index is equal to 3:
+                Set hi_limb to s3
+            End If
+        End If
+        Let out_value be 0
+        If bit_shift is equal to 0:
+            Set out_value to lo_limb
+        Otherwise:
+            Let lo_part_raw be lo_limb shifted right by bit_shift
+            Let lo_keep_width be 64 minus bit_shift
+            Let lo_mask be 0
+            If lo_keep_width is equal to 64:
+                Set lo_mask to bitwise not 0
+            Otherwise:
+                Let mask_base be 1 shifted left by lo_keep_width
+                Set lo_mask to mask_base minus 1
+            End If
+            Let lo_part be lo_part_raw bitwise and lo_mask
+            Let inv_shift be 64 minus bit_shift
+            Let hi_part be hi_limb shifted left by inv_shift
+            Set out_value to lo_part bitwise or hi_part
+        End If
+        Let offset be i multiplied by 8
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, out_value
+        Set i to i plus 1
+    End While
+    Return INT256_OK
+End Process
+
+Note: ============================================================================
+Note: 64x64 -> 128 Multiplication (Schoolbook Building Block)
+Note: ============================================================================
+
+Process called "int256_mul_64x64_to_128_lo" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Return the low 64 bits of the 128-bit unsigned product a*b.
+        Native multiplication produces the low 64 bits via natural
+        wrapping.
+    @End Reasoning
+    @Implementation
+        Return a multiplied by b.
+    @End Implementation
+    @Performance_Hints
+        Single mul instruction.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Return a multiplied by b
+End Process
+
+Process called "int256_mul_64x64_to_128_hi" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Return the high 64 bits of the 128-bit unsigned product a*b.
+        Decompose into 32-bit halves and use only the wrapping 64-bit
+        multiplier (the bootstrap compiler does not expose mulq high
+        result or __int128).
+    @End Reasoning
+    @Implementation
+        a = a_hi*2^32 + a_lo, b = b_hi*2^32 + b_lo.
+        Four 32x32 -> 64 partial products: lo_lo, hi_lo, lo_hi, hi_hi.
+        Sum the column at offset 32: mid = hi_lo + lo_hi + hi32(lo_lo),
+        captured with carries (since three 64-bit unsigned values can
+        produce a 2-bit carry).
+        High 64 bits = hi_hi + hi32(mid) + (cross-column carry << 32).
+    @End Implementation
+    @Performance_Hints
+        4 multiplies + several shifts/ANDs/adds. The portable fallback
+        when the target compiler/ISA does not expose mulhi.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time data flow (no value-dependent branches).
+    @End Security_Scope
+
+    Let mask32 be INT256_LIMB_MASK_LOW32
+    Let a_lo be a bitwise and mask32
+    Let a_hi_raw be a shifted right by 32
+    Let a_hi be a_hi_raw bitwise and mask32
+    Let b_lo be b bitwise and mask32
+    Let b_hi_raw be b shifted right by 32
+    Let b_hi be b_hi_raw bitwise and mask32
+
+    Let lo_lo be a_lo multiplied by b_lo
+    Let hi_lo be a_hi multiplied by b_lo
+    Let lo_hi be a_lo multiplied by b_hi
+    Let hi_hi be a_hi multiplied by b_hi
+
+    Let lo_lo_high_raw be lo_lo shifted right by 32
+    Let lo_lo_high be lo_lo_high_raw bitwise and mask32
+
+    Let mid_a be hi_lo plus lo_lo_high
+    Let carry_a be proc int256_carry_from_add with hi_lo, lo_lo_high, mid_a
+    Let mid be mid_a plus lo_hi
+    Let carry_b be proc int256_carry_from_add with mid_a, lo_hi, mid
+
+    Let mid_high_raw be mid shifted right by 32
+    Let mid_high be mid_high_raw bitwise and mask32
+
+    Let total_carry be carry_a plus carry_b
+    Let carry_contribution be total_carry shifted left by 32
+    Let hi_partial be hi_hi plus mid_high
+    Let hi_result be hi_partial plus carry_contribution
+    Return hi_result
+End Process
+
+Note: ============================================================================
+Note: Multiplication
+Note: ============================================================================
+
+Process called "int256_mul" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Compute result = (a * b) mod 2^256. Wrapping semantics: bits
+        beyond position 255 are discarded.
+    @End Reasoning
+    @Implementation
+        Schoolbook. For each (i, j) with i+j < 4, compute the 128-bit
+        product a_i * b_j (lo + hi halves) and accumulate into result at
+        positions i+j and i+j+1 with carry propagation upward.
+        Operand snapshot to allow result aliasing a or b.
+    @End Implementation
+    @Performance_Hints
+        4x4 = 16 multiplies maximum, but truncated at limb 3 so the
+        effective count is 10 full partial products (positions 0..3).
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time inner loop. Wrapping semantics documented.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Note: Snapshot operands.
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let b0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let b1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let b2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let b3 be proc memory_get_int64 from MemoryCore with b, 24
+
+    Note: Zero result accumulator.
+    Let zres be proc int256_set_zero with result
+
+    Let i be 0
+    While i is less than 4:
+        Let ai be 0
+        If i is equal to 0:
+            Set ai to a0
+        End If
+        If i is equal to 1:
+            Set ai to a1
+        End If
+        If i is equal to 2:
+            Set ai to a2
+        End If
+        If i is equal to 3:
+            Set ai to a3
+        End If
+        Let j be 0
+        While j is less than 4:
+            Let dest be i plus j
+            If dest is less than 4:
+                Let bj be 0
+                If j is equal to 0:
+                    Set bj to b0
+                End If
+                If j is equal to 1:
+                    Set bj to b1
+                End If
+                If j is equal to 2:
+                    Set bj to b2
+                End If
+                If j is equal to 3:
+                    Set bj to b3
+                End If
+
+                Let p_lo be proc int256_mul_64x64_to_128_lo with ai, bj
+                Let p_hi be proc int256_mul_64x64_to_128_hi with ai, bj
+
+                Let dest_offset be dest multiplied by 8
+                Let cur_dest be proc memory_get_int64 from MemoryCore with result, dest_offset
+                Let new_dest be cur_dest plus p_lo
+                Let carry_dest be proc int256_carry_from_add with cur_dest, p_lo, new_dest
+                Let store_d be proc memory_set_int64 from MemoryCore with result, dest_offset, new_dest
+
+                Let next_dest be dest plus 1
+                If next_dest is less than 4:
+                    Let next_offset be next_dest multiplied by 8
+                    Let cur_next be proc memory_get_int64 from MemoryCore with result, next_offset
+                    Let added_hi be cur_next plus p_hi
+                    Let carry_hi be proc int256_carry_from_add with cur_next, p_hi, added_hi
+                    Let final_next be added_hi plus carry_dest
+                    Let carry_cd be proc int256_carry_from_add with added_hi, carry_dest, final_next
+                    Let store_n be proc memory_set_int64 from MemoryCore with result, next_offset, final_next
+                    Let propagate be carry_hi plus carry_cd
+                    Let k be next_dest plus 1
+                    While k is less than 4:
+                        If propagate is equal to 0:
+                            Set k to 4
+                        Otherwise:
+                            Let k_offset be k multiplied by 8
+                            Let cur_k be proc memory_get_int64 from MemoryCore with result, k_offset
+                            Let new_k be cur_k plus propagate
+                            Let carry_k be proc int256_carry_from_add with cur_k, propagate, new_k
+                            Let store_k be proc memory_set_int64 from MemoryCore with result, k_offset, new_k
+                            Set propagate to carry_k
+                            Set k to k plus 1
+                        End If
+                    End While
+                End If
+            End If
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+    Return INT256_OK
+End Process
+
+Process called "int256_mul_full" takes a as Integer, b as Integer, low_out as Integer, high_out as Integer returns Integer:
+    @Reasoning
+        Compute the full 256x256 -> 512 bit product. Returns the low 256
+        bits in low_out (a regular Int256 buffer) and the high 256 bits
+        in high_out (another Int256 buffer). Required for fixed-point
+        multiplication where the intermediate product would otherwise lose
+        precision.
+    @End Reasoning
+    @Implementation
+        Allocate a temporary Int512 buffer, run schoolbook into it (the
+        same algorithm as int512_mul restricted to 4-limb inputs filling
+        8-limb output), then copy the low 4 limbs to low_out and the high
+        4 limbs to high_out. Operand snapshot for aliasing safety.
+    @End Implementation
+    @Performance_Hints
+        16 full 64x64 -> 128 multiplications. No carry truncation. The
+        most expensive multiplication path; reserved for cases where
+        full precision is required.
+    @End Performance_Hints
+    @Security_Scope
+        Wrapping never occurs; result is exact. Constant-time inner loop.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If low_out is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If high_out is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Note: Snapshot a and b.
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let b0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let b1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let b2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let b3 be proc memory_get_int64 from MemoryCore with b, 24
+
+    Note: Allocate an Int512 scratch buffer for the full product.
+    Let prod be proc int512_allocate from Int512
+    If prod is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let zret be proc int512_set_zero from Int512 with prod
+
+    Note: Schoolbook accumulation: for each (i, j) where i,j in 0..3,
+    Note: write a_i * b_j into prod at limb i+j (lo) and i+j+1 (hi).
+    Let i be 0
+    While i is less than 4:
+        Let ai be 0
+        If i is equal to 0:
+            Set ai to a0
+        End If
+        If i is equal to 1:
+            Set ai to a1
+        End If
+        If i is equal to 2:
+            Set ai to a2
+        End If
+        If i is equal to 3:
+            Set ai to a3
+        End If
+        Let j be 0
+        While j is less than 4:
+            Let bj be 0
+            If j is equal to 0:
+                Set bj to b0
+            End If
+            If j is equal to 1:
+                Set bj to b1
+            End If
+            If j is equal to 2:
+                Set bj to b2
+            End If
+            If j is equal to 3:
+                Set bj to b3
+            End If
+
+            Let p_lo be proc int256_mul_64x64_to_128_lo with ai, bj
+            Let p_hi be proc int256_mul_64x64_to_128_hi with ai, bj
+
+            Let dest be i plus j
+            Let dest_offset be dest multiplied by 8
+            Let cur_dest be proc memory_get_int64 from MemoryCore with prod, dest_offset
+            Let new_dest be cur_dest plus p_lo
+            Let carry_dest be proc int256_carry_from_add with cur_dest, p_lo, new_dest
+            Let store_d be proc memory_set_int64 from MemoryCore with prod, dest_offset, new_dest
+
+            Let next_dest be dest plus 1
+            If next_dest is less than 8:
+                Let next_offset be next_dest multiplied by 8
+                Let cur_next be proc memory_get_int64 from MemoryCore with prod, next_offset
+                Let added_hi be cur_next plus p_hi
+                Let carry_hi be proc int256_carry_from_add with cur_next, p_hi, added_hi
+                Let final_next be added_hi plus carry_dest
+                Let carry_cd be proc int256_carry_from_add with added_hi, carry_dest, final_next
+                Let store_n be proc memory_set_int64 from MemoryCore with prod, next_offset, final_next
+                Let propagate be carry_hi plus carry_cd
+                Let k be next_dest plus 1
+                While k is less than 8:
+                    If propagate is equal to 0:
+                        Set k to 8
+                    Otherwise:
+                        Let k_offset be k multiplied by 8
+                        Let cur_k be proc memory_get_int64 from MemoryCore with prod, k_offset
+                        Let new_k be cur_k plus propagate
+                        Let carry_k be proc int256_carry_from_add with cur_k, propagate, new_k
+                        Let store_k be proc memory_set_int64 from MemoryCore with prod, k_offset, new_k
+                        Set propagate to carry_k
+                        Set k to k plus 1
+                    End If
+                End While
+            End If
+
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+
+    Note: Copy low 4 limbs (offsets 0..24) to low_out.
+    Let pl0 be proc memory_get_int64 from MemoryCore with prod, 0
+    Let pl1 be proc memory_get_int64 from MemoryCore with prod, 8
+    Let pl2 be proc memory_get_int64 from MemoryCore with prod, 16
+    Let pl3 be proc memory_get_int64 from MemoryCore with prod, 24
+    Let sl0 be proc memory_set_int64 from MemoryCore with low_out, 0, pl0
+    Let sl1 be proc memory_set_int64 from MemoryCore with low_out, 8, pl1
+    Let sl2 be proc memory_set_int64 from MemoryCore with low_out, 16, pl2
+    Let sl3 be proc memory_set_int64 from MemoryCore with low_out, 24, pl3
+
+    Note: Copy high 4 limbs (offsets 32..56) to high_out.
+    Let ph0 be proc memory_get_int64 from MemoryCore with prod, 32
+    Let ph1 be proc memory_get_int64 from MemoryCore with prod, 40
+    Let ph2 be proc memory_get_int64 from MemoryCore with prod, 48
+    Let ph3 be proc memory_get_int64 from MemoryCore with prod, 56
+    Let sh0 be proc memory_set_int64 from MemoryCore with high_out, 0, ph0
+    Let sh1 be proc memory_set_int64 from MemoryCore with high_out, 8, ph1
+    Let sh2 be proc memory_set_int64 from MemoryCore with high_out, 16, ph2
+    Let sh3 be proc memory_set_int64 from MemoryCore with high_out, 24, ph3
+
+    Let dummy_free be proc int512_free from Int512 with prod
+    Return INT256_OK
+End Process
+
+Process called "int256_mul_checked" takes a as Integer, b as Integer, result as Integer, overflow_out as Integer returns Integer:
+    @Reasoning
+        Multiply a and b; write the low 256 bits to result and set
+        *overflow_out to 1 if any bit of the high 256 bits is set
+        (indicating the true product exceeded 2^256 - 1), else 0.
+    @End Reasoning
+    @Implementation
+        Allocate a scratch high buffer, call int256_mul_full, then test
+        if the high buffer is zero. Overflow flag is 0 if high is zero,
+        else 1.
+    @End Implementation
+    @Performance_Hints
+        Same cost as int256_mul_full plus a zero-test.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time inner loop; final overflow test is constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If overflow_out is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Let high_scratch be proc int256_allocate
+    If high_scratch is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let rc be proc int256_mul_full with a, b, result, high_scratch
+    If rc is not equal to INT256_OK:
+        Let dummy_free be proc int256_free with high_scratch
+        Return rc
+    End If
+    Let is_zero be proc int256_is_zero with high_scratch
+    Let overflow_flag be 0
+    If is_zero is equal to 0:
+        Set overflow_flag to 1
+    End If
+    Let dummy_set be proc memory_set_int64 from MemoryCore with overflow_out, 0, overflow_flag
+    Let dummy_free2 be proc int256_free with high_scratch
+    Return INT256_OK
+End Process
+
+Note: ============================================================================
+Note: Division and Modulo (Binary Long Division)
+Note: ============================================================================
+
+Process called "int256_divmod" takes a as Integer, b as Integer, q_out as Integer, r_out as Integer returns Integer:
+    @Reasoning
+        Compute q, r such that a = q*b + r with 0 <= r < b. Binary
+        long division (shift-and-subtract). Deterministic across all
+        platforms.
+    @End Reasoning
+    @Implementation
+        Pseudocode:
+          if b == 0: return INT256_ERR_DIVIDE_BY_ZERO
+          q = 0; r = 0
+          for bit_index from 255 down to 0:
+              r = (r << 1) | bit(a, bit_index)
+              if r >= b:
+                  r -= b
+                  q |= (1 << bit_index)
+        Uses scratch buffers for the in-progress remainder and quotient
+        so the inputs can alias the outputs safely.
+    @End Implementation
+    @Performance_Hints
+        256 iterations. Each iteration: one full-width left shift, one
+        single-bit OR, one limb comparison, optionally one subtract and
+        one limb bit-set. Dominant cost: ~256 left-shifts.
+    @End Performance_Hints
+    @Security_Scope
+        Divide-by-zero explicitly rejected with INT256_ERR_DIVIDE_BY_ZERO.
+        Data-dependent branch on r >= b makes this not constant-time
+        in general; callers requiring CT division must use a CT
+        implementation specifically.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If q_out is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If r_out is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Let div_zero be proc int256_is_zero with b
+    If div_zero is equal to 1:
+        Return INT256_ERR_DIVIDE_BY_ZERO
+    End If
+
+    Let a_copy be proc int256_allocate
+    If a_copy is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let b_copy be proc int256_allocate
+    If b_copy is equal to 0:
+        Let fa be proc int256_free with a_copy
+        Return INT256_ERR_NULL
+    End If
+    Let r_work be proc int256_allocate
+    If r_work is equal to 0:
+        Let fa2 be proc int256_free with a_copy
+        Let fb2 be proc int256_free with b_copy
+        Return INT256_ERR_NULL
+    End If
+    Let q_work be proc int256_allocate
+    If q_work is equal to 0:
+        Let fa3 be proc int256_free with a_copy
+        Let fb3 be proc int256_free with b_copy
+        Let fr3 be proc int256_free with r_work
+        Return INT256_ERR_NULL
+    End If
+
+    Let cpa be proc int256_copy with a, a_copy
+    Let cpb be proc int256_copy with b, b_copy
+    Let zr be proc int256_set_zero with r_work
+    Let zq be proc int256_set_zero with q_work
+
+    Let bit_index be 255
+    While bit_index is greater than or equal to 0:
+        Let dshl be proc int256_shift_left with r_work, 1, r_work
+        Let limb_idx be bit_index divided by 64
+        Let bit_in_limb be bit_index modulo by 64
+        Let offset be limb_idx multiplied by 8
+        Let a_limb be proc memory_get_int64 from MemoryCore with a_copy, offset
+        Let shifted be a_limb shifted right by bit_in_limb
+        Let dividend_bit be shifted bitwise and 1
+        Let cur_low be proc memory_get_int64 from MemoryCore with r_work, 0
+        Let new_low be cur_low bitwise or dividend_bit
+        Let dstore be proc memory_set_int64 from MemoryCore with r_work, 0, new_low
+
+        Let cmp be proc int256_compare with r_work, b_copy
+        If cmp is greater than or equal to 0:
+            Let dsub be proc int256_sub with r_work, b_copy, r_work
+            Let q_offset be limb_idx multiplied by 8
+            Let q_cur be proc memory_get_int64 from MemoryCore with q_work, q_offset
+            Let q_mask be 1 shifted left by bit_in_limb
+            Let q_new be q_cur bitwise or q_mask
+            Let qstore be proc memory_set_int64 from MemoryCore with q_work, q_offset, q_new
+        End If
+        Set bit_index to bit_index minus 1
+    End While
+
+    Let cpq be proc int256_copy with q_work, q_out
+    Let cpr be proc int256_copy with r_work, r_out
+    Let fa4 be proc int256_free with a_copy
+    Let fb4 be proc int256_free with b_copy
+    Let fr4 be proc int256_free with r_work
+    Let fq4 be proc int256_free with q_work
+    Return INT256_OK
+End Process
+
+Process called "int256_div" takes a as Integer, b as Integer, q_out as Integer, r_out as Integer returns Integer:
+    @Reasoning
+        Public divmod entry point that also exposes the remainder. The
+        spec calls this `int256_div(a, b, quotient_out, remainder_out)`;
+        identical to int256_divmod.
+    @End Reasoning
+    @Implementation
+        Direct call to int256_divmod.
+    @End Implementation
+    @Performance_Hints
+        Same as int256_divmod.
+    @End Performance_Hints
+    @Security_Scope
+        Same as int256_divmod.
+    @End Security_Scope
+
+    Let rc be proc int256_divmod with a, b, q_out, r_out
+    Return rc
+End Process
+
+Process called "int256_mod" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Compute result = a mod b. Discards the quotient via a local
+        scratch buffer.
+    @End Reasoning
+    @Implementation
+        Allocate scratch quotient, call divmod, free scratch.
+    @End Implementation
+    @Performance_Hints
+        Same as divmod plus one allocation pair.
+    @End Performance_Hints
+    @Security_Scope
+        Same as divmod.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Let q_scratch be proc int256_allocate
+    If q_scratch is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let rc be proc int256_divmod with a, b, q_scratch, result
+    Let dfree be proc int256_free with q_scratch
+    Return rc
+End Process
+
+Note: ============================================================================
+Note: Byte Serialization
+Note: ============================================================================
+
+Process called "int256_from_bytes_be" takes bytes_ptr as Integer, result as Integer returns Integer:
+    @Reasoning
+        Read 32 bytes in big-endian order (most significant byte first)
+        into the Int256 result. This matches the byte ordering used in
+        Ethereum RLP encoding, network protocols, and standard
+        cryptographic libraries.
+    @End Reasoning
+    @Implementation
+        Iterate 32 bytes from bytes_ptr; for each byte index b in 0..31,
+        the byte at offset b is the (31-b)-th byte from the bottom of the
+        little-endian limb representation. We compute:
+          target_limb_index = (31 - b) / 8
+          target_byte_in_limb = (31 - b) % 8
+        and place the byte at the correct offset within the result buffer.
+        Implementation walks 32 bytes and writes into the result buffer
+        in place after first zeroing it.
+    @End Implementation
+    @Performance_Hints
+        32 byte loads + 32 byte stores, with offset math.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds: bytes_ptr must reference a valid 32-byte source buffer.
+        Caller's responsibility.
+    @End Security_Scope
+
+    If bytes_ptr is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let zret be proc int256_set_zero with result
+    Let i be 0
+    While i is less than 32:
+        Let byte_value be proc memory_get_byte from MemoryCore with bytes_ptr, i
+        Note: Byte i in the source (big-endian) sits at position
+        Note: (31 - i) in the little-endian internal layout.
+        Let target_offset be 31 minus i
+        Let dummy be proc memory_set_byte from MemoryCore with result, target_offset, byte_value
+        Set i to i plus 1
+    End While
+    Return INT256_OK
+End Process
+
+Process called "int256_from_bytes_le" takes bytes_ptr as Integer, result as Integer returns Integer:
+    @Reasoning
+        Read 32 bytes in little-endian order (least significant byte
+        first) into the Int256 result. Direct copy because the internal
+        layout is already little-endian by byte.
+    @End Reasoning
+    @Implementation
+        32 byte copies from source to destination at the same offsets.
+    @End Implementation
+    @Performance_Hints
+        32 byte loads + 32 byte stores. Could be vectorized as four
+        64-bit loads/stores at the cost of source-alignment assumptions.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds: 32 bytes of source required.
+    @End Security_Scope
+
+    If bytes_ptr is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let i be 0
+    While i is less than 32:
+        Let byte_value be proc memory_get_byte from MemoryCore with bytes_ptr, i
+        Let dummy be proc memory_set_byte from MemoryCore with result, i, byte_value
+        Set i to i plus 1
+    End While
+    Return INT256_OK
+End Process
+
+Process called "int256_to_bytes_be" takes a as Integer, bytes_ptr as Integer returns Integer:
+    @Reasoning
+        Write 32 bytes of Int256 to bytes_ptr in big-endian order.
+        Byte i of the destination receives byte (31-i) of the internal
+        little-endian layout.
+    @End Reasoning
+    @Implementation
+        Walks 32 bytes, reading from the reversed offset.
+    @End Implementation
+    @Performance_Hints
+        32 loads + 32 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds: destination buffer must have 32 bytes available.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If bytes_ptr is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let i be 0
+    While i is less than 32:
+        Let source_offset be 31 minus i
+        Let byte_value be proc memory_get_byte from MemoryCore with a, source_offset
+        Let dummy be proc memory_set_byte from MemoryCore with bytes_ptr, i, byte_value
+        Set i to i plus 1
+    End While
+    Return INT256_OK
+End Process
+
+Process called "int256_to_bytes_le" takes a as Integer, bytes_ptr as Integer returns Integer:
+    @Reasoning
+        Write 32 bytes of Int256 to bytes_ptr in little-endian order.
+        Direct byte-by-byte copy from the internal layout.
+    @End Reasoning
+    @Implementation
+        32 byte copies, same offset.
+    @End Implementation
+    @Performance_Hints
+        32 loads + 32 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds: destination must have 32 bytes available.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If bytes_ptr is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let i be 0
+    While i is less than 32:
+        Let byte_value be proc memory_get_byte from MemoryCore with a, i
+        Let dummy be proc memory_set_byte from MemoryCore with bytes_ptr, i, byte_value
+        Set i to i plus 1
+    End While
+    Return INT256_OK
+End Process
+
+Note: ============================================================================
+Note: Hex String Conversion
+Note: ============================================================================
+
+Process called "int256_hex_char_to_value" takes ch as Integer returns Integer:
+    @Reasoning
+        Convert a single hex character ('0'..'9', 'a'..'f', 'A'..'F') to
+        its 0..15 value, or -1 if invalid. Used during hex parsing.
+    @End Reasoning
+    @Implementation
+        Range tests on the ASCII code.
+    @End Implementation
+    @Performance_Hints
+        Three branches; fully predictable.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 on invalid input; caller must check.
+    @End Security_Scope
+
+    If ch is greater than or equal to INT256_ASCII_ZERO:
+        If ch is less than or equal to INT256_ASCII_NINE:
+            Return ch minus INT256_ASCII_ZERO
+        End If
+    End If
+    If ch is greater than or equal to INT256_ASCII_LOWER_A:
+        If ch is less than or equal to INT256_ASCII_LOWER_F:
+            Let base be ch minus INT256_ASCII_LOWER_A
+            Return base plus 10
+        End If
+    End If
+    If ch is greater than or equal to INT256_ASCII_UPPER_A:
+        If ch is less than or equal to INT256_ASCII_UPPER_F:
+            Let base be ch minus INT256_ASCII_UPPER_A
+            Return base plus 10
+        End If
+    End If
+    Return -1
+End Process
+
+Process called "int256_value_to_hex_char" takes value as Integer returns Integer:
+    @Reasoning
+        Convert a 0..15 nibble value into a lowercase hex ASCII byte.
+        '0'..'9' for 0..9, 'a'..'f' for 10..15. Used during hex output.
+    @End Reasoning
+    @Implementation
+        Direct range mapping.
+    @End Implementation
+    @Performance_Hints
+        Single branch.
+    @End Performance_Hints
+    @Security_Scope
+        Out-of-range value returns '0' (defensive default; caller is
+        responsible for never passing out-of-range nibbles to this proc).
+        We use '0' rather than an error code because the result type is
+        the byte itself; callers checking for malformed input should
+        validate the nibble first.
+    @End Security_Scope
+
+    If value is less than 0:
+        Return INT256_ASCII_ZERO
+    End If
+    If value is less than 10:
+        Return INT256_ASCII_ZERO plus value
+    End If
+    If value is less than 16:
+        Let offset be value minus 10
+        Return INT256_ASCII_LOWER_A plus offset
+    End If
+    Return INT256_ASCII_ZERO
+End Process
+
+Process called "int256_string_length" takes str_ptr as Integer returns Integer:
+    @Reasoning
+        Compute the length of a null-terminated C-style string. Internal
+        utility used by hex / decimal parsers.
+    @End Reasoning
+    @Implementation
+        Walks bytes until a zero byte is found.
+    @End Implementation
+    @Performance_Hints
+        O(n) on string length.
+    @End Performance_Hints
+    @Security_Scope
+        Walks until a null terminator; caller must ensure the string is
+        properly terminated.
+    @End Security_Scope
+
+    If str_ptr is equal to 0:
+        Return 0
+    End If
+    Let len be 0
+    While len is less than 1000000:
+        Let byte_value be proc memory_get_byte from MemoryCore with str_ptr, len
+        If byte_value is equal to 0:
+            Return len
+        End If
+        Set len to len plus 1
+    End While
+    Return len
+End Process
+
+Process called "int256_from_hex_string" takes str_ptr as Integer, result as Integer returns Integer:
+    @Reasoning
+        Parse a hex string into the Int256 result. The string may
+        optionally start with "0x" or "0X". Each subsequent character
+        must be a valid hex digit; otherwise INT256_ERR_INVALID_INPUT.
+        Strings longer than 64 hex digits (excluding prefix) are
+        truncated at the high end and INT256_ERR_INVALID_INPUT is
+        returned to flag the input as too long.
+    @End Reasoning
+    @Implementation
+        Step 1: skip "0x"/"0X" prefix if present.
+        Step 2: zero result.
+        Step 3: starting from the highest character, walk each character
+        from left to right; for each character, multiply result by 16
+        (shift_left by 4) and OR-add the nibble.
+        Length validation: prefix-stripped length must be 1..64.
+    @End Implementation
+    @Performance_Hints
+        O(n) on string length. Each character requires one shift_left(4)
+        which is O(limbs).
+    @End Performance_Hints
+    @Security_Scope
+        Invalid characters and out-of-range lengths are rejected.
+    @End Security_Scope
+
+    If str_ptr is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+
+    Let len be proc int256_string_length with str_ptr
+    If len is equal to 0:
+        Return INT256_ERR_INVALID_INPUT
+    End If
+
+    Note: Detect "0x" or "0X" prefix.
+    Let start_index be 0
+    If len is greater than or equal to 2:
+        Let ch0 be proc memory_get_byte from MemoryCore with str_ptr, 0
+        Let ch1 be proc memory_get_byte from MemoryCore with str_ptr, 1
+        If ch0 is equal to INT256_ASCII_ZERO:
+            If ch1 is equal to 120:
+                Set start_index to 2
+            End If
+            If ch1 is equal to 88:
+                Set start_index to 2
+            End If
+        End If
+    End If
+
+    Let effective_len be len minus start_index
+    If effective_len is equal to 0:
+        Return INT256_ERR_INVALID_INPUT
+    End If
+    If effective_len is greater than 64:
+        Return INT256_ERR_INVALID_INPUT
+    End If
+
+    Let zret be proc int256_set_zero with result
+
+    Let i be start_index
+    While i is less than len:
+        Let ch be proc memory_get_byte from MemoryCore with str_ptr, i
+        Let nibble be proc int256_hex_char_to_value with ch
+        If nibble is less than 0:
+            Return INT256_ERR_INVALID_INPUT
+        End If
+        Let shl_ret be proc int256_shift_left with result, 4, result
+        Let cur_low be proc memory_get_int64 from MemoryCore with result, 0
+        Let new_low be cur_low bitwise or nibble
+        Let dstore be proc memory_set_int64 from MemoryCore with result, 0, new_low
+        Set i to i plus 1
+    End While
+    Return INT256_OK
+End Process
+
+Process called "int256_to_hex_string" takes a as Integer, out_ptr as Integer, out_capacity as Integer returns Integer:
+    @Reasoning
+        Write the Int256 to out_ptr as a lowercase hex string (no "0x"
+        prefix) with leading zeros suppressed (except when the value is
+        zero, in which case "0" is written). Returns the length written
+        (excluding the null terminator) or a negative error code.
+        The buffer must hold at least 65 bytes (64 hex digits + 1 null).
+    @End Reasoning
+    @Implementation
+        Compute 64 hex digits by extracting nibbles from the most
+        significant down to the least significant. Skip leading zero
+        nibbles for normal output. If all nibbles were zero, output "0".
+        Always write a null terminator at the end.
+        Capacity validated to be at least 65.
+    @End Implementation
+    @Performance_Hints
+        64 nibble extractions, 64 byte stores.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds: out_capacity must be >= 65 to safely hold the maximum
+        possible output (64 chars + null).
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If out_ptr is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If out_capacity is less than 65:
+        Return INT256_ERR_INVALID_INPUT
+    End If
+
+    Let is_zero_flag be proc int256_is_zero with a
+    If is_zero_flag is equal to 1:
+        Let d0 be proc memory_set_byte from MemoryCore with out_ptr, 0, INT256_ASCII_ZERO
+        Let d1 be proc memory_set_byte from MemoryCore with out_ptr, 1, 0
+        Return 1
+    End If
+
+    Note: Extract nibbles from high (nibble 63 = bit 252..255) down to 0.
+    Let scratch_index be 0
+    Let started be 0
+    Let write_pos be 0
+    Let nibble_index be 63
+    While nibble_index is greater than or equal to 0:
+        Let limb_index be nibble_index divided by 16
+        Let nibble_in_limb be nibble_index modulo by 16
+        Let bit_shift be nibble_in_limb multiplied by 4
+        Let offset be limb_index multiplied by 8
+        Let limb_value be proc memory_get_int64 from MemoryCore with a, offset
+        Let shifted be limb_value shifted right by bit_shift
+        Let nibble be shifted bitwise and 15
+        If started is equal to 0:
+            If nibble is not equal to 0:
+                Set started to 1
+            End If
+        End If
+        If started is equal to 1:
+            Let ch be proc int256_value_to_hex_char with nibble
+            Let dummy be proc memory_set_byte from MemoryCore with out_ptr, write_pos, ch
+            Set write_pos to write_pos plus 1
+        End If
+        Set nibble_index to nibble_index minus 1
+    End While
+    Let null_terminator be proc memory_set_byte from MemoryCore with out_ptr, write_pos, 0
+    Return write_pos
+End Process
+
+Note: ============================================================================
+Note: Decimal String Conversion
+Note: ============================================================================
+
+Process called "int256_from_decimal_string" takes str_ptr as Integer, result as Integer returns Integer:
+    @Reasoning
+        Parse a decimal string into the Int256 result. The string must
+        consist entirely of digits 0..9 (no '+', '-' since Int256 is
+        unsigned, no whitespace).
+    @End Reasoning
+    @Implementation
+        For each digit from left to right:
+          result = result * 10 + digit
+        Multiplication by 10 implemented as (result << 3) + (result << 1)
+        = 8*result + 2*result, all via int256_mul / shift_left + add.
+        For numerical efficiency we instead multiply by a constant 10
+        Int256 prepared once.
+    @End Implementation
+    @Performance_Hints
+        O(n) decimal digits; each digit requires one mul and one add.
+        Maximum decimal length for 256-bit unsigned is 78 digits
+        (since 2^256 - 1 ~= 1.16 * 10^77).
+    @End Performance_Hints
+    @Security_Scope
+        Returns INT256_ERR_INVALID_INPUT for empty or malformed input.
+        Note: input strings longer than 78 digits may overflow silently
+        (wrapping mod 2^256); the caller should bound the input length
+        for consensus-critical use.
+    @End Security_Scope
+
+    If str_ptr is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let len be proc int256_string_length with str_ptr
+    If len is equal to 0:
+        Return INT256_ERR_INVALID_INPUT
+    End If
+
+    Let zret be proc int256_set_zero with result
+
+    Let ten be proc int256_allocate
+    If ten is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let ten_set be proc int256_set_u64 with ten, 10
+
+    Let digit_buf be proc int256_allocate
+    If digit_buf is equal to 0:
+        Let ft be proc int256_free with ten
+        Return INT256_ERR_NULL
+    End If
+
+    Let scratch be proc int256_allocate
+    If scratch is equal to 0:
+        Let ft2 be proc int256_free with ten
+        Let fdb2 be proc int256_free with digit_buf
+        Return INT256_ERR_NULL
+    End If
+
+    Let i be 0
+    While i is less than len:
+        Let ch be proc memory_get_byte from MemoryCore with str_ptr, i
+        If ch is less than INT256_ASCII_ZERO:
+            Let ft3 be proc int256_free with ten
+            Let fdb3 be proc int256_free with digit_buf
+            Let fs3 be proc int256_free with scratch
+            Return INT256_ERR_INVALID_INPUT
+        End If
+        If ch is greater than INT256_ASCII_NINE:
+            Let ft3b be proc int256_free with ten
+            Let fdb3b be proc int256_free with digit_buf
+            Let fs3b be proc int256_free with scratch
+            Return INT256_ERR_INVALID_INPUT
+        End If
+        Let digit be ch minus INT256_ASCII_ZERO
+
+        Note: scratch = result * 10
+        Let mul_rc be proc int256_mul with result, ten, scratch
+        Note: digit_buf = digit
+        Let db_set be proc int256_set_u64 with digit_buf, digit
+        Note: result = scratch + digit_buf
+        Let add_rc be proc int256_add with scratch, digit_buf, result
+        Set i to i plus 1
+    End While
+
+    Let ft4 be proc int256_free with ten
+    Let fdb4 be proc int256_free with digit_buf
+    Let fs4 be proc int256_free with scratch
+    Return INT256_OK
+End Process
+
+Process called "int256_to_decimal_string" takes a as Integer, out_ptr as Integer, out_capacity as Integer returns Integer:
+    @Reasoning
+        Write the decimal representation of `a` to out_ptr, null-
+        terminated. Returns the length (excluding null) on success or
+        a negative error on failure. Buffer must hold at least 79 bytes
+        (78 digits + null).
+    @End Reasoning
+    @Implementation
+        Repeated long division by 10:
+          while a != 0:
+              (a, digit) = divmod(a, 10)
+              push '0' + digit
+          if no digits: push '0'
+          reverse the digit buffer into out_ptr; null-terminate.
+        Uses temporary Int256 buffers for the running quotient and
+        remainder; the input is unchanged.
+    @End Implementation
+    @Performance_Hints
+        At most 78 division iterations. Each iteration is a
+        divmod-by-256-bit-value, dominated by the 256-bit shift inside
+        divmod. Total cost: O(78 * 256) limb ops.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds: capacity must be >= 79.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If out_ptr is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If out_capacity is less than 79:
+        Return INT256_ERR_INVALID_INPUT
+    End If
+
+    Let is_zero_flag be proc int256_is_zero with a
+    If is_zero_flag is equal to 1:
+        Let d0 be proc memory_set_byte from MemoryCore with out_ptr, 0, INT256_ASCII_ZERO
+        Let d1 be proc memory_set_byte from MemoryCore with out_ptr, 1, 0
+        Return 1
+    End If
+
+    Let work be proc int256_allocate
+    If work is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let q_tmp be proc int256_allocate
+    If q_tmp is equal to 0:
+        Let fw be proc int256_free with work
+        Return INT256_ERR_NULL
+    End If
+    Let r_tmp be proc int256_allocate
+    If r_tmp is equal to 0:
+        Let fw2 be proc int256_free with work
+        Let fq2 be proc int256_free with q_tmp
+        Return INT256_ERR_NULL
+    End If
+    Let ten be proc int256_allocate
+    If ten is equal to 0:
+        Let fw3 be proc int256_free with work
+        Let fq3 be proc int256_free with q_tmp
+        Let fr3 be proc int256_free with r_tmp
+        Return INT256_ERR_NULL
+    End If
+
+    Let cpa be proc int256_copy with a, work
+    Let ten_set be proc int256_set_u64 with ten, 10
+
+    Note: Buffer for digits in reverse order. Max 78 digits.
+    Let digits be proc allocate from Layout with 80
+    If digits is equal to 0:
+        Let fw4 be proc int256_free with work
+        Let fq4 be proc int256_free with q_tmp
+        Let fr4 be proc int256_free with r_tmp
+        Let ftn4 be proc int256_free with ten
+        Return INT256_ERR_NULL
+    End If
+
+    Let digit_count be 0
+    Let keep_going be 1
+    While keep_going is equal to 1:
+        Let work_zero be proc int256_is_zero with work
+        If work_zero is equal to 1:
+            Set keep_going to 0
+        Otherwise:
+            Let divrc be proc int256_divmod with work, ten, q_tmp, r_tmp
+            Let r_low be proc memory_get_int64 from MemoryCore with r_tmp, 0
+            Let digit_char be INT256_ASCII_ZERO plus r_low
+            Let dstore be proc memory_set_byte from MemoryCore with digits, digit_count, digit_char
+            Set digit_count to digit_count plus 1
+            Let cp_q be proc int256_copy with q_tmp, work
+        End If
+    End While
+
+    Note: Reverse digits into out_ptr.
+    Let out_idx be 0
+    Let src_idx be digit_count minus 1
+    While src_idx is greater than or equal to 0:
+        Let ch be proc memory_get_byte from MemoryCore with digits, src_idx
+        Let dstore2 be proc memory_set_byte from MemoryCore with out_ptr, out_idx, ch
+        Set out_idx to out_idx plus 1
+        Set src_idx to src_idx minus 1
+    End While
+    Let null_terminator be proc memory_set_byte from MemoryCore with out_ptr, out_idx, 0
+
+    Let dfree be proc deallocate from Layout with digits
+    Let fw5 be proc int256_free with work
+    Let fq5 be proc int256_free with q_tmp
+    Let fr5 be proc int256_free with r_tmp
+    Let ftn5 be proc int256_free with ten
+    Return digit_count
+End Process
+
+Note: ============================================================================
+Note: Fixed-Point Operations
+Note: ============================================================================
+Note:
+Fixed-point semantics: an Int256 value x represents the rational
+x / scale_factor where scale_factor is provided per-operation.
+Example: scale_factor = 10^18 (the wei convention) means a value
+of 1500000000000000000 represents 1.5.
+
+Multiplication of two fixed-point values a and b with the same scale:
+  (a * b) is at scale^2; to bring back to scale, divide by scale.
+  The product can overflow 2^256 even when neither operand does,
+  so we use int256_mul_full to compute the 512-bit intermediate
+  and then divide by scale, using a 512-bit divisor.
+
+Division: (a / b) at scale s = (a * s) / b. The intermediate (a * s)
+can overflow 256 bits, so we promote to Int512 for the multiplication
+and division back down.
+:End Note
+
+Note: ============================================================================
+
+Process called "int256_fixed_mul" takes a as Integer, b as Integer, scale as Integer, result as Integer returns Integer:
+    @Reasoning
+        Fixed-point multiplication preserving scale. Treats a and b as
+        rationals a/scale and b/scale, computes (a*b)/scale, and stores
+        the result. Uses int256_mul_full to obtain the exact 512-bit
+        product, then divides by scale promoted to Int512.
+    @End Reasoning
+    @Implementation
+        Step 1: int256_mul_full(a, b) -> (low256, high256)
+        Step 2: assemble (low256, high256) into an Int512 prod_512
+        Step 3: build an Int512 holding `scale` in the low bits
+        Step 4: int512_divmod(prod_512, scale_512) -> quotient_512
+        Step 5: low 256 bits of quotient become result. The high 256 bits
+                should be zero; if not, the result wraps (overflowed) -
+                but the typical fixed-point case where scale is large
+                ensures the quotient fits in 256 bits.
+    @End Implementation
+    @Performance_Hints
+        Most expensive Int256 operation: 16 mults + one Int512 divmod
+        (512 iterations). Use only when full precision is required.
+    @End Performance_Hints
+    @Security_Scope
+        Division-by-zero rejected with INT256_ERR_DIVIDE_BY_ZERO if
+        scale is zero (zero scale has no meaning in fixed-point). The
+        scale parameter is an Int256 (not a raw u64) to support scales
+        beyond 2^64.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If scale is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let scale_zero be proc int256_is_zero with scale
+    If scale_zero is equal to 1:
+        Return INT256_ERR_DIVIDE_BY_ZERO
+    End If
+
+    Let high_part be proc int256_allocate
+    If high_part is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let low_part be proc int256_allocate
+    If low_part is equal to 0:
+        Let fhp be proc int256_free with high_part
+        Return INT256_ERR_NULL
+    End If
+
+    Let mul_rc be proc int256_mul_full with a, b, low_part, high_part
+    If mul_rc is not equal to INT256_OK:
+        Let fhp2 be proc int256_free with high_part
+        Let flp2 be proc int256_free with low_part
+        Return mul_rc
+    End If
+
+    Note: Assemble the 512-bit product.
+    Let prod_512 be proc int512_allocate from Int512
+    If prod_512 is equal to 0:
+        Let fhp3 be proc int256_free with high_part
+        Let flp3 be proc int256_free with low_part
+        Return INT256_ERR_NULL
+    End If
+    Let scale_512 be proc int512_allocate from Int512
+    If scale_512 is equal to 0:
+        Let fhp4 be proc int256_free with high_part
+        Let flp4 be proc int256_free with low_part
+        Let fp4 be proc int512_free from Int512 with prod_512
+        Return INT256_ERR_NULL
+    End If
+    Let q_512 be proc int512_allocate from Int512
+    If q_512 is equal to 0:
+        Let fhp5 be proc int256_free with high_part
+        Let flp5 be proc int256_free with low_part
+        Let fp5 be proc int512_free from Int512 with prod_512
+        Let fs5 be proc int512_free from Int512 with scale_512
+        Return INT256_ERR_NULL
+    End If
+    Let r_512 be proc int512_allocate from Int512
+    If r_512 is equal to 0:
+        Let fhp6 be proc int256_free with high_part
+        Let flp6 be proc int256_free with low_part
+        Let fp6 be proc int512_free from Int512 with prod_512
+        Let fs6 be proc int512_free from Int512 with scale_512
+        Let fq6 be proc int512_free from Int512 with q_512
+        Return INT256_ERR_NULL
+    End If
+
+    Note: Copy low_part to prod_512 low 4 limbs.
+    Let lp0 be proc memory_get_int64 from MemoryCore with low_part, 0
+    Let lp1 be proc memory_get_int64 from MemoryCore with low_part, 8
+    Let lp2 be proc memory_get_int64 from MemoryCore with low_part, 16
+    Let lp3 be proc memory_get_int64 from MemoryCore with low_part, 24
+    Let sp0 be proc memory_set_int64 from MemoryCore with prod_512, 0, lp0
+    Let sp1 be proc memory_set_int64 from MemoryCore with prod_512, 8, lp1
+    Let sp2 be proc memory_set_int64 from MemoryCore with prod_512, 16, lp2
+    Let sp3 be proc memory_set_int64 from MemoryCore with prod_512, 24, lp3
+
+    Note: Copy high_part to prod_512 high 4 limbs.
+    Let hp0 be proc memory_get_int64 from MemoryCore with high_part, 0
+    Let hp1 be proc memory_get_int64 from MemoryCore with high_part, 8
+    Let hp2 be proc memory_get_int64 from MemoryCore with high_part, 16
+    Let hp3 be proc memory_get_int64 from MemoryCore with high_part, 24
+    Let sp4 be proc memory_set_int64 from MemoryCore with prod_512, 32, hp0
+    Let sp5 be proc memory_set_int64 from MemoryCore with prod_512, 40, hp1
+    Let sp6 be proc memory_set_int64 from MemoryCore with prod_512, 48, hp2
+    Let sp7 be proc memory_set_int64 from MemoryCore with prod_512, 56, hp3
+
+    Note: Promote scale (Int256) into the low 4 limbs of scale_512.
+    Let sc0 be proc memory_get_int64 from MemoryCore with scale, 0
+    Let sc1 be proc memory_get_int64 from MemoryCore with scale, 8
+    Let sc2 be proc memory_get_int64 from MemoryCore with scale, 16
+    Let sc3 be proc memory_get_int64 from MemoryCore with scale, 24
+    Let ws0 be proc memory_set_int64 from MemoryCore with scale_512, 0, sc0
+    Let ws1 be proc memory_set_int64 from MemoryCore with scale_512, 8, sc1
+    Let ws2 be proc memory_set_int64 from MemoryCore with scale_512, 16, sc2
+    Let ws3 be proc memory_set_int64 from MemoryCore with scale_512, 24, sc3
+    Let ws4 be proc memory_set_int64 from MemoryCore with scale_512, 32, 0
+    Let ws5 be proc memory_set_int64 from MemoryCore with scale_512, 40, 0
+    Let ws6 be proc memory_set_int64 from MemoryCore with scale_512, 48, 0
+    Let ws7 be proc memory_set_int64 from MemoryCore with scale_512, 56, 0
+
+    Let div_rc be proc int512_divmod from Int512 with prod_512, scale_512, q_512, r_512
+
+    Note: Copy low 4 limbs of q_512 into result.
+    Let q0 be proc memory_get_int64 from MemoryCore with q_512, 0
+    Let q1 be proc memory_get_int64 from MemoryCore with q_512, 8
+    Let q2 be proc memory_get_int64 from MemoryCore with q_512, 16
+    Let q3 be proc memory_get_int64 from MemoryCore with q_512, 24
+    Let r0_store be proc memory_set_int64 from MemoryCore with result, 0, q0
+    Let r1_store be proc memory_set_int64 from MemoryCore with result, 8, q1
+    Let r2_store be proc memory_set_int64 from MemoryCore with result, 16, q2
+    Let r3_store be proc memory_set_int64 from MemoryCore with result, 24, q3
+
+    Let fhp7 be proc int256_free with high_part
+    Let flp7 be proc int256_free with low_part
+    Let fp7 be proc int512_free from Int512 with prod_512
+    Let fs7 be proc int512_free from Int512 with scale_512
+    Let fq7 be proc int512_free from Int512 with q_512
+    Let fr7 be proc int512_free from Int512 with r_512
+    Return div_rc
+End Process
+
+Process called "int256_fixed_div" takes a as Integer, b as Integer, scale as Integer, result as Integer returns Integer:
+    @Reasoning
+        Fixed-point division preserving scale. Treats a, b as rationals
+        a/scale, b/scale; computes (a*scale)/b. The intermediate (a*scale)
+        can overflow 256 bits, so we widen to Int512 for the multiply and
+        divide.
+    @End Reasoning
+    @Implementation
+        Step 1: prod_512 = a * scale (256x256 -> 512, full precision)
+        Step 2: build divisor_512 with b in the low 4 limbs, zero high
+        Step 3: q_512 = prod_512 / divisor_512
+        Step 4: copy low 256 bits of q_512 to result.
+    @End Implementation
+    @Performance_Hints
+        Same cost class as int256_fixed_mul.
+    @End Performance_Hints
+    @Security_Scope
+        Division by zero (b == 0) rejected with INT256_ERR_DIVIDE_BY_ZERO.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If scale is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let b_zero be proc int256_is_zero with b
+    If b_zero is equal to 1:
+        Return INT256_ERR_DIVIDE_BY_ZERO
+    End If
+
+    Let high_part be proc int256_allocate
+    If high_part is equal to 0:
+        Return INT256_ERR_NULL
+    End If
+    Let low_part be proc int256_allocate
+    If low_part is equal to 0:
+        Let fhp be proc int256_free with high_part
+        Return INT256_ERR_NULL
+    End If
+    Let mul_rc be proc int256_mul_full with a, scale, low_part, high_part
+    If mul_rc is not equal to INT256_OK:
+        Let fhp2 be proc int256_free with high_part
+        Let flp2 be proc int256_free with low_part
+        Return mul_rc
+    End If
+
+    Let prod_512 be proc int512_allocate from Int512
+    If prod_512 is equal to 0:
+        Let fhp3 be proc int256_free with high_part
+        Let flp3 be proc int256_free with low_part
+        Return INT256_ERR_NULL
+    End If
+    Let divisor_512 be proc int512_allocate from Int512
+    If divisor_512 is equal to 0:
+        Let fhp4 be proc int256_free with high_part
+        Let flp4 be proc int256_free with low_part
+        Let fp4 be proc int512_free from Int512 with prod_512
+        Return INT256_ERR_NULL
+    End If
+    Let q_512 be proc int512_allocate from Int512
+    If q_512 is equal to 0:
+        Let fhp5 be proc int256_free with high_part
+        Let flp5 be proc int256_free with low_part
+        Let fp5 be proc int512_free from Int512 with prod_512
+        Let fd5 be proc int512_free from Int512 with divisor_512
+        Return INT256_ERR_NULL
+    End If
+    Let r_512 be proc int512_allocate from Int512
+    If r_512 is equal to 0:
+        Let fhp6 be proc int256_free with high_part
+        Let flp6 be proc int256_free with low_part
+        Let fp6 be proc int512_free from Int512 with prod_512
+        Let fd6 be proc int512_free from Int512 with divisor_512
+        Let fq6 be proc int512_free from Int512 with q_512
+        Return INT256_ERR_NULL
+    End If
+
+    Note: Build prod_512 from (low_part, high_part).
+    Let lp0 be proc memory_get_int64 from MemoryCore with low_part, 0
+    Let lp1 be proc memory_get_int64 from MemoryCore with low_part, 8
+    Let lp2 be proc memory_get_int64 from MemoryCore with low_part, 16
+    Let lp3 be proc memory_get_int64 from MemoryCore with low_part, 24
+    Let sp0 be proc memory_set_int64 from MemoryCore with prod_512, 0, lp0
+    Let sp1 be proc memory_set_int64 from MemoryCore with prod_512, 8, lp1
+    Let sp2 be proc memory_set_int64 from MemoryCore with prod_512, 16, lp2
+    Let sp3 be proc memory_set_int64 from MemoryCore with prod_512, 24, lp3
+    Let hp0 be proc memory_get_int64 from MemoryCore with high_part, 0
+    Let hp1 be proc memory_get_int64 from MemoryCore with high_part, 8
+    Let hp2 be proc memory_get_int64 from MemoryCore with high_part, 16
+    Let hp3 be proc memory_get_int64 from MemoryCore with high_part, 24
+    Let sp4 be proc memory_set_int64 from MemoryCore with prod_512, 32, hp0
+    Let sp5 be proc memory_set_int64 from MemoryCore with prod_512, 40, hp1
+    Let sp6 be proc memory_set_int64 from MemoryCore with prod_512, 48, hp2
+    Let sp7 be proc memory_set_int64 from MemoryCore with prod_512, 56, hp3
+
+    Note: Build divisor_512 with b in low 4 limbs, zero in high.
+    Let db0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let db1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let db2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let db3 be proc memory_get_int64 from MemoryCore with b, 24
+    Let wd0 be proc memory_set_int64 from MemoryCore with divisor_512, 0, db0
+    Let wd1 be proc memory_set_int64 from MemoryCore with divisor_512, 8, db1
+    Let wd2 be proc memory_set_int64 from MemoryCore with divisor_512, 16, db2
+    Let wd3 be proc memory_set_int64 from MemoryCore with divisor_512, 24, db3
+    Let wd4 be proc memory_set_int64 from MemoryCore with divisor_512, 32, 0
+    Let wd5 be proc memory_set_int64 from MemoryCore with divisor_512, 40, 0
+    Let wd6 be proc memory_set_int64 from MemoryCore with divisor_512, 48, 0
+    Let wd7 be proc memory_set_int64 from MemoryCore with divisor_512, 56, 0
+
+    Let div_rc be proc int512_divmod from Int512 with prod_512, divisor_512, q_512, r_512
+
+    Note: Copy low 4 limbs of q_512 to result (high should be zero in
+    Note: well-formed fixed-point use; if not, the result wraps).
+    Let q0 be proc memory_get_int64 from MemoryCore with q_512, 0
+    Let q1 be proc memory_get_int64 from MemoryCore with q_512, 8
+    Let q2 be proc memory_get_int64 from MemoryCore with q_512, 16
+    Let q3 be proc memory_get_int64 from MemoryCore with q_512, 24
+    Let r0s be proc memory_set_int64 from MemoryCore with result, 0, q0
+    Let r1s be proc memory_set_int64 from MemoryCore with result, 8, q1
+    Let r2s be proc memory_set_int64 from MemoryCore with result, 16, q2
+    Let r3s be proc memory_set_int64 from MemoryCore with result, 24, q3
+
+    Let fhp7 be proc int256_free with high_part
+    Let flp7 be proc int256_free with low_part
+    Let fp7 be proc int512_free from Int512 with prod_512
+    Let fd7 be proc int512_free from Int512 with divisor_512
+    Let fq7 be proc int512_free from Int512 with q_512
+    Let fr7 be proc int512_free from Int512 with r_512
+    Return div_rc
+End Process

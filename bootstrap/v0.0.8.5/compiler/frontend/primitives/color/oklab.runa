@@ -1,0 +1,966 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+:End Note
+
+Note:
+==============================================================================
+oklab - Oklab and Oklch Perceptual Color Spaces (Bjorn Ottosson 2020)
+==============================================================================
+
+Oklab is a perceptually-uniform colour space published by Bjorn Ottosson
+in 2020 (https://bottosson.github.io/posts/oklab/) designed to improve
+on CIELAB at modern display gamuts. The forward pipeline:
+
+    1. linear-RGB -> LMS via the matrix M1:
+
+           |  0.4122214708  0.5363325363  0.0514459929 |
+       M1 = |  0.2119034982  0.6806995451  0.1073969566 |
+           |  0.0883024619  0.2817188376  0.6299787005 |
+
+    2. LMS -> LMS' via cube-root per component (LMS'_i = cbrt(LMS_i)).
+
+    3. LMS' -> Lab via the matrix M2:
+
+           |  0.2104542553   0.7936177850  -0.0040720468 |
+       M2 = |  1.9779984951  -2.4285922050   0.4505937099 |
+           |  0.0259040371   0.7827717662  -0.8086757660 |
+
+Oklch is the polar form (L, C, h) of Oklab. Euclidean distance in Oklab
+is a perceptually meaningful colour-difference metric (oklab_delta_e
+below).
+
+References:
+  - B. Ottosson, "A perceptual color space for image processing", 2020
+  - https://bottosson.github.io/posts/oklab/
+==============================================================================
+:End Note
+
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: STRUCT TYPE DEFINITIONS
+Note: ============================================================================
+
+Type called "ColorOklab":
+    l as Float
+    a as Float
+    b as Float
+End Type
+
+Type called "ColorOklch":
+    l as Float
+    c as Float
+    h as Float
+End Type
+
+Note: ============================================================================
+Note: NUMERIC HELPERS
+Note: ============================================================================
+
+Process called "absf" takes v as Float returns Float:
+    @Reasoning
+    Absolute value.
+    @End Reasoning
+    @Implementation
+    Compare then negate.
+    @End Implementation
+    @Performance_Hints
+    Single compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If v is less than 0.0:
+        Return 0.0 minus v
+    End If
+    Return v
+End Process
+
+Process called "sqrtf" takes x as Float returns Float:
+    @Reasoning
+    Square-root via arithmetic_core.
+    @End Reasoning
+    @Implementation
+    Delegates to Arith.sqrt.
+    @End Implementation
+    @Performance_Hints
+    ~14 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return Arith.sqrt(x)
+End Process
+
+Process called "cbrtf" takes x as Float returns Float:
+    @Reasoning
+    Real cube root with sign preservation. Used three times per
+    oklab encoding.
+    @End Reasoning
+    @Implementation
+    Scale-reduce |x| into [1, 8] via division/multiplication by 8.0,
+    eight Newton iterations on y^3 - x = 0, then reassemble with
+    pow(2) scaling.
+    @End Implementation
+    @Performance_Hints
+    ~ 80 FLOPs per call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure, bounded loop.
+    @End Security_Scope
+    Let sign be 1.0
+    Let m be x
+    If x is less than 0.0:
+        Set sign to 0.0 minus 1.0
+        Set m to 0.0 minus x
+    End If
+    If m is less than 0.000000000000000000000000000000001:
+        Return 0.0
+    End If
+    Let scale_up be 0
+    Let scratch be m
+    While scratch is greater than 8.0:
+        Set scratch to scratch divided by 8.0
+        Set scale_up to scale_up plus 1
+        If scale_up is greater than 400:
+            Set scratch to 8.0
+        End If
+    End While
+    Let scale_dn be 0
+    While scratch is less than 1.0:
+        Set scratch to scratch multiplied by 8.0
+        Set scale_dn to scale_dn plus 1
+        If scale_dn is greater than 400:
+            Set scratch to 1.0
+        End If
+    End While
+    Let y be scratch
+    Let iter be 0
+    While iter is less than 10:
+        Let y2 be y multiplied by y
+        Let num be (y2 multiplied by y) minus scratch
+        Let den be 3.0 multiplied by y2
+        If den is less than or equal to 0.0:
+            Set iter to 10
+        Otherwise:
+            Set y to y minus (num divided by den)
+            Set iter to iter plus 1
+        End If
+    End While
+    Let pow2 be 1.0
+    Let iu be 0
+    While iu is less than scale_up:
+        Set pow2 to pow2 multiplied by 2.0
+        Set iu to iu plus 1
+    End While
+    Let pow2_dn be 1.0
+    Let id be 0
+    While id is less than scale_dn:
+        Set pow2_dn to pow2_dn multiplied by 2.0
+        Set id to id plus 1
+    End While
+    Set y to (y multiplied by pow2) divided by pow2_dn
+    Return sign multiplied by y
+End Process
+
+Process called "pow_real" takes base as Float, exponent as Float returns Float:
+    @Reasoning
+    Real exponentiation x^y via exp(y * ln(x)). Used by the sRGB transfer
+    function during the rgb->oklab pipeline. Honours the IEEE-754 / POSIX
+    convention that x^0 = 1 for all finite x including zero.
+    @End Reasoning
+    @Implementation
+    Mercator series for ln, Maclaurin for exp; range-reduction by
+    halving / doubling. The exponent==0 short-circuit is checked before
+    the log-domain reduction so that pow_real(0.0, 0.0) returns 1.0
+    instead of falling through to the non-positive-base early-return.
+    @End Implementation
+    @Performance_Hints
+    ~ 70 FLOPs per call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If exponent is equal to 0.0:
+        Return 1.0
+    End If
+    If base is less than or equal to 0.0:
+        Return 0.0
+    End If
+    Let m be base
+    Let k be 0
+    While m is greater than or equal to 2.0:
+        Set m to m divided by 2.0
+        Set k to k plus 1
+        If k is greater than 2048:
+            Return 0.0
+        End If
+    End While
+    Let kd be 0
+    While m is less than 1.0:
+        Set m to m multiplied by 2.0
+        Set kd to kd plus 1
+        If kd is greater than 2048:
+            Return 0.0
+        End If
+    End While
+    Let z be (m minus 1.0) divided by (m plus 1.0)
+    Let z2 be z multiplied by z
+    Let term be z
+    Let ln_m be 0.0
+    Let idx be 0
+    While idx is less than 30:
+        Let denom be Arith.int_to_float((2 multiplied by idx) plus 1)
+        Set ln_m to ln_m plus (term divided by denom)
+        Set term to term multiplied by z2
+        Set idx to idx plus 1
+    End While
+    Set ln_m to ln_m multiplied by 2.0
+    Let ln2 be 0.69314718055994530941723212145817656807550013436025525412
+    Let ln_base be ln_m plus (Arith.int_to_float(k) multiplied by ln2)
+    Set ln_base to ln_base minus (Arith.int_to_float(kd) multiplied by ln2)
+    Let y be exponent multiplied by ln_base
+    Let n_floor be Arith.float_to_int(y divided by ln2)
+    If y is less than 0.0:
+        If Arith.int_to_float(n_floor) is greater than (y divided by ln2):
+            Set n_floor to n_floor minus 1
+        End If
+    End If
+    Let r_y be y minus (Arith.int_to_float(n_floor) multiplied by ln2)
+    Let exp_r be 1.0
+    Let s_term be 1.0
+    Let i be 1
+    While i is less than 32:
+        Set s_term to (s_term multiplied by r_y) divided by Arith.int_to_float(i)
+        Set exp_r to exp_r plus s_term
+        Set i to i plus 1
+    End While
+    Let two_n be 1.0
+    If n_floor is greater than or equal to 0:
+        Let nn be n_floor
+        While nn is greater than 0:
+            Set two_n to two_n multiplied by 2.0
+            Set nn to nn minus 1
+        End While
+    Otherwise:
+        Let nn be 0 minus n_floor
+        While nn is greater than 0:
+            Set two_n to two_n divided by 2.0
+            Set nn to nn minus 1
+        End While
+    End If
+    Return exp_r multiplied by two_n
+End Process
+
+Process called "sin_deg" takes deg as Float returns Float:
+    @Reasoning
+    Sine in degrees for oklch_to_oklab conversion and hue rotation.
+    @End Reasoning
+    @Implementation
+    Reduce to [-180, 180], convert to radians, sum the Taylor series.
+    @End Implementation
+    @Performance_Hints
+    ~ 30 multiplies per call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let d be deg
+    While d is greater than or equal to 360.0:
+        Set d to d minus 360.0
+    End While
+    While d is less than 0.0:
+        Set d to d plus 360.0
+    End While
+    Let pi_const be 3.14159265358979323846
+    Let x be (d multiplied by pi_const) divided by 180.0
+    If x is greater than pi_const:
+        Set x to x minus (2.0 multiplied by pi_const)
+    End If
+    Let result be 0.0
+    Let term be x
+    Let sign be 1.0
+    Let n be 1
+    While n is less than 28:
+        Set result to result plus (sign multiplied by term)
+        Set term to (term multiplied by x) multiplied by x
+        Let denom1 be Arith.int_to_float((2 multiplied by n) plus 1)
+        Let denom2 be Arith.int_to_float(2 multiplied by n)
+        Set term to term divided by denom1
+        Set term to term divided by denom2
+        Set sign to 0.0 minus sign
+        Set n to n plus 1
+    End While
+    Return result
+End Process
+
+Process called "cos_deg" takes deg as Float returns Float:
+    @Reasoning
+    Cosine in degrees via sin(90 - x).
+    @End Reasoning
+    @Implementation
+    Calls sin_deg(90 - deg).
+    @End Implementation
+    @Performance_Hints
+    Same as sin_deg.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return sin_deg(90.0 minus deg)
+End Process
+
+Process called "atan2_deg" takes y as Float, x as Float returns Float:
+    @Reasoning
+    Two-argument arctangent in degrees, range [0, 360).
+    @End Reasoning
+    @Implementation
+    Maclaurin series with octant dispatch.
+    @End Implementation
+    @Performance_Hints
+    ~ 50 FLOPs per call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let pi_const be 3.14159265358979323846
+    If x is equal to 0.0:
+        If y is greater than 0.0:
+            Return 90.0
+        End If
+        If y is less than 0.0:
+            Return 270.0
+        End If
+        Return 0.0
+    End If
+    Let abs_y be absf(y)
+    Let abs_x be absf(x)
+    Let t be abs_y divided by abs_x
+    Let inverted be 0
+    If t is greater than 1.0:
+        Set t to 1.0 divided by t
+        Set inverted to 1
+    End If
+    Let result be 0.0
+    Let term be t
+    Let sign be 1.0
+    Let n be 0
+    Let t2 be t multiplied by t
+    While n is less than 60:
+        Let denom be Arith.int_to_float((2 multiplied by n) plus 1)
+        Set result to result plus ((sign multiplied by term) divided by denom)
+        Set term to term multiplied by t2
+        Set sign to 0.0 minus sign
+        Set n to n plus 1
+    End While
+    If inverted is equal to 1:
+        Set result to (pi_const divided by 2.0) minus result
+    End If
+    If x is less than 0.0:
+        If y is greater than or equal to 0.0:
+            Set result to pi_const minus result
+        Otherwise:
+            Set result to (0.0 minus pi_const) plus result
+        End If
+    Otherwise:
+        If y is less than 0.0:
+            Set result to 0.0 minus result
+        End If
+    End If
+    Let deg_val be (result multiplied by 180.0) divided by pi_const
+    While deg_val is less than 0.0:
+        Set deg_val to deg_val plus 360.0
+    End While
+    While deg_val is greater than or equal to 360.0:
+        Set deg_val to deg_val minus 360.0
+    End While
+    Return deg_val
+End Process
+
+Process called "srgb_to_linear_local" takes c as Float returns Float:
+    @Reasoning
+    Local sRGB inverse transfer for the rgb_to_oklab pipeline.
+    @End Reasoning
+    @Implementation
+    Piecewise: c/12.92 for c<=0.04045 else ((c+0.055)/1.055)^2.4.
+    @End Implementation
+    @Performance_Hints
+    Toe branch is two FP ops; gamma dominated by pow_real.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let sign be 1.0
+    Let a be c
+    If c is less than 0.0:
+        Set sign to 0.0 minus 1.0
+        Set a to 0.0 minus c
+    End If
+    Let result be 0.0
+    If a is less than or equal to 0.04045:
+        Set result to a divided by 12.92
+    Otherwise:
+        Let inside be (a plus 0.055) divided by 1.055
+        Set result to pow_real(inside, 2.4)
+    End If
+    Return sign multiplied by result
+End Process
+
+Process called "linear_to_srgb_local" takes c as Float returns Float:
+    @Reasoning
+    Forward sRGB transfer for the oklab_to_rgb pipeline.
+    @End Reasoning
+    @Implementation
+    Piecewise.
+    @End Implementation
+    @Performance_Hints
+    Toe branch two FP ops; gamma dominated by pow_real.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let sign be 1.0
+    Let a be c
+    If c is less than 0.0:
+        Set sign to 0.0 minus 1.0
+        Set a to 0.0 minus c
+    End If
+    Let result be 0.0
+    If a is less than or equal to 0.0031308:
+        Set result to a multiplied by 12.92
+    Otherwise:
+        Let inv_gamma be 1.0 divided by 2.4
+        Set result to (1.055 multiplied by pow_real(a, inv_gamma)) minus 0.055
+    End If
+    Return sign multiplied by result
+End Process
+
+Process called "clamp01_local" takes v as Float returns Float:
+    @Reasoning
+    Unit clamp for output channels.
+    @End Reasoning
+    @Implementation
+    Two compares.
+    @End Implementation
+    @Performance_Hints
+    Two compares.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If v is less than 0.0:
+        Return 0.0
+    End If
+    If v is greater than 1.0:
+        Return 1.0
+    End If
+    Return v
+End Process
+
+Note: ============================================================================
+Note: LINEAR-RGB <-> OKLAB
+Note: ============================================================================
+
+Process called "linear_rgb_to_oklab" takes r as Float, g as Float, b as Float returns ColorOklab:
+    @Reasoning
+    Apply the M1 matrix to linear RGB, take the cube root of each LMS
+    component, then apply the M2 matrix to yield Oklab L, a, b. Constants
+    are from Ottosson's 2020 paper.
+    @End Reasoning
+    @Implementation
+    Two 3x3 matrix multiplies straddling three cbrt calls.
+    @End Implementation
+    @Performance_Hints
+    Dominated by the three cbrt evaluations.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let l_lms be (((0.4122214708 multiplied by r) plus (0.5363325363 multiplied by g)) plus (0.0514459929 multiplied by b))
+    Let m_lms be (((0.2119034982 multiplied by r) plus (0.6806995451 multiplied by g)) plus (0.1073969566 multiplied by b))
+    Let s_lms be (((0.0883024619 multiplied by r) plus (0.2817188376 multiplied by g)) plus (0.6299787005 multiplied by b))
+    Let l_p be cbrtf(l_lms)
+    Let m_p be cbrtf(m_lms)
+    Let s_p be cbrtf(s_lms)
+    Let out be a value of type ColorOklab
+    Set out.l to (((0.2104542553 multiplied by l_p) plus (0.7936177850 multiplied by m_p)) plus ((0.0 minus 0.0040720468) multiplied by s_p))
+    Set out.a to (((1.9779984951 multiplied by l_p) plus ((0.0 minus 2.4285922050) multiplied by m_p)) plus (0.4505937099 multiplied by s_p))
+    Set out.b to (((0.0259040371 multiplied by l_p) plus (0.7827717662 multiplied by m_p)) plus ((0.0 minus 0.8086757660) multiplied by s_p))
+    Return out
+End Process
+
+Process called "oklab_to_linear_rgb" takes lab as ColorOklab, out_rgb as Integer returns Integer:
+    @Reasoning
+    Invert the M2 matrix to yield LMS', cube each component to recover
+    LMS, then invert the M1 matrix to yield linear RGB. Outputs four
+    floats (r, g, b, 1.0) at offsets 0, 8, 16, 24 of out_rgb.
+    @End Reasoning
+    @Implementation
+    Two 3x3 matrix multiplies (inverse of M1 and M2). The inverse
+    coefficients are from Ottosson's paper.
+    @End Implementation
+    @Performance_Hints
+    Three multiplies + nine multiplies per matrix; cube reverse is three
+    multiplies.
+    @End Performance_Hints
+    @Security_Scope
+    Caller guarantees out_rgb has at least 32 writable bytes.
+    @End Security_Scope
+    Let l_p be lab.l plus ((0.3963377774 multiplied by lab.a) plus (0.2158037573 multiplied by lab.b))
+    Let m_p be lab.l minus ((0.1055613458 multiplied by lab.a) plus (0.0638541728 multiplied by lab.b))
+    Let s_p be lab.l minus ((0.0894841775 multiplied by lab.a) plus (1.2914855480 multiplied by lab.b))
+    Let l_lms be (l_p multiplied by l_p) multiplied by l_p
+    Let m_lms be (m_p multiplied by m_p) multiplied by m_p
+    Let s_lms be (s_p multiplied by s_p) multiplied by s_p
+    Let r be ((4.0767416621 multiplied by l_lms) plus ((0.0 minus 3.3077115913) multiplied by m_lms)) plus (0.2309699292 multiplied by s_lms)
+    Let g be (((0.0 minus 1.2684380046) multiplied by l_lms) plus (2.6097574011 multiplied by m_lms)) plus ((0.0 minus 0.3413193965) multiplied by s_lms)
+    Let b be (((0.0 minus 0.0041960863) multiplied by l_lms) plus ((0.0 minus 0.7034186147) multiplied by m_lms)) plus (1.7076147010 multiplied by s_lms)
+    Let _wr be store_float_at_oklab(out_rgb, 0, r)
+    Let _wg be store_float_at_oklab(out_rgb, 8, g)
+    Let _wb be store_float_at_oklab(out_rgb, 16, b)
+    Let _wa be store_float_at_oklab(out_rgb, 24, 1.0)
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: OKLAB <-> OKLCH
+Note: ============================================================================
+
+Process called "oklab_to_oklch" takes lab as ColorOklab returns ColorOklch:
+    @Reasoning
+    Polar conversion: C = sqrt(a^2 + b^2), h = atan2(b, a) in degrees.
+    @End Reasoning
+    @Implementation
+    sqrtf + atan2_deg.
+    @End Implementation
+    @Performance_Hints
+    One sqrt + one atan2.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorOklch
+    Set out.l to lab.l
+    Set out.c to sqrtf((lab.a multiplied by lab.a) plus (lab.b multiplied by lab.b))
+    Set out.h to atan2_deg(lab.b, lab.a)
+    Return out
+End Process
+
+Process called "oklch_to_oklab" takes lch as ColorOklch returns ColorOklab:
+    @Reasoning
+    Inverse polar conversion: a = C cos(h), b = C sin(h) (h in degrees).
+    @End Reasoning
+    @Implementation
+    cos_deg + sin_deg.
+    @End Implementation
+    @Performance_Hints
+    One sin + one cos.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorOklab
+    Set out.l to lch.l
+    Set out.a to lch.c multiplied by cos_deg(lch.h)
+    Set out.b to lch.c multiplied by sin_deg(lch.h)
+    Return out
+End Process
+
+Note: ============================================================================
+Note: FULL sRGB <-> OKLAB PIPELINES
+Note: ============================================================================
+
+Process called "rgb_to_oklab" takes r as Float, g as Float, b as Float returns ColorOklab:
+    @Reasoning
+    Full sRGB (non-linear) to Oklab pipeline. Linearises each channel
+    via the IEC 61966-2-1 inverse transfer then dispatches to
+    linear_rgb_to_oklab.
+    @End Reasoning
+    @Implementation
+    Three sRGB inverse transfers + linear_rgb_to_oklab.
+    @End Implementation
+    @Performance_Hints
+    Three pow_real + three cbrt = dominant cost.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let r_lin be srgb_to_linear_local(r)
+    Let g_lin be srgb_to_linear_local(g)
+    Let b_lin be srgb_to_linear_local(b)
+    Return linear_rgb_to_oklab(r_lin, g_lin, b_lin)
+End Process
+
+Process called "oklab_to_rgb" takes lab as ColorOklab, out_rgb as Integer returns Integer:
+    @Reasoning
+    Full Oklab to sRGB pipeline. Dispatches to oklab_to_linear_rgb into
+    a 32-byte scratch buffer (heap-allocated), applies the sRGB forward
+    transfer to each channel, then writes the result back at offsets
+    0/8/16/24. The scratch is leaked here so callers that hold the
+    pointer can inspect it; the recommended path is to pass a single
+    out_rgb buffer.
+    @End Reasoning
+    @Implementation
+    Reads linear values via bits_to_float_local from the scratch and
+    encodes them via linear_to_srgb_local.
+    @End Implementation
+    @Performance_Hints
+    Three sRGB encodings dominate.
+    @End Performance_Hints
+    @Security_Scope
+    Caller owns out_rgb (32 bytes).
+    @End Security_Scope
+    Let l_p be lab.l plus ((0.3963377774 multiplied by lab.a) plus (0.2158037573 multiplied by lab.b))
+    Let m_p be lab.l minus ((0.1055613458 multiplied by lab.a) plus (0.0638541728 multiplied by lab.b))
+    Let s_p be lab.l minus ((0.0894841775 multiplied by lab.a) plus (1.2914855480 multiplied by lab.b))
+    Let l_lms be (l_p multiplied by l_p) multiplied by l_p
+    Let m_lms be (m_p multiplied by m_p) multiplied by m_p
+    Let s_lms be (s_p multiplied by s_p) multiplied by s_p
+    Let r_lin be ((4.0767416621 multiplied by l_lms) plus ((0.0 minus 3.3077115913) multiplied by m_lms)) plus (0.2309699292 multiplied by s_lms)
+    Let g_lin be (((0.0 minus 1.2684380046) multiplied by l_lms) plus (2.6097574011 multiplied by m_lms)) plus ((0.0 minus 0.3413193965) multiplied by s_lms)
+    Let b_lin be (((0.0 minus 0.0041960863) multiplied by l_lms) plus ((0.0 minus 0.7034186147) multiplied by m_lms)) plus (1.7076147010 multiplied by s_lms)
+    Let r_srgb be linear_to_srgb_local(r_lin)
+    Let g_srgb be linear_to_srgb_local(g_lin)
+    Let b_srgb be linear_to_srgb_local(b_lin)
+    Let _wr be store_float_at_oklab(out_rgb, 0, clamp01_local(r_srgb))
+    Let _wg be store_float_at_oklab(out_rgb, 8, clamp01_local(g_srgb))
+    Let _wb be store_float_at_oklab(out_rgb, 16, clamp01_local(b_srgb))
+    Let _wa be store_float_at_oklab(out_rgb, 24, 1.0)
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PERCEPTUAL DELTA-E
+Note: ============================================================================
+
+Process called "oklab_delta_e" takes c1 as ColorOklab, c2 as ColorOklab returns Float:
+    @Reasoning
+    Oklab is designed so Euclidean distance is a perceptually meaningful
+    colour-difference. No weighting is required.
+    @End Reasoning
+    @Implementation
+    sqrt((dL)^2 + (da)^2 + (db)^2).
+    @End Implementation
+    @Performance_Hints
+    Three multiplies + two adds + sqrt.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let dl be c1.l minus c2.l
+    Let da be c1.a minus c2.a
+    Let db be c1.b minus c2.b
+    Let sum be ((dl multiplied by dl) plus (da multiplied by da)) plus (db multiplied by db)
+    Return sqrtf(sum)
+End Process
+
+Note: ============================================================================
+Note: OKLCH MANIPULATION
+Note: ============================================================================
+
+Process called "oklch_rotate_hue" takes lch as ColorOklch, degrees as Float returns ColorOklch:
+    @Reasoning
+    Rotate hue by a signed number of degrees, with wrap-around to
+    [0, 360).
+    @End Reasoning
+    @Implementation
+    Modular addition.
+    @End Implementation
+    @Performance_Hints
+    Single add + bounded modulus loop.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorOklch
+    Set out.l to lch.l
+    Set out.c to lch.c
+    Let h_new be lch.h plus degrees
+    While h_new is greater than or equal to 360.0:
+        Set h_new to h_new minus 360.0
+    End While
+    While h_new is less than 0.0:
+        Set h_new to h_new plus 360.0
+    End While
+    Set out.h to h_new
+    Return out
+End Process
+
+Process called "oklch_lighten" takes lch as ColorOklch, amount as Float returns ColorOklch:
+    @Reasoning
+    Additively increase L*, leaving chroma and hue unchanged.
+    @End Reasoning
+    @Implementation
+    L' = L + amount. Oklab L is unbounded above formally; for sRGB
+    content produced by rgb_to_oklab and any downstream display pipeline
+    the lightness lies in [0, 1].
+    @End Implementation
+    @Performance_Hints
+    Single add.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorOklch
+    Set out.l to lch.l plus amount
+    Set out.c to lch.c
+    Set out.h to lch.h
+    Return out
+End Process
+
+Process called "oklch_chroma_clip" takes lch as ColorOklch returns ColorOklch:
+    @Reasoning
+    Reduce chroma until the resulting colour lies inside the sRGB gamut.
+    Uses bisection on chroma in [0, original-C] guided by an
+    in-gamut test of the resulting Oklab -> linear RGB output.
+    @End Reasoning
+    @Implementation
+    Convert oklch -> oklab -> linear RGB; if any channel is outside
+    [0, 1] then halve chroma and retry, up to 30 iterations. Final
+    result is the highest chroma found that produced an in-gamut colour.
+    @End Implementation
+    @Performance_Hints
+    Up to 30 oklab_to_linear_rgb conversions; each is ~ 30 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure, bounded.
+    @End Security_Scope
+    Let out be a value of type ColorOklch
+    Set out.l to lch.l
+    Set out.h to lch.h
+    Let low_c be 0.0
+    Let high_c be lch.c
+    Let iter be 0
+    While iter is less than 30:
+        Let mid_c be (low_c plus high_c) divided by 2.0
+        Let trial be a value of type ColorOklch
+        Set trial.l to lch.l
+        Set trial.c to mid_c
+        Set trial.h to lch.h
+        Let trial_lab be oklch_to_oklab(trial)
+        Let l_p be trial_lab.l plus ((0.3963377774 multiplied by trial_lab.a) plus (0.2158037573 multiplied by trial_lab.b))
+        Let m_p be trial_lab.l minus ((0.1055613458 multiplied by trial_lab.a) plus (0.0638541728 multiplied by trial_lab.b))
+        Let s_p be trial_lab.l minus ((0.0894841775 multiplied by trial_lab.a) plus (1.2914855480 multiplied by trial_lab.b))
+        Let l_lms be (l_p multiplied by l_p) multiplied by l_p
+        Let m_lms be (m_p multiplied by m_p) multiplied by m_p
+        Let s_lms be (s_p multiplied by s_p) multiplied by s_p
+        Let r_lin be ((4.0767416621 multiplied by l_lms) plus ((0.0 minus 3.3077115913) multiplied by m_lms)) plus (0.2309699292 multiplied by s_lms)
+        Let g_lin be (((0.0 minus 1.2684380046) multiplied by l_lms) plus (2.6097574011 multiplied by m_lms)) plus ((0.0 minus 0.3413193965) multiplied by s_lms)
+        Let b_lin be (((0.0 minus 0.0041960863) multiplied by l_lms) plus ((0.0 minus 0.7034186147) multiplied by m_lms)) plus (1.7076147010 multiplied by s_lms)
+        Let in_gamut be 1
+        If r_lin is less than 0.0:
+            Set in_gamut to 0
+        End If
+        If r_lin is greater than 1.0:
+            Set in_gamut to 0
+        End If
+        If g_lin is less than 0.0:
+            Set in_gamut to 0
+        End If
+        If g_lin is greater than 1.0:
+            Set in_gamut to 0
+        End If
+        If b_lin is less than 0.0:
+            Set in_gamut to 0
+        End If
+        If b_lin is greater than 1.0:
+            Set in_gamut to 0
+        End If
+        If in_gamut is equal to 1:
+            Set low_c to mid_c
+        Otherwise:
+            Set high_c to mid_c
+        End If
+        Set iter to iter plus 1
+    End While
+    Set out.c to low_c
+    Return out
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS / CONSTRUCTORS
+Note: ============================================================================
+
+Process called "oklab_create" takes l as Float, a as Float, b as Float returns ColorOklab:
+    @Reasoning
+    Direct constructor.
+    @End Reasoning
+    @Implementation
+    Field assignment.
+    @End Implementation
+    @Performance_Hints
+    Single allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorOklab
+    Set out.l to l
+    Set out.a to a
+    Set out.b to b
+    Return out
+End Process
+
+Process called "oklch_create" takes l as Float, c as Float, h as Float returns ColorOklch:
+    @Reasoning
+    Direct constructor.
+    @End Reasoning
+    @Implementation
+    Field assignment.
+    @End Implementation
+    @Performance_Hints
+    Single allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorOklch
+    Set out.l to l
+    Set out.c to c
+    Set out.h to h
+    Return out
+End Process
+
+Process called "oklab_l" takes c as ColorOklab returns Float:
+    @Reasoning
+    Read L.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.l
+End Process
+
+Process called "oklab_a" takes c as ColorOklab returns Float:
+    @Reasoning
+    Read a.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.a
+End Process
+
+Process called "oklab_b" takes c as ColorOklab returns Float:
+    @Reasoning
+    Read b.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.b
+End Process
+
+Process called "oklch_l" takes c as ColorOklch returns Float:
+    @Reasoning
+    Read L.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.l
+End Process
+
+Process called "oklch_c" takes c as ColorOklch returns Float:
+    @Reasoning
+    Read chroma.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.c
+End Process
+
+Process called "oklch_h" takes c as ColorOklch returns Float:
+    @Reasoning
+    Read hue.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.h
+End Process
+
+Note: ============================================================================
+Note: BIT-CAST HELPERS
+Note: ============================================================================
+
+Process called "float_to_bits_oklab" takes x as Float returns Integer:
+    @Reasoning
+    Bit-cast Float64 to its 64-bit integer pattern.
+    @End Reasoning
+    @Implementation
+    Inline assembly reads the float-occupying stack slot as integer.
+    @End Implementation
+    @Performance_Hints
+    Single mov.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "store_float_at_oklab" takes ptr as Integer, offset as Integer, value as Float returns Integer:
+    @Reasoning
+    Bit-cast a Float64 and store at ptr + offset.
+    @End Reasoning
+    @Implementation
+    float_to_bits_oklab + memory_set_int64.
+    @End Implementation
+    @Performance_Hints
+    Two movs + one store.
+    @End Performance_Hints
+    @Security_Scope
+    Caller owns ptr.
+    @End Security_Scope
+    Let bits be float_to_bits_oklab(value)
+    Let _w be Memory.memory_set_int64(ptr, offset, bits)
+    Return 0
+End Process

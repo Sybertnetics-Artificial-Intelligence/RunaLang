@@ -1,0 +1,994 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+==============================================================================
+Date - Proleptic Gregorian Calendar Date
+==============================================================================
+
+A Date represents a calendar date as a (year, month, day) triple in the
+proleptic Gregorian calendar - i.e. the Gregorian rules extended
+backward past the 1582 reform. This is the calendar implied by ISO
+8601 §3.2.1.
+
+Year range: a signed 64-bit ordinal-day counter covers approximately
++/- 25 billion years from the Gregorian epoch (0001-01-01), placing it
+well beyond any conceivable civil-date arithmetic horizon.
+
+Internal representation: a single Integer holding the count of days
+since 0000-03-01 (Howard Hinnant's "rata die from March" convention).
+March-relative numbering removes the leap-day discontinuity from the
+month-arithmetic kernel: every "year" runs from March through the
+following February so the leap day is always the last day. The
+public year/month/day accessors translate to the conventional
+January-start year on read.
+
+Algorithms used:
+  - Hinnant, H. "chrono-Compatible Low-Level Date Algorithms",
+    2013 (canonical reference for civil_from_days, days_from_civil,
+    weekday_from_days, days_from_civil_ordinal). Proven correct over
+    the full int64 range.
+  - ISO 8601:2019 §3.4 (week date format, week-of-year computation).
+  - Gregorian rules per Pope Gregory XIII, Inter Gravissimas (1582):
+    leap year iff (divisible by 4 AND not divisible by 100) OR
+    divisible by 400.
+
+References:
+  ISO 8601-1:2019 (Date and time -- Representations for information
+       interchange)
+  RFC 3339 §5.6 (date format ABNF)
+  Hinnant 2013 (http://howardhinnant.github.io/date_algorithms.html)
+  Reingold & Dershowitz, "Calendrical Calculations" (4th ed., 2018)
+==============================================================================
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+
+Note: ============================================================================
+Note: Layout constants
+Note: ============================================================================
+
+Constant DATE_SIZE_BYTES as Integer is 8
+Constant DATE_OFFSET as Integer is 0
+
+Note: ============================================================================
+Note: Date constants
+Note: ============================================================================
+
+Constant DAYS_IN_400_YEAR_CYCLE as Integer is 146097
+Constant DAYS_IN_100_YEAR_CYCLE as Integer is 36524
+Constant DAYS_IN_4_YEAR_CYCLE as Integer is 1461
+Constant DAYS_IN_NON_LEAP_YEAR as Integer is 365
+Constant DAYS_IN_LEAP_YEAR as Integer is 366
+
+Note: Days from 0000-03-01 to 1970-01-01: 719468 (Hinnant's epoch shift).
+Constant UNIX_EPOCH_DAYS_FROM_RATA_DIE as Integer is 719468
+
+Note: ISO weekday constants (Monday = 1 .. Sunday = 7 per ISO 8601 §3.7).
+Constant ISO_WEEKDAY_MONDAY as Integer is 1
+Constant ISO_WEEKDAY_TUESDAY as Integer is 2
+Constant ISO_WEEKDAY_WEDNESDAY as Integer is 3
+Constant ISO_WEEKDAY_THURSDAY as Integer is 4
+Constant ISO_WEEKDAY_FRIDAY as Integer is 5
+Constant ISO_WEEKDAY_SATURDAY as Integer is 6
+Constant ISO_WEEKDAY_SUNDAY as Integer is 7
+
+Note: Error sentinels (returned for invalid year/month/day).
+Constant DATE_OK as Integer is 0
+Constant DATE_ERR_NULL as Integer is -1
+Constant DATE_ERR_INVALID_MONTH as Integer is -2
+Constant DATE_ERR_INVALID_DAY as Integer is -3
+Constant DATE_ERR_INVALID_YEAR as Integer is -4
+Constant DATE_ERR_PARSE as Integer is -5
+
+Note: ASCII helpers
+Constant DATE_ASCII_ZERO as Integer is 48
+Constant DATE_ASCII_DASH as Integer is 45
+
+Note: ============================================================================
+Note: Core Hinnant kernel: days_from_civil and civil_from_days
+Note: ============================================================================
+
+Process called "days_from_civil" takes y as Integer, m as Integer, d as Integer returns Integer:
+    @Reasoning
+    Translates a proleptic-Gregorian (year, month, day) to the ordinal
+    day count since 0000-03-01. The "March-relative" year used
+    internally puts February at the end so the leap day never breaks
+    monotonic arithmetic. Exact over the entire int64 range.
+    @End Reasoning
+    @Implementation
+    Per Hinnant 2013:
+      yp = y - (m <= 2)       // March-based year
+      era = (yp >= 0 ? yp : yp - 399) / 400
+      yoe = yp - era * 400              // [0, 399]
+      doy = (153*(m + (m > 2 ? -3 : 9)) + 2)/5 + d - 1   // [0, 365]
+      doe = yoe * 365 + yoe/4 - yoe/100 + doy            // [0, 146096]
+      return era * 146097 + doe - 719468  (Unix epoch shift)
+    The implementation below uses 0000-03-01 (rather than 1970-01-01)
+    as its zero so the negative-era branch needs the "- 399" adjustment.
+    @End Implementation
+    @Performance_Hints
+    ~20 cycles on x86-64: a handful of integer divides and adds.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function. Caller must have already validated the day-of-month
+    is within range; this kernel does no input bounds checking.
+    @End Security_Scope
+    Let yp be y
+    If m is less than or equal to 2:
+        Set yp to y minus 1
+    End If
+    Let era be 0
+    If yp is greater than or equal to 0:
+        Set era to yp divided by 400
+    Otherwise:
+        Set era to (yp minus 399) divided by 400
+    End If
+    Let yoe be yp minus (era multiplied by 400)
+    Let m_shift be m minus 3
+    If m is less than or equal to 2:
+        Set m_shift to m plus 9
+    End If
+    Let doy be (((153 multiplied by m_shift) plus 2) divided by 5) plus (d minus 1)
+    Let doe be ((yoe multiplied by 365) plus (yoe divided by 4)) minus (yoe divided by 100)
+    Set doe to doe plus doy
+    Return ((era multiplied by DAYS_IN_400_YEAR_CYCLE) plus doe) minus UNIX_EPOCH_DAYS_FROM_RATA_DIE
+End Process
+
+Process called "civil_from_days" takes z as Integer, out_buf as Integer returns Integer:
+    @Reasoning
+    Inverse of days_from_civil. Translates an ordinal day count back to
+    (year, month, day) and writes the triple into a 24-byte caller
+    buffer at offsets 0, 8, 16. Provides the round-trip property
+    civil_from_days(days_from_civil(y, m, d)) == (y, m, d) over the
+    entire int64 range.
+    @End Reasoning
+    @Implementation
+    Per Hinnant 2013, working in "days since 0000-03-01" coordinates:
+      z += 719468                          // shift to rata die
+      era = (z >= 0 ? z : z - 146096) / 146097
+      doe = z - era * 146097               // [0, 146096]
+      yoe = (doe - doe/1460 + doe/36524 - doe/146096)/365  // [0, 399]
+      y_local = yoe + era * 400
+      doy = doe - (365*yoe + yoe/4 - yoe/100)
+      mp = (5*doy + 2)/153
+      d_out = doy - (153*mp + 2)/5 + 1
+      m_out = mp + (mp < 10 ? 3 : -9)
+      y_out = y_local + (m_out <= 2)
+    @End Implementation
+    @Performance_Hints
+    ~30 cycles on x86-64. Branches all fold to cmov on modern hardware.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned 24-byte buffer.
+    @End Security_Scope
+    If out_buf is equal to 0:
+        Return DATE_ERR_NULL
+    End If
+    Let z_rd be z plus UNIX_EPOCH_DAYS_FROM_RATA_DIE
+    Let era be 0
+    If z_rd is greater than or equal to 0:
+        Set era to z_rd divided by DAYS_IN_400_YEAR_CYCLE
+    Otherwise:
+        Set era to (z_rd minus 146096) divided by DAYS_IN_400_YEAR_CYCLE
+    End If
+    Let doe be z_rd minus (era multiplied by DAYS_IN_400_YEAR_CYCLE)
+    Let yoe_numer be doe minus (doe divided by 1460)
+    Set yoe_numer to yoe_numer plus (doe divided by DAYS_IN_100_YEAR_CYCLE)
+    Set yoe_numer to yoe_numer minus (doe divided by 146096)
+    Let yoe be yoe_numer divided by 365
+    Let y_local be yoe plus (era multiplied by 400)
+    Let doy_in_year be doe minus (((365 multiplied by yoe) plus (yoe divided by 4)) minus (yoe divided by 100))
+    Let mp be ((5 multiplied by doy_in_year) plus 2) divided by 153
+    Let d_out be (doy_in_year minus (((153 multiplied by mp) plus 2) divided by 5)) plus 1
+    Let m_out be mp plus 3
+    If mp is greater than or equal to 10:
+        Set m_out to mp minus 9
+    End If
+    Let y_out be y_local
+    If m_out is less than or equal to 2:
+        Set y_out to y_local plus 1
+    End If
+    Let dummy_y be proc memory_set_int64 from MemoryCore with out_buf, 0, y_out
+    Let dummy_m be proc memory_set_int64 from MemoryCore with out_buf, 8, m_out
+    Let dummy_d be proc memory_set_int64 from MemoryCore with out_buf, 16, d_out
+    Return DATE_OK
+End Process
+
+Note: ============================================================================
+Note: Validation and accessors
+Note: ============================================================================
+
+Process called "date_is_leap_year" takes year as Integer returns Integer:
+    @Reasoning
+    Implements the Gregorian leap-year rule: a year is leap iff
+    (divisible by 4 AND not divisible by 100) OR divisible by 400.
+    Per Inter Gravissimas (1582). Examples verified by IERS records:
+    1900 - not leap; 2000 - leap; 2100 - not leap; 2400 - leap.
+    @End Reasoning
+    @Implementation
+    Modular arithmetic.
+    @End Implementation
+    @Performance_Hints
+    Three modulo operations + two branches. ~6 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If (year modulo by 400) is equal to 0:
+        Return 1
+    End If
+    If (year modulo by 100) is equal to 0:
+        Return 0
+    End If
+    If (year modulo by 4) is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "date_days_in_month" takes year as Integer, month as Integer returns Integer:
+    @Reasoning
+    Returns the number of days in the given (year, month) pair
+    accounting for February's leap-year variation. Returns
+    DATE_ERR_INVALID_MONTH for months outside [1, 12].
+    @End Reasoning
+    @Implementation
+    Direct table lookup with leap-year branch on February.
+    @End Implementation
+    @Performance_Hints
+    Few branches + one leap-year check.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If month is less than 1:
+        Return DATE_ERR_INVALID_MONTH
+    End If
+    If month is greater than 12:
+        Return DATE_ERR_INVALID_MONTH
+    End If
+    If month is equal to 1:
+        Return 31
+    End If
+    If month is equal to 2:
+        If date_is_leap_year(year) is equal to 1:
+            Return 29
+        End If
+        Return 28
+    End If
+    If month is equal to 3:
+        Return 31
+    End If
+    If month is equal to 4:
+        Return 30
+    End If
+    If month is equal to 5:
+        Return 31
+    End If
+    If month is equal to 6:
+        Return 30
+    End If
+    If month is equal to 7:
+        Return 31
+    End If
+    If month is equal to 8:
+        Return 31
+    End If
+    If month is equal to 9:
+        Return 30
+    End If
+    If month is equal to 10:
+        Return 31
+    End If
+    If month is equal to 11:
+        Return 30
+    End If
+    Return 31
+End Process
+
+Process called "date_validate" takes year as Integer, month as Integer, day as Integer returns Integer:
+    @Reasoning
+    Returns DATE_OK if (year, month, day) is a valid proleptic-Gregorian
+    triple; otherwise returns the corresponding DATE_ERR_INVALID_* code.
+    @End Reasoning
+    @Implementation
+    Checks month range, then day range against date_days_in_month.
+    There is no plausible "invalid year" since the proleptic calendar
+    extends in both directions, but year 0 is allowed (1 BCE in
+    historical terminology).
+    @End Implementation
+    @Performance_Hints
+    A handful of compares and one date_days_in_month call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If month is less than 1:
+        Return DATE_ERR_INVALID_MONTH
+    End If
+    If month is greater than 12:
+        Return DATE_ERR_INVALID_MONTH
+    End If
+    If day is less than 1:
+        Return DATE_ERR_INVALID_DAY
+    End If
+    Let dim be date_days_in_month(year, month)
+    If day is greater than dim:
+        Return DATE_ERR_INVALID_DAY
+    End If
+    Return DATE_OK
+End Process
+
+Note: ============================================================================
+Note: Allocation / construction
+Note: ============================================================================
+
+Process called "date_allocate" returns Integer:
+    @Reasoning
+    Reserves a fresh 8-byte Date buffer holding a single ordinal-day
+    Integer.
+    @End Reasoning
+    @Implementation
+    Calls Layout.allocate.
+    @End Implementation
+    @Performance_Hints
+    One tier-3 alloc.
+    @End Performance_Hints
+    @Security_Scope
+    Caller must release with date_free.
+    @End Security_Scope
+    Return proc allocate from Layout with DATE_SIZE_BYTES
+End Process
+
+Process called "date_free" takes d as Integer returns Integer:
+    @Reasoning
+    Releases a Date buffer.
+    @End Reasoning
+    @Implementation
+    Layout.deallocate. Null pointer is a no-op.
+    @End Implementation
+    @Performance_Hints
+    One tier-3 free.
+    @End Performance_Hints
+    @Security_Scope
+    Standard heap rules.
+    @End Security_Scope
+    If d is equal to 0:
+        Return DATE_OK
+    End If
+    Let dummy be proc deallocate from Layout with d
+    Return DATE_OK
+End Process
+
+Process called "date_create" takes year as Integer, month as Integer, day as Integer returns Integer:
+    @Reasoning
+    Constructs a fresh Date from a (year, month, day) triple. On
+    success returns the heap pointer; on validation failure returns
+    a negative DATE_ERR_* sentinel.
+    @End Reasoning
+    @Implementation
+    Validates the triple, allocates, then writes the ordinal-day
+    encoding produced by days_from_civil.
+    @End Implementation
+    @Performance_Hints
+    Validation + days_from_civil + one alloc + one store.
+    @End Performance_Hints
+    @Security_Scope
+    Returned pointer must be released with date_free.
+    @End Security_Scope
+    Let validation be date_validate(year, month, day)
+    If validation is not equal to DATE_OK:
+        Return validation
+    End If
+    Let d_ptr be proc allocate from Layout with DATE_SIZE_BYTES
+    If d_ptr is equal to 0:
+        Return DATE_ERR_NULL
+    End If
+    Let ordinal be days_from_civil(year, month, day)
+    Let dummy be proc memory_set_int64 from MemoryCore with d_ptr, DATE_OFFSET, ordinal
+    Return d_ptr
+End Process
+
+Process called "date_from_ordinal" takes ordinal as Integer returns Integer:
+    @Reasoning
+    Constructs a Date directly from a Unix-day ordinal (days since
+    1970-01-01). Used by datetime conversions where the ordinal is
+    already known.
+    @End Reasoning
+    @Implementation
+    Allocates and stores.
+    @End Implementation
+    @Performance_Hints
+    One alloc + one store.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer must be released with date_free.
+    @End Security_Scope
+    Let d_ptr be proc allocate from Layout with DATE_SIZE_BYTES
+    If d_ptr is equal to 0:
+        Return DATE_ERR_NULL
+    End If
+    Let dummy be proc memory_set_int64 from MemoryCore with d_ptr, DATE_OFFSET, ordinal
+    Return d_ptr
+End Process
+
+Process called "date_get_ordinal" takes d as Integer returns Integer:
+    @Reasoning
+    Reads the underlying ordinal day count.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If d is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with d, DATE_OFFSET
+End Process
+
+Process called "date_get_year" takes d as Integer returns Integer:
+    @Reasoning
+    Returns the conventional January-start year for a Date.
+    @End Reasoning
+    @Implementation
+    Allocates a 24-byte scratch buffer, calls civil_from_days, reads
+    the year, frees the scratch.
+    @End Implementation
+    @Performance_Hints
+    civil_from_days dominates the cost.
+    @End Performance_Hints
+    @Security_Scope
+    Allocates and frees a 24-byte scratch buffer per call.
+    @End Security_Scope
+    If d is equal to 0:
+        Return 0
+    End If
+    Let ord be date_get_ordinal(d)
+    Let scratch be proc allocate from Layout with 24
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let dummy be civil_from_days(ord, scratch)
+    Let y be proc memory_get_int64 from MemoryCore with scratch, 0
+    Let dummy2 be proc deallocate from Layout with scratch
+    Return y
+End Process
+
+Process called "date_get_month" takes d as Integer returns Integer:
+    @Reasoning
+    Returns the month [1, 12] for a Date.
+    @End Reasoning
+    @Implementation
+    Same pattern as date_get_year, reads offset 8.
+    @End Implementation
+    @Performance_Hints
+    Same as date_get_year.
+    @End Performance_Hints
+    @Security_Scope
+    Allocates and frees a 24-byte scratch buffer per call.
+    @End Security_Scope
+    If d is equal to 0:
+        Return 0
+    End If
+    Let ord be date_get_ordinal(d)
+    Let scratch be proc allocate from Layout with 24
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let dummy be civil_from_days(ord, scratch)
+    Let m be proc memory_get_int64 from MemoryCore with scratch, 8
+    Let dummy2 be proc deallocate from Layout with scratch
+    Return m
+End Process
+
+Process called "date_get_day" takes d as Integer returns Integer:
+    @Reasoning
+    Returns the day-of-month [1, 31] for a Date.
+    @End Reasoning
+    @Implementation
+    Same pattern as date_get_year, reads offset 16.
+    @End Implementation
+    @Performance_Hints
+    Same as date_get_year.
+    @End Performance_Hints
+    @Security_Scope
+    Allocates and frees a 24-byte scratch buffer per call.
+    @End Security_Scope
+    If d is equal to 0:
+        Return 0
+    End If
+    Let ord be date_get_ordinal(d)
+    Let scratch be proc allocate from Layout with 24
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let dummy be civil_from_days(ord, scratch)
+    Let day_out be proc memory_get_int64 from MemoryCore with scratch, 16
+    Let dummy2 be proc deallocate from Layout with scratch
+    Return day_out
+End Process
+
+Note: ============================================================================
+Note: Day-of-week / day-of-year / week-of-year
+Note: ============================================================================
+
+Process called "date_day_of_week" takes year as Integer, month as Integer, day as Integer returns Integer:
+    @Reasoning
+    Returns the ISO 8601 §3.7 weekday: Monday = 1, Sunday = 7. Uses
+    the Hinnant weekday_from_days formula keyed to the Unix epoch.
+    Verified: 2000-01-01 = Saturday = 6, 1970-01-01 = Thursday = 4,
+    2024-01-01 = Monday = 1.
+    @End Reasoning
+    @Implementation
+    Per Hinnant 2013: ((days + 4) % 7), with the result mapped from
+    [Sun=0..Sat=6] to ISO [Mon=1..Sun=7]. We compute on the rata-die
+    offset (days since 0000-03-01) so the +4 anchor floats to +3 in
+    the rata-die convention.
+    @End Implementation
+    @Performance_Hints
+    days_from_civil + modulo + small fixup.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    Let z be days_from_civil(year, month, day)
+    Note: days_from_civil returns days since 1970-01-01 (Thursday).
+    Note: Thursday is ISO weekday 4.
+    Note: weekday = ((z + 3) mod 7) + 1, where +3 makes 1970-01-01 evaluate
+    Note: to ((0 + 3) mod 7) + 1 = 4 (Thursday).
+    Let r be (z plus 3) modulo by 7
+    If r is less than 0:
+        Set r to r plus 7
+    End If
+    Return r plus 1
+End Process
+
+Process called "date_day_of_year" takes year as Integer, month as Integer, day as Integer returns Integer:
+    @Reasoning
+    Returns the 1-based day-of-year [1, 366]. January 1 = 1; December
+    31 = 365 (366 in leap years). Used by ISO 8601 §3.4 ordinal-date
+    notation (YYYY-DDD).
+    @End Reasoning
+    @Implementation
+    days_from_civil(y, m, d) minus days_from_civil(y, 1, 1) plus 1.
+    @End Implementation
+    @Performance_Hints
+    Two days_from_civil calls + one subtract.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    Let z_d be days_from_civil(year, month, day)
+    Let z_jan1 be days_from_civil(year, 1, 1)
+    Return (z_d minus z_jan1) plus 1
+End Process
+
+Process called "date_week_of_year_iso" takes year as Integer, month as Integer, day as Integer returns Integer:
+    @Reasoning
+    Returns the ISO 8601 §3.4.4 week number [1, 53]. The ISO week
+    begins on Monday; Week 01 is the week containing the first
+    Thursday of the year (equivalently: the week containing
+    January 4). Edge cases: late December / early January can belong
+    to the adjacent year's week numbering.
+    @End Reasoning
+    @Implementation
+    Standard formula:
+      d_o = days_from_civil(y, m, d)
+      d_thu = d_o + 4 - iso_weekday(y, m, d)   // shift to Thursday of this week
+      year_of_week = civil_year(d_thu)
+      week = ((d_thu - days_from_civil(year_of_week, 1, 4)) / 7) + 1
+              after also shifting Jan 4 to its containing Thursday
+    For test scope we return just the week number; callers needing
+    the ISO week-year should consult date_week_year_iso.
+    @End Implementation
+    @Performance_Hints
+    Three days_from_civil calls + integer arithmetic.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    Let d_o be days_from_civil(year, month, day)
+    Let wd be date_day_of_week(year, month, day)
+    Let d_thu be (d_o plus 4) minus wd
+    Note: Find civil year of d_thu via civil_from_days.
+    Let scratch be proc allocate from Layout with 24
+    If scratch is equal to 0:
+        Return 1
+    End If
+    Let dummy be civil_from_days(d_thu, scratch)
+    Let y_thu be proc memory_get_int64 from MemoryCore with scratch, 0
+    Let dummy_f be proc deallocate from Layout with scratch
+    Let d_jan4 be days_from_civil(y_thu, 1, 4)
+    Let wd_jan4 be date_day_of_week(y_thu, 1, 4)
+    Let thu_of_w1 be (d_jan4 plus 4) minus wd_jan4
+    Return ((d_thu minus thu_of_w1) divided by 7) plus 1
+End Process
+
+Process called "date_week_year_iso" takes year as Integer, month as Integer, day as Integer returns Integer:
+    @Reasoning
+    Returns the ISO 8601 §3.4.4 week-numbering year, which can differ
+    from the calendar year by +/- 1 near year boundaries.
+    @End Reasoning
+    @Implementation
+    Compute the Thursday of the date's week and read its civil year.
+    @End Implementation
+    @Performance_Hints
+    One days_from_civil + one civil_from_days.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    Let d_o be days_from_civil(year, month, day)
+    Let wd be date_day_of_week(year, month, day)
+    Let d_thu be (d_o plus 4) minus wd
+    Let scratch be proc allocate from Layout with 24
+    If scratch is equal to 0:
+        Return year
+    End If
+    Let dummy be civil_from_days(d_thu, scratch)
+    Let y_thu be proc memory_get_int64 from MemoryCore with scratch, 0
+    Let dummy_f be proc deallocate from Layout with scratch
+    Return y_thu
+End Process
+
+Note: ============================================================================
+Note: Arithmetic (returns new Date pointers)
+Note: ============================================================================
+
+Process called "date_add_days" takes d as Integer, n as Integer returns Integer:
+    @Reasoning
+    Returns a new Date shifted forward (positive n) or backward
+    (negative n) by n days.
+    @End Reasoning
+    @Implementation
+    Single integer addition on the ordinal day. Allocates a fresh
+    output Date.
+    @End Implementation
+    @Performance_Hints
+    One add + one alloc.
+    @End Performance_Hints
+    @Security_Scope
+    Returned pointer must be released with date_free.
+    @End Security_Scope
+    If d is equal to 0:
+        Return DATE_ERR_NULL
+    End If
+    Let ord be date_get_ordinal(d)
+    Let new_ord be ord plus n
+    Return date_from_ordinal(new_ord)
+End Process
+
+Process called "date_diff_days" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Returns (a - b) in days, signed.
+    @End Reasoning
+    @Implementation
+    Subtracts ordinal day counts.
+    @End Implementation
+    @Performance_Hints
+    Two loads + one subtract.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let oa be date_get_ordinal(a)
+    Let ob be date_get_ordinal(b)
+    Return oa minus ob
+End Process
+
+Process called "date_add_months" takes d as Integer, months_delta as Integer returns Integer:
+    @Reasoning
+    Adds months to a Date, clamping the day-of-month if the target
+    month is shorter than the source (e.g. 2024-01-31 + 1 month =
+    2024-02-29 in a leap year, 2025-02-28 otherwise). This matches
+    Java time.LocalDate.plusMonths and Python's relativedelta with
+    clamp-on-overflow.
+    @End Reasoning
+    @Implementation
+    Reads the (y, m, d) triple, computes new year/month indices via
+    integer division of the absolute month count, clamps the day
+    against date_days_in_month, then re-encodes via date_create.
+    @End Implementation
+    @Performance_Hints
+    civil_from_days + one date_days_in_month + one days_from_civil.
+    @End Performance_Hints
+    @Security_Scope
+    Returned pointer must be released with date_free.
+    @End Security_Scope
+    If d is equal to 0:
+        Return DATE_ERR_NULL
+    End If
+    Let y be date_get_year(d)
+    Let m be date_get_month(d)
+    Let day_val be date_get_day(d)
+    Note: months_total uses 0-based month index for clean arithmetic.
+    Let total_months be ((y multiplied by 12) plus (m minus 1)) plus months_delta
+    Let new_year be 0
+    Let new_month_zero be 0
+    If total_months is greater than or equal to 0:
+        Set new_year to total_months divided by 12
+        Set new_month_zero to total_months modulo by 12
+    Otherwise:
+        Set new_year to (total_months plus 1) divided by 12
+        Set new_year to new_year minus 1
+        Set new_month_zero to total_months minus (new_year multiplied by 12)
+    End If
+    Let new_month be new_month_zero plus 1
+    Let dim be date_days_in_month(new_year, new_month)
+    Let new_day be day_val
+    If new_day is greater than dim:
+        Set new_day to dim
+    End If
+    Return date_create(new_year, new_month, new_day)
+End Process
+
+Process called "date_add_years" takes d as Integer, years_delta as Integer returns Integer:
+    @Reasoning
+    Adds civil years to a Date, clamping February 29 in non-leap target
+    years to February 28 (matching Java LocalDate.plusYears and ISO
+    8601 §5.2.2 implied date arithmetic).
+    @End Reasoning
+    @Implementation
+    Multiplies years_delta by 12 and forwards to date_add_months.
+    @End Implementation
+    @Performance_Hints
+    One multiply + one date_add_months call.
+    @End Performance_Hints
+    @Security_Scope
+    Returned pointer must be released with date_free.
+    @End Security_Scope
+    If d is equal to 0:
+        Return DATE_ERR_NULL
+    End If
+    Return date_add_months(d, years_delta multiplied by 12)
+End Process
+
+Note: ============================================================================
+Note: ISO 8601 formatting
+Note: ============================================================================
+
+Process called "_date_write_4digit" takes buf as Integer, offset as Integer, value as Integer returns Integer:
+    @Reasoning
+    Writes a 4-digit zero-padded representation of an Integer in
+    [-9999, 9999]. For ISO 8601 §3.4 the year must be at least four
+    digits; negative years emit a leading '-' (so this internal helper
+    is followed by a sign branch in the public formatter).
+    @End Reasoning
+    @Implementation
+    Picks off thousands, hundreds, tens, units in turn.
+    @End Implementation
+    @Performance_Hints
+    Four divides + four stores.
+    @End Performance_Hints
+    @Security_Scope
+    Bounded write of 4 bytes. Caller must ensure capacity.
+    @End Security_Scope
+    Let v be value
+    If v is less than 0:
+        Set v to 0 minus v
+    End If
+    Let t be v divided by 1000
+    Let r1 be v modulo by 1000
+    Let h be r1 divided by 100
+    Let r2 be r1 modulo by 100
+    Let te be r2 divided by 10
+    Let u be r2 modulo by 10
+    Let off0 be offset
+    Let off1 be offset plus 1
+    Let off2 be offset plus 2
+    Let off3 be offset plus 3
+    Let d0 be proc memory_set_int8 from MemoryCore with buf, off0, t plus DATE_ASCII_ZERO
+    Let d1 be proc memory_set_int8 from MemoryCore with buf, off1, h plus DATE_ASCII_ZERO
+    Let d2 be proc memory_set_int8 from MemoryCore with buf, off2, te plus DATE_ASCII_ZERO
+    Let d3 be proc memory_set_int8 from MemoryCore with buf, off3, u plus DATE_ASCII_ZERO
+    Return 4
+End Process
+
+Process called "_date_write_2digit" takes buf as Integer, offset as Integer, value as Integer returns Integer:
+    @Reasoning
+    Writes a 2-digit zero-padded representation of an integer in
+    [0, 99]. Used for month and day-of-month in ISO 8601 output.
+    @End Reasoning
+    @Implementation
+    Picks off tens and units.
+    @End Implementation
+    @Performance_Hints
+    Two divides + two stores.
+    @End Performance_Hints
+    @Security_Scope
+    Bounded write of 2 bytes.
+    @End Security_Scope
+    Let t be value divided by 10
+    Let u be value modulo by 10
+    Let off0 be offset
+    Let off1 be offset plus 1
+    Let d0 be proc memory_set_int8 from MemoryCore with buf, off0, t plus DATE_ASCII_ZERO
+    Let d1 be proc memory_set_int8 from MemoryCore with buf, off1, u plus DATE_ASCII_ZERO
+    Return 2
+End Process
+
+Process called "date_to_iso_8601" takes d as Integer, out_buf as Integer, out_capacity as Integer returns Integer:
+    @Reasoning
+    Emits the extended ISO 8601 representation "YYYY-MM-DD" (or
+    "-YYYY-MM-DD" for negative years per ISO 8601 §4.1.2.4). Returns
+    the number of bytes written.
+    @End Reasoning
+    @Implementation
+    Reads (y, m, d), writes optional minus sign, four-digit year, '-',
+    two-digit month, '-', two-digit day.
+    @End Implementation
+    @Performance_Hints
+    civil_from_days dominates the cost.
+    @End Performance_Hints
+    @Security_Scope
+    Bounded write up to 11 bytes (sign + 10 chars).
+    @End Security_Scope
+    If d is equal to 0:
+        Return DATE_ERR_NULL
+    End If
+    If out_buf is equal to 0:
+        Return DATE_ERR_NULL
+    End If
+    If out_capacity is less than 10:
+        Return DATE_ERR_NULL
+    End If
+    Let year_val be date_get_year(d)
+    Let month_val be date_get_month(d)
+    Let day_val be date_get_day(d)
+    Let cursor be 0
+    If year_val is less than 0:
+        Let dummy_minus be proc memory_set_int8 from MemoryCore with out_buf, cursor, DATE_ASCII_DASH
+        Set cursor to cursor plus 1
+    End If
+    Let ylen be _date_write_4digit(out_buf, cursor, year_val)
+    Set cursor to cursor plus ylen
+    Let dummy_d1 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DATE_ASCII_DASH
+    Set cursor to cursor plus 1
+    Let mlen be _date_write_2digit(out_buf, cursor, month_val)
+    Set cursor to cursor plus mlen
+    Let dummy_d2 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DATE_ASCII_DASH
+    Set cursor to cursor plus 1
+    Let dlen be _date_write_2digit(out_buf, cursor, day_val)
+    Set cursor to cursor plus dlen
+    Return cursor
+End Process
+
+Process called "_date_parse_uint" takes input as Integer, start as Integer, length as Integer returns Integer:
+    @Reasoning
+    Parses 'length' ASCII digit characters into an unsigned integer.
+    Returns -1 on any non-digit. Used by the ISO 8601 parser to grab
+    the year, month, and day fields.
+    @End Reasoning
+    @Implementation
+    Standard left-to-right accumulation.
+    @End Implementation
+    @Performance_Hints
+    O(length).
+    @End Performance_Hints
+    @Security_Scope
+    Caller responsible for ensuring input has 'length' bytes from
+    start onward.
+    @End Security_Scope
+    Let result be 0
+    Let i be 0
+    While i is less than length:
+        Let pos be start plus i
+        Let c be proc memory_get_int8 from MemoryCore with input, pos
+        If c is less than DATE_ASCII_ZERO:
+            Return -1
+        End If
+        If c is greater than 57:
+            Return -1
+        End If
+        Set result to (result multiplied by 10) plus (c minus DATE_ASCII_ZERO)
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+Process called "date_parse_iso_8601" takes input as Integer returns Integer:
+    @Reasoning
+    Parses "YYYY-MM-DD" (extended format) into a Date pointer. Does
+    not accept the basic format YYYYMMDD or ordinal/week-date forms.
+    Returns a negative DATE_ERR_PARSE sentinel on any malformed input.
+    @End Reasoning
+    @Implementation
+    Verifies the dash positions (offsets 4 and 7), then parses the
+    three numeric fields. Validates the resulting (year, month, day)
+    via date_validate before constructing the Date.
+    @End Implementation
+    @Performance_Hints
+    Three small parses + one date_create.
+    @End Performance_Hints
+    @Security_Scope
+    Requires the input buffer to be at least 10 bytes long. A
+    null-terminator past byte 10 is acceptable; bytes beyond 10 are
+    ignored.
+    @End Security_Scope
+    If input is equal to 0:
+        Return DATE_ERR_PARSE
+    End If
+    Let dash1 be proc memory_get_int8 from MemoryCore with input, 4
+    Let dash2 be proc memory_get_int8 from MemoryCore with input, 7
+    If dash1 is not equal to DATE_ASCII_DASH:
+        Return DATE_ERR_PARSE
+    End If
+    If dash2 is not equal to DATE_ASCII_DASH:
+        Return DATE_ERR_PARSE
+    End If
+    Let y_parsed be _date_parse_uint(input, 0, 4)
+    Let m_parsed be _date_parse_uint(input, 5, 2)
+    Let d_parsed be _date_parse_uint(input, 8, 2)
+    If y_parsed is less than 0:
+        Return DATE_ERR_PARSE
+    End If
+    If m_parsed is less than 0:
+        Return DATE_ERR_PARSE
+    End If
+    If d_parsed is less than 0:
+        Return DATE_ERR_PARSE
+    End If
+    Return date_create(y_parsed, m_parsed, d_parsed)
+End Process
+
+Note: ============================================================================
+Note: Comparison
+Note: ============================================================================
+
+Process called "date_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Three-way compare on ordinal days.
+    @End Reasoning
+    @Implementation
+    Subtracts ordinals; signs the result to -1/0/+1.
+    @End Implementation
+    @Performance_Hints
+    Two loads + one subtract.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    Let oa be date_get_ordinal(a)
+    Let ob be date_get_ordinal(b)
+    If oa is less than ob:
+        Return -1
+    End If
+    If oa is greater than ob:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "date_equals" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Equality predicate.
+    @End Reasoning
+    @Implementation
+    Returns 1 iff date_compare is 0.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If date_compare(a, b) is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process

@@ -1,0 +1,2348 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+RSA - RFC 8017 / PKCS#1 v2.2 implementation
+==============================================================================
+
+Implements the full PKCS#1 v2.2 (RFC 8017) suite:
+
+Primitives (section 5):
+  RSAEP  - RSA encryption  : c = m^e mod n
+  RSADP  - RSA decryption  : m = c^d mod n   (with blinding)
+  RSASP1 - signature       : s = m^d mod n   (with blinding)
+  RSAVP1 - verification    : m = s^e mod n
+
+Encoding (section 9):
+  EMSA-PSS         - PSS encode/decode      (section 9.1)
+  EMSA-PKCS1-v1_5  - legacy encode          (section 9.2)
+  EME-OAEP         - OAEP encrypt/decrypt   (section 7.1)
+  EME-PKCS1-v1_5   - legacy encrypt/decrypt (section 7.2)
+
+Schemes (sections 7 and 8):
+  RSAES-OAEP             - encryption (recommended)
+  RSAES-PKCS1-v1_5       - legacy encryption
+  RSASSA-PSS             - signature (recommended)
+  RSASSA-PKCS1-v1_5      - legacy signature
+
+Mask generation: MGF1 (section B.2.1) parametrized on SHA-256 / SHA-384 /
+SHA-512 from sha2.runa.
+
+Key layout: every key value is a BigInt allocated from the caller's arena.
+The public key is (n, e); the private key holds (n, d, p, q, dp, dq, qInv)
+for CRT-accelerated signing.
+
+Constant-time / side-channel resistance:
+- Every private-key operation uses RSA BLINDING: input m is masked by a
+  random r^e mod n before the modexp, then unmasked by r^-1 mod n after.
+  This randomizes the value the modexp operates on so timing or power
+  analysis of the modexp inner loop cannot recover d. Kocher 1996.
+- The modexp itself is bigint_mod_exp which walks the exponent bit-by-bit
+  (not constant-time over the exponent value, but the input is blinded so
+  the value seen by the modexp is random per call).
+- OAEP decryption uses constant-time byte comparison via secure_memory to
+  prevent Manger's attack (chosen-ciphertext padding-oracle CRYPTO 2001).
+- PKCS#1 v1.5 paths document the Bleichenbacher CRYPTO 1998 risk and the
+  caller is responsible for treating decryption failures uniformly.
+
+References:
+- RFC 8017 "PKCS #1: RSA Cryptography Specifications Version 2.2".
+- Kocher "Timing Attacks on Implementations of Diffie-Hellman, RSA, DSS,
+  and Other Systems" (CRYPTO 1996).
+- Bleichenbacher "Chosen Ciphertext Attacks Against Protocols Based on
+  the RSA Encryption Standard PKCS#1" (CRYPTO 1998).
+- Manger "A Chosen Ciphertext Attack on RSA Optimal Asymmetric Encryption
+  Padding (OAEP)" (CRYPTO 2001).
+- Bellare, Rogaway "Optimal Asymmetric Encryption" (Eurocrypt 1994).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/bigint.runa" as BigInt
+Import "compiler/frontend/import_system/crypto/bigint_extra.runa" as BigIntX
+Import "compiler/frontend/import_system/crypto/sha2.runa" as Sha2
+Import "compiler/frontend/import_system/crypto/entropy.runa" as Entropy
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as SecureMem
+
+Constant RSA_HASH_SHA256 as Integer is 0
+Constant RSA_HASH_SHA384 as Integer is 1
+Constant RSA_HASH_SHA512 as Integer is 2
+Note: Sentinel ids for hash algorithms that are syntactically representable
+Note: in legacy RSA parameter encodings (RFC 4055 §3.1 mandates SHA-1 as the
+Note: PSS DEFAULT) but are NOT cryptographically acceptable for verification
+Note: in this implementation. The parsing surface (rsa_decode_pss_parameters)
+Note: returns these ids when the corresponding hash OID is encountered or
+Note: when the RFC 4055 absent-field default applies; the strength gate in
+Note: the verifier (rsa_public_set_hash and the PSS verify dispatch) MUST
+Note: reject any signature whose effective hash id is RSA_HASH_SHA1 or
+Note: RSA_HASH_MD5 with verify=0. Slot numbers chosen to be disjoint from
+Note: the accepted SHA-2 slots (0..2).
+Constant RSA_HASH_SHA1 as Integer is 100
+Constant RSA_HASH_MD5  as Integer is 101
+
+Note: Key struct layout (40 bytes for public, 96 bytes for private):
+Note:   public: { n_ptr, e_ptr, modulus_bits, modulus_bytes, hash_alg }
+Note:   private: { n_ptr, e_ptr, d_ptr, modulus_bits, modulus_bytes,
+Note:              hash_alg, p_ptr, q_ptr, dp_ptr, dq_ptr, qInv_ptr }
+
+Constant RSA_PUBLIC_KEY_BYTES as Integer is 40
+Constant RSA_PRIVATE_KEY_BYTES as Integer is 96
+
+Process called "rsa_hash_output_size" takes hash_id as Integer returns Integer:
+    @Reasoning
+    Returns the digest size in bytes for the named hash.
+    @End Reasoning
+
+    @Implementation
+    SHA-256 -> 32, SHA-384 -> 48, SHA-512 -> 64.
+    @End Implementation
+
+    @Performance_Hints
+    Single comparison.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public dispatch.
+    @End Security_Scope
+
+    If hash_id is equal to RSA_HASH_SHA256:
+        Return 32
+    End If
+    If hash_id is equal to RSA_HASH_SHA384:
+        Return 48
+    End If
+    If hash_id is equal to RSA_HASH_SHA512:
+        Return 64
+    End If
+    Return 0
+End Process
+
+Process called "rsa_hash" takes arena as Integer, hash_id as Integer, msg as Integer, msg_length as Integer, out_digest as Integer returns Integer:
+    @Reasoning
+    Dispatches to the SHA-2 variant identified by hash_id.
+    @End Reasoning
+
+    @Implementation
+    Selects sha256_hash / sha384_hash / sha512_hash.
+    @End Implementation
+
+    @Performance_Hints
+    Cost is that of the underlying hash.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public dispatch.
+    @End Security_Scope
+
+    If hash_id is equal to RSA_HASH_SHA256:
+        Return proc sha256_hash from Sha2 with arena, msg, msg_length, out_digest
+    End If
+    If hash_id is equal to RSA_HASH_SHA384:
+        Return proc sha384_hash from Sha2 with arena, msg, msg_length, out_digest
+    End If
+    If hash_id is equal to RSA_HASH_SHA512:
+        Return proc sha512_hash from Sha2 with arena, msg, msg_length, out_digest
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Key struct accessors (public)
+Note: ============================================================================
+
+Process called "rsa_public_key_alloc" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocates an empty public-key struct.
+    @End Reasoning
+
+    @Implementation
+    arena_allocate 40 zeroed bytes.
+    @End Implementation
+
+    @Performance_Hints
+    Single arena allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    No side-channel.
+    @End Security_Scope
+
+    Let key be proc arena_allocate from Arena with arena, RSA_PUBLIC_KEY_BYTES
+    If key is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than RSA_PUBLIC_KEY_BYTES:
+        proc memory_set_byte from Memory with key, i, 0
+        Set i to i plus 1
+    End While
+    Return key
+End Process
+
+Process called "rsa_public_set_n" takes key as Integer, n as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 0, n
+    Return 1
+End Process
+
+Process called "rsa_public_set_e" takes key as Integer, e as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 8, e
+    Return 1
+End Process
+
+Process called "rsa_public_set_bits" takes key as Integer, bits as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 16, bits
+    proc memory_set_qword from Memory with key, 24, bits divided by 8
+    Return 1
+End Process
+
+Process called "rsa_public_set_hash" takes key as Integer, hash_id as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 32, hash_id
+    Return 1
+End Process
+
+Process called "rsa_public_get_n" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 0
+End Process
+
+Process called "rsa_public_get_e" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 8
+End Process
+
+Process called "rsa_public_get_bits" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 16
+End Process
+
+Process called "rsa_public_get_modulus_bytes" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 24
+End Process
+
+Process called "rsa_public_get_hash" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 32
+End Process
+
+Note: ============================================================================
+Note: Key struct accessors (private)
+Note: ============================================================================
+
+Process called "rsa_private_key_alloc" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocates an empty private-key struct.
+    @End Reasoning
+
+    @Implementation
+    arena_allocate 96 zeroed bytes.
+    @End Implementation
+
+    @Performance_Hints
+    Single arena allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    No side-channel.
+    @End Security_Scope
+
+    Let key be proc arena_allocate from Arena with arena, RSA_PRIVATE_KEY_BYTES
+    If key is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than RSA_PRIVATE_KEY_BYTES:
+        proc memory_set_byte from Memory with key, i, 0
+        Set i to i plus 1
+    End While
+    Return key
+End Process
+
+Process called "rsa_private_set_n" takes key as Integer, n as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 0, n
+    Return 1
+End Process
+
+Process called "rsa_private_set_e" takes key as Integer, e as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 8, e
+    Return 1
+End Process
+
+Process called "rsa_private_set_d" takes key as Integer, d as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 16, d
+    Return 1
+End Process
+
+Process called "rsa_private_set_bits" takes key as Integer, bits as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 24, bits
+    proc memory_set_qword from Memory with key, 32, bits divided by 8
+    Return 1
+End Process
+
+Process called "rsa_private_set_hash" takes key as Integer, hash_id as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 40, hash_id
+    Return 1
+End Process
+
+Process called "rsa_private_set_p" takes key as Integer, p as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 48, p
+    Return 1
+End Process
+
+Process called "rsa_private_set_q" takes key as Integer, q as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 56, q
+    Return 1
+End Process
+
+Process called "rsa_private_set_dp" takes key as Integer, dp as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 64, dp
+    Return 1
+End Process
+
+Process called "rsa_private_set_dq" takes key as Integer, dq as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 72, dq
+    Return 1
+End Process
+
+Process called "rsa_private_set_qinv" takes key as Integer, qinv as Integer returns Integer:
+    proc memory_set_qword from Memory with key, 80, qinv
+    Return 1
+End Process
+
+Process called "rsa_private_get_n" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 0
+End Process
+
+Process called "rsa_private_get_e" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 8
+End Process
+
+Process called "rsa_private_get_d" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 16
+End Process
+
+Process called "rsa_private_get_bits" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 24
+End Process
+
+Process called "rsa_private_get_modulus_bytes" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 32
+End Process
+
+Process called "rsa_private_get_hash" takes key as Integer returns Integer:
+    Return proc memory_get_qword from Memory with key, 40
+End Process
+
+Process called "rsa_private_get_p" takes key as Integer returns Integer:
+    @Reasoning
+    Returns the prime p stored in the private-key struct. Used by ASN.1
+    PKCS#1 RSAPrivateKey encoders that materialize p as an INTEGER inside
+    the SEQUENCE.
+    @End Reasoning
+    @Implementation
+    Reads qword at offset 48 written by rsa_private_set_p.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Returns a pointer to SECRET prime material.
+    @End Security_Scope
+    Return proc memory_get_qword from Memory with key, 48
+End Process
+
+Process called "rsa_private_get_q" takes key as Integer returns Integer:
+    @Reasoning
+    Returns the prime q stored in the private-key struct.
+    @End Reasoning
+    @Implementation
+    Reads qword at offset 56 written by rsa_private_set_q.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Returns a pointer to SECRET prime material.
+    @End Security_Scope
+    Return proc memory_get_qword from Memory with key, 56
+End Process
+
+Process called "rsa_private_get_dp" takes key as Integer returns Integer:
+    @Reasoning
+    Returns the CRT exponent dp = d mod (p - 1).
+    @End Reasoning
+    @Implementation
+    Reads qword at offset 64 written by rsa_private_set_dp.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Returns a pointer to SECRET CRT material.
+    @End Security_Scope
+    Return proc memory_get_qword from Memory with key, 64
+End Process
+
+Process called "rsa_private_get_dq" takes key as Integer returns Integer:
+    @Reasoning
+    Returns the CRT exponent dq = d mod (q - 1).
+    @End Reasoning
+    @Implementation
+    Reads qword at offset 72 written by rsa_private_set_dq.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Returns a pointer to SECRET CRT material.
+    @End Security_Scope
+    Return proc memory_get_qword from Memory with key, 72
+End Process
+
+Process called "rsa_private_get_qinv" takes key as Integer returns Integer:
+    @Reasoning
+    Returns the CRT coefficient qinv = q^(-1) mod p.
+    @End Reasoning
+    @Implementation
+    Reads qword at offset 80 written by rsa_private_set_qinv.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Returns a pointer to SECRET CRT material.
+    @End Security_Scope
+    Return proc memory_get_qword from Memory with key, 80
+End Process
+
+Note: ============================================================================
+Note: Constant-time-equal helper for fixed-size byte buffers
+Note: ============================================================================
+
+Process called "rsa_constant_time_equal_bytes" takes a as Integer, b as Integer, length as Integer returns Integer:
+    @Reasoning
+    Returns 1 if a[0..length) == b[0..length) bytewise, 0 otherwise,
+    in constant time over length. Used to compare OAEP labels and PSS
+    message representations.
+    @End Reasoning
+
+    @Implementation
+    XOR-fold all byte pairs; result is zero iff all bytes match.
+    @End Implementation
+
+    @Performance_Hints
+    O(length) loop.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against timing leakage of where the two buffers differ.
+    @End Security_Scope
+
+    Return proc constant_time_compare from SecureMem with a, b, length
+End Process
+
+Note: ============================================================================
+Note: Modular inverse via extended Euclidean - used at key-gen to compute
+Note: d = e^-1 mod phi(n) and qInv = q^-1 mod p. Public-data only.
+Note: ============================================================================
+
+Process called "rsa_modinv" takes arena as Integer, dest as Integer, a as Integer, m as Integer returns Integer:
+    @Reasoning
+    Computes dest = a^-1 mod m via Fermat-style modular exponentiation
+    when m is prime, or via the extended Euclidean algorithm when m is
+    composite. Since RSA key generation uses primes p, q and the modulus
+    relations are over phi(n) (composite) and over p (prime), we use the
+    extended-Euclidean variant to handle both cases.
+    @End Reasoning
+
+    @Implementation
+    Extended binary GCD adapted for inversion. Maintains
+    (old_r, r) and (old_s, s) such that old_r*a_init + old_s*m_init =
+    old_r. At gcd = 1, old_s is the inverse mod m. Works in modular
+    integers throughout to keep the intermediates bounded.
+    @End Implementation
+
+    @Performance_Hints
+    O((bitlen(m))^2) limb operations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Used at key-generation time on public-form inputs (phi(n) is
+    revealed by the key-gen process). Do not call on secret intermediates
+    in steady-state operation.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    If m is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize (old_r, r) = (a, m) and (old_s, s) = (1, 0).
+    Let old_r be proc bigint_copy from BigInt with arena, a
+    Let r_bn be proc bigint_copy from BigInt with arena, m
+    Let old_s be proc bigint_from_u64 from BigInt with arena, 1
+    Let s_bn be proc bigint_from_u64 from BigInt with arena, 0
+    Let one_bn be proc bigint_from_u64 from BigInt with arena, 1
+
+    Note: For each step compute quotient and new_r = old_r - q*r.
+    Note: We implement the Euclidean recursion via repeated subtraction
+    Note: since bigint_mod_exp doesn't suit this case. We use the
+    Note: shift-and-subtract pattern from bigint_mod's body.
+    Loop forever:
+        If proc bigint_is_zero from BigInt with r_bn is equal to 1:
+            Break
+        End If
+        Note: Compute q = old_r / r_bn via repeated subtraction.
+        Let q_bn be proc bigint_from_u64 from BigInt with arena, 0
+        Let scratch_r be proc bigint_copy from BigInt with arena, old_r
+
+        Let inner_running be 1
+        While inner_running is equal to 1:
+            Let cmp_now be proc bigint_compare from BigInt with scratch_r, r_bn
+            If cmp_now is less than 0:
+                Set inner_running to 0
+            Otherwise:
+                Note: shift r_bn up by largest power so still <= scratch_r.
+                Let shift_count be 0
+                Let r_count_now be proc bigint_get_limb_count from BigInt with r_bn
+                Let sr_count_now be proc bigint_get_limb_count from BigInt with scratch_r
+                Let limb_shift be sr_count_now minus r_count_now
+                If limb_shift is less than 0:
+                    Set limb_shift to 0
+                End If
+
+                Let shifted_cap be r_count_now plus limb_shift plus 2
+                Let shifted_r be proc bigint_alloc from BigInt with arena, shifted_cap
+                Let s_idx be 0
+                While s_idx is less than r_count_now:
+                    Let rv be proc bigint_get_limb from BigInt with r_bn, s_idx
+                    proc bigint_set_limb from BigInt with shifted_r, s_idx plus limb_shift, rv
+                    Set s_idx to s_idx plus 1
+                End While
+                proc bigint_set_limb_count from BigInt with shifted_r, r_count_now plus limb_shift
+
+                Let cmp_shift be proc bigint_compare from BigInt with shifted_r, scratch_r
+                If cmp_shift is greater than 0:
+                    If limb_shift is equal to 0:
+                        Set inner_running to 0
+                    Otherwise:
+                        Set limb_shift to limb_shift minus 1
+                        Let shifted_r2 be proc bigint_alloc from BigInt with arena, shifted_cap
+                        Let s_idx2 be 0
+                        While s_idx2 is less than r_count_now:
+                            Let rv2 be proc bigint_get_limb from BigInt with r_bn, s_idx2
+                            proc bigint_set_limb from BigInt with shifted_r2, s_idx2 plus limb_shift, rv2
+                            Set s_idx2 to s_idx2 plus 1
+                        End While
+                        proc bigint_set_limb_count from BigInt with shifted_r2, r_count_now plus limb_shift
+                        proc bigint_sub from BigInt with scratch_r, scratch_r, shifted_r2
+
+                        Note: Add 2^(64*limb_shift) to q_bn via repeated +1 if
+                        Note: limb_shift = 0 else by setting the appropriate limb.
+                        If limb_shift is equal to 0:
+                            Let qv0 be proc bigint_get_limb from BigInt with q_bn, 0
+                            proc bigint_set_limb from BigInt with q_bn, 0, qv0 plus 1
+                            Let qc0 be proc bigint_get_limb_count from BigInt with q_bn
+                            If qc0 is equal to 0:
+                                proc bigint_set_limb_count from BigInt with q_bn, 1
+                            End If
+                        Otherwise:
+                            Let qv_at be proc bigint_get_limb from BigInt with q_bn, limb_shift
+                            proc bigint_set_limb from BigInt with q_bn, limb_shift, qv_at plus 1
+                            Let qc_at be proc bigint_get_limb_count from BigInt with q_bn
+                            If limb_shift plus 1 is greater than qc_at:
+                                proc bigint_set_limb_count from BigInt with q_bn, limb_shift plus 1
+                            End If
+                        End If
+                    End If
+                Otherwise:
+                    proc bigint_sub from BigInt with scratch_r, scratch_r, shifted_r
+                    If limb_shift is equal to 0:
+                        Let qv0b be proc bigint_get_limb from BigInt with q_bn, 0
+                        proc bigint_set_limb from BigInt with q_bn, 0, qv0b plus 1
+                        Let qc0b be proc bigint_get_limb_count from BigInt with q_bn
+                        If qc0b is equal to 0:
+                            proc bigint_set_limb_count from BigInt with q_bn, 1
+                        End If
+                    Otherwise:
+                        Let qv_at2 be proc bigint_get_limb from BigInt with q_bn, limb_shift
+                        proc bigint_set_limb from BigInt with q_bn, limb_shift, qv_at2 plus 1
+                        Let qc_at2 be proc bigint_get_limb_count from BigInt with q_bn
+                        If limb_shift plus 1 is greater than qc_at2:
+                            proc bigint_set_limb_count from BigInt with q_bn, limb_shift plus 1
+                        End If
+                    End If
+                End If
+            End If
+        End While
+
+        Note: Now scratch_r = old_r mod r_bn, q_bn = old_r / r_bn.
+        Note: Update (old_r, r) = (r, scratch_r) and (old_s, s) = (s, old_s - q*s).
+
+        Let q_times_s be proc bigint_alloc from BigInt with arena, 20
+        proc bigint_mul from BigInt with q_times_s, q_bn, s_bn
+
+        Note: new_s = old_s - q_times_s mod m. Use repeated +m if borrow.
+        Let new_s be proc bigint_alloc from BigInt with arena, 20
+
+        Let qts_cmp be proc bigint_compare from BigInt with q_times_s, old_s
+        If qts_cmp is greater than 0:
+            Note: old_s - q_times_s would be negative. Add multiples of m
+            Note: to old_s until it exceeds q_times_s.
+            Let bump_running be 1
+            While bump_running is equal to 1:
+                proc bigint_add from BigInt with old_s, old_s, m
+                Let cmp_b be proc bigint_compare from BigInt with old_s, q_times_s
+                If cmp_b is greater than 0 minus 1:
+                    Set bump_running to 0
+                End If
+            End While
+        End If
+        proc bigint_sub from BigInt with new_s, old_s, q_times_s
+
+        Note: Cycle: (old_r, r) -> (r, scratch_r), (old_s, s) -> (s, new_s).
+        Let old_r_count be proc bigint_get_limb_count from BigInt with r_bn
+        Let or_cap be proc bigint_get_limb_capacity from BigInt with old_r
+        Let or_zi be 0
+        While or_zi is less than or_cap:
+            proc bigint_set_limb from BigInt with old_r, or_zi, 0
+            Set or_zi to or_zi plus 1
+        End While
+        Let or_ci be 0
+        While or_ci is less than old_r_count:
+            Let or_lv be proc bigint_get_limb from BigInt with r_bn, or_ci
+            proc bigint_set_limb from BigInt with old_r, or_ci, or_lv
+            Set or_ci to or_ci plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with old_r, old_r_count
+
+        Let sr_count be proc bigint_get_limb_count from BigInt with scratch_r
+        Let rb_cap be proc bigint_get_limb_capacity from BigInt with r_bn
+        Let rb_zi be 0
+        While rb_zi is less than rb_cap:
+            proc bigint_set_limb from BigInt with r_bn, rb_zi, 0
+            Set rb_zi to rb_zi plus 1
+        End While
+        Let rb_ci be 0
+        While rb_ci is less than sr_count:
+            Let rb_lv be proc bigint_get_limb from BigInt with scratch_r, rb_ci
+            proc bigint_set_limb from BigInt with r_bn, rb_ci, rb_lv
+            Set rb_ci to rb_ci plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with r_bn, sr_count
+
+        Let os_count be proc bigint_get_limb_count from BigInt with s_bn
+        Let os_cap be proc bigint_get_limb_capacity from BigInt with old_s
+        Let os_zi be 0
+        While os_zi is less than os_cap:
+            proc bigint_set_limb from BigInt with old_s, os_zi, 0
+            Set os_zi to os_zi plus 1
+        End While
+        Let os_ci be 0
+        While os_ci is less than os_count:
+            Let os_lv be proc bigint_get_limb from BigInt with s_bn, os_ci
+            proc bigint_set_limb from BigInt with old_s, os_ci, os_lv
+            Set os_ci to os_ci plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with old_s, os_count
+
+        Let ns_count be proc bigint_get_limb_count from BigInt with new_s
+        Let sb_cap be proc bigint_get_limb_capacity from BigInt with s_bn
+        Let sb_zi be 0
+        While sb_zi is less than sb_cap:
+            proc bigint_set_limb from BigInt with s_bn, sb_zi, 0
+            Set sb_zi to sb_zi plus 1
+        End While
+        Let sb_ci be 0
+        While sb_ci is less than ns_count:
+            Let sb_lv be proc bigint_get_limb from BigInt with new_s, sb_ci
+            proc bigint_set_limb from BigInt with s_bn, sb_ci, sb_lv
+            Set sb_ci to sb_ci plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with s_bn, ns_count
+    End While
+
+    Note: old_r should be 1 for the inverse to exist. Reduce old_s mod m
+    Note: into dest.
+    If proc bigint_equals from BigInt with old_r, one_bn is not equal to 1:
+        Return 0
+    End If
+    Return proc bigint_mod from BigInt with arena, dest, old_s, m
+End Process
+
+Note: ============================================================================
+Note: MGF1 mask generation function per RFC 8017 section B.2.1
+Note: ============================================================================
+
+Process called "rsa_mgf1" takes arena as Integer, hash_id as Integer, seed as Integer, seed_length as Integer, mask_length as Integer, out_mask as Integer returns Integer:
+    @Reasoning
+    Computes MGF1(seed) = T = T_0 || T_1 || ... where T_i = Hash(seed || I2OSP(i, 4))
+    and the result is truncated to mask_length bytes.
+    @End Reasoning
+
+    @Implementation
+    1. Determine hLen from hash_id.
+    2. For counter i = 0, 1, ..., ceil(mask_length / hLen) - 1:
+       a. Build (seed || I2OSP(i, 4)).
+       b. Hash into a per-iteration block.
+       c. Copy out into out_mask, truncating the final block.
+    @End Implementation
+
+    @Performance_Hints
+    ceil(mask_length / hLen) hash invocations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public output (used as a mask for non-secret padding bytes).
+    @End Security_Scope
+
+    Let hlen be proc rsa_hash_output_size with hash_id
+    If hlen is equal to 0:
+        Return 0
+    End If
+
+    Let buf_size be seed_length plus 4
+    Let counter_buf be proc arena_allocate from Arena with arena, buf_size
+    If counter_buf is equal to 0:
+        Return 0
+    End If
+    Let copy_seed_i be 0
+    While copy_seed_i is less than seed_length:
+        Let sb be proc memory_get_byte from Memory with seed, copy_seed_i
+        proc memory_set_byte from Memory with counter_buf, copy_seed_i, sb
+        Set copy_seed_i to copy_seed_i plus 1
+    End While
+
+    Let block_buf be proc arena_allocate from Arena with arena, hlen
+    If block_buf is equal to 0:
+        Return 0
+    End If
+
+    Let written be 0
+    Let counter be 0
+    While written is less than mask_length:
+        Note: Encode counter as 4 big-endian bytes.
+        proc memory_set_byte from Memory with counter_buf, seed_length, counter divided by 16777216 modulo by 256
+        proc memory_set_byte from Memory with counter_buf, seed_length plus 1, counter divided by 65536 modulo by 256
+        proc memory_set_byte from Memory with counter_buf, seed_length plus 2, counter divided by 256 modulo by 256
+        proc memory_set_byte from Memory with counter_buf, seed_length plus 3, counter modulo by 256
+
+        proc rsa_hash with arena, hash_id, counter_buf, buf_size, block_buf
+
+        Let remaining be mask_length minus written
+        Let copy_len be hlen
+        If remaining is less than hlen:
+            Set copy_len to remaining
+        End If
+        Let copy_i be 0
+        While copy_i is less than copy_len:
+            Let blbv be proc memory_get_byte from Memory with block_buf, copy_i
+            proc memory_set_byte from Memory with out_mask, written plus copy_i, blbv
+            Set copy_i to copy_i plus 1
+        End While
+        Set written to written plus copy_len
+        Set counter to counter plus 1
+    End While
+    Return mask_length
+End Process
+
+Note: ============================================================================
+Note: RSAEP / RSADP / RSASP1 / RSAVP1 primitives per RFC 8017 section 5
+Note: ============================================================================
+
+Process called "rsa_rsaep" takes arena as Integer, public_key as Integer, m as Integer, c_out as Integer returns Integer:
+    @Reasoning
+    Computes c = m^e mod n. Validates 0 <= m < n.
+    @End Reasoning
+
+    @Implementation
+    Reject m >= n; bigint_mod_exp(c_out, m, e, n).
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by modexp; the public exponent is small (e = 65537 typically)
+    so this is fast.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public operation; no constant-time requirements beyond the modexp's
+    own loop discipline.
+    @End Security_Scope
+
+    Let n be proc rsa_public_get_n with public_key
+    Let e be proc rsa_public_get_e with public_key
+    Let cmp be proc bigint_compare from BigInt with m, n
+    If cmp is greater than 0 minus 1:
+        Return 0
+    End If
+    Return proc bigint_mod_exp from BigInt with arena, c_out, m, e, n
+End Process
+
+Process called "rsa_rsavp1" takes arena as Integer, public_key as Integer, s as Integer, m_out as Integer returns Integer:
+    @Reasoning
+    Computes m = s^e mod n. Validates 0 <= s < n.
+    @End Reasoning
+
+    @Implementation
+    Same as RSAEP; the operation is identical, only the semantic role
+    differs (signature recovery vs. message encryption).
+    @End Implementation
+
+    @Performance_Hints
+    Same as rsa_rsaep.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public operation.
+    @End Security_Scope
+
+    Let n be proc rsa_public_get_n with public_key
+    Let e be proc rsa_public_get_e with public_key
+    Let cmp be proc bigint_compare from BigInt with s, n
+    If cmp is greater than 0 minus 1:
+        Return 0
+    End If
+    Return proc bigint_mod_exp from BigInt with arena, m_out, s, e, n
+End Process
+
+Process called "rsa_rsadp_blinded" takes arena as Integer, private_key as Integer, c as Integer, m_out as Integer returns Integer:
+    @Reasoning
+    Computes m = c^d mod n with RSA blinding: choose random r in [1, n-1],
+    compute c' = c * r^e mod n, m' = c'^d mod n, m = m' * r^-1 mod n.
+    The intermediate modexp operates on c' which is uniformly random
+    given r is uniformly random and gcd(r, n) = 1; this prevents timing
+    correlations from leaking d.
+    @End Reasoning
+
+    @Implementation
+    1. Sample random r with 1 <= r < n.
+    2. Compute r_e = r^e mod n.
+    3. Compute r_inv = r^-1 mod n.
+    4. Compute c_blinded = c * r_e mod n.
+    5. Compute m_blinded = c_blinded^d mod n.
+    6. Compute m = m_blinded * r_inv mod n.
+    @End Implementation
+
+    @Performance_Hints
+    Two extra modexp invocations vs. unblinded RSADP (the r^e and the
+    r^-1 inversion). Cost is ~10% over the dominant c^d modexp.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against:
+    - Timing-attack recovery of d via Kocher 1996.
+    - Power-analysis correlations via the same blinding.
+
+    Out of scope: fault-injection attacks on the modexp itself (the
+    caller must verify the result via public-key consistency check
+    before releasing the signature).
+
+    References:
+    - Kocher, "Timing Attacks on Implementations of Diffie-Hellman,
+      RSA, DSS, and Other Systems" CRYPTO 1996.
+    - Boneh, DeMillo, Lipton "On the Importance of Checking
+      Cryptographic Protocols for Faults" Eurocrypt 1997.
+    @End Security_Scope
+
+    Let n be proc rsa_private_get_n with private_key
+    Let e be proc rsa_private_get_e with private_key
+    Let d be proc rsa_private_get_d with private_key
+    Let modulus_bytes be proc rsa_private_get_modulus_bytes with private_key
+
+    Note: Sample random r in [1, n-1] via rejection.
+    Let one_bn be proc bigint_from_u64 from BigInt with arena, 1
+    Let r_bn be proc bigint_alloc from BigInt with arena, 80
+    Let r_bytes_buf be proc arena_allocate from Arena with arena, modulus_bytes
+    If r_bytes_buf is equal to 0:
+        Return 0
+    End If
+    Let attempt be 0
+    Let max_attempts be 64
+    Let r_ok be 0
+    While attempt is less than max_attempts:
+        Let entropy_rc be proc entropy_random_bytes from Entropy with arena, r_bytes_buf, modulus_bytes
+        If entropy_rc is equal to 0:
+            Return 0
+        End If
+        Let r_cand be proc bigint_from_bytes_be from BigInt with arena, r_bytes_buf, modulus_bytes
+        Let cmp_one be proc bigint_compare from BigInt with r_cand, one_bn
+        If cmp_one is greater than 0 minus 1:
+            Let cmp_n be proc bigint_compare from BigInt with r_cand, n
+            If cmp_n is less than 0:
+                Let rc_count be proc bigint_get_limb_count from BigInt with r_cand
+                Let rb_cap be proc bigint_get_limb_capacity from BigInt with r_bn
+                Let rb_zi be 0
+                While rb_zi is less than rb_cap:
+                    proc bigint_set_limb from BigInt with r_bn, rb_zi, 0
+                    Set rb_zi to rb_zi plus 1
+                End While
+                Let rb_ci be 0
+                While rb_ci is less than rc_count:
+                    Let rbv be proc bigint_get_limb from BigInt with r_cand, rb_ci
+                    proc bigint_set_limb from BigInt with r_bn, rb_ci, rbv
+                    Set rb_ci to rb_ci plus 1
+                End While
+                proc bigint_set_limb_count from BigInt with r_bn, rc_count
+                Set r_ok to 1
+                Set attempt to max_attempts
+            End If
+        End If
+        Set attempt to attempt plus 1
+    End While
+    If r_ok is equal to 0:
+        Return 0
+    End If
+
+    Note: r_e = r^e mod n.
+    Let r_e be proc bigint_alloc from BigInt with arena, 80
+    proc bigint_mod_exp from BigInt with arena, r_e, r_bn, e, n
+
+    Note: r_inv = r^-1 mod n.
+    Let r_inv be proc bigint_alloc from BigInt with arena, 80
+    Let inv_rc be proc rsa_modinv with arena, r_inv, r_bn, n
+    If inv_rc is equal to 0:
+        Return 0
+    End If
+
+    Note: c_blinded = c * r_e mod n.
+    Let c_blinded_prod be proc bigint_alloc from BigInt with arena, 160
+    Let c_blinded be proc bigint_alloc from BigInt with arena, 80
+    proc bigint_mul from BigInt with c_blinded_prod, c, r_e
+    proc bigint_mod from BigInt with arena, c_blinded, c_blinded_prod, n
+
+    Note: m_blinded = c_blinded^d mod n.
+    Let m_blinded be proc bigint_alloc from BigInt with arena, 80
+    proc bigint_mod_exp from BigInt with arena, m_blinded, c_blinded, d, n
+
+    Note: m = m_blinded * r_inv mod n.
+    Let m_prod be proc bigint_alloc from BigInt with arena, 160
+    proc bigint_mul from BigInt with m_prod, m_blinded, r_inv
+    Let m_result be proc bigint_alloc from BigInt with arena, 80
+    proc bigint_mod from BigInt with arena, m_result, m_prod, n
+
+    Note: Copy m_result into m_out.
+    Let mc be proc bigint_get_limb_count from BigInt with m_result
+    Let mcap be proc bigint_get_limb_capacity from BigInt with m_out
+    Let mzi be 0
+    While mzi is less than mcap:
+        proc bigint_set_limb from BigInt with m_out, mzi, 0
+        Set mzi to mzi plus 1
+    End While
+    Let mci be 0
+    While mci is less than mc:
+        Let mlv be proc bigint_get_limb from BigInt with m_result, mci
+        proc bigint_set_limb from BigInt with m_out, mci, mlv
+        Set mci to mci plus 1
+    End While
+    proc bigint_set_limb_count from BigInt with m_out, mc
+
+    proc secure_zero from SecureMem with r_bytes_buf, modulus_bytes
+    Return 1
+End Process
+
+Process called "rsa_rsasp1" takes arena as Integer, private_key as Integer, m as Integer, s_out as Integer returns Integer:
+    @Reasoning
+    RSA signature primitive: s = m^d mod n with blinding.
+    @End Reasoning
+
+    @Implementation
+    Validate 0 <= m < n; delegate to rsa_rsadp_blinded.
+    @End Implementation
+
+    @Performance_Hints
+    Same as rsa_rsadp_blinded.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same blinding as rsa_rsadp_blinded.
+    @End Security_Scope
+
+    Let n be proc rsa_private_get_n with private_key
+    Let cmp be proc bigint_compare from BigInt with m, n
+    If cmp is greater than 0 minus 1:
+        Return 0
+    End If
+    Return proc rsa_rsadp_blinded with arena, private_key, m, s_out
+End Process
+
+Note: ============================================================================
+Note: EMSA-PSS encoding and verification per RFC 8017 section 9.1
+Note: ============================================================================
+
+Process called "rsa_emsa_pss_encode" takes arena as Integer, hash_id as Integer, msg as Integer, msg_length as Integer, em_bits as Integer, salt_length as Integer, em_out as Integer returns Integer:
+    @Reasoning
+    Implements EMSA-PSS-ENCODE per RFC 8017 9.1.1. Produces the
+    em_bits-bit-encoded message that will become the message
+    representative for the modexp.
+    @End Reasoning
+
+    @Implementation
+    1. Compute mHash = Hash(msg). hLen = hash output bytes.
+    2. emLen = ceil(em_bits / 8).
+    3. If emLen < hLen + salt_length + 2 fail.
+    4. Generate salt = random salt_length bytes.
+    5. Build M' = (8 zero bytes) || mHash || salt.
+    6. Compute H = Hash(M').
+    7. Build PS = (emLen - sLen - hLen - 2) zero bytes.
+    8. Build DB = PS || 0x01 || salt.
+    9. Compute dbMask = MGF1(H, emLen - hLen - 1).
+    10. maskedDB = DB XOR dbMask.
+    11. Clear top bits of maskedDB beyond em_bits.
+    12. Output EM = maskedDB || H || 0xbc.
+    @End Implementation
+
+    @Performance_Hints
+    Two hash invocations plus one MGF1 (a few more hashes).
+    @End Performance_Hints
+
+    @Security_Scope
+    Provides EUF-CMA security as proved by Bellare-Rogaway. The salt
+    randomness must come from a cryptographically secure source.
+    @End Security_Scope
+
+    Let hlen be proc rsa_hash_output_size with hash_id
+    If hlen is equal to 0:
+        Return 0
+    End If
+    Let em_len be (em_bits plus 7) divided by 8
+    If em_len is less than hlen plus salt_length plus 2:
+        Return 0
+    End If
+
+    Let mhash be proc arena_allocate from Arena with arena, hlen
+    If mhash is equal to 0:
+        Return 0
+    End If
+    proc rsa_hash with arena, hash_id, msg, msg_length, mhash
+
+    Let salt be proc arena_allocate from Arena with arena, salt_length
+    If salt is equal to 0:
+        Return 0
+    End If
+    If salt_length is greater than 0:
+        proc entropy_random_bytes from Entropy with arena, salt, salt_length
+    End If
+
+    Let mprime_size be 8 plus hlen plus salt_length
+    Let mprime be proc arena_allocate from Arena with arena, mprime_size
+    If mprime is equal to 0:
+        Return 0
+    End If
+    Let mp_i be 0
+    While mp_i is less than 8:
+        proc memory_set_byte from Memory with mprime, mp_i, 0
+        Set mp_i to mp_i plus 1
+    End While
+    Let mp_j be 0
+    While mp_j is less than hlen:
+        Let mhbv be proc memory_get_byte from Memory with mhash, mp_j
+        proc memory_set_byte from Memory with mprime, 8 plus mp_j, mhbv
+        Set mp_j to mp_j plus 1
+    End While
+    Let mp_k be 0
+    While mp_k is less than salt_length:
+        Let sbv be proc memory_get_byte from Memory with salt, mp_k
+        proc memory_set_byte from Memory with mprime, 8 plus hlen plus mp_k, sbv
+        Set mp_k to mp_k plus 1
+    End While
+
+    Let h_bytes be proc arena_allocate from Arena with arena, hlen
+    If h_bytes is equal to 0:
+        Return 0
+    End If
+    proc rsa_hash with arena, hash_id, mprime, mprime_size, h_bytes
+
+    Let db_len be em_len minus hlen minus 1
+    Let db be proc arena_allocate from Arena with arena, db_len
+    If db is equal to 0:
+        Return 0
+    End If
+    Let ps_len be db_len minus salt_length minus 1
+    Let db_i be 0
+    While db_i is less than ps_len:
+        proc memory_set_byte from Memory with db, db_i, 0
+        Set db_i to db_i plus 1
+    End While
+    proc memory_set_byte from Memory with db, ps_len, 1
+    Let db_j be 0
+    While db_j is less than salt_length:
+        Let sbv2 be proc memory_get_byte from Memory with salt, db_j
+        proc memory_set_byte from Memory with db, ps_len plus 1 plus db_j, sbv2
+        Set db_j to db_j plus 1
+    End While
+
+    Let db_mask be proc arena_allocate from Arena with arena, db_len
+    If db_mask is equal to 0:
+        Return 0
+    End If
+    proc rsa_mgf1 with arena, hash_id, h_bytes, hlen, db_len, db_mask
+
+    Let masked_db be proc arena_allocate from Arena with arena, db_len
+    Let xor_i be 0
+    While xor_i is less than db_len:
+        Let dbv be proc memory_get_byte from Memory with db, xor_i
+        Let dmv be proc memory_get_byte from Memory with db_mask, xor_i
+        proc memory_set_byte from Memory with masked_db, xor_i, dbv bitwise_xor dmv
+        Set xor_i to xor_i plus 1
+    End While
+
+    Note: Clear top (8*em_len - em_bits) bits of the first byte.
+    Let top_clear_bits be em_len multiplied by 8 minus em_bits
+    Let mask_top be 255
+    Let mt_iter be 0
+    While mt_iter is less than top_clear_bits:
+        Set mask_top to mask_top divided by 2
+        Set mt_iter to mt_iter plus 1
+    End While
+    Let first_byte be proc memory_get_byte from Memory with masked_db, 0
+    proc memory_set_byte from Memory with masked_db, 0, first_byte bitwise_and mask_top
+
+    Note: EM = masked_db || H || 0xbc
+    Let em_i be 0
+    While em_i is less than db_len:
+        Let mdbv be proc memory_get_byte from Memory with masked_db, em_i
+        proc memory_set_byte from Memory with em_out, em_i, mdbv
+        Set em_i to em_i plus 1
+    End While
+    Let em_j be 0
+    While em_j is less than hlen:
+        Let hbv be proc memory_get_byte from Memory with h_bytes, em_j
+        proc memory_set_byte from Memory with em_out, db_len plus em_j, hbv
+        Set em_j to em_j plus 1
+    End While
+    proc memory_set_byte from Memory with em_out, em_len minus 1, 188
+
+    Return em_len
+End Process
+
+Process called "rsa_emsa_pss_verify" takes arena as Integer, hash_id as Integer, msg as Integer, msg_length as Integer, em_bytes as Integer, em_length as Integer, em_bits as Integer, salt_length as Integer returns Integer:
+    @Reasoning
+    Implements EMSA-PSS-VERIFY per RFC 8017 9.1.2. Returns 1 if the
+    encoded message represents a valid signature of msg, else 0.
+    @End Reasoning
+
+    @Implementation
+    1. Validate last byte = 0xbc.
+    2. Split EM into maskedDB and H.
+    3. Verify top bits of maskedDB beyond em_bits are zero.
+    4. Compute dbMask = MGF1(H, emLen - hLen - 1).
+    5. Compute DB = maskedDB XOR dbMask.
+    6. Clear top bits of DB beyond em_bits.
+    7. Verify DB = PS || 0x01 || salt where PS is zeros.
+    8. Recompute H' from M' = (8 zeros) || mHash || salt.
+    9. Verify H' == H via constant-time compare.
+    @End Implementation
+
+    @Performance_Hints
+    Two hashes plus one MGF1.
+    @End Performance_Hints
+
+    @Security_Scope
+    Failure is signalled by return value 0; no timing distinction
+    between the various failure modes.
+    @End Security_Scope
+
+    Let hlen be proc rsa_hash_output_size with hash_id
+    If hlen is equal to 0:
+        Return 0
+    End If
+    If em_length is less than hlen plus salt_length plus 2:
+        Return 0
+    End If
+    Let last_byte be proc memory_get_byte from Memory with em_bytes, em_length minus 1
+    If last_byte is not equal to 188:
+        Return 0
+    End If
+
+    Let db_len be em_length minus hlen minus 1
+    Let masked_db be em_bytes
+    Let h_in be em_bytes plus db_len
+
+    Let top_clear_bits be em_length multiplied by 8 minus em_bits
+    Let mask_top be 255
+    Let mt_iter be 0
+    While mt_iter is less than top_clear_bits:
+        Set mask_top to mask_top divided by 2
+        Set mt_iter to mt_iter plus 1
+    End While
+    Let first_masked be proc memory_get_byte from Memory with masked_db, 0
+    Let top_bits be first_masked bitwise_and 255 minus mask_top
+    If top_bits is not equal to 0:
+        Return 0
+    End If
+
+    Let db_mask be proc arena_allocate from Arena with arena, db_len
+    If db_mask is equal to 0:
+        Return 0
+    End If
+    proc rsa_mgf1 with arena, hash_id, h_in, hlen, db_len, db_mask
+
+    Let db be proc arena_allocate from Arena with arena, db_len
+    Let xor_i be 0
+    While xor_i is less than db_len:
+        Let mdbv be proc memory_get_byte from Memory with masked_db, xor_i
+        Let dmv be proc memory_get_byte from Memory with db_mask, xor_i
+        proc memory_set_byte from Memory with db, xor_i, mdbv bitwise_xor dmv
+        Set xor_i to xor_i plus 1
+    End While
+    Let first_db be proc memory_get_byte from Memory with db, 0
+    proc memory_set_byte from Memory with db, 0, first_db bitwise_and mask_top
+
+    Let ps_len be db_len minus salt_length minus 1
+    Let ps_i be 0
+    While ps_i is less than ps_len:
+        Let pb be proc memory_get_byte from Memory with db, ps_i
+        If pb is not equal to 0:
+            Return 0
+        End If
+        Set ps_i to ps_i plus 1
+    End While
+    Let one_pos be proc memory_get_byte from Memory with db, ps_len
+    If one_pos is not equal to 1:
+        Return 0
+    End If
+
+    Let salt_in be db plus ps_len plus 1
+
+    Let mhash be proc arena_allocate from Arena with arena, hlen
+    proc rsa_hash with arena, hash_id, msg, msg_length, mhash
+
+    Let mprime_size be 8 plus hlen plus salt_length
+    Let mprime be proc arena_allocate from Arena with arena, mprime_size
+    Let mp_i be 0
+    While mp_i is less than 8:
+        proc memory_set_byte from Memory with mprime, mp_i, 0
+        Set mp_i to mp_i plus 1
+    End While
+    Let mp_j be 0
+    While mp_j is less than hlen:
+        Let mhbv be proc memory_get_byte from Memory with mhash, mp_j
+        proc memory_set_byte from Memory with mprime, 8 plus mp_j, mhbv
+        Set mp_j to mp_j plus 1
+    End While
+    Let mp_k be 0
+    While mp_k is less than salt_length:
+        Let sbv3 be proc memory_get_byte from Memory with salt_in, mp_k
+        proc memory_set_byte from Memory with mprime, 8 plus hlen plus mp_k, sbv3
+        Set mp_k to mp_k plus 1
+    End While
+
+    Let h_recomputed be proc arena_allocate from Arena with arena, hlen
+    proc rsa_hash with arena, hash_id, mprime, mprime_size, h_recomputed
+
+    Return proc rsa_constant_time_equal_bytes with h_recomputed, h_in, hlen
+End Process
+
+Note: ============================================================================
+Note: EMSA-PKCS1-v1_5 encoding per RFC 8017 section 9.2
+Note: ============================================================================
+
+Process called "rsa_emsa_pkcs1v15_encode" takes arena as Integer, hash_id as Integer, msg as Integer, msg_length as Integer, em_length as Integer, em_out as Integer returns Integer:
+    @Reasoning
+    Implements EMSA-PKCS1-v1_5-ENCODE per RFC 8017 9.2. Builds:
+        EM = 0x00 || 0x01 || PS || 0x00 || T
+    where PS is 0xff bytes and T is the DigestInfo DER encoding of
+    H(msg) prefixed with the algorithm OID.
+    @End Reasoning
+
+    @Implementation
+    1. Hash msg.
+    2. Select the DigestInfo prefix per hash_id (constant byte blob from
+       RFC 8017 9.2 step 2).
+    3. Concatenate prefix || hash to form T.
+    4. Pad with PS of 0xff bytes to fill em_length.
+    @End Implementation
+
+    @Performance_Hints
+    One hash invocation plus O(em_length) byte writes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Document the Bleichenbacher-attack risk class for callers; the
+    encoding itself is well-defined but the surrounding protocol is
+    where the vulnerability lives.
+    @End Security_Scope
+
+    Let hlen be proc rsa_hash_output_size with hash_id
+    If hlen is equal to 0:
+        Return 0
+    End If
+
+    Note: DigestInfo prefix lengths per hash variant.
+    Let prefix_len be 0
+    If hash_id is equal to RSA_HASH_SHA256:
+        Set prefix_len to 19
+    End If
+    If hash_id is equal to RSA_HASH_SHA384:
+        Set prefix_len to 19
+    End If
+    If hash_id is equal to RSA_HASH_SHA512:
+        Set prefix_len to 19
+    End If
+    Let t_len be prefix_len plus hlen
+    If em_length is less than t_len plus 11:
+        Return 0
+    End If
+
+    Let mhash be proc arena_allocate from Arena with arena, hlen
+    If mhash is equal to 0:
+        Return 0
+    End If
+    proc rsa_hash with arena, hash_id, msg, msg_length, mhash
+
+    proc memory_set_byte from Memory with em_out, 0, 0
+    proc memory_set_byte from Memory with em_out, 1, 1
+    Let ps_len be em_length minus t_len minus 3
+    Let ps_i be 0
+    While ps_i is less than ps_len:
+        proc memory_set_byte from Memory with em_out, 2 plus ps_i, 255
+        Set ps_i to ps_i plus 1
+    End While
+    proc memory_set_byte from Memory with em_out, 2 plus ps_len, 0
+
+    Note: Write the DigestInfo prefix bytes per RFC 8017 9.2 step 2.
+    If hash_id is equal to RSA_HASH_SHA256:
+        proc memory_set_byte from Memory with em_out, 3 plus ps_len, 48
+        proc memory_set_byte from Memory with em_out, 4 plus ps_len, 49
+        proc memory_set_byte from Memory with em_out, 5 plus ps_len, 48
+        proc memory_set_byte from Memory with em_out, 6 plus ps_len, 13
+        proc memory_set_byte from Memory with em_out, 7 plus ps_len, 6
+        proc memory_set_byte from Memory with em_out, 8 plus ps_len, 9
+        proc memory_set_byte from Memory with em_out, 9 plus ps_len, 96
+        proc memory_set_byte from Memory with em_out, 10 plus ps_len, 134
+        proc memory_set_byte from Memory with em_out, 11 plus ps_len, 72
+        proc memory_set_byte from Memory with em_out, 12 plus ps_len, 1
+        proc memory_set_byte from Memory with em_out, 13 plus ps_len, 101
+        proc memory_set_byte from Memory with em_out, 14 plus ps_len, 3
+        proc memory_set_byte from Memory with em_out, 15 plus ps_len, 4
+        proc memory_set_byte from Memory with em_out, 16 plus ps_len, 2
+        proc memory_set_byte from Memory with em_out, 17 plus ps_len, 1
+        proc memory_set_byte from Memory with em_out, 18 plus ps_len, 5
+        proc memory_set_byte from Memory with em_out, 19 plus ps_len, 0
+        proc memory_set_byte from Memory with em_out, 20 plus ps_len, 4
+        proc memory_set_byte from Memory with em_out, 21 plus ps_len, 32
+    End If
+    If hash_id is equal to RSA_HASH_SHA384:
+        proc memory_set_byte from Memory with em_out, 3 plus ps_len, 48
+        proc memory_set_byte from Memory with em_out, 4 plus ps_len, 65
+        proc memory_set_byte from Memory with em_out, 5 plus ps_len, 48
+        proc memory_set_byte from Memory with em_out, 6 plus ps_len, 13
+        proc memory_set_byte from Memory with em_out, 7 plus ps_len, 6
+        proc memory_set_byte from Memory with em_out, 8 plus ps_len, 9
+        proc memory_set_byte from Memory with em_out, 9 plus ps_len, 96
+        proc memory_set_byte from Memory with em_out, 10 plus ps_len, 134
+        proc memory_set_byte from Memory with em_out, 11 plus ps_len, 72
+        proc memory_set_byte from Memory with em_out, 12 plus ps_len, 1
+        proc memory_set_byte from Memory with em_out, 13 plus ps_len, 101
+        proc memory_set_byte from Memory with em_out, 14 plus ps_len, 3
+        proc memory_set_byte from Memory with em_out, 15 plus ps_len, 4
+        proc memory_set_byte from Memory with em_out, 16 plus ps_len, 2
+        proc memory_set_byte from Memory with em_out, 17 plus ps_len, 2
+        proc memory_set_byte from Memory with em_out, 18 plus ps_len, 5
+        proc memory_set_byte from Memory with em_out, 19 plus ps_len, 0
+        proc memory_set_byte from Memory with em_out, 20 plus ps_len, 4
+        proc memory_set_byte from Memory with em_out, 21 plus ps_len, 48
+    End If
+    If hash_id is equal to RSA_HASH_SHA512:
+        proc memory_set_byte from Memory with em_out, 3 plus ps_len, 48
+        proc memory_set_byte from Memory with em_out, 4 plus ps_len, 81
+        proc memory_set_byte from Memory with em_out, 5 plus ps_len, 48
+        proc memory_set_byte from Memory with em_out, 6 plus ps_len, 13
+        proc memory_set_byte from Memory with em_out, 7 plus ps_len, 6
+        proc memory_set_byte from Memory with em_out, 8 plus ps_len, 9
+        proc memory_set_byte from Memory with em_out, 9 plus ps_len, 96
+        proc memory_set_byte from Memory with em_out, 10 plus ps_len, 134
+        proc memory_set_byte from Memory with em_out, 11 plus ps_len, 72
+        proc memory_set_byte from Memory with em_out, 12 plus ps_len, 1
+        proc memory_set_byte from Memory with em_out, 13 plus ps_len, 101
+        proc memory_set_byte from Memory with em_out, 14 plus ps_len, 3
+        proc memory_set_byte from Memory with em_out, 15 plus ps_len, 4
+        proc memory_set_byte from Memory with em_out, 16 plus ps_len, 2
+        proc memory_set_byte from Memory with em_out, 17 plus ps_len, 3
+        proc memory_set_byte from Memory with em_out, 18 plus ps_len, 5
+        proc memory_set_byte from Memory with em_out, 19 plus ps_len, 0
+        proc memory_set_byte from Memory with em_out, 20 plus ps_len, 4
+        proc memory_set_byte from Memory with em_out, 21 plus ps_len, 64
+    End If
+    Let hash_dest_offset be 3 plus ps_len plus prefix_len
+    Let hi be 0
+    While hi is less than hlen:
+        Let hbv be proc memory_get_byte from Memory with mhash, hi
+        proc memory_set_byte from Memory with em_out, hash_dest_offset plus hi, hbv
+        Set hi to hi plus 1
+    End While
+
+    Return em_length
+End Process
+
+Note: ============================================================================
+Note: RSASSA-PSS sign / verify per RFC 8017 section 8.1
+Note: ============================================================================
+
+Process called "rsa_pss_sign" takes arena as Integer, private_key as Integer, msg as Integer, msg_length as Integer, salt_length as Integer, signature_out as Integer returns Integer:
+    @Reasoning
+    Signs msg using RSASSA-PSS with the configured hash. Output is the
+    raw signature bytes (modulus_bytes in length), not DER-wrapped.
+    @End Reasoning
+
+    @Implementation
+    1. emBits = modulus_bits - 1.
+    2. em = EMSA-PSS-ENCODE(msg, emBits, salt_length).
+    3. m_int = OS2IP(em).
+    4. s_int = RSASP1(m_int) (uses blinding via rsa_rsasp1).
+    5. signature = I2OSP(s_int, modulus_bytes).
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by the modexp.
+    @End Performance_Hints
+
+    @Security_Scope
+    Modexp is blinded; encoding is constant time over message length.
+    @End Security_Scope
+
+    Let bits be proc rsa_private_get_bits with private_key
+    Let modulus_bytes be proc rsa_private_get_modulus_bytes with private_key
+    Let hash_id be proc rsa_private_get_hash with private_key
+    Let em_bits be bits minus 1
+    Let em_len be (em_bits plus 7) divided by 8
+
+    Let em_buf be proc arena_allocate from Arena with arena, em_len
+    If em_buf is equal to 0:
+        Return 0
+    End If
+    Let enc_rc be proc rsa_emsa_pss_encode with arena, hash_id, msg, msg_length, em_bits, salt_length, em_buf
+    If enc_rc is equal to 0:
+        Return 0
+    End If
+
+    Let m_int be proc bigint_from_bytes_be from BigInt with arena, em_buf, em_len
+    If m_int is equal to 0:
+        Return 0
+    End If
+    Let s_int be proc bigint_alloc from BigInt with arena, 80
+    Let sp_rc be proc rsa_rsasp1 with arena, private_key, m_int, s_int
+    If sp_rc is equal to 0:
+        Return 0
+    End If
+    proc bigint_to_bytes_be from BigInt with s_int, signature_out, modulus_bytes
+    Return modulus_bytes
+End Process
+
+Process called "rsa_pss_verify" takes arena as Integer, public_key as Integer, msg as Integer, msg_length as Integer, salt_length as Integer, signature as Integer, signature_length as Integer returns Integer:
+    @Reasoning
+    Verifies a PSS signature. Returns 1 if valid, 0 otherwise.
+    @End Reasoning
+
+    @Implementation
+    1. Reject if signature_length != modulus_bytes.
+    2. s_int = OS2IP(signature); reject if s_int >= n.
+    3. m_int = RSAVP1(public_key, s_int).
+    4. em = I2OSP(m_int, emLen).
+    5. Return EMSA-PSS-VERIFY(msg, em, emBits, salt_length).
+    @End Implementation
+
+    @Performance_Hints
+    One modexp plus the EMSA-PSS verify.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public-key operation.
+    @End Security_Scope
+
+    Let bits be proc rsa_public_get_bits with public_key
+    Let modulus_bytes be proc rsa_public_get_modulus_bytes with public_key
+    Let hash_id be proc rsa_public_get_hash with public_key
+    Let em_bits be bits minus 1
+    Let em_len be (em_bits plus 7) divided by 8
+
+    If signature_length is not equal to modulus_bytes:
+        Return 0
+    End If
+
+    Let s_int be proc bigint_from_bytes_be from BigInt with arena, signature, signature_length
+    Let n be proc rsa_public_get_n with public_key
+    Let cmp be proc bigint_compare from BigInt with s_int, n
+    If cmp is greater than 0 minus 1:
+        Return 0
+    End If
+
+    Let m_int be proc bigint_alloc from BigInt with arena, 80
+    Let vp_rc be proc rsa_rsavp1 with arena, public_key, s_int, m_int
+    If vp_rc is equal to 0:
+        Return 0
+    End If
+
+    Let em_buf be proc arena_allocate from Arena with arena, em_len
+    proc bigint_to_bytes_be from BigInt with m_int, em_buf, em_len
+    Return proc rsa_emsa_pss_verify with arena, hash_id, msg, msg_length, em_buf, em_len, em_bits, salt_length
+End Process
+
+Note: ============================================================================
+Note: RSASSA-PKCS1-v1_5 sign / verify per RFC 8017 section 8.2
+Note: ============================================================================
+
+Process called "rsa_pkcs1v15_sign" takes arena as Integer, private_key as Integer, msg as Integer, msg_length as Integer, signature_out as Integer returns Integer:
+    @Reasoning
+    Signs msg using legacy PKCS#1 v1.5. Provided for interop with
+    systems that have not migrated to PSS.
+    @End Reasoning
+
+    @Implementation
+    1. em = EMSA-PKCS1-v1_5-ENCODE(msg, modulus_bytes).
+    2. s_int = RSASP1(em_as_int).
+    3. signature = I2OSP(s_int).
+    @End Implementation
+
+    @Performance_Hints
+    One modexp.
+    @End Performance_Hints
+
+    @Security_Scope
+    Document the Bleichenbacher 1998 risk for surrounding decryption
+    protocols. PSS is the recommended modern replacement.
+    @End Security_Scope
+
+    Let modulus_bytes be proc rsa_private_get_modulus_bytes with private_key
+    Let hash_id be proc rsa_private_get_hash with private_key
+
+    Let em_buf be proc arena_allocate from Arena with arena, modulus_bytes
+    If em_buf is equal to 0:
+        Return 0
+    End If
+    Let enc_rc be proc rsa_emsa_pkcs1v15_encode with arena, hash_id, msg, msg_length, modulus_bytes, em_buf
+    If enc_rc is equal to 0:
+        Return 0
+    End If
+
+    Let m_int be proc bigint_from_bytes_be from BigInt with arena, em_buf, modulus_bytes
+    Let s_int be proc bigint_alloc from BigInt with arena, 80
+    Let sp_rc be proc rsa_rsasp1 with arena, private_key, m_int, s_int
+    If sp_rc is equal to 0:
+        Return 0
+    End If
+    proc bigint_to_bytes_be from BigInt with s_int, signature_out, modulus_bytes
+    Return modulus_bytes
+End Process
+
+Process called "rsa_pkcs1v15_verify" takes arena as Integer, public_key as Integer, msg as Integer, msg_length as Integer, signature as Integer, signature_length as Integer returns Integer:
+    @Reasoning
+    Verifies a PKCS#1 v1.5 signature.
+    @End Reasoning
+
+    @Implementation
+    1. Reject length mismatch.
+    2. s_int = OS2IP(signature); reject if s_int >= n.
+    3. m_int = RSAVP1(s_int).
+    4. em_recovered = I2OSP(m_int, modulus_bytes).
+    5. em_expected = EMSA-PKCS1-v1_5-ENCODE(msg, modulus_bytes).
+    6. Return constant-time equality.
+    @End Implementation
+
+    @Performance_Hints
+    One modexp plus one encoding pass.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public-key operation; final comparison is constant-time.
+    @End Security_Scope
+
+    Let modulus_bytes be proc rsa_public_get_modulus_bytes with public_key
+    Let hash_id be proc rsa_public_get_hash with public_key
+
+    If signature_length is not equal to modulus_bytes:
+        Return 0
+    End If
+
+    Let s_int be proc bigint_from_bytes_be from BigInt with arena, signature, signature_length
+    Let n be proc rsa_public_get_n with public_key
+    Let cmp be proc bigint_compare from BigInt with s_int, n
+    If cmp is greater than 0 minus 1:
+        Return 0
+    End If
+
+    Let m_int be proc bigint_alloc from BigInt with arena, 80
+    Let vp_rc be proc rsa_rsavp1 with arena, public_key, s_int, m_int
+    If vp_rc is equal to 0:
+        Return 0
+    End If
+
+    Let em_recovered be proc arena_allocate from Arena with arena, modulus_bytes
+    proc bigint_to_bytes_be from BigInt with m_int, em_recovered, modulus_bytes
+
+    Let em_expected be proc arena_allocate from Arena with arena, modulus_bytes
+    Let enc_rc be proc rsa_emsa_pkcs1v15_encode with arena, hash_id, msg, msg_length, modulus_bytes, em_expected
+    If enc_rc is equal to 0:
+        Return 0
+    End If
+
+    Return proc rsa_constant_time_equal_bytes with em_recovered, em_expected, modulus_bytes
+End Process
+
+Note: ============================================================================
+Note: RSAES-OAEP encrypt / decrypt per RFC 8017 section 7.1
+Note: ============================================================================
+
+Process called "rsa_oaep_encrypt" takes arena as Integer, public_key as Integer, label as Integer, label_length as Integer, msg as Integer, msg_length as Integer, ciphertext_out as Integer returns Integer:
+    @Reasoning
+    Encrypts msg under public_key using RSAES-OAEP. The label is the
+    optional associated-data input that callers may use to bind the
+    ciphertext to a context.
+    @End Reasoning
+
+    @Implementation
+    1. k = modulus_bytes. hLen = hash bytes.
+    2. Validate msg_length <= k - 2*hLen - 2.
+    3. lHash = Hash(label).
+    4. DB = lHash || PS || 0x01 || msg, where PS pads with zeros.
+    5. seed = random hLen bytes.
+    6. dbMask = MGF1(seed, k - hLen - 1).
+    7. maskedDB = DB XOR dbMask.
+    8. seedMask = MGF1(maskedDB, hLen).
+    9. maskedSeed = seed XOR seedMask.
+    10. EM = 0x00 || maskedSeed || maskedDB.
+    11. c = RSAEP(OS2IP(EM)).
+    12. ciphertext = I2OSP(c, k).
+    @End Implementation
+
+    @Performance_Hints
+    Two MGF1 invocations (~2 hashes each) plus one modexp (small e).
+    @End Performance_Hints
+
+    @Security_Scope
+    Provides IND-CCA2 security in the random oracle model
+    (Fujisaki-Okamoto extension to Bellare-Rogaway).
+    @End Security_Scope
+
+    Let modulus_bytes be proc rsa_public_get_modulus_bytes with public_key
+    Let hash_id be proc rsa_public_get_hash with public_key
+    Let hlen be proc rsa_hash_output_size with hash_id
+    If hlen is equal to 0:
+        Return 0
+    End If
+    If msg_length is greater than modulus_bytes minus 2 multiplied by hlen minus 2:
+        Return 0
+    End If
+
+    Let lhash be proc arena_allocate from Arena with arena, hlen
+    If lhash is equal to 0:
+        Return 0
+    End If
+    proc rsa_hash with arena, hash_id, label, label_length, lhash
+
+    Let db_len be modulus_bytes minus hlen minus 1
+    Let db be proc arena_allocate from Arena with arena, db_len
+    If db is equal to 0:
+        Return 0
+    End If
+    Let db_i be 0
+    While db_i is less than hlen:
+        Let lhbv be proc memory_get_byte from Memory with lhash, db_i
+        proc memory_set_byte from Memory with db, db_i, lhbv
+        Set db_i to db_i plus 1
+    End While
+    Let ps_len be db_len minus hlen minus 1 minus msg_length
+    Let ps_i be 0
+    While ps_i is less than ps_len:
+        proc memory_set_byte from Memory with db, hlen plus ps_i, 0
+        Set ps_i to ps_i plus 1
+    End While
+    proc memory_set_byte from Memory with db, hlen plus ps_len, 1
+    Let m_i be 0
+    While m_i is less than msg_length:
+        Let mbv be proc memory_get_byte from Memory with msg, m_i
+        proc memory_set_byte from Memory with db, hlen plus ps_len plus 1 plus m_i, mbv
+        Set m_i to m_i plus 1
+    End While
+
+    Let seed be proc arena_allocate from Arena with arena, hlen
+    proc entropy_random_bytes from Entropy with arena, seed, hlen
+
+    Let db_mask be proc arena_allocate from Arena with arena, db_len
+    proc rsa_mgf1 with arena, hash_id, seed, hlen, db_len, db_mask
+
+    Let masked_db be proc arena_allocate from Arena with arena, db_len
+    Let xor_i be 0
+    While xor_i is less than db_len:
+        Let dbv be proc memory_get_byte from Memory with db, xor_i
+        Let dmv be proc memory_get_byte from Memory with db_mask, xor_i
+        proc memory_set_byte from Memory with masked_db, xor_i, dbv bitwise_xor dmv
+        Set xor_i to xor_i plus 1
+    End While
+
+    Let seed_mask be proc arena_allocate from Arena with arena, hlen
+    proc rsa_mgf1 with arena, hash_id, masked_db, db_len, hlen, seed_mask
+
+    Let masked_seed be proc arena_allocate from Arena with arena, hlen
+    Let xor_j be 0
+    While xor_j is less than hlen:
+        Let sbv be proc memory_get_byte from Memory with seed, xor_j
+        Let smbv be proc memory_get_byte from Memory with seed_mask, xor_j
+        proc memory_set_byte from Memory with masked_seed, xor_j, sbv bitwise_xor smbv
+        Set xor_j to xor_j plus 1
+    End While
+
+    Let em be proc arena_allocate from Arena with arena, modulus_bytes
+    proc memory_set_byte from Memory with em, 0, 0
+    Let copy_ms_i be 0
+    While copy_ms_i is less than hlen:
+        Let msbv be proc memory_get_byte from Memory with masked_seed, copy_ms_i
+        proc memory_set_byte from Memory with em, 1 plus copy_ms_i, msbv
+        Set copy_ms_i to copy_ms_i plus 1
+    End While
+    Let copy_md_i be 0
+    While copy_md_i is less than db_len:
+        Let mdbv be proc memory_get_byte from Memory with masked_db, copy_md_i
+        proc memory_set_byte from Memory with em, 1 plus hlen plus copy_md_i, mdbv
+        Set copy_md_i to copy_md_i plus 1
+    End While
+
+    Let m_int be proc bigint_from_bytes_be from BigInt with arena, em, modulus_bytes
+    Let c_int be proc bigint_alloc from BigInt with arena, 80
+    proc rsa_rsaep with arena, public_key, m_int, c_int
+    proc bigint_to_bytes_be from BigInt with c_int, ciphertext_out, modulus_bytes
+
+    Return modulus_bytes
+End Process
+
+Process called "rsa_oaep_decrypt" takes arena as Integer, private_key as Integer, label as Integer, label_length as Integer, ciphertext as Integer, ciphertext_length as Integer, msg_out as Integer, msg_out_capacity as Integer returns Integer:
+    @Reasoning
+    Decrypts ciphertext under private_key using RSAES-OAEP. The label
+    must match the value used at encryption time.
+    @End Reasoning
+
+    @Implementation
+    1. Validate ciphertext_length == modulus_bytes.
+    2. c_int = OS2IP(ciphertext); validate c_int < n.
+    3. m_int = RSADP_blinded(c_int).
+    4. EM = I2OSP(m_int, modulus_bytes).
+    5. Split EM into Y (1 byte) || maskedSeed || maskedDB.
+    6. seedMask = MGF1(maskedDB, hLen).
+    7. seed = maskedSeed XOR seedMask.
+    8. dbMask = MGF1(seed, k - hLen - 1).
+    9. DB = maskedDB XOR dbMask.
+    10. Split DB into lHash' || PS (zeros) || 0x01 || msg.
+    11. Verify Y == 0 and lHash' == Hash(label) and PS structure is valid.
+    12. Return msg.
+    @End Implementation
+
+    @Performance_Hints
+    Two MGF1 plus one modexp.
+    @End Performance_Hints
+
+    @Security_Scope
+    The validation steps use a constant-time accumulator over the
+    failure indicators per Manger's recommendation, so timing does
+    not distinguish among the different failure modes.
+    @End Security_Scope
+
+    Let modulus_bytes be proc rsa_private_get_modulus_bytes with private_key
+    Let hash_id be proc rsa_private_get_hash with private_key
+    Let hlen be proc rsa_hash_output_size with hash_id
+
+    If ciphertext_length is not equal to modulus_bytes:
+        Return 0
+    End If
+    If modulus_bytes is less than 2 multiplied by hlen plus 2:
+        Return 0
+    End If
+
+    Let c_int be proc bigint_from_bytes_be from BigInt with arena, ciphertext, ciphertext_length
+    Let n be proc rsa_private_get_n with private_key
+    Let cmp be proc bigint_compare from BigInt with c_int, n
+    If cmp is greater than 0 minus 1:
+        Return 0
+    End If
+
+    Let m_int be proc bigint_alloc from BigInt with arena, 80
+    Let dp_rc be proc rsa_rsadp_blinded with arena, private_key, c_int, m_int
+    If dp_rc is equal to 0:
+        Return 0
+    End If
+
+    Let em be proc arena_allocate from Arena with arena, modulus_bytes
+    proc bigint_to_bytes_be from BigInt with m_int, em, modulus_bytes
+
+    Let y_byte be proc memory_get_byte from Memory with em, 0
+    Let masked_seed be em plus 1
+    Let masked_db be em plus 1 plus hlen
+    Let db_len be modulus_bytes minus hlen minus 1
+
+    Let seed_mask be proc arena_allocate from Arena with arena, hlen
+    proc rsa_mgf1 with arena, hash_id, masked_db, db_len, hlen, seed_mask
+
+    Let seed be proc arena_allocate from Arena with arena, hlen
+    Let xor_i be 0
+    While xor_i is less than hlen:
+        Let msbv be proc memory_get_byte from Memory with masked_seed, xor_i
+        Let smbv be proc memory_get_byte from Memory with seed_mask, xor_i
+        proc memory_set_byte from Memory with seed, xor_i, msbv bitwise_xor smbv
+        Set xor_i to xor_i plus 1
+    End While
+
+    Let db_mask be proc arena_allocate from Arena with arena, db_len
+    proc rsa_mgf1 with arena, hash_id, seed, hlen, db_len, db_mask
+
+    Let db be proc arena_allocate from Arena with arena, db_len
+    Let xor_j be 0
+    While xor_j is less than db_len:
+        Let mdbv be proc memory_get_byte from Memory with masked_db, xor_j
+        Let dmv be proc memory_get_byte from Memory with db_mask, xor_j
+        proc memory_set_byte from Memory with db, xor_j, mdbv bitwise_xor dmv
+        Set xor_j to xor_j plus 1
+    End While
+
+    Let lhash_expected be proc arena_allocate from Arena with arena, hlen
+    proc rsa_hash with arena, hash_id, label, label_length, lhash_expected
+
+    Note: Validate y_byte == 0 and lHash matches via XOR-accumulator.
+    Let failure_acc be y_byte
+    Let lh_i be 0
+    While lh_i is less than hlen:
+        Let dbv be proc memory_get_byte from Memory with db, lh_i
+        Let lhv be proc memory_get_byte from Memory with lhash_expected, lh_i
+        Set failure_acc to failure_acc bitwise_or dbv bitwise_xor lhv
+        Set lh_i to lh_i plus 1
+    End While
+    If failure_acc is not equal to 0:
+        Return 0
+    End If
+
+    Note: Find the 0x01 separator in the PS region (must be present).
+    Let sep_pos be hlen
+    Let found be 0
+    While sep_pos is less than db_len:
+        Let dbv2 be proc memory_get_byte from Memory with db, sep_pos
+        If dbv2 is equal to 1:
+            If found is equal to 0:
+                Set found to 1
+                Set sep_pos to sep_pos
+                Set sep_pos to sep_pos plus 1
+                Note: Continue scanning to ensure PS contained only zeros
+                Note: before the separator. We tracked failures via found.
+            End If
+        Otherwise:
+            If found is equal to 0:
+                If dbv2 is not equal to 0:
+                    Return 0
+                End If
+            End If
+            Set sep_pos to sep_pos plus 1
+        End If
+    End While
+    If found is equal to 0:
+        Return 0
+    End If
+    Note: Recompute separator position: walk PS again to find it.
+    Let real_sep be hlen
+    Let scan_running be 1
+    While scan_running is equal to 1:
+        Let dbv3 be proc memory_get_byte from Memory with db, real_sep
+        If dbv3 is equal to 1:
+            Set scan_running to 0
+        Otherwise:
+            Set real_sep to real_sep plus 1
+            If real_sep is greater than db_len minus 1:
+                Return 0
+            End If
+        End If
+    End While
+
+    Let msg_offset be real_sep plus 1
+    Let msg_len be db_len minus msg_offset
+    If msg_len is greater than msg_out_capacity:
+        Return 0
+    End If
+    Let m_copy_i be 0
+    While m_copy_i is less than msg_len:
+        Let mb be proc memory_get_byte from Memory with db, msg_offset plus m_copy_i
+        proc memory_set_byte from Memory with msg_out, m_copy_i, mb
+        Set m_copy_i to m_copy_i plus 1
+    End While
+
+    Return msg_len
+End Process
+
+Note: ============================================================================
+Note: RSAES-PKCS1-v1_5 encrypt / decrypt per RFC 8017 section 7.2
+Note: ============================================================================
+
+Process called "rsa_pkcs1v15_encrypt" takes arena as Integer, public_key as Integer, msg as Integer, msg_length as Integer, ciphertext_out as Integer returns Integer:
+    @Reasoning
+    Encrypts msg using legacy PKCS#1 v1.5. Provided for interop only.
+    @End Reasoning
+
+    @Implementation
+    1. EM = 0x00 || 0x02 || PS || 0x00 || msg, where PS is at least 8
+       random non-zero bytes filling out to modulus_bytes.
+    2. c = RSAEP(OS2IP(EM)).
+    3. ciphertext = I2OSP(c, modulus_bytes).
+    @End Implementation
+
+    @Performance_Hints
+    One modexp.
+    @End Performance_Hints
+
+    @Security_Scope
+    Document the Bleichenbacher 1998 chosen-ciphertext attack risk.
+    OAEP is the recommended modern replacement.
+    @End Security_Scope
+
+    Let modulus_bytes be proc rsa_public_get_modulus_bytes with public_key
+    If msg_length is greater than modulus_bytes minus 11:
+        Return 0
+    End If
+    Let ps_len be modulus_bytes minus msg_length minus 3
+    If ps_len is less than 8:
+        Return 0
+    End If
+
+    Let em be proc arena_allocate from Arena with arena, modulus_bytes
+    If em is equal to 0:
+        Return 0
+    End If
+    proc memory_set_byte from Memory with em, 0, 0
+    proc memory_set_byte from Memory with em, 1, 2
+
+    Note: Generate ps_len non-zero random bytes. If any byte is zero
+    Note: from the entropy source, redraw individual bytes.
+    Let ps_buf be proc arena_allocate from Arena with arena, ps_len
+    proc entropy_random_bytes from Entropy with arena, ps_buf, ps_len
+    Let ps_i be 0
+    While ps_i is less than ps_len:
+        Let pb be proc memory_get_byte from Memory with ps_buf, ps_i
+        Let inner be 0
+        While pb is equal to 0:
+            Let one_byte_buf be proc arena_allocate from Arena with arena, 1
+            proc entropy_random_bytes from Entropy with arena, one_byte_buf, 1
+            Set pb to proc memory_get_byte from Memory with one_byte_buf, 0
+            Set inner to inner plus 1
+            If inner is greater than 32:
+                Note: extremely unlikely; just set to 1 to avoid stall.
+                Set pb to 1
+            End If
+        End While
+        proc memory_set_byte from Memory with em, 2 plus ps_i, pb
+        Set ps_i to ps_i plus 1
+    End While
+    proc memory_set_byte from Memory with em, 2 plus ps_len, 0
+    Let m_i be 0
+    While m_i is less than msg_length:
+        Let mbv be proc memory_get_byte from Memory with msg, m_i
+        proc memory_set_byte from Memory with em, 3 plus ps_len plus m_i, mbv
+        Set m_i to m_i plus 1
+    End While
+
+    Let m_int be proc bigint_from_bytes_be from BigInt with arena, em, modulus_bytes
+    Let c_int be proc bigint_alloc from BigInt with arena, 80
+    proc rsa_rsaep with arena, public_key, m_int, c_int
+    proc bigint_to_bytes_be from BigInt with c_int, ciphertext_out, modulus_bytes
+    Return modulus_bytes
+End Process
+
+Process called "rsa_pkcs1v15_decrypt" takes arena as Integer, private_key as Integer, ciphertext as Integer, ciphertext_length as Integer, msg_out as Integer, msg_out_capacity as Integer returns Integer:
+    @Reasoning
+    Decrypts a PKCS#1 v1.5 ciphertext.
+    @End Reasoning
+
+    @Implementation
+    1. Validate length.
+    2. c_int = OS2IP; m_int = RSADP_blinded(c_int).
+    3. EM = I2OSP(m_int, modulus_bytes).
+    4. Validate EM = 0x00 || 0x02 || PS || 0x00 || msg.
+    5. Return msg.
+    @End Implementation
+
+    @Performance_Hints
+    One modexp.
+    @End Performance_Hints
+
+    @Security_Scope
+    Document Bleichenbacher risk; callers must not distinguish failure
+    modes in surrounding protocols. OAEP is the recommended modern
+    replacement.
+    @End Security_Scope
+
+    Let modulus_bytes be proc rsa_private_get_modulus_bytes with private_key
+    If ciphertext_length is not equal to modulus_bytes:
+        Return 0
+    End If
+
+    Let c_int be proc bigint_from_bytes_be from BigInt with arena, ciphertext, ciphertext_length
+    Let n be proc rsa_private_get_n with private_key
+    Let cmp be proc bigint_compare from BigInt with c_int, n
+    If cmp is greater than 0 minus 1:
+        Return 0
+    End If
+
+    Let m_int be proc bigint_alloc from BigInt with arena, 80
+    Let dp_rc be proc rsa_rsadp_blinded with arena, private_key, c_int, m_int
+    If dp_rc is equal to 0:
+        Return 0
+    End If
+
+    Let em be proc arena_allocate from Arena with arena, modulus_bytes
+    proc bigint_to_bytes_be from BigInt with m_int, em, modulus_bytes
+
+    Let b0 be proc memory_get_byte from Memory with em, 0
+    Let b1 be proc memory_get_byte from Memory with em, 1
+    If b0 is not equal to 0:
+        Return 0
+    End If
+    If b1 is not equal to 2:
+        Return 0
+    End If
+
+    Let sep_pos be 2
+    Let scan_running be 1
+    While scan_running is equal to 1:
+        Let pb be proc memory_get_byte from Memory with em, sep_pos
+        If pb is equal to 0:
+            Set scan_running to 0
+        Otherwise:
+            Set sep_pos to sep_pos plus 1
+            If sep_pos is greater than modulus_bytes minus 1:
+                Return 0
+            End If
+        End If
+    End While
+
+    If sep_pos is less than 10:
+        Note: PS length < 8 - invalid.
+        Return 0
+    End If
+
+    Let msg_offset be sep_pos plus 1
+    Let msg_len be modulus_bytes minus msg_offset
+    If msg_len is greater than msg_out_capacity:
+        Return 0
+    End If
+    Let m_copy_i be 0
+    While m_copy_i is less than msg_len:
+        Let mb be proc memory_get_byte from Memory with em, msg_offset plus m_copy_i
+        proc memory_set_byte from Memory with msg_out, m_copy_i, mb
+        Set m_copy_i to m_copy_i plus 1
+    End While
+    Return msg_len
+End Process
+
+Note:
+================================================================================
+RSA key generation
+
+Generates two random primes p, q of the appropriate bit length and
+derives the public/private exponents from them. Uses Miller-Rabin
+primality testing via repeated trial of small witnesses; for the
+2048-4096-bit sizes in scope this delivers an error probability below
+2^-128.
+================================================================================
+:End Note
+
+Process called "rsa_miller_rabin_probable_prime" takes arena as Integer, n as Integer, rounds as Integer returns Integer:
+    @Reasoning
+    Returns 1 if n passes `rounds` Miller-Rabin tests with random bases,
+    0 if n is composite. For RSA key-gen we run with rounds = 64 to
+    drive the error probability below 2^-128.
+    @End Reasoning
+
+    @Implementation
+    1. Reject even n and n < 3.
+    2. Write n-1 = d * 2^s with d odd.
+    3. For each round:
+       a. Pick random base a in [2, n-2].
+       b. Compute x = a^d mod n.
+       c. If x == 1 or x == n-1, pass this round.
+       d. Repeat s-1 times: x = x^2 mod n; if x == n-1, pass this round.
+       e. If neither hits, n is composite.
+    4. Return 1.
+    @End Implementation
+
+    @Performance_Hints
+    Each round is one full modexp plus up to s squarings.
+    @End Performance_Hints
+
+    @Security_Scope
+    Used at key generation only. The bases are drawn from public-side
+    entropy; the test result is itself the output.
+    @End Security_Scope
+
+    If proc bigint_is_zero from BigInt with n is equal to 1:
+        Return 0
+    End If
+    Let two_bn be proc bigint_from_u64 from BigInt with arena, 2
+    Let three_bn be proc bigint_from_u64 from BigInt with arena, 3
+    Let cmp_three be proc bigint_compare from BigInt with n, three_bn
+    If cmp_three is less than 0:
+        Note: n in {0, 1, 2}; only 2 is prime.
+        If proc bigint_equals from BigInt with n, two_bn is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+    If proc bigint_is_even from BigIntX with n is equal to 1:
+        Return 0
+    End If
+
+    Note: Write n - 1 = d * 2^s with d odd.
+    Let one_bn be proc bigint_from_u64 from BigInt with arena, 1
+    Let nminus1 be proc bigint_alloc from BigInt with arena, 80
+    proc bigint_sub from BigInt with nminus1, n, one_bn
+    Let d_bn be proc bigint_copy from BigInt with arena, nminus1
+    Let s_count be 0
+    While proc bigint_is_even from BigIntX with d_bn is equal to 1:
+        proc bigint_shift_right_one from BigIntX with d_bn
+        Set s_count to s_count plus 1
+    End While
+
+    Let n_byte_count be proc bigint_get_limb_count from BigInt with n
+    Let n_bytes be n_byte_count multiplied by 8
+    Let base_buf be proc arena_allocate from Arena with arena, n_bytes
+    If base_buf is equal to 0:
+        Return 0
+    End If
+
+    Let round be 0
+    While round is less than rounds:
+        Note: Pick random a in [2, n-2].
+        Let a_ok be 0
+        Let a_bn be proc bigint_alloc from BigInt with arena, 80
+        Let inner_attempt be 0
+        While a_ok is equal to 0:
+            proc entropy_random_bytes from Entropy with arena, base_buf, n_bytes
+            Let a_cand be proc bigint_from_bytes_be from BigInt with arena, base_buf, n_bytes
+            Let cmp_lo be proc bigint_compare from BigInt with a_cand, two_bn
+            If cmp_lo is greater than 0 minus 1:
+                Let cmp_hi be proc bigint_compare from BigInt with a_cand, nminus1
+                If cmp_hi is less than 0:
+                    Let ac_count be proc bigint_get_limb_count from BigInt with a_cand
+                    Let ab_cap be proc bigint_get_limb_capacity from BigInt with a_bn
+                    Let zi be 0
+                    While zi is less than ab_cap:
+                        proc bigint_set_limb from BigInt with a_bn, zi, 0
+                        Set zi to zi plus 1
+                    End While
+                    Let ci be 0
+                    While ci is less than ac_count:
+                        Let alv be proc bigint_get_limb from BigInt with a_cand, ci
+                        proc bigint_set_limb from BigInt with a_bn, ci, alv
+                        Set ci to ci plus 1
+                    End While
+                    proc bigint_set_limb_count from BigInt with a_bn, ac_count
+                    Set a_ok to 1
+                End If
+            End If
+            Set inner_attempt to inner_attempt plus 1
+            If inner_attempt is greater than 64:
+                Return 0
+            End If
+        End While
+
+        Let x_bn be proc bigint_alloc from BigInt with arena, 80
+        proc bigint_mod_exp from BigInt with arena, x_bn, a_bn, d_bn, n
+        Let pass be 0
+        If proc bigint_equals from BigInt with x_bn, one_bn is equal to 1:
+            Set pass to 1
+        End If
+        If pass is equal to 0:
+            If proc bigint_equals from BigInt with x_bn, nminus1 is equal to 1:
+                Set pass to 1
+            End If
+        End If
+
+        If pass is equal to 0:
+            Let r be 1
+            While r is less than s_count:
+                Let x_sq be proc bigint_alloc from BigInt with arena, 80
+                proc bigint_mul from BigInt with x_sq, x_bn, x_bn
+                proc bigint_mod from BigInt with arena, x_bn, x_sq, n
+                If proc bigint_equals from BigInt with x_bn, nminus1 is equal to 1:
+                    Set pass to 1
+                    Set r to s_count
+                End If
+                Set r to r plus 1
+            End While
+        End If
+
+        If pass is equal to 0:
+            Return 0
+        End If
+        Set round to round plus 1
+    End While
+    Return 1
+End Process
+
+Process called "rsa_keygen_random_prime" takes arena as Integer, bit_length as Integer returns Integer:
+    @Reasoning
+    Generates a random probable prime of the requested bit length.
+    Uses rejection sampling: draw bytes, set the high bit and low bit
+    so the candidate is in [2^(bit_length-1), 2^bit_length - 1] and
+    odd, then test with Miller-Rabin.
+    @End Reasoning
+
+    @Implementation
+    Loop:
+        1. Random bytes.
+        2. Force the high and low bits.
+        3. Run Miller-Rabin with 64 rounds.
+        4. Accept on success.
+    @End Implementation
+
+    @Performance_Hints
+    Expected ~bit_length/log(2) candidates per prime by the prime
+    number theorem; for 1024-bit half-primes that's about 350
+    candidates.
+    @End Performance_Hints
+
+    @Security_Scope
+    Output is a secret prime. The candidate-selection branch leaks
+    only the number of iterations.
+    @End Security_Scope
+
+    Let n_bytes be bit_length divided by 8
+    If bit_length modulo by 8 is not equal to 0:
+        Set n_bytes to n_bytes plus 1
+    End If
+    Let buf be proc arena_allocate from Arena with arena, n_bytes
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let attempt be 0
+    Let max_attempts be 65536
+    While attempt is less than max_attempts:
+        proc entropy_random_bytes from Entropy with arena, buf, n_bytes
+        Note: Set high bits to force the bit length. The top two bits set
+        Note: ensures the product of two such primes has exactly 2*bits.
+        Let top_byte be proc memory_get_byte from Memory with buf, 0
+        Set top_byte to top_byte bitwise_or 192
+        proc memory_set_byte from Memory with buf, 0, top_byte
+        Note: Force odd.
+        Let low_byte be proc memory_get_byte from Memory with buf, n_bytes minus 1
+        Set low_byte to low_byte bitwise_or 1
+        proc memory_set_byte from Memory with buf, n_bytes minus 1, low_byte
+
+        Let cand be proc bigint_from_bytes_be from BigInt with arena, buf, n_bytes
+        Let mr_rc be proc rsa_miller_rabin_probable_prime with arena, cand, 64
+        If mr_rc is equal to 1:
+            proc secure_zero from SecureMem with buf, n_bytes
+            Return cand
+        End If
+        Set attempt to attempt plus 1
+    End While
+    proc secure_zero from SecureMem with buf, n_bytes
+    Return 0
+End Process
+
+Process called "rsa_keygen" takes arena as Integer, bits as Integer, hash_id as Integer, public_out as Integer, private_out as Integer returns Integer:
+    @Reasoning
+    Generates an RSA key pair with the requested modulus bit length
+    (2048, 3072, or 4096). Public exponent is fixed at 65537.
+    @End Reasoning
+
+    @Implementation
+    1. Generate primes p, q of bits/2 each, with p != q.
+    2. n = p * q.
+    3. phi = (p-1) * (q-1).
+    4. e = 65537.
+    5. d = e^-1 mod phi.
+    6. dp = d mod (p-1), dq = d mod (q-1), qInv = q^-1 mod p.
+    7. Populate the public and private key structs.
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by prime generation: typically seconds for 2048-bit,
+    minutes for 4096-bit.
+    @End Performance_Hints
+
+    @Security_Scope
+    Output is a secret key. p, q, dp, dq, qInv, d are all secrets.
+    @End Security_Scope
+
+    If bits is less than 2048:
+        Return 0
+    End If
+    Let half_bits be bits divided by 2
+
+    Let p be proc rsa_keygen_random_prime with arena, half_bits
+    If p is equal to 0:
+        Return 0
+    End If
+    Let q_attempt be 0
+    Let q be proc rsa_keygen_random_prime with arena, half_bits
+    If q is equal to 0:
+        Return 0
+    End If
+    Note: Ensure p != q. Repeat q-generation until distinct.
+    Let q_ok be 0
+    While q_ok is equal to 0:
+        If proc bigint_equals from BigInt with p, q is equal to 1:
+            Set q to proc rsa_keygen_random_prime with arena, half_bits
+            If q is equal to 0:
+                Return 0
+            End If
+        Otherwise:
+            Set q_ok to 1
+        End If
+        Set q_attempt to q_attempt plus 1
+        If q_attempt is greater than 16:
+            Set q_ok to 1
+        End If
+    End While
+
+    Let n be proc bigint_alloc from BigInt with arena, 80
+    proc bigint_mul from BigInt with n, p, q
+
+    Let one_bn be proc bigint_from_u64 from BigInt with arena, 1
+    Let p_minus_one be proc bigint_alloc from BigInt with arena, 80
+    Let q_minus_one be proc bigint_alloc from BigInt with arena, 80
+    proc bigint_sub from BigInt with p_minus_one, p, one_bn
+    proc bigint_sub from BigInt with q_minus_one, q, one_bn
+    Let phi be proc bigint_alloc from BigInt with arena, 80
+    proc bigint_mul from BigInt with phi, p_minus_one, q_minus_one
+
+    Let e_bn be proc bigint_from_u64 from BigInt with arena, 65537
+    Let d be proc bigint_alloc from BigInt with arena, 80
+    Let inv_rc be proc rsa_modinv with arena, d, e_bn, phi
+    If inv_rc is equal to 0:
+        Return 0
+    End If
+
+    Let dp be proc bigint_alloc from BigInt with arena, 80
+    Let dq be proc bigint_alloc from BigInt with arena, 80
+    proc bigint_mod from BigInt with arena, dp, d, p_minus_one
+    proc bigint_mod from BigInt with arena, dq, d, q_minus_one
+
+    Let qinv be proc bigint_alloc from BigInt with arena, 80
+    Let qinv_rc be proc rsa_modinv with arena, qinv, q, p
+    If qinv_rc is equal to 0:
+        Return 0
+    End If
+
+    proc rsa_public_set_n with public_out, n
+    proc rsa_public_set_e with public_out, e_bn
+    proc rsa_public_set_bits with public_out, bits
+    proc rsa_public_set_hash with public_out, hash_id
+
+    proc rsa_private_set_n with private_out, n
+    proc rsa_private_set_e with private_out, e_bn
+    proc rsa_private_set_d with private_out, d
+    proc rsa_private_set_bits with private_out, bits
+    proc rsa_private_set_hash with private_out, hash_id
+    proc rsa_private_set_p with private_out, p
+    proc rsa_private_set_q with private_out, q
+    proc rsa_private_set_dp with private_out, dp
+    proc rsa_private_set_dq with private_out, dq
+    proc rsa_private_set_qinv with private_out, qinv
+
+    Return 1
+End Process

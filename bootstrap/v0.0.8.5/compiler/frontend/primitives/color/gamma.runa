@@ -1,0 +1,740 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+:End Note
+
+Note:
+==============================================================================
+Gamma - Display Opto-Electronic Transfer Functions (OETFs / EOTFs)
+==============================================================================
+
+Display systems do not encode linear scene light; they encode an
+opto-electrical transformation of it. This module implements every
+transfer function in widespread use, both forward (linear -> encoded)
+and inverse (encoded -> linear), so callers can move between the
+native compositor / shader linear-light domain and the file-format /
+display-port encoded domain.
+
+Curves supported:
+
+  GAMMA_LINEAR
+      Identity transfer (y = x). Selected by pipelines whose input data
+      already lies in the linear-light domain (deep-colour scientific
+      imaging, intermediate render targets, EXR float buffers) so the
+      gamma stage compiles to a single passthrough copy without altering
+      the channel values.
+
+  GAMMA_SRGB
+      The IEC 61966-2-1:1999 piecewise sRGB transfer function:
+          v_encoded = 12.92 * v_lin                if v_lin <= 0.0031308
+          v_encoded = 1.055 * v_lin^(1/2.4) - 0.055 otherwise
+      Inverse:
+          v_lin = v_enc / 12.92                    if v_enc <= 0.04045
+          v_lin = ((v_enc + 0.055) / 1.055)^2.4    otherwise
+
+  GAMMA_22, GAMMA_24
+      Power-law transfer functions y = x^(1/gamma) and the inverse.
+      Gamma = 2.2 matches PC monitors (approximately) and the
+      CRT-era television tradition. Gamma = 2.4 matches modern
+      reference monitors per BT.1886.
+
+  GAMMA_BT709 / GAMMA_BT2020
+      The ITU-R BT.709-6 / BT.2020-2 piecewise transfer function used
+      for HD and UHD broadcast video. Forward:
+          v_enc = 4.500 * v_lin                    if v_lin <  0.018
+          v_enc = 1.099 * v_lin^0.45 - 0.099       otherwise
+      (BT.2020 narrow-range alpha = 1.09929682680944, beta = 0.018053968510807;
+       broadcast-range coefficients match BT.709 for 10-bit signals.)
+
+  GAMMA_PQ
+      The SMPTE ST 2084 (Perceptual Quantizer) electro-optical transfer
+      function used by HDR10 / Dolby Vision. Encodes absolute luminance
+      in cd/m^2 over the range 0..10000.
+          E' = ((c1 + c2*L^m1) / (1 + c3*L^m1))^m2
+      where m1 = 0.1593017578125, m2 = 78.84375,
+            c1 = 0.8359375,        c2 = 18.8515625, c3 = 18.6875,
+      L is normalised luminance L = Y / 10000 (Y in cd/m^2).
+
+  GAMMA_HLG
+      The ITU-R BT.2100-2 Hybrid Log-Gamma transfer function (HLG)
+      used by broadcast HDR (BBC / NHK). Forward:
+          E' = sqrt(3 * E)                            for 0 <= E <= 1/12
+          E' = a * ln(12 * E - b) + c                 for 1/12 < E <= 1
+      where a = 0.17883277, b = 0.28466892, c = 0.55991073.
+
+All transcendental evaluations use Taylor / Newton kernels internal
+to this module so the file has no external dependency beyond
+arithmetic_core for native sqrt.
+
+References:
+  - IEC 61966-2-1:1999 (sRGB)
+  - ITU-R BT.1886 (Reference monitor EOTF for HDTV studio production)
+  - ITU-R BT.709-6 (HDTV signal format)
+  - ITU-R BT.2020-2 (UHDTV signal format)
+  - SMPTE ST 2084:2014 (Perceptual Quantizer)
+  - ITU-R BT.2100-2 (HDR formats including PQ and HLG)
+==============================================================================
+:End Note
+
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+
+Note: ============================================================================
+Note: GAMMA CURVE IDENTIFIERS
+Note: ============================================================================
+
+Constant GAMMA_LINEAR as Integer is 0
+Constant GAMMA_SRGB as Integer is 1
+Constant GAMMA_22 as Integer is 2
+Constant GAMMA_24 as Integer is 3
+Constant GAMMA_BT709 as Integer is 4
+Constant GAMMA_BT2020 as Integer is 5
+Constant GAMMA_PQ as Integer is 6
+Constant GAMMA_HLG as Integer is 7
+
+Note: ============================================================================
+Note: MATH HELPERS - exp / log / pow via series
+Note: ============================================================================
+
+Process called "expf" takes x as Float returns Float:
+    @Reasoning
+    Float64 e^x via Taylor expansion around 0. Used by powf (pow base
+    exponential reduction) and HLG's log-component inverse. Range
+    reduction folds x into ln2-sized intervals so the series converges
+    in <=24 terms across the inputs needed by the gamma curves
+    (|x| <= ~12 for our use cases).
+    @End Reasoning
+    @Implementation
+    Range reduction: x = k*ln2 + r with |r| <= ln2/2; result is
+    2^k * e^r computed by k-fold doubling / halving of e^r. e^r is a
+    Taylor sum truncated at 24 terms.
+    @End Implementation
+    @Performance_Hints
+    ~120 FLOPs in the worst case.
+    @End Performance_Hints
+    @Security_Scope
+    Pure. Returns 0 for extreme negative x and a large positive number
+    for x >= 700 (avoids Float64 overflow path).
+    @End Security_Scope
+    If x is greater than 700.0:
+        Return 1.0e300
+    End If
+    If x is less than 0.0 minus 700.0:
+        Return 0.0
+    End If
+    Let ln2 be 0.6931471805599453
+    Let k be 0
+    Let r be x
+    While r is greater than (ln2 divided by 2.0):
+        Set r to r minus ln2
+        Set k to k plus 1
+    End While
+    While r is less than 0.0 minus (ln2 divided by 2.0):
+        Set r to r plus ln2
+        Set k to k minus 1
+    End While
+    Let sum be 1.0
+    Let term be 1.0
+    Let i be 1
+    While i is less than 30:
+        Let i_as_f be Arith.int_to_float(i)
+        Set term to (term multiplied by r) divided by i_as_f
+        Set sum to sum plus term
+        Set i to i plus 1
+    End While
+    Let scale be 1.0
+    If k is greater than 0:
+        Let step be 0
+        While step is less than k:
+            Set scale to scale multiplied by 2.0
+            Set step to step plus 1
+        End While
+    End If
+    If k is less than 0:
+        Let neg_k be 0 minus k
+        Let step be 0
+        While step is less than neg_k:
+            Set scale to scale divided by 2.0
+            Set step to step plus 1
+        End While
+    End If
+    Return sum multiplied by scale
+End Process
+
+Process called "lnf" takes x as Float returns Float:
+    @Reasoning
+    Natural logarithm of x. Range reduction via repeated halving until
+    the argument lies in [1, 2), then the rapidly-convergent
+    series ln(1+u) = u - u^2/2 + u^3/3 - ... (|u| <= 1) gives ~52 bits
+    of precision in 30 terms.
+    @End Reasoning
+    @Implementation
+    Halve x while x > 2 (track count k); double while x < 1. Result is
+    k*ln2 + ln_series(x - 1).
+    @End Implementation
+    @Performance_Hints
+    ~120 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure. Returns a large negative number for x <= 0 to mimic the
+    IEEE-754 negative-infinity propagation.
+    @End Security_Scope
+    If x is less than or equal to 0.0:
+        Return 0.0 minus 1.0e300
+    End If
+    Let ln2 be 0.6931471805599453
+    Let k be 0
+    Let m be x
+    While m is greater than or equal to 2.0:
+        Set m to m divided by 2.0
+        Set k to k plus 1
+    End While
+    While m is less than 1.0:
+        Set m to m multiplied by 2.0
+        Set k to k minus 1
+    End While
+    Let u be m minus 1.0
+    Let sum be 0.0
+    Let term be u
+    Let i be 1
+    While i is less than 60:
+        Let i_as_f be Arith.int_to_float(i)
+        Let contribution be term divided by i_as_f
+        If (i modulo by 2) is equal to 0:
+            Set sum to sum minus contribution
+        Otherwise:
+            Set sum to sum plus contribution
+        End If
+        Set term to term multiplied by u
+        Set i to i plus 1
+    End While
+    Let k_as_f be Arith.int_to_float(k)
+    Return sum plus (k_as_f multiplied by ln2)
+End Process
+
+Process called "powf" takes base as Float, exponent as Float returns Float:
+    @Reasoning
+    Float64 power: base^exponent = exp(exponent * ln(base)) for positive
+    base. Negative bases with integer exponents are handled by the
+    sign-of-result correction step.
+    @End Reasoning
+    @Implementation
+    Two transcendental kernels plus a multiplicative step. The base = 0
+    edge case returns 0 for positive exponent and a large value for
+    negative (mirroring IEEE-754 pow semantics).
+    @End Implementation
+    @Performance_Hints
+    ~240 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If base is equal to 0.0:
+        If exponent is greater than 0.0:
+            Return 0.0
+        End If
+        Return 1.0e300
+    End If
+    If base is less than 0.0:
+        Return 0.0
+    End If
+    Let lnb be lnf(base)
+    Let prod be exponent multiplied by lnb
+    Return expf(prod)
+End Process
+
+Note: ============================================================================
+Note: sRGB FORWARD AND INVERSE
+Note: ============================================================================
+
+Process called "srgb_encode" takes v_lin as Float returns Float:
+    @Reasoning
+    Apply the IEC 61966-2-1:1999 sRGB OETF to a linear-light value:
+        if v_lin <= 0.0031308:
+            v_enc = 12.92 * v_lin
+        else:
+            v_enc = 1.055 * v_lin^(1/2.4) - 0.055
+    Clamps the input to non-negative because sRGB encoding is undefined
+    for negative light.
+    @End Reasoning
+    @Implementation
+    One compare and either a multiply or a power-and-affine.
+    @End Implementation
+    @Performance_Hints
+    Power branch dominates: ~240 FLOPs via powf.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be v_lin
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    If v is less than or equal to 0.0031308:
+        Return 12.92 multiplied by v
+    End If
+    Let exp be 1.0 divided by 2.4
+    Let p be powf(v, exp)
+    Return (1.055 multiplied by p) minus 0.055
+End Process
+
+Process called "srgb_decode" takes v_enc as Float returns Float:
+    @Reasoning
+    Apply the inverse sRGB EOTF:
+        if v_enc <= 0.04045:
+            v_lin = v_enc / 12.92
+        else:
+            v_lin = ((v_enc + 0.055) / 1.055)^2.4
+    @End Reasoning
+    @Implementation
+    One compare; a divide or a powf.
+    @End Implementation
+    @Performance_Hints
+    Power branch dominates.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be v_enc
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    If v is less than or equal to 0.04045:
+        Return v divided by 12.92
+    End If
+    Let inner be (v plus 0.055) divided by 1.055
+    Return powf(inner, 2.4)
+End Process
+
+Note: ============================================================================
+Note: PURE GAMMA POWER LAW (2.2 / 2.4)
+Note: ============================================================================
+
+Process called "gamma22_encode" takes v_lin as Float returns Float:
+    @Reasoning
+    Forward power-law transfer with gamma = 2.2 used historically by
+    PC monitors. Encoded value = linear^(1/2.2).
+    @End Reasoning
+    @Implementation
+    powf with the constant exponent 1/2.2.
+    @End Implementation
+    @Performance_Hints
+    ~240 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be v_lin
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    Let inv_gamma be 1.0 divided by 2.2
+    Return powf(v, inv_gamma)
+End Process
+
+Process called "gamma22_decode" takes v_enc as Float returns Float:
+    @Reasoning
+    Inverse power-law transfer for gamma = 2.2: linear = encoded^2.2.
+    @End Reasoning
+    @Implementation
+    powf with the constant exponent 2.2.
+    @End Implementation
+    @Performance_Hints
+    ~240 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be v_enc
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    Return powf(v, 2.2)
+End Process
+
+Process called "gamma24_encode" takes v_lin as Float returns Float:
+    @Reasoning
+    Forward power-law transfer with gamma = 2.4 (BT.1886 reference
+    studio monitor).
+    @End Reasoning
+    @Implementation
+    powf with the constant exponent 1/2.4.
+    @End Implementation
+    @Performance_Hints
+    ~240 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be v_lin
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    Let inv_gamma be 1.0 divided by 2.4
+    Return powf(v, inv_gamma)
+End Process
+
+Process called "gamma24_decode" takes v_enc as Float returns Float:
+    @Reasoning
+    Inverse power-law transfer with gamma = 2.4.
+    @End Reasoning
+    @Implementation
+    powf with the constant exponent 2.4.
+    @End Implementation
+    @Performance_Hints
+    ~240 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be v_enc
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    Return powf(v, 2.4)
+End Process
+
+Note: ============================================================================
+Note: BT.709 AND BT.2020 PIECEWISE TRANSFER FUNCTIONS
+Note: ============================================================================
+
+Process called "bt709_encode" takes v_lin as Float returns Float:
+    @Reasoning
+    ITU-R BT.709-6 OETF:
+        if v_lin < 0.018:
+            v_enc = 4.500 * v_lin
+        else:
+            v_enc = 1.099 * v_lin^0.45 - 0.099
+    @End Reasoning
+    @Implementation
+    One compare; a multiply or a power-and-affine.
+    @End Implementation
+    @Performance_Hints
+    Power branch dominates.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be v_lin
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    If v is less than 0.018:
+        Return 4.5 multiplied by v
+    End If
+    Let p be powf(v, 0.45)
+    Return (1.099 multiplied by p) minus 0.099
+End Process
+
+Process called "bt709_decode" takes v_enc as Float returns Float:
+    @Reasoning
+    Inverse ITU-R BT.709-6 OETF:
+        if v_enc < 0.081:
+            v_lin = v_enc / 4.500
+        else:
+            v_lin = ((v_enc + 0.099) / 1.099)^(1/0.45)
+    @End Reasoning
+    @Implementation
+    Symmetric to bt709_encode.
+    @End Implementation
+    @Performance_Hints
+    Power branch dominates.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be v_enc
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    If v is less than 0.081:
+        Return v divided by 4.5
+    End If
+    Let inner be (v plus 0.099) divided by 1.099
+    Let inv_exp be 1.0 divided by 0.45
+    Return powf(inner, inv_exp)
+End Process
+
+Process called "bt2020_encode" takes v_lin as Float returns Float:
+    @Reasoning
+    ITU-R BT.2020-2 OETF (10-bit / 12-bit broadcast):
+        if v_lin < beta:
+            v_enc = 4.500 * v_lin
+        else:
+            v_enc = alpha * v_lin^0.45 - (alpha - 1)
+        alpha = 1.09929682680944, beta = 0.018053968510807
+    @End Reasoning
+    @Implementation
+    Same shape as BT.709 with refined coefficients per BT.2020-2.
+    @End Implementation
+    @Performance_Hints
+    Power branch dominates.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be v_lin
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    Let beta be 0.018053968510807
+    If v is less than beta:
+        Return 4.5 multiplied by v
+    End If
+    Let alpha be 1.09929682680944
+    Let p be powf(v, 0.45)
+    Return (alpha multiplied by p) minus (alpha minus 1.0)
+End Process
+
+Process called "bt2020_decode" takes v_enc as Float returns Float:
+    @Reasoning
+    Inverse ITU-R BT.2020-2 OETF.
+    @End Reasoning
+    @Implementation
+    Symmetric to bt2020_encode.
+    @End Implementation
+    @Performance_Hints
+    Power branch dominates.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be v_enc
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    Let alpha be 1.09929682680944
+    Let threshold be 4.5 multiplied by 0.018053968510807
+    If v is less than threshold:
+        Return v divided by 4.5
+    End If
+    Let inner be (v plus (alpha minus 1.0)) divided by alpha
+    Let inv_exp be 1.0 divided by 0.45
+    Return powf(inner, inv_exp)
+End Process
+
+Note: ============================================================================
+Note: PERCEPTUAL QUANTIZER (SMPTE ST 2084)
+Note: ============================================================================
+
+Process called "pq_encode" takes l_normalised as Float returns Float:
+    @Reasoning
+    SMPTE ST 2084 inverse-EOTF that encodes absolute luminance normalised
+    to 10000 cd/m^2 as a [0, 1] code value:
+        L_m1 = L^m1
+        E' = ((c1 + c2 * L_m1) / (1 + c3 * L_m1))^m2
+    Where m1 = 0.1593017578125, m2 = 78.84375,
+          c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875.
+    @End Reasoning
+    @Implementation
+    Two powf invocations and a rational evaluation.
+    @End Implementation
+    @Performance_Hints
+    ~480 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let l be l_normalised
+    If l is less than 0.0:
+        Set l to 0.0
+    End If
+    Let m1 be 0.1593017578125
+    Let m2 be 78.84375
+    Let c1 be 0.8359375
+    Let c2 be 18.8515625
+    Let c3 be 18.6875
+    Let l_m1 be powf(l, m1)
+    Let num be c1 plus (c2 multiplied by l_m1)
+    Let den be 1.0 plus (c3 multiplied by l_m1)
+    Let frac be num divided by den
+    Return powf(frac, m2)
+End Process
+
+Process called "pq_decode" takes e_prime as Float returns Float:
+    @Reasoning
+    SMPTE ST 2084 EOTF: inverse of pq_encode.
+        L^m1 = max((E'^(1/m2) - c1), 0) / (c2 - c3 * E'^(1/m2))
+        L = L^m1^(1/m1)
+    @End Reasoning
+    @Implementation
+    Two powf invocations and a rational evaluation.
+    @End Implementation
+    @Performance_Hints
+    ~480 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let e be e_prime
+    If e is less than 0.0:
+        Set e to 0.0
+    End If
+    Let m1 be 0.1593017578125
+    Let m2 be 78.84375
+    Let c1 be 0.8359375
+    Let c2 be 18.8515625
+    Let c3 be 18.6875
+    Let inv_m2 be 1.0 divided by m2
+    Let e_inv_m2 be powf(e, inv_m2)
+    Let num be e_inv_m2 minus c1
+    If num is less than 0.0:
+        Set num to 0.0
+    End If
+    Let den be c2 minus (c3 multiplied by e_inv_m2)
+    Let l_m1 be num divided by den
+    Let inv_m1 be 1.0 divided by m1
+    Return powf(l_m1, inv_m1)
+End Process
+
+Note: ============================================================================
+Note: HYBRID LOG-GAMMA (ITU-R BT.2100-2)
+Note: ============================================================================
+
+Process called "hlg_encode" takes e_lin as Float returns Float:
+    @Reasoning
+    ITU-R BT.2100-2 HLG OETF:
+        if 0 <= E <= 1/12:    E' = sqrt(3 E)
+        if 1/12 < E <= 1:     E' = a * ln(12 E - b) + c
+        a = 0.17883277, b = 0.28466892, c = 0.55991073
+    @End Reasoning
+    @Implementation
+    One compare; sqrt branch or ln branch.
+    @End Implementation
+    @Performance_Hints
+    Log branch dominates: ~120 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let e be e_lin
+    If e is less than 0.0:
+        Set e to 0.0
+    End If
+    Let one_twelfth be 1.0 divided by 12.0
+    If e is less than or equal to one_twelfth:
+        Return Arith.sqrt(3.0 multiplied by e)
+    End If
+    Let a be 0.17883277
+    Let b be 0.28466892
+    Let c be 0.55991073
+    Return (a multiplied by lnf((12.0 multiplied by e) minus b)) plus c
+End Process
+
+Process called "hlg_decode" takes e_prime as Float returns Float:
+    @Reasoning
+    Inverse ITU-R BT.2100-2 HLG OETF:
+        if 0 <= E' <= 1/2:    E = (E')^2 / 3
+        if 1/2 < E' <= 1:     E = (exp((E' - c) / a) + b) / 12
+    @End Reasoning
+    @Implementation
+    One compare; quadratic or exp branch.
+    @End Implementation
+    @Performance_Hints
+    Exp branch dominates.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let v be e_prime
+    If v is less than 0.0:
+        Set v to 0.0
+    End If
+    If v is less than or equal to 0.5:
+        Return (v multiplied by v) divided by 3.0
+    End If
+    Let a be 0.17883277
+    Let b be 0.28466892
+    Let c be 0.55991073
+    Let inner be (v minus c) divided by a
+    Return (expf(inner) plus b) divided by 12.0
+End Process
+
+Note: ============================================================================
+Note: GENERIC DISPATCH
+Note: ============================================================================
+
+Process called "apply_gamma" takes linear_value as Float, curve as Integer returns Float:
+    @Reasoning
+    Dispatch to the forward transfer function specified by the
+    GammaCurve identifier. Returns linear_value unchanged for
+    GAMMA_LINEAR.
+    @End Reasoning
+    @Implementation
+    Switch on curve identifier.
+    @End Implementation
+    @Performance_Hints
+    Branch + targeted function cost.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If curve is equal to GAMMA_LINEAR:
+        Return linear_value
+    End If
+    If curve is equal to GAMMA_SRGB:
+        Return srgb_encode(linear_value)
+    End If
+    If curve is equal to GAMMA_22:
+        Return gamma22_encode(linear_value)
+    End If
+    If curve is equal to GAMMA_24:
+        Return gamma24_encode(linear_value)
+    End If
+    If curve is equal to GAMMA_BT709:
+        Return bt709_encode(linear_value)
+    End If
+    If curve is equal to GAMMA_BT2020:
+        Return bt2020_encode(linear_value)
+    End If
+    If curve is equal to GAMMA_PQ:
+        Return pq_encode(linear_value)
+    End If
+    If curve is equal to GAMMA_HLG:
+        Return hlg_encode(linear_value)
+    End If
+    Return linear_value
+End Process
+
+Process called "remove_gamma" takes gamma_value as Float, curve as Integer returns Float:
+    @Reasoning
+    Dispatch to the inverse transfer function specified by the
+    GammaCurve identifier.
+    @End Reasoning
+    @Implementation
+    Switch on curve identifier.
+    @End Implementation
+    @Performance_Hints
+    Branch + targeted function cost.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If curve is equal to GAMMA_LINEAR:
+        Return gamma_value
+    End If
+    If curve is equal to GAMMA_SRGB:
+        Return srgb_decode(gamma_value)
+    End If
+    If curve is equal to GAMMA_22:
+        Return gamma22_decode(gamma_value)
+    End If
+    If curve is equal to GAMMA_24:
+        Return gamma24_decode(gamma_value)
+    End If
+    If curve is equal to GAMMA_BT709:
+        Return bt709_decode(gamma_value)
+    End If
+    If curve is equal to GAMMA_BT2020:
+        Return bt2020_decode(gamma_value)
+    End If
+    If curve is equal to GAMMA_PQ:
+        Return pq_decode(gamma_value)
+    End If
+    If curve is equal to GAMMA_HLG:
+        Return hlg_decode(gamma_value)
+    End If
+    Return gamma_value
+End Process

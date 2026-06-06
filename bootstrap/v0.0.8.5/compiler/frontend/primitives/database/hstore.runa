@@ -1,0 +1,412 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+HSTORE - PostgreSQL-style flat key->value string map.
+
+A flat string-keyed dictionary specialized for SQL workloads. Provides
+the SQL HSTORE operators:
+  - get(key) -> value or null
+  - set(key, value)
+  - delete(key)
+  - has_key(key) -> bool
+  - keys() -> iterator
+  - merge(other) - other's entries overwrite ours
+
+HStore layout (24 bytes):
+  offset 0:  entries_ptr   (8 bytes) - array of Entry*
+  offset 8:  entry_count   (8 bytes)
+  offset 16: entry_capacity (8 bytes)
+
+Entry layout (32 bytes):
+  offset 0:  key_ptr   (8 bytes) - heap-owned, null-terminated
+  offset 8:  key_len   (8 bytes)
+  offset 16: value_ptr (8 bytes) - heap-owned, null-terminated, or 0 for null
+  offset 24: value_len (8 bytes)
+
+Dependencies:
+- memory/layout.runa
+- core/memory_core.runa
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant HS_OFF_ENTRIES as Integer is 0
+Constant HS_OFF_COUNT as Integer is 8
+Constant HS_OFF_CAPACITY as Integer is 16
+Constant HS_STRUCT_SIZE as Integer is 24
+
+Constant HSE_OFF_KEY as Integer is 0
+Constant HSE_OFF_KLEN as Integer is 8
+Constant HSE_OFF_VALUE as Integer is 16
+Constant HSE_OFF_VLEN as Integer is 24
+Constant HSE_STRUCT_SIZE as Integer is 32
+
+Constant HSTORE_OK as Integer is 1
+Constant HSTORE_ERR_INVALID as Integer is 0
+Constant HSTORE_NOT_FOUND as Integer is -1
+
+Constant HSTORE_DEFAULT_CAPACITY as Integer is 8
+
+Process called "hstore_create" returns Integer:
+    Let h be proc allocate from Memory with HS_STRUCT_SIZE
+    If h is equal to 0:
+        Return 0
+    End If
+    Let bytes be HSTORE_DEFAULT_CAPACITY multiplied by 8
+    Let entries be proc allocate from Memory with bytes
+    If entries is equal to 0:
+        proc deallocate from Memory with h
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with h, HS_OFF_ENTRIES, entries
+    proc memory_set_int64 from Mem with h, HS_OFF_COUNT, 0
+    proc memory_set_int64 from Mem with h, HS_OFF_CAPACITY, HSTORE_DEFAULT_CAPACITY
+    Return h
+End Process
+
+Process called "hstore_destroy" takes h as Integer returns Integer:
+    If h is equal to 0:
+        Return HSTORE_ERR_INVALID
+    End If
+    Let entries be proc memory_get_int64 from Mem with h, HS_OFF_ENTRIES
+    Let count be proc memory_get_int64 from Mem with h, HS_OFF_COUNT
+    Let i be 0
+    While i is less than count:
+        Let off be i multiplied by 8
+        Let e be proc memory_get_int64 from Mem with entries, off
+        If e is not equal to 0:
+            Let kp be proc memory_get_int64 from Mem with e, HSE_OFF_KEY
+            Let vp be proc memory_get_int64 from Mem with e, HSE_OFF_VALUE
+            If kp is not equal to 0:
+                proc deallocate from Memory with kp
+            End If
+            If vp is not equal to 0:
+                proc deallocate from Memory with vp
+            End If
+            proc deallocate from Memory with e
+        End If
+        Set i to i plus 1
+    End While
+    If entries is not equal to 0:
+        proc deallocate from Memory with entries
+    End If
+    proc deallocate from Memory with h
+    Return HSTORE_OK
+End Process
+
+Process called "hstore_key_compare" takes a_ptr as Integer, a_len as Integer, b_ptr as Integer, b_len as Integer returns Integer:
+    If a_len is not equal to b_len:
+        Return 1
+    End If
+    Let i be 0
+    While i is less than a_len:
+        Let av be proc memory_get_byte from Mem with a_ptr, i
+        Let bv be proc memory_get_byte from Mem with b_ptr, i
+        If av is not equal to bv:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "hstore_find_entry" takes h as Integer, key_ptr as Integer, key_len as Integer returns Integer:
+    Let entries be proc memory_get_int64 from Mem with h, HS_OFF_ENTRIES
+    Let count be proc memory_get_int64 from Mem with h, HS_OFF_COUNT
+    Let i be 0
+    While i is less than count:
+        Let off be i multiplied by 8
+        Let e be proc memory_get_int64 from Mem with entries, off
+        Let kp be proc memory_get_int64 from Mem with e, HSE_OFF_KEY
+        Let kl be proc memory_get_int64 from Mem with e, HSE_OFF_KLEN
+        Let cmp be proc hstore_key_compare with kp, kl, key_ptr, key_len
+        If cmp is equal to 0:
+            Return e
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "hstore_grow_if_needed" takes h as Integer returns Integer:
+    Let cap be proc memory_get_int64 from Mem with h, HS_OFF_CAPACITY
+    Let count be proc memory_get_int64 from Mem with h, HS_OFF_COUNT
+    If count is less than cap:
+        Return HSTORE_OK
+    End If
+    Let new_cap be cap multiplied by 2
+    Let new_bytes be new_cap multiplied by 8
+    Let new_entries be proc allocate from Memory with new_bytes
+    If new_entries is equal to 0:
+        Return HSTORE_ERR_INVALID
+    End If
+    Let old_entries be proc memory_get_int64 from Mem with h, HS_OFF_ENTRIES
+    Let copy_bytes be count multiplied by 8
+    proc memory_copy from Mem with new_entries, old_entries, copy_bytes
+    Let zero_bytes be new_bytes minus copy_bytes
+    If zero_bytes is greater than 0:
+        proc memory_zero from Mem with (new_entries plus copy_bytes), zero_bytes
+    End If
+    proc deallocate from Memory with old_entries
+    proc memory_set_int64 from Mem with h, HS_OFF_ENTRIES, new_entries
+    proc memory_set_int64 from Mem with h, HS_OFF_CAPACITY, new_cap
+    Return HSTORE_OK
+End Process
+
+Process called "hstore_copy_string" takes src as Integer, len as Integer returns Integer:
+    Let copy be proc allocate from Memory with (len plus 1)
+    If copy is equal to 0:
+        Return 0
+    End If
+    If src is not equal to 0:
+        If len is greater than 0:
+            proc memory_copy from Mem with copy, src, len
+        End If
+    End If
+    proc memory_set_byte from Mem with copy, len, 0
+    Return copy
+End Process
+
+@Reasoning
+Set a key->value mapping. If the key already exists its value is
+replaced (and the old value freed).
+@End Reasoning
+
+@Implementation
+Lookup, free old value if present, copy new value bytes, or insert new
+entry growing the array if needed.
+@End Implementation
+
+@Performance_Hints
+O(n) lookup. For very large hstores, use a hashtable instead.
+@End Performance_Hints
+
+@Security_Scope
+key and value bytes are copied into hstore-owned heap memory.
+@End Security_Scope
+
+Process called "hstore_set" takes h as Integer, key_ptr as Integer, key_len as Integer, value_ptr as Integer, value_len as Integer returns Integer:
+    If h is equal to 0:
+        Return HSTORE_ERR_INVALID
+    End If
+    If key_ptr is equal to 0:
+        Return HSTORE_ERR_INVALID
+    End If
+    If key_len is less than 0:
+        Return HSTORE_ERR_INVALID
+    End If
+
+    Let existing be proc hstore_find_entry with h, key_ptr, key_len
+    If existing is not equal to 0:
+        Let old_vp be proc memory_get_int64 from Mem with existing, HSE_OFF_VALUE
+        If old_vp is not equal to 0:
+            proc deallocate from Memory with old_vp
+        End If
+        Let new_vp be proc hstore_copy_string with value_ptr, value_len
+        proc memory_set_int64 from Mem with existing, HSE_OFF_VALUE, new_vp
+        proc memory_set_int64 from Mem with existing, HSE_OFF_VLEN, value_len
+        Return HSTORE_OK
+    End If
+
+    Let grow_rc be proc hstore_grow_if_needed with h
+    If grow_rc is not equal to HSTORE_OK:
+        Return HSTORE_ERR_INVALID
+    End If
+
+    Let entry be proc allocate from Memory with HSE_STRUCT_SIZE
+    If entry is equal to 0:
+        Return HSTORE_ERR_INVALID
+    End If
+    Let key_copy be proc hstore_copy_string with key_ptr, key_len
+    If key_copy is equal to 0:
+        proc deallocate from Memory with entry
+        Return HSTORE_ERR_INVALID
+    End If
+    Let val_copy be proc hstore_copy_string with value_ptr, value_len
+    proc memory_set_int64 from Mem with entry, HSE_OFF_KEY, key_copy
+    proc memory_set_int64 from Mem with entry, HSE_OFF_KLEN, key_len
+    proc memory_set_int64 from Mem with entry, HSE_OFF_VALUE, val_copy
+    proc memory_set_int64 from Mem with entry, HSE_OFF_VLEN, value_len
+
+    Let entries be proc memory_get_int64 from Mem with h, HS_OFF_ENTRIES
+    Let count be proc memory_get_int64 from Mem with h, HS_OFF_COUNT
+    Let off be count multiplied by 8
+    proc memory_set_int64 from Mem with entries, off, entry
+    proc memory_set_int64 from Mem with h, HS_OFF_COUNT, (count plus 1)
+    Return HSTORE_OK
+End Process
+
+Process called "hstore_get" takes h as Integer, key_ptr as Integer, key_len as Integer, out_value_ptr_holder as Integer, out_value_len_holder as Integer returns Integer:
+    If h is equal to 0:
+        Return HSTORE_NOT_FOUND
+    End If
+    Let entry be proc hstore_find_entry with h, key_ptr, key_len
+    If entry is equal to 0:
+        If out_value_ptr_holder is not equal to 0:
+            proc memory_set_int64 from Mem with out_value_ptr_holder, 0, 0
+        End If
+        If out_value_len_holder is not equal to 0:
+            proc memory_set_int64 from Mem with out_value_len_holder, 0, 0
+        End If
+        Return HSTORE_NOT_FOUND
+    End If
+    Let vp be proc memory_get_int64 from Mem with entry, HSE_OFF_VALUE
+    Let vl be proc memory_get_int64 from Mem with entry, HSE_OFF_VLEN
+    If out_value_ptr_holder is not equal to 0:
+        proc memory_set_int64 from Mem with out_value_ptr_holder, 0, vp
+    End If
+    If out_value_len_holder is not equal to 0:
+        proc memory_set_int64 from Mem with out_value_len_holder, 0, vl
+    End If
+    Return HSTORE_OK
+End Process
+
+Process called "hstore_has_key" takes h as Integer, key_ptr as Integer, key_len as Integer returns Integer:
+    If h is equal to 0:
+        Return 0
+    End If
+    Let entry be proc hstore_find_entry with h, key_ptr, key_len
+    If entry is not equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "hstore_delete" takes h as Integer, key_ptr as Integer, key_len as Integer returns Integer:
+    If h is equal to 0:
+        Return HSTORE_ERR_INVALID
+    End If
+    Let entries be proc memory_get_int64 from Mem with h, HS_OFF_ENTRIES
+    Let count be proc memory_get_int64 from Mem with h, HS_OFF_COUNT
+    Let i be 0
+    While i is less than count:
+        Let off be i multiplied by 8
+        Let e be proc memory_get_int64 from Mem with entries, off
+        Let kp be proc memory_get_int64 from Mem with e, HSE_OFF_KEY
+        Let kl be proc memory_get_int64 from Mem with e, HSE_OFF_KLEN
+        Let cmp be proc hstore_key_compare with kp, kl, key_ptr, key_len
+        If cmp is equal to 0:
+            Note: Free the entry's owned strings
+            If kp is not equal to 0:
+                proc deallocate from Memory with kp
+            End If
+            Let vp be proc memory_get_int64 from Mem with e, HSE_OFF_VALUE
+            If vp is not equal to 0:
+                proc deallocate from Memory with vp
+            End If
+            proc deallocate from Memory with e
+
+            Note: Shift remaining entries left by one
+            Let j be i
+            While j is less than (count minus 1):
+                Let from_off be (j plus 1) multiplied by 8
+                Let to_off be j multiplied by 8
+                Let next_e be proc memory_get_int64 from Mem with entries, from_off
+                proc memory_set_int64 from Mem with entries, to_off, next_e
+                Set j to j plus 1
+            End While
+            Let last_off be (count minus 1) multiplied by 8
+            proc memory_set_int64 from Mem with entries, last_off, 0
+            proc memory_set_int64 from Mem with h, HS_OFF_COUNT, (count minus 1)
+            Return HSTORE_OK
+        End If
+        Set i to i plus 1
+    End While
+    Return HSTORE_NOT_FOUND
+End Process
+
+@Reasoning
+Merge other's entries into self. Other's values overwrite self's.
+@End Reasoning
+
+@Implementation
+Walk other's entries; for each call hstore_set.
+@End Implementation
+
+@Performance_Hints
+O(other_count * (self_count + 1)).
+@End Performance_Hints
+
+@Security_Scope
+Entries from other are copied (not aliased).
+@End Security_Scope
+
+Process called "hstore_merge" takes self as Integer, other as Integer returns Integer:
+    If self is equal to 0:
+        Return HSTORE_ERR_INVALID
+    End If
+    If other is equal to 0:
+        Return HSTORE_OK
+    End If
+    Let entries be proc memory_get_int64 from Mem with other, HS_OFF_ENTRIES
+    Let count be proc memory_get_int64 from Mem with other, HS_OFF_COUNT
+    Let i be 0
+    While i is less than count:
+        Let off be i multiplied by 8
+        Let e be proc memory_get_int64 from Mem with entries, off
+        If e is not equal to 0:
+            Let kp be proc memory_get_int64 from Mem with e, HSE_OFF_KEY
+            Let kl be proc memory_get_int64 from Mem with e, HSE_OFF_KLEN
+            Let vp be proc memory_get_int64 from Mem with e, HSE_OFF_VALUE
+            Let vl be proc memory_get_int64 from Mem with e, HSE_OFF_VLEN
+            proc hstore_set with self, kp, kl, vp, vl
+        End If
+        Set i to i plus 1
+    End While
+    Return HSTORE_OK
+End Process
+
+Process called "hstore_count" takes h as Integer returns Integer:
+    If h is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with h, HS_OFF_COUNT
+End Process
+
+Process called "hstore_iterate_get_entry" takes h as Integer, index as Integer returns Integer:
+    If h is equal to 0:
+        Return 0
+    End If
+    Let count be proc memory_get_int64 from Mem with h, HS_OFF_COUNT
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Let entries be proc memory_get_int64 from Mem with h, HS_OFF_ENTRIES
+    Let off be index multiplied by 8
+    Return proc memory_get_int64 from Mem with entries, off
+End Process
+
+Process called "hstore_entry_key" takes entry as Integer returns Integer:
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with entry, HSE_OFF_KEY
+End Process
+
+Process called "hstore_entry_key_len" takes entry as Integer returns Integer:
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with entry, HSE_OFF_KLEN
+End Process
+
+Process called "hstore_entry_value" takes entry as Integer returns Integer:
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with entry, HSE_OFF_VALUE
+End Process
+
+Process called "hstore_entry_value_len" takes entry as Integer returns Integer:
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with entry, HSE_OFF_VLEN
+End Process

@@ -1,0 +1,810 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+BACK_PRESSURE - Reactive Streams 1.0 compatible back-pressure
+primitives.
+
+Three core types:
+  BoundedBuffer  - mutex+condvar protected ring buffer optimised for
+                   streaming (producer blocks when full, consumer blocks
+                   when empty).
+  Publisher      - exposes a subscribe(subscriber) operation; tracks all
+                   active subscriptions.
+  Subscriber     - receives onNext/onComplete/onError callbacks driven
+                   by demand expressed via Subscription.request(n).
+  Subscription   - per-(publisher, subscriber) demand counter; cancel
+                   marks the subscription stopped.
+
+BoundedBuffer layout (72 bytes):
+  offset 0:  mutex_ptr        (8 bytes)
+  offset 8:  not_full_cv      (8 bytes)
+  offset 16: not_empty_cv     (8 bytes)
+  offset 24: buffer_ptr       (8 bytes) - ring of 8-byte slots
+  offset 32: capacity         (8 bytes)
+  offset 40: head             (8 bytes) - next read index
+  offset 48: tail             (8 bytes) - next write index
+  offset 56: count            (8 bytes) - number of buffered elements
+  offset 64: closed_flag      (8 bytes) - 1 once buffer is closed
+
+Publisher layout (40 bytes):
+  offset 0:  mutex_ptr        (8 bytes)
+  offset 8:  subscriptions    (8 bytes) - linked list head
+  offset 16: source_fn        (8 bytes) - Process pointer; pull-mode source
+  offset 24: source_state     (8 bytes) - opaque user state
+  offset 32: subscription_count (8 bytes)
+
+Subscriber layout (32 bytes):
+  offset 0:  on_next_fn       (8 bytes) - (subscriber_state, value) -> Integer
+  offset 8:  on_complete_fn   (8 bytes) - (subscriber_state) -> Integer
+  offset 16: on_error_fn      (8 bytes) - (subscriber_state, error) -> Integer
+  offset 24: state_ptr        (8 bytes)
+
+Subscription layout (48 bytes):
+  offset 0:  publisher        (8 bytes)
+  offset 8:  subscriber       (8 bytes)
+  offset 16: pending_demand   (8 bytes)
+  offset 24: cancelled_flag   (8 bytes)
+  offset 32: mutex_ptr        (8 bytes)
+  offset 40: next             (8 bytes) - publisher's linked-list pointer
+
+Dependencies:
+- threading/sync_core.runa
+- memory/layout.runa
+- core/memory_core.runa
+- streams/stream.runa (for adapter into pull stream)
+:End Note
+
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/streams/stream.runa" as Stream
+
+Note: BoundedBuffer constants
+Constant BB_OFF_MUTEX as Integer is 0
+Constant BB_OFF_NOT_FULL as Integer is 8
+Constant BB_OFF_NOT_EMPTY as Integer is 16
+Constant BB_OFF_BUFFER as Integer is 24
+Constant BB_OFF_CAPACITY as Integer is 32
+Constant BB_OFF_HEAD as Integer is 40
+Constant BB_OFF_TAIL as Integer is 48
+Constant BB_OFF_COUNT as Integer is 56
+Constant BB_OFF_CLOSED as Integer is 64
+Constant BB_STRUCT_SIZE as Integer is 72
+
+Constant BB_OK as Integer is 1
+Constant BB_ERR_INVALID as Integer is 0
+Constant BB_ERR_CLOSED as Integer is -1
+Constant BB_ERR_FULL as Integer is -2
+Constant BB_ERR_EMPTY as Integer is -3
+
+Note: Publisher / Subscriber / Subscription constants
+Constant PUB_OFF_MUTEX as Integer is 0
+Constant PUB_OFF_SUBS as Integer is 8
+Constant PUB_OFF_SOURCE_FN as Integer is 16
+Constant PUB_OFF_SOURCE_STATE as Integer is 24
+Constant PUB_OFF_COUNT as Integer is 32
+Constant PUB_STRUCT_SIZE as Integer is 40
+
+Constant SUB_OFF_ON_NEXT as Integer is 0
+Constant SUB_OFF_ON_COMPLETE as Integer is 8
+Constant SUB_OFF_ON_ERROR as Integer is 16
+Constant SUB_OFF_STATE as Integer is 24
+Constant SUB_STRUCT_SIZE as Integer is 32
+
+Constant SUBN_OFF_PUB as Integer is 0
+Constant SUBN_OFF_SUBR as Integer is 8
+Constant SUBN_OFF_DEMAND as Integer is 16
+Constant SUBN_OFF_CANCELLED as Integer is 24
+Constant SUBN_OFF_MUTEX as Integer is 32
+Constant SUBN_OFF_NEXT as Integer is 40
+Constant SUBN_STRUCT_SIZE as Integer is 48
+
+Constant SUBN_OK as Integer is 1
+Constant SUBN_ERR_INVALID as Integer is 0
+Constant SUBN_ERR_CANCELLED as Integer is -1
+Constant SUBN_ERR_NO_DEMAND as Integer is -2
+
+Constant SOURCE_OK as Integer is 1
+Constant SOURCE_COMPLETE as Integer is 0
+Constant SOURCE_ERROR as Integer is -1
+
+Note: ============================================================================
+Note: Indirect-call shims — real x86_64 indirect dispatch via inline assembly.
+Note: ============================================================================
+
+Process called "bp_runtime_call_indirect_2" takes fn as Integer, a as Integer, b as Integer returns Integer:
+    Note: fn at [rbp-8], a at [rbp-16], b at [rbp-24], result at [rbp-32].
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        mov rax, qword ptr [rbp-8]
+        mov rdi, qword ptr [rbp-16]
+        mov rsi, qword ptr [rbp-24]
+        call rax
+        mov qword ptr [rbp-32], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "bp_runtime_call_indirect_1" takes fn as Integer, a as Integer returns Integer:
+    Note: fn at [rbp-8], a at [rbp-16], result at [rbp-24].
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        mov rax, qword ptr [rbp-8]
+        mov rdi, qword ptr [rbp-16]
+        call rax
+        mov qword ptr [rbp-24], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Note: ============================================================================
+Note: BoundedBuffer
+Note: ============================================================================
+
+@Reasoning
+A BoundedBuffer is a ring buffer optimised for streaming: producers
+block on not_full while the buffer is at capacity, consumers block on
+not_empty while it is empty. It is similar to channel.runa but holds a
+contiguous buffer rather than a linked list, which keeps cache locality
+high in steady state.
+@End Reasoning
+
+@Implementation
+Allocate the 72-byte record, allocate the ring (capacity * 8 bytes),
+create one mutex and two condvars. Initialise indices to zero.
+@End Implementation
+
+@Performance_Hints
+Each enqueue/dequeue pays one mutex acquire. condvar signalling is
+issued only when transitioning across the empty/full boundaries.
+@End Performance_Hints
+
+@Security_Scope
+Heap-owned; close() prevents further writes but allows the consumer to
+drain remaining items.
+@End Security_Scope
+
+Process called "bounded_buffer_create" takes capacity as Integer returns Integer:
+    If capacity is less than or equal to 0:
+        Return 0
+    End If
+    Let b be proc allocate from Memory with BB_STRUCT_SIZE
+    If b is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc mutex_create from Sync
+    If mtx is equal to 0:
+        proc deallocate from Memory with b
+        Return 0
+    End If
+    Let cv_full be proc condvar_create from Sync
+    If cv_full is equal to 0:
+        proc mutex_destroy from Sync with mtx
+        proc deallocate from Memory with b
+        Return 0
+    End If
+    Let cv_empty be proc condvar_create from Sync
+    If cv_empty is equal to 0:
+        proc condvar_destroy from Sync with cv_full
+        proc mutex_destroy from Sync with mtx
+        proc deallocate from Memory with b
+        Return 0
+    End If
+    Let buf_bytes be capacity multiplied by 8
+    Let buf be proc allocate from Memory with buf_bytes
+    If buf is equal to 0:
+        proc condvar_destroy from Sync with cv_empty
+        proc condvar_destroy from Sync with cv_full
+        proc mutex_destroy from Sync with mtx
+        proc deallocate from Memory with b
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with b, BB_OFF_MUTEX, mtx
+    proc memory_set_int64 from Mem with b, BB_OFF_NOT_FULL, cv_full
+    proc memory_set_int64 from Mem with b, BB_OFF_NOT_EMPTY, cv_empty
+    proc memory_set_int64 from Mem with b, BB_OFF_BUFFER, buf
+    proc memory_set_int64 from Mem with b, BB_OFF_CAPACITY, capacity
+    proc memory_set_int64 from Mem with b, BB_OFF_HEAD, 0
+    proc memory_set_int64 from Mem with b, BB_OFF_TAIL, 0
+    proc memory_set_int64 from Mem with b, BB_OFF_COUNT, 0
+    proc memory_set_int64 from Mem with b, BB_OFF_CLOSED, 0
+    Return b
+End Process
+
+Process called "bounded_buffer_destroy" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return BB_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with b, BB_OFF_MUTEX
+    Let cv_full be proc memory_get_int64 from Mem with b, BB_OFF_NOT_FULL
+    Let cv_empty be proc memory_get_int64 from Mem with b, BB_OFF_NOT_EMPTY
+    Let buf be proc memory_get_int64 from Mem with b, BB_OFF_BUFFER
+    If buf is not equal to 0:
+        proc deallocate from Memory with buf
+    End If
+    If cv_full is not equal to 0:
+        proc condvar_destroy from Sync with cv_full
+    End If
+    If cv_empty is not equal to 0:
+        proc condvar_destroy from Sync with cv_empty
+    End If
+    If mtx is not equal to 0:
+        proc mutex_destroy from Sync with mtx
+    End If
+    proc deallocate from Memory with b
+    Return BB_OK
+End Process
+
+Process called "bounded_buffer_capacity" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with b, BB_OFF_CAPACITY
+End Process
+
+Process called "bounded_buffer_count" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc memory_get_int64 from Mem with b, BB_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let c be proc memory_get_int64 from Mem with b, BB_OFF_COUNT
+    proc mutex_unlock from Sync with mtx
+    Return c
+End Process
+
+Process called "bounded_buffer_is_closed" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 1
+    End If
+    Return proc memory_get_int64 from Mem with b, BB_OFF_CLOSED
+End Process
+
+@Reasoning
+push blocks the calling thread until there is room in the buffer or it
+has been closed.
+@End Reasoning
+
+@Implementation
+Acquire mutex; while count == capacity and not closed, wait on
+not_full. On closure return BB_ERR_CLOSED. Otherwise store the value
+at tail, advance tail mod capacity, increment count, signal not_empty
+and release.
+@End Implementation
+
+@Performance_Hints
+One mutex acquire; at most one condvar signal per push.
+@End Performance_Hints
+
+@Security_Scope
+Concurrent push from multiple producers is safe (they serialise on the
+mutex).
+@End Security_Scope
+
+Process called "bounded_buffer_push" takes b as Integer, value as Integer returns Integer:
+    If b is equal to 0:
+        Return BB_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with b, BB_OFF_MUTEX
+    Let cv_full be proc memory_get_int64 from Mem with b, BB_OFF_NOT_FULL
+    Let cv_empty be proc memory_get_int64 from Mem with b, BB_OFF_NOT_EMPTY
+    proc mutex_lock from Sync with mtx
+    While 1 is equal to 1:
+        Let closed be proc memory_get_int64 from Mem with b, BB_OFF_CLOSED
+        If closed is equal to 1:
+            proc mutex_unlock from Sync with mtx
+            Return BB_ERR_CLOSED
+        End If
+        Let count be proc memory_get_int64 from Mem with b, BB_OFF_COUNT
+        Let capacity be proc memory_get_int64 from Mem with b, BB_OFF_CAPACITY
+        If count is less than capacity:
+            Let tail be proc memory_get_int64 from Mem with b, BB_OFF_TAIL
+            Let buf be proc memory_get_int64 from Mem with b, BB_OFF_BUFFER
+            Let off be tail multiplied by 8
+            proc memory_set_int64 from Mem with buf, off, value
+            Let new_tail be tail plus 1
+            If new_tail is greater than or equal to capacity:
+                Set new_tail to 0
+            End If
+            proc memory_set_int64 from Mem with b, BB_OFF_TAIL, new_tail
+            proc memory_set_int64 from Mem with b, BB_OFF_COUNT, (count plus 1)
+            proc condvar_signal from Sync with cv_empty
+            proc mutex_unlock from Sync with mtx
+            Return BB_OK
+        End If
+        proc condvar_wait from Sync with cv_full, mtx
+    End While
+    proc mutex_unlock from Sync with mtx
+    Return BB_ERR_INVALID
+End Process
+
+Process called "bounded_buffer_try_push" takes b as Integer, value as Integer returns Integer:
+    If b is equal to 0:
+        Return BB_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with b, BB_OFF_MUTEX
+    Let cv_empty be proc memory_get_int64 from Mem with b, BB_OFF_NOT_EMPTY
+    proc mutex_lock from Sync with mtx
+    Let closed be proc memory_get_int64 from Mem with b, BB_OFF_CLOSED
+    If closed is equal to 1:
+        proc mutex_unlock from Sync with mtx
+        Return BB_ERR_CLOSED
+    End If
+    Let count be proc memory_get_int64 from Mem with b, BB_OFF_COUNT
+    Let capacity be proc memory_get_int64 from Mem with b, BB_OFF_CAPACITY
+    If count is greater than or equal to capacity:
+        proc mutex_unlock from Sync with mtx
+        Return BB_ERR_FULL
+    End If
+    Let tail be proc memory_get_int64 from Mem with b, BB_OFF_TAIL
+    Let buf be proc memory_get_int64 from Mem with b, BB_OFF_BUFFER
+    Let off be tail multiplied by 8
+    proc memory_set_int64 from Mem with buf, off, value
+    Let new_tail be tail plus 1
+    If new_tail is greater than or equal to capacity:
+        Set new_tail to 0
+    End If
+    proc memory_set_int64 from Mem with b, BB_OFF_TAIL, new_tail
+    proc memory_set_int64 from Mem with b, BB_OFF_COUNT, (count plus 1)
+    proc condvar_signal from Sync with cv_empty
+    proc mutex_unlock from Sync with mtx
+    Return BB_OK
+End Process
+
+@Reasoning
+pop blocks until at least one element is available or the buffer is
+closed AND empty.
+@End Reasoning
+
+@Implementation
+Acquire mutex; while count == 0 and not closed, wait on not_empty.
+When closed and empty, return BB_ERR_CLOSED. Otherwise read at head,
+advance head mod capacity, decrement count, signal not_full and release.
+@End Implementation
+
+@Performance_Hints
+One mutex acquire; at most one condvar signal per pop.
+@End Performance_Hints
+
+@Security_Scope
+Concurrent pops are safe.
+@End Security_Scope
+
+Process called "bounded_buffer_pop" takes b as Integer, out_holder as Integer returns Integer:
+    If b is equal to 0:
+        Return BB_ERR_INVALID
+    End If
+    If out_holder is equal to 0:
+        Return BB_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with b, BB_OFF_MUTEX
+    Let cv_full be proc memory_get_int64 from Mem with b, BB_OFF_NOT_FULL
+    Let cv_empty be proc memory_get_int64 from Mem with b, BB_OFF_NOT_EMPTY
+    proc mutex_lock from Sync with mtx
+    While 1 is equal to 1:
+        Let count be proc memory_get_int64 from Mem with b, BB_OFF_COUNT
+        If count is greater than 0:
+            Let head be proc memory_get_int64 from Mem with b, BB_OFF_HEAD
+            Let buf be proc memory_get_int64 from Mem with b, BB_OFF_BUFFER
+            Let off be head multiplied by 8
+            Let value be proc memory_get_int64 from Mem with buf, off
+            Let capacity be proc memory_get_int64 from Mem with b, BB_OFF_CAPACITY
+            Let new_head be head plus 1
+            If new_head is greater than or equal to capacity:
+                Set new_head to 0
+            End If
+            proc memory_set_int64 from Mem with b, BB_OFF_HEAD, new_head
+            proc memory_set_int64 from Mem with b, BB_OFF_COUNT, (count minus 1)
+            proc memory_set_int64 from Mem with out_holder, 0, value
+            proc condvar_signal from Sync with cv_full
+            proc mutex_unlock from Sync with mtx
+            Return BB_OK
+        End If
+        Let closed be proc memory_get_int64 from Mem with b, BB_OFF_CLOSED
+        If closed is equal to 1:
+            proc mutex_unlock from Sync with mtx
+            Return BB_ERR_CLOSED
+        End If
+        proc condvar_wait from Sync with cv_empty, mtx
+    End While
+    proc mutex_unlock from Sync with mtx
+    Return BB_ERR_INVALID
+End Process
+
+Process called "bounded_buffer_try_pop" takes b as Integer, out_holder as Integer returns Integer:
+    If b is equal to 0:
+        Return BB_ERR_INVALID
+    End If
+    If out_holder is equal to 0:
+        Return BB_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with b, BB_OFF_MUTEX
+    Let cv_full be proc memory_get_int64 from Mem with b, BB_OFF_NOT_FULL
+    proc mutex_lock from Sync with mtx
+    Let count be proc memory_get_int64 from Mem with b, BB_OFF_COUNT
+    If count is equal to 0:
+        Let closed be proc memory_get_int64 from Mem with b, BB_OFF_CLOSED
+        proc mutex_unlock from Sync with mtx
+        If closed is equal to 1:
+            Return BB_ERR_CLOSED
+        End If
+        Return BB_ERR_EMPTY
+    End If
+    Let head be proc memory_get_int64 from Mem with b, BB_OFF_HEAD
+    Let buf be proc memory_get_int64 from Mem with b, BB_OFF_BUFFER
+    Let off be head multiplied by 8
+    Let value be proc memory_get_int64 from Mem with buf, off
+    Let capacity be proc memory_get_int64 from Mem with b, BB_OFF_CAPACITY
+    Let new_head be head plus 1
+    If new_head is greater than or equal to capacity:
+        Set new_head to 0
+    End If
+    proc memory_set_int64 from Mem with b, BB_OFF_HEAD, new_head
+    proc memory_set_int64 from Mem with b, BB_OFF_COUNT, (count minus 1)
+    proc memory_set_int64 from Mem with out_holder, 0, value
+    proc condvar_signal from Sync with cv_full
+    proc mutex_unlock from Sync with mtx
+    Return BB_OK
+End Process
+
+Process called "bounded_buffer_close" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return BB_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with b, BB_OFF_MUTEX
+    Let cv_full be proc memory_get_int64 from Mem with b, BB_OFF_NOT_FULL
+    Let cv_empty be proc memory_get_int64 from Mem with b, BB_OFF_NOT_EMPTY
+    proc mutex_lock from Sync with mtx
+    proc memory_set_int64 from Mem with b, BB_OFF_CLOSED, 1
+    proc condvar_broadcast from Sync with cv_full
+    proc condvar_broadcast from Sync with cv_empty
+    proc mutex_unlock from Sync with mtx
+    Return BB_OK
+End Process
+
+Note: ============================================================================
+Note: Publisher / Subscriber / Subscription
+Note: ============================================================================
+
+@Reasoning
+Publisher is the source side of a Reactive Streams pipeline. It holds a
+pull-mode source function (state, out_holder) -> Integer; this matches
+the stream.runa next-fn protocol. The publisher maintains a linked
+list of Subscriptions to broadcast onNext/onComplete/onError.
+@End Reasoning
+
+@Implementation
+Allocate 40 bytes, create a mutex protecting the subscription list,
+zero the head pointer.
+@End Implementation
+
+@Performance_Hints
+One allocation + one mutex_create per publisher.
+@End Performance_Hints
+
+@Security_Scope
+Caller owns the source function and state. The publisher does not free
+state when destroyed; callers should release it explicitly.
+@End Security_Scope
+
+Process called "publisher_create" takes source_fn as Integer, source_state as Integer returns Integer:
+    Let p be proc allocate from Memory with PUB_STRUCT_SIZE
+    If p is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc mutex_create from Sync
+    If mtx is equal to 0:
+        proc deallocate from Memory with p
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with p, PUB_OFF_MUTEX, mtx
+    proc memory_set_int64 from Mem with p, PUB_OFF_SUBS, 0
+    proc memory_set_int64 from Mem with p, PUB_OFF_SOURCE_FN, source_fn
+    proc memory_set_int64 from Mem with p, PUB_OFF_SOURCE_STATE, source_state
+    proc memory_set_int64 from Mem with p, PUB_OFF_COUNT, 0
+    Return p
+End Process
+
+Process called "publisher_destroy" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return SUBN_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with p, PUB_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let head be proc memory_get_int64 from Mem with p, PUB_OFF_SUBS
+    While head is not equal to 0:
+        Let next_n be proc memory_get_int64 from Mem with head, SUBN_OFF_NEXT
+        Let sub_mtx be proc memory_get_int64 from Mem with head, SUBN_OFF_MUTEX
+        If sub_mtx is not equal to 0:
+            proc mutex_destroy from Sync with sub_mtx
+        End If
+        proc deallocate from Memory with head
+        Set head to next_n
+    End While
+    proc memory_set_int64 from Mem with p, PUB_OFF_SUBS, 0
+    proc mutex_unlock from Sync with mtx
+    proc mutex_destroy from Sync with mtx
+    proc deallocate from Memory with p
+    Return SUBN_OK
+End Process
+
+Process called "publisher_subscription_count" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc memory_get_int64 from Mem with p, PUB_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let n be proc memory_get_int64 from Mem with p, PUB_OFF_COUNT
+    proc mutex_unlock from Sync with mtx
+    Return n
+End Process
+
+Process called "subscriber_create" takes on_next_fn as Integer, on_complete_fn as Integer, on_error_fn as Integer, state_ptr as Integer returns Integer:
+    Let s be proc allocate from Memory with SUB_STRUCT_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with s, SUB_OFF_ON_NEXT, on_next_fn
+    proc memory_set_int64 from Mem with s, SUB_OFF_ON_COMPLETE, on_complete_fn
+    proc memory_set_int64 from Mem with s, SUB_OFF_ON_ERROR, on_error_fn
+    proc memory_set_int64 from Mem with s, SUB_OFF_STATE, state_ptr
+    Return s
+End Process
+
+Process called "subscriber_destroy" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return SUBN_ERR_INVALID
+    End If
+    proc deallocate from Memory with s
+    Return SUBN_OK
+End Process
+
+@Reasoning
+subscribe links a subscriber to a publisher and returns a Subscription
+the consumer uses to express demand. The publisher pushes the new node
+to the head of its subscription list.
+@End Reasoning
+
+@Implementation
+Allocate a Subscription record with its own mutex, store publisher and
+subscriber pointers, initialise demand to zero, splice into the
+publisher's list.
+@End Implementation
+
+@Performance_Hints
+One allocation + one mutex_create per subscribe call.
+@End Performance_Hints
+
+@Security_Scope
+The returned subscription is owned by the publisher's destroy; do not
+free it manually.
+@End Security_Scope
+
+Process called "publisher_subscribe" takes publisher as Integer, subscriber as Integer returns Integer:
+    If publisher is equal to 0:
+        Return 0
+    End If
+    If subscriber is equal to 0:
+        Return 0
+    End If
+    Let subn be proc allocate from Memory with SUBN_STRUCT_SIZE
+    If subn is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc mutex_create from Sync
+    If mtx is equal to 0:
+        proc deallocate from Memory with subn
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with subn, SUBN_OFF_PUB, publisher
+    proc memory_set_int64 from Mem with subn, SUBN_OFF_SUBR, subscriber
+    proc memory_set_int64 from Mem with subn, SUBN_OFF_DEMAND, 0
+    proc memory_set_int64 from Mem with subn, SUBN_OFF_CANCELLED, 0
+    proc memory_set_int64 from Mem with subn, SUBN_OFF_MUTEX, mtx
+    Let pmtx be proc memory_get_int64 from Mem with publisher, PUB_OFF_MUTEX
+    proc mutex_lock from Sync with pmtx
+    Let head be proc memory_get_int64 from Mem with publisher, PUB_OFF_SUBS
+    proc memory_set_int64 from Mem with subn, SUBN_OFF_NEXT, head
+    proc memory_set_int64 from Mem with publisher, PUB_OFF_SUBS, subn
+    Let cnt be proc memory_get_int64 from Mem with publisher, PUB_OFF_COUNT
+    proc memory_set_int64 from Mem with publisher, PUB_OFF_COUNT, (cnt plus 1)
+    proc mutex_unlock from Sync with pmtx
+    Return subn
+End Process
+
+Process called "subscription_pending_demand" takes subn as Integer returns Integer:
+    If subn is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc memory_get_int64 from Mem with subn, SUBN_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let d be proc memory_get_int64 from Mem with subn, SUBN_OFF_DEMAND
+    proc mutex_unlock from Sync with mtx
+    Return d
+End Process
+
+Process called "subscription_is_cancelled" takes subn as Integer returns Integer:
+    If subn is equal to 0:
+        Return 1
+    End If
+    Let mtx be proc memory_get_int64 from Mem with subn, SUBN_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let c be proc memory_get_int64 from Mem with subn, SUBN_OFF_CANCELLED
+    proc mutex_unlock from Sync with mtx
+    Return c
+End Process
+
+Process called "subscription_cancel" takes subn as Integer returns Integer:
+    If subn is equal to 0:
+        Return SUBN_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with subn, SUBN_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    proc memory_set_int64 from Mem with subn, SUBN_OFF_CANCELLED, 1
+    proc memory_set_int64 from Mem with subn, SUBN_OFF_DEMAND, 0
+    proc mutex_unlock from Sync with mtx
+    Return SUBN_OK
+End Process
+
+@Reasoning
+subscription_request expresses demand: the consumer is ready to receive
+up to n additional onNext callbacks. The publisher fulfils outstanding
+demand by pulling from its source until either demand or source is
+exhausted.
+@End Reasoning
+
+@Implementation
+Add n to pending_demand under the subscription mutex. Then attempt to
+drain demand: while demand > 0 and source has data, pull a value via
+the indirect shim, dispatch on_next to the subscriber, decrement demand.
+On source completion deliver on_complete and cancel the subscription.
+On source error deliver on_error and cancel.
+@End Implementation
+
+@Performance_Hints
+Demand drain is single-threaded per subscription, so the inner loop is
+lock-free past the initial demand update.
+@End Performance_Hints
+
+@Security_Scope
+The source function must be safe to call from the requesting thread.
+@End Security_Scope
+
+Process called "subscription_request" takes subn as Integer, n as Integer returns Integer:
+    If subn is equal to 0:
+        Return SUBN_ERR_INVALID
+    End If
+    If n is less than or equal to 0:
+        Return SUBN_OK
+    End If
+    Let sub_mtx be proc memory_get_int64 from Mem with subn, SUBN_OFF_MUTEX
+    proc mutex_lock from Sync with sub_mtx
+    Let cancelled be proc memory_get_int64 from Mem with subn, SUBN_OFF_CANCELLED
+    If cancelled is equal to 1:
+        proc mutex_unlock from Sync with sub_mtx
+        Return SUBN_ERR_CANCELLED
+    End If
+    Let prior_demand be proc memory_get_int64 from Mem with subn, SUBN_OFF_DEMAND
+    proc memory_set_int64 from Mem with subn, SUBN_OFF_DEMAND, (prior_demand plus n)
+    proc mutex_unlock from Sync with sub_mtx
+
+    Let publisher be proc memory_get_int64 from Mem with subn, SUBN_OFF_PUB
+    Let subscriber be proc memory_get_int64 from Mem with subn, SUBN_OFF_SUBR
+    Let source_fn be proc memory_get_int64 from Mem with publisher, PUB_OFF_SOURCE_FN
+    Let source_state be proc memory_get_int64 from Mem with publisher, PUB_OFF_SOURCE_STATE
+    Let on_next be proc memory_get_int64 from Mem with subscriber, SUB_OFF_ON_NEXT
+    Let on_complete be proc memory_get_int64 from Mem with subscriber, SUB_OFF_ON_COMPLETE
+    Let on_error be proc memory_get_int64 from Mem with subscriber, SUB_OFF_ON_ERROR
+    Let subscriber_state be proc memory_get_int64 from Mem with subscriber, SUB_OFF_STATE
+
+    Let scratch be proc allocate from Memory with 8
+    If scratch is equal to 0:
+        Return SUBN_ERR_INVALID
+    End If
+
+    While 1 is equal to 1:
+        proc mutex_lock from Sync with sub_mtx
+        Let demand be proc memory_get_int64 from Mem with subn, SUBN_OFF_DEMAND
+        Let cancel_check be proc memory_get_int64 from Mem with subn, SUBN_OFF_CANCELLED
+        If demand is less than or equal to 0:
+            proc mutex_unlock from Sync with sub_mtx
+            proc deallocate from Memory with scratch
+            Return SUBN_OK
+        End If
+        If cancel_check is equal to 1:
+            proc mutex_unlock from Sync with sub_mtx
+            proc deallocate from Memory with scratch
+            Return SUBN_ERR_CANCELLED
+        End If
+        proc memory_set_int64 from Mem with subn, SUBN_OFF_DEMAND, (demand minus 1)
+        proc mutex_unlock from Sync with sub_mtx
+
+        Let rc be proc bp_runtime_call_indirect_2 with source_fn, source_state, scratch
+        If rc is equal to SOURCE_OK:
+            Let v be proc memory_get_int64 from Mem with scratch, 0
+            If on_next is not equal to 0:
+                proc bp_runtime_call_indirect_2 with on_next, subscriber_state, v
+            End If
+        End If
+        If rc is equal to SOURCE_COMPLETE:
+            If on_complete is not equal to 0:
+                proc bp_runtime_call_indirect_1 with on_complete, subscriber_state
+            End If
+            proc subscription_cancel with subn
+            proc deallocate from Memory with scratch
+            Return SUBN_OK
+        End If
+        If rc is equal to SOURCE_ERROR:
+            If on_error is not equal to 0:
+                proc bp_runtime_call_indirect_2 with on_error, subscriber_state, rc
+            End If
+            proc subscription_cancel with subn
+            proc deallocate from Memory with scratch
+            Return SUBN_ERR_CANCELLED
+        End If
+    End While
+    proc deallocate from Memory with scratch
+    Return SUBN_OK
+End Process
+
+Note: ============================================================================
+Note: BoundedBuffer-as-Stream adapter
+Note: ============================================================================
+
+@Reasoning
+Expose a BoundedBuffer as a pull Stream so existing stream transformers
+can drain it without reimplementing back-pressure logic.
+@End Reasoning
+
+@Implementation
+The next-fn calls bounded_buffer_pop which blocks until data is
+available or the buffer is closed.
+@End Implementation
+
+@Performance_Hints
+One mutex round-trip per pulled value.
+@End Performance_Hints
+
+@Security_Scope
+The buffer must outlive the stream.
+@End Security_Scope
+
+Process called "bp_buffer_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return 0
+    End If
+    Let rc be proc bounded_buffer_pop with state, out_holder
+    If rc is equal to BB_OK:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "proc_address_bp_buffer_next" returns Integer:
+    Note: Take the address of bp_buffer_next so the stream layer can store it
+    Note: as an Integer-valued function pointer. RIP-relative LEA is position-
+    Note: independent and resolves at link time. Result local lives at [rbp-8]
+    Note: because this Process has no parameters.
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + bp_buffer_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "bounded_buffer_to_stream" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return proc stream_create from Stream with proc_address_bp_buffer_next(), b, 0
+End Process

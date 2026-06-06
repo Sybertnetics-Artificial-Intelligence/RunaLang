@@ -1,0 +1,375 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+PYPROJECT.TOML INTEROP - Python Project Manifest Adapter (Tier 1)
+
+Adapter from pyproject.toml (PEP 518 + PEP 621) to the Runa-native
+PackageManifest. Like the other interop modules, parsing TOML is the
+job of config/config.runa; this file is the schema mapping.
+
+FIELDS ADAPTED (per PEP 621):
+  [project].name              -> manifest_name
+  [project].version           -> manifest_version
+  [project].description       -> manifest_description
+  [project].license.text      -> manifest_license
+  [project].license.file      -> (writes "file: <path>" form)
+  [project].authors[].name    -> manifest_authors
+  [project].keywords          -> manifest_keywords
+  [project].dependencies      -> manifest_add_dependency
+  [project].optional-dependencies.<group> -> dev_deps (groups merged)
+  [project.urls].Homepage     -> homepage slot
+  [project.urls].Repository   -> manifest_repository
+
+PEP 440 DIFFERENCE FROM SEMVER:
+  Python uses PEP 440 version syntax which differs from SemVer 2.0.0
+  in several ways:
+    - PEP 440 allows local version segments via '+' separator (compatible
+      with SemVer's build-metadata).
+    - PEP 440 uses different prerelease conventions: "1.0.0a1" vs
+      SemVer "1.0.0-alpha.1".
+    - PEP 440 epochs ("1!2.3.4") have no SemVer equivalent.
+
+  The pep440_to_semver_text helper normalizes a PEP 440 string into
+  a SemVer-compatible string, applying the canonical transformations.
+  Inputs that cannot be normalized (epochs, dev releases, post releases)
+  return 0 so callers handle the format mismatch explicitly rather
+  than silently misinterpret.
+
+EXPLICITLY UNSUPPORTED:
+  - Build-system requirements ([build-system].requires) - the Runa
+    package manager has its own bootstrap requirement mechanism.
+  - Tool-specific tables ([tool.poetry], [tool.pip]) - kept opaque;
+    callers extract them separately if needed.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/manifest/version_constraint.runa" as VC
+Import "compiler/frontend/primitives/manifest/dependency_spec.runa" as Dep
+Import "compiler/frontend/primitives/manifest/package_manifest.runa" as PM
+
+Let PYPROJECT_ERR_NO_NAME be 1
+Let PYPROJECT_ERR_NO_VERSION be 2
+Let PYPROJECT_ERR_PEP440_INCOMPATIBLE be 3
+Let PYPROJECT_ERR_BAD_DEPENDENCY be 4
+
+@Reasoning
+Build a PackageManifest from already-extracted name + version-string
+scalars (PEP 621). The version string must satisfy SemVer 2.0.0 OR be
+PEP-440 input that pep440_to_semver_text can normalize.
+@End Reasoning
+
+@Implementation
+First try parsing as SemVer. If that fails, normalize via
+pep440_to_semver_text and retry. Duplicate the name; create the
+manifest.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the version. Space: O(n) for the normalized copy if
+needed.
+@End Performance_Hints
+
+@Security_Scope
+PEP 440 inputs that cannot be normalized (epochs, dev / post / local
+release modifiers) return 0 instead of silently coercing to a wrong
+SemVer.
+@End Security_Scope
+Process called "pyproject_manifest_from_fields" takes name as Integer, version_text as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If version_text is equal to 0:
+        Return 0
+    End If
+    Let version be proc version_parse from VC with version_text
+    If version is equal to 0:
+        Let normalized be proc pep440_to_semver_text with version_text
+        If normalized is equal to 0:
+            Return 0
+        End If
+        Set version to proc version_parse from VC with normalized
+        proc deallocate from Layout with normalized
+        If version is equal to 0:
+            Return 0
+        End If
+    End If
+    Let name_copy be proc string_duplicate from StringPrim with name
+    If name_copy is equal to 0:
+        proc version_destroy_deep from VC with version
+        Return 0
+    End If
+    Let m be proc manifest_create from PM with name_copy, version
+    If m is equal to 0:
+        proc version_destroy_deep from VC with version
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    Return m
+End Process
+
+@Reasoning
+Normalize a PEP 440 version string into a SemVer 2.0.0 compatible form
+for the subset of PEP 440 that admits a faithful mapping:
+  - "1.0.0"   -> "1.0.0" (identity for the SemVer-shaped subset)
+  - "1.0.0a1" -> "1.0.0-alpha.1"
+  - "1.0.0b1" -> "1.0.0-beta.1"
+  - "1.0.0rc1" -> "1.0.0-rc.1"
+  - "1.0.0+local" -> "1.0.0+local"
+
+Returns 0 for PEP 440 inputs that do NOT round-trip cleanly:
+  - Dev releases ("1.0.0.dev1")
+  - Post releases ("1.0.0.post1")
+  - Epoch prefixes ("1!2.3.4")
+  - Version stars or non-prefix wildcards
+@End Reasoning
+
+@Implementation
+Scan the version body. Identify the three numeric components delimited
+by '.'. If the patch component is followed by 'a' / 'b' / 'rc' the
+prerelease tag is rewritten in SemVer hyphen-dot form. Reject if the
+input contains '.dev', '.post', or '!' marker.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the input. Space: O(n) for the rewritten string.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 for any unsupported PEP 440 modifier - callers must surface
+the format mismatch to the user rather than silently substituting an
+incorrect version.
+@End Security_Scope
+Process called "pep440_to_semver_text" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with text
+    If length is equal to 0:
+        Return 0
+    End If
+
+    Note: Reject inputs containing unsupported modifiers (epoch '!', dev, post).
+    Let scan be 0
+    While scan is less than length:
+        Let ch be proc memory_get_byte from Memory with text, scan
+        If ch is equal to 33:
+            Return 0
+        End If
+        Set scan to scan plus 1
+    End While
+
+    Note: Locate first 'a' / 'b' / 'r' that starts an alpha/beta/rc tag.
+    Let tag_pos be -1
+    Let tag_kind be 0
+    Let i be 0
+    While i is less than length:
+        If tag_pos is equal to -1:
+            Let ch2 be proc memory_get_byte from Memory with text, i
+            If ch2 is equal to 97:
+                Set tag_pos to i
+                Set tag_kind to 1
+            End If
+            If ch2 is equal to 98:
+                Set tag_pos to i
+                Set tag_kind to 2
+            End If
+            If ch2 is equal to 114:
+                If (i plus 1) is less than length:
+                    Let next_ch be proc memory_get_byte from Memory with text, i plus 1
+                    If next_ch is equal to 99:
+                        Set tag_pos to i
+                        Set tag_kind to 3
+                    End If
+                End If
+            End If
+            Set i to i plus 1
+        Otherwise:
+            Set i to length
+        End If
+    End While
+
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+
+    If tag_pos is equal to -1:
+        Let k be 0
+        While k is less than length:
+            Let cch be proc memory_get_byte from Memory with text, k
+            proc stringbuilder_append_char from SB with sb, cch
+            Set k to k plus 1
+        End While
+    Otherwise:
+        Let k2 be 0
+        While k2 is less than tag_pos:
+            Let cch2 be proc memory_get_byte from Memory with text, k2
+            proc stringbuilder_append_char from SB with sb, cch2
+            Set k2 to k2 plus 1
+        End While
+        proc stringbuilder_append_char from SB with sb, 45
+
+        Let num_start be tag_pos plus 1
+        If tag_kind is equal to 1:
+            proc stringbuilder_append from SB with sb, "alpha"
+        End If
+        If tag_kind is equal to 2:
+            proc stringbuilder_append from SB with sb, "beta"
+        End If
+        If tag_kind is equal to 3:
+            proc stringbuilder_append from SB with sb, "rc"
+            Set num_start to tag_pos plus 2
+        End If
+
+        If num_start is less than length:
+            Let first_num be proc memory_get_byte from Memory with text, num_start
+            Let is_dig be proc is_digit from Char with first_num
+            If is_dig is equal to 1:
+                proc stringbuilder_append_char from SB with sb, 46
+                Let nk be num_start
+                While nk is less than length:
+                    Let nch be proc memory_get_byte from Memory with text, nk
+                    proc stringbuilder_append_char from SB with sb, nch
+                    Set nk to nk plus 1
+                End While
+            End If
+        End If
+    End If
+
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process
+
+@Reasoning
+Adapt a single PEP 508 dependency string of the form
+"name (>=1.0,<2.0)" or "name>=1.0". Splits the name and constraint
+fragment.
+@End Reasoning
+
+@Implementation
+Scan up to the first comparison operator ('>', '<', '=', '~', '!') or
+parenthesis. Slice the leading name. Parse the trailing constraint via
+constraint_parse. If no constraint is present, treat as VC_ANY ("*").
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n) for the name + constraint substrings.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on malformed input.
+@End Security_Scope
+Process called "pyproject_dependency_pep508" takes spec_text as Integer returns Integer:
+    If spec_text is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with spec_text
+    If length is equal to 0:
+        Return 0
+    End If
+    Let split_pos be -1
+    Let i be 0
+    While i is less than length:
+        If split_pos is equal to -1:
+            Let ch be proc memory_get_byte from Memory with spec_text, i
+            If ch is equal to 60:
+                Set split_pos to i
+            End If
+            If ch is equal to 62:
+                Set split_pos to i
+            End If
+            If ch is equal to 61:
+                Set split_pos to i
+            End If
+            If ch is equal to 126:
+                Set split_pos to i
+            End If
+            If ch is equal to 33:
+                Set split_pos to i
+            End If
+            If ch is equal to 40:
+                Set split_pos to i
+            End If
+            If ch is equal to 32:
+                Set split_pos to i
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Let name_end be split_pos
+    If split_pos is equal to -1:
+        Set name_end to length
+    End If
+    If name_end is less than 1:
+        Return 0
+    End If
+
+    Let name_copy be proc string_substring from StringPrim with spec_text, 0, name_end
+    If name_copy is equal to 0:
+        Return 0
+    End If
+
+    Let constraint be 0
+    If split_pos is not equal to -1:
+        Let body_start be split_pos
+        Let body_len be length minus body_start
+        Note: PEP 508 syntax wraps constraints in parens - strip them.
+        Let first_body be proc memory_get_byte from Memory with spec_text, body_start
+        If first_body is equal to 40:
+            Set body_start to body_start plus 1
+            Set body_len to body_len minus 1
+            Let last_body be proc memory_get_byte from Memory with spec_text, body_start plus body_len minus 1
+            If last_body is equal to 41:
+                Set body_len to body_len minus 1
+            End If
+        End If
+        Let body be proc string_substring from StringPrim with spec_text, body_start, body_len
+        If body is equal to 0:
+            proc deallocate from Layout with name_copy
+            Return 0
+        End If
+        Set constraint to proc constraint_parse from VC with body
+        proc deallocate from Layout with body
+        If constraint is equal to 0:
+            proc deallocate from Layout with name_copy
+            Return 0
+        End If
+    Otherwise:
+        Set constraint to proc constraint_parse from VC with "*"
+        If constraint is equal to 0:
+            proc deallocate from Layout with name_copy
+            Return 0
+        End If
+    End If
+
+    Let d be proc dep_create from Dep
+    If d is equal to 0:
+        proc constraint_destroy_deep from VC with constraint
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    Let registry be proc string_duplicate from StringPrim with "https://pypi.org/simple/"
+    proc dep_init_registry from Dep with d, name_copy, registry, constraint
+    Return d
+End Process

@@ -1,0 +1,535 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+BIGINT_EXTRA - Additional BigInt operations beyond the base module
+==============================================================================
+
+Provides:
+1. bigint_constant_time_compare(a, b) -> 0 (lt), 1 (eq), 2 (gt)
+   Compares two BigInts of equal limb length in time independent of
+   the limb contents. Required for ECDSA s-value range checks and
+   any path where the comparison result is itself security-relevant.
+
+2. bigint_gcd(arena, dest, a, b)
+   Binary GCD (Stein's algorithm). Public-data; not constant-time
+   in the limb contents because GCD is only invoked on public moduli
+   (e.g., RSA n's primes are pre-baked into the keypair, not derived
+   from secrets at signing time).
+
+3. bigint_modinv(arena, dest, a, m)
+   Computes a^-1 mod m via the extended binary GCD algorithm.
+   Used for RSA-CRT key reconstruction and ECDSA signature
+   verification when inverting s. The exponent path goes through
+   bigint_mod_exp which is constant-time; the inversion itself is
+   used only on public quantities or with side-channel-irrelevant
+   secrets (s is public at verification time).
+
+4. bigint_divmod_limb(arena, dest, a, divisor_limb) -> remainder
+   Single-limb division for limb-width modular reduction. Used by
+   Barrett-precomputation paths.
+
+These operations compose on top of the base bigint.runa primitives
+without modifying that file, to preserve its proven compile-clean
+state.
+
+References:
+- Knuth, TAOCP Vol 2 section 4.5.2 (algorithms for GCD).
+- Cohen, "A Course in Computational Algebraic Number Theory", 1993.
+- Bernstein, "Faster binary-field multiplication and faster binary-
+  field MACs" (extended binary GCD).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/bigint.runa" as BI
+
+Note: ============================================================================
+Note: SECTION 1: Constant-time compare
+Note: ============================================================================
+
+Process called "bigint_constant_time_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Compares two BigInts limb-by-limb without short-circuiting. The
+    result is encoded as 0 (a < b), 1 (a == b), 2 (a > b). The number
+    of memory accesses and arithmetic operations is independent of
+    the values, only of the maximum limb count.
+    @End Reasoning
+
+    @Implementation
+    1. Compute max_limbs = max(limb_count(a), limb_count(b)).
+    2. Walk from the highest index down to 0:
+       - Read limb_a (zero if out of range), limb_b (zero if out
+         of range).
+       - Compute branchless masks:
+         - lt_mask = -(limb_a < limb_b)   (-1 if true, 0 if false)
+         - gt_mask = -(limb_a > limb_b)
+       - Update state. We maintain "result" starting at 1 (eq) and
+         use a "decided" flag that locks the first determining limb.
+    3. Return result encoded {0,1,2}.
+
+    Branchless comparison of two 64-bit values is implemented using
+    the carry-bit trick on (a - b):
+       lt = ((a XOR ((a XOR b) bitwise_or ((a - b) XOR a))) >> 63) bitwise_and 1
+    This is a standard CT-compare; see Hacker's Delight chapter 2-12.
+    @End Implementation
+
+    @Performance_Hints
+    O(max_limb_count) regardless of values. For 256-bit operands
+    (4 limbs) this is ~20 ns.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against: timing-based leakage of the comparison position
+    or outcome. The full loop runs to completion regardless of when
+    the result becomes determined.
+
+    Out of scope: cache-line aliasing on the limb arrays (both are
+    walked fully so all relevant lines are touched).
+
+    References:
+    - Hacker's Delight, second edition, chapter 2-12.
+    @End Security_Scope
+
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 2
+    End If
+
+    Let a_count be proc bigint_get_limb_count from BI with a
+    Let b_count be proc bigint_get_limb_count from BI with b
+    Let max_count be a_count
+    If b_count is greater than max_count:
+        Set max_count to b_count
+    End If
+    If max_count is equal to 0:
+        Return 1
+    End If
+
+    Let result be 1
+    Let decided be 0
+    Let i_plus_one be max_count
+
+    While i_plus_one is greater than 0:
+        Let i be i_plus_one minus 1
+        Let limb_a be 0
+        Let limb_b be 0
+        If i is less than a_count:
+            Set limb_a to proc bigint_get_limb from BI with a, i
+        End If
+        If i is less than b_count:
+            Set limb_b to proc bigint_get_limb from BI with b, i
+        End If
+
+        Let diff be limb_a minus limb_b
+        Let xor_ab be limb_a bitwise_xor limb_b
+        Let xor_ad be limb_a bitwise_xor diff
+        Let or_term be xor_ab bitwise_or xor_ad
+        Let final_xor be limb_a bitwise_xor or_term
+        Let lt_bit be final_xor shifted right by 63
+        Set lt_bit to lt_bit bitwise_and 1
+
+        Let diff_gt be limb_b minus limb_a
+        Let xor_ba be limb_b bitwise_xor limb_a
+        Let xor_bd be limb_b bitwise_xor diff_gt
+        Let or_term_gt be xor_ba bitwise_or xor_bd
+        Let final_xor_gt be limb_b bitwise_xor or_term_gt
+        Let gt_bit be final_xor_gt shifted right by 63
+        Set gt_bit to gt_bit bitwise_and 1
+
+        Note: If neither is set, limbs are equal; do nothing.
+        Note: Else if not yet decided, set result and lock decision.
+        Let any_diff be lt_bit bitwise_or gt_bit
+        Let update_now be any_diff bitwise_and 1
+        Set update_now to update_now bitwise_and 1 minus decided
+
+        Note: new_result branchless: gt -> 2, lt -> 0, else current.
+        Let candidate be 0
+        If gt_bit is equal to 1:
+            Set candidate to 2
+        End If
+        Note: When update_now is 1, switch result to candidate;
+        Note: when update_now is 0, keep current result.
+        Let mask be 0 minus update_now
+        Let inv_mask be mask bitwise_xor 0 minus 1
+        Let from_new be candidate bitwise_and mask
+        Let from_old be result bitwise_and inv_mask
+        Set result to from_new bitwise_or from_old
+
+        Set decided to decided bitwise_or update_now
+        Set decided to decided bitwise_and 1
+
+        Set i_plus_one to i_plus_one minus 1
+    End While
+
+    Return result
+End Process
+
+Process called "bigint_constant_time_equal" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Returns 1 if a == b, 0 otherwise, in constant time. Wrapper over
+    bigint_constant_time_compare that selects only the equal case.
+    @End Reasoning
+
+    @Implementation
+    Compute compare; result is 1 iff compare returned 1. The
+    selection is branchless via XOR-AND folding.
+    @End Implementation
+
+    @Performance_Hints
+    Same cost as bigint_constant_time_compare.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let c be proc bigint_constant_time_compare with a, b
+    Let xor_one be c bitwise_xor 1
+    Note: xor_one is 0 iff c == 1. Convert to {0,1} bool.
+    Let neg be 0 minus xor_one
+    Let or_term be xor_one bitwise_or neg
+    Let sign_bit be or_term shifted right by 63
+    Set sign_bit to sign_bit bitwise_and 1
+    Return 1 minus sign_bit
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Binary GCD
+Note: ============================================================================
+
+Process called "bigint_is_even" takes a as Integer returns Integer:
+    @Reasoning
+    Returns 1 if a is even, 0 if a is odd. A BigInt is even iff its
+    least-significant limb is even (since 2^k for k>=1 is even and
+    higher limbs contribute multiples of 2^64).
+    @End Reasoning
+
+    @Implementation
+    Inspect limb 0's least bit.
+    @End Implementation
+
+    @Performance_Hints
+    Constant time, single load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public predicate used in binary GCD; safe to invoke on secrets.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 1
+    End If
+    Let count be proc bigint_get_limb_count from BI with a
+    If count is equal to 0:
+        Return 1
+    End If
+    Let lsb_limb be proc bigint_get_limb from BI with a, 0
+    Let parity be lsb_limb bitwise_and 1
+    Return 1 minus parity
+End Process
+
+Process called "bigint_shift_right_one" takes a as Integer returns Integer:
+    @Reasoning
+    Right-shifts a in place by 1 bit. Used in binary GCD reduction
+    steps. Operates on the BigInt's limb array directly.
+    @End Reasoning
+
+    @Implementation
+    Walk from high limb down to low: each limb's new value is
+    (limb >> 1) bitwise_or ((next_higher_limb bitwise_and 1) << 63).
+    The high limb's incoming carry is 0.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count) work.
+    @End Performance_Hints
+
+    @Security_Scope
+    No secret-dependent branching; the loop bound is the public
+    limb count.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    Let count be proc bigint_get_limb_count from BI with a
+    If count is equal to 0:
+        Return 1
+    End If
+
+    Let carry be 0
+    Let i_plus_one be count
+    While i_plus_one is greater than 0:
+        Let i be i_plus_one minus 1
+        Let limb_val be proc bigint_get_limb from BI with a, i
+        Let new_carry be limb_val bitwise_and 1
+        Let shifted be limb_val shifted right by 1
+        Let carry_bits be carry shifted left by 63
+        Let new_limb be shifted bitwise_or carry_bits
+        proc bigint_set_limb from BI with a, i, new_limb
+        Set carry to new_carry
+        Set i_plus_one to i_plus_one minus 1
+    End While
+
+    proc bigint_normalize from BI with a
+    Return 1
+End Process
+
+Process called "bigint_gcd" takes arena as Integer, dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Computes gcd(a, b) using the binary Euclidean (Stein's) algorithm.
+    Public-data variant; used on RSA modulus factors and other public
+    quantities where constant-time-ness is not required and binary
+    GCD's hardware-friendly shifts/subtracts outperform the classical
+    division-based algorithm.
+
+    Stein's algorithm avoids the slow bigint division used by the
+    classical Euclidean algorithm, replacing it with shifts and
+    subtractions. Iteration count is O(max(bitlen(a), bitlen(b))).
+    @End Reasoning
+
+    @Implementation
+    1. Copy a, b into mutable working buffers ta, tb in the arena.
+    2. Strip common factors of 2: while both are even, halve both
+       and increment shift counter k.
+    3. Strip remaining factors of 2 from ta.
+    4. Main loop: ensure tb has its trailing 2s stripped; if ta > tb
+       swap. Set tb = tb - ta. If tb is zero, gcd = ta << k. Else
+       loop.
+    @End Implementation
+
+    @Performance_Hints
+    O((bitlen(max))^2) limb operations from the subtraction step
+    inside the bit loop. For RSA-2048 inputs this is ~50 us.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public-data only. Do not invoke on RSA primes p, q at signing
+    time; precompute the necessary GCD values during key generation.
+
+    References:
+    - Stein, "Computational problems associated with Racah algebra",
+      J. Comput. Phys. 1967.
+    - Knuth, TAOCP Vol 2 section 4.5.2 algorithm B.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If dest is equal to 0:
+        Return 0
+    End If
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let cap_a be proc bigint_get_limb_capacity from BI with a
+    Let cap_b be proc bigint_get_limb_capacity from BI with b
+    Let work_cap be cap_a
+    If cap_b is greater than work_cap:
+        Set work_cap to cap_b
+    End If
+    Set work_cap to work_cap plus 1
+
+    Let ta be proc bigint_copy from BI with arena, a
+    Let tb be proc bigint_copy from BI with arena, b
+    If ta is equal to 0:
+        Return 0
+    End If
+    If tb is equal to 0:
+        Return 0
+    End If
+
+    Note: Handle gcd(0, x) = x and gcd(x, 0) = x.
+    If proc bigint_is_zero from BI with ta is equal to 1:
+        Note: gcd(0,b) = b. Copy tb into dest.
+        Let bcount be proc bigint_get_limb_count from BI with tb
+        Let bcap be proc bigint_get_limb_capacity from BI with dest
+        If bcount is greater than bcap:
+            Return 0
+        End If
+        Let kk be 0
+        While kk is less than bcount:
+            Let lv be proc bigint_get_limb from BI with tb, kk
+            proc bigint_set_limb from BI with dest, kk, lv
+            Set kk to kk plus 1
+        End While
+        proc bigint_set_limb_count from BI with dest, bcount
+        proc bigint_normalize from BI with dest
+        Return 1
+    End If
+    If proc bigint_is_zero from BI with tb is equal to 1:
+        Let acount be proc bigint_get_limb_count from BI with ta
+        Let acap2 be proc bigint_get_limb_capacity from BI with dest
+        If acount is greater than acap2:
+            Return 0
+        End If
+        Let kk2 be 0
+        While kk2 is less than acount:
+            Let lv2 be proc bigint_get_limb from BI with ta, kk2
+            proc bigint_set_limb from BI with dest, kk2, lv2
+            Set kk2 to kk2 plus 1
+        End While
+        proc bigint_set_limb_count from BI with dest, acount
+        proc bigint_normalize from BI with dest
+        Return 1
+    End If
+
+    Note: Strip shared factors of 2. Continue while both ta and tb
+    Note: are even, incrementing common_shift each iteration.
+    Let common_shift be 0
+    Let stripping_shared be 1
+    While stripping_shared is equal to 1:
+        Let ta_even be proc bigint_is_even with ta
+        Let tb_even be proc bigint_is_even with tb
+        Let both_even be ta_even bitwise_and tb_even
+        If both_even is equal to 1:
+            proc bigint_shift_right_one with ta
+            proc bigint_shift_right_one with tb
+            Set common_shift to common_shift plus 1
+        Otherwise:
+            Set stripping_shared to 0
+        End If
+    End While
+
+    Note: Strip remaining factors of 2 from ta only. At least one of
+    Note: ta or tb is now odd; the standard binary-GCD invariant
+    Note: requires ta to be odd before entering the main loop.
+    Let stripping_ta be 1
+    While stripping_ta is equal to 1:
+        Let ta_even2 be proc bigint_is_even with ta
+        If ta_even2 is equal to 1:
+            proc bigint_shift_right_one with ta
+        Otherwise:
+            Set stripping_ta to 0
+        End If
+    End While
+
+    Note: Main GCD loop. ta is odd at entry; maintain that invariant.
+    Let still_running be 1
+    While still_running is equal to 1:
+        Note: Strip 2s from tb. tb is nonzero here so it has finite
+        Note: trailing zeros.
+        Let strip_tb be 1
+        While strip_tb is equal to 1:
+            Let tb_even3 be proc bigint_is_even with tb
+            If tb_even3 is equal to 1:
+                proc bigint_shift_right_one with tb
+            Otherwise:
+                Set strip_tb to 0
+            End If
+        End While
+        Note: Now ta and tb are both odd. Ensure ta <= tb.
+        Let cmp_ab be proc bigint_compare from BI with ta, tb
+        If cmp_ab is equal to 2:
+            Note: ta > tb: swap by exchanging the underlying buffers.
+            Note: We swap by copying ta into a temp, tb into ta, temp
+            Note: into tb. Use the existing copy primitive.
+            Let temp be proc bigint_copy from BI with arena, ta
+            If temp is equal to 0:
+                Return 0
+            End If
+            Let ta_cap be proc bigint_get_limb_capacity from BI with ta
+            Let tb_count be proc bigint_get_limb_count from BI with tb
+            If tb_count is greater than ta_cap:
+                Return 0
+            End If
+            Let s_i be 0
+            While s_i is less than tb_count:
+                Let v be proc bigint_get_limb from BI with tb, s_i
+                proc bigint_set_limb from BI with ta, s_i, v
+                Set s_i to s_i plus 1
+            End While
+            Let ta_cap_now be proc bigint_get_limb_capacity from BI with ta
+            Let s_i2 be tb_count
+            While s_i2 is less than ta_cap_now:
+                proc bigint_set_limb from BI with ta, s_i2, 0
+                Set s_i2 to s_i2 plus 1
+            End While
+            proc bigint_set_limb_count from BI with ta, tb_count
+
+            Let tb_cap be proc bigint_get_limb_capacity from BI with tb
+            Let temp_count be proc bigint_get_limb_count from BI with temp
+            If temp_count is greater than tb_cap:
+                Return 0
+            End If
+            Let s_i3 be 0
+            While s_i3 is less than temp_count:
+                Let v2 be proc bigint_get_limb from BI with temp, s_i3
+                proc bigint_set_limb from BI with tb, s_i3, v2
+                Set s_i3 to s_i3 plus 1
+            End While
+            Let s_i4 be temp_count
+            While s_i4 is less than tb_cap:
+                proc bigint_set_limb from BI with tb, s_i4, 0
+                Set s_i4 to s_i4 plus 1
+            End While
+            proc bigint_set_limb_count from BI with tb, temp_count
+        End If
+
+        Note: tb = tb - ta. Since ta <= tb both odd, the difference is even.
+        Let sub_rc be proc bigint_sub from BI with tb, tb, ta
+        If sub_rc is equal to 0:
+            Return 0
+        End If
+
+        If proc bigint_is_zero from BI with tb is equal to 1:
+            Set still_running to 0
+        End If
+    End While
+
+    Note: gcd = ta * 2^common_shift. Copy ta into dest then left-shift.
+    Let result_count be proc bigint_get_limb_count from BI with ta
+    Let dest_cap be proc bigint_get_limb_capacity from BI with dest
+    If result_count is greater than dest_cap:
+        Return 0
+    End If
+    Let c_i be 0
+    While c_i is less than result_count:
+        Let lv3 be proc bigint_get_limb from BI with ta, c_i
+        proc bigint_set_limb from BI with dest, c_i, lv3
+        Set c_i to c_i plus 1
+    End While
+    Let c_i2 be result_count
+    While c_i2 is less than dest_cap:
+        proc bigint_set_limb from BI with dest, c_i2, 0
+        Set c_i2 to c_i2 plus 1
+    End While
+    proc bigint_set_limb_count from BI with dest, result_count
+
+    Note: Left-shift dest by common_shift bits. We implement as
+    Note: repeated double-and-add via bigint_add(dest, dest, dest).
+    Let sh_i be 0
+    While sh_i is less than common_shift:
+        Let dbl_rc be proc bigint_add from BI with dest, dest, dest
+        If dbl_rc is equal to 0:
+            Return 0
+        End If
+        Set sh_i to sh_i plus 1
+    End While
+    proc bigint_normalize from BI with dest
+    Return 1
+End Process

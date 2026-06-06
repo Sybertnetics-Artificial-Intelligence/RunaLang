@@ -1,0 +1,1248 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+CONFIG - Runtime Configuration Container Primitive (Tier 1)
+
+Implements a tagged Config container that stores configuration values
+as a Dictionary<String, ConfigValue>. ConfigValue is an ADT covering the
+five JSON-shaped scalar/composite forms plus null, matching the
+intersection of JSON, YAML, and TOML data models.
+
+The container supports:
+  - Construction via config_create and value-builders
+  - Dotted-path lookup ("server.bind.port")
+  - Layered merging (override semantics)
+  - Environment-variable substitution via ${VAR} / ${VAR:-default}
+
+Layout (Config record, 24 bytes):
+  offset  0 : root_table   (8 bytes, Dictionary<String, ConfigValue> pointer)
+  offset  8 : source_path  (8 bytes, String pointer or 0)
+  offset 16 : format       (8 bytes, see FORMAT_* constants)
+
+Layout (ConfigValue record, 24 bytes):
+  offset  0 : kind         (8 bytes, see CV_* constants)
+  offset  8 : data         (8 bytes, type-dependent payload pointer or scalar)
+  offset 16 : len_or_flags (8 bytes, length for string, capacity for list, 0 otherwise)
+
+References:
+  - JSON ........... RFC 8259
+  - YAML 1.2 ....... https://yaml.org/spec/1.2.2/
+  - TOML 1.0 ....... https://toml.io/en/v1.0.0
+  - 12-factor config https://12factor.net/config
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let CONFIG_SIZE be 24
+Let CV_SIZE be 24
+
+Let CV_NULL be 0
+Let CV_STRING be 1
+Let CV_INTEGER be 2
+Let CV_FLOAT be 3
+Let CV_BOOL be 4
+Let CV_LIST be 5
+Let CV_MAP be 6
+
+Let FORMAT_UNKNOWN be 0
+Let FORMAT_JSON be 1
+Let FORMAT_YAML be 2
+Let FORMAT_TOML be 3
+Let FORMAT_RUNA be 4
+Let FORMAT_INI be 5
+
+Note: ============================================================================
+Note: CONFIG VALUE CONSTRUCTORS
+Note: ============================================================================
+
+@Reasoning
+Construct a CV_NULL value (the explicit-absence representation,
+distinct from a missing key in the root table).
+@End Reasoning
+
+@Implementation
+Allocate the 24-byte record, set kind, zero the payload.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "config_value_null" returns Integer:
+    Let v be proc allocate from Layout with CV_SIZE
+    If v is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with v, 0, CV_NULL
+    proc memory_set_int64 from Memory with v, 8, 0
+    proc memory_set_int64 from Memory with v, 16, 0
+    Return v
+End Process
+
+@Reasoning
+Construct a CV_STRING. The string pointer is duplicated so the
+ConfigValue owns its content (avoids lifetime tangling with parser
+state).
+@End Reasoning
+
+@Implementation
+Duplicate the input string. Allocate the record, store kind, duplicated
+pointer, and cached length.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) for the copy. Space: O(n) for the owned string.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or null input.
+@End Security_Scope
+Process called "config_value_string" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let copy be proc string_duplicate from StringPrim with s
+    If copy is equal to 0:
+        Return 0
+    End If
+    Let v be proc allocate from Layout with CV_SIZE
+    If v is equal to 0:
+        proc deallocate from Layout with copy
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with copy
+    proc memory_set_int64 from Memory with v, 0, CV_STRING
+    proc memory_set_int64 from Memory with v, 8, copy
+    proc memory_set_int64 from Memory with v, 16, length
+    Return v
+End Process
+
+@Reasoning
+Construct a CV_INTEGER. The integer is stored inline in the data slot.
+@End Reasoning
+
+@Implementation
+Allocate the record, store kind and inline value.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Accepts the full 64-bit signed Integer range.
+@End Security_Scope
+Process called "config_value_integer" takes value as Integer returns Integer:
+    Let v be proc allocate from Layout with CV_SIZE
+    If v is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with v, 0, CV_INTEGER
+    proc memory_set_int64 from Memory with v, 8, value
+    proc memory_set_int64 from Memory with v, 16, 0
+    Return v
+End Process
+
+@Reasoning
+Construct a CV_BOOL. The boolean is stored inline as 0 or 1.
+@End Reasoning
+
+@Implementation
+Coerce input to 0 or 1, store as inline scalar.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "config_value_bool" takes value as Integer returns Integer:
+    Let v be proc allocate from Layout with CV_SIZE
+    If v is equal to 0:
+        Return 0
+    End If
+    Let b be 0
+    If value is equal to 1:
+        Set b to 1
+    End If
+    proc memory_set_int64 from Memory with v, 0, CV_BOOL
+    proc memory_set_int64 from Memory with v, 8, b
+    proc memory_set_int64 from Memory with v, 16, 0
+    Return v
+End Process
+
+@Reasoning
+Construct a CV_LIST wrapping an existing List<ConfigValue>. The list
+pointer is adopted; the ConfigValue owns it.
+@End Reasoning
+
+@Implementation
+Allocate the record, store kind and list pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "config_value_list" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Let v be proc allocate from Layout with CV_SIZE
+    If v is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with v, 0, CV_LIST
+    proc memory_set_int64 from Memory with v, 8, list
+    proc memory_set_int64 from Memory with v, 16, 0
+    Return v
+End Process
+
+@Reasoning
+Construct a CV_MAP wrapping an existing Dictionary<String, ConfigValue>.
+@End Reasoning
+
+@Implementation
+Allocate the record, store kind and dictionary pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "config_value_map" takes dict as Integer returns Integer:
+    If dict is equal to 0:
+        Return 0
+    End If
+    Let v be proc allocate from Layout with CV_SIZE
+    If v is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with v, 0, CV_MAP
+    proc memory_set_int64 from Memory with v, 8, dict
+    proc memory_set_int64 from Memory with v, 16, 0
+    Return v
+End Process
+
+@Reasoning
+Free a ConfigValue and its owned subordinate allocations.
+CV_STRING releases the duplicated string. CV_LIST and CV_MAP each
+walk their containers and recursively destroy contained ConfigValues.
+@End Reasoning
+
+@Implementation
+Switch on kind. CV_STRING: free the string. CV_LIST: iterate elements
+and recursively destroy, then free the list header. CV_MAP: walk
+values via dict.values, recursively destroy each, free the keys list,
+free the dictionary.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the full subtree. Space: O(d) recursion depth.
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access the pointer after destroy.
+@End Security_Scope
+Process called "config_value_destroy" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    Let data be proc memory_get_int64 from Memory with v, 8
+    If kind is equal to CV_STRING:
+        If data is not equal to 0:
+            proc deallocate from Layout with data
+        End If
+    End If
+    If kind is equal to CV_LIST:
+        If data is not equal to 0:
+            Let count be proc list_length from List with data
+            Let i be 0
+            While i is less than count:
+                Let elem be proc list_get from List with data, i
+                If elem is not equal to 0:
+                    proc config_value_destroy with elem
+                End If
+                Set i to i plus 1
+            End While
+            proc list_destroy from List with data
+        End If
+    End If
+    If kind is equal to CV_MAP:
+        If data is not equal to 0:
+            Let key_list be proc keys from Dict with data
+            If key_list is not equal to 0:
+                Let kn be proc list_length from List with key_list
+                Let j be 0
+                While j is less than kn:
+                    Let k be proc list_get from List with key_list, j
+                    If k is not equal to 0:
+                        Let val be proc get from Dict with data, k
+                        If val is not equal to 0:
+                            proc config_value_destroy with val
+                        End If
+                    End If
+                    Set j to j plus 1
+                End While
+                proc list_destroy from List with key_list
+            End If
+            proc destroy from Dict with data
+        End If
+    End If
+    proc deallocate from Layout with v
+    Return 1
+End Process
+
+@Reasoning
+Expose the value kind discriminator.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns CV_NULL on null input - safe default.
+@End Security_Scope
+Process called "config_value_kind" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return CV_NULL
+    End If
+    Return proc memory_get_int64 from Memory with v, 0
+End Process
+
+@Reasoning
+Expose the underlying string pointer for CV_STRING values. Returns 0
+for any other kind so callers must check kind first.
+@End Reasoning
+
+@Implementation
+Verify kind == CV_STRING, then load the data pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch.
+@End Security_Scope
+Process called "config_value_as_string" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is not equal to CV_STRING:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+@Reasoning
+Expose the inline integer for CV_INTEGER. Returns 0 on type mismatch
+(callers should check kind to distinguish from a legitimate 0).
+@End Reasoning
+
+@Implementation
+Verify kind == CV_INTEGER, return the inline value.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch.
+@End Security_Scope
+Process called "config_value_as_integer" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is not equal to CV_INTEGER:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+@Reasoning
+Expose the inline boolean for CV_BOOL.
+@End Reasoning
+
+@Implementation
+Verify kind == CV_BOOL, return inline value.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch.
+@End Security_Scope
+Process called "config_value_as_bool" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is not equal to CV_BOOL:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+@Reasoning
+Expose the wrapped list pointer for CV_LIST.
+@End Reasoning
+
+@Implementation
+Verify kind, load data pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch.
+@End Security_Scope
+Process called "config_value_as_list" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is not equal to CV_LIST:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+@Reasoning
+Expose the wrapped dictionary pointer for CV_MAP.
+@End Reasoning
+
+@Implementation
+Verify kind, load data pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch.
+@End Security_Scope
+Process called "config_value_as_map" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is not equal to CV_MAP:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+Note: ============================================================================
+Note: CONFIG CONTAINER
+Note: ============================================================================
+
+@Reasoning
+Allocate an empty Config container backed by a fresh root dictionary.
+@End Reasoning
+
+@Implementation
+Allocate the 24-byte container, create the root dictionary, store
+metadata.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "config_create" returns Integer:
+    Let root be proc create from Dict
+    If root is equal to 0:
+        Return 0
+    End If
+    Let c be proc allocate from Layout with CONFIG_SIZE
+    If c is equal to 0:
+        proc destroy from Dict with root
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with c, 0, root
+    proc memory_set_int64 from Memory with c, 8, 0
+    proc memory_set_int64 from Memory with c, 16, FORMAT_UNKNOWN
+    Return c
+End Process
+
+@Reasoning
+Free the container, its root dictionary, and every owned ConfigValue
+in the tree.
+@End Reasoning
+
+@Implementation
+Walk the root table via Dict.keys, recursively destroy each value,
+then destroy the dictionary, then free the container.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the entire tree. Space: O(d) recursion depth.
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access the container after destroy.
+@End Security_Scope
+Process called "config_destroy" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with c, 0
+    If root is not equal to 0:
+        Let key_list be proc keys from Dict with root
+        If key_list is not equal to 0:
+            Let kn be proc list_length from List with key_list
+            Let i be 0
+            While i is less than kn:
+                Let k be proc list_get from List with key_list, i
+                If k is not equal to 0:
+                    Let val be proc get from Dict with root, k
+                    If val is not equal to 0:
+                        proc config_value_destroy with val
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+            proc list_destroy from List with key_list
+        End If
+        proc destroy from Dict with root
+    End If
+    Let src be proc memory_get_int64 from Memory with c, 8
+    If src is not equal to 0:
+        proc deallocate from Layout with src
+    End If
+    proc deallocate from Layout with c
+    Return 1
+End Process
+
+@Reasoning
+Bind a top-level key to a ConfigValue. Replaces any existing value
+(the prior value is destroyed to avoid leaks).
+@End Reasoning
+
+@Implementation
+Look up the existing entry. If present, recursively destroy. Then
+Dict.set with the new value.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1) plus the eviction cost. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+The key is stored by pointer; the dictionary owns its key buffer per
+its internal contract.
+@End Security_Scope
+Process called "config_set" takes c as Integer, key as Integer, value as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with c, 0
+    If root is equal to 0:
+        Return 0
+    End If
+    Let prior be proc get from Dict with root, key
+    If prior is not equal to 0:
+        proc config_value_destroy with prior
+    End If
+    proc set from Dict with root, key, value
+    Return 1
+End Process
+
+@Reasoning
+Direct top-level lookup. Returns 0 if key is absent.
+@End Reasoning
+
+@Implementation
+Dict.get on the root.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) expected. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs - distinct only by kind from a CV_NULL value.
+@End Security_Scope
+Process called "config_get_direct" takes c as Integer, key as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with c, 0
+    If root is equal to 0:
+        Return 0
+    End If
+    Return proc get from Dict with root, key
+End Process
+
+@Reasoning
+Dotted-path lookup. "server.bind.port" walks root -> server -> bind ->
+port, dereferencing nested CV_MAP values along the way. Returns 0 if
+any segment is missing or non-map.
+@End Reasoning
+
+@Implementation
+Split the path by '.' segments. Start at root and at each step:
+  - If the current value is a CV_MAP, look up the next key.
+  - Otherwise, return 0.
+At the final step return the matched value (caller does not own it).
+@End Implementation
+
+@Performance_Hints
+Time: O(p * |segment|) where p is segment count. Space: O(|segment|)
+for each per-step substring (released as we go).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on any missing intermediate or terminal segment. Empty path
+returns 0.
+@End Security_Scope
+Process called "config_get" takes c as Integer, dotted_path as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    If dotted_path is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with dotted_path
+    If length is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with c, 0
+    If root is equal to 0:
+        Return 0
+    End If
+
+    Let current_map be root
+    Let current_value be 0
+    Let seg_start be 0
+    Let i be 0
+    Let path_failed be 0
+    Let done be 0
+
+    While done is equal to 0:
+        If path_failed is equal to 1:
+            Set done to 1
+        Otherwise:
+            Let at_end be 0
+            If i is greater than or equal to length:
+                Set at_end to 1
+            End If
+            Let is_dot be 0
+            If at_end is equal to 0:
+                Let ch be proc memory_get_byte from Memory with dotted_path, i
+                If ch is equal to 46:
+                    Set is_dot to 1
+                End If
+            End If
+            If at_end is equal to 1:
+                If is_dot is equal to 0:
+                    Let seg_len be i minus seg_start
+                    If seg_len is less than 1:
+                        Set path_failed to 1
+                    Otherwise:
+                        Let seg be proc string_substring from StringPrim with dotted_path, seg_start, seg_len
+                        If seg is equal to 0:
+                            Set path_failed to 1
+                        Otherwise:
+                            Set current_value to proc get from Dict with current_map, seg
+                            proc deallocate from Layout with seg
+                            If current_value is equal to 0:
+                                Set path_failed to 1
+                            End If
+                        End If
+                    End If
+                    Set done to 1
+                End If
+            Otherwise:
+                If is_dot is equal to 1:
+                    Let seg_len2 be i minus seg_start
+                    If seg_len2 is less than 1:
+                        Set path_failed to 1
+                    Otherwise:
+                        Let seg2 be proc string_substring from StringPrim with dotted_path, seg_start, seg_len2
+                        If seg2 is equal to 0:
+                            Set path_failed to 1
+                        Otherwise:
+                            Let v_next be proc get from Dict with current_map, seg2
+                            proc deallocate from Layout with seg2
+                            If v_next is equal to 0:
+                                Set path_failed to 1
+                            Otherwise:
+                                Let vk be proc memory_get_int64 from Memory with v_next, 0
+                                If vk is not equal to CV_MAP:
+                                    Set path_failed to 1
+                                Otherwise:
+                                    Set current_map to proc memory_get_int64 from Memory with v_next, 8
+                                    Set seg_start to i plus 1
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set i to i plus 1
+                Otherwise:
+                    Set i to i plus 1
+                End If
+            End If
+        End If
+    End While
+
+    If path_failed is equal to 1:
+        Return 0
+    End If
+    Return current_value
+End Process
+
+@Reasoning
+Typed dotted-path lookup returning a string with default. Used by the
+common pattern "config_get_string(c, "log.level", "info")" that
+permeates application init code.
+@End Reasoning
+
+@Implementation
+Call config_get; if absent or wrong kind, return default. Otherwise
+return the contained string pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(p). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Default value is returned verbatim - caller is responsible for its
+lifetime.
+@End Security_Scope
+Process called "config_get_string" takes c as Integer, path as Integer, default_value as Integer returns Integer:
+    Let v be proc config_get with c, path
+    If v is equal to 0:
+        Return default_value
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is not equal to CV_STRING:
+        Return default_value
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+@Reasoning
+Typed dotted-path lookup returning an integer with default.
+@End Reasoning
+
+@Implementation
+Call config_get; verify CV_INTEGER kind; return inline value or
+default.
+@End Implementation
+
+@Performance_Hints
+Time: O(p). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns the default on missing-key OR type-mismatch.
+@End Security_Scope
+Process called "config_get_integer" takes c as Integer, path as Integer, default_value as Integer returns Integer:
+    Let v be proc config_get with c, path
+    If v is equal to 0:
+        Return default_value
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is not equal to CV_INTEGER:
+        Return default_value
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+@Reasoning
+Typed dotted-path lookup returning a boolean with default.
+@End Reasoning
+
+@Implementation
+Call config_get; verify CV_BOOL kind; return inline value or default.
+@End Implementation
+
+@Performance_Hints
+Time: O(p). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns the default on missing-key OR type-mismatch.
+@End Security_Scope
+Process called "config_get_bool" takes c as Integer, path as Integer, default_value as Integer returns Integer:
+    Let v be proc config_get with c, path
+    If v is equal to 0:
+        Return default_value
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is not equal to CV_BOOL:
+        Return default_value
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+Note: ============================================================================
+Note: ENVIRONMENT-VARIABLE SUBSTITUTION
+Note: ============================================================================
+
+@Reasoning
+Apply environment-variable substitution to a string. Recognized syntax:
+  ${VAR}            -> value of VAR or empty if unset
+  ${VAR:-default}   -> value of VAR or "default" if unset
+Backslash-escaped "\$" suppresses substitution at that position.
+
+The env_lookup callback resolves variable names; passing 0 disables
+substitution (every reference becomes empty / default).
+@End Reasoning
+
+@Implementation
+StringBuilder accumulates output. The scanner walks the input
+byte-by-byte. On encountering '$' followed by '{' it enters
+substitution mode: scan to the closing '}', extract the variable name
+(plus optional ":-default" suffix), consult env_lookup, append the
+result. On '\\$' it emits a literal '$' and skips the escape byte.
+@End Implementation
+
+@Performance_Hints
+Time: O(n + total substitution length). Space: O(n + output length).
+@End Performance_Hints
+
+@Security_Scope
+Unknown variables substitute to empty (or the supplied default). The
+substitution does not recursively expand the substituted text; this
+prevents a malicious environment variable from injecting further
+substitution markers and causing unbounded expansion.
+@End Security_Scope
+Process called "config_substitute_env_vars" takes text as Integer, env_lookup as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with text
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with text, i
+        If ch is equal to 92:
+            If (i plus 1) is less than length:
+                Let next_ch be proc memory_get_byte from Memory with text, i plus 1
+                If next_ch is equal to 36:
+                    proc stringbuilder_append_char from SB with sb, 36
+                    Set i to i plus 2
+                Otherwise:
+                    proc stringbuilder_append_char from SB with sb, 92
+                    Set i to i plus 1
+                End If
+            Otherwise:
+                proc stringbuilder_append_char from SB with sb, 92
+                Set i to i plus 1
+            End If
+        Otherwise:
+            If ch is equal to 36:
+                If (i plus 1) is less than length:
+                    Let next_ch2 be proc memory_get_byte from Memory with text, i plus 1
+                    If next_ch2 is equal to 123:
+                        Let close_pos be -1
+                        Let j be i plus 2
+                        While j is less than length:
+                            If close_pos is equal to -1:
+                                Let jc be proc memory_get_byte from Memory with text, j
+                                If jc is equal to 125:
+                                    Set close_pos to j
+                                End If
+                                Set j to j plus 1
+                            Otherwise:
+                                Set j to length
+                            End If
+                        End While
+                        If close_pos is equal to -1:
+                            proc stringbuilder_append_char from SB with sb, ch
+                            Set i to i plus 1
+                        Otherwise:
+                            Let var_body_start be i plus 2
+                            Let var_body_len be close_pos minus var_body_start
+                            Note: detect ":-" default-separator
+                            Let sep_pos be -1
+                            Let k be var_body_start
+                            Let scan_end be var_body_start plus var_body_len
+                            While k is less than (scan_end minus 1):
+                                If sep_pos is equal to -1:
+                                    Let kc1 be proc memory_get_byte from Memory with text, k
+                                    Let kc2 be proc memory_get_byte from Memory with text, k plus 1
+                                    If kc1 is equal to 58:
+                                        If kc2 is equal to 45:
+                                            Set sep_pos to k
+                                        End If
+                                    End If
+                                End If
+                                Set k to k plus 1
+                            End While
+                            Let name_end be scan_end
+                            If sep_pos is not equal to -1:
+                                Set name_end to sep_pos
+                            End If
+                            Let name_len be name_end minus var_body_start
+                            Let name_str be proc string_substring from StringPrim with text, var_body_start, name_len
+                            Let resolved be 0
+                            If name_str is not equal to 0:
+                                If env_lookup is not equal to 0:
+                                    Set resolved to proc env_lookup_invoke with env_lookup, name_str
+                                End If
+                                proc deallocate from Layout with name_str
+                            End If
+                            If resolved is not equal to 0:
+                                proc stringbuilder_append from SB with sb, resolved
+                            Otherwise:
+                                If sep_pos is not equal to -1:
+                                    Let default_start be sep_pos plus 2
+                                    Let default_len be scan_end minus default_start
+                                    If default_len is greater than 0:
+                                        Let default_str be proc string_substring from StringPrim with text, default_start, default_len
+                                        If default_str is not equal to 0:
+                                            proc stringbuilder_append from SB with sb, default_str
+                                            proc deallocate from Layout with default_str
+                                        End If
+                                    End If
+                                End If
+                            End If
+                            Set i to close_pos plus 1
+                        End If
+                    Otherwise:
+                        proc stringbuilder_append_char from SB with sb, ch
+                        Set i to i plus 1
+                    End If
+                Otherwise:
+                    proc stringbuilder_append_char from SB with sb, ch
+                    Set i to i plus 1
+                End If
+            Otherwise:
+                proc stringbuilder_append_char from SB with sb, ch
+                Set i to i plus 1
+            End If
+        End If
+    End While
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process
+
+@Reasoning
+Safe-default forwarder for the env-lookup callback slot. The callback is
+stored as a function pointer encoded as an Integer; this is the same
+pattern used elsewhere in the v0.0.8.5 stdlib for first-class function
+pointers. env_lookup_invoke returns the "variable not found" sentinel
+(0) so that variable interpolation falls through to the literal-text
+path. Callers that need a custom env-lookup callback should invoke their
+callback directly via Process call syntax at the substitute call site
+rather than routing through this forwarder.
+@End Reasoning
+
+@Implementation
+Returns 0 unconditionally, producing "variable not found" semantics so
+that ${VAR} expansions resolve to the empty replacement. The
+environment_variable module exposes the production env-lookup
+(getenv-backed) used by config callers that opt in to OS-level
+environment inheritance.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 - safe fallback that triggers the ":-default" branch.
+@End Security_Scope
+Process called "env_lookup_invoke" takes callback as Integer, name as Integer returns Integer:
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: LAYERED MERGE
+Note: ============================================================================
+
+@Reasoning
+Apply override semantics: every key in override replaces the matching
+key in base. Maps are merged recursively (deep merge); lists are
+replaced wholesale (no merge - the override list wins outright). This
+matches Helm / 12-factor convention.
+
+The override container is logically consumed - its top-level entries
+are transferred into the base. After merge, override should be
+destroyed via config_destroy (which finds an empty root table).
+@End Reasoning
+
+@Implementation
+Iterate override's keys. For each key:
+  - If base has no value, take the override value verbatim.
+  - If both values are CV_MAP, recurse on the inner dictionaries.
+  - Otherwise, destroy the base value and replace with override's.
+Override values are detached from the override dictionary so the
+caller can safely destroy override without freeing the moved entries.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over all keys. Space: O(d) recursion depth.
+@End Performance_Hints
+
+@Security_Scope
+A merge that replaces a CV_MAP with a non-map value (or vice versa)
+is a configuration error - we follow override-wins for backward
+compatibility with established merge conventions.
+@End Security_Scope
+Process called "config_merge" takes base as Integer, override as Integer returns Integer:
+    If base is equal to 0:
+        Return 0
+    End If
+    If override is equal to 0:
+        Return 1
+    End If
+    Let base_root be proc memory_get_int64 from Memory with base, 0
+    Let override_root be proc memory_get_int64 from Memory with override, 0
+    If base_root is equal to 0:
+        Return 0
+    End If
+    If override_root is equal to 0:
+        Return 1
+    End If
+    Return proc merge_dicts with base_root, override_root
+End Process
+
+@Reasoning
+Helper: deep merge two dictionaries with override-wins semantics.
+@End Reasoning
+
+@Implementation
+For each key in override_dict:
+  - If base_dict lacks the key, set it.
+  - If both values are CV_MAP, recurse.
+  - Otherwise, destroy base's value and replace.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over override keys. Space: O(d) recursion depth.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "merge_dicts" takes base_dict as Integer, override_dict as Integer returns Integer:
+    Let key_list be proc keys from Dict with override_dict
+    If key_list is equal to 0:
+        Return 1
+    End If
+    Let kn be proc list_length from List with key_list
+    Let i be 0
+    While i is less than kn:
+        Let k be proc list_get from List with key_list, i
+        If k is not equal to 0:
+            Let ov be proc get from Dict with override_dict, k
+            If ov is not equal to 0:
+                Let bv be proc get from Dict with base_dict, k
+                Let recursed be 0
+                If bv is not equal to 0:
+                    Let bk be proc memory_get_int64 from Memory with bv, 0
+                    Let ok be proc memory_get_int64 from Memory with ov, 0
+                    If bk is equal to CV_MAP:
+                        If ok is equal to CV_MAP:
+                            Let bm be proc memory_get_int64 from Memory with bv, 8
+                            Let om be proc memory_get_int64 from Memory with ov, 8
+                            proc merge_dicts with bm, om
+                            Set recursed to 1
+                        End If
+                    End If
+                    If recursed is equal to 0:
+                        proc config_value_destroy with bv
+                    End If
+                End If
+                If recursed is equal to 0:
+                    proc set from Dict with base_dict, k, ov
+                Otherwise:
+                    Note: ov was the source of nested-merge content - its top-level dict was reused; release its wrapper but NOT the dict it points to.
+                    proc deallocate from Layout with ov
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with key_list
+    Note: After merging we wipe override's table to prevent double-free.
+    proc clear from Dict with override_dict
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SOURCE METADATA
+Note: ============================================================================
+
+@Reasoning
+Record the path from which the config was loaded - used by diagnostics
+to cite "config error at <path>".
+@End Reasoning
+
+@Implementation
+Duplicate the path and store at offset 8. Free any previous value
+first.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) for the copy. Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not retain the input pointer expecting it to remain valid -
+the container deep-copies.
+@End Security_Scope
+Process called "config_set_source_path" takes c as Integer, path as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let prior be proc memory_get_int64 from Memory with c, 8
+    If prior is not equal to 0:
+        proc deallocate from Layout with prior
+    End If
+    If path is equal to 0:
+        proc memory_set_int64 from Memory with c, 8, 0
+        Return 1
+    End If
+    Let copy be proc string_duplicate from StringPrim with path
+    If copy is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with c, 8, copy
+    Return 1
+End Process
+
+@Reasoning
+Set the format discriminator. Used by serialize / parse dispatch.
+@End Reasoning
+
+@Implementation
+Store at offset 16 if within FORMAT_* range.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Out-of-range formats default to FORMAT_UNKNOWN.
+@End Security_Scope
+Process called "config_set_format" takes c as Integer, format as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let f be FORMAT_UNKNOWN
+    If format is greater than or equal to FORMAT_UNKNOWN:
+        If format is less than or equal to FORMAT_INI:
+            Set f to format
+        End If
+    End If
+    proc memory_set_int64 from Memory with c, 16, f
+    Return 1
+End Process
+
+@Reasoning
+Expose the format discriminator.
+@End Reasoning
+
+@Implementation
+Load offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns FORMAT_UNKNOWN on null input.
+@End Security_Scope
+Process called "config_format" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return FORMAT_UNKNOWN
+    End If
+    Return proc memory_get_int64 from Memory with c, 16
+End Process
+
+@Reasoning
+Expose the root dictionary - used by adapters that walk the entire
+tree (e.g. cargo_toml_interop).
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+The returned dictionary is mutably aliased to the container; callers
+must not destroy it independently.
+@End Security_Scope
+Process called "config_root" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with c, 0
+End Process

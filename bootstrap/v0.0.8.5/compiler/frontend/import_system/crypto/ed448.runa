@@ -1,0 +1,1321 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+Ed448 SIGNATURE per RFC 8032 section 5.2
+==============================================================================
+
+Ed448 (also "Ed448-Goldilocks") is EdDSA over the untwisted Edwards curve
+
+    x^2 + y^2 = 1 + d * x^2 * y^2     over F_(2^448 - 2^224 - 1)
+
+with d = -39081. The base point B has order
+L = 2^446 - 13818066809895115352007386748515426880336692474882178609894547503885
+(prime), cofactor 4. Public keys are 57 bytes; signatures are 114 bytes
+(R||S, each 57 bytes).
+
+Implementation:
+- Field arithmetic via field448.runa (16-limb radix-2^28).
+- Extended Edwards coordinates (X, Y, Z, T) where x=X/Z, y=Y/Z, T=XY/Z.
+  Point = 4 * fe448 = 4 * 128 = 512 bytes.
+- Hash: SHAKE256, called via the keccak_f1600 primitive in sha3.runa.
+  SHAKE256 is used with domain separation per RFC 8032 5.2.1 ("dom4"
+  prefix: "SigEd448" || phflag || OLEN(context) || context).
+- Scalar reduction mod L_448: byte-reverse to BE, use bigint_mod, reverse back.
+
+Public API:
+- ed448_keygen(seed_57, public_out_57, secret_out_114)        RFC 8032 5.2.5
+- ed448_sign(secret_114, msg, len, ctx, ctx_len, sig_out_114) RFC 8032 5.2.6
+- ed448_verify(pub_57, msg, len, ctx, ctx_len, sig_114) -> 1|0 RFC 8032 5.2.7
+
+The context must be at most 255 bytes. Empty context (ctx_len = 0) is the
+default.
+
+References:
+- RFC 8032 5.2.
+- M. Hamburg, "Ed448-Goldilocks, a new elliptic curve", 2015.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/field448.runa" as Fe
+Import "compiler/frontend/import_system/crypto/sha3.runa" as Sha3
+Import "compiler/frontend/import_system/crypto/bigint.runa" as BigInt
+
+Constant ED448_POINT_BYTES as Integer is 512
+Constant ED448_SIG_BYTES as Integer is 114
+Constant ED448_PUBKEY_BYTES as Integer is 57
+Constant ED448_PRIVKEY_BYTES as Integer is 114
+Constant ED448_SEED_BYTES as Integer is 57
+
+Note: ============================================================================
+Note: SECTION 1: SHAKE256 driver
+Note: ============================================================================
+
+Process called "ed448_shake256" takes arena as Integer, input as Integer, input_len as Integer, out as Integer, out_len as Integer returns Integer:
+    @Reasoning
+    SHAKE256 extendable-output function per FIPS 202. SHAKE256 uses the
+    Keccak[c=512] permutation with rate r = 1088 bits = 136 bytes, and a
+    domain separator byte of 0x1F before the trailing 0x80 padding bit.
+
+    This routine is local to ed448.runa because sha3.runa exposes
+    sha3_hash_internal with the SHA-3 fixed-length domain separator (0x06),
+    not the SHAKE one (0x1F). We reuse keccak_f1600 directly for the
+    permutation.
+    @End Reasoning
+
+    @Implementation
+    Absorb input in 136-byte rate blocks. Apply pad10*1 with 0x1F at
+    the head of the padding and 0x80 at the tail. Squeeze out_len bytes
+    by reading the first 136 bytes of state after each permutation.
+    @End Implementation
+
+    @Performance_Hints
+    Each permutation is fixed cost (~24 rounds of f1600). Total cost is
+    ceil(input_len / 136) + ceil(out_len / 136) permutations.
+    @End Performance_Hints
+
+    @Security_Scope
+    SHAKE256 is a 256-bit-security XOF. Output is uniformly random-
+    looking for any input. The implementation is constant-time relative
+    to input length (no branches on input bytes).
+    @End Security_Scope
+
+    Let rate_bytes be 136
+
+    Let scratch_total be 200 plus 200 plus 40 plus 40 plus rate_bytes
+    Let scratch_buffer be Arena.arena_allocate(arena, scratch_total)
+    If scratch_buffer is equal to 0:
+        Return 0
+    End If
+    Let state be scratch_buffer
+    Let scratch_b be state plus 200
+    Let scratch_c be scratch_b plus 200
+    Let scratch_d be scratch_c plus 40
+    Let block_buffer be scratch_d plus 40
+
+    Let zi be 0
+    While zi is less than 200:
+        Memory.memory_set_byte(state, zi, 0)
+        Set zi to zi plus 1
+    End While
+
+    Note: Absorb full blocks
+    Let full_blocks be input_len divided by rate_bytes
+    Let processed be 0
+    While processed is less than full_blocks:
+        Let xor_idx be 0
+        While xor_idx is less than rate_bytes:
+            Let src_b be Memory.memory_get_byte(input, processed multiplied by rate_bytes plus xor_idx)
+            Let state_b be Memory.memory_get_byte(state, xor_idx)
+            Memory.memory_set_byte(state, xor_idx, state_b bitwise_xor src_b)
+            Set xor_idx to xor_idx plus 1
+        End While
+        proc keccak_f1600 from Sha3 with state, scratch_b, scratch_c, scratch_d
+        Set processed to processed plus 1
+    End While
+
+    Note: Final block: zero, copy tail, pad with 0x1F at tail_bytes, 0x80 at last byte.
+    Let tail_offset be full_blocks multiplied by rate_bytes
+    Let tail_bytes be input_len minus tail_offset
+
+    Let pi be 0
+    While pi is less than rate_bytes:
+        Memory.memory_set_byte(block_buffer, pi, 0)
+        Set pi to pi plus 1
+    End While
+    Let copy_t be 0
+    While copy_t is less than tail_bytes:
+        Let src_t be Memory.memory_get_byte(input, tail_offset plus copy_t)
+        Memory.memory_set_byte(block_buffer, copy_t, src_t)
+        Set copy_t to copy_t plus 1
+    End While
+
+    Note: SHAKE256 domain separator at tail_bytes: 0x1F
+    Memory.memory_set_byte(block_buffer, tail_bytes, 31)
+    Let last_b be Memory.memory_get_byte(block_buffer, rate_bytes minus 1)
+    Memory.memory_set_byte(block_buffer, rate_bytes minus 1, last_b bitwise_or 128)
+
+    Let xor_idx_final be 0
+    While xor_idx_final is less than rate_bytes:
+        Let blk_b be Memory.memory_get_byte(block_buffer, xor_idx_final)
+        Let st_b be Memory.memory_get_byte(state, xor_idx_final)
+        Memory.memory_set_byte(state, xor_idx_final, st_b bitwise_xor blk_b)
+        Set xor_idx_final to xor_idx_final plus 1
+    End While
+    proc keccak_f1600 from Sha3 with state, scratch_b, scratch_c, scratch_d
+
+    Note: Squeeze
+    Let written be 0
+    While written is less than out_len:
+        Let take be rate_bytes
+        If take is greater than out_len minus written:
+            Set take to out_len minus written
+        End If
+        Let si be 0
+        While si is less than take:
+            Let sb be Memory.memory_get_byte(state, si)
+            Memory.memory_set_byte(out, written plus si, sb)
+            Set si to si plus 1
+        End While
+        Set written to written plus take
+        If written is less than out_len:
+            proc keccak_f1600 from Sha3 with state, scratch_b, scratch_c, scratch_d
+        End If
+    End While
+    Return out_len
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: dom4 domain separation prefix (RFC 8032 5.2.1)
+Note: ============================================================================
+
+Process called "ed448_write_dom4" takes arena as Integer, out_buffer as Integer, phflag as Integer, context as Integer, context_len as Integer returns Integer:
+    @Reasoning
+    Writes the dom4 prefix per RFC 8032 5.2.1:
+      "SigEd448" || OCTET(x) || OCTET(OLEN(c)) || c
+    where:
+      x = phflag (0 for pure Ed448, 1 for Ed448ph)
+      OLEN(c) is a single byte (context length, max 255)
+      c is the context bytes
+
+    Total length = 8 + 1 + 1 + context_len.
+    Returns the number of bytes written.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time relative to context_len.
+    @End Security_Scope
+
+    Note: "SigEd448" = bytes 53 69 67 45 64 34 34 38
+    Memory.memory_set_byte(out_buffer, 0, 83)
+    Memory.memory_set_byte(out_buffer, 1, 105)
+    Memory.memory_set_byte(out_buffer, 2, 103)
+    Memory.memory_set_byte(out_buffer, 3, 69)
+    Memory.memory_set_byte(out_buffer, 4, 100)
+    Memory.memory_set_byte(out_buffer, 5, 52)
+    Memory.memory_set_byte(out_buffer, 6, 52)
+    Memory.memory_set_byte(out_buffer, 7, 56)
+    Memory.memory_set_byte(out_buffer, 8, phflag bitwise_and 1)
+    Memory.memory_set_byte(out_buffer, 9, context_len bitwise_and 255)
+    Let ci be 0
+    While ci is less than context_len:
+        Let cb be Memory.memory_get_byte(context, ci)
+        Memory.memory_set_byte(out_buffer, 10 plus ci, cb)
+        Set ci to ci plus 1
+    End While
+    Return 10 plus context_len
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Point allocation in extended Edwards coords
+Note: ============================================================================
+
+Note: Point layout (512 bytes):
+Note:   offset    0..127 : X
+Note:   offset  128..255 : Y
+Note:   offset  256..383 : Z
+Note:   offset  384..511 : T
+
+Process called "ed448_point_alloc" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocates an extended Edwards point: 4 fe448 elements (X, Y, Z, T),
+    512 bytes total. Initialized to the identity (0, 1, 1, 0).
+    @End Reasoning
+
+    Let buf be Arena.arena_allocate(arena, ED448_POINT_BYTES)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 64:
+        Memory.memory_set_qword(buf, i multiplied by 8, 0)
+        Set i to i plus 1
+    End While
+    Note: Y = 1, Z = 1.
+    Memory.memory_set_qword(buf, 128, 1)
+    Memory.memory_set_qword(buf, 256, 1)
+    Return buf
+End Process
+
+Process called "ed448_point_copy" takes dest as Integer, src as Integer returns Integer:
+    Let i be 0
+    While i is less than 64:
+        Let limb be Memory.memory_get_int64(src, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, limb)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "ed448_point_select" takes dest as Integer, a as Integer, b as Integer, condition as Integer returns Integer:
+    @Reasoning
+    Constant-time conditional point assignment: dest := a if
+    condition=1 else dest := b.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let mask be 0 minus condition
+    Let not_mask be mask bitwise_xor 0 minus 1
+    Let i be 0
+    While i is less than 64:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Let bi be Memory.memory_get_int64(b, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, (ai bitwise_and mask) bitwise_or (bi bitwise_and not_mask))
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Curve constant d = -39081 (encoded as a field element)
+Note: ============================================================================
+
+Process called "ed448_load_d" takes d_out as Integer returns Integer:
+    @Reasoning
+    Loads d = -39081 (mod p448) as a field element. Computed as
+    (p - 39081) = 2^448 - 2^224 - 1 - 39081 = 2^448 - 2^224 - 39082.
+
+    In 16-limb radix-2^28 representation, this is:
+      limb 0:   2^28 - 39082 = 268396374
+      limbs 1..7: 268435455 (all-ones 28-bit)
+      limb 8:   268435454 (2^28 - 2; the boundary limb of p)
+      limbs 9..15: 268435455
+    @End Reasoning
+
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+
+    Memory.memory_set_qword(d_out, 0, 268396374)
+    Let i be 1
+    While i is less than 8:
+        Memory.memory_set_qword(d_out, i multiplied by 8, 268435455)
+        Set i to i plus 1
+    End While
+    Memory.memory_set_qword(d_out, 64, 268435454)
+    Set i to 9
+    While i is less than 16:
+        Memory.memory_set_qword(d_out, i multiplied by 8, 268435455)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Point addition and doubling (untwisted Edwards form)
+Note: ============================================================================
+
+Process called "ed448_point_add" takes arena as Integer, dest as Integer, p as Integer, q as Integer returns Integer:
+    @Reasoning
+    Untwisted Edwards addition (a=1). Formula (Hisil-Wong-Carter-Dawson
+    2008 "Twisted Edwards Curves Revisited" Section 3.1 with a=1):
+      A = X1 * X2
+      B = Y1 * Y2
+      C = T1 * d * T2
+      D = Z1 * Z2
+      E = (X1+Y1) * (X2+Y2) - A - B
+      F = D - C
+      G = D + C
+      H = B - A      (since a = 1 here; for a=-1 (Ed25519) this would be B + A)
+      X3 = E * F
+      Y3 = G * H
+      T3 = E * H
+      Z3 = F * G
+    @End Reasoning
+
+    @Performance_Hints
+    8 field multiplications + 1 small constant mult per add.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let A be proc fe448_alloc from Fe with arena
+    Let B be proc fe448_alloc from Fe with arena
+    Let C be proc fe448_alloc from Fe with arena
+    Let D be proc fe448_alloc from Fe with arena
+    Let E be proc fe448_alloc from Fe with arena
+    Let F be proc fe448_alloc from Fe with arena
+    Let G be proc fe448_alloc from Fe with arena
+    Let H be proc fe448_alloc from Fe with arena
+    Let t1 be proc fe448_alloc from Fe with arena
+    Let t2 be proc fe448_alloc from Fe with arena
+    Let d_fe be proc fe448_alloc from Fe with arena
+
+    If A is equal to 0:
+        Return 0
+    End If
+    If d_fe is equal to 0:
+        Return 0
+    End If
+
+    proc ed448_load_d with d_fe
+
+    Let p_x be p
+    Let p_y be p plus 128
+    Let p_z be p plus 256
+    Let p_t be p plus 384
+    Let q_x be q
+    Let q_y be q plus 128
+    Let q_z be q plus 256
+    Let q_t be q plus 384
+    Let dest_x be dest
+    Let dest_y be dest plus 128
+    Let dest_z be dest plus 256
+    Let dest_t be dest plus 384
+
+    proc fe448_mul from Fe with A, p_x, q_x
+    proc fe448_mul from Fe with B, p_y, q_y
+    proc fe448_mul from Fe with t1, p_t, d_fe
+    proc fe448_mul from Fe with C, t1, q_t
+    proc fe448_mul from Fe with D, p_z, q_z
+
+    Note: E = (X1+Y1)*(X2+Y2) - A - B
+    proc fe448_add from Fe with t1, p_x, p_y
+    proc fe448_add from Fe with t2, q_x, q_y
+    proc fe448_mul from Fe with E, t1, t2
+    proc fe448_sub from Fe with E, E, A
+    proc fe448_sub from Fe with E, E, B
+
+    proc fe448_sub from Fe with F, D, C
+    proc fe448_add from Fe with G, D, C
+    proc fe448_sub from Fe with H, B, A
+
+    proc fe448_mul from Fe with dest_x, E, F
+    proc fe448_mul from Fe with dest_y, G, H
+    proc fe448_mul from Fe with dest_t, E, H
+    proc fe448_mul from Fe with dest_z, F, G
+    Return 1
+End Process
+
+Process called "ed448_point_double" takes arena as Integer, dest as Integer, p as Integer returns Integer:
+    @Reasoning
+    Doubling on the untwisted Edwards curve (a=1):
+      A = X1^2
+      B = Y1^2
+      C = 2 * Z1^2
+      H = A + B
+      E = H - (X1 + Y1)^2
+      G = A - B   (a=1; for a=-1 Ed25519 this would be A + B then negate)
+      F = C + G
+      Wait: for untwisted Edwards (a=1) the doubling formula is
+        H = A + B
+        E = (X1+Y1)^2 - A - B  (note the negation: E = -(H - (X1+Y1)^2))
+        G = A - B
+        F = C - G    (sign differs from a=-1 case)
+      So:
+        X3 = E * F
+        Y3 = G * H
+        T3 = E * H
+        Z3 = F * G
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let A be proc fe448_alloc from Fe with arena
+    Let B be proc fe448_alloc from Fe with arena
+    Let C be proc fe448_alloc from Fe with arena
+    Let E be proc fe448_alloc from Fe with arena
+    Let F be proc fe448_alloc from Fe with arena
+    Let G be proc fe448_alloc from Fe with arena
+    Let H be proc fe448_alloc from Fe with arena
+    Let t1 be proc fe448_alloc from Fe with arena
+    Let t2 be proc fe448_alloc from Fe with arena
+
+    If A is equal to 0:
+        Return 0
+    End If
+    If t2 is equal to 0:
+        Return 0
+    End If
+
+    Let p_x be p
+    Let p_y be p plus 128
+    Let p_z be p plus 256
+    Let dest_x be dest
+    Let dest_y be dest plus 128
+    Let dest_z be dest plus 256
+    Let dest_t be dest plus 384
+
+    proc fe448_sqr from Fe with A, p_x
+    proc fe448_sqr from Fe with B, p_y
+    proc fe448_sqr from Fe with t1, p_z
+    proc fe448_add from Fe with C, t1, t1
+
+    proc fe448_add from Fe with t2, p_x, p_y
+    proc fe448_sqr from Fe with t1, t2
+    proc fe448_add from Fe with H, A, B
+    proc fe448_sub from Fe with E, t1, H
+
+    proc fe448_sub from Fe with G, A, B
+    proc fe448_sub from Fe with F, C, G
+
+    proc fe448_mul from Fe with dest_x, E, F
+    proc fe448_mul from Fe with dest_y, G, H
+    proc fe448_mul from Fe with dest_t, E, H
+    proc fe448_mul from Fe with dest_z, F, G
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: Scalar multiplication (constant-time double-and-add)
+Note: ============================================================================
+
+Process called "ed448_scalarmult" takes arena as Integer, result as Integer, scalar_57 as Integer, point as Integer returns Integer:
+    @Reasoning
+    Constant-time bit-by-bit double-and-add over an Ed448 scalar
+    (57 bytes = 456 bits, but effectively 448-bit scalar with the
+    top bit cleared per Ed448 clamping). We iterate from bit 447
+    down to bit 0.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: fixed 448 doublings + 448 conditional adds.
+    @End Security_Scope
+
+    Let R be proc ed448_point_alloc with arena
+    Let S be proc ed448_point_alloc with arena
+    If R is equal to 0:
+        Return 0
+    End If
+    If S is equal to 0:
+        Return 0
+    End If
+
+    Let bit_index be 447
+    While bit_index is greater than 0 minus 1:
+        proc ed448_point_double with arena, R, R
+        proc ed448_point_add with arena, S, R, point
+
+        Let byte_index be bit_index shifted right by 3
+        Let bit_in_byte be bit_index bitwise_and 7
+        Let byte_val be Memory.memory_get_byte(scalar_57, byte_index)
+        Let bit_val be (byte_val shifted right by bit_in_byte) bitwise_and 1
+
+        proc ed448_point_select with R, S, R, bit_val
+
+        Set bit_index to bit_index minus 1
+    End While
+
+    proc ed448_point_copy with result, R
+    Return 1
+End Process
+
+Process called "ed448_load_basepoint" takes arena as Integer, B_out as Integer returns Integer:
+    @Reasoning
+    Loads the Ed448 base point B per RFC 8032 5.2. The point coordinates
+    are defined by:
+      x = 224580040295924300174 ...  (large constant)
+      y = 298819210078481492676017930443295832658128183... (large constant)
+
+    Rather than encoding the constants as field-element limb dumps
+    (which are tedious and error-prone), we build B by unpacking the
+    canonical 57-byte little-endian encoding from RFC 8032 5.2:
+
+    The compressed encoding of the base point is:
+      14 fa 30 f2 5b 79 08 98 ad c8 d7 4e 2c 13 bd fd
+      c4 39 7c e6 1c ff d3 3a d7 c2 a0 05 1e 9c 78 87
+      40 98 a3 6c 73 73 ea 4b 62 c7 c9 56 37 20 76 88
+      24 bc b6 6e 71 46 3f 69 00
+
+    We first build this byte sequence, then call
+    ed448_point_decompress to obtain the extended-coordinates form.
+    @End Reasoning
+
+    @Security_Scope
+    Public constant. Decompression of a public input is non-secret.
+    @End Security_Scope
+
+    Let enc be Arena.arena_allocate(arena, 57)
+    If enc is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(enc, 0, 20)
+    Memory.memory_set_byte(enc, 1, 250)
+    Memory.memory_set_byte(enc, 2, 48)
+    Memory.memory_set_byte(enc, 3, 242)
+    Memory.memory_set_byte(enc, 4, 91)
+    Memory.memory_set_byte(enc, 5, 121)
+    Memory.memory_set_byte(enc, 6, 8)
+    Memory.memory_set_byte(enc, 7, 152)
+    Memory.memory_set_byte(enc, 8, 173)
+    Memory.memory_set_byte(enc, 9, 200)
+    Memory.memory_set_byte(enc, 10, 215)
+    Memory.memory_set_byte(enc, 11, 78)
+    Memory.memory_set_byte(enc, 12, 44)
+    Memory.memory_set_byte(enc, 13, 19)
+    Memory.memory_set_byte(enc, 14, 189)
+    Memory.memory_set_byte(enc, 15, 253)
+    Memory.memory_set_byte(enc, 16, 196)
+    Memory.memory_set_byte(enc, 17, 57)
+    Memory.memory_set_byte(enc, 18, 124)
+    Memory.memory_set_byte(enc, 19, 230)
+    Memory.memory_set_byte(enc, 20, 28)
+    Memory.memory_set_byte(enc, 21, 255)
+    Memory.memory_set_byte(enc, 22, 211)
+    Memory.memory_set_byte(enc, 23, 58)
+    Memory.memory_set_byte(enc, 24, 215)
+    Memory.memory_set_byte(enc, 25, 194)
+    Memory.memory_set_byte(enc, 26, 160)
+    Memory.memory_set_byte(enc, 27, 5)
+    Memory.memory_set_byte(enc, 28, 30)
+    Memory.memory_set_byte(enc, 29, 156)
+    Memory.memory_set_byte(enc, 30, 120)
+    Memory.memory_set_byte(enc, 31, 135)
+    Memory.memory_set_byte(enc, 32, 64)
+    Memory.memory_set_byte(enc, 33, 152)
+    Memory.memory_set_byte(enc, 34, 163)
+    Memory.memory_set_byte(enc, 35, 108)
+    Memory.memory_set_byte(enc, 36, 115)
+    Memory.memory_set_byte(enc, 37, 115)
+    Memory.memory_set_byte(enc, 38, 234)
+    Memory.memory_set_byte(enc, 39, 75)
+    Memory.memory_set_byte(enc, 40, 98)
+    Memory.memory_set_byte(enc, 41, 199)
+    Memory.memory_set_byte(enc, 42, 201)
+    Memory.memory_set_byte(enc, 43, 86)
+    Memory.memory_set_byte(enc, 44, 55)
+    Memory.memory_set_byte(enc, 45, 32)
+    Memory.memory_set_byte(enc, 46, 118)
+    Memory.memory_set_byte(enc, 47, 136)
+    Memory.memory_set_byte(enc, 48, 36)
+    Memory.memory_set_byte(enc, 49, 188)
+    Memory.memory_set_byte(enc, 50, 182)
+    Memory.memory_set_byte(enc, 51, 110)
+    Memory.memory_set_byte(enc, 52, 113)
+    Memory.memory_set_byte(enc, 53, 70)
+    Memory.memory_set_byte(enc, 54, 63)
+    Memory.memory_set_byte(enc, 55, 105)
+    Memory.memory_set_byte(enc, 56, 0)
+    Return proc ed448_point_decompress with arena, B_out, enc
+End Process
+
+Note: ============================================================================
+Note: SECTION 7: Point compression / decompression
+Note: ============================================================================
+
+Process called "ed448_point_compress" takes arena as Integer, p as Integer, bytes57_out as Integer returns Integer:
+    @Reasoning
+    Compresses an Ed448 point to 57 bytes per RFC 8032 5.2.2: encode y
+    in 56 bytes little-endian and place the sign of x in the high bit
+    of byte 56 (the 57th byte, which is otherwise zero since y < 2^448).
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: 1 inversion + 2 muls + 1 pack + 1 byte write.
+    @End Security_Scope
+
+    Let inv_z be proc fe448_alloc from Fe with arena
+    Let x_affine be proc fe448_alloc from Fe with arena
+    Let y_affine be proc fe448_alloc from Fe with arena
+    If inv_z is equal to 0:
+        Return 0
+    End If
+
+    Let p_x be p
+    Let p_y be p plus 128
+    Let p_z be p plus 256
+
+    proc fe448_inv from Fe with arena, inv_z, p_z
+    proc fe448_mul from Fe with x_affine, p_x, inv_z
+    proc fe448_mul from Fe with y_affine, p_y, inv_z
+
+    proc fe448_pack from Fe with y_affine, bytes57_out
+
+    Let x_parity be proc fe448_is_negative from Fe with x_affine
+    Memory.memory_set_byte(bytes57_out, 56, x_parity multiplied by 128)
+    Return 1
+End Process
+
+Process called "ed448_point_decompress" takes arena as Integer, p_out as Integer, bytes57_in as Integer returns Integer:
+    @Reasoning
+    Decompresses a 57-byte Ed448 encoding per RFC 8032 5.2.3.
+      1. Sign bit = byte[56] >> 7. Byte 56 must otherwise be zero
+         (the high 7 bits of byte 56 are reserved and must be 0).
+      2. Decode y from bytes[0..55].
+      3. Compute u = y^2 - 1, v = d*y^2 - 1 (note Ed448 uses d*y^2 - 1, NOT d*y^2 + 1 as Ed25519 does, because the curve equation is
+         x^2 + y^2 = 1 + d*x^2*y^2 -> x^2 = (y^2 - 1) / (d*y^2 - 1)).
+      4. Compute candidate x via a^((p+1)/4) on the Goldilocks field.
+         For p448, (p+1)/4 = 2^446 - 2^222, so x = (u/v)^((p+1)/4).
+      5. Check x^2 * v == u; if not, reject (Ed448's curve does not
+         require the sqrt(-1) twist used in Ed25519 because p448 = 3 mod 4
+         actually wait p448 mod 4 = (2^448 - 2^224 - 1) mod 4 = (0 - 0 - 1) mod 4 = 3,
+         which means a quadratic-non-residue requires no twist; ((p+1)/4)
+         power is correct on residues).
+      6. Match sign: if x_parity != x_sign_bit, negate x.
+      7. Build (X, Y, Z=1, T=X*Y).
+    @End Reasoning
+
+    @Implementation
+    Uses fe448 ops. The power (p+1)/4 chain is implemented via a
+    binary square-and-multiply loop on the constant exponent
+    (p+1)/4 = 2^446 - 2^222. Bytewise reading of the exponent.
+    @End Implementation
+
+    @Security_Scope
+    Operates on public bytes; no secrets flow through.
+    @End Security_Scope
+
+    Let last_byte be Memory.memory_get_byte(bytes57_in, 56)
+    Let x_sign_bit be last_byte shifted right by 7
+    Let last_lower be last_byte bitwise_and 127
+    If last_lower is not equal to 0:
+        Return 0
+    End If
+
+    Let y_fe be proc fe448_alloc from Fe with arena
+    proc fe448_unpack from Fe with y_fe, bytes57_in
+
+    Let one be proc fe448_alloc from Fe with arena
+    Let d_fe be proc fe448_alloc from Fe with arena
+    Let y2 be proc fe448_alloc from Fe with arena
+    Let u be proc fe448_alloc from Fe with arena
+    Let v be proc fe448_alloc from Fe with arena
+
+    proc fe448_set_one from Fe with one
+    proc ed448_load_d with d_fe
+    proc fe448_sqr from Fe with y2, y_fe
+    proc fe448_sub from Fe with u, y2, one
+    proc fe448_mul from Fe with v, d_fe, y2
+    proc fe448_sub from Fe with v, v, one
+
+    Note: Compute x = (u/v)^((p+1)/4) = (u * v^-1)^((p+1)/4).
+    Let v_inv be proc fe448_alloc from Fe with arena
+    proc fe448_inv from Fe with arena, v_inv, v
+    Let uv be proc fe448_alloc from Fe with arena
+    proc fe448_mul from Fe with uv, u, v_inv
+
+    Note: Power uv^((p+1)/4). (p+1)/4 = 2^446 - 2^222.
+    Note: Bit-pattern of (p+1)/4 in 56 bytes LE:
+    Note:   bits 0..221:    0
+    Note:   bits 222..445:  1
+    Note:   bits 446..447:  0   (since the value is 2^446 - 2^222 < 2^446 actually it's just under 2^446)
+    Note: Wait: 2^446 - 2^222 = (2^224 - 1) * 2^222. In binary, that's
+    Note: 224 ones starting at bit 222: bits 222..445 are 1.
+
+    Let exp_bytes be Arena.arena_allocate(arena, 56)
+    If exp_bytes is equal to 0:
+        Return 0
+    End If
+    Let eb be 0
+    While eb is less than 56:
+        Memory.memory_set_byte(exp_bytes, eb, 0)
+        Set eb to eb plus 1
+    End While
+    Note: Set bits 222..445 to 1.
+    Note: bit 222 lives in byte 27 (222 / 8 = 27, 222 mod 8 = 6). Set bits 6, 7 of byte 27.
+    Memory.memory_set_byte(exp_bytes, 27, 192)
+    Note: bytes 28..55 are entirely set bits 224..447, but we want bits 224..445.
+    Note: That's bytes 28..55, with the top 2 bits of byte 55 cleared.
+    Let bi be 28
+    While bi is less than 55:
+        Memory.memory_set_byte(exp_bytes, bi, 255)
+        Set bi to bi plus 1
+    End While
+    Note: byte 55 has bits 440..447, we want bits 440..445 (low 6 bits) set.
+    Memory.memory_set_byte(exp_bytes, 55, 63)
+
+    Let x_candidate be proc fe448_alloc with arena
+    Let acc be proc fe448_alloc with arena
+    Let tmp be proc fe448_alloc with arena
+    proc fe448_set_one from Fe with acc
+
+    Let bit_index be 447
+    While bit_index is greater than 0 minus 1:
+        proc fe448_sqr from Fe with acc, acc
+        Let byte_idx be bit_index shifted right by 3
+        Let bit_in_byte be bit_index bitwise_and 7
+        Let bv be Memory.memory_get_byte(exp_bytes, byte_idx)
+        Let bit be (bv shifted right by bit_in_byte) bitwise_and 1
+        proc fe448_mul from Fe with tmp, acc, uv
+        proc fe448_select from Fe with acc, tmp, acc, bit
+        Set bit_index to bit_index minus 1
+    End While
+    proc fe448_copy from Fe with x_candidate, acc
+
+    Note: Validate: x^2 * v == u.
+    Let x_sq be proc fe448_alloc from Fe with arena
+    Let check be proc fe448_alloc from Fe with arena
+    proc fe448_sqr from Fe with x_sq, x_candidate
+    proc fe448_mul from Fe with check, x_sq, v
+    Let diff be proc fe448_alloc from Fe with arena
+    proc fe448_sub from Fe with diff, check, u
+    Let ok be proc fe448_is_zero from Fe with diff
+    If ok is equal to 0:
+        Return 0
+    End If
+
+    Note: Match x sign.
+    Let x_is_zero be proc fe448_is_zero from Fe with x_candidate
+    If x_is_zero is equal to 1:
+        If x_sign_bit is equal to 1:
+            Return 0
+        End If
+    End If
+
+    Let x_parity_now be proc fe448_is_negative from Fe with x_candidate
+    Let neg_needed be x_parity_now bitwise_xor x_sign_bit
+    Let neg_x be proc fe448_alloc from Fe with arena
+    proc fe448_neg from Fe with neg_x, x_candidate
+    Let x_final be proc fe448_alloc from Fe with arena
+    proc fe448_select from Fe with x_final, neg_x, x_candidate, neg_needed
+
+    Let p_x be p_out
+    Let p_y be p_out plus 128
+    Let p_z be p_out plus 256
+    Let p_t be p_out plus 384
+    proc fe448_copy from Fe with p_x, x_final
+    proc fe448_copy from Fe with p_y, y_fe
+    proc fe448_set_one from Fe with p_z
+    proc fe448_mul from Fe with p_t, x_final, y_fe
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 8: Scalar arithmetic mod L_ed448
+Note: ============================================================================
+
+Process called "ed448_load_group_order_le" takes out_buffer as Integer returns Integer:
+    @Reasoning
+    Writes L_ed448 as 57 bytes little-endian.
+    L = 2^446 - 13818066809895115352007386748515426880336692474882178609894547503885
+      = 0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+          7CCA23E9C44EDB49AED63690216CC2728DC58F552378C292AB5844F3
+    Big-endian bytes:
+      00 3F FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+      FF FF FF FF FF FF FF FF FF FF FF FF 7C CA 23 E9
+      C4 4E DB 49 AE D6 36 90 21 6C C2 72 8D C5 8F 55
+      23 78 C2 92 AB 58 44 F3
+
+    Little-endian bytes (reverse):
+      F3 44 58 AB 92 C2 78 23 55 8F C5 8D 72 C2 6C 21
+      90 36 D6 AE 49 DB 4E C4 E9 23 CA 7C FF FF FF FF
+      FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+      FF FF FF FF FF FF FF FF 3F 00
+    @End Reasoning
+
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+
+    Memory.memory_set_byte(out_buffer, 0, 243)
+    Memory.memory_set_byte(out_buffer, 1, 68)
+    Memory.memory_set_byte(out_buffer, 2, 88)
+    Memory.memory_set_byte(out_buffer, 3, 171)
+    Memory.memory_set_byte(out_buffer, 4, 146)
+    Memory.memory_set_byte(out_buffer, 5, 194)
+    Memory.memory_set_byte(out_buffer, 6, 120)
+    Memory.memory_set_byte(out_buffer, 7, 35)
+    Memory.memory_set_byte(out_buffer, 8, 85)
+    Memory.memory_set_byte(out_buffer, 9, 143)
+    Memory.memory_set_byte(out_buffer, 10, 197)
+    Memory.memory_set_byte(out_buffer, 11, 141)
+    Memory.memory_set_byte(out_buffer, 12, 114)
+    Memory.memory_set_byte(out_buffer, 13, 194)
+    Memory.memory_set_byte(out_buffer, 14, 108)
+    Memory.memory_set_byte(out_buffer, 15, 33)
+    Memory.memory_set_byte(out_buffer, 16, 144)
+    Memory.memory_set_byte(out_buffer, 17, 54)
+    Memory.memory_set_byte(out_buffer, 18, 214)
+    Memory.memory_set_byte(out_buffer, 19, 174)
+    Memory.memory_set_byte(out_buffer, 20, 73)
+    Memory.memory_set_byte(out_buffer, 21, 219)
+    Memory.memory_set_byte(out_buffer, 22, 78)
+    Memory.memory_set_byte(out_buffer, 23, 196)
+    Memory.memory_set_byte(out_buffer, 24, 233)
+    Memory.memory_set_byte(out_buffer, 25, 35)
+    Memory.memory_set_byte(out_buffer, 26, 202)
+    Memory.memory_set_byte(out_buffer, 27, 124)
+    Let i be 28
+    While i is less than 55:
+        Memory.memory_set_byte(out_buffer, i, 255)
+        Set i to i plus 1
+    End While
+    Memory.memory_set_byte(out_buffer, 55, 63)
+    Memory.memory_set_byte(out_buffer, 56, 0)
+    Return 1
+End Process
+
+Process called "ed448_reverse_bytes" takes src as Integer, src_len as Integer, dest as Integer returns Integer:
+    @Reasoning
+    Reverses a byte buffer (little-endian -> big-endian or vice versa).
+    @End Reasoning
+    Let i be 0
+    While i is less than src_len:
+        Let bv be Memory.memory_get_byte(src, src_len minus 1 minus i)
+        Memory.memory_set_byte(dest, i, bv)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "ed448_scalar_reduce" takes arena as Integer, in_bytes as Integer, in_len as Integer, out_bytes_57 as Integer returns Integer:
+    @Reasoning
+    Reduces a little-endian byte sequence modulo L_ed448. Used to
+    reduce SHAKE256 output (114 bytes -> 57 bytes mod L) and intermediate
+    scalar arithmetic results.
+    @End Reasoning
+
+    @Implementation
+    Reverse to BE, parse via bigint, reduce, serialize BE, reverse to LE.
+    @End Implementation
+
+    @Security_Scope
+    Operates on signing scalars (secret). Reduction loop iteration
+    count depends on the input magnitude, leaking some timing
+    information. Acceptable for the EdDSA hash inputs because they
+    are random 114-byte SHAKE outputs uniformly distributed; the
+    timing distribution is also uniform.
+    @End Security_Scope
+
+    Let be_buffer be Arena.arena_allocate(arena, in_len)
+    If be_buffer is equal to 0:
+        Return 0
+    End If
+    proc ed448_reverse_bytes with in_bytes, in_len, be_buffer
+
+    Let in_bn be proc bigint_from_bytes_be from BigInt with arena, be_buffer, in_len
+    If in_bn is equal to 0:
+        Return 0
+    End If
+
+    Let L_le_buf be Arena.arena_allocate(arena, 57)
+    If L_le_buf is equal to 0:
+        Return 0
+    End If
+    proc ed448_load_group_order_le with L_le_buf
+
+    Let L_be_buf be Arena.arena_allocate(arena, 57)
+    proc ed448_reverse_bytes with L_le_buf, 57, L_be_buf
+
+    Let L_bn be proc bigint_from_bytes_be from BigInt with arena, L_be_buf, 57
+    If L_bn is equal to 0:
+        Return 0
+    End If
+
+    Let reduced_bn be proc bigint_alloc from BigInt with arena, 14
+    If reduced_bn is equal to 0:
+        Return 0
+    End If
+    Let mod_rc be proc bigint_mod from BigInt with arena, reduced_bn, in_bn, L_bn
+    If mod_rc is equal to 0:
+        Return 0
+    End If
+
+    Let reduced_be be Arena.arena_allocate(arena, 57)
+    If reduced_be is equal to 0:
+        Return 0
+    End If
+    proc bigint_to_bytes_be from BigInt with reduced_bn, reduced_be, 57
+
+    Let zi be 0
+    While zi is less than 57:
+        Memory.memory_set_byte(out_bytes_57, zi, 0)
+        Set zi to zi plus 1
+    End While
+    proc ed448_reverse_bytes with reduced_be, 57, out_bytes_57
+    Return 1
+End Process
+
+Process called "ed448_scalar_mul_add" takes arena as Integer, a_le_57 as Integer, b_le_57 as Integer, c_le_57 as Integer, out_le_57 as Integer returns Integer:
+    @Reasoning
+    Computes (a*b + c) mod L_ed448 with all operands 57-byte LE.
+    @End Reasoning
+
+    @Security_Scope
+    Operates on secret scalars during signing. Bigint primitive timing
+    depends on inputs in a uniform way; acceptable for SHAKE-derived
+    nonces.
+    @End Security_Scope
+
+    Let a_be be Arena.arena_allocate(arena, 57)
+    Let b_be be Arena.arena_allocate(arena, 57)
+    Let c_be be Arena.arena_allocate(arena, 57)
+    proc ed448_reverse_bytes with a_le_57, 57, a_be
+    proc ed448_reverse_bytes with b_le_57, 57, b_be
+    proc ed448_reverse_bytes with c_le_57, 57, c_be
+
+    Let a_bn be proc bigint_from_bytes_be from BigInt with arena, a_be, 57
+    Let b_bn be proc bigint_from_bytes_be from BigInt with arena, b_be, 57
+    Let c_bn be proc bigint_from_bytes_be from BigInt with arena, c_be, 57
+
+    Let ab_bn be proc bigint_alloc from BigInt with arena, 28
+    proc bigint_mul from BigInt with ab_bn, a_bn, b_bn
+
+    Let abc_bn be proc bigint_alloc from BigInt with arena, 29
+    proc bigint_add from BigInt with abc_bn, ab_bn, c_bn
+
+    Let L_le_buf be Arena.arena_allocate(arena, 57)
+    proc ed448_load_group_order_le with L_le_buf
+    Let L_be_buf be Arena.arena_allocate(arena, 57)
+    proc ed448_reverse_bytes with L_le_buf, 57, L_be_buf
+    Let L_bn be proc bigint_from_bytes_be from BigInt with arena, L_be_buf, 57
+
+    Let reduced_bn be proc bigint_alloc from BigInt with arena, 14
+    proc bigint_mod from BigInt with arena, reduced_bn, abc_bn, L_bn
+
+    Let reduced_be be Arena.arena_allocate(arena, 57)
+    proc bigint_to_bytes_be from BigInt with reduced_bn, reduced_be, 57
+
+    Let zi be 0
+    While zi is less than 57:
+        Memory.memory_set_byte(out_le_57, zi, 0)
+        Set zi to zi plus 1
+    End While
+    proc ed448_reverse_bytes with reduced_be, 57, out_le_57
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 9: Key generation (RFC 8032 5.2.5)
+Note: ============================================================================
+
+Process called "ed448_clamp_scalar" takes scalar_57 as Integer returns Integer:
+    @Reasoning
+    Ed448 scalar clamping per RFC 8032 5.2.5:
+      scalar[0]  &= 252       (clear low 2 bits; cofactor = 4)
+      scalar[56]  = 0         (the 57th byte is reserved zero)
+      scalar[55] |= 128       (set bit 447 to fix top)
+    @End Reasoning
+
+    Let b0 be Memory.memory_get_byte(scalar_57, 0)
+    Memory.memory_set_byte(scalar_57, 0, b0 bitwise_and 252)
+    Memory.memory_set_byte(scalar_57, 56, 0)
+    Let b55 be Memory.memory_get_byte(scalar_57, 55)
+    Memory.memory_set_byte(scalar_57, 55, b55 bitwise_or 128)
+    Return 1
+End Process
+
+Process called "ed448_keygen" takes arena as Integer, seed_57 as Integer, public_out_57 as Integer, secret_out_114 as Integer returns Integer:
+    @Reasoning
+    Generates an Ed448 keypair from a 57-byte seed per RFC 8032 5.2.5:
+      1. h = SHAKE256(seed, 114). h is 114 bytes.
+      2. a = clamp(h[0..56])
+      3. prefix = h[57..113]
+      4. Public key A = [a] * B (encoded as 57 bytes).
+      5. secret_key = seed (57) || A (57)
+    @End Reasoning
+
+    @Security_Scope
+    Seed is the actual secret; the derived a never leaves the arena.
+    @End Security_Scope
+
+    If seed_57 is equal to 0:
+        Return 0
+    End If
+    If public_out_57 is equal to 0:
+        Return 0
+    End If
+    If secret_out_114 is equal to 0:
+        Return 0
+    End If
+
+    Let h be Arena.arena_allocate(arena, 114)
+    If h is equal to 0:
+        Return 0
+    End If
+    proc ed448_shake256 with arena, seed_57, 57, h, 114
+    proc ed448_clamp_scalar with h
+
+    Let base_point be proc ed448_point_alloc with arena
+    Let result_point be proc ed448_point_alloc with arena
+    If base_point is equal to 0:
+        Return 0
+    End If
+    If result_point is equal to 0:
+        Return 0
+    End If
+
+    proc ed448_load_basepoint with arena, base_point
+    proc ed448_scalarmult with arena, result_point, h, base_point
+    proc ed448_point_compress with arena, result_point, public_out_57
+
+    Let ci be 0
+    While ci is less than 57:
+        Let sb be Memory.memory_get_byte(seed_57, ci)
+        Memory.memory_set_byte(secret_out_114, ci, sb)
+        Set ci to ci plus 1
+    End While
+    Let cj be 0
+    While cj is less than 57:
+        Let pb be Memory.memory_get_byte(public_out_57, cj)
+        Memory.memory_set_byte(secret_out_114, 57 plus cj, pb)
+        Set cj to cj plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 10: Signing (RFC 8032 5.2.6, with Ed448ph variant via phflag)
+Note: ============================================================================
+
+Process called "ed448_sign_internal" takes arena as Integer, secret_114 as Integer, message as Integer, message_length as Integer, context as Integer, context_length as Integer, phflag as Integer, signature_out_114 as Integer returns Integer:
+    @Reasoning
+    Internal Ed448 signing routine, used by both ed448_sign (phflag=0)
+    and (potentially) ed448ph signing (phflag=1). Per RFC 8032 5.2.6:
+      seed = secret[0..56]
+      A    = secret[57..113]
+      h    = SHAKE256(seed, 114)
+      a    = clamp(h[0..56])
+      prefix = h[57..113]
+      r    = SHAKE256(dom4(phflag, ctx) || prefix || message, 114) reduced mod L
+      R    = [r] * B
+      k    = SHAKE256(dom4(phflag, ctx) || R || A || message, 114) reduced mod L
+      S    = (r + k*a) mod L
+      signature = R || S (57 + 57 bytes)
+    @End Reasoning
+
+    @Implementation
+    Builds the SHAKE input buffers as concatenations in arena memory.
+    The dom4 prefix is fixed-size (10 + ctx_len bytes).
+    @End Implementation
+
+    @Security_Scope
+    Deterministic (no nonce reuse possible). Signing keys are in arena;
+    callers must wipe the arena after use.
+    @End Security_Scope
+
+    If secret_114 is equal to 0:
+        Return 0
+    End If
+    If signature_out_114 is equal to 0:
+        Return 0
+    End If
+    If context_length is greater than 255:
+        Return 0
+    End If
+
+    Let seed be secret_114
+    Let A_bytes be secret_114 plus 57
+
+    Let h be Arena.arena_allocate(arena, 114)
+    proc ed448_shake256 with arena, seed, 57, h, 114
+    proc ed448_clamp_scalar with h
+    Let a_scalar be h
+    Let prefix be h plus 57
+
+    Note: dom4 prefix size
+    Let dom_len be 10 plus context_length
+
+    Note: Build r_input = dom4 || prefix(57) || message
+    Let r_input_len be dom_len plus 57 plus message_length
+    Let r_input be Arena.arena_allocate(arena, r_input_len)
+    If r_input is equal to 0:
+        Return 0
+    End If
+    proc ed448_write_dom4 with arena, r_input, phflag, context, context_length
+    Let pi be 0
+    While pi is less than 57:
+        Let pb be Memory.memory_get_byte(prefix, pi)
+        Memory.memory_set_byte(r_input, dom_len plus pi, pb)
+        Set pi to pi plus 1
+    End While
+    Let mi be 0
+    While mi is less than message_length:
+        Let mb be Memory.memory_get_byte(message, mi)
+        Memory.memory_set_byte(r_input, dom_len plus 57 plus mi, mb)
+        Set mi to mi plus 1
+    End While
+
+    Let r_hash be Arena.arena_allocate(arena, 114)
+    proc ed448_shake256 with arena, r_input, r_input_len, r_hash, 114
+    Let r_scalar be Arena.arena_allocate(arena, 57)
+    proc ed448_scalar_reduce with arena, r_hash, 114, r_scalar
+
+    Note: R = [r] * B
+    Let base_point be proc ed448_point_alloc with arena
+    Let R_point be proc ed448_point_alloc with arena
+    proc ed448_load_basepoint with arena, base_point
+    proc ed448_scalarmult with arena, R_point, r_scalar, base_point
+    Let R_bytes be signature_out_114
+    proc ed448_point_compress with arena, R_point, R_bytes
+
+    Note: k = SHAKE256(dom4 || R || A || message, 114) mod L
+    Let k_input_len be dom_len plus 57 plus 57 plus message_length
+    Let k_input be Arena.arena_allocate(arena, k_input_len)
+    proc ed448_write_dom4 with arena, k_input, phflag, context, context_length
+    Let ki be 0
+    While ki is less than 57:
+        Let rb be Memory.memory_get_byte(R_bytes, ki)
+        Memory.memory_set_byte(k_input, dom_len plus ki, rb)
+        Set ki to ki plus 1
+    End While
+    Let kj be 0
+    While kj is less than 57:
+        Let ab be Memory.memory_get_byte(A_bytes, kj)
+        Memory.memory_set_byte(k_input, dom_len plus 57 plus kj, ab)
+        Set kj to kj plus 1
+    End While
+    Let km be 0
+    While km is less than message_length:
+        Let mb2 be Memory.memory_get_byte(message, km)
+        Memory.memory_set_byte(k_input, dom_len plus 114 plus km, mb2)
+        Set km to km plus 1
+    End While
+
+    Let k_hash be Arena.arena_allocate(arena, 114)
+    proc ed448_shake256 with arena, k_input, k_input_len, k_hash, 114
+    Let k_scalar be Arena.arena_allocate(arena, 57)
+    proc ed448_scalar_reduce with arena, k_hash, 114, k_scalar
+
+    Note: S = (r + k*a) mod L
+    Let S_bytes be signature_out_114 plus 57
+    proc ed448_scalar_mul_add with arena, k_scalar, a_scalar, r_scalar, S_bytes
+    Return 1
+End Process
+
+Process called "ed448_sign" takes arena as Integer, secret_114 as Integer, message as Integer, message_length as Integer, context as Integer, context_length as Integer, signature_out_114 as Integer returns Integer:
+    @Reasoning
+    Pure Ed448 signing (phflag = 0) per RFC 8032 5.2.6.
+    @End Reasoning
+
+    Return proc ed448_sign_internal with arena, secret_114, message, message_length, context, context_length, 0, signature_out_114
+End Process
+
+Note: ============================================================================
+Note: SECTION 11: Verification (RFC 8032 5.2.7)
+Note: ============================================================================
+
+Process called "ed448_verify_internal" takes arena as Integer, public_57 as Integer, message as Integer, message_length as Integer, context as Integer, context_length as Integer, phflag as Integer, signature_114 as Integer returns Integer:
+    @Reasoning
+    Internal Ed448 verification, supporting both pure (phflag=0) and
+    ph (phflag=1) variants per RFC 8032 5.2.7.
+
+    Algorithm:
+      R = signature[0..56]
+      S = signature[57..113]
+      A = public_57 (decoded as point)
+      k = SHAKE256(dom4(phflag, ctx) || R || A || message, 114) mod L
+      Accept iff [S]B == R + [k]A.
+    @End Reasoning
+
+    If public_57 is equal to 0:
+        Return 0
+    End If
+    If signature_114 is equal to 0:
+        Return 0
+    End If
+    If context_length is greater than 255:
+        Return 0
+    End If
+
+    Let R_bytes be signature_114
+    Let S_bytes be signature_114 plus 57
+
+    Note: S range check: 0 <= S < L
+    Let S_be be Arena.arena_allocate(arena, 57)
+    proc ed448_reverse_bytes with S_bytes, 57, S_be
+    Let S_bn be proc bigint_from_bytes_be from BigInt with arena, S_be, 57
+    If S_bn is equal to 0:
+        Return 0
+    End If
+    Let L_le_buf be Arena.arena_allocate(arena, 57)
+    proc ed448_load_group_order_le with L_le_buf
+    Let L_be_buf be Arena.arena_allocate(arena, 57)
+    proc ed448_reverse_bytes with L_le_buf, 57, L_be_buf
+    Let L_bn be proc bigint_from_bytes_be from BigInt with arena, L_be_buf, 57
+    Let s_cmp be proc bigint_compare from BigInt with S_bn, L_bn
+    If s_cmp is greater than 0 minus 1:
+        Return 0
+    End If
+
+    Note: Decode R, A
+    Let R_point be proc ed448_point_alloc with arena
+    Let A_point be proc ed448_point_alloc with arena
+    Let r_ok be proc ed448_point_decompress with arena, R_point, R_bytes
+    If r_ok is equal to 0:
+        Return 0
+    End If
+    Let a_ok be proc ed448_point_decompress with arena, A_point, public_57
+    If a_ok is equal to 0:
+        Return 0
+    End If
+
+    Note: k = SHAKE256(dom4 || R || A || message, 114) mod L
+    Let dom_len be 10 plus context_length
+    Let k_input_len be dom_len plus 57 plus 57 plus message_length
+    Let k_input be Arena.arena_allocate(arena, k_input_len)
+    proc ed448_write_dom4 with arena, k_input, phflag, context, context_length
+    Let ki be 0
+    While ki is less than 57:
+        Let rb be Memory.memory_get_byte(R_bytes, ki)
+        Memory.memory_set_byte(k_input, dom_len plus ki, rb)
+        Set ki to ki plus 1
+    End While
+    Let kj be 0
+    While kj is less than 57:
+        Let ab be Memory.memory_get_byte(public_57, kj)
+        Memory.memory_set_byte(k_input, dom_len plus 57 plus kj, ab)
+        Set kj to kj plus 1
+    End While
+    Let km be 0
+    While km is less than message_length:
+        Let mb be Memory.memory_get_byte(message, km)
+        Memory.memory_set_byte(k_input, dom_len plus 114 plus km, mb)
+        Set km to km plus 1
+    End While
+    Let k_hash be Arena.arena_allocate(arena, 114)
+    proc ed448_shake256 with arena, k_input, k_input_len, k_hash, 114
+    Let k_scalar be Arena.arena_allocate(arena, 57)
+    proc ed448_scalar_reduce with arena, k_hash, 114, k_scalar
+
+    Note: lhs = [S]B
+    Let base_point be proc ed448_point_alloc with arena
+    proc ed448_load_basepoint with arena, base_point
+    Let lhs be proc ed448_point_alloc with arena
+    proc ed448_scalarmult with arena, lhs, S_bytes, base_point
+
+    Note: rhs = R + [k]A
+    Let kA be proc ed448_point_alloc with arena
+    proc ed448_scalarmult with arena, kA, k_scalar, A_point
+    Let rhs be proc ed448_point_alloc with arena
+    proc ed448_point_add with arena, rhs, R_point, kA
+
+    Note: Compare compressed encodings.
+    Let lhs_enc be Arena.arena_allocate(arena, 57)
+    Let rhs_enc be Arena.arena_allocate(arena, 57)
+    proc ed448_point_compress with arena, lhs, lhs_enc
+    proc ed448_point_compress with arena, rhs, rhs_enc
+
+    Let eq_acc be 0
+    Let ei be 0
+    While ei is less than 57:
+        Let lb_val be Memory.memory_get_byte(lhs_enc, ei)
+        Let rb_val be Memory.memory_get_byte(rhs_enc, ei)
+        Set eq_acc to eq_acc bitwise_or (lb_val bitwise_xor rb_val)
+        Set ei to ei plus 1
+    End While
+    If eq_acc is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "ed448_verify" takes arena as Integer, public_57 as Integer, message as Integer, message_length as Integer, context as Integer, context_length as Integer, signature_114 as Integer returns Integer:
+    @Reasoning
+    Pure Ed448 verification (phflag = 0) per RFC 8032 5.2.7.
+    @End Reasoning
+
+    Return proc ed448_verify_internal with arena, public_57, message, message_length, context, context_length, 0, signature_114
+End Process

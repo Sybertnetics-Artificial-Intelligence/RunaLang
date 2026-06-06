@@ -1,0 +1,1111 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FIELD448 - Arithmetic in F_p with p = 2^448 - 2^224 - 1 (Goldilocks)
+==============================================================================
+
+Foundation for Ed448 (untwisted Edwards curve "edwards448") and X448
+(Montgomery curve "curve448"). All field operations are constant-time.
+
+Representation: 16 limbs of radix 2^28. Each limb holds bits
+[28*i, 28*(i+1)) of the 448-bit field value as a 64-bit signed integer.
+A field element occupies FIELD448_BYTES = 128 bytes.
+
+The Goldilocks prime p = phi^2 - phi - 1 where phi = 2^224 admits an
+elegant reduction: 2^448 = 2^224 + 1 (mod p). So in the 16-limb
+representation, a product limb at position 16+i contributes both to
+limb i (the +1 part) and to limb i+8 (the +2^224 part, since each limb
+spans 28 bits and 224 / 28 = 8).
+
+Reference:
+- M. Hamburg, "Ed448-Goldilocks, a new elliptic curve", 2015.
+- RFC 7748 sections 4.2, 5 (X448).
+- RFC 8032 section 5.2 (Ed448).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+
+Constant FIELD448_BYTES as Integer is 128
+Constant FIELD448_MASK28 as Integer is 268435455
+Constant FIELD448_TWO_TO_28 as Integer is 268435456
+
+Note: ============================================================================
+Note: SECTION 1: Allocation and element setup
+Note: ============================================================================
+
+Process called "fe448_alloc" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocates a 128-byte buffer for a 16-limb radix-2^28 field element.
+    Zero-initializes all limbs.
+    @End Reasoning
+
+    @Security_Scope
+    Arena-backed; lifetime tied to arena.
+    @End Security_Scope
+
+    Let buffer be Arena.arena_allocate(arena, FIELD448_BYTES)
+    If buffer is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 16:
+        Memory.memory_set_qword(buffer, i multiplied by 8, 0)
+        Set i to i plus 1
+    End While
+    Return buffer
+End Process
+
+Process called "fe448_set_zero" takes fe as Integer returns Integer:
+    Let i be 0
+    While i is less than 16:
+        Memory.memory_set_qword(fe, i multiplied by 8, 0)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe448_set_one" takes fe as Integer returns Integer:
+    Memory.memory_set_qword(fe, 0, 1)
+    Let i be 1
+    While i is less than 16:
+        Memory.memory_set_qword(fe, i multiplied by 8, 0)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe448_copy" takes dest as Integer, src as Integer returns Integer:
+    Let i be 0
+    While i is less than 16:
+        Let li be Memory.memory_get_int64(src, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, li)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Add, Sub, Neg
+Note: ============================================================================
+
+Process called "fe448_add" takes dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Component-wise addition. Each limb sum stays well within 64-bit
+    range as long as |a_i|, |b_i| < 2^62 (which holds before any
+    reduction-bounded multiplications).
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: 16 unconditional add/store ops.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 16:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Let bi be Memory.memory_get_int64(b, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, ai plus bi)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe448_sub" takes dest as Integer, a as Integer, b as Integer returns Integer:
+    Let i be 0
+    While i is less than 16:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Let bi be Memory.memory_get_int64(b, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, ai minus bi)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe448_neg" takes dest as Integer, a as Integer returns Integer:
+    Let i be 0
+    While i is less than 16:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, 0 minus ai)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Carry propagation through 16 limbs + Goldilocks reduction wrap
+Note: ============================================================================
+
+Process called "fe448_carry" takes h as Integer returns Integer:
+    @Reasoning
+    Propagates carries through all 16 limbs to bring each into [0, 2^28).
+    The overflow from limb 15 (top, 28-bit) wraps via the Goldilocks
+    identity 2^448 = 2^224 + 1, which in our representation means:
+      - carry_out_15 contributes to limb 0 (the "+1" part)
+      - carry_out_15 contributes to limb 8 (the "+2^224" part)
+
+    Two carry passes suffice when starting from well-bounded inputs
+    (output of fe448_mul or fe448_sqr).
+    @End Reasoning
+
+    @Implementation
+    Sequential carry chain through limbs 0..15, then a single wrap-back
+    adds the limb-15 overflow into both limb 0 and limb 8.
+    @End Implementation
+
+    @Security_Scope
+    Constant-time: fixed sequence of arithmetic ops.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 15:
+        Let hi be Memory.memory_get_int64(h, i multiplied by 8)
+        Let c_pre be hi plus 134217728
+        Let c be c_pre shifted right by 28
+        Let c_lo be c multiplied by 268435456
+        Set hi to hi minus c_lo
+        Memory.memory_set_qword(h, i multiplied by 8, hi)
+        Let h_next be Memory.memory_get_int64(h, (i plus 1) multiplied by 8)
+        Memory.memory_set_qword(h, (i plus 1) multiplied by 8, h_next plus c)
+        Set i to i plus 1
+    End While
+
+    Note: Wrap limb 15 -> limb 0 (+1) and limb 8 (+1 from 2^224 path).
+    Let h15 be Memory.memory_get_int64(h, 120)
+    Let c15_pre be h15 plus 134217728
+    Let c15 be c15_pre shifted right by 28
+    Let c15_lo be c15 multiplied by 268435456
+    Set h15 to h15 minus c15_lo
+    Memory.memory_set_qword(h, 120, h15)
+
+    Let h0 be Memory.memory_get_int64(h, 0)
+    Memory.memory_set_qword(h, 0, h0 plus c15)
+    Let h8 be Memory.memory_get_int64(h, 64)
+    Memory.memory_set_qword(h, 64, h8 plus c15)
+
+    Note: Second carry pass over limbs 0..8 to absorb the wrap.
+    Let j be 0
+    While j is less than 9:
+        Let hi2 be Memory.memory_get_int64(h, j multiplied by 8)
+        Let c_pre2 be hi2 plus 134217728
+        Let c2 be c_pre2 shifted right by 28
+        Let c_lo2 be c2 multiplied by 268435456
+        Set hi2 to hi2 minus c_lo2
+        Memory.memory_set_qword(h, j multiplied by 8, hi2)
+        Let h_next2 be Memory.memory_get_int64(h, (j plus 1) multiplied by 8)
+        Memory.memory_set_qword(h, (j plus 1) multiplied by 8, h_next2 plus c2)
+        Set j to j plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Multiplication (schoolbook + Goldilocks reduction)
+Note: ============================================================================
+
+Process called "fe448_mul" takes dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Schoolbook multiplication of two 16-limb radix-2^28 elements, then
+    reduce via 2^448 = 2^224 + 1 (Goldilocks).
+
+    Step 1 computes the 31 cross-product sums r[0..30]:
+      r[k] = sum_{i+j=k} a_i * b_j  for k in [0, 30]
+
+    Step 2 folds limbs r[16..30] back into r[0..15] using:
+      r[i]   += r[i+16] * 1        (contribution from 2^448 reducing to 1)
+      r[i+8] += r[i+16] * 1        (contribution from 2^448 reducing to 2^224)
+    so each high-index limb r[i+16] doubles into limbs i and i+8 of the
+    reduced result. The bounded ranges of inputs keep this within 64-bit.
+
+    The schedule below merges the two steps: r[16+i] is computed but
+    not stored, and its value is directly folded into r[i] and r[i+8]
+    via additions to the running sums.
+    @End Reasoning
+
+    @Implementation
+    Loads all 16 limbs of a and b. Computes each output limb r[i] for
+    i in [0, 15] by:
+      r[i] = sum_{j+k=i, 0<=j,k<16} a_j * b_k +
+             sum_{j+k=i+16, 0<=j,k<16} a_j * b_k +
+             sum_{j+k=i+8, 0<=j,k<16, i+8 in [16,30]} a_j * b_k (only if i < 8 too)
+    Wait: the wrap rule is r[i] += r[i+16] (mod position-aware). For
+    i+16 in [16, 30], r[i+16] is the limb at position i+16; its
+    Goldilocks contribution is +1 to limb i and +1 to limb i+8 (with
+    i+8 itself in [8, 22], folding back through 16 as well if i+8 >= 16).
+
+    Specifically, every "high" limb at position k in [16, 30] contributes:
+      - to limb (k - 16)        (the +1 part)
+      - to limb (k - 8)         (the +2^224 part)
+        - if k - 8 >= 16 (k >= 24), this itself is a high limb that
+          needs further folding: k-8 in [16, 22], contributing to
+          (k-24) and (k-16). Since we are computing r[i] for i in
+          [0, 15] only, we expand these folds inline.
+
+    @End Implementation
+
+    @Performance_Hints
+    256 multiplications + ~256 additions + 16 carries. The wrap folding
+    adds zero extra multiplications, only additions.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: fixed sequence of arithmetic.
+    @End Security_Scope
+
+    Let a0 be Memory.memory_get_int64(a, 0)
+    Let a1 be Memory.memory_get_int64(a, 8)
+    Let a2 be Memory.memory_get_int64(a, 16)
+    Let a3 be Memory.memory_get_int64(a, 24)
+    Let a4 be Memory.memory_get_int64(a, 32)
+    Let a5 be Memory.memory_get_int64(a, 40)
+    Let a6 be Memory.memory_get_int64(a, 48)
+    Let a7 be Memory.memory_get_int64(a, 56)
+    Let a8 be Memory.memory_get_int64(a, 64)
+    Let a9 be Memory.memory_get_int64(a, 72)
+    Let a10 be Memory.memory_get_int64(a, 80)
+    Let a11 be Memory.memory_get_int64(a, 88)
+    Let a12 be Memory.memory_get_int64(a, 96)
+    Let a13 be Memory.memory_get_int64(a, 104)
+    Let a14 be Memory.memory_get_int64(a, 112)
+    Let a15 be Memory.memory_get_int64(a, 120)
+
+    Let b0 be Memory.memory_get_int64(b, 0)
+    Let b1 be Memory.memory_get_int64(b, 8)
+    Let b2 be Memory.memory_get_int64(b, 16)
+    Let b3 be Memory.memory_get_int64(b, 24)
+    Let b4 be Memory.memory_get_int64(b, 32)
+    Let b5 be Memory.memory_get_int64(b, 40)
+    Let b6 be Memory.memory_get_int64(b, 48)
+    Let b7 be Memory.memory_get_int64(b, 56)
+    Let b8 be Memory.memory_get_int64(b, 64)
+    Let b9 be Memory.memory_get_int64(b, 72)
+    Let b10 be Memory.memory_get_int64(b, 80)
+    Let b11 be Memory.memory_get_int64(b, 88)
+    Let b12 be Memory.memory_get_int64(b, 96)
+    Let b13 be Memory.memory_get_int64(b, 104)
+    Let b14 be Memory.memory_get_int64(b, 112)
+    Let b15 be Memory.memory_get_int64(b, 120)
+
+    Note: Compute the 31 raw cross-sum limbs r0..r30 of the 16x16 product.
+    Note: We accumulate into 31 64-bit Integer locals.
+
+    Let r0 be a0 multiplied by b0
+    Let r1 be a0 multiplied by b1
+    Set r1 to r1 plus a1 multiplied by b0
+    Let r2 be a0 multiplied by b2
+    Set r2 to r2 plus a1 multiplied by b1
+    Set r2 to r2 plus a2 multiplied by b0
+    Let r3 be a0 multiplied by b3
+    Set r3 to r3 plus a1 multiplied by b2
+    Set r3 to r3 plus a2 multiplied by b1
+    Set r3 to r3 plus a3 multiplied by b0
+    Let r4 be a0 multiplied by b4
+    Set r4 to r4 plus a1 multiplied by b3
+    Set r4 to r4 plus a2 multiplied by b2
+    Set r4 to r4 plus a3 multiplied by b1
+    Set r4 to r4 plus a4 multiplied by b0
+    Let r5 be a0 multiplied by b5
+    Set r5 to r5 plus a1 multiplied by b4
+    Set r5 to r5 plus a2 multiplied by b3
+    Set r5 to r5 plus a3 multiplied by b2
+    Set r5 to r5 plus a4 multiplied by b1
+    Set r5 to r5 plus a5 multiplied by b0
+    Let r6 be a0 multiplied by b6
+    Set r6 to r6 plus a1 multiplied by b5
+    Set r6 to r6 plus a2 multiplied by b4
+    Set r6 to r6 plus a3 multiplied by b3
+    Set r6 to r6 plus a4 multiplied by b2
+    Set r6 to r6 plus a5 multiplied by b1
+    Set r6 to r6 plus a6 multiplied by b0
+    Let r7 be a0 multiplied by b7
+    Set r7 to r7 plus a1 multiplied by b6
+    Set r7 to r7 plus a2 multiplied by b5
+    Set r7 to r7 plus a3 multiplied by b4
+    Set r7 to r7 plus a4 multiplied by b3
+    Set r7 to r7 plus a5 multiplied by b2
+    Set r7 to r7 plus a6 multiplied by b1
+    Set r7 to r7 plus a7 multiplied by b0
+    Let r8 be a0 multiplied by b8
+    Set r8 to r8 plus a1 multiplied by b7
+    Set r8 to r8 plus a2 multiplied by b6
+    Set r8 to r8 plus a3 multiplied by b5
+    Set r8 to r8 plus a4 multiplied by b4
+    Set r8 to r8 plus a5 multiplied by b3
+    Set r8 to r8 plus a6 multiplied by b2
+    Set r8 to r8 plus a7 multiplied by b1
+    Set r8 to r8 plus a8 multiplied by b0
+    Let r9 be a0 multiplied by b9
+    Set r9 to r9 plus a1 multiplied by b8
+    Set r9 to r9 plus a2 multiplied by b7
+    Set r9 to r9 plus a3 multiplied by b6
+    Set r9 to r9 plus a4 multiplied by b5
+    Set r9 to r9 plus a5 multiplied by b4
+    Set r9 to r9 plus a6 multiplied by b3
+    Set r9 to r9 plus a7 multiplied by b2
+    Set r9 to r9 plus a8 multiplied by b1
+    Set r9 to r9 plus a9 multiplied by b0
+    Let r10 be a0 multiplied by b10
+    Set r10 to r10 plus a1 multiplied by b9
+    Set r10 to r10 plus a2 multiplied by b8
+    Set r10 to r10 plus a3 multiplied by b7
+    Set r10 to r10 plus a4 multiplied by b6
+    Set r10 to r10 plus a5 multiplied by b5
+    Set r10 to r10 plus a6 multiplied by b4
+    Set r10 to r10 plus a7 multiplied by b3
+    Set r10 to r10 plus a8 multiplied by b2
+    Set r10 to r10 plus a9 multiplied by b1
+    Set r10 to r10 plus a10 multiplied by b0
+    Let r11 be a0 multiplied by b11
+    Set r11 to r11 plus a1 multiplied by b10
+    Set r11 to r11 plus a2 multiplied by b9
+    Set r11 to r11 plus a3 multiplied by b8
+    Set r11 to r11 plus a4 multiplied by b7
+    Set r11 to r11 plus a5 multiplied by b6
+    Set r11 to r11 plus a6 multiplied by b5
+    Set r11 to r11 plus a7 multiplied by b4
+    Set r11 to r11 plus a8 multiplied by b3
+    Set r11 to r11 plus a9 multiplied by b2
+    Set r11 to r11 plus a10 multiplied by b1
+    Set r11 to r11 plus a11 multiplied by b0
+    Let r12 be a0 multiplied by b12
+    Set r12 to r12 plus a1 multiplied by b11
+    Set r12 to r12 plus a2 multiplied by b10
+    Set r12 to r12 plus a3 multiplied by b9
+    Set r12 to r12 plus a4 multiplied by b8
+    Set r12 to r12 plus a5 multiplied by b7
+    Set r12 to r12 plus a6 multiplied by b6
+    Set r12 to r12 plus a7 multiplied by b5
+    Set r12 to r12 plus a8 multiplied by b4
+    Set r12 to r12 plus a9 multiplied by b3
+    Set r12 to r12 plus a10 multiplied by b2
+    Set r12 to r12 plus a11 multiplied by b1
+    Set r12 to r12 plus a12 multiplied by b0
+    Let r13 be a0 multiplied by b13
+    Set r13 to r13 plus a1 multiplied by b12
+    Set r13 to r13 plus a2 multiplied by b11
+    Set r13 to r13 plus a3 multiplied by b10
+    Set r13 to r13 plus a4 multiplied by b9
+    Set r13 to r13 plus a5 multiplied by b8
+    Set r13 to r13 plus a6 multiplied by b7
+    Set r13 to r13 plus a7 multiplied by b6
+    Set r13 to r13 plus a8 multiplied by b5
+    Set r13 to r13 plus a9 multiplied by b4
+    Set r13 to r13 plus a10 multiplied by b3
+    Set r13 to r13 plus a11 multiplied by b2
+    Set r13 to r13 plus a12 multiplied by b1
+    Set r13 to r13 plus a13 multiplied by b0
+    Let r14 be a0 multiplied by b14
+    Set r14 to r14 plus a1 multiplied by b13
+    Set r14 to r14 plus a2 multiplied by b12
+    Set r14 to r14 plus a3 multiplied by b11
+    Set r14 to r14 plus a4 multiplied by b10
+    Set r14 to r14 plus a5 multiplied by b9
+    Set r14 to r14 plus a6 multiplied by b8
+    Set r14 to r14 plus a7 multiplied by b7
+    Set r14 to r14 plus a8 multiplied by b6
+    Set r14 to r14 plus a9 multiplied by b5
+    Set r14 to r14 plus a10 multiplied by b4
+    Set r14 to r14 plus a11 multiplied by b3
+    Set r14 to r14 plus a12 multiplied by b2
+    Set r14 to r14 plus a13 multiplied by b1
+    Set r14 to r14 plus a14 multiplied by b0
+    Let r15 be a0 multiplied by b15
+    Set r15 to r15 plus a1 multiplied by b14
+    Set r15 to r15 plus a2 multiplied by b13
+    Set r15 to r15 plus a3 multiplied by b12
+    Set r15 to r15 plus a4 multiplied by b11
+    Set r15 to r15 plus a5 multiplied by b10
+    Set r15 to r15 plus a6 multiplied by b9
+    Set r15 to r15 plus a7 multiplied by b8
+    Set r15 to r15 plus a8 multiplied by b7
+    Set r15 to r15 plus a9 multiplied by b6
+    Set r15 to r15 plus a10 multiplied by b5
+    Set r15 to r15 plus a11 multiplied by b4
+    Set r15 to r15 plus a12 multiplied by b3
+    Set r15 to r15 plus a13 multiplied by b2
+    Set r15 to r15 plus a14 multiplied by b1
+    Set r15 to r15 plus a15 multiplied by b0
+
+    Let r16 be a1 multiplied by b15
+    Set r16 to r16 plus a2 multiplied by b14
+    Set r16 to r16 plus a3 multiplied by b13
+    Set r16 to r16 plus a4 multiplied by b12
+    Set r16 to r16 plus a5 multiplied by b11
+    Set r16 to r16 plus a6 multiplied by b10
+    Set r16 to r16 plus a7 multiplied by b9
+    Set r16 to r16 plus a8 multiplied by b8
+    Set r16 to r16 plus a9 multiplied by b7
+    Set r16 to r16 plus a10 multiplied by b6
+    Set r16 to r16 plus a11 multiplied by b5
+    Set r16 to r16 plus a12 multiplied by b4
+    Set r16 to r16 plus a13 multiplied by b3
+    Set r16 to r16 plus a14 multiplied by b2
+    Set r16 to r16 plus a15 multiplied by b1
+    Let r17 be a2 multiplied by b15
+    Set r17 to r17 plus a3 multiplied by b14
+    Set r17 to r17 plus a4 multiplied by b13
+    Set r17 to r17 plus a5 multiplied by b12
+    Set r17 to r17 plus a6 multiplied by b11
+    Set r17 to r17 plus a7 multiplied by b10
+    Set r17 to r17 plus a8 multiplied by b9
+    Set r17 to r17 plus a9 multiplied by b8
+    Set r17 to r17 plus a10 multiplied by b7
+    Set r17 to r17 plus a11 multiplied by b6
+    Set r17 to r17 plus a12 multiplied by b5
+    Set r17 to r17 plus a13 multiplied by b4
+    Set r17 to r17 plus a14 multiplied by b3
+    Set r17 to r17 plus a15 multiplied by b2
+    Let r18 be a3 multiplied by b15
+    Set r18 to r18 plus a4 multiplied by b14
+    Set r18 to r18 plus a5 multiplied by b13
+    Set r18 to r18 plus a6 multiplied by b12
+    Set r18 to r18 plus a7 multiplied by b11
+    Set r18 to r18 plus a8 multiplied by b10
+    Set r18 to r18 plus a9 multiplied by b9
+    Set r18 to r18 plus a10 multiplied by b8
+    Set r18 to r18 plus a11 multiplied by b7
+    Set r18 to r18 plus a12 multiplied by b6
+    Set r18 to r18 plus a13 multiplied by b5
+    Set r18 to r18 plus a14 multiplied by b4
+    Set r18 to r18 plus a15 multiplied by b3
+    Let r19 be a4 multiplied by b15
+    Set r19 to r19 plus a5 multiplied by b14
+    Set r19 to r19 plus a6 multiplied by b13
+    Set r19 to r19 plus a7 multiplied by b12
+    Set r19 to r19 plus a8 multiplied by b11
+    Set r19 to r19 plus a9 multiplied by b10
+    Set r19 to r19 plus a10 multiplied by b9
+    Set r19 to r19 plus a11 multiplied by b8
+    Set r19 to r19 plus a12 multiplied by b7
+    Set r19 to r19 plus a13 multiplied by b6
+    Set r19 to r19 plus a14 multiplied by b5
+    Set r19 to r19 plus a15 multiplied by b4
+    Let r20 be a5 multiplied by b15
+    Set r20 to r20 plus a6 multiplied by b14
+    Set r20 to r20 plus a7 multiplied by b13
+    Set r20 to r20 plus a8 multiplied by b12
+    Set r20 to r20 plus a9 multiplied by b11
+    Set r20 to r20 plus a10 multiplied by b10
+    Set r20 to r20 plus a11 multiplied by b9
+    Set r20 to r20 plus a12 multiplied by b8
+    Set r20 to r20 plus a13 multiplied by b7
+    Set r20 to r20 plus a14 multiplied by b6
+    Set r20 to r20 plus a15 multiplied by b5
+    Let r21 be a6 multiplied by b15
+    Set r21 to r21 plus a7 multiplied by b14
+    Set r21 to r21 plus a8 multiplied by b13
+    Set r21 to r21 plus a9 multiplied by b12
+    Set r21 to r21 plus a10 multiplied by b11
+    Set r21 to r21 plus a11 multiplied by b10
+    Set r21 to r21 plus a12 multiplied by b9
+    Set r21 to r21 plus a13 multiplied by b8
+    Set r21 to r21 plus a14 multiplied by b7
+    Set r21 to r21 plus a15 multiplied by b6
+    Let r22 be a7 multiplied by b15
+    Set r22 to r22 plus a8 multiplied by b14
+    Set r22 to r22 plus a9 multiplied by b13
+    Set r22 to r22 plus a10 multiplied by b12
+    Set r22 to r22 plus a11 multiplied by b11
+    Set r22 to r22 plus a12 multiplied by b10
+    Set r22 to r22 plus a13 multiplied by b9
+    Set r22 to r22 plus a14 multiplied by b8
+    Set r22 to r22 plus a15 multiplied by b7
+    Let r23 be a8 multiplied by b15
+    Set r23 to r23 plus a9 multiplied by b14
+    Set r23 to r23 plus a10 multiplied by b13
+    Set r23 to r23 plus a11 multiplied by b12
+    Set r23 to r23 plus a12 multiplied by b11
+    Set r23 to r23 plus a13 multiplied by b10
+    Set r23 to r23 plus a14 multiplied by b9
+    Set r23 to r23 plus a15 multiplied by b8
+    Let r24 be a9 multiplied by b15
+    Set r24 to r24 plus a10 multiplied by b14
+    Set r24 to r24 plus a11 multiplied by b13
+    Set r24 to r24 plus a12 multiplied by b12
+    Set r24 to r24 plus a13 multiplied by b11
+    Set r24 to r24 plus a14 multiplied by b10
+    Set r24 to r24 plus a15 multiplied by b9
+    Let r25 be a10 multiplied by b15
+    Set r25 to r25 plus a11 multiplied by b14
+    Set r25 to r25 plus a12 multiplied by b13
+    Set r25 to r25 plus a13 multiplied by b12
+    Set r25 to r25 plus a14 multiplied by b11
+    Set r25 to r25 plus a15 multiplied by b10
+    Let r26 be a11 multiplied by b15
+    Set r26 to r26 plus a12 multiplied by b14
+    Set r26 to r26 plus a13 multiplied by b13
+    Set r26 to r26 plus a14 multiplied by b12
+    Set r26 to r26 plus a15 multiplied by b11
+    Let r27 be a12 multiplied by b15
+    Set r27 to r27 plus a13 multiplied by b14
+    Set r27 to r27 plus a14 multiplied by b13
+    Set r27 to r27 plus a15 multiplied by b12
+    Let r28 be a13 multiplied by b15
+    Set r28 to r28 plus a14 multiplied by b14
+    Set r28 to r28 plus a15 multiplied by b13
+    Let r29 be a14 multiplied by b15
+    Set r29 to r29 plus a15 multiplied by b14
+    Let r30 be a15 multiplied by b15
+
+    Note: Goldilocks reduction. Each r[i+16] for i in [0..14] contributes
+    Note: +1 to r[i] (the "+1" part of 2^448 = 2^224 + 1) and +1 to r[i+8]
+    Note: (the "+2^224" part). Since (i+8) for i in [0..7] lands in
+    Note: [8..15], that's a direct contribution. For i >= 8, (i+8) >= 16,
+    Note: so the contribution itself folds: limb (i+8) is a high limb
+    Note: that contributes to (i+8-16) = i-8 and (i+8-8) = i. We expand
+    Note: the iterated folds inline.
+
+    Note: First fold (r16..r30 -> r0..r22, then r17..r22 -> r1..r14, etc.)
+    Note: But it's cleaner to just compute the final r0..r15 by
+    Note: substituting both contributions of each high limb directly.
+
+    Note: For each high index k in [16, 30]:
+    Note:   contribution to limb (k - 16): always (single +1 from 2^448 = 2^224 + 1, the "+1" part)
+    Note:   contribution to limb (k - 8) for k - 8 < 16: direct (the "+2^224" part)
+    Note:                  for k - 8 >= 16: nested fold; (k-8) is a high limb of [16, 22]:
+    Note:                    contributes to (k-8-16) = k-24 and (k-8-8) = k-16
+    Note: Net direct contributions of r[k]:
+    Note:   k=16:  to r[0]    (16-16) and r[8]    (16-8) -- both single hops
+    Note:   k=17:  to r[1]    and r[9]
+    Note:   ...
+    Note:   k=23:  to r[7]    and r[15]
+    Note:   k=24:  to r[8]    (24-16) and r[16]  -- (24-8); r[16] folds to r[0] and r[8]
+    Note:                                            => net contributions r[0] (1) + r[8] (1 + 1) = r[8] doubled
+    Note:   k=25:  to r[9]    and r[17] -> r[1] and r[9]
+    Note:                                            => r[1] (1) + r[9] (1 + 1)
+    Note:   ...
+    Note:   k=30:  to r[14]   and r[22] -> r[6] and r[14]
+    Note:                                            => r[6] (1) + r[14] (1 + 1)
+
+    Note: After the iterated folds for k in [16..30]:
+    Note:   r[i] for i in [0..6]: gets contributions from k=i+16 (single) and (if k=i+24<=30) k=i+24 (single via deeper fold)
+    Note:   r[i] for i=7: gets contributions from k=23 (only)
+    Note:   r[i] for i in [8..14]: gets contributions from k=i+8 (single, from deeper fold of k=i+16) AND
+    Note:                          k=i+16 if i+16 < 31 ((only valid for i<=14: yes, since k=i+16 in [24..30] is valid))
+    Note:                          plus contributions from k=i+8 (single direct hop from r[i+8]=high if i+8>=16)
+    Note:   r[15]: contribution from r[23] (k=23 maps to r[15]) and nothing higher (r[31] doesn't exist)
+    Note: Simpler restatement (the Goldilocks fold rule):
+    Note:   r[i] += r[i+16] + r[i+8]_high   where the second term applies only if i+8 corresponds to a high index
+    Note: Let's just directly compute the FINAL limbs using inline additions.
+
+    Note: First-level fold: r[i+8] += r[i+16] for i in [0..6] (since r[i+16] for i in [0..6] are high limbs that contribute to position i+16-8=i+8).
+    Note: But r[i+8] for i in [0..6] are LOW limbs (i+8 in [8..14]), so they remain final limbs.
+
+    Note: Wait. Let me restate the Goldilocks reduction clearly.
+    Note:   p = 2^448 - 2^224 - 1
+    Note:   2^448 = 2^224 + 1 (mod p)
+    Note: A multi-precision value h with limbs h[0..30] (radix 2^28) represents
+    Note:   sum_{i=0..30} h[i] * 2^(28*i)
+    Note: For i in [16..30], 2^(28*i) = 2^(28*i - 448) * 2^448 = 2^(28*i-448) * (2^224 + 1)
+    Note:                            = 2^(28*(i-16)) * (2^224 + 1)
+    Note:                            = 2^(28*(i-16)) + 2^(28*(i-16) + 224)
+    Note:                            = 2^(28*(i-16)) + 2^(28*(i-16) + 28*8)
+    Note:                            = 2^(28*(i-16)) + 2^(28*(i-8))
+    Note: So h[i] for i in [16..30] contributes to limbs (i-16) and (i-8).
+
+    Note: For i in [16..22], (i-8) is in [8..14] (still a low limb).
+    Note: For i in [23..30], (i-8) is in [15..22]. (i-8 in [16..22] for i in [24..30])
+    Note:    => i-8 itself is a "second-level high limb", and recursively contributes to (i-8-16) = i-24 and (i-8-8) = i-16.
+
+    Note: So the FULL reduction rules:
+    Note:   For i in [16..23]: r[i] adds to r[i-16] and r[i-8]
+    Note:   For i in [24..30]: r[i] adds to r[i-16] (direct +1) and to r[i-8] (which is a high limb in [16..22]).
+    Note:        That high contribution itself folds: into r[i-24] and r[i-16].
+    Note:        So net additions from r[i]: +1 to r[i-16], +1 to r[i-16] (via second hop), +1 to r[i-24]
+    Note:        = +2 to r[i-16] and +1 to r[i-24].
+    Note:        Equivalently: r[i] contributes 2*r[i] to r[i-16] and 1*r[i] to r[i-24], for i in [24..30].
+
+    Note: Note that r[i-8] for i in [16..23] (i.e., i-8 in [8..15]) is a normal low limb that just collects an addition.
+
+    Note: Build final limbs:
+
+    Let f0 be r0 plus r16 plus 2 multiplied by r24
+    Let f1 be r1 plus r17 plus 2 multiplied by r25
+    Let f2 be r2 plus r18 plus 2 multiplied by r26
+    Let f3 be r3 plus r19 plus 2 multiplied by r27
+    Let f4 be r4 plus r20 plus 2 multiplied by r28
+    Let f5 be r5 plus r21 plus 2 multiplied by r29
+    Let f6 be r6 plus r22 plus 2 multiplied by r30
+    Let f7 be r7 plus r23
+    Let f8 be r8 plus r16 plus r24
+    Let f9 be r9 plus r17 plus r25
+    Let f10 be r10 plus r18 plus r26
+    Let f11 be r11 plus r19 plus r27
+    Let f12 be r12 plus r20 plus r28
+    Let f13 be r13 plus r21 plus r29
+    Let f14 be r14 plus r22 plus r30
+    Let f15 be r15 plus r23
+
+    Memory.memory_set_qword(dest, 0, f0)
+    Memory.memory_set_qword(dest, 8, f1)
+    Memory.memory_set_qword(dest, 16, f2)
+    Memory.memory_set_qword(dest, 24, f3)
+    Memory.memory_set_qword(dest, 32, f4)
+    Memory.memory_set_qword(dest, 40, f5)
+    Memory.memory_set_qword(dest, 48, f6)
+    Memory.memory_set_qword(dest, 56, f7)
+    Memory.memory_set_qword(dest, 64, f8)
+    Memory.memory_set_qword(dest, 72, f9)
+    Memory.memory_set_qword(dest, 80, f10)
+    Memory.memory_set_qword(dest, 88, f11)
+    Memory.memory_set_qword(dest, 96, f12)
+    Memory.memory_set_qword(dest, 104, f13)
+    Memory.memory_set_qword(dest, 112, f14)
+    Memory.memory_set_qword(dest, 120, f15)
+
+    proc fe448_carry with dest
+    Return 1
+End Process
+
+Process called "fe448_sqr" takes dest as Integer, a as Integer returns Integer:
+    @Reasoning
+    Squaring of a 16-limb field element. Delegated to fe448_mul with
+    b = a for simplicity and shared correctness with the audited mul
+    kernel. A specialized squaring schedule would halve the cross-
+    product count at the cost of separate parity bookkeeping; we accept
+    the constant-factor cost in exchange for a single reviewed kernel.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time, inherited from fe448_mul.
+    @End Security_Scope
+
+    proc fe448_mul with dest, a, a
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Conditional swap and select
+Note: ============================================================================
+
+Process called "fe448_cswap" takes a as Integer, b as Integer, swap_bit as Integer returns Integer:
+    @Reasoning
+    Constant-time conditional swap of two field elements, branchless.
+    Same XOR-with-mask pattern as fe25519_cswap, adapted to 16 limbs.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: same instruction sequence regardless of swap_bit.
+    @End Security_Scope
+
+    Let mask be 0 minus swap_bit
+    Let i be 0
+    While i is less than 16:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Let bi be Memory.memory_get_int64(b, i multiplied by 8)
+        Let xored be ai bitwise_xor bi
+        Let t be xored bitwise_and mask
+        Memory.memory_set_qword(a, i multiplied by 8, ai bitwise_xor t)
+        Memory.memory_set_qword(b, i multiplied by 8, bi bitwise_xor t)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe448_select" takes dest as Integer, a as Integer, b as Integer, condition as Integer returns Integer:
+    @Reasoning
+    Constant-time conditional move: dest := a if condition=1, else b.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let mask be 0 minus condition
+    Let not_mask be mask bitwise_xor 0 minus 1
+    Let i be 0
+    While i is less than 16:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Let bi be Memory.memory_get_int64(b, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, (ai bitwise_and mask) bitwise_or (bi bitwise_and not_mask))
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: Pack/Unpack (field element <-> 56 bytes)
+Note: ============================================================================
+
+Process called "fe448_unpack" takes fe as Integer, bytes56 as Integer returns Integer:
+    @Reasoning
+    Decodes a 56-byte little-endian buffer into a 16-limb radix-2^28
+    field element. Each limb is 28 bits; pairs of consecutive limbs
+    span 7 bytes. Specifically, limb i takes bits [28i, 28i+28). We
+    extract 4 bytes per limb pair with a 4-bit shift mid-pair.
+
+    Layout: 56 bytes = 8 groups of 7 bytes, each group encoding 2 limbs.
+    For group g (g in [0, 8)):
+      base = 7 * g
+      limb (2g)   = byte[base+0] | byte[base+1]<<8 | byte[base+2]<<16 | (byte[base+3] & 0x0F)<<24
+      limb (2g+1) = byte[base+3]>>4 | byte[base+4]<<4 | byte[base+5]<<12 | byte[base+6]<<20
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time byte unpacking; no branches.
+    @End Security_Scope
+
+    Let g be 0
+    While g is less than 8:
+        Let base be g multiplied by 7
+        Let b0 be Memory.memory_get_byte(bytes56, base)
+        Let b1 be Memory.memory_get_byte(bytes56, base plus 1)
+        Let b2 be Memory.memory_get_byte(bytes56, base plus 2)
+        Let b3 be Memory.memory_get_byte(bytes56, base plus 3)
+        Let b4 be Memory.memory_get_byte(bytes56, base plus 4)
+        Let b5 be Memory.memory_get_byte(bytes56, base plus 5)
+        Let b6 be Memory.memory_get_byte(bytes56, base plus 6)
+
+        Let lo_limb be b0
+        Set lo_limb to lo_limb plus b1 multiplied by 256
+        Set lo_limb to lo_limb plus b2 multiplied by 65536
+        Set lo_limb to lo_limb plus (b3 bitwise_and 15) multiplied by 16777216
+
+        Let hi_limb be b3 shifted right by 4
+        Set hi_limb to hi_limb plus b4 multiplied by 16
+        Set hi_limb to hi_limb plus b5 multiplied by 4096
+        Set hi_limb to hi_limb plus b6 multiplied by 1048576
+
+        Memory.memory_set_qword(fe, g multiplied by 16, lo_limb)
+        Memory.memory_set_qword(fe, g multiplied by 16 plus 8, hi_limb)
+        Set g to g plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe448_freeze" takes fe as Integer returns Integer:
+    @Reasoning
+    Brings the field element to its unique canonical representative
+    in [0, p). Two carry passes followed by a constant-time
+    subtraction of p if the value is >= p.
+
+    p = 2^448 - 2^224 - 1, so p in 16 limbs of 28-bit is:
+      limbs 0..7:    2^28 - 1 except limb 0 = 2^28 - 1
+      Actually: p = (2^224 - 1) * 2^224 + (2^224 - 1)
+                  = (2^28-1)*2^(28*8) - (2^28-1)*... wait, let me restate.
+      p in radix 2^28: 16 limbs where
+        limb i = 2^28 - 1 = 268435455  for i in [0, 7]  (since these limbs sum to 2^224 - 1)
+        limb 8 = 2^28 - 2 = 268435454                   (since limb 8 contributes the boundary)
+        limb i = 2^28 - 1 = 268435455  for i in [9, 15] (sum to (2^224 - 1) * 2^224)
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    proc fe448_carry with fe
+    proc fe448_carry with fe
+
+    Note: Compute h + (p+1) and check if it overflowed (i.e., h was >= p-1).
+    Note: A simpler approach: try h - p, and select between h and h-p
+    Note: branchlessly based on the borrow.
+
+    Note: Build p in 16 limbs.
+    Note: p limbs (LSB first, radix 2^28):
+    Note:   l[0..7]  = 268435455
+    Note:   l[8]     = 268435454
+    Note:   l[9..15] = 268435455
+
+    Note: Compute t = h - p with borrow.
+    Let h0 be Memory.memory_get_int64(fe, 0)
+    Let h1 be Memory.memory_get_int64(fe, 8)
+    Let h2 be Memory.memory_get_int64(fe, 16)
+    Let h3 be Memory.memory_get_int64(fe, 24)
+    Let h4 be Memory.memory_get_int64(fe, 32)
+    Let h5 be Memory.memory_get_int64(fe, 40)
+    Let h6 be Memory.memory_get_int64(fe, 48)
+    Let h7 be Memory.memory_get_int64(fe, 56)
+    Let h8 be Memory.memory_get_int64(fe, 64)
+    Let h9 be Memory.memory_get_int64(fe, 72)
+    Let h10 be Memory.memory_get_int64(fe, 80)
+    Let h11 be Memory.memory_get_int64(fe, 88)
+    Let h12 be Memory.memory_get_int64(fe, 96)
+    Let h13 be Memory.memory_get_int64(fe, 104)
+    Let h14 be Memory.memory_get_int64(fe, 112)
+    Let h15 be Memory.memory_get_int64(fe, 120)
+
+    Let mask be 268435455
+
+    Note: Subtract p from h, limb by limb with borrow propagation.
+    Note: Use signed Integer arithmetic; the borrow is captured as
+    Note: the high bit of the (signed) difference.
+
+    Let t0 be h0 minus 268435455
+    Let borrow be t0 shifted right by 28
+    Note: borrow is -1 if t0 < 0, 0 otherwise.
+    Set t0 to t0 bitwise_and mask
+
+    Let t1 be h1 minus 268435455 plus borrow
+    Set borrow to t1 shifted right by 28
+    Set t1 to t1 bitwise_and mask
+
+    Let t2 be h2 minus 268435455 plus borrow
+    Set borrow to t2 shifted right by 28
+    Set t2 to t2 bitwise_and mask
+
+    Let t3 be h3 minus 268435455 plus borrow
+    Set borrow to t3 shifted right by 28
+    Set t3 to t3 bitwise_and mask
+
+    Let t4 be h4 minus 268435455 plus borrow
+    Set borrow to t4 shifted right by 28
+    Set t4 to t4 bitwise_and mask
+
+    Let t5 be h5 minus 268435455 plus borrow
+    Set borrow to t5 shifted right by 28
+    Set t5 to t5 bitwise_and mask
+
+    Let t6 be h6 minus 268435455 plus borrow
+    Set borrow to t6 shifted right by 28
+    Set t6 to t6 bitwise_and mask
+
+    Let t7 be h7 minus 268435455 plus borrow
+    Set borrow to t7 shifted right by 28
+    Set t7 to t7 bitwise_and mask
+
+    Let t8 be h8 minus 268435454 plus borrow
+    Set borrow to t8 shifted right by 28
+    Set t8 to t8 bitwise_and mask
+
+    Let t9 be h9 minus 268435455 plus borrow
+    Set borrow to t9 shifted right by 28
+    Set t9 to t9 bitwise_and mask
+
+    Let t10 be h10 minus 268435455 plus borrow
+    Set borrow to t10 shifted right by 28
+    Set t10 to t10 bitwise_and mask
+
+    Let t11 be h11 minus 268435455 plus borrow
+    Set borrow to t11 shifted right by 28
+    Set t11 to t11 bitwise_and mask
+
+    Let t12 be h12 minus 268435455 plus borrow
+    Set borrow to t12 shifted right by 28
+    Set t12 to t12 bitwise_and mask
+
+    Let t13 be h13 minus 268435455 plus borrow
+    Set borrow to t13 shifted right by 28
+    Set t13 to t13 bitwise_and mask
+
+    Let t14 be h14 minus 268435455 plus borrow
+    Set borrow to t14 shifted right by 28
+    Set t14 to t14 bitwise_and mask
+
+    Let t15 be h15 minus 268435455 plus borrow
+    Let final_borrow be t15 shifted right by 28
+    Set t15 to t15 bitwise_and mask
+
+    Note: final_borrow == 0 means h - p >= 0 (h was >= p), so use t.
+    Note: final_borrow == -1 means h - p < 0 (h < p), so use h.
+    Note: select_mask: all-ones if h>=p (use t), all-zeros if h<p (use h).
+    Let use_t_mask be final_borrow plus 1
+    Note: final_borrow is 0 or -1; +1 gives 1 or 0. Build to all-ones via negation.
+    Let select_mask be 0 minus use_t_mask
+    Let not_select_mask be select_mask bitwise_xor 0 minus 1
+
+    Memory.memory_set_qword(fe, 0, (t0 bitwise_and select_mask) bitwise_or (h0 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 8, (t1 bitwise_and select_mask) bitwise_or (h1 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 16, (t2 bitwise_and select_mask) bitwise_or (h2 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 24, (t3 bitwise_and select_mask) bitwise_or (h3 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 32, (t4 bitwise_and select_mask) bitwise_or (h4 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 40, (t5 bitwise_and select_mask) bitwise_or (h5 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 48, (t6 bitwise_and select_mask) bitwise_or (h6 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 56, (t7 bitwise_and select_mask) bitwise_or (h7 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 64, (t8 bitwise_and select_mask) bitwise_or (h8 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 72, (t9 bitwise_and select_mask) bitwise_or (h9 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 80, (t10 bitwise_and select_mask) bitwise_or (h10 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 88, (t11 bitwise_and select_mask) bitwise_or (h11 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 96, (t12 bitwise_and select_mask) bitwise_or (h12 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 104, (t13 bitwise_and select_mask) bitwise_or (h13 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 112, (t14 bitwise_and select_mask) bitwise_or (h14 bitwise_and not_select_mask))
+    Memory.memory_set_qword(fe, 120, (t15 bitwise_and select_mask) bitwise_or (h15 bitwise_and not_select_mask))
+    Return 1
+End Process
+
+Process called "fe448_pack" takes fe as Integer, bytes56_out as Integer returns Integer:
+    @Reasoning
+    Packs a field element to 56 bytes little-endian. Each pair of
+    limbs (28-bit + 28-bit) packs into 7 bytes.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    proc fe448_freeze with fe
+
+    Let g be 0
+    While g is less than 8:
+        Let base be g multiplied by 7
+        Let lo_limb be Memory.memory_get_int64(fe, g multiplied by 16)
+        Let hi_limb be Memory.memory_get_int64(fe, g multiplied by 16 plus 8)
+
+        Memory.memory_set_byte(bytes56_out, base, lo_limb bitwise_and 255)
+        Memory.memory_set_byte(bytes56_out, base plus 1, (lo_limb shifted right by 8) bitwise_and 255)
+        Memory.memory_set_byte(bytes56_out, base plus 2, (lo_limb shifted right by 16) bitwise_and 255)
+        Memory.memory_set_byte(bytes56_out, base plus 3, ((lo_limb shifted right by 24) bitwise_or (hi_limb multiplied by 16)) bitwise_and 255)
+        Memory.memory_set_byte(bytes56_out, base plus 4, (hi_limb shifted right by 4) bitwise_and 255)
+        Memory.memory_set_byte(bytes56_out, base plus 5, (hi_limb shifted right by 12) bitwise_and 255)
+        Memory.memory_set_byte(bytes56_out, base plus 6, (hi_limb shifted right by 20) bitwise_and 255)
+        Set g to g plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 7: Equality and zero tests
+Note: ============================================================================
+
+Process called "fe448_is_zero" takes fe as Integer returns Integer:
+    @Reasoning
+    Constant-time zero test (mod p). Freezes the input and ORs all
+    limbs together.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    proc fe448_freeze with fe
+    Let or_acc be 0
+    Let i be 0
+    While i is less than 16:
+        Let limb be Memory.memory_get_int64(fe, i multiplied by 8)
+        Set or_acc to or_acc bitwise_or limb
+        Set i to i plus 1
+    End While
+    Let neg_or be 0 minus or_acc
+    Let or_or_neg be or_acc bitwise_or neg_or
+    Let nonzero_bit be (or_or_neg shifted right by 63) bitwise_and 1
+    Return 1 minus nonzero_bit
+End Process
+
+Process called "fe448_is_negative" takes fe as Integer returns Integer:
+    @Reasoning
+    Returns the LSB of the canonical representative. Used for Ed448
+    point encoding (the sign of x is encoded in a separate byte).
+    @End Reasoning
+
+    proc fe448_freeze with fe
+    Let h0 be Memory.memory_get_int64(fe, 0)
+    Return h0 bitwise_and 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 8: Inversion via Fermat (a^(p-2) mod p)
+Note: ============================================================================
+
+Process called "fe448_inv" takes arena as Integer, dest as Integer, a as Integer returns Integer:
+    @Reasoning
+    Computes a^-1 (mod p) via Fermat: a^(p-2) where p = 2^448 - 2^224 - 1.
+      p - 2 = 2^448 - 2^224 - 3
+
+    Strategy (addition chain optimized for Goldilocks):
+      Let t = a^(2^223 - 1)  (Frobenius-style sub-chain)
+      Compute step by step using consecutive squarings and a few
+      multiplications:
+        a^2, a^3, a^(2^2-1), a^(2^4-1), a^(2^8-1), a^(2^16-1),
+        a^(2^32-1), a^(2^64-1), a^(2^128-1), a^(2^224-1)
+      Final assembly:
+        t = (a^(2^224 - 1))^2 * a              = a^(2^225 - 1)
+        u = t^(2^223) * (a^(2^223 - 1))         = a^(2^448 - 2^224 - 1) ... etc
+
+    The chain below builds a^(2^448 - 2^224 - 3) directly:
+      r = a^(2^448 - 2^224 - 1) / a^2
+        = a^((2^448 - 2^224 - 1) - 2)
+        = a^(p - 2)
+
+    Reference: Hamburg "Ed448-Goldilocks" appendix, addition chain
+    similar to ed448-donna's invert function.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: fixed chain length and fixed sequence of squarings
+    and multiplications.
+    @End Security_Scope
+
+    Let t1 be proc fe448_alloc with arena
+    Let t2 be proc fe448_alloc with arena
+    Let t3 be proc fe448_alloc with arena
+    If t1 is equal to 0:
+        Return 0
+    End If
+    If t3 is equal to 0:
+        Return 0
+    End If
+
+    Note: t1 = a^2
+    proc fe448_sqr with t1, a
+    Note: t1 = a^3 = a^2 * a
+    proc fe448_mul with t1, t1, a
+    Note: t1 = a^(2^2 - 1) = a^3   (same value)
+    Note: Square once: t2 = a^(2^2) = a^4
+    proc fe448_sqr with t2, t1
+    Note: t1 = a^(2^3 - 1) = t1^2 * a = a^4 * a = a^5? Actually 2^3-1=7.
+    Note: Use careful Brauer chain:
+
+    Note: Standard sliding-window chain for Goldilocks inversion (works
+    Note: regardless of cleverness):
+    Note:   r = a; loop e = p - 2 = bit-by-bit; for each bit b from MSB
+    Note:   to LSB: r = r^2; if b: r *= a.
+    Note: 448 squarings + ~224 multiplications. Slow but constant-time.
+
+    Note: Implement the straightforward binary chain using p_minus_2 as
+    Note: a bit sequence read from a fixed byte buffer.
+
+    proc fe448_set_one with t1
+    Let p_m2_bytes be Arena.arena_allocate(arena, 56)
+    If p_m2_bytes is equal to 0:
+        Return 0
+    End If
+    Note: p - 2 in 56 bytes little-endian:
+    Note: p - 2 = 2^448 - 2^224 - 3
+    Note:       = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE
+    Note:         FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE
+    Note: Bytes (LE): byte 0 = 0xFD (=253), bytes 1..27 = 0xFF, byte 28 = 0xFE,
+    Note:            bytes 29..55 = 0xFF.
+    Memory.memory_set_byte(p_m2_bytes, 0, 253)
+    Let pi be 1
+    While pi is less than 28:
+        Memory.memory_set_byte(p_m2_bytes, pi, 255)
+        Set pi to pi plus 1
+    End While
+    Memory.memory_set_byte(p_m2_bytes, 28, 254)
+    Set pi to 29
+    While pi is less than 56:
+        Memory.memory_set_byte(p_m2_bytes, pi, 255)
+        Set pi to pi plus 1
+    End While
+
+    Note: Square-and-multiply from MSB. Loop over bit_index from 447 down to 0.
+    Let bit_index be 447
+    While bit_index is greater than 0 minus 1:
+        proc fe448_sqr with t1, t1
+        Let byte_index be bit_index shifted right by 3
+        Let bit_in_byte be bit_index bitwise_and 7
+        Let byte_val be Memory.memory_get_byte(p_m2_bytes, byte_index)
+        Let bit_val be (byte_val shifted right by bit_in_byte) bitwise_and 1
+        Note: If bit set, multiply t1 by a; otherwise keep t1 (constant-time select).
+        proc fe448_mul with t2, t1, a
+        proc fe448_select with t1, t2, t1, bit_val
+        Set bit_index to bit_index minus 1
+    End While
+
+    proc fe448_copy with dest, t1
+    Return 1
+End Process

@@ -1,0 +1,377 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Unit tests for compiler/frontend/primitives/streams/buffered_io.runa.
+
+The lifecycle / tag-dispatch tests use fd 0 as a synthetic descriptor:
+the buffer machinery does not touch the fd until a syscall is requested,
+so this exercises the record fields in isolation.
+
+The read_line tests below DO perform real file I/O. Each test writes
+known content to /tmp/runa_test_bio_*.txt via the FIO primitives, opens
+the file with fio_open_read, drives buffered_reader_read_line through
+the LF / CRLF / bare-CR / refill-boundary / EOF-without-terminator
+cases, and confirms the returned payload byte-by-byte. Temp files are
+left on /tmp after the run; the host shell or test harness cleans them
+up between sessions and there is no portable unlink primitive exposed
+from this layer.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/frontend/primitives/streams/buffered_io.runa" as BIO
+Import "compiler/frontend/primitives/io/file_io.runa" as FIO
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+Process called "test_buffered_reader_create_default" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.reader_create_default")
+    Let r be BIO.buffered_reader_create(0, 0)
+    T.assert_not_null(results, "default-size reader allocated", r)
+    T.assert_equal(results, "tag reports READER", BIO.buffered_io_tag(r), 1)
+    T.assert_equal(results, "is_reader returns 1", BIO.buffered_io_is_reader(r), 1)
+    T.assert_equal(results, "is_writer returns 0", BIO.buffered_io_is_writer(r), 0)
+    T.assert_equal(results, "no data available yet", BIO.buffered_reader_available(r), 0)
+    T.assert_equal(results, "fresh reader not at EOF", BIO.buffered_reader_eof(r), 0)
+    Return 1
+End Process
+
+Process called "test_buffered_reader_custom_size" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.reader_custom_size")
+    Let r be BIO.buffered_reader_create(0, 256)
+    T.assert_not_null(results, "reader with 256-byte buffer allocated", r)
+    T.assert_equal(results, "tag matches READER", BIO.buffered_io_tag(r), 1)
+    Return 1
+End Process
+
+Process called "test_buffered_writer_create_default" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.writer_create_default")
+    Let w be BIO.buffered_writer_create(0, 0)
+    T.assert_not_null(results, "default-size writer allocated", w)
+    T.assert_equal(results, "tag reports WRITER", BIO.buffered_io_tag(w), 2)
+    T.assert_equal(results, "is_writer returns 1", BIO.buffered_io_is_writer(w), 1)
+    T.assert_equal(results, "is_reader returns 0", BIO.buffered_io_is_reader(w), 0)
+    T.assert_equal(results, "writer starts with no pending bytes", BIO.buffered_writer_pending(w), 0)
+    T.assert_equal(results, "writer has no errors yet", BIO.buffered_writer_has_error(w), 0)
+    Return 1
+End Process
+
+Process called "test_writer_write_byte_tracks_position" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.write_byte_position")
+    Let w be BIO.buffered_writer_create(0, 64)
+    BIO.buffered_writer_write_byte(w, 65)
+    BIO.buffered_writer_write_byte(w, 66)
+    BIO.buffered_writer_write_byte(w, 67)
+    T.assert_equal(results, "three bytes pending", BIO.buffered_writer_pending(w), 3)
+    Return 1
+End Process
+
+Process called "test_reader_tag_mismatch_returns_error" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.tag_mismatch_on_writer_call")
+    Let r be BIO.buffered_reader_create(0, 64)
+    Note: Call writer-only flush on a reader handle; tag-mismatch path
+    Note: should return IO_ERR_TAG_MISMATCH (-4).
+    Let rc be BIO.buffered_writer_flush(r)
+    T.assert_equal(results, "flush on reader returns TAG_MISMATCH", rc, -4)
+    Return 1
+End Process
+
+Process called "test_writer_flush_empty_is_ok" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.flush_empty_ok")
+    Let w be BIO.buffered_writer_create(1, 64)
+    Let rc be BIO.buffered_writer_flush(w)
+    T.assert_equal(results, "empty flush returns OK", rc, 1)
+    Return 1
+End Process
+
+Process called "test_writer_pending_after_clamped_writes" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.writer_pending_zero_count")
+    Let w be BIO.buffered_writer_create(1, 64)
+    Let dummy be allocate(1)
+    Let rc be BIO.buffered_writer_write(w, dummy, 0)
+    T.assert_equal(results, "write(..., 0) returns 0", rc, 0)
+    T.assert_equal(results, "writer still has 0 pending", BIO.buffered_writer_pending(w), 0)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Helpers for the real-file read_line tests
+Note: ============================================================================
+
+Process called "bytes_match_string" that takes buf as Integer, length as Integer, expected as String, expected_length as Integer returns Integer:
+    Note: Compare the first `length` bytes of `buf` against the first
+    Note: `expected_length` bytes of `expected`. Returns 1 if length matches
+    Note: and every byte is equal, 0 otherwise. A null buf is never a match.
+    If buf is equal to 0:
+        Return 0
+    End If
+    If length is not equal to expected_length:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than length:
+        Let actual_byte be proc memory_get_byte from Mem with buf, i
+        Let expected_byte be proc memory_get_byte from Mem with expected, i
+        If actual_byte is not equal to expected_byte:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "open_temp_for_read" that takes path as String, content as String returns Integer:
+    Note: Write `content` to `path` (overwriting any existing file) and open
+    Note: the result for reading. Returns the fd on success or a negative
+    Note: value on failure. The caller owns the fd and must close it.
+    Let written be proc write_entire_file from FIO with path, content
+    If written is less than 0:
+        Return written
+    End If
+    Let fd be proc fio_open_read from FIO with path
+    Return fd
+End Process
+
+Note: ============================================================================
+Note: Real-file read_line tests
+Note: ============================================================================
+
+Process called "test_read_line_lf" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.read_line_lf")
+    Let path be "/tmp/runa_test_bio_lf.txt"
+    Let content be "alpha\nbeta\ngamma"
+    Let fd be open_temp_for_read(path, content)
+    T.assert_greater_than(results, "open_temp_for_read returned a valid fd", fd, -1)
+    If fd is less than 0:
+        Return 0
+    End If
+    Let r be proc buffered_reader_create from BIO with fd, 0
+    T.assert_not_null(results, "reader allocated for LF file", r)
+    Let len_holder be proc allocate from Memory with 8
+    T.assert_not_null(results, "len holder allocated", len_holder)
+
+    Let line1 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line1_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_not_null(results, "line 1 returned non-null buffer", line1)
+    T.assert_equal(results, "line 1 length is 5 (alpha)", line1_len, 5)
+    T.assert_equal(results, "line 1 content matches 'alpha'", bytes_match_string(line1, line1_len, "alpha", 5), 1)
+    If line1 is not equal to 0:
+        proc deallocate from Memory with line1
+    End If
+
+    Let line2 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line2_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_not_null(results, "line 2 returned non-null buffer", line2)
+    T.assert_equal(results, "line 2 length is 4 (beta)", line2_len, 4)
+    T.assert_equal(results, "line 2 content matches 'beta'", bytes_match_string(line2, line2_len, "beta", 4), 1)
+    If line2 is not equal to 0:
+        proc deallocate from Memory with line2
+    End If
+
+    Let line3 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line3_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_not_null(results, "line 3 returned non-null buffer (partial last line)", line3)
+    T.assert_equal(results, "line 3 length is 5 (gamma)", line3_len, 5)
+    T.assert_equal(results, "line 3 content matches 'gamma'", bytes_match_string(line3, line3_len, "gamma", 5), 1)
+    If line3 is not equal to 0:
+        proc deallocate from Memory with line3
+    End If
+
+    Let line4 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line4_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "line 4 returns 0 at EOF", line4, 0)
+    T.assert_equal(results, "line 4 length is 0 at EOF", line4_len, 0)
+
+    proc deallocate from Memory with len_holder
+    proc buffered_reader_close from BIO with r
+    Return 1
+End Process
+
+Process called "test_read_line_crlf" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.read_line_crlf")
+    Let path be "/tmp/runa_test_bio_crlf.txt"
+    Let content be "one\r\ntwo\r\nthree"
+    Let fd be open_temp_for_read(path, content)
+    T.assert_greater_than(results, "open_temp_for_read returned a valid fd", fd, -1)
+    If fd is less than 0:
+        Return 0
+    End If
+    Let r be proc buffered_reader_create from BIO with fd, 0
+    Let len_holder be proc allocate from Memory with 8
+
+    Let line1 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line1_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "CRLF line 1 length is 3 (one)", line1_len, 3)
+    T.assert_equal(results, "CRLF line 1 strips CR and LF", bytes_match_string(line1, line1_len, "one", 3), 1)
+    If line1 is not equal to 0:
+        proc deallocate from Memory with line1
+    End If
+
+    Let line2 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line2_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "CRLF line 2 length is 3 (two)", line2_len, 3)
+    T.assert_equal(results, "CRLF line 2 strips CR and LF", bytes_match_string(line2, line2_len, "two", 3), 1)
+    If line2 is not equal to 0:
+        proc deallocate from Memory with line2
+    End If
+
+    Let line3 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line3_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "CRLF line 3 length is 5 (three)", line3_len, 5)
+    T.assert_equal(results, "CRLF line 3 matches 'three'", bytes_match_string(line3, line3_len, "three", 5), 1)
+    If line3 is not equal to 0:
+        proc deallocate from Memory with line3
+    End If
+
+    Let line4 be proc buffered_reader_read_line from BIO with r, len_holder
+    T.assert_equal(results, "CRLF line 4 returns 0 at EOF", line4, 0)
+
+    proc deallocate from Memory with len_holder
+    proc buffered_reader_close from BIO with r
+    Return 1
+End Process
+
+Process called "test_read_line_cr_only" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.read_line_cr_only")
+    Let path be "/tmp/runa_test_bio_cr.txt"
+    Let content be "x\ry\rz"
+    Let fd be open_temp_for_read(path, content)
+    T.assert_greater_than(results, "open_temp_for_read returned a valid fd", fd, -1)
+    If fd is less than 0:
+        Return 0
+    End If
+    Let r be proc buffered_reader_create from BIO with fd, 0
+    Let len_holder be proc allocate from Memory with 8
+
+    Let line1 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line1_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "bare-CR line 1 length is 1 (x)", line1_len, 1)
+    T.assert_equal(results, "bare-CR line 1 matches 'x'", bytes_match_string(line1, line1_len, "x", 1), 1)
+    If line1 is not equal to 0:
+        proc deallocate from Memory with line1
+    End If
+
+    Let line2 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line2_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "bare-CR line 2 length is 1 (y)", line2_len, 1)
+    T.assert_equal(results, "bare-CR line 2 matches 'y'", bytes_match_string(line2, line2_len, "y", 1), 1)
+    If line2 is not equal to 0:
+        proc deallocate from Memory with line2
+    End If
+
+    Let line3 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line3_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "bare-CR line 3 length is 1 (z)", line3_len, 1)
+    T.assert_equal(results, "bare-CR line 3 matches 'z'", bytes_match_string(line3, line3_len, "z", 1), 1)
+    If line3 is not equal to 0:
+        proc deallocate from Memory with line3
+    End If
+
+    Let line4 be proc buffered_reader_read_line from BIO with r, len_holder
+    T.assert_equal(results, "bare-CR line 4 returns 0 at EOF", line4, 0)
+
+    proc deallocate from Memory with len_holder
+    proc buffered_reader_close from BIO with r
+    Return 1
+End Process
+
+Process called "test_read_line_crlf_across_refill" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.read_line_crlf_across_refill")
+    Let path be "/tmp/runa_test_bio_crlf_refill.txt"
+    Let content be "ab\r\ncd\r\nef"
+    Let fd be open_temp_for_read(path, content)
+    T.assert_greater_than(results, "open_temp_for_read returned a valid fd", fd, -1)
+    If fd is less than 0:
+        Return 0
+    End If
+    Note: 4-byte buffer forces the CRLF to straddle a refill boundary.
+    Note: After reading "ab\r" the buffer has 1 byte left ('\n') consumed by
+    Note: the post-CR peek; after reading "\ncd" the next refill brings
+    Note: "\nef" and read_line must still terminate cd at the previous CR.
+    Let r be proc buffered_reader_create from BIO with fd, 4
+    Let len_holder be proc allocate from Memory with 8
+
+    Let line1 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line1_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "refill line 1 length is 2 (ab)", line1_len, 2)
+    T.assert_equal(results, "refill line 1 matches 'ab'", bytes_match_string(line1, line1_len, "ab", 2), 1)
+    If line1 is not equal to 0:
+        proc deallocate from Memory with line1
+    End If
+
+    Let line2 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line2_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "refill line 2 length is 2 (cd)", line2_len, 2)
+    T.assert_equal(results, "refill line 2 matches 'cd'", bytes_match_string(line2, line2_len, "cd", 2), 1)
+    If line2 is not equal to 0:
+        proc deallocate from Memory with line2
+    End If
+
+    Let line3 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line3_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "refill line 3 length is 2 (ef)", line3_len, 2)
+    T.assert_equal(results, "refill line 3 matches 'ef'", bytes_match_string(line3, line3_len, "ef", 2), 1)
+    If line3 is not equal to 0:
+        proc deallocate from Memory with line3
+    End If
+
+    Let line4 be proc buffered_reader_read_line from BIO with r, len_holder
+    T.assert_equal(results, "refill line 4 returns 0 at EOF", line4, 0)
+
+    proc deallocate from Memory with len_holder
+    proc buffered_reader_close from BIO with r
+    Return 1
+End Process
+
+Process called "test_read_line_eof_no_terminator" that takes results as Integer returns Integer:
+    T.begin_suite(results, "buffered_io.read_line_eof_no_terminator")
+    Let path be "/tmp/runa_test_bio_eof.txt"
+    Let content be "tail"
+    Let fd be open_temp_for_read(path, content)
+    T.assert_greater_than(results, "open_temp_for_read returned a valid fd", fd, -1)
+    If fd is less than 0:
+        Return 0
+    End If
+    Let r be proc buffered_reader_create from BIO with fd, 0
+    Let len_holder be proc allocate from Memory with 8
+
+    Let line1 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line1_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_not_null(results, "partial last line returned non-null buffer", line1)
+    T.assert_equal(results, "partial last line length is 4 (tail)", line1_len, 4)
+    T.assert_equal(results, "partial last line matches 'tail'", bytes_match_string(line1, line1_len, "tail", 4), 1)
+    If line1 is not equal to 0:
+        proc deallocate from Memory with line1
+    End If
+
+    Let line2 be proc buffered_reader_read_line from BIO with r, len_holder
+    Let line2_len be proc memory_get_int64 from Mem with len_holder, 0
+    T.assert_equal(results, "follow-up call returns 0 at EOF", line2, 0)
+    T.assert_equal(results, "follow-up call length is 0 at EOF", line2_len, 0)
+
+    proc deallocate from Memory with len_holder
+    proc buffered_reader_close from BIO with r
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+    test_buffered_reader_create_default(results)
+    test_buffered_reader_custom_size(results)
+    test_buffered_writer_create_default(results)
+    test_writer_write_byte_tracks_position(results)
+    test_reader_tag_mismatch_returns_error(results)
+    test_writer_flush_empty_is_ok(results)
+    test_writer_pending_after_clamped_writes(results)
+    test_read_line_lf(results)
+    test_read_line_crlf(results)
+    test_read_line_cr_only(results)
+    test_read_line_crlf_across_refill(results)
+    test_read_line_eof_no_terminator(results)
+    T.print_summary(results)
+    Let exit_code be T.get_failed(results)
+    T.destroy_test_results(results)
+    Return exit_code
+End Process

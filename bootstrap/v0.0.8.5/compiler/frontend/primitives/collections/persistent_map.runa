@@ -1,0 +1,837 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+PERSISTENT MAP - Hash Array Mapped Trie (HAMT) Tier 0 Primitive
+
+This file implements an immutable hash map using a Hash Array Mapped
+Trie, as popularized by Clojure. The trie is keyed by the bits of a
+key's hash, split into 5-bit groups (so each level has up to 32
+children).
+
+Node types (discriminated by tag at offset 0):
+  Tag 1 = BITMAP_NODE
+    offset 0:  tag = 1
+    offset 8:  bitmap (8 bytes; bit i set => slot i present)
+    offset 16: refcount
+    offset 24: count_of_children
+    offset 32+: children array (variable length; one pointer per set bit)
+
+  Tag 2 = LEAF_NODE (single key/value)
+    offset 0:  tag = 2
+    offset 8:  hash
+    offset 16: refcount
+    offset 24: key
+    offset 32: value
+
+  Tag 3 = COLLISION_NODE (multiple key/value pairs with same hash)
+    offset 0:  tag = 3
+    offset 8:  hash
+    offset 16: refcount
+    offset 24: pair_count
+    offset 32+: alternating key, value pairs (16 bytes each)
+
+Persistent updates: every "modification" produces a new root that
+shares structure with the old root wherever unchanged.
+
+Header (16 bytes):
+  offset 0: root pointer (0 if empty)
+  offset 8: size
+
+Note on simplicity vs. Clojure: This implementation stores bitmaps in a
+single 64-bit word (giving 64-way branching, somewhat denser than the
+classic 32-way trie). The classic 32-way trie uses a 32-bit bitmap and
+fits the children-count in 5 bits; we use a 64-bit bitmap and 6 bits
+per level for slightly less depth.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Let PMAP_TAG_BITMAP be 1
+Let PMAP_TAG_LEAF be 2
+Let PMAP_TAG_COLLISION be 3
+Let PMAP_BITS_PER_LEVEL be 6
+Let PMAP_LEVEL_MASK be 63
+Let PMAP_HEADER_SIZE be 16
+
+@Reasoning
+Hash an integer key to a uniformly distributed 64-bit hash.
+@End Reasoning
+
+@Implementation
+splitmix64 mix.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-cryptographic.
+@End Security_Scope
+Process called "pmap_hash" takes key as Integer returns Integer:
+    Let h be key
+    Set h to h bitwise xor (h shifted right by 33)
+    Set h to h multiplied by 18397679294719823053
+    Set h to h bitwise xor (h shifted right by 33)
+    Set h to h multiplied by 14181476777654086739
+    Set h to h bitwise xor (h shifted right by 33)
+    If h is less than 0:
+        Set h to 0 minus h
+    End If
+    Return h
+End Process
+
+@Reasoning
+Count set bits in a 64-bit value (population count). Used to compute
+the position within a sparse-array node from a bitmap.
+@End Reasoning
+
+@Implementation
+Iterate bit by bit. A SWAR / parallel popcount would be faster, but
+bootstrap clarity wins here: 64 iterations max.
+@End Implementation
+
+@Performance_Hints
+Time: O(64) = O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure.
+@End Security_Scope
+Process called "pmap_popcount" takes x as Integer returns Integer:
+    Let c be 0
+    Let i be 0
+    While i is less than 64:
+        Let mask be 1 shifted left by i
+        Let bit be x bitwise and mask
+        If bit is not equal to 0:
+            Set c to c plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return c
+End Process
+
+@Reasoning
+Extract the 6-bit index from a hash at a given depth (0, 1, 2, ...).
+Each level consumes the next 6 bits of the hash.
+@End Reasoning
+
+@Implementation
+shift = depth * 6; return (hash >> shift) AND 0x3F.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure.
+@End Security_Scope
+Process called "pmap_level_index" takes hash as Integer, depth as Integer returns Integer:
+    Let shift be depth multiplied by PMAP_BITS_PER_LEVEL
+    Let shifted be hash shifted right by shift
+    Return shifted bitwise and PMAP_LEVEL_MASK
+End Process
+
+@Reasoning
+Create an empty persistent map.
+@End Reasoning
+
+@Implementation
+Allocate header; root = 0, size = 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pmap_create" returns Integer:
+    Let pm be proc allocate from Layout with PMAP_HEADER_SIZE
+    If pm is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with pm, 0, 0
+    proc memory_set_int64 from Memory with pm, 8, 0
+    Return pm
+End Process
+
+@Reasoning
+Create a leaf node with a single (key, value, hash) entry.
+@End Reasoning
+
+@Implementation
+Allocate 40 bytes, set tag, hash, refcount = 1, key, value.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pmap_leaf_create" takes key as Integer, value as Integer, hash as Integer returns Integer:
+    Let leaf be proc allocate from Layout with 40
+    If leaf is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with leaf, 0, PMAP_TAG_LEAF
+    proc memory_set_int64 from Memory with leaf, 8, hash
+    proc memory_set_int64 from Memory with leaf, 16, 1
+    proc memory_set_int64 from Memory with leaf, 24, key
+    proc memory_set_int64 from Memory with leaf, 32, value
+    Return leaf
+End Process
+
+@Reasoning
+Look up a key in a persistent map. Walks the trie following 6-bit
+hash slices.
+@End Reasoning
+
+@Implementation
+At each step:
+- If node is null, key absent (return 0).
+- If LEAF: compare key.
+- If BITMAP: extract bits-at-depth; check bitmap; if absent return 0;
+  else compute compact array index via popcount of (bitmap AND (bit-1)),
+  load child at that slot, recurse with depth+1.
+- If COLLISION: linear scan key/value pairs.
+@End Implementation
+
+@Performance_Hints
+Time: O(log_64 n) ~ O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "pmap_get" takes pm as Integer, key as Integer returns Integer:
+    If pm is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with pm, 0
+    If root is equal to 0:
+        Return 0
+    End If
+    Let hash be proc pmap_hash with key
+    Let node be root
+    Let depth be 0
+    While node is not equal to 0:
+        Let tag be proc memory_get_int64 from Memory with node, 0
+        If tag is equal to PMAP_TAG_LEAF:
+            Let lk be proc memory_get_int64 from Memory with node, 24
+            If lk is equal to key:
+                Return proc memory_get_int64 from Memory with node, 32
+            End If
+            Return 0
+        End If
+        If tag is equal to PMAP_TAG_BITMAP:
+            Let bitmap be proc memory_get_int64 from Memory with node, 8
+            Let idx be proc pmap_level_index with hash, depth
+            Let bit be 1 shifted left by idx
+            Let present be bitmap bitwise and bit
+            If present is equal to 0:
+                Return 0
+            End If
+            Let lower_mask be bit minus 1
+            Let lower_bits be bitmap bitwise and lower_mask
+            Let slot be proc pmap_popcount with lower_bits
+            Let child_addr be node plus (32 plus (slot multiplied by 8))
+            Set node to proc memory_get_int64 from Memory with child_addr, 0
+            Set depth to depth plus 1
+        Otherwise:
+            If tag is equal to PMAP_TAG_COLLISION:
+                Let pc be proc memory_get_int64 from Memory with node, 24
+                Let i be 0
+                While i is less than pc:
+                    Let pair_addr be node plus (32 plus (i multiplied by 16))
+                    Let ck be proc memory_get_int64 from Memory with pair_addr, 0
+                    If ck is equal to key:
+                        Return proc memory_get_int64 from Memory with pair_addr, 8
+                    End If
+                    Set i to i plus 1
+                End While
+                Return 0
+            Otherwise:
+                Return 0
+            End If
+        End If
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Contains predicate.
+@End Reasoning
+
+@Implementation
+Walks the same trie path; returns 1 on key match.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "pmap_contains" takes pm as Integer, key as Integer returns Integer:
+    If pm is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with pm, 0
+    If root is equal to 0:
+        Return 0
+    End If
+    Let hash be proc pmap_hash with key
+    Let node be root
+    Let depth be 0
+    While node is not equal to 0:
+        Let tag be proc memory_get_int64 from Memory with node, 0
+        If tag is equal to PMAP_TAG_LEAF:
+            Let lk be proc memory_get_int64 from Memory with node, 24
+            If lk is equal to key:
+                Return 1
+            End If
+            Return 0
+        End If
+        If tag is equal to PMAP_TAG_BITMAP:
+            Let bitmap be proc memory_get_int64 from Memory with node, 8
+            Let idx be proc pmap_level_index with hash, depth
+            Let bit be 1 shifted left by idx
+            Let present be bitmap bitwise and bit
+            If present is equal to 0:
+                Return 0
+            End If
+            Let lower_mask be bit minus 1
+            Let lower_bits be bitmap bitwise and lower_mask
+            Let slot be proc pmap_popcount with lower_bits
+            Let child_addr be node plus (32 plus (slot multiplied by 8))
+            Set node to proc memory_get_int64 from Memory with child_addr, 0
+            Set depth to depth plus 1
+        Otherwise:
+            If tag is equal to PMAP_TAG_COLLISION:
+                Let pc be proc memory_get_int64 from Memory with node, 24
+                Let i be 0
+                While i is less than pc:
+                    Let pair_addr be node plus (32 plus (i multiplied by 16))
+                    Let ck be proc memory_get_int64 from Memory with pair_addr, 0
+                    If ck is equal to key:
+                        Return 1
+                    End If
+                    Set i to i plus 1
+                End While
+                Return 0
+            Otherwise:
+                Return 0
+            End If
+        End If
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Build a bitmap node from a single leaf as a child at a given level
+index. Used as a building block when merging two leaves with
+different hash bits.
+@End Reasoning
+
+@Implementation
+Allocate header (32 bytes) + 1 child slot (8 bytes) = 40 bytes; set
+bitmap = (1 << idx); place leaf at slot 0; refcount = 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: 40 bytes.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pmap_bitmap_node_single" takes child as Integer, idx as Integer returns Integer:
+    Let node be proc allocate from Layout with 40
+    If node is equal to 0:
+        Return 0
+    End If
+    Let bit be 1 shifted left by idx
+    proc memory_set_int64 from Memory with node, 0, PMAP_TAG_BITMAP
+    proc memory_set_int64 from Memory with node, 8, bit
+    proc memory_set_int64 from Memory with node, 16, 1
+    proc memory_set_int64 from Memory with node, 24, 1
+    proc memory_set_int64 from Memory with node, 32, child
+    Return node
+End Process
+
+@Reasoning
+Build a fresh BITMAP node that contains exactly two leaves whose
+hash slices differ at some depth. The function descends until the
+slices diverge, building a chain of single-child BITMAP nodes; when
+the slices finally differ, it builds a two-child node containing
+both leaves in canonical bit-order. If the hashes are identical all
+the way down (a true hash collision), it builds a COLLISION node.
+@End Reasoning
+
+@Implementation
+Iterative chain construction. Maintain a parent pointer that will be
+linked to whatever the inner combination becomes; on each level, if
+the two leaves share the same 6-bit slice, allocate a single-child
+BITMAP node and recurse one deeper. When they finally differ, build
+the two-child BITMAP. Backfill the parent chain so the topmost node
+is returned.
+
+Special case: if depth exceeds the number of significant hash bits
+without divergence (10 levels of 6 bits each covers all 64 bits),
+collapse into a COLLISION node holding both pairs.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n). Space: O(log n) for the chain of single-child nodes
+in the rare collision-prone case.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure. All partial allocations are freed.
+@End Security_Scope
+Process called "pmap_combine_two_leaves" takes leaf_a as Integer, hash_a as Integer, leaf_b as Integer, hash_b as Integer, depth as Integer returns Integer:
+    Let idx_a be proc pmap_level_index with hash_a, depth
+    Let idx_b be proc pmap_level_index with hash_b, depth
+    If idx_a is equal to idx_b:
+        If depth is greater than or equal to 10:
+            Note: full 60+ bits matched - true collision
+            Let coll be proc allocate from Layout with 64
+            If coll is equal to 0:
+                Return 0
+            End If
+            Let ka be proc memory_get_int64 from Memory with leaf_a, 24
+            Let va be proc memory_get_int64 from Memory with leaf_a, 32
+            Let kb be proc memory_get_int64 from Memory with leaf_b, 24
+            Let vb be proc memory_get_int64 from Memory with leaf_b, 32
+            proc memory_set_int64 from Memory with coll, 0, PMAP_TAG_COLLISION
+            proc memory_set_int64 from Memory with coll, 8, hash_a
+            proc memory_set_int64 from Memory with coll, 16, 1
+            proc memory_set_int64 from Memory with coll, 24, 2
+            proc memory_set_int64 from Memory with coll, 32, ka
+            proc memory_set_int64 from Memory with coll, 40, va
+            proc memory_set_int64 from Memory with coll, 48, kb
+            proc memory_set_int64 from Memory with coll, 56, vb
+            Return coll
+        End If
+        Let inner be proc pmap_combine_two_leaves with leaf_a, hash_a, leaf_b, hash_b, depth plus 1
+        If inner is equal to 0:
+            Return 0
+        End If
+        Let single be proc pmap_bitmap_node_single with inner, idx_a
+        If single is equal to 0:
+            Return 0
+        End If
+        Return single
+    End If
+    Let bnode be proc allocate from Layout with 48
+    If bnode is equal to 0:
+        Return 0
+    End If
+    Let bit_a be 1 shifted left by idx_a
+    Let bit_b be 1 shifted left by idx_b
+    Let bitmap be bit_a bitwise or bit_b
+    proc memory_set_int64 from Memory with bnode, 0, PMAP_TAG_BITMAP
+    proc memory_set_int64 from Memory with bnode, 8, bitmap
+    proc memory_set_int64 from Memory with bnode, 16, 1
+    proc memory_set_int64 from Memory with bnode, 24, 2
+    If idx_a is less than idx_b:
+        proc memory_set_int64 from Memory with bnode, 32, leaf_a
+        proc memory_set_int64 from Memory with bnode, 40, leaf_b
+    Otherwise:
+        proc memory_set_int64 from Memory with bnode, 32, leaf_b
+        proc memory_set_int64 from Memory with bnode, 40, leaf_a
+    End If
+    Return bnode
+End Process
+
+@Reasoning
+Clone a BITMAP node, inserting or replacing a child at the given
+level index. The clone retains all unaffected children (incrementing
+their refcounts) and substitutes the new child for the chosen slot.
+@End Reasoning
+
+@Implementation
+1) Compute bit = 1 << idx. Compute is_present = (bitmap & bit) != 0.
+2) Compute slot = popcount(bitmap & (bit - 1)).
+3) If present: new_bitmap = bitmap; child_count_new = child_count.
+   Else: new_bitmap = bitmap | bit; child_count_new = child_count + 1.
+4) Allocate new node sized for child_count_new children.
+5) Copy children: positions [0..slot) unchanged; position [slot] = new
+   child; positions [slot+1..end] = old positions [slot+(is_present?1:0)..end].
+6) For each unchanged child, increment its refcount.
+@End Implementation
+
+@Performance_Hints
+Time: O(branching). Space: O(branching) per copy.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pmap_bitmap_assoc" takes bnode as Integer, idx as Integer, new_child as Integer returns Integer:
+    Let bitmap be proc memory_get_int64 from Memory with bnode, 8
+    Let old_count be proc memory_get_int64 from Memory with bnode, 24
+    Let bit be 1 shifted left by idx
+    Let is_present_mask be bitmap bitwise and bit
+    Let is_present be 0
+    If is_present_mask is not equal to 0:
+        Set is_present to 1
+    End If
+    Let lower_bits be bitmap bitwise and (bit minus 1)
+    Let slot be proc pmap_popcount with lower_bits
+    Let new_count be old_count
+    Let new_bitmap be bitmap
+    If is_present is equal to 0:
+        Set new_count to new_count plus 1
+        Set new_bitmap to bitmap bitwise or bit
+    End If
+    Let new_size be 32 plus (new_count multiplied by 8)
+    Let new_node be proc allocate from Layout with new_size
+    If new_node is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with new_node, 0, PMAP_TAG_BITMAP
+    proc memory_set_int64 from Memory with new_node, 8, new_bitmap
+    proc memory_set_int64 from Memory with new_node, 16, 1
+    proc memory_set_int64 from Memory with new_node, 24, new_count
+    Note: Copy old children [0..slot) verbatim
+    Let i be 0
+    While i is less than slot:
+        Let src_addr be bnode plus (32 plus (i multiplied by 8))
+        Let dst_addr be new_node plus (32 plus (i multiplied by 8))
+        Let child be proc memory_get_int64 from Memory with src_addr, 0
+        proc memory_set_int64 from Memory with dst_addr, 0, child
+        Note: retain child
+        Let rc be proc memory_get_int64 from Memory with child, 16
+        proc memory_set_int64 from Memory with child, 16, rc plus 1
+        Set i to i plus 1
+    End While
+    Note: Place new child at slot
+    Let new_slot_addr be new_node plus (32 plus (slot multiplied by 8))
+    proc memory_set_int64 from Memory with new_slot_addr, 0, new_child
+    Note: Copy trailing children
+    Let src_off be slot plus is_present
+    Let dst_off be slot plus 1
+    While src_off is less than old_count:
+        Let src_addr be bnode plus (32 plus (src_off multiplied by 8))
+        Let dst_addr be new_node plus (32 plus (dst_off multiplied by 8))
+        Let child be proc memory_get_int64 from Memory with src_addr, 0
+        proc memory_set_int64 from Memory with dst_addr, 0, child
+        Let rc be proc memory_get_int64 from Memory with child, 16
+        proc memory_set_int64 from Memory with child, 16, rc plus 1
+        Set src_off to src_off plus 1
+        Set dst_off to dst_off plus 1
+    End While
+    Return new_node
+End Process
+
+@Reasoning
+Insert into a subtree rooted at 'node' at the given depth. Returns
+the new subtree root (which may be 'node' if the key already maps to
+the same value, but for simplicity we always allocate path copies).
+Handles leaf, bitmap, and collision cases.
+@End Reasoning
+
+@Implementation
+- Empty: return a new leaf.
+- LEAF same key: return new leaf with new value.
+- LEAF different key: combine two leaves.
+- BITMAP: descend into the child at the appropriate slot (or insert
+  a new leaf if the slot is empty), then path-copy via bitmap_assoc.
+- COLLISION same hash: linear search; if key present, build new
+  collision with updated value; else append new pair.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pmap_assoc_node" takes node as Integer, key as Integer, value as Integer, hash as Integer, depth as Integer returns Integer:
+    If node is equal to 0:
+        Return proc pmap_leaf_create with key, value, hash
+    End If
+    Let tag be proc memory_get_int64 from Memory with node, 0
+    If tag is equal to PMAP_TAG_LEAF:
+        Let existing_key be proc memory_get_int64 from Memory with node, 24
+        Let existing_hash be proc memory_get_int64 from Memory with node, 8
+        If existing_key is equal to key:
+            Return proc pmap_leaf_create with key, value, hash
+        End If
+        Let new_leaf be proc pmap_leaf_create with key, value, hash
+        If new_leaf is equal to 0:
+            Return 0
+        End If
+        Let rc be proc memory_get_int64 from Memory with node, 16
+        proc memory_set_int64 from Memory with node, 16, rc plus 1
+        Return proc pmap_combine_two_leaves with node, existing_hash, new_leaf, hash, depth
+    End If
+    If tag is equal to PMAP_TAG_BITMAP:
+        Let bitmap be proc memory_get_int64 from Memory with node, 8
+        Let idx be proc pmap_level_index with hash, depth
+        Let bit be 1 shifted left by idx
+        Let present be bitmap bitwise and bit
+        Let new_child be 0
+        If present is equal to 0:
+            Set new_child to proc pmap_leaf_create with key, value, hash
+        Otherwise:
+            Let lower_bits be bitmap bitwise and (bit minus 1)
+            Let slot be proc pmap_popcount with lower_bits
+            Let child_addr be node plus (32 plus (slot multiplied by 8))
+            Let child be proc memory_get_int64 from Memory with child_addr, 0
+            Set new_child to proc pmap_assoc_node with child, key, value, hash, depth plus 1
+        End If
+        If new_child is equal to 0:
+            Return 0
+        End If
+        Return proc pmap_bitmap_assoc with node, idx, new_child
+    End If
+    If tag is equal to PMAP_TAG_COLLISION:
+        Let coll_hash be proc memory_get_int64 from Memory with node, 8
+        Let pair_count be proc memory_get_int64 from Memory with node, 24
+        Let i be 0
+        Let match_index be 0 minus 1
+        While i is less than pair_count:
+            Let pair_addr be node plus (32 plus (i multiplied by 16))
+            Let ck be proc memory_get_int64 from Memory with pair_addr, 0
+            If ck is equal to key:
+                Set match_index to i
+                Set i to pair_count
+            Otherwise:
+                Set i to i plus 1
+            End If
+        End While
+        Let new_pair_count be pair_count
+        If match_index is equal to 0 minus 1:
+            Set new_pair_count to pair_count plus 1
+        End If
+        Let new_size be 32 plus (new_pair_count multiplied by 16)
+        Let new_coll be proc allocate from Layout with new_size
+        If new_coll is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with new_coll, 0, PMAP_TAG_COLLISION
+        proc memory_set_int64 from Memory with new_coll, 8, coll_hash
+        proc memory_set_int64 from Memory with new_coll, 16, 1
+        proc memory_set_int64 from Memory with new_coll, 24, new_pair_count
+        Let j be 0
+        While j is less than pair_count:
+            Let src_addr be node plus (32 plus (j multiplied by 16))
+            Let dst_addr be new_coll plus (32 plus (j multiplied by 16))
+            Let pk be proc memory_get_int64 from Memory with src_addr, 0
+            Let pv be proc memory_get_int64 from Memory with src_addr, 8
+            If j is equal to match_index:
+                proc memory_set_int64 from Memory with dst_addr, 0, key
+                proc memory_set_int64 from Memory with dst_addr, 8, value
+            Otherwise:
+                proc memory_set_int64 from Memory with dst_addr, 0, pk
+                proc memory_set_int64 from Memory with dst_addr, 8, pv
+            End If
+            Set j to j plus 1
+        End While
+        If match_index is equal to 0 minus 1:
+            Let append_addr be new_coll plus (32 plus (pair_count multiplied by 16))
+            proc memory_set_int64 from Memory with append_addr, 0, key
+            proc memory_set_int64 from Memory with append_addr, 8, value
+        End If
+        Return new_coll
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Public persistent insert. Path-copies the trie, returning a new map
+header that shares structure with the original wherever possible.
+@End Reasoning
+
+@Implementation
+1) Allocate new header.
+2) Call pmap_assoc_node on root.
+3) If the key was previously present, size unchanged; else size + 1.
+   We detect new-vs-update by calling pmap_contains first.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pmap_assoc" takes pm as Integer, key as Integer, value as Integer returns Integer:
+    If pm is equal to 0:
+        Return 0
+    End If
+    Let new_pm be proc allocate from Layout with PMAP_HEADER_SIZE
+    If new_pm is equal to 0:
+        Return 0
+    End If
+    Let was_present be proc pmap_contains with pm, key
+    Let hash be proc pmap_hash with key
+    Let old_root be proc memory_get_int64 from Memory with pm, 0
+    Let new_root be proc pmap_assoc_node with old_root, key, value, hash, 0
+    If new_root is equal to 0:
+        proc deallocate from Layout with new_pm
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with new_pm, 0, new_root
+    Let old_size be proc memory_get_int64 from Memory with pm, 8
+    If was_present is equal to 1:
+        proc memory_set_int64 from Memory with new_pm, 8, old_size
+    Otherwise:
+        proc memory_set_int64 from Memory with new_pm, 8, old_size plus 1
+    End If
+    Return new_pm
+End Process
+
+@Reasoning
+Size accessor.
+@End Reasoning
+
+@Implementation
+Read size field at offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "pmap_size" takes pm as Integer returns Integer:
+    If pm is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with pm, 8
+End Process
+
+@Reasoning
+Empty predicate.
+@End Reasoning
+
+@Implementation
+Returns 1 if root is null.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "pmap_is_empty" takes pm as Integer returns Integer:
+    If pm is equal to 0:
+        Return 1
+    End If
+    Let root be proc memory_get_int64 from Memory with pm, 0
+    If root is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Release of map handle - decrements all the refcounts in the subtree
+and frees nodes whose count reaches zero. Caller still must release
+the header itself.
+@End Reasoning
+
+@Implementation
+Iterative traversal with a node stack. Decrement each node's refcount;
+if reaches zero, push children if BITMAP/COLLISION and then free.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) worst case for unique structure.
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "pmap_destroy" takes pm as Integer returns Integer:
+    If pm is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with pm, 0
+    Let cap be 64
+    Let buf_bytes be cap multiplied by 8
+    Let buf be proc allocate from Layout with buf_bytes
+    If buf is equal to 0:
+        proc deallocate from Layout with pm
+        Return 0
+    End If
+    Let sp be 0
+    If root is not equal to 0:
+        proc memory_set_int64 from Memory with buf, 0, root
+        Set sp to 1
+    End If
+    While sp is greater than 0:
+        Set sp to sp minus 1
+        Let off be sp multiplied by 8
+        Let node be proc memory_get_int64 from Memory with buf, off
+        Let rc be proc memory_get_int64 from Memory with node, 16
+        Let new_rc be rc minus 1
+        proc memory_set_int64 from Memory with node, 16, new_rc
+        If new_rc is equal to 0:
+            Let tag be proc memory_get_int64 from Memory with node, 0
+            If tag is equal to PMAP_TAG_BITMAP:
+                Let child_count be proc memory_get_int64 from Memory with node, 24
+                Let i be 0
+                While i is less than child_count:
+                    Let child_addr be node plus (32 plus (i multiplied by 8))
+                    Let child be proc memory_get_int64 from Memory with child_addr, 0
+                    Let need be sp plus 1
+                    If need is greater than cap:
+                        Let new_cap be cap multiplied by 2
+                        Let new_bytes be new_cap multiplied by 8
+                        Let new_buf be proc allocate from Layout with new_bytes
+                        If new_buf is equal to 0:
+                            proc deallocate from Layout with buf
+                            proc deallocate from Layout with pm
+                            Return 0
+                        End If
+                        Let copy_bytes be cap multiplied by 8
+                        proc memory_copy from Memory with new_buf, buf, copy_bytes
+                        proc deallocate from Layout with buf
+                        Set buf to new_buf
+                        Set cap to new_cap
+                    End If
+                    Let s_off be sp multiplied by 8
+                    proc memory_set_int64 from Memory with buf, s_off, child
+                    Set sp to sp plus 1
+                    Set i to i plus 1
+                End While
+            End If
+            proc deallocate from Layout with node
+        End If
+    End While
+    proc deallocate from Layout with buf
+    proc deallocate from Layout with pm
+    Return 1
+End Process

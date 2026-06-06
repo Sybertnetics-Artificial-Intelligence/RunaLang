@@ -1,0 +1,395 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+PERSISTENT LIST - Immutable Cons-Cell List Tier 0 Primitive
+
+This file implements a singly-linked cons-cell list designed for
+functional (persistent) use. Every "modifying" operation returns a
+new list that structurally shares its tail with the old list. The
+old list remains valid - readers from a previous snapshot see the
+old data.
+
+Cons cell (24 bytes):
+  offset 0:  value (8 bytes)
+  offset 8:  tail (8 bytes; pointer to cdr)
+  offset 16: refcount (8 bytes; atomic refcount for memory reclamation)
+
+The empty list is represented by the pointer 0 (nil).
+
+Because cells are shared, freeing must be reference-counted: cons()
+takes ownership of one share of 'tail' and stores it; head/tail
+accessors are reads only and do not retain; the destroy function
+decrements the refcount and only frees when it reaches zero.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Let PLIST_CELL_SIZE be 24
+
+@Reasoning
+Construct a new cons cell with given head and tail. Increments the
+refcount of the tail since the new cell now holds one share.
+@End Reasoning
+
+@Implementation
+1) Allocate 24 bytes.
+2) Store value at offset 0, tail at offset 8, refcount = 1 at offset 16.
+3) If tail != 0, increment tail's refcount.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: 24 bytes.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "plist_cons" takes value as Integer, tail as Integer returns Integer:
+    Let cell be proc allocate from Layout with PLIST_CELL_SIZE
+    If cell is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with cell, 0, value
+    proc memory_set_int64 from Memory with cell, 8, tail
+    proc memory_set_int64 from Memory with cell, 16, 1
+    If tail is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with tail, 16
+        proc memory_set_int64 from Memory with tail, 16, rc plus 1
+    End If
+    Return cell
+End Process
+
+@Reasoning
+The empty list (nil) sentinel value.
+@End Reasoning
+
+@Implementation
+Returns 0 to indicate the empty list. Helper to keep the API uniform
+with cons/head/tail.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure.
+@End Security_Scope
+Process called "plist_nil" returns Integer:
+    Return 0
+End Process
+
+@Reasoning
+Empty predicate.
+@End Reasoning
+
+@Implementation
+Returns 1 if list pointer is 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "plist_is_empty" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+First element. Convention: head(nil) = 0 (the caller must check
+is_empty first if 0 is a valid element).
+@End Reasoning
+
+@Implementation
+Read offset 0 of cell.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "plist_head" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with list, 0
+End Process
+
+@Reasoning
+Tail of the list (everything after the first element).
+@End Reasoning
+
+@Implementation
+Read offset 8 of cell. Tail of nil is nil.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "plist_tail" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with list, 8
+End Process
+
+@Reasoning
+Length (number of elements). Walks the chain.
+@End Reasoning
+
+@Implementation
+Iterate cdr-pointers counting cells.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "plist_length" takes list as Integer returns Integer:
+    Let len be 0
+    Let cur be list
+    While cur is not equal to 0:
+        Set len to len plus 1
+        Set cur to proc memory_get_int64 from Memory with cur, 8
+    End While
+    Return len
+End Process
+
+@Reasoning
+Retain - increment the refcount. Used when the caller wants to keep
+a copy of the list pointer across an ownership boundary.
+@End Reasoning
+
+@Implementation
+Bump the refcount at offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must pair every retain with one release.
+@End Security_Scope
+Process called "plist_retain" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Let rc be proc memory_get_int64 from Memory with list, 16
+    proc memory_set_int64 from Memory with list, 16, rc plus 1
+    Return 1
+End Process
+
+@Reasoning
+Release - decrement refcount. When it reaches zero, free the cell and
+recurse into its tail.
+@End Reasoning
+
+@Implementation
+Iterative release to avoid recursion-depth stack pressure on long
+lists. While list is non-zero:
+- Decrement refcount.
+- If now zero, save tail, free this cell, advance to tail (which we
+  then process with the same logic on the next iteration).
+- If still > 0, stop because the tail is shared with another holder.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) worst case if the list is unique. O(1) if shared.
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access list after release.
+@End Security_Scope
+Process called "plist_release" takes list as Integer returns Integer:
+    Let cur be list
+    While cur is not equal to 0:
+        Let rc be proc memory_get_int64 from Memory with cur, 16
+        Let new_rc be rc minus 1
+        proc memory_set_int64 from Memory with cur, 16, new_rc
+        If new_rc is greater than 0:
+            Return 1
+        End If
+        Let next_tail be proc memory_get_int64 from Memory with cur, 8
+        proc deallocate from Layout with cur
+        Set cur to next_tail
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Reverse a persistent list non-destructively. Builds a new list one
+cons at a time; the old list remains valid.
+@End Reasoning
+
+@Implementation
+Iterate the source list, consing each value onto an accumulator
+initialized to nil. The result is reversed.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n) for the new cells.
+@End Performance_Hints
+
+@Security_Scope
+Caller must release the returned list when done.
+@End Security_Scope
+Process called "plist_reverse" takes list as Integer returns Integer:
+    Let acc be 0
+    Let cur be list
+    While cur is not equal to 0:
+        Let v be proc memory_get_int64 from Memory with cur, 0
+        Let next be proc memory_get_int64 from Memory with cur, 8
+        Let new_cell be proc plist_cons with v, acc
+        If new_cell is equal to 0:
+            proc plist_release with acc
+            Return 0
+        End If
+        Note: plist_cons retained 'acc' once; the old acc reference we
+        Note: held has been transferred into the new cell's tail slot,
+        Note: so we drop our local reference (offset by the retain inside
+        Note: cons we don't need to release here).
+        Set acc to new_cell
+        Set cur to next
+    End While
+    Return acc
+End Process
+
+@Reasoning
+Append two persistent lists. Returns a new list whose elements are
+a followed by b. b is shared (refcounted), a is copied cell-by-cell.
+@End Reasoning
+
+@Implementation
+Reverse(a) then cons each element onto b. Equivalent to:
+  result = b; for each element of reverse(a): result = cons(element, result).
+@End Implementation
+
+@Performance_Hints
+Time: O(|a|). Space: O(|a|) for the new cells.
+@End Performance_Hints
+
+@Security_Scope
+Caller must release the returned list.
+@End Security_Scope
+Process called "plist_append" takes a as Integer, b as Integer returns Integer:
+    Let ra be proc plist_reverse with a
+    If ra is equal to 0:
+        If a is equal to 0:
+            proc plist_retain with b
+            Return b
+        End If
+        Return 0
+    End If
+    Let result be b
+    If b is not equal to 0:
+        proc plist_retain with b
+    End If
+    Let cur be ra
+    While cur is not equal to 0:
+        Let v be proc memory_get_int64 from Memory with cur, 0
+        Let new_cell be proc plist_cons with v, result
+        If new_cell is equal to 0:
+            proc plist_release with result
+            proc plist_release with ra
+            Return 0
+        End If
+        Note: cons retains 'result' for the new cell, so we release our
+        Note: local reference to keep refcount accurate.
+        proc plist_release with result
+        Set result to new_cell
+        Set cur to proc memory_get_int64 from Memory with cur, 8
+    End While
+    proc plist_release with ra
+    Return result
+End Process
+
+@Reasoning
+nth element accessor.
+@End Reasoning
+
+@Implementation
+Walk n cells; return head of the nth, or 0 if shorter.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Out-of-range returns 0.
+@End Security_Scope
+Process called "plist_nth" takes list as Integer, n as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    If n is less than 0:
+        Return 0
+    End If
+    Let cur be list
+    Let i be 0
+    While i is less than n:
+        If cur is equal to 0:
+            Return 0
+        End If
+        Set cur to proc memory_get_int64 from Memory with cur, 8
+        Set i to i plus 1
+    End While
+    If cur is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with cur, 0
+End Process
+
+@Reasoning
+Refcount accessor for introspection / testing.
+@End Reasoning
+
+@Implementation
+Read offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "plist_refcount" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with list, 16
+End Process

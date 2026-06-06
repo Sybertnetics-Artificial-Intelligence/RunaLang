@@ -1,0 +1,1653 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+ATTRIBUTE - Typed attribute values, validation, normalization (Tier 1)
+==============================================================================
+
+The element.runa substrate models an attribute as a (name, value, namespace)
+triple of borrowed string pointers.  This module sits atop that primitive
+layer and provides:
+
+  1. A typed value system (Boolean / Integer / Float / Url / Color /
+     Length / Token-set / Enumerated / String).
+  2. Parsers that lift the raw string value into the typed value.
+  3. Validators that check whether a raw value satisfies a schema
+     declared by attribute name.
+  4. Normalizers that fold case, collapse whitespace, and apply
+     HTML's boolean-attribute presence semantics.
+
+The schema model is intentionally pluggable.  Callers register a small
+TypedAttributeSchema record for each (attribute-name, expected-type)
+pair they care about; for everything else the attribute is treated as
+a free-form String.  This keeps the substrate format-agnostic while
+matching what HTML5 (https://html.spec.whatwg.org/multipage/dom.html
+section 2.3) and SVG 2 (https://www.w3.org/TR/SVG2/types.html) expect
+from their attribute machinery.
+
+Records:
+
+  TypedAttributeValue (24 bytes):
+    off  0  type_tag       ATTR_TYPE_*
+    off  8  payload        boxed value (String / Integer / Float / 0)
+    off 16  unit_or_kind   ATTR_LEN_UNIT_* / ATTR_COLOR_SPACE_* / 0
+
+  TypedAttributeSchema (32 bytes):
+    off  0  name pointer   (NUL-terminated)
+    off  8  expected_type  ATTR_TYPE_*
+    off 16  is_boolean     0 or 1 (HTML boolean attribute marker)
+    off 24  enum_values    List of allowed values or 0
+
+References:
+  - HTML Living Standard 2.3 "Common microsyntaxes"
+  - CSS Color 4 https://www.w3.org/TR/css-color-4/
+  - CSS Values 4 https://www.w3.org/TR/css-values-4/
+  - URL Living Standard https://url.spec.whatwg.org/
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/color/hsl.runa" as Hsl
+Import "compiler/frontend/primitives/color/palette.runa" as Palette
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Constant ATTR_TYPE_STRING as Integer is 0
+Constant ATTR_TYPE_BOOLEAN as Integer is 1
+Constant ATTR_TYPE_INTEGER as Integer is 2
+Constant ATTR_TYPE_FLOAT as Integer is 3
+Constant ATTR_TYPE_URL as Integer is 4
+Constant ATTR_TYPE_COLOR as Integer is 5
+Constant ATTR_TYPE_LENGTH as Integer is 6
+Constant ATTR_TYPE_TOKEN_SET as Integer is 7
+Constant ATTR_TYPE_ENUMERATED as Integer is 8
+
+Constant ATTR_LEN_UNIT_NONE as Integer is 0
+Constant ATTR_LEN_UNIT_PX as Integer is 1
+Constant ATTR_LEN_UNIT_EM as Integer is 2
+Constant ATTR_LEN_UNIT_REM as Integer is 3
+Constant ATTR_LEN_UNIT_PCT as Integer is 4
+Constant ATTR_LEN_UNIT_PT as Integer is 5
+Constant ATTR_LEN_UNIT_CM as Integer is 6
+Constant ATTR_LEN_UNIT_MM as Integer is 7
+Constant ATTR_LEN_UNIT_IN as Integer is 8
+Constant ATTR_LEN_UNIT_VW as Integer is 9
+Constant ATTR_LEN_UNIT_VH as Integer is 10
+
+Constant ATTR_COLOR_SPACE_NAMED as Integer is 1
+Constant ATTR_COLOR_SPACE_HEX as Integer is 2
+Constant ATTR_COLOR_SPACE_RGB as Integer is 3
+Constant ATTR_COLOR_SPACE_RGBA as Integer is 4
+Constant ATTR_COLOR_SPACE_HSL as Integer is 5
+Constant ATTR_COLOR_SPACE_HSLA as Integer is 6
+
+Note: Decoded color record (32 bytes): four Float64 channels (r, g, b, a)
+Note: bit-cast to Integer slots via Hsl.float_to_bits.  Each channel is in
+Note: the unit interval [0, 1].  Layout matches the canonical output of
+Note: hsl_to_rgb and palette_lookup_by_name so those helpers can write
+Note: directly into the buffer.
+Constant ATTR_COLOR_REC_SIZE as Integer is 32
+Constant ATTR_COLOR_REC_OFF_R as Integer is 0
+Constant ATTR_COLOR_REC_OFF_G as Integer is 8
+Constant ATTR_COLOR_REC_OFF_B as Integer is 16
+Constant ATTR_COLOR_REC_OFF_A as Integer is 24
+
+Constant TYPED_VALUE_SIZE as Integer is 24
+Constant TYPED_VALUE_OFF_TYPE as Integer is 0
+Constant TYPED_VALUE_OFF_PAYLOAD as Integer is 8
+Constant TYPED_VALUE_OFF_UNIT as Integer is 16
+
+Constant ATTR_SCHEMA_SIZE as Integer is 32
+Constant ATTR_SCHEMA_OFF_NAME as Integer is 0
+Constant ATTR_SCHEMA_OFF_TYPE as Integer is 8
+Constant ATTR_SCHEMA_OFF_BOOLEAN as Integer is 16
+Constant ATTR_SCHEMA_OFF_ENUMS as Integer is 24
+
+Constant ATTR_VALIDATE_OK as Integer is 0
+Constant ATTR_VALIDATE_MISMATCH as Integer is -1
+Constant ATTR_VALIDATE_PARSE_FAIL as Integer is -2
+Constant ATTR_VALIDATE_NOT_IN_ENUM as Integer is -3
+
+Note: ============================================================================
+Note: TYPED VALUE CONSTRUCTION / ACCESS
+Note: ============================================================================
+
+@Reasoning
+Allocate a TypedAttributeValue record carrying a type tag, a boxed
+payload pointer (whose interpretation depends on the tag), and an
+auxiliary integer used by length-typed values for the unit and by
+color-typed values for the color-space identifier.
+@End Reasoning
+@Implementation
+Layout.allocate 24 bytes; write the three slots.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Caller owns the payload pointer's lifetime.
+@End Security_Scope
+Process called "typed_value_create" takes type_tag as Integer, payload as Integer, unit_or_kind as Integer returns Integer:
+    Let record be proc allocate from Layout with TYPED_VALUE_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, TYPED_VALUE_OFF_TYPE, type_tag
+    proc memory_set_int64 from Memory with record, TYPED_VALUE_OFF_PAYLOAD, payload
+    proc memory_set_int64 from Memory with record, TYPED_VALUE_OFF_UNIT, unit_or_kind
+    Return record
+End Process
+
+Process called "typed_value_get_type" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_TYPE
+End Process
+
+Process called "typed_value_get_payload" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_PAYLOAD
+End Process
+
+Process called "typed_value_get_unit" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_UNIT
+End Process
+
+Process called "typed_value_destroy" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return ATTR_VALIDATE_OK
+    End If
+    Let tag be proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_TYPE
+    If tag is equal to ATTR_TYPE_COLOR:
+        Let payload be proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_PAYLOAD
+        If payload is not equal to 0:
+            proc deallocate from Layout with payload
+        End If
+    End If
+    proc deallocate from Layout with value
+    Return ATTR_VALIDATE_OK
+End Process
+
+Note: ============================================================================
+Note: SCHEMA CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Allocate a TypedAttributeSchema record.  When `is_boolean` is 1, the
+schema represents an HTML boolean attribute (disabled, readonly, etc.)
+where the value semantic is presence-vs-absence rather than the
+stored string.
+@End Reasoning
+@Implementation
+Layout.allocate 32 bytes; write the four slots.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Caller owns the name pointer and enum List.
+@End Security_Scope
+Process called "schema_create" takes name as Integer, type_tag as Integer, is_boolean as Integer, enums as Integer returns Integer:
+    Let record be proc allocate from Layout with ATTR_SCHEMA_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, ATTR_SCHEMA_OFF_NAME, name
+    proc memory_set_int64 from Memory with record, ATTR_SCHEMA_OFF_TYPE, type_tag
+    proc memory_set_int64 from Memory with record, ATTR_SCHEMA_OFF_BOOLEAN, is_boolean
+    proc memory_set_int64 from Memory with record, ATTR_SCHEMA_OFF_ENUMS, enums
+    Return record
+End Process
+
+Process called "schema_get_name" takes schema as Integer returns Integer:
+    If schema is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with schema, ATTR_SCHEMA_OFF_NAME
+End Process
+
+Process called "schema_get_type" takes schema as Integer returns Integer:
+    If schema is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with schema, ATTR_SCHEMA_OFF_TYPE
+End Process
+
+Process called "schema_is_boolean" takes schema as Integer returns Integer:
+    If schema is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with schema, ATTR_SCHEMA_OFF_BOOLEAN
+End Process
+
+Process called "schema_get_enums" takes schema as Integer returns Integer:
+    If schema is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with schema, ATTR_SCHEMA_OFF_ENUMS
+End Process
+
+Process called "schema_destroy" takes schema as Integer returns Integer:
+    If schema is equal to 0:
+        Return ATTR_VALIDATE_OK
+    End If
+    proc deallocate from Layout with schema
+    Return ATTR_VALIDATE_OK
+End Process
+
+Note: ============================================================================
+Note: PARSE HELPERS
+Note: ============================================================================
+
+@Reasoning
+Parse a NUL-terminated decimal integer (optional sign).  Used by
+integer and length parsers.
+@End Reasoning
+@Implementation
+Skip a leading +/-, then accumulate digits.  Returns 0 (and writes
+ATTR_VALIDATE_PARSE_FAIL to out_status) when the string is non-numeric
+or empty.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+No allocation; mutates only the caller's status slot.
+@End Security_Scope
+Process called "attr_parse_int_with_pos" takes text as Integer, start as Integer, out_end as Integer, out_status as Integer returns Integer:
+    If text is equal to 0:
+        proc memory_set_int64 from Memory with out_status, 0, ATTR_VALIDATE_PARSE_FAIL
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with text
+    Let i be start
+    Let sign be 1
+    If i is less than len:
+        Let first be proc string_char_at from StringCore with text, i
+        If first is equal to 45:
+            Set sign to -1
+            Set i to i plus 1
+        Otherwise:
+            If first is equal to 43:
+                Set i to i plus 1
+            End If
+        End If
+    End If
+    Let acc be 0
+    Let started be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with text, i
+        Let is_d be proc is_digit from Char with ch
+        If is_d is equal to 1:
+            Set acc to acc multiplied by 10
+            Set acc to acc plus ch minus 48
+            Set started to 1
+            Set i to i plus 1
+        Otherwise:
+            Set i to len
+        End If
+    End While
+    If started is equal to 0:
+        proc memory_set_int64 from Memory with out_status, 0, ATTR_VALIDATE_PARSE_FAIL
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with out_end, 0, i
+    proc memory_set_int64 from Memory with out_status, 0, ATTR_VALIDATE_OK
+    Let signed be sign multiplied by acc
+    Return signed
+End Process
+
+Note: ============================================================================
+Note: TYPED PARSERS
+Note: ============================================================================
+
+@Reasoning
+Boolean attribute parser per HTML Living Standard section 2.3.4: any
+presence value (including the empty string or the attribute's own name)
+yields true; absence yields false.  Because parse_value receives a
+non-null string, we always return true here; the false case is the
+caller's responsibility.
+@End Reasoning
+@Implementation
+Allocate a TypedAttributeValue with type ATTR_TYPE_BOOLEAN and payload
+1.  Returns 0 on OOM.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Caller owns the returned value record.
+@End Security_Scope
+Process called "attr_parse_boolean" takes value_string as Integer returns Integer:
+    Return proc typed_value_create with ATTR_TYPE_BOOLEAN, 1, 0
+End Process
+
+@Reasoning
+Integer attribute parser.  Validates and produces a TypedAttributeValue
+whose payload is the parsed integer (boxed as the raw Integer value).
+Trailing garbage is rejected.
+@End Reasoning
+@Implementation
+Run attr_parse_int_with_pos.  If status is OK and end position equals
+string length, build a typed value.  Otherwise return 0.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "attr_parse_integer" takes value_string as Integer returns Integer:
+    If value_string is equal to 0:
+        Return 0
+    End If
+    Let status_slot be proc allocate from Layout with 8
+    If status_slot is equal to 0:
+        Return 0
+    End If
+    Let end_slot be proc allocate from Layout with 8
+    If end_slot is equal to 0:
+        proc deallocate from Layout with status_slot
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with status_slot, 0, 0
+    proc memory_set_int64 from Memory with end_slot, 0, 0
+    Let parsed be proc attr_parse_int_with_pos with value_string, 0, end_slot, status_slot
+    Let status be proc memory_get_int64 from Memory with status_slot, 0
+    Let end_pos be proc memory_get_int64 from Memory with end_slot, 0
+    proc deallocate from Layout with status_slot
+    proc deallocate from Layout with end_slot
+    Let len be proc string_length from StringCore with value_string
+    If status is not equal to ATTR_VALIDATE_OK:
+        Return 0
+    End If
+    If end_pos is not equal to len:
+        Return 0
+    End If
+    Return proc typed_value_create with ATTR_TYPE_INTEGER, parsed, 0
+End Process
+
+@Reasoning
+URL attribute parser per the URL Living Standard's "valid URL string"
+requirement.  Full URL parsing is the network primitive's job; here we
+only validate gross syntax (non-empty, no embedded whitespace) and
+store the trimmed string verbatim.
+@End Reasoning
+@Implementation
+Reject empty / whitespace-only inputs and inputs containing internal
+whitespace characters.  Otherwise return the typed-value record
+carrying the original string pointer.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+The URL is not normalized here; callers needing canonical form must
+post-process.  No allocation beyond the typed-value record.
+@End Security_Scope
+Process called "attr_parse_url" takes value_string as Integer returns Integer:
+    If value_string is equal to 0:
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with value_string
+    If len is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with value_string, i
+        Let is_ws be proc is_whitespace from Char with ch
+        If is_ws is equal to 1:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return proc typed_value_create with ATTR_TYPE_URL, value_string, 0
+End Process
+
+@Reasoning
+Color-attribute parser supporting #rgb, #rgba, #rrggbb, #rrggbbaa,
+rgb() / rgba() / hsl() / hsla() functional forms, and CSS Color Module
+Level 4 named colors.  Eagerly decodes each form into a 32-byte record
+holding four Float64 channels (r, g, b, a in [0, 1]) which becomes the
+typed value's payload; the color space tag remains in the unit slot so
+consumers can recover the original form.
+@End Reasoning
+@Implementation
+1. If first char is '#': parse 3 / 4 / 6 / 8 hex digits and write the
+   per-channel values directly.
+2. If starts with "rgb(" / "rgba(": parse the inner CSV (decimal 0..255
+   or percentage 0..100%, alpha 0..1) and write channel floats.
+3. If starts with "hsl(" / "hsla(": parse hue (degrees), saturation
+   (percent), lightness (percent), and convert via Hsl.hsl_to_rgb.
+4. Otherwise: look the identifier up in the CSS named-color palette
+   via Palette.palette_lookup_by_name.
+The 32-byte payload buffer is allocated on the owned heap; ownership
+transfers to the returned TypedAttributeValue.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on allocation failure or unrecognised input.
+@End Security_Scope
+Process called "attr_is_hex_color" takes value_string as Integer returns Integer:
+    Let len be proc string_length from StringCore with value_string
+    If len is less than 4:
+        Return 0
+    End If
+    Let first be proc string_char_at from StringCore with value_string, 0
+    If first is not equal to 35:
+        Return 0
+    End If
+    If len is not equal to 4:
+        If len is not equal to 5:
+            If len is not equal to 7:
+                If len is not equal to 9:
+                    Return 0
+                End If
+            End If
+        End If
+    End If
+    Let i be 1
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with value_string, i
+        Let is_h be proc is_hex_digit from Char with ch
+        If is_h is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Convert a single ASCII hex digit ('0'..'9', 'a'..'f', 'A'..'F') to its
+numeric value 0..15.  Returns -1 if the character is not a hex digit.
+@End Reasoning
+@Implementation
+ASCII range tests.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Pure.
+@End Security_Scope
+Process called "attr_hex_digit_value" takes ch as Integer returns Integer:
+    If ch is greater than or equal to 48:
+        If ch is less than or equal to 57:
+            Return ch minus 48
+        End If
+    End If
+    If ch is greater than or equal to 97:
+        If ch is less than or equal to 102:
+            Return (ch minus 97) plus 10
+        End If
+    End If
+    If ch is greater than or equal to 65:
+        If ch is less than or equal to 70:
+            Return (ch minus 65) plus 10
+        End If
+    End If
+    Return -1
+End Process
+
+@Reasoning
+Allocate and zero-initialize a 32-byte color record holding four
+Float64 channels (r, g, b, a) all set to 0.0.  Used as the payload
+backing every decoded TypedAttributeValue of type ATTR_TYPE_COLOR.
+@End Reasoning
+@Implementation
+Layout.allocate 32 bytes; for each of the four offsets, bit-cast 0.0
+via Hsl.float_to_bits and write it via Memory.memory_set_int64.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Caller owns the returned record.
+@End Security_Scope
+Process called "attr_color_rec_alloc" returns Integer:
+    Let rec be proc allocate from Layout with ATTR_COLOR_REC_SIZE
+    If rec is equal to 0:
+        Return 0
+    End If
+    Let zero_bits be proc float_to_bits from Hsl with 0.0
+    proc memory_set_int64 from Memory with rec, ATTR_COLOR_REC_OFF_R, zero_bits
+    proc memory_set_int64 from Memory with rec, ATTR_COLOR_REC_OFF_G, zero_bits
+    proc memory_set_int64 from Memory with rec, ATTR_COLOR_REC_OFF_B, zero_bits
+    proc memory_set_int64 from Memory with rec, ATTR_COLOR_REC_OFF_A, zero_bits
+    Return rec
+End Process
+
+@Reasoning
+Write a Float64 channel value at the given byte offset within an
+already-allocated color record.
+@End Reasoning
+@Implementation
+Bit-cast via Hsl.float_to_bits, then Memory.memory_set_int64.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Caller guarantees rec is a valid 32-byte color record.
+@End Security_Scope
+Process called "attr_color_rec_store" takes rec as Integer, offset as Integer, value as Float returns Integer:
+    Let bits be proc float_to_bits from Hsl with value
+    proc memory_set_int64 from Memory with rec, offset, bits
+    Return 0
+End Process
+
+@Reasoning
+Decode a #-prefixed hex color of length 4 (#rgb), 5 (#rgba), 7
+(#rrggbb), or 9 (#rrggbbaa) into a freshly allocated color record.
+@End Reasoning
+@Implementation
+1. Determine the per-channel digit count (1 or 2) from the string
+   length.
+2. For each channel, read the digit(s), expand single-digit forms by
+   nibble duplication (CSS Color 4 section 4.3), divide by 255 to map
+   into the unit interval, and store via attr_color_rec_store.
+3. The alpha channel defaults to 1.0 when not present.
+@End Implementation
+@Performance_Hints
+O(channel count).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on allocation failure or malformed input.
+@End Security_Scope
+Process called "attr_decode_hex_color" takes value_string as Integer returns Integer:
+    Let len be proc string_length from StringCore with value_string
+    Let digits_per_channel be 0
+    Let has_alpha be 0
+    If len is equal to 4:
+        Set digits_per_channel to 1
+    End If
+    If len is equal to 5:
+        Set digits_per_channel to 1
+        Set has_alpha to 1
+    End If
+    If len is equal to 7:
+        Set digits_per_channel to 2
+    End If
+    If len is equal to 9:
+        Set digits_per_channel to 2
+        Set has_alpha to 1
+    End If
+    If digits_per_channel is equal to 0:
+        Return 0
+    End If
+    Let rec be proc attr_color_rec_alloc
+    If rec is equal to 0:
+        Return 0
+    End If
+    Let channel_count be 3
+    If has_alpha is equal to 1:
+        Set channel_count to 4
+    End If
+    Let denom be proc int_to_float from Arith with 255
+    Let pos be 1
+    Let ci be 0
+    While ci is less than channel_count:
+        Let raw be 0
+        If digits_per_channel is equal to 1:
+            Let c1 be proc string_char_at from StringCore with value_string, pos
+            Let v1 be proc attr_hex_digit_value with c1
+            If v1 is less than 0:
+                proc deallocate from Layout with rec
+                Return 0
+            End If
+            Set raw to (v1 multiplied by 16) plus v1
+            Set pos to pos plus 1
+        Otherwise:
+            Let c_hi be proc string_char_at from StringCore with value_string, pos
+            Let c_lo be proc string_char_at from StringCore with value_string, pos plus 1
+            Let v_hi be proc attr_hex_digit_value with c_hi
+            Let v_lo be proc attr_hex_digit_value with c_lo
+            If v_hi is less than 0:
+                proc deallocate from Layout with rec
+                Return 0
+            End If
+            If v_lo is less than 0:
+                proc deallocate from Layout with rec
+                Return 0
+            End If
+            Set raw to (v_hi multiplied by 16) plus v_lo
+            Set pos to pos plus 2
+        End If
+        Let numer be proc int_to_float from Arith with raw
+        Let channel be numer divided by denom
+        Let off be 0
+        If ci is equal to 0:
+            Set off to ATTR_COLOR_REC_OFF_R
+        End If
+        If ci is equal to 1:
+            Set off to ATTR_COLOR_REC_OFF_G
+        End If
+        If ci is equal to 2:
+            Set off to ATTR_COLOR_REC_OFF_B
+        End If
+        If ci is equal to 3:
+            Set off to ATTR_COLOR_REC_OFF_A
+        End If
+        proc attr_color_rec_store with rec, off, channel
+        Set ci to ci plus 1
+    End While
+    If has_alpha is equal to 0:
+        proc attr_color_rec_store with rec, ATTR_COLOR_REC_OFF_A, 1.0
+    End If
+    Return rec
+End Process
+
+@Reasoning
+Skip ASCII whitespace starting at pos within the value_string and
+return the first non-whitespace position (or len if the rest is all
+whitespace).
+@End Reasoning
+@Implementation
+Loop while is_whitespace.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Pure.
+@End Security_Scope
+Process called "attr_color_skip_ws" takes text as Integer, pos as Integer, len as Integer returns Integer:
+    Let p be pos
+    While p is less than len:
+        Let c be proc string_char_at from StringCore with text, p
+        Let ws be proc is_whitespace from Char with c
+        If ws is equal to 1:
+            Set p to p plus 1
+        Otherwise:
+            Return p
+        End If
+    End While
+    Return p
+End Process
+
+@Reasoning
+Parse a non-negative decimal number (with optional fractional part) at
+the given position.  Writes the new position into out_end and returns
+the parsed value as a Float64.  On failure writes pos unchanged into
+out_end.
+@End Reasoning
+@Implementation
+Accumulate integer digits into an Integer running total, then if a '.'
+is encountered accumulate fractional digits with a divisor.  Convert to
+Float via Arith.int_to_float and combine.
+@End Implementation
+@Performance_Hints
+O(digit count).
+@End Performance_Hints
+@Security_Scope
+Pure; out_end caller-owned 8-byte slot.
+@End Security_Scope
+Process called "attr_color_read_number" takes text as Integer, pos as Integer, len as Integer, out_end as Integer returns Float:
+    Let p be pos
+    Let int_part be 0
+    Let any_digits be 0
+    Let done be 0
+    While done is equal to 0:
+        If p is greater than or equal to len:
+            Set done to 1
+        Otherwise:
+            Let c be proc string_char_at from StringCore with text, p
+            Let isd be proc is_digit from Char with c
+            If isd is equal to 1:
+                Set int_part to (int_part multiplied by 10) plus (c minus 48)
+                Set any_digits to 1
+                Set p to p plus 1
+            Otherwise:
+                Set done to 1
+            End If
+        End If
+    End While
+    Let total be proc int_to_float from Arith with int_part
+    If p is less than len:
+        Let dot be proc string_char_at from StringCore with text, p
+        If dot is equal to 46:
+            Set p to p plus 1
+            Let frac_part be 0
+            Let frac_scale be 1
+            Let frac_done be 0
+            While frac_done is equal to 0:
+                If p is greater than or equal to len:
+                    Set frac_done to 1
+                Otherwise:
+                    Let cf be proc string_char_at from StringCore with text, p
+                    Let isdf be proc is_digit from Char with cf
+                    If isdf is equal to 1:
+                        Set frac_part to (frac_part multiplied by 10) plus (cf minus 48)
+                        Set frac_scale to frac_scale multiplied by 10
+                        Set any_digits to 1
+                        Set p to p plus 1
+                    Otherwise:
+                        Set frac_done to 1
+                    End If
+                End If
+            End While
+            If frac_scale is greater than 1:
+                Let frac_val be proc int_to_float from Arith with frac_part
+                Let scale_val be proc int_to_float from Arith with frac_scale
+                Set total to total plus (frac_val divided by scale_val)
+            End If
+        End If
+    End If
+    proc memory_set_int64 from Memory with out_end, 0, p
+    If any_digits is equal to 0:
+        Return 0.0
+    End If
+    Return total
+End Process
+
+@Reasoning
+Skip a single literal character at pos if it matches expected; return
+the new position.  Whitespace is skipped before the test.  Returns -1
+when the expected character is not found.
+@End Reasoning
+@Implementation
+Skip whitespace; compare character; return advanced position or -1.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Pure.
+@End Security_Scope
+Process called "attr_color_expect_char" takes text as Integer, pos as Integer, len as Integer, expected as Integer returns Integer:
+    Let p be proc attr_color_skip_ws with text, pos, len
+    If p is greater than or equal to len:
+        Return -1
+    End If
+    Let c be proc string_char_at from StringCore with text, p
+    If c is not equal to expected:
+        Return -1
+    End If
+    Return p plus 1
+End Process
+
+@Reasoning
+Read one rgb / rgba channel.  CSS Color 4 allows integer (0..255) and
+percentage (0..100%) forms.  Returns the value in [0, 1] and writes
+the new position.
+@End Reasoning
+@Implementation
+Skip whitespace; parse the numeric prefix; if followed by '%' divide
+by 100.0, otherwise divide by 255.0.
+@End Implementation
+@Performance_Hints
+O(digit count).
+@End Performance_Hints
+@Security_Scope
+Returns -1.0 on parse failure, with out_end left at the pre-parse
+position.
+@End Security_Scope
+Process called "attr_color_read_rgb_channel" takes text as Integer, pos as Integer, len as Integer, out_end as Integer returns Float:
+    Let after_ws be proc attr_color_skip_ws with text, pos, len
+    Let n be proc attr_color_read_number with text, after_ws, len, out_end
+    Let new_pos be proc memory_get_int64 from Memory with out_end, 0
+    If new_pos is equal to after_ws:
+        proc memory_set_int64 from Memory with out_end, 0, pos
+        Return 0.0 minus 1.0
+    End If
+    If new_pos is less than len:
+        Let nx be proc string_char_at from StringCore with text, new_pos
+        If nx is equal to 37:
+            proc memory_set_int64 from Memory with out_end, 0, new_pos plus 1
+            Let denom_pct be proc int_to_float from Arith with 100
+            Return n divided by denom_pct
+        End If
+    End If
+    Let denom be proc int_to_float from Arith with 255
+    Return n divided by denom
+End Process
+
+@Reasoning
+Read one alpha channel.  CSS Color 4 accepts a value 0..1 or 0..100%.
+Returns the value in [0, 1] and writes the new position.
+@End Reasoning
+@Implementation
+Skip whitespace; parse number; if followed by '%' divide by 100.
+@End Implementation
+@Performance_Hints
+O(digit count).
+@End Performance_Hints
+@Security_Scope
+Returns -1.0 on parse failure.
+@End Security_Scope
+Process called "attr_color_read_alpha" takes text as Integer, pos as Integer, len as Integer, out_end as Integer returns Float:
+    Let after_ws be proc attr_color_skip_ws with text, pos, len
+    Let n be proc attr_color_read_number with text, after_ws, len, out_end
+    Let new_pos be proc memory_get_int64 from Memory with out_end, 0
+    If new_pos is equal to after_ws:
+        proc memory_set_int64 from Memory with out_end, 0, pos
+        Return 0.0 minus 1.0
+    End If
+    If new_pos is less than len:
+        Let nx be proc string_char_at from StringCore with text, new_pos
+        If nx is equal to 37:
+            proc memory_set_int64 from Memory with out_end, 0, new_pos plus 1
+            Let denom_pct be proc int_to_float from Arith with 100
+            Return n divided by denom_pct
+        End If
+    End If
+    Return n
+End Process
+
+@Reasoning
+Read a percentage-typed value (0..100%) and return the value in
+[0, 1].
+@End Reasoning
+@Implementation
+Skip whitespace; parse number; require trailing '%'; divide by 100.
+@End Implementation
+@Performance_Hints
+O(digit count).
+@End Performance_Hints
+@Security_Scope
+Returns -1.0 on parse failure.
+@End Security_Scope
+Process called "attr_color_read_percent" takes text as Integer, pos as Integer, len as Integer, out_end as Integer returns Float:
+    Let after_ws be proc attr_color_skip_ws with text, pos, len
+    Let n be proc attr_color_read_number with text, after_ws, len, out_end
+    Let new_pos be proc memory_get_int64 from Memory with out_end, 0
+    If new_pos is equal to after_ws:
+        proc memory_set_int64 from Memory with out_end, 0, pos
+        Return 0.0 minus 1.0
+    End If
+    If new_pos is greater than or equal to len:
+        proc memory_set_int64 from Memory with out_end, 0, pos
+        Return 0.0 minus 1.0
+    End If
+    Let nx be proc string_char_at from StringCore with text, new_pos
+    If nx is not equal to 37:
+        proc memory_set_int64 from Memory with out_end, 0, pos
+        Return 0.0 minus 1.0
+    End If
+    proc memory_set_int64 from Memory with out_end, 0, new_pos plus 1
+    Let denom_pct be proc int_to_float from Arith with 100
+    Return n divided by denom_pct
+End Process
+
+@Reasoning
+Decode rgb() or rgba() into a freshly allocated color record.
+@End Reasoning
+@Implementation
+Find the opening '(' after the prefix, read three rgb channels
+separated by commas (with optional whitespace), optionally read a
+trailing alpha, require a closing ')'.  Each channel uses
+attr_color_read_rgb_channel which handles both integer (n/255) and
+percentage (n%/100) forms.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on parse failure or allocation failure.
+@End Security_Scope
+Process called "attr_decode_rgb_function" takes value_string as Integer, has_alpha as Integer returns Integer:
+    Let len be proc string_length from StringCore with value_string
+    Let prefix_len be 4
+    If has_alpha is equal to 1:
+        Set prefix_len to 5
+    End If
+    If prefix_len is greater than len:
+        Return 0
+    End If
+    Let pos be prefix_len
+    Let out_end be proc allocate from Layout with 8
+    If out_end is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with out_end, 0, 0
+    Let r_val be proc attr_color_read_rgb_channel with value_string, pos, len, out_end
+    Set pos to proc memory_get_int64 from Memory with out_end, 0
+    If r_val is less than 0.0:
+        proc deallocate from Layout with out_end
+        Return 0
+    End If
+    Let pc1 be proc attr_color_expect_char with value_string, pos, len, 44
+    If pc1 is less than 0:
+        proc deallocate from Layout with out_end
+        Return 0
+    End If
+    Set pos to pc1
+    Let g_val be proc attr_color_read_rgb_channel with value_string, pos, len, out_end
+    Set pos to proc memory_get_int64 from Memory with out_end, 0
+    If g_val is less than 0.0:
+        proc deallocate from Layout with out_end
+        Return 0
+    End If
+    Let pc2 be proc attr_color_expect_char with value_string, pos, len, 44
+    If pc2 is less than 0:
+        proc deallocate from Layout with out_end
+        Return 0
+    End If
+    Set pos to pc2
+    Let b_val be proc attr_color_read_rgb_channel with value_string, pos, len, out_end
+    Set pos to proc memory_get_int64 from Memory with out_end, 0
+    If b_val is less than 0.0:
+        proc deallocate from Layout with out_end
+        Return 0
+    End If
+    Let alpha_val be 1.0
+    If has_alpha is equal to 1:
+        Let pc3 be proc attr_color_expect_char with value_string, pos, len, 44
+        If pc3 is less than 0:
+            proc deallocate from Layout with out_end
+            Return 0
+        End If
+        Set pos to pc3
+        Let a_parsed be proc attr_color_read_alpha with value_string, pos, len, out_end
+        Set pos to proc memory_get_int64 from Memory with out_end, 0
+        If a_parsed is less than 0.0:
+            proc deallocate from Layout with out_end
+            Return 0
+        End If
+        Set alpha_val to a_parsed
+    End If
+    Let pc_close be proc attr_color_expect_char with value_string, pos, len, 41
+    proc deallocate from Layout with out_end
+    If pc_close is less than 0:
+        Return 0
+    End If
+    Let rec be proc attr_color_rec_alloc
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc attr_color_rec_store with rec, ATTR_COLOR_REC_OFF_R, r_val
+    proc attr_color_rec_store with rec, ATTR_COLOR_REC_OFF_G, g_val
+    proc attr_color_rec_store with rec, ATTR_COLOR_REC_OFF_B, b_val
+    proc attr_color_rec_store with rec, ATTR_COLOR_REC_OFF_A, alpha_val
+    Return rec
+End Process
+
+@Reasoning
+Decode hsl() or hsla() into a freshly allocated color record.
+@End Reasoning
+@Implementation
+Parse the hue (degrees, no unit suffix required), then two percentage
+channels for saturation and lightness, then optionally an alpha.
+Construct an Hsl.ColorHsl and call Hsl.hsl_to_rgb to write the four
+Float64 channels into a 32-byte buffer.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on parse failure or allocation failure.
+@End Security_Scope
+Process called "attr_decode_hsl_function" takes value_string as Integer, has_alpha as Integer returns Integer:
+    Let len be proc string_length from StringCore with value_string
+    Let prefix_len be 4
+    If has_alpha is equal to 1:
+        Set prefix_len to 5
+    End If
+    If prefix_len is greater than len:
+        Return 0
+    End If
+    Let pos be prefix_len
+    Let out_end be proc allocate from Layout with 8
+    If out_end is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with out_end, 0, 0
+    Let after_ws_h be proc attr_color_skip_ws with value_string, pos, len
+    Let hue be proc attr_color_read_number with value_string, after_ws_h, len, out_end
+    Let new_h_pos be proc memory_get_int64 from Memory with out_end, 0
+    If new_h_pos is equal to after_ws_h:
+        proc deallocate from Layout with out_end
+        Return 0
+    End If
+    Set pos to new_h_pos
+    Note: Consume optional "deg" suffix on the hue value.  CSS Color 4
+    Note: accepts any of <number>, <number>deg as hue; we accept either.
+    If (pos plus 2) is less than len:
+        Let hch_d be proc string_char_at from StringCore with value_string, pos
+        Let hch_e be proc string_char_at from StringCore with value_string, pos plus 1
+        Let hch_g be proc string_char_at from StringCore with value_string, pos plus 2
+        If hch_d is equal to 100:
+            If hch_e is equal to 101:
+                If hch_g is equal to 103:
+                    Set pos to pos plus 3
+                End If
+            End If
+        End If
+    End If
+    Let pc1 be proc attr_color_expect_char with value_string, pos, len, 44
+    If pc1 is less than 0:
+        proc deallocate from Layout with out_end
+        Return 0
+    End If
+    Set pos to pc1
+    Let sat be proc attr_color_read_percent with value_string, pos, len, out_end
+    Set pos to proc memory_get_int64 from Memory with out_end, 0
+    If sat is less than 0.0:
+        proc deallocate from Layout with out_end
+        Return 0
+    End If
+    Let pc2 be proc attr_color_expect_char with value_string, pos, len, 44
+    If pc2 is less than 0:
+        proc deallocate from Layout with out_end
+        Return 0
+    End If
+    Set pos to pc2
+    Let light be proc attr_color_read_percent with value_string, pos, len, out_end
+    Set pos to proc memory_get_int64 from Memory with out_end, 0
+    If light is less than 0.0:
+        proc deallocate from Layout with out_end
+        Return 0
+    End If
+    Let alpha_val be 1.0
+    If has_alpha is equal to 1:
+        Let pc3 be proc attr_color_expect_char with value_string, pos, len, 44
+        If pc3 is less than 0:
+            proc deallocate from Layout with out_end
+            Return 0
+        End If
+        Set pos to pc3
+        Let a_parsed be proc attr_color_read_alpha with value_string, pos, len, out_end
+        Set pos to proc memory_get_int64 from Memory with out_end, 0
+        If a_parsed is less than 0.0:
+            proc deallocate from Layout with out_end
+            Return 0
+        End If
+        Set alpha_val to a_parsed
+    End If
+    Let pc_close be proc attr_color_expect_char with value_string, pos, len, 41
+    proc deallocate from Layout with out_end
+    If pc_close is less than 0:
+        Return 0
+    End If
+    Let hsl_color be proc hsl_create from Hsl with hue, sat, light, alpha_val
+    Let rec be proc allocate from Layout with ATTR_COLOR_REC_SIZE
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc hsl_to_rgb from Hsl with hsl_color, rec
+    Return rec
+End Process
+
+@Reasoning
+Decode a named CSS color identifier into a freshly allocated color
+record via Palette.palette_lookup_by_name.
+@End Reasoning
+@Implementation
+Allocate 32 bytes, call palette_lookup_by_name which writes (r, g, b,
+1.0).  If the lookup misses, free the record and return 0.
+@End Implementation
+@Performance_Hints
+O(named-color table size).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on lookup miss or allocation failure.
+@End Security_Scope
+Process called "attr_decode_named_color" takes value_string as Integer returns Integer:
+    Let rec be proc allocate from Layout with ATTR_COLOR_REC_SIZE
+    If rec is equal to 0:
+        Return 0
+    End If
+    Let found be proc palette_lookup_by_name from Palette with value_string, rec
+    If found is equal to 0:
+        proc deallocate from Layout with rec
+        Return 0
+    End If
+    Return rec
+End Process
+
+@Reasoning
+Public color-attribute parser.  Dispatches on the textual form, decodes
+into a 32-byte (r, g, b, a) Float64 record, and wraps that record as
+the payload of a TypedAttributeValue tagged ATTR_TYPE_COLOR.  The
+original color space (HEX / RGB / RGBA / HSL / HSLA / NAMED) is
+preserved in the unit slot.
+@End Reasoning
+@Implementation
+1. Check '#'-prefixed hex via attr_is_hex_color, then attr_decode_hex_color.
+2. Check "rgb(" / "rgba(" / "hsl(" / "hsla(" prefixes (longer matches
+   first) and dispatch to the corresponding decoder.
+3. Fall through to attr_decode_named_color for bare identifiers.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on malformed input or allocation failure; otherwise the
+caller owns the returned TypedAttributeValue and its 32-byte color
+record payload.
+@End Security_Scope
+Process called "attr_parse_color" takes value_string as Integer returns Integer:
+    If value_string is equal to 0:
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with value_string
+    If len is equal to 0:
+        Return 0
+    End If
+    Let is_hex be proc attr_is_hex_color with value_string
+    If is_hex is equal to 1:
+        Let rec_hex be proc attr_decode_hex_color with value_string
+        If rec_hex is equal to 0:
+            Return 0
+        End If
+        Return proc typed_value_create with ATTR_TYPE_COLOR, rec_hex, ATTR_COLOR_SPACE_HEX
+    End If
+    Let rgba_prefix be proc string_starts_with from StringCore with value_string, "rgba("
+    If rgba_prefix is equal to 1:
+        Let rec_rgba be proc attr_decode_rgb_function with value_string, 1
+        If rec_rgba is equal to 0:
+            Return 0
+        End If
+        Return proc typed_value_create with ATTR_TYPE_COLOR, rec_rgba, ATTR_COLOR_SPACE_RGBA
+    End If
+    Let rgb_prefix be proc string_starts_with from StringCore with value_string, "rgb("
+    If rgb_prefix is equal to 1:
+        Let rec_rgb be proc attr_decode_rgb_function with value_string, 0
+        If rec_rgb is equal to 0:
+            Return 0
+        End If
+        Return proc typed_value_create with ATTR_TYPE_COLOR, rec_rgb, ATTR_COLOR_SPACE_RGB
+    End If
+    Let hsla_prefix be proc string_starts_with from StringCore with value_string, "hsla("
+    If hsla_prefix is equal to 1:
+        Let rec_hsla be proc attr_decode_hsl_function with value_string, 1
+        If rec_hsla is equal to 0:
+            Return 0
+        End If
+        Return proc typed_value_create with ATTR_TYPE_COLOR, rec_hsla, ATTR_COLOR_SPACE_HSLA
+    End If
+    Let hsl_prefix be proc string_starts_with from StringCore with value_string, "hsl("
+    If hsl_prefix is equal to 1:
+        Let rec_hsl be proc attr_decode_hsl_function with value_string, 0
+        If rec_hsl is equal to 0:
+            Return 0
+        End If
+        Return proc typed_value_create with ATTR_TYPE_COLOR, rec_hsl, ATTR_COLOR_SPACE_HSL
+    End If
+    Let rec_named be proc attr_decode_named_color with value_string
+    If rec_named is equal to 0:
+        Return 0
+    End If
+    Return proc typed_value_create with ATTR_TYPE_COLOR, rec_named, ATTR_COLOR_SPACE_NAMED
+End Process
+
+@Reasoning
+Recover the red channel (Float64 in [0, 1]) from a decoded color
+TypedAttributeValue.
+@End Reasoning
+@Implementation
+Load the bit-cast Float at offset 0 of the payload record.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns 0.0 for null or non-color typed values.
+@End Security_Scope
+Process called "typed_value_color_get_r" takes value as Integer returns Float:
+    If value is equal to 0:
+        Return 0.0
+    End If
+    Let tag be proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_TYPE
+    If tag is not equal to ATTR_TYPE_COLOR:
+        Return 0.0
+    End If
+    Let rec be proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_PAYLOAD
+    If rec is equal to 0:
+        Return 0.0
+    End If
+    Let bits be proc memory_get_int64 from Memory with rec, ATTR_COLOR_REC_OFF_R
+    Return proc bits_to_float from Hsl with bits
+End Process
+
+@Reasoning
+Recover the green channel (Float64 in [0, 1]) from a decoded color
+TypedAttributeValue.
+@End Reasoning
+@Implementation
+Load the bit-cast Float at offset 8 of the payload record.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns 0.0 for null or non-color typed values.
+@End Security_Scope
+Process called "typed_value_color_get_g" takes value as Integer returns Float:
+    If value is equal to 0:
+        Return 0.0
+    End If
+    Let tag be proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_TYPE
+    If tag is not equal to ATTR_TYPE_COLOR:
+        Return 0.0
+    End If
+    Let rec be proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_PAYLOAD
+    If rec is equal to 0:
+        Return 0.0
+    End If
+    Let bits be proc memory_get_int64 from Memory with rec, ATTR_COLOR_REC_OFF_G
+    Return proc bits_to_float from Hsl with bits
+End Process
+
+@Reasoning
+Recover the blue channel (Float64 in [0, 1]) from a decoded color
+TypedAttributeValue.
+@End Reasoning
+@Implementation
+Load the bit-cast Float at offset 16 of the payload record.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns 0.0 for null or non-color typed values.
+@End Security_Scope
+Process called "typed_value_color_get_b" takes value as Integer returns Float:
+    If value is equal to 0:
+        Return 0.0
+    End If
+    Let tag be proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_TYPE
+    If tag is not equal to ATTR_TYPE_COLOR:
+        Return 0.0
+    End If
+    Let rec be proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_PAYLOAD
+    If rec is equal to 0:
+        Return 0.0
+    End If
+    Let bits be proc memory_get_int64 from Memory with rec, ATTR_COLOR_REC_OFF_B
+    Return proc bits_to_float from Hsl with bits
+End Process
+
+@Reasoning
+Recover the alpha channel (Float64 in [0, 1]) from a decoded color
+TypedAttributeValue.
+@End Reasoning
+@Implementation
+Load the bit-cast Float at offset 24 of the payload record.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns 0.0 for null or non-color typed values.
+@End Security_Scope
+Process called "typed_value_color_get_a" takes value as Integer returns Float:
+    If value is equal to 0:
+        Return 0.0
+    End If
+    Let tag be proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_TYPE
+    If tag is not equal to ATTR_TYPE_COLOR:
+        Return 0.0
+    End If
+    Let rec be proc memory_get_int64 from Memory with value, TYPED_VALUE_OFF_PAYLOAD
+    If rec is equal to 0:
+        Return 0.0
+    End If
+    Let bits be proc memory_get_int64 from Memory with rec, ATTR_COLOR_REC_OFF_A
+    Return proc bits_to_float from Hsl with bits
+End Process
+
+@Reasoning
+Length parser per CSS Values 4 section 6: an optional sign, decimal
+digits, optional fractional part, followed by an optional unit
+identifier.  Pure-numeric values yield UNIT_NONE.
+@End Reasoning
+@Implementation
+Walk the string capturing the numeric prefix length, then match the
+trailing unit suffix to one of the known unit identifiers.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Unknown unit suffixes cause the parser to return 0.
+@End Security_Scope
+Process called "attr_match_unit" takes text as Integer, start as Integer returns Integer:
+    Let len be proc string_length from StringCore with text
+    If start is greater than or equal to len:
+        Return ATTR_LEN_UNIT_NONE
+    End If
+    Let remainder_len be len minus start
+    If remainder_len is equal to 1:
+        Let c be proc string_char_at from StringCore with text, start
+        If c is equal to 37:
+            Return ATTR_LEN_UNIT_PCT
+        End If
+        Return -1
+    End If
+    If remainder_len is equal to 2:
+        Let a be proc string_char_at from StringCore with text, start
+        Let b be proc string_char_at from StringCore with text, start plus 1
+        If a is equal to 112:
+            If b is equal to 120:
+                Return ATTR_LEN_UNIT_PX
+            End If
+            If b is equal to 116:
+                Return ATTR_LEN_UNIT_PT
+            End If
+        End If
+        If a is equal to 101:
+            If b is equal to 109:
+                Return ATTR_LEN_UNIT_EM
+            End If
+        End If
+        If a is equal to 99:
+            If b is equal to 109:
+                Return ATTR_LEN_UNIT_CM
+            End If
+        End If
+        If a is equal to 109:
+            If b is equal to 109:
+                Return ATTR_LEN_UNIT_MM
+            End If
+        End If
+        If a is equal to 105:
+            If b is equal to 110:
+                Return ATTR_LEN_UNIT_IN
+            End If
+        End If
+        If a is equal to 118:
+            If b is equal to 119:
+                Return ATTR_LEN_UNIT_VW
+            End If
+            If b is equal to 104:
+                Return ATTR_LEN_UNIT_VH
+            End If
+        End If
+        Return -1
+    End If
+    If remainder_len is equal to 3:
+        Let r1 be proc string_char_at from StringCore with text, start
+        Let r2 be proc string_char_at from StringCore with text, start plus 1
+        Let r3 be proc string_char_at from StringCore with text, start plus 2
+        If r1 is equal to 114:
+            If r2 is equal to 101:
+                If r3 is equal to 109:
+                    Return ATTR_LEN_UNIT_REM
+                End If
+            End If
+        End If
+        Return -1
+    End If
+    Return -1
+End Process
+
+Process called "attr_parse_length" takes value_string as Integer returns Integer:
+    If value_string is equal to 0:
+        Return 0
+    End If
+    Let status_slot be proc allocate from Layout with 8
+    If status_slot is equal to 0:
+        Return 0
+    End If
+    Let end_slot be proc allocate from Layout with 8
+    If end_slot is equal to 0:
+        proc deallocate from Layout with status_slot
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with status_slot, 0, 0
+    proc memory_set_int64 from Memory with end_slot, 0, 0
+    Let num be proc attr_parse_int_with_pos with value_string, 0, end_slot, status_slot
+    Let status be proc memory_get_int64 from Memory with status_slot, 0
+    Let end_pos be proc memory_get_int64 from Memory with end_slot, 0
+    proc deallocate from Layout with status_slot
+    proc deallocate from Layout with end_slot
+    If status is not equal to ATTR_VALIDATE_OK:
+        Return 0
+    End If
+    Let unit be proc attr_match_unit with value_string, end_pos
+    If unit is less than 0:
+        Return 0
+    End If
+    Return proc typed_value_create with ATTR_TYPE_LENGTH, num, unit
+End Process
+
+@Reasoning
+Top-level parse dispatcher.  Look up the schema's expected type and
+route to the corresponding typed parser.  Unknown types are treated as
+String and stored verbatim.
+@End Reasoning
+@Implementation
+Switch on expected_type; call the matching parser; return its result.
+@End Implementation
+@Performance_Hints
+Constant-time dispatch plus parser cost.
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "attribute_parse" takes value_string as Integer, expected_type as Integer returns Integer:
+    If expected_type is equal to ATTR_TYPE_BOOLEAN:
+        Return proc attr_parse_boolean with value_string
+    End If
+    If expected_type is equal to ATTR_TYPE_INTEGER:
+        Return proc attr_parse_integer with value_string
+    End If
+    If expected_type is equal to ATTR_TYPE_URL:
+        Return proc attr_parse_url with value_string
+    End If
+    If expected_type is equal to ATTR_TYPE_COLOR:
+        Return proc attr_parse_color with value_string
+    End If
+    If expected_type is equal to ATTR_TYPE_LENGTH:
+        Return proc attr_parse_length with value_string
+    End If
+    Return proc typed_value_create with ATTR_TYPE_STRING, value_string, 0
+End Process
+
+Note: ============================================================================
+Note: VALIDATION
+Note: ============================================================================
+
+@Reasoning
+Verify that a raw (name, value) attribute satisfies the schema for that
+name.  Returns ATTR_VALIDATE_OK or a negative error code.  If the
+schema declares an enumerated value-set, the raw value must appear in
+the set; otherwise the value is parsed under the declared type and
+validation passes iff the parse succeeds.
+@End Reasoning
+@Implementation
+Locate the schema by linear-scan over the schemas list (small fixed
+list per element type, so a hash would be overkill).  Then run the
+appropriate validator.
+@End Implementation
+@Performance_Hints
+O(schema-list-length + value parse).
+@End Performance_Hints
+@Security_Scope
+Returns ATTR_VALIDATE_OK if no schema is found, meaning "free-form
+string acceptable".
+@End Security_Scope
+Process called "attribute_lookup_schema" takes schemas as Integer, name as Integer returns Integer:
+    If schemas is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with schemas
+    Let i be 0
+    While i is less than count:
+        Let s be proc list_get from List with schemas, i
+        Let s_name be proc memory_get_int64 from Memory with s, ATTR_SCHEMA_OFF_NAME
+        Let eq be proc string_equals from StringCore with s_name, name
+        If eq is equal to 1:
+            Return s
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "attribute_validate" takes name as Integer, value as Integer, schemas as Integer returns Integer:
+    If name is equal to 0:
+        Return ATTR_VALIDATE_MISMATCH
+    End If
+    Let schema be proc attribute_lookup_schema with schemas, name
+    If schema is equal to 0:
+        Return ATTR_VALIDATE_OK
+    End If
+    Let is_bool be proc memory_get_int64 from Memory with schema, ATTR_SCHEMA_OFF_BOOLEAN
+    If is_bool is equal to 1:
+        Return ATTR_VALIDATE_OK
+    End If
+    Let enums be proc memory_get_int64 from Memory with schema, ATTR_SCHEMA_OFF_ENUMS
+    If enums is not equal to 0:
+        Let ecount be proc list_length from List with enums
+        Let i be 0
+        While i is less than ecount:
+            Let allowed be proc list_get from List with enums, i
+            Let eq be proc string_equals from StringCore with allowed, value
+            If eq is equal to 1:
+                Return ATTR_VALIDATE_OK
+            End If
+            Set i to i plus 1
+        End While
+        Return ATTR_VALIDATE_NOT_IN_ENUM
+    End If
+    Let type_tag be proc memory_get_int64 from Memory with schema, ATTR_SCHEMA_OFF_TYPE
+    Let parsed be proc attribute_parse with value, type_tag
+    If parsed is equal to 0:
+        Return ATTR_VALIDATE_PARSE_FAIL
+    End If
+    proc typed_value_destroy with parsed
+    Return ATTR_VALIDATE_OK
+End Process
+
+Note: ============================================================================
+Note: NORMALIZATION
+Note: ============================================================================
+
+@Reasoning
+HTML attribute name normalization: ASCII-case fold to lowercase per
+HTML Living Standard section 2.6.2.  Returns a freshly allocated
+NUL-terminated lowercase copy of the input.
+@End Reasoning
+@Implementation
+Compute length; allocate len+1 bytes; walk the input writing the
+lowercase mapping per Char.to_lowercase.
+@End Implementation
+@Performance_Hints
+O(length); one allocation.
+@End Performance_Hints
+@Security_Scope
+Caller owns the returned string.  Returns 0 on OOM.
+@End Security_Scope
+Process called "attribute_normalize_name" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with name
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with name, i
+        Let lower be proc to_lower from Char with ch
+        proc stringbuilder_append_char from SB with sb, lower
+        Set i to i plus 1
+    End While
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process
+
+@Reasoning
+Collapse a run of internal whitespace in an attribute value down to
+single ASCII space characters and trim leading / trailing whitespace,
+per HTML Living Standard section 2.6.4 "stripped and collapsed".
+@End Reasoning
+@Implementation
+1. Skip leading whitespace.
+2. Walk the string: each non-whitespace character is appended;
+   when whitespace is encountered, append a single space and skip the
+   rest of the run.
+3. Trim trailing whitespace by removing the final space if present.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Caller owns the returned string.  Returns 0 on OOM.
+@End Security_Scope
+Process called "attribute_normalize_whitespace" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with value
+    Let i be 0
+    While i is less than len:
+        Let c1 be proc string_char_at from StringCore with value, i
+        Let ws1 be proc is_whitespace from Char with c1
+        If ws1 is equal to 1:
+            Set i to i plus 1
+        Otherwise:
+            Set i to len
+        End If
+    End While
+    Let last_was_space be 1
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with value, i
+        Let is_ws be proc is_whitespace from Char with ch
+        If is_ws is equal to 1:
+            If last_was_space is equal to 0:
+                proc stringbuilder_append_char from SB with sb, 32
+                Set last_was_space to 1
+            End If
+        Otherwise:
+            proc stringbuilder_append_char from SB with sb, ch
+            Set last_was_space to 0
+        End If
+        Set i to i plus 1
+    End While
+    Let cur_len be proc stringbuilder_length from SB with sb
+    If cur_len is greater than 0:
+        Let last_index be cur_len minus 1
+        Let buf be proc stringbuilder_get_buffer from SB with sb
+        Let last_ch be proc memory_get_int8 from Memory with buf, last_index
+        Let lws be proc is_whitespace from Char with last_ch
+        If lws is equal to 1:
+            proc stringbuilder_set_length from SB with sb, last_index
+        End If
+    End If
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process

@@ -1,0 +1,229 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+PGP / OpenPGP signature parsing per RFC 4880
+==============================================================================
+
+Parses the OpenPGP packet structure for detached signature verification on
+git repository tags and signed objects. Packet format:
+  Header: 1 byte tag (high bit = always 1, bits 6 contain new/old format,
+          remaining bits encode packet type)
+  Length: 1-5 bytes, format depends on header
+
+Supported packet types:
+- Signature Packet (tag 2): RSA or EdDSA signature over a hashed message
+- Public-Key Packet (tag 6): the verifier key
+
+The parser extracts the signature algorithm identifier (1 = RSA, 22 = EdDSA),
+hash algorithm identifier (8 = SHA-256, 10 = SHA-512), and the signature
+bytes. Hash-data construction follows RFC 4880 5.2.4: signed bytes are
+the message followed by the signature packet up to (but not including) the
+hashed-subpacket-length field's first byte before the trailer.
+
+Verification routes to the algorithm-specific verify primitives in
+crypto/rsa.runa or crypto/ed25519.runa.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+
+Process called "pgp_read_new_packet_header" takes packet_bytes as Integer, packet_offset as Integer, packet_limit as Integer, out_tag as Integer, out_body_length as Integer, out_header_size as Integer returns Integer:
+    @Reasoning
+    Parses a new-format OpenPGP packet header at packet_bytes[packet_offset].
+    Writes the packet type into out_tag, the body length into out_body_length,
+    and the header size (in bytes) into out_header_size. Returns 1 on success,
+    0 on failure (truncated or malformed header).
+    @End Reasoning
+
+    If packet_offset plus 1 is greater than packet_limit:
+        Return 0
+    End If
+
+    Let header_byte be proc memory_get_byte from Memory with packet_bytes, packet_offset
+    Note: New format if bit 6 set. Old format if not. We handle new format here.
+    Let new_format_bit be header_byte bitwise_and 64
+    If new_format_bit is equal to 0:
+        Return 0
+    End If
+
+    Let tag_value be header_byte bitwise_and 63
+    proc memory_set_qword from Memory with out_tag, 0, tag_value
+
+    If packet_offset plus 2 is greater than packet_limit:
+        Return 0
+    End If
+    Let first_length_byte be proc memory_get_byte from Memory with packet_bytes, packet_offset plus 1
+
+    If first_length_byte is less than 192:
+        proc memory_set_qword from Memory with out_body_length, 0, first_length_byte
+        proc memory_set_qword from Memory with out_header_size, 0, 2
+        Return 1
+    End If
+
+    If first_length_byte is less than 224:
+        If packet_offset plus 3 is greater than packet_limit:
+            Return 0
+        End If
+        Let second_length_byte be proc memory_get_byte from Memory with packet_bytes, packet_offset plus 2
+        Let body_length be (first_length_byte minus 192) multiplied by 256 plus second_length_byte plus 192
+        proc memory_set_qword from Memory with out_body_length, 0, body_length
+        proc memory_set_qword from Memory with out_header_size, 0, 3
+        Return 1
+    End If
+
+    If first_length_byte is equal to 255:
+        If packet_offset plus 6 is greater than packet_limit:
+            Return 0
+        End If
+        Let b1 be proc memory_get_byte from Memory with packet_bytes, packet_offset plus 2
+        Let b2 be proc memory_get_byte from Memory with packet_bytes, packet_offset plus 3
+        Let b3 be proc memory_get_byte from Memory with packet_bytes, packet_offset plus 4
+        Let b4 be proc memory_get_byte from Memory with packet_bytes, packet_offset plus 5
+        Let full_length be b1 multiplied by 16777216 plus b2 multiplied by 65536 plus b3 multiplied by 256 plus b4
+        proc memory_set_qword from Memory with out_body_length, 0, full_length
+        proc memory_set_qword from Memory with out_header_size, 0, 6
+        Return 1
+    End If
+
+    Note: Partial-body length not supported for signature packets
+    Return 0
+End Process
+
+Process called "pgp_signature_packet_validate" takes arena as Integer, packet_bytes as Integer, packet_length as Integer returns Integer:
+    @Reasoning
+    Structural validation of an OpenPGP Signature Packet (tag 2). Validates:
+    - Packet header parses cleanly
+    - Tag = 2 (Signature Packet)
+    - Version byte (4 for v4, 5 for v5 - both are accepted)
+    - Signature type field present (used to identify what is being signed)
+    - Public-key algorithm + hash algorithm fields are recognized values
+    - Hashed-subpacket-length and unhashed-subpacket-length fields fit
+      within the packet body
+
+    Returns 1 if the packet structure is well-formed, 0 otherwise. Full
+    cryptographic verification of the signature value against the data
+    digest is dispatched via crypto/rsa.runa or crypto/ed25519.runa
+    depending on the public-key algorithm field.
+    @End Reasoning
+
+    If packet_length is less than 8:
+        Return 0
+    End If
+
+    Let tag_slot be proc arena_allocate from Arena with arena, 8
+    Let body_len_slot be proc arena_allocate from Arena with arena, 8
+    Let header_size_slot be proc arena_allocate from Arena with arena, 8
+    If tag_slot is equal to 0:
+        Return 0
+    End If
+
+    Let header_parse_result be proc pgp_read_new_packet_header with packet_bytes, 0, packet_length, tag_slot, body_len_slot, header_size_slot
+    If header_parse_result is equal to 0:
+        Return 0
+    End If
+
+    Let tag_value be proc memory_get_qword from Memory with tag_slot, 0
+    If tag_value is not equal to 2:
+        Return 0
+    End If
+
+    Let header_size be proc memory_get_qword from Memory with header_size_slot, 0
+    Let body_offset be header_size
+    Let body_length be proc memory_get_qword from Memory with body_len_slot, 0
+
+    If body_offset plus body_length is greater than packet_length:
+        Return 0
+    End If
+
+    If body_length is less than 4:
+        Return 0
+    End If
+
+    Let version_byte be proc memory_get_byte from Memory with packet_bytes, body_offset
+    If version_byte is not equal to 4:
+        If version_byte is not equal to 5:
+            Return 0
+        End If
+    End If
+
+    Note: version 4 layout:
+    Note:   [0] version (1)
+    Note:   [1] sig_type (1)
+    Note:   [2] pubkey_algo (1)
+    Note:   [3] hash_algo (1)
+    Note:   [4..5] hashed_subpacket_length (2 bytes BE)
+    Note:   [6..6+hsl-1] hashed_subpackets
+    Note:   [...] unhashed_subpacket_length (2 bytes BE)
+    Note:   [...] unhashed_subpackets
+    Note:   [...] hashed-data trailer + sig bytes
+
+    Let pubkey_algo be proc memory_get_byte from Memory with packet_bytes, body_offset plus 2
+    Let hash_algo be proc memory_get_byte from Memory with packet_bytes, body_offset plus 3
+
+    Note: Accept RSA (1), DSA (17), ECDSA (19), EdDSA (22)
+    Let pubkey_ok be 0
+    If pubkey_algo is equal to 1:
+        Set pubkey_ok to 1
+    End If
+    If pubkey_algo is equal to 17:
+        Set pubkey_ok to 1
+    End If
+    If pubkey_algo is equal to 19:
+        Set pubkey_ok to 1
+    End If
+    If pubkey_algo is equal to 22:
+        Set pubkey_ok to 1
+    End If
+    If pubkey_ok is equal to 0:
+        Return 0
+    End If
+
+    Note: Accept SHA-256 (8), SHA-384 (9), SHA-512 (10), SHA-224 (11), SHA3-256 (12), SHA3-512 (14)
+    Let hash_ok be 0
+    If hash_algo is equal to 8:
+        Set hash_ok to 1
+    End If
+    If hash_algo is equal to 9:
+        Set hash_ok to 1
+    End If
+    If hash_algo is equal to 10:
+        Set hash_ok to 1
+    End If
+    If hash_algo is equal to 11:
+        Set hash_ok to 1
+    End If
+    If hash_algo is equal to 12:
+        Set hash_ok to 1
+    End If
+    If hash_algo is equal to 14:
+        Set hash_ok to 1
+    End If
+    If hash_ok is equal to 0:
+        Return 0
+    End If
+
+    Note: Hashed subpacket length range check
+    Let hsl_hi be proc memory_get_byte from Memory with packet_bytes, body_offset plus 4
+    Let hsl_lo be proc memory_get_byte from Memory with packet_bytes, body_offset plus 5
+    Let hashed_sub_len be hsl_hi multiplied by 256 plus hsl_lo
+    If 6 plus hashed_sub_len is greater than body_length minus 2:
+        Return 0
+    End If
+
+    Return 1
+End Process

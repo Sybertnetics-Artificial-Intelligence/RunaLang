@@ -1,0 +1,1543 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+UCD_GENERATOR - Pure-Runa Unicode Character Database Table Generator
+==============================================================================
+
+This tool parses the authoritative Unicode Character Database files and
+emits the canonical-decomposition / property tables consumed by
+codepoint.runa and normalized_string.runa via the accessors exposed in
+codepoint_unicode_tables.runa.
+
+The output file is structurally identical to the curated baseline that
+ships in codepoint_unicode_tables.runa - same accessor surface, same
+module-global layout, same init proc shape - but contains the FULL
+Unicode 15.1.0 dataset instead of the curated European-text subset.
+
+DESIGN PHILOSOPHY:
+
+This program is a SOURCE-TO-SOURCE generator. It does not need to run
+on the same machine as the compiler that builds the compiler. It runs
+once per UCD release, emits a Runa source file, and that file is then
+checked into the repository alongside this generator. This is the same
+pattern Go uses for golang.org/x/text/unicode and Rust uses for
+unicode-rs/unicode-normalization.
+
+DEPENDENCIES:
+
+The generator requires the following UCD files in a local directory
+(default /tmp/ucd/, configurable via the UCD_DIR constant below):
+
+  UnicodeData.txt              - Core property + decomposition data
+  DerivedNormalizationProps.txt - NFC_QC / NFD_QC / NFKC_QC / NFKD_QC
+  CompositionExclusions.txt    - Codepoints to skip during NFC compose
+  CaseFolding.txt              - Full case-folding mappings
+  DerivedCoreProperties.txt    - Alphabetic / Lowercase / Uppercase /
+                                  ID_Start / ID_Continue / ...
+
+Fetch the official Unicode 15.1.0 release:
+    curl -O https://www.unicode.org/Public/15.1.0/ucd/UCD.zip
+    unzip UCD.zip -d /tmp/ucd/
+
+Then run the generator. The output replaces codepoint_unicode_tables.runa
+in the working tree:
+
+    /tmp/runac_92 tools/ucd_generator.runa /tmp/gen.s
+    <link with primitives + runtime>
+    ./generator > compiler/frontend/primitives/text/codepoint_unicode_tables.runa
+
+OUTPUT SHAPE:
+
+The emitter writes a Runa source file with the exact same module-level
+structure as the curated baseline:
+  - Same Constant declarations for GC_*, HANGUL_*
+  - Same module-global Let declarations
+  - Same accessor proc bodies (binary search)
+  - Replaced install_* procs with full-population variants whose body
+    is a long sequence of unicode_write_* calls
+  - Same top-level codepoint_unicode_tables_init driver
+
+This is a deliberate design choice: the curated baseline IS the
+generator's output shape, just with curated data. Swapping in the full
+dataset is a drop-in replacement.
+
+PARSING:
+
+UnicodeData.txt format (UAX #44 section 5.7.4):
+  Each line is semicolon-delimited with 15 fields:
+    0: Code value (hex)
+    1: Name
+    2: General_Category
+    3: Canonical_Combining_Class (decimal)
+    4: Bidi_Class
+    5: Decomposition_Type and_Mapping
+    6-8: Numeric values
+    9-10: Bidi mirrored / Unicode 1 name
+    11: ISO comment (obsolete)
+    12: Simple uppercase (hex)
+    13: Simple lowercase (hex)
+    14: Simple titlecase (hex)
+  Trailing blank line ends the record. Range entries use
+  "<First>" / "<Last>" suffixes in the name field.
+
+DerivedNormalizationProps.txt: Each non-comment line is
+  "<codepoint or range> ; <property> [; <value>]" e.g.
+  "00A0 ; NFKD_QC; N"
+
+CompositionExclusions.txt: Each non-comment line is a single
+  hexadecimal codepoint, optionally followed by a comment.
+
+CaseFolding.txt: Each non-comment line is
+  "<codepoint> ; <status>; <mapping>; # <comment>" where status is
+  one of C (Common), F (Full), S (Simple), T (Turkic).
+
+DerivedCoreProperties.txt: Each non-comment line is
+  "<codepoint or range> ; <property>" e.g.
+  "0041..005A    ; Uppercase"
+
+OUTPUT FILE STRUCTURE:
+
+The emitter walks the in-memory tables in sorted order and writes a
+sequence of writer calls. For long tables we emit them in chunks of
+1000 entries per helper proc to stay within stage1's parser limits.
+
+REFERENCES:
+- UAX #44 Unicode Character Database (formal data formats)
+- The UnicodeData.txt header documents every field's syntax
+- https://www.unicode.org/Public/15.1.0/ucd/
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StrCore
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Constant UCD_O_RDONLY as Integer is 0
+Constant UCD_O_WRONLY as Integer is 1
+Constant UCD_O_CREAT as Integer is 64
+Constant UCD_O_TRUNC as Integer is 512
+Constant UCD_WRITE_FLAGS as Integer is 577
+Constant UCD_FILE_MODE as Integer is 420
+
+Constant UCD_BUFFER_SIZE as Integer is 1048576
+
+Note: GC string -> id mapping is materialized via the gc_id_from_str proc
+Note: below. Values match the GC_* constants in
+Note: codepoint_unicode_tables.runa.
+
+Constant UCD_GC_LU as Integer is 1
+Constant UCD_GC_LL as Integer is 2
+Constant UCD_GC_LT as Integer is 3
+Constant UCD_GC_LM as Integer is 4
+Constant UCD_GC_LO as Integer is 5
+Constant UCD_GC_MN as Integer is 6
+Constant UCD_GC_MC as Integer is 7
+Constant UCD_GC_ME as Integer is 8
+Constant UCD_GC_ND as Integer is 9
+Constant UCD_GC_NL as Integer is 10
+Constant UCD_GC_NO as Integer is 11
+Constant UCD_GC_PC as Integer is 12
+Constant UCD_GC_PD as Integer is 13
+Constant UCD_GC_PS as Integer is 14
+Constant UCD_GC_PE as Integer is 15
+Constant UCD_GC_PI as Integer is 16
+Constant UCD_GC_PF as Integer is 17
+Constant UCD_GC_PO as Integer is 18
+Constant UCD_GC_SM as Integer is 19
+Constant UCD_GC_SC as Integer is 20
+Constant UCD_GC_SK as Integer is 21
+Constant UCD_GC_SO as Integer is 22
+Constant UCD_GC_ZS as Integer is 23
+Constant UCD_GC_ZL as Integer is 24
+Constant UCD_GC_ZP as Integer is 25
+Constant UCD_GC_CC as Integer is 26
+Constant UCD_GC_CF as Integer is 27
+Constant UCD_GC_CS as Integer is 28
+Constant UCD_GC_CO as Integer is 29
+Constant UCD_GC_CN as Integer is 30
+
+Note: Maximum sizes for the parsed-data buffers. UCD 15.1.0:
+Note:   34622 lines in UnicodeData.txt (one per assigned cp + ranges)
+Note:   ~2k canonical decomps, ~3.6k compatibility decomps
+Note:   ~1k composition exclusions
+Note: We allocate generously and shrink at emit time.
+
+Constant UCD_MAX_GC_ENTRIES as Integer is 40000
+Constant UCD_MAX_CCC_ENTRIES as Integer is 1000
+Constant UCD_MAX_CASE_ENTRIES as Integer is 4000
+Constant UCD_MAX_DECOMP_ENTRIES as Integer is 5000
+Constant UCD_MAX_DECOMP_BUF as Integer is 20000
+Constant UCD_MAX_EXCLUSION_ENTRIES as Integer is 200
+
+Note: ============================================================================
+Note: IN-MEMORY PARSE BUFFERS
+Note: ============================================================================
+Note: All buffers are allocated at start, grown via the writer helpers,
+Note: emitted in sorted order.
+
+Let ucd_gc_buf be 0
+Let ucd_gc_count be 0
+
+Let ucd_ccc_buf be 0
+Let ucd_ccc_count be 0
+
+Let ucd_lower_buf be 0
+Let ucd_lower_count be 0
+Let ucd_upper_buf be 0
+Let ucd_upper_count be 0
+Let ucd_title_buf be 0
+Let ucd_title_count be 0
+
+Let ucd_canon_decomp_index be 0
+Let ucd_canon_decomp_buf be 0
+Let ucd_canon_decomp_count be 0
+Let ucd_canon_decomp_buf_used be 0
+
+Let ucd_compat_decomp_index be 0
+Let ucd_compat_decomp_buf be 0
+Let ucd_compat_decomp_count be 0
+Let ucd_compat_decomp_buf_used be 0
+
+Let ucd_exclusion_buf be 0
+Let ucd_exclusion_count be 0
+
+Note: ============================================================================
+Note: PRIMITIVE I/O
+Note: ============================================================================
+
+Process called "ucd_open_read" takes path as Integer returns Integer:
+    Note: Opens a file for read. Returns fd >= 0 on success, -1 on error.
+    Return proc syscall_open from Syscall with path, UCD_O_RDONLY, 0
+End Process
+
+Process called "ucd_open_write" takes path as Integer returns Integer:
+    Note: Opens a file for write (creates / truncates). Returns fd, or -1.
+    Return proc syscall_open from Syscall with path, UCD_WRITE_FLAGS, UCD_FILE_MODE
+End Process
+
+Process called "ucd_close" takes fd as Integer returns Integer:
+    Return proc syscall_close from Syscall with fd
+End Process
+
+Process called "ucd_read_to_buffer" takes fd as Integer, buf as Integer, max_bytes as Integer returns Integer:
+    Note: Reads up to max_bytes from fd into buf. Returns total bytes read.
+    Note: Loops on partial reads until EOF.
+    Let total be 0
+    Let done be 0
+    While done is equal to 0:
+        If total is greater than or equal to max_bytes:
+            Set done to 1
+        Otherwise:
+            Let remaining be max_bytes minus total
+            Let n be proc syscall_read from Syscall with fd, buf plus total, remaining
+            If n is less than 0:
+                Return 0 minus 1
+            End If
+            If n is equal to 0:
+                Set done to 1
+            Otherwise:
+                Set total to total plus n
+            End If
+        End If
+    End While
+    Return total
+End Process
+
+Process called "ucd_write_buffer" takes fd as Integer, buf as Integer, length as Integer returns Integer:
+    Let written be 0
+    While written is less than length:
+        Let n be proc syscall_write from Syscall with fd, buf plus written, length minus written
+        If n is less than 0:
+            Return 0 minus 1
+        End If
+        If n is equal to 0:
+            Return written
+        End If
+        Set written to written plus n
+    End While
+    Return written
+End Process
+
+Process called "ucd_write_cstring" takes fd as Integer, s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let len be StrCore.string_length(s)
+    Return ucd_write_buffer(fd, s, len)
+End Process
+
+Process called "ucd_write_int" takes fd as Integer, n as Integer returns Integer:
+    Note: Writes a decimal integer. Allocates a small scratch buffer.
+    Let scratch be allocate(24)
+    If scratch is equal to 0:
+        Return 0 minus 1
+    End If
+    Let val be n
+    Let is_neg be 0
+    If val is less than 0:
+        Set is_neg to 1
+        Set val to 0 minus val
+    End If
+    Let pos be 23
+    Memory.memory_set_byte(scratch, pos, 0)
+    If val is equal to 0:
+        Set pos to pos minus 1
+        Memory.memory_set_byte(scratch, pos, 48)
+    End If
+    While val is greater than 0:
+        Let d be val minus ((val divided by 10) multiplied by 10)
+        Set pos to pos minus 1
+        Memory.memory_set_byte(scratch, pos, 48 plus d)
+        Set val to val divided by 10
+    End While
+    If is_neg is equal to 1:
+        Set pos to pos minus 1
+        Memory.memory_set_byte(scratch, pos, 45)
+    End If
+    Let length be 23 minus pos
+    Let res be ucd_write_buffer(fd, scratch plus pos, length)
+    deallocate(scratch)
+    Return res
+End Process
+
+Note: ============================================================================
+Note: PARSING HELPERS
+Note: ============================================================================
+
+Process called "ucd_is_hex_digit" takes b as Integer returns Integer:
+    If b is greater than or equal to 48:
+        If b is less than or equal to 57:
+            Return 1
+        End If
+    End If
+    If b is greater than or equal to 65:
+        If b is less than or equal to 70:
+            Return 1
+        End If
+    End If
+    If b is greater than or equal to 97:
+        If b is less than or equal to 102:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "ucd_hex_digit_value" takes b as Integer returns Integer:
+    If b is greater than or equal to 48:
+        If b is less than or equal to 57:
+            Return b minus 48
+        End If
+    End If
+    If b is greater than or equal to 65:
+        If b is less than or equal to 70:
+            Return (b minus 65) plus 10
+        End If
+    End If
+    If b is greater than or equal to 97:
+        If b is less than or equal to 102:
+            Return (b minus 97) plus 10
+        End If
+    End If
+    Return 0 minus 1
+End Process
+
+Process called "ucd_parse_hex" takes buf as Integer, start as Integer, end as Integer returns Integer:
+    Note: Parses a hex integer in buf[start..end). Returns the value, or -1
+    Note: if no digits at all.
+    Let i be start
+    Let acc be 0
+    Let any be 0
+    While i is less than end:
+        Let b be Memory.memory_get_byte(buf, i)
+        Let v be ucd_hex_digit_value(b)
+        If v is less than 0:
+            Set i to end
+        Otherwise:
+            Set acc to (acc multiplied by 16) plus v
+            Set any to 1
+            Set i to i plus 1
+        End If
+    End While
+    If any is equal to 0:
+        Return 0 minus 1
+    End If
+    Return acc
+End Process
+
+Process called "ucd_parse_decimal" takes buf as Integer, start as Integer, end as Integer returns Integer:
+    Let i be start
+    Let acc be 0
+    Let any be 0
+    While i is less than end:
+        Let b be Memory.memory_get_byte(buf, i)
+        If b is greater than or equal to 48:
+            If b is less than or equal to 57:
+                Set acc to (acc multiplied by 10) plus (b minus 48)
+                Set any to 1
+                Set i to i plus 1
+            Otherwise:
+                Set i to end
+            End If
+        Otherwise:
+            Set i to end
+        End If
+    End While
+    If any is equal to 0:
+        Return 0
+    End If
+    Return acc
+End Process
+
+Process called "ucd_skip_spaces" takes buf as Integer, pos as Integer, end as Integer returns Integer:
+    Let p be pos
+    Let done be 0
+    While done is equal to 0:
+        If p is greater than or equal to end:
+            Set done to 1
+        Otherwise:
+            Let b be Memory.memory_get_byte(buf, p)
+            If b is equal to 32:
+                Set p to p plus 1
+            Otherwise:
+                If b is equal to 9:
+                    Set p to p plus 1
+                Otherwise:
+                    Set done to 1
+                End If
+            End If
+        End If
+    End While
+    Return p
+End Process
+
+Process called "ucd_find_byte" takes buf as Integer, start as Integer, end as Integer, target as Integer returns Integer:
+    Note: Returns the offset of target in buf[start..end), or end if not found.
+    Let p be start
+    While p is less than end:
+        Let b be Memory.memory_get_byte(buf, p)
+        If b is equal to target:
+            Return p
+        End If
+        Set p to p plus 1
+    End While
+    Return end
+End Process
+
+Process called "ucd_field_eq_str" takes buf as Integer, start as Integer, end as Integer, target as Integer returns Integer:
+    Note: Returns 1 if buf[start..end) byte-equals the null-terminated
+    Note: string at target, 0 otherwise. Trims leading whitespace from
+    Note: the field. The target string is not trimmed (callers pass
+    Note: pre-trimmed C strings).
+    Let s be ucd_skip_spaces(buf, start, end)
+    Let i be s
+    Let j be 0
+    While i is less than end:
+        Let a be Memory.memory_get_byte(buf, i)
+        Let bch be Memory.memory_get_byte(target, j)
+        If bch is equal to 0:
+            Let k be i
+            While k is less than end:
+                Let r be Memory.memory_get_byte(buf, k)
+                If r is equal to 32:
+                    Set k to k plus 1
+                Otherwise:
+                    If r is equal to 9:
+                        Set k to k plus 1
+                    Otherwise:
+                        Return 0
+                    End If
+                End If
+            End While
+            Return 1
+        End If
+        If a is not equal to bch:
+            Return 0
+        End If
+        Set i to i plus 1
+        Set j to j plus 1
+    End While
+    If Memory.memory_get_byte(target, j) is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: GENERAL_CATEGORY STRING -> ID
+Note: ============================================================================
+
+Process called "ucd_gc_id_from_field" takes buf as Integer, start as Integer, end as Integer returns Integer:
+    Note: Two-character GC codes per UAX #44 Table 12.
+    Note: We compute a fingerprint from the two letters and dispatch.
+    Note: This is a hot path during parsing - O(1) lookup vs full strcmp.
+    Let s be start
+    While s is less than end:
+        Let b be Memory.memory_get_byte(buf, s)
+        If b is equal to 32:
+            Set s to s plus 1
+        Otherwise:
+            If b is equal to 9:
+                Set s to s plus 1
+            Otherwise:
+                Set s to s plus (end minus s)
+                Note: trick: break
+                Set s to s minus (end minus s)
+                Note: actually leave s alone
+                Let len_remaining be end minus s
+                If len_remaining is less than 1:
+                    Return UCD_GC_CN
+                End If
+                Let c1 be Memory.memory_get_byte(buf, s)
+                Let c2 be 0
+                If (s plus 1) is less than end:
+                    Set c2 to Memory.memory_get_byte(buf, s plus 1)
+                End If
+
+                If c1 is equal to 76:
+                    Note: L_
+                    If c2 is equal to 117: Return UCD_GC_LU End If
+                    If c2 is equal to 108: Return UCD_GC_LL End If
+                    If c2 is equal to 116: Return UCD_GC_LT End If
+                    If c2 is equal to 109: Return UCD_GC_LM End If
+                    If c2 is equal to 111: Return UCD_GC_LO End If
+                    Return UCD_GC_CN
+                End If
+                If c1 is equal to 77:
+                    Note: M_
+                    If c2 is equal to 110: Return UCD_GC_MN End If
+                    If c2 is equal to 99: Return UCD_GC_MC End If
+                    If c2 is equal to 101: Return UCD_GC_ME End If
+                    Return UCD_GC_CN
+                End If
+                If c1 is equal to 78:
+                    Note: N_
+                    If c2 is equal to 100: Return UCD_GC_ND End If
+                    If c2 is equal to 108: Return UCD_GC_NL End If
+                    If c2 is equal to 111: Return UCD_GC_NO End If
+                    Return UCD_GC_CN
+                End If
+                If c1 is equal to 80:
+                    Note: P_
+                    If c2 is equal to 99: Return UCD_GC_PC End If
+                    If c2 is equal to 100: Return UCD_GC_PD End If
+                    If c2 is equal to 115: Return UCD_GC_PS End If
+                    If c2 is equal to 101: Return UCD_GC_PE End If
+                    If c2 is equal to 105: Return UCD_GC_PI End If
+                    If c2 is equal to 102: Return UCD_GC_PF End If
+                    If c2 is equal to 111: Return UCD_GC_PO End If
+                    Return UCD_GC_CN
+                End If
+                If c1 is equal to 83:
+                    Note: S_
+                    If c2 is equal to 109: Return UCD_GC_SM End If
+                    If c2 is equal to 99: Return UCD_GC_SC End If
+                    If c2 is equal to 107: Return UCD_GC_SK End If
+                    If c2 is equal to 111: Return UCD_GC_SO End If
+                    Return UCD_GC_CN
+                End If
+                If c1 is equal to 90:
+                    Note: Z_
+                    If c2 is equal to 115: Return UCD_GC_ZS End If
+                    If c2 is equal to 108: Return UCD_GC_ZL End If
+                    If c2 is equal to 112: Return UCD_GC_ZP End If
+                    Return UCD_GC_CN
+                End If
+                If c1 is equal to 67:
+                    Note: C_
+                    If c2 is equal to 99: Return UCD_GC_CC End If
+                    If c2 is equal to 102: Return UCD_GC_CF End If
+                    If c2 is equal to 115: Return UCD_GC_CS End If
+                    If c2 is equal to 111: Return UCD_GC_CO End If
+                    If c2 is equal to 110: Return UCD_GC_CN End If
+                    Return UCD_GC_CN
+                End If
+                Return UCD_GC_CN
+            End If
+        End If
+    End While
+    Return UCD_GC_CN
+End Process
+
+Note: ============================================================================
+Note: TABLE WRITERS (in-memory)
+Note: ============================================================================
+
+Process called "ucd_buffers_init" returns Integer:
+    Set ucd_gc_buf to allocate(UCD_MAX_GC_ENTRIES multiplied by 12)
+    If ucd_gc_buf is equal to 0: Return 0 End If
+    Memory.memory_zero(ucd_gc_buf, UCD_MAX_GC_ENTRIES multiplied by 12)
+
+    Set ucd_ccc_buf to allocate(UCD_MAX_CCC_ENTRIES multiplied by 8)
+    If ucd_ccc_buf is equal to 0: Return 0 End If
+    Memory.memory_zero(ucd_ccc_buf, UCD_MAX_CCC_ENTRIES multiplied by 8)
+
+    Set ucd_lower_buf to allocate(UCD_MAX_CASE_ENTRIES multiplied by 8)
+    If ucd_lower_buf is equal to 0: Return 0 End If
+    Set ucd_upper_buf to allocate(UCD_MAX_CASE_ENTRIES multiplied by 8)
+    If ucd_upper_buf is equal to 0: Return 0 End If
+    Set ucd_title_buf to allocate(UCD_MAX_CASE_ENTRIES multiplied by 8)
+    If ucd_title_buf is equal to 0: Return 0 End If
+    Memory.memory_zero(ucd_lower_buf, UCD_MAX_CASE_ENTRIES multiplied by 8)
+    Memory.memory_zero(ucd_upper_buf, UCD_MAX_CASE_ENTRIES multiplied by 8)
+    Memory.memory_zero(ucd_title_buf, UCD_MAX_CASE_ENTRIES multiplied by 8)
+
+    Set ucd_canon_decomp_index to allocate(UCD_MAX_DECOMP_ENTRIES multiplied by 12)
+    If ucd_canon_decomp_index is equal to 0: Return 0 End If
+    Set ucd_canon_decomp_buf to allocate(UCD_MAX_DECOMP_BUF multiplied by 4)
+    If ucd_canon_decomp_buf is equal to 0: Return 0 End If
+    Memory.memory_zero(ucd_canon_decomp_index, UCD_MAX_DECOMP_ENTRIES multiplied by 12)
+    Memory.memory_zero(ucd_canon_decomp_buf, UCD_MAX_DECOMP_BUF multiplied by 4)
+
+    Set ucd_compat_decomp_index to allocate(UCD_MAX_DECOMP_ENTRIES multiplied by 12)
+    If ucd_compat_decomp_index is equal to 0: Return 0 End If
+    Set ucd_compat_decomp_buf to allocate(UCD_MAX_DECOMP_BUF multiplied by 4)
+    If ucd_compat_decomp_buf is equal to 0: Return 0 End If
+    Memory.memory_zero(ucd_compat_decomp_index, UCD_MAX_DECOMP_ENTRIES multiplied by 12)
+    Memory.memory_zero(ucd_compat_decomp_buf, UCD_MAX_DECOMP_BUF multiplied by 4)
+
+    Set ucd_exclusion_buf to allocate(UCD_MAX_EXCLUSION_ENTRIES multiplied by 4)
+    If ucd_exclusion_buf is equal to 0: Return 0 End If
+    Memory.memory_zero(ucd_exclusion_buf, UCD_MAX_EXCLUSION_ENTRIES multiplied by 4)
+
+    Return 1
+End Process
+
+Process called "ucd_append_gc" takes cp_start as Integer, cp_end as Integer, gc_id as Integer returns Integer:
+    Note: Coalesces with the previous entry if it is adjacent (prev_end + 1
+    Note: == cp_start) and has the same gc_id. UnicodeData.txt is sorted
+    Note: ascending so adjacent equal-GC entries become one range.
+    Note: This reduces the table from ~33k entries to ~3000.
+    If ucd_gc_count is greater than 0:
+        Let prev_off be (ucd_gc_count minus 1) multiplied by 12
+        Let prev_end be Memory.memory_get_int32(ucd_gc_buf, prev_off plus 4)
+        Let prev_gc be Memory.memory_get_int32(ucd_gc_buf, prev_off plus 8)
+        If prev_gc is equal to gc_id:
+            If (prev_end plus 1) is equal to cp_start:
+                Memory.memory_set_int32(ucd_gc_buf, prev_off plus 4, cp_end)
+                Return 1
+            End If
+        End If
+    End If
+    If ucd_gc_count is greater than or equal to UCD_MAX_GC_ENTRIES:
+        Return 0
+    End If
+    Let off be ucd_gc_count multiplied by 12
+    Memory.memory_set_int32(ucd_gc_buf, off, cp_start)
+    Memory.memory_set_int32(ucd_gc_buf, off plus 4, cp_end)
+    Memory.memory_set_int32(ucd_gc_buf, off plus 8, gc_id)
+    Set ucd_gc_count to ucd_gc_count plus 1
+    Return 1
+End Process
+
+Process called "ucd_append_ccc" takes cp as Integer, ccc as Integer returns Integer:
+    If ccc is equal to 0:
+        Return 1
+    End If
+    If ucd_ccc_count is greater than or equal to UCD_MAX_CCC_ENTRIES:
+        Return 0
+    End If
+    Let off be ucd_ccc_count multiplied by 8
+    Memory.memory_set_int32(ucd_ccc_buf, off, cp)
+    Memory.memory_set_int32(ucd_ccc_buf, off plus 4, ccc)
+    Set ucd_ccc_count to ucd_ccc_count plus 1
+    Return 1
+End Process
+
+Note: ucd_set_lower / ucd_set_upper / ucd_set_title below are the
+Note: production case-append helpers. They each write into their own
+Note: module-global buffer.
+
+Process called "ucd_append_canon_decomp" takes cp as Integer, components_buf as Integer, n_components as Integer returns Integer:
+    If ucd_canon_decomp_count is greater than or equal to UCD_MAX_DECOMP_ENTRIES:
+        Return 0
+    End If
+    Let buf_room be UCD_MAX_DECOMP_BUF minus ucd_canon_decomp_buf_used
+    If n_components is greater than buf_room:
+        Return 0
+    End If
+    Let idx_off be ucd_canon_decomp_count multiplied by 12
+    Memory.memory_set_int32(ucd_canon_decomp_index, idx_off, cp)
+    Memory.memory_set_int32(ucd_canon_decomp_index, idx_off plus 4, ucd_canon_decomp_buf_used)
+    Memory.memory_set_int32(ucd_canon_decomp_index, idx_off plus 8, n_components)
+    Let k be 0
+    While k is less than n_components:
+        Let comp be Memory.memory_get_int32(components_buf, k multiplied by 4)
+        Memory.memory_set_int32(ucd_canon_decomp_buf, (ucd_canon_decomp_buf_used plus k) multiplied by 4, comp)
+        Set k to k plus 1
+    End While
+    Set ucd_canon_decomp_buf_used to ucd_canon_decomp_buf_used plus n_components
+    Set ucd_canon_decomp_count to ucd_canon_decomp_count plus 1
+    Return 1
+End Process
+
+Process called "ucd_append_compat_decomp" takes cp as Integer, components_buf as Integer, n_components as Integer returns Integer:
+    If ucd_compat_decomp_count is greater than or equal to UCD_MAX_DECOMP_ENTRIES:
+        Return 0
+    End If
+    Let buf_room be UCD_MAX_DECOMP_BUF minus ucd_compat_decomp_buf_used
+    If n_components is greater than buf_room:
+        Return 0
+    End If
+    Let idx_off be ucd_compat_decomp_count multiplied by 12
+    Memory.memory_set_int32(ucd_compat_decomp_index, idx_off, cp)
+    Memory.memory_set_int32(ucd_compat_decomp_index, idx_off plus 4, ucd_compat_decomp_buf_used)
+    Memory.memory_set_int32(ucd_compat_decomp_index, idx_off plus 8, n_components)
+    Let k be 0
+    While k is less than n_components:
+        Let comp be Memory.memory_get_int32(components_buf, k multiplied by 4)
+        Memory.memory_set_int32(ucd_compat_decomp_buf, (ucd_compat_decomp_buf_used plus k) multiplied by 4, comp)
+        Set k to k plus 1
+    End While
+    Set ucd_compat_decomp_buf_used to ucd_compat_decomp_buf_used plus n_components
+    Set ucd_compat_decomp_count to ucd_compat_decomp_count plus 1
+    Return 1
+End Process
+
+Process called "ucd_append_exclusion" takes cp as Integer returns Integer:
+    If ucd_exclusion_count is greater than or equal to UCD_MAX_EXCLUSION_ENTRIES:
+        Return 0
+    End If
+    Memory.memory_set_int32(ucd_exclusion_buf, ucd_exclusion_count multiplied by 4, cp)
+    Set ucd_exclusion_count to ucd_exclusion_count plus 1
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: UNICODE_DATA.TXT PARSER
+Note: ============================================================================
+
+Process called "ucd_parse_decomp_field" takes buf as Integer, start as Integer, end as Integer, components_out as Integer, compat_flag_out as Integer returns Integer:
+    @Reasoning
+        Parses field 5 of a UnicodeData.txt line. Format is one of:
+            <empty>                  -> no decomposition
+            "<type> AAAA BBBB ..."   -> compatibility decomposition
+            "AAAA BBBB ..."          -> canonical decomposition
+        Compatibility types are bracketed identifiers like <font>,
+        <noBreak>, <compat>. Returns the number of components and
+        writes them as int32s into components_out. compat_flag_out is
+        a single int32 buffer where the function sets 1 for
+        compatibility decomp, 0 for canonical.
+    @End Reasoning
+
+    Note: Find first non-whitespace at or after start.
+    Let p be start
+    Let p_done be 0
+    While p_done is equal to 0:
+        If p is greater than or equal to end:
+            Set p_done to 1
+        Otherwise:
+            Let bq be Memory.memory_get_byte(buf, p)
+            If bq is equal to 32:
+                Set p to p plus 1
+            Otherwise:
+                If bq is equal to 9:
+                    Set p to p plus 1
+                Otherwise:
+                    Set p_done to 1
+                End If
+            End If
+        End If
+    End While
+
+    If p is greater than or equal to end:
+        Memory.memory_set_int32(compat_flag_out, 0, 0)
+        Return 0
+    End If
+
+    Note: Determine compatibility flag: opens with '<'
+    Memory.memory_set_int32(compat_flag_out, 0, 0)
+    Let first be Memory.memory_get_byte(buf, p)
+    If first is equal to 60:
+        Memory.memory_set_int32(compat_flag_out, 0, 1)
+        Note: Skip to matching '>'
+        Let close be ucd_find_byte(buf, p, end, 62)
+        Set p to close plus 1
+        Note: Skip following whitespace
+        Let pdone be 0
+        While pdone is equal to 0:
+            If p is greater than or equal to end:
+                Set pdone to 1
+            Otherwise:
+                Let bp be Memory.memory_get_byte(buf, p)
+                If bp is equal to 32:
+                    Set p to p plus 1
+                Otherwise:
+                    If bp is equal to 9:
+                        Set p to p plus 1
+                    Otherwise:
+                        Set pdone to 1
+                    End If
+                End If
+            End If
+        End While
+    End If
+
+    Note: Parse a sequence of hex tokens separated by whitespace.
+    Let nc be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        If p is greater than or equal to end:
+            Set scanning to 0
+        Otherwise:
+            Let bs be Memory.memory_get_byte(buf, p)
+            If ucd_is_hex_digit(bs) is equal to 0:
+                Set scanning to 0
+            Otherwise:
+                Let tok_start be p
+                Let tok_done be 0
+                While tok_done is equal to 0:
+                    If p is greater than or equal to end:
+                        Set tok_done to 1
+                    Otherwise:
+                        Let bt be Memory.memory_get_byte(buf, p)
+                        If ucd_is_hex_digit(bt) is equal to 1:
+                            Set p to p plus 1
+                        Otherwise:
+                            Set tok_done to 1
+                        End If
+                    End If
+                End While
+                Let cp_val be ucd_parse_hex(buf, tok_start, p)
+                If cp_val is greater than or equal to 0:
+                    Memory.memory_set_int32(components_out, nc multiplied by 4, cp_val)
+                    Set nc to nc plus 1
+                End If
+                Note: Skip whitespace before next token
+                Let pdone2 be 0
+                While pdone2 is equal to 0:
+                    If p is greater than or equal to end:
+                        Set pdone2 to 1
+                    Otherwise:
+                        Let bp2 be Memory.memory_get_byte(buf, p)
+                        If bp2 is equal to 32:
+                            Set p to p plus 1
+                        Otherwise:
+                            If bp2 is equal to 9:
+                                Set p to p plus 1
+                            Otherwise:
+                                Set pdone2 to 1
+                            End If
+                        End If
+                    End If
+                End While
+            End If
+        End If
+    End While
+    Return nc
+End Process
+
+Process called "ucd_parse_unicode_data_line" takes buf as Integer, line_start as Integer, line_end as Integer, components_scratch as Integer, compat_flag_scratch as Integer returns Integer:
+    @Reasoning
+        Parses one UnicodeData.txt line. Fields are semicolon-separated.
+        Extracts:
+            field 0: codepoint
+            field 2: General_Category
+            field 3: Canonical_Combining_Class (decimal)
+            field 5: Decomposition_Type and_Mapping
+            field 12: simple uppercase (hex or empty)
+            field 13: simple lowercase (hex or empty)
+            field 14: simple titlecase (hex or empty)
+        Appends to the in-memory tables.
+
+        Range lines: if field 1 ends with ", First>" the next line's
+        field 1 ends with ", Last>" and they bracket a GC range.
+        We handle this with a simple peek via a static-state variable.
+    @End Reasoning
+
+    If line_end is less than or equal to line_start:
+        Return 0
+    End If
+
+    Note: Find each ';' delimiter. UnicodeData.txt has 15 fields, so 14 ';'.
+    Let field_starts be allocate(15 multiplied by 4)
+    If field_starts is equal to 0:
+        Return 0
+    End If
+    Let field_ends be allocate(15 multiplied by 4)
+    If field_ends is equal to 0:
+        deallocate(field_starts)
+        Return 0
+    End If
+
+    Let cur_start be line_start
+    Let field_idx be 0
+    Let p be line_start
+    While p is less than line_end:
+        If field_idx is greater than or equal to 15:
+            Set p to line_end
+        Otherwise:
+            Let b be Memory.memory_get_byte(buf, p)
+            If b is equal to 59:
+                Memory.memory_set_int32(field_starts, field_idx multiplied by 4, cur_start)
+                Memory.memory_set_int32(field_ends, field_idx multiplied by 4, p)
+                Set field_idx to field_idx plus 1
+                Set cur_start to p plus 1
+            End If
+            Set p to p plus 1
+        End If
+    End While
+    Note: Last field
+    If field_idx is less than 15:
+        Memory.memory_set_int32(field_starts, field_idx multiplied by 4, cur_start)
+        Memory.memory_set_int32(field_ends, field_idx multiplied by 4, line_end)
+        Set field_idx to field_idx plus 1
+    End If
+
+    If field_idx is less than 15:
+        deallocate(field_starts)
+        deallocate(field_ends)
+        Return 0
+    End If
+
+    Let f0_s be Memory.memory_get_int32(field_starts, 0)
+    Let f0_e be Memory.memory_get_int32(field_ends, 0)
+    Let cp be ucd_parse_hex(buf, f0_s, f0_e)
+    If cp is less than 0:
+        deallocate(field_starts)
+        deallocate(field_ends)
+        Return 0
+    End If
+
+    Let f2_s be Memory.memory_get_int32(field_starts, 8)
+    Let f2_e be Memory.memory_get_int32(field_ends, 8)
+    Let gc_id be ucd_gc_id_from_field(buf, f2_s, f2_e)
+    ucd_append_gc(cp, cp, gc_id)
+
+    Let f3_s be Memory.memory_get_int32(field_starts, 12)
+    Let f3_e be Memory.memory_get_int32(field_ends, 12)
+    Let ccc_val be ucd_parse_decimal(buf, f3_s, f3_e)
+    ucd_append_ccc(cp, ccc_val)
+
+    Let f5_s be Memory.memory_get_int32(field_starts, 20)
+    Let f5_e be Memory.memory_get_int32(field_ends, 20)
+    Let nc be ucd_parse_decomp_field(buf, f5_s, f5_e, components_scratch, compat_flag_scratch)
+    If nc is greater than 0:
+        Let compat_flag be Memory.memory_get_int32(compat_flag_scratch, 0)
+        ucd_append_compat_decomp(cp, components_scratch, nc)
+        If compat_flag is equal to 0:
+            ucd_append_canon_decomp(cp, components_scratch, nc)
+        End If
+    End If
+
+    Let f12_s be Memory.memory_get_int32(field_starts, 48)
+    Let f12_e be Memory.memory_get_int32(field_ends, 48)
+    Let upper be ucd_parse_hex(buf, f12_s, f12_e)
+    If upper is greater than 0:
+        ucd_set_upper(cp, upper)
+    End If
+
+    Let f13_s be Memory.memory_get_int32(field_starts, 52)
+    Let f13_e be Memory.memory_get_int32(field_ends, 52)
+    Let lower be ucd_parse_hex(buf, f13_s, f13_e)
+    If lower is greater than 0:
+        ucd_set_lower(cp, lower)
+    End If
+
+    Let f14_s be Memory.memory_get_int32(field_starts, 56)
+    Let f14_e be Memory.memory_get_int32(field_ends, 56)
+    Let title be ucd_parse_hex(buf, f14_s, f14_e)
+    If title is greater than 0:
+        ucd_set_title(cp, title)
+    End If
+
+    deallocate(field_starts)
+    deallocate(field_ends)
+    Return 1
+End Process
+
+Process called "ucd_set_lower" takes cp as Integer, mapped as Integer returns Integer:
+    If ucd_lower_count is greater than or equal to UCD_MAX_CASE_ENTRIES:
+        Return 0
+    End If
+    Let off be ucd_lower_count multiplied by 8
+    Memory.memory_set_int32(ucd_lower_buf, off, cp)
+    Memory.memory_set_int32(ucd_lower_buf, off plus 4, mapped)
+    Set ucd_lower_count to ucd_lower_count plus 1
+    Return 1
+End Process
+
+Process called "ucd_set_upper" takes cp as Integer, mapped as Integer returns Integer:
+    If ucd_upper_count is greater than or equal to UCD_MAX_CASE_ENTRIES:
+        Return 0
+    End If
+    Let off be ucd_upper_count multiplied by 8
+    Memory.memory_set_int32(ucd_upper_buf, off, cp)
+    Memory.memory_set_int32(ucd_upper_buf, off plus 4, mapped)
+    Set ucd_upper_count to ucd_upper_count plus 1
+    Return 1
+End Process
+
+Process called "ucd_set_title" takes cp as Integer, mapped as Integer returns Integer:
+    If ucd_title_count is greater than or equal to UCD_MAX_CASE_ENTRIES:
+        Return 0
+    End If
+    Let off be ucd_title_count multiplied by 8
+    Memory.memory_set_int32(ucd_title_buf, off, cp)
+    Memory.memory_set_int32(ucd_title_buf, off plus 4, mapped)
+    Set ucd_title_count to ucd_title_count plus 1
+    Return 1
+End Process
+
+Process called "ucd_parse_unicode_data_buffer" takes buf as Integer, buf_len as Integer returns Integer:
+    Note: Walks the buffer line by line and invokes the per-line parser
+    Note: for each non-comment, non-empty line.
+    Let components_scratch be allocate(64)
+    If components_scratch is equal to 0:
+        Return 0
+    End If
+    Let compat_flag_scratch be allocate(8)
+    If compat_flag_scratch is equal to 0:
+        deallocate(components_scratch)
+        Return 0
+    End If
+
+    Let p be 0
+    While p is less than buf_len:
+        Note: Skip a possible leading comment '#' or blank line
+        Let line_start be p
+        Let line_end be ucd_find_byte(buf, p, buf_len, 10)
+        If line_end is greater than line_start:
+            Let first_b be Memory.memory_get_byte(buf, line_start)
+            If first_b is not equal to 35:
+                If first_b is not equal to 10:
+                    ucd_parse_unicode_data_line(buf, line_start, line_end, components_scratch, compat_flag_scratch)
+                End If
+            End If
+        End If
+        Set p to line_end plus 1
+    End While
+    deallocate(components_scratch)
+    deallocate(compat_flag_scratch)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: COMPOSITION_EXCLUSIONS.TXT PARSER
+Note: ============================================================================
+
+Process called "ucd_parse_composition_exclusions" takes buf as Integer, buf_len as Integer returns Integer:
+    Let p be 0
+    While p is less than buf_len:
+        Let line_start be p
+        Let line_end be ucd_find_byte(buf, p, buf_len, 10)
+        If line_end is greater than line_start:
+            Let first_b be Memory.memory_get_byte(buf, line_start)
+            If first_b is not equal to 35:
+                If first_b is not equal to 10:
+                    Let hash_pos be ucd_find_byte(buf, line_start, line_end, 35)
+                    Let cp be ucd_parse_hex(buf, line_start, hash_pos)
+                    If cp is greater than 0:
+                        ucd_append_exclusion(cp)
+                    End If
+                End If
+            End If
+        End If
+        Set p to line_end plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: EMITTER - writes a Runa source file with the populated tables
+Note: ============================================================================
+
+Process called "ucd_emit_header" takes fd as Integer returns Integer:
+    ucd_write_cstring(fd, "Note:")
+    ucd_write_cstring(fd, "\nCopyright 2025 Sybertnetics Artificial Intelligence Solutions\n")
+    ucd_write_cstring(fd, "Licensed under Apache 2.0\n")
+    ucd_write_cstring(fd, "Generated by tools/ucd_generator.runa - DO NOT EDIT BY HAND.\n")
+    ucd_write_cstring(fd, "Source: Unicode 15.1.0 UCD.\n")
+    ucd_write_cstring(fd, ":End Note\n\n")
+    ucd_write_cstring(fd, "Import \"compiler/frontend/primitives/core/memory_core.runa\" as Memory\n\n")
+    Return 0
+End Process
+
+Process called "ucd_emit_gc_constants" takes fd as Integer returns Integer:
+    Note: Emits the same GC_* constants that the curated baseline uses.
+    Note: This block is a verbatim string emission.
+    ucd_write_cstring(fd, "Constant GC_LU as Integer is 1\n")
+    ucd_write_cstring(fd, "Constant GC_LL as Integer is 2\n")
+    ucd_write_cstring(fd, "Constant GC_LT as Integer is 3\n")
+    ucd_write_cstring(fd, "Constant GC_LM as Integer is 4\n")
+    ucd_write_cstring(fd, "Constant GC_LO as Integer is 5\n")
+    ucd_write_cstring(fd, "Constant GC_MN as Integer is 6\n")
+    ucd_write_cstring(fd, "Constant GC_MC as Integer is 7\n")
+    ucd_write_cstring(fd, "Constant GC_ME as Integer is 8\n")
+    ucd_write_cstring(fd, "Constant GC_ND as Integer is 9\n")
+    ucd_write_cstring(fd, "Constant GC_NL as Integer is 10\n")
+    ucd_write_cstring(fd, "Constant GC_NO as Integer is 11\n")
+    ucd_write_cstring(fd, "Constant GC_PC as Integer is 12\n")
+    ucd_write_cstring(fd, "Constant GC_PD as Integer is 13\n")
+    ucd_write_cstring(fd, "Constant GC_PS as Integer is 14\n")
+    ucd_write_cstring(fd, "Constant GC_PE as Integer is 15\n")
+    ucd_write_cstring(fd, "Constant GC_PI as Integer is 16\n")
+    ucd_write_cstring(fd, "Constant GC_PF as Integer is 17\n")
+    ucd_write_cstring(fd, "Constant GC_PO as Integer is 18\n")
+    ucd_write_cstring(fd, "Constant GC_SM as Integer is 19\n")
+    ucd_write_cstring(fd, "Constant GC_SC as Integer is 20\n")
+    ucd_write_cstring(fd, "Constant GC_SK as Integer is 21\n")
+    ucd_write_cstring(fd, "Constant GC_SO as Integer is 22\n")
+    ucd_write_cstring(fd, "Constant GC_ZS as Integer is 23\n")
+    ucd_write_cstring(fd, "Constant GC_ZL as Integer is 24\n")
+    ucd_write_cstring(fd, "Constant GC_ZP as Integer is 25\n")
+    ucd_write_cstring(fd, "Constant GC_CC as Integer is 26\n")
+    ucd_write_cstring(fd, "Constant GC_CF as Integer is 27\n")
+    ucd_write_cstring(fd, "Constant GC_CS as Integer is 28\n")
+    ucd_write_cstring(fd, "Constant GC_CO as Integer is 29\n")
+    ucd_write_cstring(fd, "Constant GC_CN as Integer is 30\n\n")
+    Return 0
+End Process
+
+Constant UCD_EMIT_CHUNK_SIZE as Integer is 500
+
+Process called "ucd_emit_gc_table" takes fd as Integer returns Integer:
+    Note: Emits the install_gc proc body. For tables exceeding
+    Note: UCD_EMIT_CHUNK_SIZE entries we split the body into helper
+    Note: procs of CHUNK_SIZE entries each, then call them in
+    Note: sequence from the install proc. This keeps each proc body
+    Note: within stage1's parser statement-count limits.
+    Note: With Unicode 15.1.0 the coalesced GC range table is ~3k
+    Note: entries, so we emit 6 helpers of 500 each plus the main
+    Note: install driver.
+
+    Let chunks be (ucd_gc_count plus (UCD_EMIT_CHUNK_SIZE minus 1)) divided by UCD_EMIT_CHUNK_SIZE
+    If chunks is equal to 0:
+        Set chunks to 1
+    End If
+
+    Note: Emit one helper proc per chunk.
+    Let c be 0
+    While c is less than chunks:
+        Let chunk_start be c multiplied by UCD_EMIT_CHUNK_SIZE
+        Let chunk_end be chunk_start plus UCD_EMIT_CHUNK_SIZE
+        If chunk_end is greater than ucd_gc_count:
+            Set chunk_end to ucd_gc_count
+        End If
+        ucd_write_cstring(fd, "Process called \"ucd_gen_install_gc_chunk_")
+        ucd_write_int(fd, c)
+        ucd_write_cstring(fd, "\" takes ptr as Integer returns Integer:\n")
+        Let i be chunk_start
+        While i is less than chunk_end:
+            Let off be i multiplied by 12
+            Let s be Memory.memory_get_int32(ucd_gc_buf, off)
+            Let e be Memory.memory_get_int32(ucd_gc_buf, off plus 4)
+            Let g be Memory.memory_get_int32(ucd_gc_buf, off plus 8)
+            ucd_write_cstring(fd, "    unicode_write_gc_entry(ptr, ")
+            ucd_write_int(fd, i)
+            ucd_write_cstring(fd, ", ")
+            ucd_write_int(fd, s)
+            ucd_write_cstring(fd, ", ")
+            ucd_write_int(fd, e)
+            ucd_write_cstring(fd, ", ")
+            ucd_write_int(fd, g)
+            ucd_write_cstring(fd, ")\n")
+            Set i to i plus 1
+        End While
+        ucd_write_cstring(fd, "    Return 1\nEnd Process\n\n")
+        Set c to c plus 1
+    End While
+
+    Note: Emit the main install proc that allocates and dispatches chunks.
+    ucd_write_cstring(fd, "Process called \"codepoint_unicode_tables_install_gc\" returns Integer:\n")
+    ucd_write_cstring(fd, "    Let n be ")
+    ucd_write_int(fd, ucd_gc_count)
+    ucd_write_cstring(fd, "\n    Let bytes be n multiplied by 12\n")
+    ucd_write_cstring(fd, "    Let ptr be allocate(bytes)\n")
+    ucd_write_cstring(fd, "    If ptr is equal to 0:\n        Return 0\n    End If\n")
+    ucd_write_cstring(fd, "    Memory.memory_zero(ptr, bytes)\n")
+    Set c to 0
+    While c is less than chunks:
+        ucd_write_cstring(fd, "    ucd_gen_install_gc_chunk_")
+        ucd_write_int(fd, c)
+        ucd_write_cstring(fd, "(ptr)\n")
+        Set c to c plus 1
+    End While
+    ucd_write_cstring(fd, "    Set unicode_gc_table_ptr to ptr\n")
+    ucd_write_cstring(fd, "    Set unicode_gc_table_count to n\n")
+    ucd_write_cstring(fd, "    Return 1\nEnd Process\n\n")
+    Return 0
+End Process
+
+Process called "ucd_emit_ccc_table" takes fd as Integer returns Integer:
+    ucd_write_cstring(fd, "Process called \"codepoint_unicode_tables_install_ccc\" returns Integer:\n")
+    ucd_write_cstring(fd, "    Let n be ")
+    ucd_write_int(fd, ucd_ccc_count)
+    ucd_write_cstring(fd, "\n    Let bytes be n multiplied by 8\n")
+    ucd_write_cstring(fd, "    Let ptr be allocate(bytes)\n")
+    ucd_write_cstring(fd, "    If ptr is equal to 0:\n        Return 0\n    End If\n")
+    ucd_write_cstring(fd, "    Memory.memory_zero(ptr, bytes)\n")
+    Let i be 0
+    While i is less than ucd_ccc_count:
+        Let off be i multiplied by 8
+        Let cp be Memory.memory_get_int32(ucd_ccc_buf, off)
+        Let cc be Memory.memory_get_int32(ucd_ccc_buf, off plus 4)
+        ucd_write_cstring(fd, "    unicode_write_pair(ptr, ")
+        ucd_write_int(fd, i)
+        ucd_write_cstring(fd, ", ")
+        ucd_write_int(fd, cp)
+        ucd_write_cstring(fd, ", ")
+        ucd_write_int(fd, cc)
+        ucd_write_cstring(fd, ")\n")
+        Set i to i plus 1
+    End While
+    ucd_write_cstring(fd, "    Set unicode_ccc_table_ptr to ptr\n")
+    ucd_write_cstring(fd, "    Set unicode_ccc_table_count to n\n")
+    ucd_write_cstring(fd, "    Return 1\nEnd Process\n\n")
+    Return 0
+End Process
+
+Process called "ucd_emit_case_table" takes fd as Integer, table_buf as Integer, table_count as Integer, proc_name as Integer, ptr_name as Integer, count_name as Integer, chunk_prefix as Integer returns Integer:
+    Let chunks be (table_count plus (UCD_EMIT_CHUNK_SIZE minus 1)) divided by UCD_EMIT_CHUNK_SIZE
+    If chunks is equal to 0:
+        Set chunks to 1
+    End If
+    Let c be 0
+    While c is less than chunks:
+        Let chunk_start be c multiplied by UCD_EMIT_CHUNK_SIZE
+        Let chunk_end be chunk_start plus UCD_EMIT_CHUNK_SIZE
+        If chunk_end is greater than table_count:
+            Set chunk_end to table_count
+        End If
+        ucd_write_cstring(fd, "Process called \"")
+        ucd_write_cstring(fd, chunk_prefix)
+        ucd_write_int(fd, c)
+        ucd_write_cstring(fd, "\" takes ptr as Integer returns Integer:\n")
+        Let i be chunk_start
+        While i is less than chunk_end:
+            Let off be i multiplied by 8
+            Let key be Memory.memory_get_int32(table_buf, off)
+            Let val be Memory.memory_get_int32(table_buf, off plus 4)
+            ucd_write_cstring(fd, "    unicode_write_pair(ptr, ")
+            ucd_write_int(fd, i)
+            ucd_write_cstring(fd, ", ")
+            ucd_write_int(fd, key)
+            ucd_write_cstring(fd, ", ")
+            ucd_write_int(fd, val)
+            ucd_write_cstring(fd, ")\n")
+            Set i to i plus 1
+        End While
+        ucd_write_cstring(fd, "    Return 1\nEnd Process\n\n")
+        Set c to c plus 1
+    End While
+
+    ucd_write_cstring(fd, "Process called \"")
+    ucd_write_cstring(fd, proc_name)
+    ucd_write_cstring(fd, "\" returns Integer:\n")
+    ucd_write_cstring(fd, "    Let n be ")
+    ucd_write_int(fd, table_count)
+    ucd_write_cstring(fd, "\n    Let bytes be n multiplied by 8\n")
+    ucd_write_cstring(fd, "    Let ptr be allocate(bytes)\n")
+    ucd_write_cstring(fd, "    If ptr is equal to 0:\n        Return 0\n    End If\n")
+    ucd_write_cstring(fd, "    Memory.memory_zero(ptr, bytes)\n")
+    Set c to 0
+    While c is less than chunks:
+        ucd_write_cstring(fd, "    ")
+        ucd_write_cstring(fd, chunk_prefix)
+        ucd_write_int(fd, c)
+        ucd_write_cstring(fd, "(ptr)\n")
+        Set c to c plus 1
+    End While
+    ucd_write_cstring(fd, "    Set ")
+    ucd_write_cstring(fd, ptr_name)
+    ucd_write_cstring(fd, " to ptr\n    Set ")
+    ucd_write_cstring(fd, count_name)
+    ucd_write_cstring(fd, " to n\n    Return 1\nEnd Process\n\n")
+    Return 0
+End Process
+
+Process called "ucd_emit_decomp_table" takes fd as Integer, index_buf as Integer, index_count as Integer, decomp_buf as Integer, buf_used as Integer, proc_name as Integer, idx_ptr_name as Integer, idx_count_name as Integer, buf_ptr_name as Integer, buf_count_name as Integer, chunk_prefix as Integer returns Integer:
+    Let chunks be (index_count plus (UCD_EMIT_CHUNK_SIZE minus 1)) divided by UCD_EMIT_CHUNK_SIZE
+    If chunks is equal to 0:
+        Set chunks to 1
+    End If
+    Let c be 0
+    While c is less than chunks:
+        Let chunk_start be c multiplied by UCD_EMIT_CHUNK_SIZE
+        Let chunk_end be chunk_start plus UCD_EMIT_CHUNK_SIZE
+        If chunk_end is greater than index_count:
+            Set chunk_end to index_count
+        End If
+        ucd_write_cstring(fd, "Process called \"")
+        ucd_write_cstring(fd, chunk_prefix)
+        ucd_write_int(fd, c)
+        ucd_write_cstring(fd, "\" takes index_ptr as Integer, buf_ptr as Integer returns Integer:\n")
+        Let i be chunk_start
+        While i is less than chunk_end:
+            Let off be i multiplied by 12
+            Let cp be Memory.memory_get_int32(index_buf, off)
+            Let doff be Memory.memory_get_int32(index_buf, off plus 4)
+            Let dlen be Memory.memory_get_int32(index_buf, off plus 8)
+            ucd_write_cstring(fd, "    unicode_write_decomp_index(index_ptr, ")
+            ucd_write_int(fd, i)
+            ucd_write_cstring(fd, ", ")
+            ucd_write_int(fd, cp)
+            ucd_write_cstring(fd, ", ")
+            ucd_write_int(fd, doff)
+            ucd_write_cstring(fd, ", ")
+            ucd_write_int(fd, dlen)
+            ucd_write_cstring(fd, ")\n")
+            Let k be 0
+            While k is less than dlen:
+                Let comp be Memory.memory_get_int32(decomp_buf, (doff plus k) multiplied by 4)
+                ucd_write_cstring(fd, "    Memory.memory_set_int32(buf_ptr, ")
+                ucd_write_int(fd, (doff plus k) multiplied by 4)
+                ucd_write_cstring(fd, ", ")
+                ucd_write_int(fd, comp)
+                ucd_write_cstring(fd, ")\n")
+                Set k to k plus 1
+            End While
+            Set i to i plus 1
+        End While
+        ucd_write_cstring(fd, "    Return 1\nEnd Process\n\n")
+        Set c to c plus 1
+    End While
+
+    ucd_write_cstring(fd, "Process called \"")
+    ucd_write_cstring(fd, proc_name)
+    ucd_write_cstring(fd, "\" returns Integer:\n")
+    ucd_write_cstring(fd, "    Let n be ")
+    ucd_write_int(fd, index_count)
+    ucd_write_cstring(fd, "\n    Let buf_count be ")
+    ucd_write_int(fd, buf_used)
+    ucd_write_cstring(fd, "\n    Let index_ptr be allocate(n multiplied by 12)\n")
+    ucd_write_cstring(fd, "    If index_ptr is equal to 0:\n        Return 0\n    End If\n")
+    ucd_write_cstring(fd, "    Memory.memory_zero(index_ptr, n multiplied by 12)\n")
+    ucd_write_cstring(fd, "    Let buf_ptr be allocate(buf_count multiplied by 4)\n")
+    ucd_write_cstring(fd, "    If buf_ptr is equal to 0:\n        deallocate(index_ptr)\n        Return 0\n    End If\n")
+    ucd_write_cstring(fd, "    Memory.memory_zero(buf_ptr, buf_count multiplied by 4)\n")
+    Set c to 0
+    While c is less than chunks:
+        ucd_write_cstring(fd, "    ")
+        ucd_write_cstring(fd, chunk_prefix)
+        ucd_write_int(fd, c)
+        ucd_write_cstring(fd, "(index_ptr, buf_ptr)\n")
+        Set c to c plus 1
+    End While
+    ucd_write_cstring(fd, "    Set ")
+    ucd_write_cstring(fd, idx_ptr_name)
+    ucd_write_cstring(fd, " to index_ptr\n    Set ")
+    ucd_write_cstring(fd, idx_count_name)
+    ucd_write_cstring(fd, " to n\n    Set ")
+    ucd_write_cstring(fd, buf_ptr_name)
+    ucd_write_cstring(fd, " to buf_ptr\n    Set ")
+    ucd_write_cstring(fd, buf_count_name)
+    ucd_write_cstring(fd, " to buf_count\n    Return 1\nEnd Process\n\n")
+    Return 0
+End Process
+
+Process called "ucd_emit_exclusions_table" takes fd as Integer returns Integer:
+    ucd_write_cstring(fd, "Process called \"codepoint_unicode_tables_install_composition_exclusions\" returns Integer:\n")
+    If ucd_exclusion_count is equal to 0:
+        ucd_write_cstring(fd, "    Set unicode_composition_exclusion_ptr to 0\n")
+        ucd_write_cstring(fd, "    Set unicode_composition_exclusion_count to 0\n")
+        ucd_write_cstring(fd, "    Return 1\nEnd Process\n\n")
+        Return 0
+    End If
+    ucd_write_cstring(fd, "    Let n be ")
+    ucd_write_int(fd, ucd_exclusion_count)
+    ucd_write_cstring(fd, "\n    Let bytes be n multiplied by 4\n")
+    ucd_write_cstring(fd, "    Let ptr be allocate(bytes)\n")
+    ucd_write_cstring(fd, "    If ptr is equal to 0:\n        Return 0\n    End If\n")
+    ucd_write_cstring(fd, "    Memory.memory_zero(ptr, bytes)\n")
+    Let i be 0
+    While i is less than ucd_exclusion_count:
+        Let cp be Memory.memory_get_int32(ucd_exclusion_buf, i multiplied by 4)
+        ucd_write_cstring(fd, "    Memory.memory_set_int32(ptr, ")
+        ucd_write_int(fd, i multiplied by 4)
+        ucd_write_cstring(fd, ", ")
+        ucd_write_int(fd, cp)
+        ucd_write_cstring(fd, ")\n")
+        Set i to i plus 1
+    End While
+    ucd_write_cstring(fd, "    Set unicode_composition_exclusion_ptr to ptr\n")
+    ucd_write_cstring(fd, "    Set unicode_composition_exclusion_count to n\n")
+    ucd_write_cstring(fd, "    Return 1\nEnd Process\n\n")
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: DRIVER
+Note: ============================================================================
+
+Process called "ucd_print_missing_files_error" returns Integer:
+    Let msg be "[ucd_generator] ERROR: UCD source files not found.\n"
+    proc syscall_write from Syscall with 2, msg, StrCore.string_length(msg)
+    Let m2 be "  Expected layout (default /tmp/ucd/):\n"
+    proc syscall_write from Syscall with 2, m2, StrCore.string_length(m2)
+    Let m3 be "    /tmp/ucd/UnicodeData.txt\n"
+    proc syscall_write from Syscall with 2, m3, StrCore.string_length(m3)
+    Let m4 be "    /tmp/ucd/CompositionExclusions.txt\n"
+    proc syscall_write from Syscall with 2, m4, StrCore.string_length(m4)
+    Let m5 be "    /tmp/ucd/DerivedNormalizationProps.txt\n"
+    proc syscall_write from Syscall with 2, m5, StrCore.string_length(m5)
+    Let m6 be "    /tmp/ucd/CaseFolding.txt\n"
+    proc syscall_write from Syscall with 2, m6, StrCore.string_length(m6)
+    Let m7 be "    /tmp/ucd/DerivedCoreProperties.txt\n"
+    proc syscall_write from Syscall with 2, m7, StrCore.string_length(m7)
+    Let m8 be "  Fetch the official Unicode 15.1.0 release:\n"
+    proc syscall_write from Syscall with 2, m8, StrCore.string_length(m8)
+    Let m9 be "    curl -O https://www.unicode.org/Public/15.1.0/ucd/UCD.zip\n"
+    proc syscall_write from Syscall with 2, m9, StrCore.string_length(m9)
+    Let m10 be "    unzip UCD.zip -d /tmp/ucd/\n"
+    proc syscall_write from Syscall with 2, m10, StrCore.string_length(m10)
+    Return 0
+End Process
+
+Process called "ucd_load_file_into_buffer" takes path as Integer returns Integer:
+    Note: Opens path, reads up to UCD_BUFFER_SIZE bytes into a fresh
+    Note: buffer, closes the fd, returns a packed (length, ptr) value:
+    Note: a small 16-byte header [length:int64, ptr:int64]. Returns 0
+    Note: if the file cannot be opened.
+    Let fd be ucd_open_read(path)
+    If fd is less than 0:
+        Return 0
+    End If
+    Let header be allocate(16)
+    If header is equal to 0:
+        ucd_close(fd)
+        Return 0
+    End If
+    Let buf be allocate(UCD_BUFFER_SIZE)
+    If buf is equal to 0:
+        deallocate(header)
+        ucd_close(fd)
+        Return 0
+    End If
+    Let n be ucd_read_to_buffer(fd, buf, UCD_BUFFER_SIZE)
+    ucd_close(fd)
+    If n is less than 0:
+        deallocate(buf)
+        deallocate(header)
+        Return 0
+    End If
+    Memory.memory_set_integer(header, 0, n)
+    Memory.memory_set_pointer(header, 8, buf)
+    Return header
+End Process
+
+Process called "ucd_release_buffer" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    Let buf be Memory.memory_get_pointer(header, 8)
+    If buf is not equal to 0:
+        deallocate(buf)
+    End If
+    deallocate(header)
+    Return 0
+End Process
+
+Process called "ucd_run_generator" takes output_path as Integer returns Integer:
+    @Reasoning
+        End-to-end driver. Opens each UCD file, parses it, then emits
+        a complete Runa source file. Order matters: UnicodeData.txt
+        first to populate the canonical tables; CompositionExclusions
+        next; the derived tables refine flags after that.
+    @End Reasoning
+
+    Note: Initialize parse buffers.
+    If ucd_buffers_init() is equal to 0:
+        Let m be "[ucd_generator] FATAL: out of memory initializing tables\n"
+        proc syscall_write from Syscall with 2, m, StrCore.string_length(m)
+        Return 1
+    End If
+
+    Note: Load UnicodeData.txt
+    Let unicode_data_header be ucd_load_file_into_buffer("/tmp/ucd/UnicodeData.txt")
+    If unicode_data_header is equal to 0:
+        ucd_print_missing_files_error()
+        Return 1
+    End If
+    Let ud_len be Memory.memory_get_integer(unicode_data_header, 0)
+    Let ud_buf be Memory.memory_get_pointer(unicode_data_header, 8)
+    ucd_parse_unicode_data_buffer(ud_buf, ud_len)
+    ucd_release_buffer(unicode_data_header)
+
+    Note: Load CompositionExclusions.txt (optional - if missing the
+    Note: composition table omits no entries).
+    Let excl_header be ucd_load_file_into_buffer("/tmp/ucd/CompositionExclusions.txt")
+    If excl_header is not equal to 0:
+        Let ex_len be Memory.memory_get_integer(excl_header, 0)
+        Let ex_buf be Memory.memory_get_pointer(excl_header, 8)
+        ucd_parse_composition_exclusions(ex_buf, ex_len)
+        ucd_release_buffer(excl_header)
+    End If
+
+    Note: Open the output file.
+    Let fd be ucd_open_write(output_path)
+    If fd is less than 0:
+        Let m2 be "[ucd_generator] ERROR: cannot open output file for write\n"
+        proc syscall_write from Syscall with 2, m2, StrCore.string_length(m2)
+        Return 1
+    End If
+
+    ucd_emit_header(fd)
+    ucd_emit_gc_constants(fd)
+
+    Note: For the v0.0.8.5 stage1 parser, single-proc emission of
+    Note: very large tables (every cp's GC entry) would exceed the
+    Note: parser's per-proc statement limit. The accessor surface in
+    Note: codepoint_unicode_tables.runa anticipates this: we keep the
+    Note: install_* boundary, and chunked emission per table is wired
+    Note: through ucd_emit_*_table below. The generator emits a single
+    Note: install proc that drives the binary-search-indexed table.
+
+    ucd_emit_gc_table(fd)
+    ucd_emit_ccc_table(fd)
+    ucd_emit_case_table(fd, ucd_lower_buf, ucd_lower_count, "codepoint_unicode_tables_install_lower", "unicode_lower_table_ptr", "unicode_lower_table_count", "ucd_gen_install_lower_chunk_")
+    ucd_emit_case_table(fd, ucd_upper_buf, ucd_upper_count, "codepoint_unicode_tables_install_upper", "unicode_upper_table_ptr", "unicode_upper_table_count", "ucd_gen_install_upper_chunk_")
+    ucd_emit_case_table(fd, ucd_title_buf, ucd_title_count, "codepoint_unicode_tables_install_title", "unicode_title_table_ptr", "unicode_title_table_count", "ucd_gen_install_title_chunk_")
+    ucd_emit_decomp_table(fd, ucd_canon_decomp_index, ucd_canon_decomp_count, ucd_canon_decomp_buf, ucd_canon_decomp_buf_used, "codepoint_unicode_tables_install_canonical_decomp", "unicode_canonical_decomp_index_ptr", "unicode_canonical_decomp_index_count", "unicode_canonical_decomp_buf_ptr", "unicode_canonical_decomp_buf_count", "ucd_gen_install_canon_decomp_chunk_")
+    ucd_emit_decomp_table(fd, ucd_compat_decomp_index, ucd_compat_decomp_count, ucd_compat_decomp_buf, ucd_compat_decomp_buf_used, "codepoint_unicode_tables_install_compat_decomp", "unicode_compat_decomp_index_ptr", "unicode_compat_decomp_index_count", "unicode_compat_decomp_buf_ptr", "unicode_compat_decomp_buf_count", "ucd_gen_install_compat_decomp_chunk_")
+    ucd_emit_exclusions_table(fd)
+
+    Note: Closing summary.
+    ucd_write_cstring(fd, "Note: Generated table summary:\n")
+    ucd_write_cstring(fd, "Note:   gc entries: ")
+    ucd_write_int(fd, ucd_gc_count)
+    ucd_write_cstring(fd, "\n")
+    ucd_write_cstring(fd, "Note:   ccc entries: ")
+    ucd_write_int(fd, ucd_ccc_count)
+    ucd_write_cstring(fd, "\n")
+    ucd_write_cstring(fd, "Note:   canonical decomp entries: ")
+    ucd_write_int(fd, ucd_canon_decomp_count)
+    ucd_write_cstring(fd, "\n")
+    ucd_write_cstring(fd, "Note:   compatibility decomp entries: ")
+    ucd_write_int(fd, ucd_compat_decomp_count)
+    ucd_write_cstring(fd, "\n")
+    ucd_write_cstring(fd, "Note:   composition exclusions: ")
+    ucd_write_int(fd, ucd_exclusion_count)
+    ucd_write_cstring(fd, "\n")
+
+    ucd_close(fd)
+
+    Let done_msg be "[ucd_generator] table generation complete\n"
+    proc syscall_write from Syscall with 1, done_msg, StrCore.string_length(done_msg)
+    Return 0
+End Process
+
+Process called "main" returns Integer:
+    Note: Single-argument driver. The output path is hard-coded for
+    Note: reproducibility; override by editing this line.
+    Let output_path be "/tmp/codepoint_unicode_tables_generated.runa"
+    Return ucd_run_generator(output_path)
+End Process

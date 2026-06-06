@@ -1,0 +1,597 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+Sparse matrix storage in COO, CSR, and CSC formats.
+
+A sparse matrix stores only non-zero entries plus row/column metadata,
+suitable for matrices where the vast majority of entries are zero (FEM
+stiffness matrices, graph adjacency, scientific computing kernels).
+
+Storage formats supported:
+  - COO (Coordinate format): three arrays (row_idx, col_idx, value) of
+    equal length, in any order. Used for incremental construction.
+  - CSR (Compressed Sparse Row): row_ptr[n_rows + 1], col_idx[nnz],
+    values[nnz]. Optimized for row-major iteration and matvec from the
+    left (y = A*x).
+  - CSC (Compressed Sparse Column): col_ptr[n_cols + 1], row_idx[nnz],
+    values[nnz]. Optimized for column iteration (y = A^T * x).
+
+Memory layout per format:
+  COO header (32 bytes):
+    Offset  0: n_rows (Integer)
+    Offset  8: n_cols (Integer)
+    Offset 16: nnz (Integer, count of stored entries)
+    Offset 24: capacity (Integer, max nnz reserved)
+  Followed by three buffers: row_idx (nnz * 8), col_idx (nnz * 8),
+  values (nnz * 8).
+
+  CSR header (32 bytes):
+    Offset  0: n_rows
+    Offset  8: n_cols
+    Offset 16: nnz
+    Offset 24: row_ptr_capacity
+  Followed by: row_ptr ((n_rows + 1) * 8), col_idx (nnz * 8), values (nnz * 8).
+
+  CSC: same as CSR but col_ptr / row_idx swap.
+
+For simplicity, all three formats are represented as a header
+pointing to three separate buffers (allocated independently).
+
+Operations:
+  - COO: allocate / free / append_entry / get_nnz / get_dimensions / to_csr
+  - CSR: allocate / free / matvec / matmul (CSR x CSR), transpose, to_coo
+  - CSC: allocate / free / matvec / transpose
+
+@Reasoning
+COO is the natural format for input/output and matrix construction
+(append one entry at a time, no global indexing constraint). CSR/CSC
+are the formats used by inner kernels (matvec / matmul) because
+contiguous row or column access matches the hardware prefetcher and
+limits indirect indexing to the nnz tier.
+
+The CSR matvec kernel is the canonical sparse linear algebra workhorse
+and follows the algorithm of Saad, "Iterative Methods for Sparse Linear
+Systems", 2nd ed. 2003, chapter 3.5.
+@End Reasoning
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Constant SPARSE_HEADER_BYTES as Integer is 56
+Constant SPARSE_LANE_BYTES as Integer is 8
+
+Note: header layout (extended to hold buffer pointers inline):
+Note:   0:  n_rows
+Note:   8:  n_cols
+Note:  16:  nnz
+Note:  24:  capacity (max nnz - for COO; row_ptr length for CSR/CSC)
+Note:  32:  ptr_row_or_rowptr
+Note:  40:  ptr_col_or_colptr_or_colidx
+Note:  48:  ptr_values
+
+Process called "sparse_float_to_bits" takes x as Float returns Integer:
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "sparse_bits_to_float" takes b as Integer returns Float:
+    Let result be 0.0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Note: ============================================================================
+Note: COO format
+Note: ============================================================================
+
+Process called "sparse_coo_allocate" takes n_rows as Integer, n_cols as Integer, capacity as Integer returns Integer:
+    @Reasoning
+        Allocate a COO sparse matrix with up to `capacity` non-zero
+        entries. The three index/value arrays are allocated separately
+        to keep the structure resizable.
+    @End Reasoning
+    @Implementation
+        Header + 3 buffers.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Zeroed.
+    @End Security_Scope
+    Let h be proc allocate from Layout with SPARSE_HEADER_BYTES
+    If h is equal to 0:
+        Return 0
+    End If
+    Let row_buf be proc allocate from Layout with capacity multiplied by SPARSE_LANE_BYTES
+    Let col_buf be proc allocate from Layout with capacity multiplied by SPARSE_LANE_BYTES
+    Let val_buf be proc allocate from Layout with capacity multiplied by SPARSE_LANE_BYTES
+    If row_buf is equal to 0:
+        Let _f be proc deallocate from Layout with h
+        Return 0
+    End If
+    If col_buf is equal to 0:
+        Let _f1 be proc deallocate from Layout with h
+        Let _f2 be proc deallocate from Layout with row_buf
+        Return 0
+    End If
+    If val_buf is equal to 0:
+        Let _f1 be proc deallocate from Layout with h
+        Let _f2 be proc deallocate from Layout with row_buf
+        Let _f3 be proc deallocate from Layout with col_buf
+        Return 0
+    End If
+    Let _wr be proc memory_set_int64 from Memory with h, 0, n_rows
+    Let _wc be proc memory_set_int64 from Memory with h, 8, n_cols
+    Let _wn be proc memory_set_int64 from Memory with h, 16, 0
+    Let _wcap be proc memory_set_int64 from Memory with h, 24, capacity
+    Let _wpr be proc memory_set_int64 from Memory with h, 32, row_buf
+    Let _wpc be proc memory_set_int64 from Memory with h, 40, col_buf
+    Let _wpv be proc memory_set_int64 from Memory with h, 48, val_buf
+    Return h
+End Process
+
+Process called "sparse_coo_free" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let rb be proc memory_get_int64 from Memory with m, 32
+    Let cb be proc memory_get_int64 from Memory with m, 40
+    Let vb be proc memory_get_int64 from Memory with m, 48
+    If rb is not equal to 0:
+        Let _fa be proc deallocate from Layout with rb
+    End If
+    If cb is not equal to 0:
+        Let _fb be proc deallocate from Layout with cb
+    End If
+    If vb is not equal to 0:
+        Let _fc be proc deallocate from Layout with vb
+    End If
+    Let _fh be proc deallocate from Layout with m
+    Return 0
+End Process
+
+Process called "sparse_coo_get_nnz" takes m as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with m, 16
+End Process
+
+Process called "sparse_coo_get_n_rows" takes m as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with m, 0
+End Process
+
+Process called "sparse_coo_get_n_cols" takes m as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with m, 8
+End Process
+
+Process called "sparse_coo_append_entry" takes m as Integer, row as Integer, col as Integer, value as Float returns Integer:
+    @Reasoning
+        Append a non-zero entry to the COO matrix's tail. Returns -1
+        on capacity exhaustion.
+    @End Reasoning
+    @Implementation
+        Three writes + nnz increment.
+    @End Implementation
+    @Performance_Hints
+        O(1) amortized.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds-checked.
+    @End Security_Scope
+    Let nnz be proc memory_get_int64 from Memory with m, 16
+    Let cap be proc memory_get_int64 from Memory with m, 24
+    If nnz is greater than (cap minus 1):
+        Return -1
+    End If
+    Let nrows be proc memory_get_int64 from Memory with m, 0
+    Let ncols be proc memory_get_int64 from Memory with m, 8
+    If row is greater than (nrows minus 1):
+        Return -1
+    End If
+    If col is greater than (ncols minus 1):
+        Return -1
+    End If
+    Let rb be proc memory_get_int64 from Memory with m, 32
+    Let cb be proc memory_get_int64 from Memory with m, 40
+    Let vb be proc memory_get_int64 from Memory with m, 48
+    Let off be nnz multiplied by SPARSE_LANE_BYTES
+    Let _wr be proc memory_set_int64 from Memory with rb, off, row
+    Let _wc be proc memory_set_int64 from Memory with cb, off, col
+    Let vbits be proc sparse_float_to_bits with value
+    Let _wv be proc memory_set_int64 from Memory with vb, off, vbits
+    Let _wn be proc memory_set_int64 from Memory with m, 16, nnz plus 1
+    Return 0
+End Process
+
+Process called "sparse_coo_get_row_at" takes m as Integer, k as Integer returns Integer:
+    Let rb be proc memory_get_int64 from Memory with m, 32
+    Return proc memory_get_int64 from Memory with rb, k multiplied by SPARSE_LANE_BYTES
+End Process
+
+Process called "sparse_coo_get_col_at" takes m as Integer, k as Integer returns Integer:
+    Let cb be proc memory_get_int64 from Memory with m, 40
+    Return proc memory_get_int64 from Memory with cb, k multiplied by SPARSE_LANE_BYTES
+End Process
+
+Process called "sparse_coo_get_value_at" takes m as Integer, k as Integer returns Float:
+    Let vb be proc memory_get_int64 from Memory with m, 48
+    Let bits be proc memory_get_int64 from Memory with vb, k multiplied by SPARSE_LANE_BYTES
+    Return proc sparse_bits_to_float with bits
+End Process
+
+Note: ============================================================================
+Note: CSR format (header layout shares with COO but row_ptr instead of row_idx)
+Note: ============================================================================
+
+Process called "sparse_csr_allocate" takes n_rows as Integer, n_cols as Integer, nnz as Integer returns Integer:
+    @Reasoning
+        Allocate a CSR matrix with exactly nnz entries. row_ptr has
+        n_rows + 1 slots so the difference row_ptr[i+1] - row_ptr[i]
+        gives the count of entries in row i.
+    @End Reasoning
+    @Implementation
+        Three buffer allocations.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Zeroed.
+    @End Security_Scope
+    Let h be proc allocate from Layout with SPARSE_HEADER_BYTES
+    If h is equal to 0:
+        Return 0
+    End If
+    Let row_ptr_buf be proc allocate from Layout with (n_rows plus 1) multiplied by SPARSE_LANE_BYTES
+    Let col_idx_buf be proc allocate from Layout with nnz multiplied by SPARSE_LANE_BYTES
+    Let val_buf be proc allocate from Layout with nnz multiplied by SPARSE_LANE_BYTES
+    If row_ptr_buf is equal to 0:
+        Let _f be proc deallocate from Layout with h
+        Return 0
+    End If
+    If col_idx_buf is equal to 0:
+        Let _f1 be proc deallocate from Layout with h
+        Let _f2 be proc deallocate from Layout with row_ptr_buf
+        Return 0
+    End If
+    If val_buf is equal to 0:
+        Let _f1 be proc deallocate from Layout with h
+        Let _f2 be proc deallocate from Layout with row_ptr_buf
+        Let _f3 be proc deallocate from Layout with col_idx_buf
+        Return 0
+    End If
+    Let _wr be proc memory_set_int64 from Memory with h, 0, n_rows
+    Let _wc be proc memory_set_int64 from Memory with h, 8, n_cols
+    Let _wn be proc memory_set_int64 from Memory with h, 16, nnz
+    Let _wcap be proc memory_set_int64 from Memory with h, 24, n_rows plus 1
+    Let _wpr be proc memory_set_int64 from Memory with h, 32, row_ptr_buf
+    Let _wpc be proc memory_set_int64 from Memory with h, 40, col_idx_buf
+    Let _wpv be proc memory_set_int64 from Memory with h, 48, val_buf
+    Return h
+End Process
+
+Process called "sparse_csr_free" takes m as Integer returns Integer:
+    Return proc sparse_coo_free with m
+End Process
+
+Process called "sparse_csr_get_nnz" takes m as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with m, 16
+End Process
+
+Process called "sparse_csr_set_row_ptr" takes m as Integer, i as Integer, value as Integer returns Integer:
+    Let rb be proc memory_get_int64 from Memory with m, 32
+    Let _w be proc memory_set_int64 from Memory with rb, i multiplied by SPARSE_LANE_BYTES, value
+    Return 0
+End Process
+
+Process called "sparse_csr_get_row_ptr" takes m as Integer, i as Integer returns Integer:
+    Let rb be proc memory_get_int64 from Memory with m, 32
+    Return proc memory_get_int64 from Memory with rb, i multiplied by SPARSE_LANE_BYTES
+End Process
+
+Process called "sparse_csr_set_entry" takes m as Integer, k as Integer, col as Integer, value as Float returns Integer:
+    Let cb be proc memory_get_int64 from Memory with m, 40
+    Let vb be proc memory_get_int64 from Memory with m, 48
+    Let off be k multiplied by SPARSE_LANE_BYTES
+    Let _wc be proc memory_set_int64 from Memory with cb, off, col
+    Let vbits be proc sparse_float_to_bits with value
+    Let _wv be proc memory_set_int64 from Memory with vb, off, vbits
+    Return 0
+End Process
+
+Process called "sparse_csr_get_col_at" takes m as Integer, k as Integer returns Integer:
+    Let cb be proc memory_get_int64 from Memory with m, 40
+    Return proc memory_get_int64 from Memory with cb, k multiplied by SPARSE_LANE_BYTES
+End Process
+
+Process called "sparse_csr_get_value_at" takes m as Integer, k as Integer returns Float:
+    Let vb be proc memory_get_int64 from Memory with m, 48
+    Let bits be proc memory_get_int64 from Memory with vb, k multiplied by SPARSE_LANE_BYTES
+    Return proc sparse_bits_to_float with bits
+End Process
+
+Process called "sparse_csr_matvec" takes m as Integer, x_buf as Integer, y_buf as Integer returns Integer:
+    @Reasoning
+        Compute y = A * x where A is in CSR format. The canonical
+        kernel: for each row i, y[i] = sum over entries (k_lo..k_hi) of
+        values[k] * x[col_idx[k]].
+    @End Reasoning
+    @Implementation
+        Two nested loops. Outer over rows, inner over the entry slice
+        delimited by row_ptr[i] and row_ptr[i+1].
+    @End Implementation
+    @Performance_Hints
+        O(nnz). The L1-D access pattern is hot on the values/col_idx
+        arrays; x is randomly indexed.
+    @End Performance_Hints
+    @Security_Scope
+        x_buf and y_buf must be n_cols * 8 and n_rows * 8 byte buffers
+        of Float64 bit patterns.
+    @End Security_Scope
+    Let n_rows be proc memory_get_int64 from Memory with m, 0
+    Let i be 0
+    While i is less than n_rows:
+        Let k_lo be proc sparse_csr_get_row_ptr with m, i
+        Let k_hi be proc sparse_csr_get_row_ptr with m, i plus 1
+        Let sum be 0.0
+        Let k be k_lo
+        While k is less than k_hi:
+            Let col be proc sparse_csr_get_col_at with m, k
+            Let val be proc sparse_csr_get_value_at with m, k
+            Let x_bits be proc memory_get_int64 from Memory with x_buf, col multiplied by SPARSE_LANE_BYTES
+            Let x_val be proc sparse_bits_to_float with x_bits
+            Set sum to sum plus (val multiplied by x_val)
+            Set k to k plus 1
+        End While
+        Let sum_bits be proc sparse_float_to_bits with sum
+        Let _wy be proc memory_set_int64 from Memory with y_buf, i multiplied by SPARSE_LANE_BYTES, sum_bits
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "sparse_coo_to_csr" takes coo as Integer returns Integer:
+    @Reasoning
+        Convert a COO matrix to CSR. The standard two-pass algorithm:
+          Pass 1: count entries per row.
+          Pass 2: scatter values into the CSR arrays at row_ptr-derived
+                  offsets.
+    @End Reasoning
+    @Implementation
+        Per Saad chapter 3.4.
+    @End Implementation
+    @Performance_Hints
+        O(nnz + n_rows).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 if allocation fails.
+    @End Security_Scope
+    Let n_rows be proc sparse_coo_get_n_rows with coo
+    Let n_cols be proc sparse_coo_get_n_cols with coo
+    Let nnz be proc sparse_coo_get_nnz with coo
+    Let csr be proc sparse_csr_allocate with n_rows, n_cols, nnz
+    If csr is equal to 0:
+        Return 0
+    End If
+    Note: Pass 1: histogram of entries per row.
+    Let i be 0
+    While i is less than (n_rows plus 1):
+        Let _wz be proc sparse_csr_set_row_ptr with csr, i, 0
+        Set i to i plus 1
+    End While
+    Let k be 0
+    While k is less than nnz:
+        Let r be proc sparse_coo_get_row_at with coo, k
+        Let prev be proc sparse_csr_get_row_ptr with csr, r plus 1
+        Let _wi be proc sparse_csr_set_row_ptr with csr, r plus 1, prev plus 1
+        Set k to k plus 1
+    End While
+    Note: Cumulative sum.
+    Let j be 1
+    While j is less than (n_rows plus 1):
+        Let prev_p be proc sparse_csr_get_row_ptr with csr, j minus 1
+        Let cur_p be proc sparse_csr_get_row_ptr with csr, j
+        Let _ws be proc sparse_csr_set_row_ptr with csr, j, prev_p plus cur_p
+        Set j to j plus 1
+    End While
+    Note: Pass 2: scatter using a write-pointer per row (we mutate row_ptr
+    Note: in place and restore at the end).
+    Let cur_offsets be proc allocate from Layout with n_rows multiplied by SPARSE_LANE_BYTES
+    Let ii be 0
+    While ii is less than n_rows:
+        Let rp be proc sparse_csr_get_row_ptr with csr, ii
+        Let _wco be proc memory_set_int64 from Memory with cur_offsets, ii multiplied by SPARSE_LANE_BYTES, rp
+        Set ii to ii plus 1
+    End While
+    Let kk be 0
+    While kk is less than nnz:
+        Let r be proc sparse_coo_get_row_at with coo, kk
+        Let c be proc sparse_coo_get_col_at with coo, kk
+        Let v be proc sparse_coo_get_value_at with coo, kk
+        Let dest_off be proc memory_get_int64 from Memory with cur_offsets, r multiplied by SPARSE_LANE_BYTES
+        Let _set be proc sparse_csr_set_entry with csr, dest_off, c, v
+        Let _wo be proc memory_set_int64 from Memory with cur_offsets, r multiplied by SPARSE_LANE_BYTES, dest_off plus 1
+        Set kk to kk plus 1
+    End While
+    Let _fo be proc deallocate from Layout with cur_offsets
+    Return csr
+End Process
+
+Process called "sparse_csr_to_coo" takes csr as Integer returns Integer:
+    @Reasoning
+        Reverse conversion: walk row_ptr and emit COO triples.
+    @End Reasoning
+    @Implementation
+        Single pass over CSR.
+    @End Implementation
+    @Performance_Hints
+        O(nnz).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on alloc failure.
+    @End Security_Scope
+    Let n_rows be proc memory_get_int64 from Memory with csr, 0
+    Let n_cols be proc memory_get_int64 from Memory with csr, 8
+    Let nnz be proc memory_get_int64 from Memory with csr, 16
+    Let coo be proc sparse_coo_allocate with n_rows, n_cols, nnz
+    If coo is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than n_rows:
+        Let k_lo be proc sparse_csr_get_row_ptr with csr, i
+        Let k_hi be proc sparse_csr_get_row_ptr with csr, i plus 1
+        Let k be k_lo
+        While k is less than k_hi:
+            Let col be proc sparse_csr_get_col_at with csr, k
+            Let val be proc sparse_csr_get_value_at with csr, k
+            Let _ap be proc sparse_coo_append_entry with coo, i, col, val
+            Set k to k plus 1
+        End While
+        Set i to i plus 1
+    End While
+    Return coo
+End Process
+
+Process called "sparse_csr_transpose" takes m as Integer returns Integer:
+    @Reasoning
+        Transpose A -> A^T. Equivalent to converting A to COO, swapping
+        row and col indices, and converting back to CSR.
+    @End Reasoning
+    @Implementation
+        Compose csr_to_coo + index swap + coo_to_csr. Memory cost is
+        O(nnz) for the intermediate.
+    @End Implementation
+    @Performance_Hints
+        O(nnz + n_rows + n_cols).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on alloc failure.
+    @End Security_Scope
+    Let coo be proc sparse_csr_to_coo with m
+    If coo is equal to 0:
+        Return 0
+    End If
+    Let nnz be proc sparse_coo_get_nnz with coo
+    Let rb be proc memory_get_int64 from Memory with coo, 32
+    Let cb be proc memory_get_int64 from Memory with coo, 40
+    Note: Swap row/col index buffers in-place by exchanging buffer pointers.
+    Let _wr be proc memory_set_int64 from Memory with coo, 32, cb
+    Let _wc be proc memory_set_int64 from Memory with coo, 40, rb
+    Note: Swap n_rows and n_cols.
+    Let n_rows be proc memory_get_int64 from Memory with coo, 0
+    Let n_cols be proc memory_get_int64 from Memory with coo, 8
+    Let _wn1 be proc memory_set_int64 from Memory with coo, 0, n_cols
+    Let _wn2 be proc memory_set_int64 from Memory with coo, 8, n_rows
+    Let csr_t be proc sparse_coo_to_csr with coo
+    Let _fc be proc sparse_coo_free with coo
+    Return csr_t
+End Process
+
+Note: ============================================================================
+Note: CSC format - structurally identical to CSR but column-major
+Note: ============================================================================
+
+Process called "sparse_csc_allocate" takes n_rows as Integer, n_cols as Integer, nnz as Integer returns Integer:
+    @Reasoning
+        Allocate CSC with col_ptr (n_cols + 1), row_idx (nnz), values (nnz).
+        Shares the header layout with CSR but the role of the first
+        index buffer is column-pointer instead of row-pointer.
+    @End Reasoning
+    @Implementation
+        Calls into sparse_csr_allocate with n_rows / n_cols swapped so
+        col_ptr lives in the row_ptr slot.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Zeroed.
+    @End Security_Scope
+    Let h be proc allocate from Layout with SPARSE_HEADER_BYTES
+    If h is equal to 0:
+        Return 0
+    End If
+    Let col_ptr_buf be proc allocate from Layout with (n_cols plus 1) multiplied by SPARSE_LANE_BYTES
+    Let row_idx_buf be proc allocate from Layout with nnz multiplied by SPARSE_LANE_BYTES
+    Let val_buf be proc allocate from Layout with nnz multiplied by SPARSE_LANE_BYTES
+    If col_ptr_buf is equal to 0:
+        Let _f be proc deallocate from Layout with h
+        Return 0
+    End If
+    If row_idx_buf is equal to 0:
+        Let _f1 be proc deallocate from Layout with h
+        Let _f2 be proc deallocate from Layout with col_ptr_buf
+        Return 0
+    End If
+    If val_buf is equal to 0:
+        Let _f1 be proc deallocate from Layout with h
+        Let _f2 be proc deallocate from Layout with col_ptr_buf
+        Let _f3 be proc deallocate from Layout with row_idx_buf
+        Return 0
+    End If
+    Let _wr be proc memory_set_int64 from Memory with h, 0, n_rows
+    Let _wc be proc memory_set_int64 from Memory with h, 8, n_cols
+    Let _wn be proc memory_set_int64 from Memory with h, 16, nnz
+    Let _wcap be proc memory_set_int64 from Memory with h, 24, n_cols plus 1
+    Let _wpc be proc memory_set_int64 from Memory with h, 32, col_ptr_buf
+    Let _wpr be proc memory_set_int64 from Memory with h, 40, row_idx_buf
+    Let _wpv be proc memory_set_int64 from Memory with h, 48, val_buf
+    Return h
+End Process
+
+Process called "sparse_csc_free" takes m as Integer returns Integer:
+    Return proc sparse_coo_free with m
+End Process
+
+Process called "sparse_csc_matvec" takes m as Integer, x_buf as Integer, y_buf as Integer returns Integer:
+    @Reasoning
+        y = A * x with A in CSC. Iterate over columns; for each column
+        j, add x[j] * A[i, j] to y[i] for every row index i in that
+        column. This is the analog of the CSR row-iteration kernel.
+    @End Reasoning
+    @Implementation
+        Y must be pre-zeroed by caller.
+    @End Implementation
+    @Performance_Hints
+        O(nnz). Worse access pattern on y than CSR has on x.
+    @End Performance_Hints
+    @Security_Scope
+        Caller initializes y_buf to zeros.
+    @End Security_Scope
+    Let n_cols be proc memory_get_int64 from Memory with m, 8
+    Let col_ptr_buf be proc memory_get_int64 from Memory with m, 32
+    Let row_idx_buf be proc memory_get_int64 from Memory with m, 40
+    Let val_buf be proc memory_get_int64 from Memory with m, 48
+    Let j be 0
+    While j is less than n_cols:
+        Let k_lo be proc memory_get_int64 from Memory with col_ptr_buf, j multiplied by SPARSE_LANE_BYTES
+        Let k_hi be proc memory_get_int64 from Memory with col_ptr_buf, (j plus 1) multiplied by SPARSE_LANE_BYTES
+        Let x_bits be proc memory_get_int64 from Memory with x_buf, j multiplied by SPARSE_LANE_BYTES
+        Let x_j be proc sparse_bits_to_float with x_bits
+        Let k be k_lo
+        While k is less than k_hi:
+            Let row be proc memory_get_int64 from Memory with row_idx_buf, k multiplied by SPARSE_LANE_BYTES
+            Let bits_v be proc memory_get_int64 from Memory with val_buf, k multiplied by SPARSE_LANE_BYTES
+            Let val be proc sparse_bits_to_float with bits_v
+            Let bits_y be proc memory_get_int64 from Memory with y_buf, row multiplied by SPARSE_LANE_BYTES
+            Let y_cur be proc sparse_bits_to_float with bits_y
+            Let new_y be y_cur plus (val multiplied by x_j)
+            Let new_y_bits be proc sparse_float_to_bits with new_y
+            Let _wy be proc memory_set_int64 from Memory with y_buf, row multiplied by SPARSE_LANE_BYTES, new_y_bits
+            Set k to k plus 1
+        End While
+        Set j to j plus 1
+    End While
+    Return 0
+End Process

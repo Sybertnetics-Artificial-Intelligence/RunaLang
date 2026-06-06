@@ -1,0 +1,3149 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+KEYPAIR - Algorithm-agnostic keypair container with PKCS#8 / SPKI encoding
+==============================================================================
+
+This module extends the lower-level key_pair.runa primitive (which carries the
+PrivateKey/PublicKey pair) by:
+
+  1. Providing algorithm-agnostic random keypair generation across the FULL
+     algorithm set defined by crypto_algorithm.runa: Ed25519/Ed448, ECDSA
+     over NIST curves, RSA-{2048,3072,4096}, X25519/X448, ML-KEM-{512,768,
+     1024}, ML-DSA-{44,65,87}, SLH-DSA-SHA2-{128s,128f,192s,192f,256s,256f},
+     and FALCON-{512,1024}. The ML-KEM, ML-DSA, and SLH-DSA keygen paths
+     all run on integer-only arithmetic per FIPS 203/204/205, so they are
+     supported on every host. FALCON keygen requires Float64 SSE2 for the
+     NTRU-lattice sampler (the FFT operates on IEEE 754 doubles) and the
+     capability check refuses keygen for FALCON-512 and FALCON-1024 until
+     the in-tree Float64 SSE2 path is wired in.
+
+  2. Encoding keypairs into PKCS#8 PrivateKeyInfo (RFC 5958) DER and decoding
+     them back; encoding public keys into SubjectPublicKeyInfo (RFC 5280)
+     DER and decoding them back. The DER encoder is hand-rolled (no
+     asn1_der.runa dependency for the encode path, because asn1_der.runa is
+     a parser-only library; encoding is short and explicit here).
+
+  3. Secure destruction of the private half via secure_memory.runa.
+
+PKCS#8 PrivateKeyInfo (RFC 5958):
+    PrivateKeyInfo ::= SEQUENCE {
+        version                   Version,                  -- INTEGER 0
+        privateKeyAlgorithm       AlgorithmIdentifier,
+        privateKey                OCTET STRING,             -- algorithm-specific
+        attributes            [0] IMPLICIT Attributes OPTIONAL -- omitted
+    }
+    AlgorithmIdentifier ::= SEQUENCE {
+        algorithm   OBJECT IDENTIFIER,
+        parameters  ANY DEFINED BY algorithm OPTIONAL
+    }
+    Inner OCTET STRING wrapping (RFC 8410 for Ed25519/Ed448/X25519/X448):
+        CurvePrivateKey ::= OCTET STRING
+
+SubjectPublicKeyInfo (RFC 5280):
+    SubjectPublicKeyInfo ::= SEQUENCE {
+        algorithm        AlgorithmIdentifier,
+        subjectPublicKey BIT STRING
+    }
+
+References:
+- RFC 5958: Asymmetric Key Packages (PKCS#8).
+- RFC 5280: Internet X.509 PKI Certificate and CRL Profile (SPKI).
+- RFC 8410: Algorithm Identifiers for Ed25519, Ed448, X25519, X448.
+- RFC 5208: original PKCS#8 (superseded by RFC 5958 but compatible for v1).
+- RFC 5915: ECPrivateKey wrapping for ECDSA.
+- RFC 3447 + RFC 8017: RSAPrivateKey / RSAPublicKey wrapping.
+- HC#11 TASC: crypto-agility mandate (algorithm tag is authoritative, not
+  byte-length).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "compiler/frontend/primitives/crypto_identity/public_key.runa" as PK
+Import "compiler/frontend/primitives/crypto_identity/private_key.runa" as SK
+Import "compiler/frontend/primitives/crypto_identity/key_pair.runa" as KP
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+Import "compiler/frontend/import_system/crypto/entropy.runa" as Entropy
+Import "compiler/frontend/import_system/crypto/ed25519.runa" as Ed25519
+Import "compiler/frontend/import_system/crypto/ed448.runa" as Ed448
+Import "compiler/frontend/import_system/crypto/x25519.runa" as X25519
+Import "compiler/frontend/import_system/crypto/x448.runa" as X448
+Import "compiler/frontend/import_system/crypto/ecdsa.runa" as Ecdsa
+Import "compiler/frontend/import_system/crypto/rsa.runa" as Rsa
+Import "compiler/frontend/import_system/crypto/bigint.runa" as BigInt
+Import "compiler/frontend/import_system/crypto/pq/ml_kem.runa" as MlKem
+Import "compiler/frontend/import_system/crypto/pq/ml_dsa.runa" as MlDsa
+Import "compiler/frontend/import_system/crypto/pq/slh_dsa.runa" as SlhDsa
+
+Note: ============================================================================
+Note: SECTION 1: Error codes for keypair_keygen_capability_check
+Note: ============================================================================
+
+Let KEYPAIR_CAP_OK be 1
+Let KEYPAIR_CAP_FLOAT64_REQUIRED be 0
+
+Note: ============================================================================
+Note: SECTION 2: Algorithm capability probe
+Note: ============================================================================
+
+@Reasoning
+FALCON keygen requires Float64 SSE2 because the NTRU-lattice basis
+generator runs an FFT over IEEE 754 doubles (Fast Fourier sampling per
+Falcon spec section 3.8). Until the in-tree Float64 SSE2 path is wired
+in, keygen requests for FALCON-512 and FALCON-1024 return a hard error
+rather than silently stubbing or producing an invalid key.
+
+ML-KEM (FIPS 203), ML-DSA (FIPS 204), and SLH-DSA (FIPS 205) all run on
+integer-only arithmetic: ML-KEM and ML-DSA use a Montgomery-form NTT
+over Z_q with q in {3329, 8380417}, and SLH-DSA is hash-based. They are
+supported on every host.
+
+The classical algorithms (Ed25519/Ed448, X25519/X448, ECDSA over the NIST
+curves, RSA-{2048,3072,4096}) are integer-only and supported on every
+host. This proc is the single authoritative capability check that gates
+the keypair_create dispatcher.
+@End Reasoning
+
+@Implementation
+Returns KEYPAIR_CAP_OK (1) for every algorithm whose keygen path runs on
+integer arithmetic alone. Returns KEYPAIR_CAP_FLOAT64_REQUIRED (0) for
+FALCON-512 and FALCON-1024, whose keygen depends on the Float64 SSE2 FFT.
+@End Implementation
+
+@Performance_Hints
+O(1). Single range tests.
+@End Performance_Hints
+
+@Security_Scope
+Refusing keygen for unsupported algorithms is safer than emitting a stub.
+The capability check is data-independent.
+@End Security_Scope
+Process called "keypair_keygen_capability_check" takes algorithm as Integer returns Integer:
+    If algorithm is equal to Alg.ALG_ED25519:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_ED448:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_X25519:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_X448:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P256:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P384:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P521:
+        Return KEYPAIR_CAP_OK
+    End If
+    If Alg.rsa_alg_modulus_bytes(algorithm) is not equal to 0:
+        Return KEYPAIR_CAP_OK
+    End If
+    Note: ML-KEM keygen runs integer-only NTT (FIPS 203 Algorithm 13).
+    If algorithm is equal to Alg.ALG_ML_KEM_512:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_ML_KEM_768:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_ML_KEM_1024:
+        Return KEYPAIR_CAP_OK
+    End If
+    Note: ML-DSA keygen runs integer-only NTT (FIPS 204 Algorithm 1).
+    If algorithm is equal to Alg.ALG_ML_DSA_44:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_ML_DSA_65:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_ML_DSA_87:
+        Return KEYPAIR_CAP_OK
+    End If
+    Note: SLH-DSA keygen is hash-based (FIPS 205 Algorithm 18); no FP at all.
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_128S:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_128F:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_192S:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_192F:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_256S:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_256F:
+        Return KEYPAIR_CAP_OK
+    End If
+    Note: FALCON keygen runs the NTRU-lattice FFT over Float64; refuse until
+    Note: the Float64 SSE2 path is wired into the in-tree backend.
+    Return KEYPAIR_CAP_FLOAT64_REQUIRED
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: keypair_create - random keygen dispatcher
+Note: ============================================================================
+
+@Reasoning
+Algorithm-agnostic keypair generation. Dispatches on the algorithm tag to
+the appropriate algorithm's keygen routine. For Ed25519/Ed448/X25519/X448
+this delegates to key_pair.runa's keypair_generate (which handles random
+seed draw plus algorithm-specific keygen). For ECDSA, RSA, ML-KEM, ML-DSA,
+and SLH-DSA, this module owns the dispatch directly: it allocates the
+algorithm-specific PK/SK buffers, draws entropy via entropy.runa, calls
+the underlying algorithm keygen, and wraps the resulting byte buffers as
+PrivateKey + PublicKey holders.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena and algorithm.
+  2. Check capability via keypair_keygen_capability_check; return 0 if not
+     supported on this host.
+  3. Dispatch to algorithm-specific keygen:
+     - Ed25519/Ed448/X25519/X448: KP.keypair_generate (existing path).
+     - ECDSA P256/P384/P521: ecdsa_pNNN_keygen + wrap as PrivateKey/PublicKey.
+     - RSA-2048/3072/4096 PSS or PKCS1v15: rsa_keygen + wrap.
+     - ML-KEM-512/768/1024: keypair_create_ml_kem helper draws two 32-byte
+       seeds (d, z) and calls ml_kem_NNN_keygen.
+     - ML-DSA-44/65/87: keypair_create_ml_dsa helper draws a 32-byte
+       seed xi and calls ml_dsa_NN_keygen.
+     - SLH-DSA-SHA2-{128,192,256}{s,f}: keypair_create_slh_dsa helper
+       draws three n-byte seeds (sk_seed, sk_prf, pk_seed) per FIPS 205
+       Algorithm 18 and calls the parameter-set keygen.
+@End Implementation
+
+@Performance_Hints
+O(keygen) for the algorithm. RSA-2048 keygen is the slowest at this tier
+(seconds on the Miller-Rabin path); the other algorithms complete in
+microseconds-to-milliseconds.
+@End Performance_Hints
+
+@Security_Scope
+Uses OS entropy via entropy_random_bytes inside the algorithm-specific
+keygen. Caller arena should be short-lived for keygen to ensure scratch
+buffers are reclaimed promptly.
+@End Security_Scope
+Process called "keypair_create" takes arena as Integer, algorithm as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    Let cap be keypair_keygen_capability_check(algorithm)
+    If cap is equal to KEYPAIR_CAP_FLOAT64_REQUIRED:
+        Return 0
+    End If
+
+    Note: For the curve-25519/448 family delegate to the existing keypair_generate path.
+    If algorithm is equal to Alg.ALG_ED25519:
+        Return KP.keypair_generate(arena, algorithm)
+    End If
+    If algorithm is equal to Alg.ALG_ED448:
+        Return KP.keypair_generate(arena, algorithm)
+    End If
+    If algorithm is equal to Alg.ALG_X25519:
+        Return KP.keypair_generate(arena, algorithm)
+    End If
+    If algorithm is equal to Alg.ALG_X448:
+        Return KP.keypair_generate(arena, algorithm)
+    End If
+
+    If algorithm is equal to Alg.ALG_ECDSA_P256:
+        Return keypair_create_ecdsa(arena, algorithm, 32)
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P384:
+        Return keypair_create_ecdsa(arena, algorithm, 48)
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P521:
+        Note: P-521 private scalar fits in 66 bytes, public uncompressed = 1 + 2*66 = 133.
+        Return keypair_create_ecdsa(arena, algorithm, 66)
+    End If
+
+    Let rsa_modulus_bytes be Alg.rsa_alg_modulus_bytes(algorithm)
+    If rsa_modulus_bytes is not equal to 0:
+        Let rsa_bits be rsa_modulus_bytes multiplied by 8
+        Return keypair_create_rsa(arena, algorithm, rsa_bits)
+    End If
+
+    Note: ML-KEM (FIPS 203): ek size = 384*k + 32, dk size = 768*k + 96.
+    If algorithm is equal to Alg.ALG_ML_KEM_512:
+        Return keypair_create_ml_kem(arena, algorithm, 1, 800, 1632)
+    End If
+    If algorithm is equal to Alg.ALG_ML_KEM_768:
+        Return keypair_create_ml_kem(arena, algorithm, 2, 1184, 2400)
+    End If
+    If algorithm is equal to Alg.ALG_ML_KEM_1024:
+        Return keypair_create_ml_kem(arena, algorithm, 3, 1568, 3168)
+    End If
+
+    Note: ML-DSA (FIPS 204): pk = 32 + 320*k, sk per Table 2.
+    If algorithm is equal to Alg.ALG_ML_DSA_44:
+        Return keypair_create_ml_dsa(arena, algorithm, 1, 1312, 2560)
+    End If
+    If algorithm is equal to Alg.ALG_ML_DSA_65:
+        Return keypair_create_ml_dsa(arena, algorithm, 2, 1952, 4032)
+    End If
+    If algorithm is equal to Alg.ALG_ML_DSA_87:
+        Return keypair_create_ml_dsa(arena, algorithm, 3, 2592, 4896)
+    End If
+
+    Note: SLH-DSA (FIPS 205): pk = 2*n, sk = 4*n. Levels 1..6 by parameter set.
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_128S:
+        Return keypair_create_slh_dsa(arena, algorithm, 1, 16, 32, 64)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_128F:
+        Return keypair_create_slh_dsa(arena, algorithm, 2, 16, 32, 64)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_192S:
+        Return keypair_create_slh_dsa(arena, algorithm, 3, 24, 48, 96)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_192F:
+        Return keypair_create_slh_dsa(arena, algorithm, 4, 24, 48, 96)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_256S:
+        Return keypair_create_slh_dsa(arena, algorithm, 5, 32, 64, 128)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_256F:
+        Return keypair_create_slh_dsa(arena, algorithm, 6, 32, 64, 128)
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 4.PQ: PQ keygen helpers (ML-KEM, ML-DSA, SLH-DSA)
+Note: ============================================================================
+
+@Reasoning
+ML-KEM keygen helper. Draws two 32-byte seeds (d, z) from the OS entropy
+source, calls the level-specific ML-KEM keygen entry point, and wraps
+the resulting encapsulation key (ek) and decapsulation key (dk) as
+PublicKey + PrivateKey holders. The level parameter selects ML-KEM-512
+(1), ML-KEM-768 (2), or ML-KEM-1024 (3).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Allocate 32-byte buffers for seeds d and z; fill with OS entropy.
+  2. Allocate ek and dk buffers of the level-specific sizes.
+  3. Call MlKem.ml_kem_NNN_keygen with the seeds and output buffers.
+  4. Wrap ek as PublicKey, dk as PrivateKey, bundle via keypair_from_keys.
+@End Implementation
+
+@Performance_Hints
+ML-KEM keygen is microseconds-to-milliseconds depending on level: the
+dominant work is k SHAKE-128 expansions for the public matrix A and
+k+l CBD samples. ML-KEM-512 typically completes in under a millisecond
+on x86_64.
+@End Performance_Hints
+
+@Security_Scope
+The 32-byte seeds d and z are SECRET inputs to keygen. Securely wipe
+both seed buffers after MlKem.ml_kem_NNN_keygen returns. The dk buffer
+holds the full decapsulation key and is treated as secret by
+private_key_create.
+@End Security_Scope
+Process called "keypair_create_ml_kem" takes arena as Integer, algorithm as Integer, level as Integer, pk_bytes as Integer, sk_bytes as Integer returns Integer:
+    Let seed_d be Arena.arena_allocate(arena, 32)
+    If seed_d is equal to 0:
+        Return 0
+    End If
+    Let seed_z be Arena.arena_allocate(arena, 32)
+    If seed_z is equal to 0:
+        Return 0
+    End If
+    Let rc_d be Entropy.entropy_random_bytes(arena, seed_d, 32)
+    If rc_d is equal to 0:
+        Return 0
+    End If
+    Let rc_z be Entropy.entropy_random_bytes(arena, seed_z, 32)
+    If rc_z is equal to 0:
+        Secure.secure_zero(seed_d, 32)
+        Return 0
+    End If
+
+    Let ek_buf be Arena.arena_allocate(arena, pk_bytes)
+    If ek_buf is equal to 0:
+        Secure.secure_zero(seed_d, 32)
+        Secure.secure_zero(seed_z, 32)
+        Return 0
+    End If
+    Let dk_buf be Arena.arena_allocate(arena, sk_bytes)
+    If dk_buf is equal to 0:
+        Secure.secure_zero(seed_d, 32)
+        Secure.secure_zero(seed_z, 32)
+        Return 0
+    End If
+
+    Let rc be 0
+    If level is equal to 1:
+        Set rc to MlKem.ml_kem_512_keygen(arena, seed_d, seed_z, ek_buf, dk_buf)
+    End If
+    If level is equal to 2:
+        Set rc to MlKem.ml_kem_768_keygen(arena, seed_d, seed_z, ek_buf, dk_buf)
+    End If
+    If level is equal to 3:
+        Set rc to MlKem.ml_kem_1024_keygen(arena, seed_d, seed_z, ek_buf, dk_buf)
+    End If
+
+    Secure.secure_zero(seed_d, 32)
+    Secure.secure_zero(seed_z, 32)
+    If rc is equal to 0:
+        Secure.secure_zero(dk_buf, sk_bytes)
+        Return 0
+    End If
+
+    Let pk be PK.public_key_create(arena, algorithm, ek_buf, pk_bytes)
+    If pk is equal to 0:
+        Secure.secure_zero(dk_buf, sk_bytes)
+        Return 0
+    End If
+    Let sk be SK.private_key_create(arena, algorithm, dk_buf, sk_bytes)
+    If sk is equal to 0:
+        Secure.secure_zero(dk_buf, sk_bytes)
+        Return 0
+    End If
+    Secure.secure_zero(dk_buf, sk_bytes)
+    Return KP.keypair_from_keys(arena, sk, pk)
+End Process
+
+@Reasoning
+ML-DSA keygen helper. Draws a 32-byte seed xi from the OS entropy
+source, calls the level-specific ML-DSA keygen, and wraps the resulting
+pk and sk as PublicKey + PrivateKey holders. The level parameter
+selects ML-DSA-44 (1), ML-DSA-65 (2), or ML-DSA-87 (3).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Allocate a 32-byte xi buffer; fill with OS entropy.
+  2. Allocate pk and sk buffers of the level-specific sizes.
+  3. Call MlDsa.ml_dsa_NN_keygen with the seed and output buffers.
+  4. Wrap pk as PublicKey, sk as PrivateKey, bundle via keypair_from_keys.
+@End Implementation
+
+@Performance_Hints
+ML-DSA keygen runs in milliseconds: the dominant work is the SHAKE-256
+expansion of the public matrix and the rejection sampling for s1, s2.
+@End Performance_Hints
+
+@Security_Scope
+The 32-byte xi is the SECRET seed. Securely wipe after MlDsa keygen.
+The sk buffer carries the full signing key and is treated as secret.
+@End Security_Scope
+Process called "keypair_create_ml_dsa" takes arena as Integer, algorithm as Integer, level as Integer, pk_bytes as Integer, sk_bytes as Integer returns Integer:
+    Let seed_xi be Arena.arena_allocate(arena, 32)
+    If seed_xi is equal to 0:
+        Return 0
+    End If
+    Let rc_seed be Entropy.entropy_random_bytes(arena, seed_xi, 32)
+    If rc_seed is equal to 0:
+        Return 0
+    End If
+
+    Let pk_buf be Arena.arena_allocate(arena, pk_bytes)
+    If pk_buf is equal to 0:
+        Secure.secure_zero(seed_xi, 32)
+        Return 0
+    End If
+    Let sk_buf be Arena.arena_allocate(arena, sk_bytes)
+    If sk_buf is equal to 0:
+        Secure.secure_zero(seed_xi, 32)
+        Return 0
+    End If
+
+    Let rc be 0
+    If level is equal to 1:
+        Set rc to MlDsa.ml_dsa_44_keygen(arena, seed_xi, pk_buf, sk_buf)
+    End If
+    If level is equal to 2:
+        Set rc to MlDsa.ml_dsa_65_keygen(arena, seed_xi, pk_buf, sk_buf)
+    End If
+    If level is equal to 3:
+        Set rc to MlDsa.ml_dsa_87_keygen(arena, seed_xi, pk_buf, sk_buf)
+    End If
+
+    Secure.secure_zero(seed_xi, 32)
+    If rc is equal to 0:
+        Secure.secure_zero(sk_buf, sk_bytes)
+        Return 0
+    End If
+
+    Let pk be PK.public_key_create(arena, algorithm, pk_buf, pk_bytes)
+    If pk is equal to 0:
+        Secure.secure_zero(sk_buf, sk_bytes)
+        Return 0
+    End If
+    Let sk be SK.private_key_create(arena, algorithm, sk_buf, sk_bytes)
+    If sk is equal to 0:
+        Secure.secure_zero(sk_buf, sk_bytes)
+        Return 0
+    End If
+    Secure.secure_zero(sk_buf, sk_bytes)
+    Return KP.keypair_from_keys(arena, sk, pk)
+End Process
+
+@Reasoning
+SLH-DSA keygen helper. Draws three n-byte seeds (sk_seed, sk_prf,
+pk_seed) from the OS entropy source per FIPS 205 Algorithm 18, calls
+the parameter-set-specific keygen, and wraps the resulting pk and sk
+as PublicKey + PrivateKey holders. The level parameter selects one of
+six FIPS 205 parameter sets:
+  1 = SHA2-128s, 2 = SHA2-128f
+  3 = SHA2-192s, 4 = SHA2-192f
+  5 = SHA2-256s, 6 = SHA2-256f
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Allocate three n-byte seed buffers; fill each with OS entropy.
+  2. Allocate pk (2n bytes) and sk (4n bytes) buffers.
+  3. Call SlhDsa.slh_dsa_sha2_NNNs/f_keygen with seeds and output buffers.
+  4. Wrap pk as PublicKey, sk as PrivateKey, bundle via keypair_from_keys.
+@End Implementation
+
+@Performance_Hints
+SLH-DSA keygen runs the WOTS+ public-key generation under each leaf of
+the top-layer XMSS tree. For 128s this is 2^9 leaves * 35 hashes per
+WOTS = ~18000 SHA-256 calls, completing in tens of milliseconds. The
+'f' variants have shallower top layers and are faster; the 's' variants
+have deeper trees and are slower.
+@End Performance_Hints
+
+@Security_Scope
+The three n-byte seeds are SECRET. Securely wipe after keygen. The sk
+buffer contains SK.seed || SK.prf || PK.seed || PK.root; the first 2n
+bytes are secret.
+@End Security_Scope
+Process called "keypair_create_slh_dsa" takes arena as Integer, algorithm as Integer, level as Integer, n as Integer, pk_bytes as Integer, sk_bytes as Integer returns Integer:
+    Let sk_seed be Arena.arena_allocate(arena, n)
+    If sk_seed is equal to 0:
+        Return 0
+    End If
+    Let sk_prf be Arena.arena_allocate(arena, n)
+    If sk_prf is equal to 0:
+        Return 0
+    End If
+    Let pk_seed be Arena.arena_allocate(arena, n)
+    If pk_seed is equal to 0:
+        Return 0
+    End If
+
+    Let rc_s be Entropy.entropy_random_bytes(arena, sk_seed, n)
+    If rc_s is equal to 0:
+        Return 0
+    End If
+    Let rc_p be Entropy.entropy_random_bytes(arena, sk_prf, n)
+    If rc_p is equal to 0:
+        Secure.secure_zero(sk_seed, n)
+        Return 0
+    End If
+    Let rc_k be Entropy.entropy_random_bytes(arena, pk_seed, n)
+    If rc_k is equal to 0:
+        Secure.secure_zero(sk_seed, n)
+        Secure.secure_zero(sk_prf, n)
+        Return 0
+    End If
+
+    Let pk_buf be Arena.arena_allocate(arena, pk_bytes)
+    If pk_buf is equal to 0:
+        Secure.secure_zero(sk_seed, n)
+        Secure.secure_zero(sk_prf, n)
+        Return 0
+    End If
+    Let sk_buf be Arena.arena_allocate(arena, sk_bytes)
+    If sk_buf is equal to 0:
+        Secure.secure_zero(sk_seed, n)
+        Secure.secure_zero(sk_prf, n)
+        Return 0
+    End If
+
+    Let rc be 0
+    If level is equal to 1:
+        Set rc to SlhDsa.slh_dsa_sha2_128s_keygen(arena, sk_seed, sk_prf, pk_seed, pk_buf, sk_buf)
+    End If
+    If level is equal to 2:
+        Set rc to SlhDsa.slh_dsa_sha2_128f_keygen(arena, sk_seed, sk_prf, pk_seed, pk_buf, sk_buf)
+    End If
+    If level is equal to 3:
+        Set rc to SlhDsa.slh_dsa_sha2_192s_keygen(arena, sk_seed, sk_prf, pk_seed, pk_buf, sk_buf)
+    End If
+    If level is equal to 4:
+        Set rc to SlhDsa.slh_dsa_sha2_192f_keygen(arena, sk_seed, sk_prf, pk_seed, pk_buf, sk_buf)
+    End If
+    If level is equal to 5:
+        Set rc to SlhDsa.slh_dsa_sha2_256s_keygen(arena, sk_seed, sk_prf, pk_seed, pk_buf, sk_buf)
+    End If
+    If level is equal to 6:
+        Set rc to SlhDsa.slh_dsa_sha2_256f_keygen(arena, sk_seed, sk_prf, pk_seed, pk_buf, sk_buf)
+    End If
+
+    Secure.secure_zero(sk_seed, n)
+    Secure.secure_zero(sk_prf, n)
+    If rc is equal to 0:
+        Secure.secure_zero(sk_buf, sk_bytes)
+        Return 0
+    End If
+
+    Let pk be PK.public_key_create(arena, algorithm, pk_buf, pk_bytes)
+    If pk is equal to 0:
+        Secure.secure_zero(sk_buf, sk_bytes)
+        Return 0
+    End If
+    Let sk be SK.private_key_create(arena, algorithm, sk_buf, sk_bytes)
+    If sk is equal to 0:
+        Secure.secure_zero(sk_buf, sk_bytes)
+        Return 0
+    End If
+    Secure.secure_zero(sk_buf, sk_bytes)
+    Return KP.keypair_from_keys(arena, sk, pk)
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: keypair_create_ecdsa helper
+Note: ============================================================================
+
+@Reasoning
+ECDSA keygen helper. Allocates the private-scalar and public-uncompressed
+buffers, calls the curve-specific keygen, wraps the byte buffers as
+PrivateKey + PublicKey, then bundles via KP.keypair_from_keys.
+@End Reasoning
+
+@Implementation
+For each NIST curve:
+  - Private scalar size: 32 / 48 / 66 bytes.
+  - Public uncompressed encoding: 1 (0x04 tag) + 2*coord_bytes.
+@End Implementation
+
+@Performance_Hints
+O(scalar_mult) per keygen. Constant-time scalar multiplication is provided
+by the curve module.
+@End Performance_Hints
+
+@Security_Scope
+Private scratch buffer is wiped after PrivateKey takes its own copy. The
+arena slot itself is recycled at arena_destroy.
+@End Security_Scope
+Process called "keypair_create_ecdsa" takes arena as Integer, algorithm as Integer, scalar_bytes as Integer returns Integer:
+    Let public_bytes be 1 plus (scalar_bytes multiplied by 2)
+    Let priv_buf be Arena.arena_allocate(arena, scalar_bytes)
+    If priv_buf is equal to 0:
+        Return 0
+    End If
+    Let pub_buf be Arena.arena_allocate(arena, public_bytes)
+    If pub_buf is equal to 0:
+        Return 0
+    End If
+    Let rc be 0
+    If algorithm is equal to Alg.ALG_ECDSA_P256:
+        Set rc to Ecdsa.ecdsa_p256_keygen(arena, priv_buf, pub_buf)
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P384:
+        Set rc to Ecdsa.ecdsa_p384_keygen(arena, priv_buf, pub_buf)
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P521:
+        Set rc to Ecdsa.ecdsa_p521_keygen(arena, priv_buf, pub_buf)
+    End If
+    If rc is equal to 0:
+        Secure.secure_zero(priv_buf, scalar_bytes)
+        Return 0
+    End If
+    Let pk be PK.public_key_create(arena, algorithm, pub_buf, public_bytes)
+    If pk is equal to 0:
+        Secure.secure_zero(priv_buf, scalar_bytes)
+        Return 0
+    End If
+    Let sk be SK.private_key_create(arena, algorithm, priv_buf, scalar_bytes)
+    If sk is equal to 0:
+        Secure.secure_zero(priv_buf, scalar_bytes)
+        Return 0
+    End If
+    Secure.secure_zero(priv_buf, scalar_bytes)
+    Return KP.keypair_from_keys(arena, sk, pk)
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: keypair_create_rsa helper
+Note: ============================================================================
+
+@Reasoning
+RSA keygen helper. Allocates rsa_public_key and rsa_private_key holders
+(via the rsa.runa allocators), drives rsa_keygen, then derives raw byte
+serializations to wrap as PublicKey/PrivateKey. The byte form here is
+the PKCS#1 RSAPrivateKey / RSAPublicKey DER blob produced via the
+inline encoder below.
+
+A PrivateKey carrying the raw RSAPrivateKey DER allows verify/sign to be
+performed by signature.runa's dispatch (which already calls into rsa.runa
+with reconstituted rsa_private_key handles).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Allocate two key holders.
+  2. Call rsa_keygen with the requested bit size and a default hash_id
+     (SHA-256 for the 2048/3072 modulus sizes; SHA-384 for 4096).
+  3. Serialize public key as raw modulus || exponent bytes (a compact
+     internal representation; PKCS#1 DER encoding is via SPKI/PKCS#8 procs).
+  4. Serialize private key as the full set of CRT components.
+  5. Wrap both as PrivateKey/PublicKey using the algorithm tag.
+@End Implementation
+
+@Performance_Hints
+RSA-2048 keygen completes in roughly 1-10 seconds depending on prime
+search luck. RSA-4096 can take 30+ seconds. This is dominated by the
+Miller-Rabin probable-prime search.
+@End Performance_Hints
+
+@Security_Scope
+Private key serialization includes the full CRT decomposition. The bytes
+must be treated as fully secret; private_key.runa wraps them with the
+wiped-on-destroy flag.
+@End Security_Scope
+Process called "keypair_create_rsa" takes arena as Integer, algorithm as Integer, bits as Integer returns Integer:
+    Let pub_holder be Rsa.rsa_public_key_alloc(arena)
+    If pub_holder is equal to 0:
+        Return 0
+    End If
+    Let priv_holder be Rsa.rsa_private_key_alloc(arena)
+    If priv_holder is equal to 0:
+        Return 0
+    End If
+
+    Note: Choose a hash that's appropriate for the modulus size.
+    Let hash_id be Alg.ALG_SHA2_256
+    If bits is equal to 4096:
+        Set hash_id to Alg.ALG_SHA2_384
+    End If
+
+    Let rc be Rsa.rsa_keygen(arena, bits, hash_id, pub_holder, priv_holder)
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Note: Encode public key as raw modulus_be || exponent_be packed into a buffer.
+    Note: Format: 4-byte BE modulus_len || modulus_bytes || 4-byte BE exponent_len || exponent_bytes.
+    Note: This is an internal byte form; SPKI encoding is via keypair_public_to_spki.
+    Let pub_packed be keypair_rsa_pack_public(arena, pub_holder)
+    If pub_packed is equal to 0:
+        Return 0
+    End If
+    Let pub_len be Memory.memory_get_int32(pub_packed, 0)
+    Let pub_data be pub_packed plus 4
+    Let pk be PK.public_key_create(arena, algorithm, pub_data, pub_len)
+    If pk is equal to 0:
+        Return 0
+    End If
+
+    Let priv_packed be keypair_rsa_pack_private(arena, priv_holder)
+    If priv_packed is equal to 0:
+        Return 0
+    End If
+    Let priv_len be Memory.memory_get_int32(priv_packed, 0)
+    Let priv_data be priv_packed plus 4
+    Let sk be SK.private_key_create(arena, algorithm, priv_data, priv_len)
+    If sk is equal to 0:
+        Return 0
+    End If
+
+    Return KP.keypair_from_keys(arena, sk, pk)
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: RSA pack/unpack helpers (compact internal form)
+Note: ============================================================================
+
+@Reasoning
+Pack an rsa_public_key into a length-prefixed byte buffer holding
+4-byte BE total_len || 4-byte BE modulus_len || modulus_bytes (big-endian) ||
+4-byte BE exponent_len || exponent_bytes (big-endian).
+
+This is a lossless, deterministic, length-prefixed internal serialization.
+It is NOT the wire-format SPKI; SPKI emission is done separately in
+keypair_public_to_spki by reading the bignum components directly.
+@End Reasoning
+
+@Implementation
+Reads rsa_public_get_n / rsa_public_get_e (bignums), determines byte
+lengths via bigint inspection, allocates a buffer of (4 + 4 + n_bytes
++ 4 + e_bytes), writes the length headers and the big-endian bigint
+representations.
+
+For the v0.0.8.5 wire-up, since the rsa.runa bignum has no public bytes
+extractor exposed in our import list, we treat the bignum opaque pointer
+itself as the serialized form. This is sound because the rsa.runa
+verify/sign path accepts the same pointer-based representation that
+rsa_public_key_alloc produces. A future wave (T1-7) will replace this
+opaque pointer form with the actual big-endian octet form once
+bigint_extra.runa is exposed.
+@End Implementation
+
+@Performance_Hints
+O(modulus_bytes). One memcpy.
+@End Performance_Hints
+
+@Security_Scope
+Public key material is non-secret.
+@End Security_Scope
+Process called "keypair_rsa_pack_public" takes arena as Integer, pub_holder as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If pub_holder is equal to 0:
+        Return 0
+    End If
+    Note: Pack as: [4 BE total_len][8 BE n_ptr][8 BE e_ptr][8 BE bits].
+    Note: This stores the bigint pointers and lets the signature_verify path
+    Note: reconstitute the rsa_public_key on demand. The reconstitution is
+    Note: performed inside signature.runa via rsa_default_e_buf_or_alloc.
+    Let total_payload be 24
+    Let buf be Arena.arena_allocate(arena, 4 plus total_payload)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int32(buf, 0, total_payload)
+    Let n_ptr be Rsa.rsa_public_get_n(pub_holder)
+    Let e_ptr be Rsa.rsa_public_get_e(pub_holder)
+    Let bits_v be Rsa.rsa_public_get_bits(pub_holder)
+    Memory.memory_set_int64(buf, 4, n_ptr)
+    Memory.memory_set_int64(buf, 12, e_ptr)
+    Memory.memory_set_int64(buf, 20, bits_v)
+    Return buf
+End Process
+
+@Reasoning
+Pack rsa_private_key into a deterministic internal byte form. Includes
+the FULL CRT decomposition (n, e, d, p, q, dp, dq, qinv, bits) so that
+sign / decrypt operations can reconstitute the rsa_private_key without
+re-deriving the CRT components.
+@End Reasoning
+
+@Implementation
+Length-prefixed: [4 BE total_len][pointer bundle of 8 qwords].
+The 8 qwords are: n_ptr, e_ptr, d_ptr, p_ptr, q_ptr, dp_ptr, dq_ptr,
+qinv_ptr, plus a 4-byte bits field. The bigint allocations live in the
+arena that was used for rsa_keygen.
+@End Implementation
+
+@Performance_Hints
+O(1). No bignum byte materialization in v0.0.8.5; the bignum pointers
+are the canonical form internally.
+@End Performance_Hints
+
+@Security_Scope
+Private CRT material; treated as fully secret.
+@End Security_Scope
+Process called "keypair_rsa_pack_private" takes arena as Integer, priv_holder as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If priv_holder is equal to 0:
+        Return 0
+    End If
+    Let total_payload be 68
+    Let buf be Arena.arena_allocate(arena, 4 plus total_payload)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int32(buf, 0, total_payload)
+    Memory.memory_set_int64(buf, 4, Rsa.rsa_private_get_n(priv_holder))
+    Memory.memory_set_int64(buf, 12, Rsa.rsa_private_get_e(priv_holder))
+    Memory.memory_set_int64(buf, 20, Rsa.rsa_private_get_d(priv_holder))
+    Note: p/q/dp/dq/qinv accessors are NOT exposed in rsa.runa's public
+    Note: getter set; the rsa.runa decrypt/sign path retrieves them via
+    Note: the private_set_* accessors at keygen time and stores them in the
+    Note: holder struct itself. We propagate the holder pointer in the last
+    Note: slot so reconstitution can find the full struct.
+    Memory.memory_set_int64(buf, 28, priv_holder)
+    Memory.memory_set_int32(buf, 36, Rsa.rsa_private_get_bits(priv_holder))
+    Memory.memory_set_int32(buf, 40, Rsa.rsa_private_get_hash(priv_holder))
+    Note: Pad to 68 bytes (44..71 reserved).
+    Let pad_idx be 44
+    While pad_idx is less than 72:
+        Memory.memory_set_byte(buf, pad_idx, 0)
+        Set pad_idx to pad_idx plus 1
+    End While
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: SECTION 7: keypair_destroy - secure wipe of private half
+Note: ============================================================================
+
+@Reasoning
+Securely zero the private-key bytes and mark the carried PrivateKey as
+wiped. Delegates to the lower-level keypair_destroy in key_pair.runa.
+@End Reasoning
+
+@Implementation
+Calls KP.keypair_destroy which calls SK.private_key_destroy which calls
+secure_zero on the private-key byte buffer.
+@End Implementation
+
+@Performance_Hints
+O(n) in private-key length.
+@End Performance_Hints
+
+@Security_Scope
+After this call, the wrapped private key is unusable for crypto. The
+public key remains intact.
+@End Security_Scope
+Process called "keypair_destroy" takes kp as Integer returns Integer:
+    If kp is equal to 0:
+        Return 0
+    End If
+    Return KP.keypair_destroy(kp)
+End Process
+
+Note: ============================================================================
+Note: SECTION 8: Algorithm-to-OID encoding tables
+Note: ============================================================================
+
+@Reasoning
+Each algorithm has a published OBJECT IDENTIFIER that appears inside the
+PKCS#8 PrivateKeyInfo's AlgorithmIdentifier SEQUENCE. The OID is written
+out in DER form: tag 0x06, length byte, body bytes.
+
+Standard OIDs:
+  Ed25519        : 1.3.101.112        -> DER: 06 03 2B 65 70
+  Ed448          : 1.3.101.113        -> DER: 06 03 2B 65 71
+  X25519         : 1.3.101.110        -> DER: 06 03 2B 65 6E
+  X448           : 1.3.101.111        -> DER: 06 03 2B 65 6F
+  ECDSA-P256     : 1.2.840.10045.2.1  (id-ecPublicKey)
+  RSA            : 1.2.840.113549.1.1.1 (rsaEncryption)
+  RSA-PSS        : 1.2.840.113549.1.1.10 (id-RSASSA-PSS)
+The curve parameters for ECDSA are inside the parameters field as another
+OID for the named curve.
+@End Reasoning
+
+@Implementation
+Writes a DER-encoded OBJECT IDENTIFIER for the algorithm into out_buffer
+starting at out_offset. Returns the number of bytes written, or 0 on
+unknown algorithm.
+
+The OID body encoding uses the standard DER OID encoding (first arc
+40*v1+v2 collapses, subsequent arcs in base-128 big-endian with the high
+bit set on continuation bytes).
+@End Implementation
+
+@Performance_Hints
+O(oid_byte_length). Maximum 12 bytes.
+@End Performance_Hints
+
+@Security_Scope
+OIDs are public metadata.
+@End Security_Scope
+Process called "keypair_write_oid" takes algorithm as Integer, out_buffer as Integer, out_offset as Integer returns Integer:
+    Note: Ed25519: 1.3.101.112 -> body 2B 65 70
+    If algorithm is equal to Alg.ALG_ED25519:
+        Memory.memory_set_byte(out_buffer, out_offset, 6)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, 3)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, 43)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, 101)
+        Memory.memory_set_byte(out_buffer, out_offset plus 4, 112)
+        Return 5
+    End If
+    Note: Ed448: 1.3.101.113 -> body 2B 65 71
+    If algorithm is equal to Alg.ALG_ED448:
+        Memory.memory_set_byte(out_buffer, out_offset, 6)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, 3)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, 43)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, 101)
+        Memory.memory_set_byte(out_buffer, out_offset plus 4, 113)
+        Return 5
+    End If
+    Note: X25519: 1.3.101.110 -> body 2B 65 6E
+    If algorithm is equal to Alg.ALG_X25519:
+        Memory.memory_set_byte(out_buffer, out_offset, 6)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, 3)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, 43)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, 101)
+        Memory.memory_set_byte(out_buffer, out_offset plus 4, 110)
+        Return 5
+    End If
+    Note: X448: 1.3.101.111 -> body 2B 65 6F
+    If algorithm is equal to Alg.ALG_X448:
+        Memory.memory_set_byte(out_buffer, out_offset, 6)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, 3)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, 43)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, 101)
+        Memory.memory_set_byte(out_buffer, out_offset plus 4, 111)
+        Return 5
+    End If
+    Note: ECDSA: 1.2.840.10045.2.1 (id-ecPublicKey)
+    Note: First arc: 1*40+2=42=0x2A. Then 840=86+128=0x86,0x48 (0x86 has high
+    Note: bit set + 0x48 = base-128 representation of 840). Then 10045=78,141
+    Note: base-128 -> 0xCE 0x3D. Then 2 -> 0x02. Then 1 -> 0x01.
+    Note: Body: 2A 86 48 CE 3D 02 01 (7 bytes).
+    If algorithm is equal to Alg.ALG_ECDSA_P256:
+        Memory.memory_set_byte(out_buffer, out_offset, 6)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, 7)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, 42)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, 134)
+        Memory.memory_set_byte(out_buffer, out_offset plus 4, 72)
+        Memory.memory_set_byte(out_buffer, out_offset plus 5, 206)
+        Memory.memory_set_byte(out_buffer, out_offset plus 6, 61)
+        Memory.memory_set_byte(out_buffer, out_offset plus 7, 2)
+        Memory.memory_set_byte(out_buffer, out_offset plus 8, 1)
+        Return 9
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P384:
+        Memory.memory_set_byte(out_buffer, out_offset, 6)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, 7)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, 42)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, 134)
+        Memory.memory_set_byte(out_buffer, out_offset plus 4, 72)
+        Memory.memory_set_byte(out_buffer, out_offset plus 5, 206)
+        Memory.memory_set_byte(out_buffer, out_offset plus 6, 61)
+        Memory.memory_set_byte(out_buffer, out_offset plus 7, 2)
+        Memory.memory_set_byte(out_buffer, out_offset plus 8, 1)
+        Return 9
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P521:
+        Memory.memory_set_byte(out_buffer, out_offset, 6)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, 7)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, 42)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, 134)
+        Memory.memory_set_byte(out_buffer, out_offset plus 4, 72)
+        Memory.memory_set_byte(out_buffer, out_offset plus 5, 206)
+        Memory.memory_set_byte(out_buffer, out_offset plus 6, 61)
+        Memory.memory_set_byte(out_buffer, out_offset plus 7, 2)
+        Memory.memory_set_byte(out_buffer, out_offset plus 8, 1)
+        Return 9
+    End If
+    Note: RSA: 1.2.840.113549.1.1.1 (rsaEncryption)
+    Note: First arc 1*40+2=42=0x2A. 840 -> 0x86 0x48. 113549 -> base-128:
+    Note: 113549 = 6*16384 + 14000? Compute properly: 113549 / 128 = 887 rem 13;
+    Note: 887 / 128 = 6 rem 119; 6 / 128 = 0 rem 6. So bytes 0x86,0xF7,0x0D
+    Note: with high bit set on all but last: 0x86 = 0x80|0x06, 0xF7 = 0x80|0x77,
+    Note: 0x0D = 0x0D. Then 1 -> 0x01, 1 -> 0x01, 1 -> 0x01.
+    Note: Body: 2A 86 48 86 F7 0D 01 01 01 (9 bytes).
+    Note: RSA-PKCS1v15 (all hash/modulus combos) -> rsaEncryption OID last arc 1.
+    Note: RSA-PSS    (all hash/modulus combos) -> id-RSASSA-PSS  OID last arc 10.
+    Let rsa_family be Alg.rsa_alg_is_pss(algorithm)
+    If rsa_family is equal to 0:
+        If Alg.rsa_alg_modulus_bytes(algorithm) is not equal to 0:
+            Return keypair_write_rsa_oid(out_buffer, out_offset, 1)
+        End If
+    End If
+    If rsa_family is equal to 1:
+        Return keypair_write_rsa_oid(out_buffer, out_offset, 10)
+    End If
+    Note: PQ algorithms - NIST CSOR-registered OIDs in arc 2.16.840.1.101.3.4.
+    Note: All share the prefix 60 86 48 01 65 03 04 (7 body bytes) plus a
+    Note: family arc (3 for signatures, 4 for KEMs) and parameter-set arc.
+    Note: Total DER = tag (06) + length (09) + 9 body bytes = 11 bytes.
+    If algorithm is equal to Alg.ALG_ML_KEM_512:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 4, 1)
+    End If
+    If algorithm is equal to Alg.ALG_ML_KEM_768:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 4, 2)
+    End If
+    If algorithm is equal to Alg.ALG_ML_KEM_1024:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 4, 3)
+    End If
+    If algorithm is equal to Alg.ALG_ML_DSA_44:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 3, 17)
+    End If
+    If algorithm is equal to Alg.ALG_ML_DSA_65:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 3, 18)
+    End If
+    If algorithm is equal to Alg.ALG_ML_DSA_87:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 3, 19)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_128S:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 3, 20)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_128F:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 3, 21)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_192S:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 3, 22)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_192F:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 3, 23)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_256S:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 3, 24)
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_256F:
+        Return keypair_write_pq_oid(out_buffer, out_offset, 3, 25)
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Helper that emits an 11-byte DER OID under the NIST CSOR arc
+2.16.840.1.101.3.4.<family>.<param_set>. Used for ML-KEM (family=4),
+ML-DSA (family=3), and SLH-DSA (family=3).
+@End Reasoning
+
+@Implementation
+First arc 2*40+16 = 96 = 0x60. 840 base-128 -> 0x86 0x48. 1 -> 0x01.
+101 -> 0x65. 3 -> 0x03. 4 -> 0x04. family -> single byte (3 or 4).
+param_set is in 1..127 for all currently registered values, so it
+encodes as a single byte. Body length = 9 bytes; total DER = 11 bytes.
+@End Implementation
+
+@Performance_Hints
+O(1). 11 bytes written.
+@End Performance_Hints
+
+@Security_Scope
+Public OID metadata.
+@End Security_Scope
+Process called "keypair_write_pq_oid" takes out_buffer as Integer, out_offset as Integer, family as Integer, param_set as Integer returns Integer:
+    Memory.memory_set_byte(out_buffer, out_offset, 6)
+    Memory.memory_set_byte(out_buffer, out_offset plus 1, 9)
+    Memory.memory_set_byte(out_buffer, out_offset plus 2, 96)
+    Memory.memory_set_byte(out_buffer, out_offset plus 3, 134)
+    Memory.memory_set_byte(out_buffer, out_offset plus 4, 72)
+    Memory.memory_set_byte(out_buffer, out_offset plus 5, 1)
+    Memory.memory_set_byte(out_buffer, out_offset plus 6, 101)
+    Memory.memory_set_byte(out_buffer, out_offset plus 7, 3)
+    Memory.memory_set_byte(out_buffer, out_offset plus 8, 4)
+    Memory.memory_set_byte(out_buffer, out_offset plus 9, family)
+    Memory.memory_set_byte(out_buffer, out_offset plus 10, param_set)
+    Return 11
+End Process
+
+@Reasoning
+Helper that writes the rsaEncryption / id-RSASSA-PSS OID. The last arc
+differs between PKCS#1-v1.5 (1) and RSASSA-PSS (10).
+@End Reasoning
+
+@Implementation
+OID 1.2.840.113549.1.1.{1,10}:
+  First arc: 0x2A
+  840:       0x86 0x48
+  113549:    0x86 0xF7 0x0D
+  1, 1, last
+@End Implementation
+
+@Performance_Hints
+O(1). 9 bytes written.
+@End Performance_Hints
+
+@Security_Scope
+Public OID metadata.
+@End Security_Scope
+Process called "keypair_write_rsa_oid" takes out_buffer as Integer, out_offset as Integer, last_arc as Integer returns Integer:
+    Memory.memory_set_byte(out_buffer, out_offset, 6)
+    Memory.memory_set_byte(out_buffer, out_offset plus 1, 9)
+    Memory.memory_set_byte(out_buffer, out_offset plus 2, 42)
+    Memory.memory_set_byte(out_buffer, out_offset plus 3, 134)
+    Memory.memory_set_byte(out_buffer, out_offset plus 4, 72)
+    Memory.memory_set_byte(out_buffer, out_offset plus 5, 134)
+    Memory.memory_set_byte(out_buffer, out_offset plus 6, 247)
+    Memory.memory_set_byte(out_buffer, out_offset plus 7, 13)
+    Memory.memory_set_byte(out_buffer, out_offset plus 8, 1)
+    Memory.memory_set_byte(out_buffer, out_offset plus 9, 1)
+    Memory.memory_set_byte(out_buffer, out_offset plus 10, last_arc)
+    Return 11
+End Process
+
+Note: ============================================================================
+Note: SECTION 9: DER length helpers
+Note: ============================================================================
+
+@Reasoning
+DER length encoding rules (X.690 8.1.3):
+  - 0..127: single byte
+  - 128..255: 0x81 followed by length byte
+  - 256..65535: 0x82 followed by 2 BE bytes
+  - 65536..16777215: 0x83 followed by 3 BE bytes
+  - etc.
+This helper writes the length and returns the number of bytes consumed.
+@End Reasoning
+
+@Implementation
+Branch on the length value and write the appropriate form.
+@End Implementation
+
+@Performance_Hints
+O(1). At most 5 bytes written.
+@End Performance_Hints
+
+@Security_Scope
+Encoding metadata; non-secret.
+@End Security_Scope
+Process called "keypair_write_der_length" takes out_buffer as Integer, out_offset as Integer, length as Integer returns Integer:
+    If length is less than 128:
+        Memory.memory_set_byte(out_buffer, out_offset, length)
+        Return 1
+    End If
+    If length is less than 256:
+        Memory.memory_set_byte(out_buffer, out_offset, 129)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, length)
+        Return 2
+    End If
+    If length is less than 65536:
+        Memory.memory_set_byte(out_buffer, out_offset, 130)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, (length divided by 256) modulo by 256)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, length modulo by 256)
+        Return 3
+    End If
+    If length is less than 16777216:
+        Memory.memory_set_byte(out_buffer, out_offset, 131)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, (length divided by 65536) modulo by 256)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, (length divided by 256) modulo by 256)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, length modulo by 256)
+        Return 4
+    End If
+    Memory.memory_set_byte(out_buffer, out_offset, 132)
+    Memory.memory_set_byte(out_buffer, out_offset plus 1, (length divided by 16777216) modulo by 256)
+    Memory.memory_set_byte(out_buffer, out_offset plus 2, (length divided by 65536) modulo by 256)
+    Memory.memory_set_byte(out_buffer, out_offset plus 3, (length divided by 256) modulo by 256)
+    Memory.memory_set_byte(out_buffer, out_offset plus 4, length modulo by 256)
+    Return 5
+End Process
+
+@Reasoning
+Helper that returns the number of bytes a DER length encoding will
+consume without writing anything. Used for pre-allocation sizing.
+@End Reasoning
+
+@Implementation
+Mirrors keypair_write_der_length but returns the byte count.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret encoding metadata.
+@End Security_Scope
+Process called "keypair_der_length_bytes" takes length as Integer returns Integer:
+    If length is less than 128:
+        Return 1
+    End If
+    If length is less than 256:
+        Return 2
+    End If
+    If length is less than 65536:
+        Return 3
+    End If
+    If length is less than 16777216:
+        Return 4
+    End If
+    Return 5
+End Process
+
+Note: ============================================================================
+Note: SECTION 10: keypair_serialize_pkcs8 - PKCS#8 PrivateKeyInfo encoding
+Note: ============================================================================
+
+@Reasoning
+Encode a KeyPair's private half as a PKCS#8 PrivateKeyInfo DER blob per
+RFC 5958. The structure is:
+
+  SEQUENCE (tag 0x30) {
+    INTEGER 0                              -- version (3 bytes: 02 01 00)
+    SEQUENCE (AlgorithmIdentifier) {
+      OBJECT IDENTIFIER algorithm
+      -- parameters: NULL for RSA, absent for Ed25519/Ed448/X25519/X448,
+      --             namedCurve OID for ECDSA
+    }
+    OCTET STRING privateKey                -- algorithm-specific inner encoding
+  }
+
+For Ed25519/Ed448/X25519/X448 per RFC 8410, the privateKey OCTET STRING
+contains another OCTET STRING wrapping the raw scalar: an outer 0x04
+length-prefixed wrapping holds an inner 0x04 length-prefixed CurvePrivateKey.
+
+For RSA, the privateKey OCTET STRING holds the PKCS#1 RSAPrivateKey
+DER blob (RFC 8017 Appendix A.1.2).
+
+For ECDSA, the privateKey OCTET STRING holds the SEC 1 ECPrivateKey blob
+(RFC 5915).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Get the algorithm tag and private bytes from the keypair.
+  2. Compute the sizes of each inner element.
+  3. Build the SEQUENCE inside-out:
+     - inner_alg_seq: SEQUENCE { OID, optional params }
+     - private_octet: OCTET STRING { algorithm-specific encoding }
+     - outer_seq: SEQUENCE { 02 01 00, alg_seq, private_octet }
+  4. Allocate a single output buffer, write the outer SEQUENCE header
+     followed by the inner bytes.
+  5. Return the buffer pointer and stash the total length at the start.
+
+For v0.0.8.5, full PKCS#8 emission is implemented for the Ed25519/Ed448/
+X25519/X448 family (RFC 8410). ECDSA and RSA emission are explicit DER
+constructions using the SubjectPublicKeyInfo path for the public half.
+
+Output format: [4 BE total_len][... DER bytes ...]
+The caller dereferences out_buffer+4 for the DER bytes and reads the
+length from out_buffer[0..3] (big-endian int32).
+@End Implementation
+
+@Performance_Hints
+O(private_key_byte_length). One pass write.
+@End Performance_Hints
+
+@Security_Scope
+The DER blob holds the private key material. Caller is responsible for
+secure storage and zeroization after use.
+@End Security_Scope
+Process called "keypair_serialize_pkcs8" takes arena as Integer, kp as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If kp is equal to 0:
+        Return 0
+    End If
+    Let algorithm be KP.keypair_algorithm(kp)
+    Let sk be KP.keypair_private(kp)
+    If sk is equal to 0:
+        Return 0
+    End If
+    Let priv_bytes be SK.private_key_secret_bytes_internal(sk)
+    Let priv_len be SK.private_key_byte_length(sk)
+    If priv_bytes is equal to 0:
+        Return 0
+    End If
+
+    Note: RFC 8410 curve family: emit RFC 5958 form.
+    If algorithm is equal to Alg.ALG_ED25519:
+        Return keypair_serialize_pkcs8_curve_8410(arena, algorithm, priv_bytes, priv_len)
+    End If
+    If algorithm is equal to Alg.ALG_ED448:
+        Return keypair_serialize_pkcs8_curve_8410(arena, algorithm, priv_bytes, priv_len)
+    End If
+    If algorithm is equal to Alg.ALG_X25519:
+        Return keypair_serialize_pkcs8_curve_8410(arena, algorithm, priv_bytes, priv_len)
+    End If
+    If algorithm is equal to Alg.ALG_X448:
+        Return keypair_serialize_pkcs8_curve_8410(arena, algorithm, priv_bytes, priv_len)
+    End If
+
+    Note: ECDSA: build the RFC 5915 ECPrivateKey SEQUENCE inside the
+    Note: privateKey OCTET STRING. The public key is sourced from the
+    Note: KeyPair's PublicKey side.
+    If algorithm is equal to Alg.ALG_ECDSA_P256:
+        Return keypair_serialize_pkcs8_ecdsa(arena, algorithm, kp, priv_bytes, priv_len)
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P384:
+        Return keypair_serialize_pkcs8_ecdsa(arena, algorithm, kp, priv_bytes, priv_len)
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P521:
+        Return keypair_serialize_pkcs8_ecdsa(arena, algorithm, kp, priv_bytes, priv_len)
+    End If
+
+    Note: RSA: build the RFC 8017 RSAPrivateKey SEQUENCE inside the
+    Note: privateKey OCTET STRING.
+    If Alg.rsa_alg_modulus_bytes(algorithm) is not equal to 0:
+        Return keypair_serialize_pkcs8_rsa(arena, algorithm, sk)
+    End If
+
+    Note: PQ algorithms (ML-KEM, ML-DSA, SLH-DSA): PKCS#8 wrapping is
+    Note: not standardized at the same level as the classical families;
+    Note: emit the algorithm OID and a raw OCTET STRING of the key bytes.
+    Note: The pair round-trips through keypair_deserialize_pkcs8 for
+    Note: in-tree consumers via algorithm-driven dispatch.
+    Return keypair_serialize_pkcs8_pq(arena, algorithm, priv_bytes, priv_len)
+End Process
+
+@Reasoning
+Helper that emits the RFC 8410 PKCS#8 form for the curve-25519/448
+family. The inner OCTET STRING wraps another OCTET STRING (CurvePrivateKey)
+containing the raw scalar bytes. For Ed25519 the raw scalar is the 32-byte
+seed (NOT the 64-byte expanded form); we extract the first 32 bytes of
+the stored expanded key.
+@End Reasoning
+
+@Implementation
+Constructs:
+  SEQUENCE {
+    INTEGER 0
+    SEQUENCE { OID algorithm }                   -- no parameters
+    OCTET STRING {
+      OCTET STRING { raw_scalar_bytes }
+    }
+  }
+@End Implementation
+
+@Performance_Hints
+O(scalar_length). One pass.
+@End Performance_Hints
+
+@Security_Scope
+Carries the private scalar; caller wipes after use.
+@End Security_Scope
+Process called "keypair_serialize_pkcs8_curve_8410" takes arena as Integer, algorithm as Integer, priv_bytes as Integer, priv_len as Integer returns Integer:
+    Note: For Ed25519 the seed is the first 32 bytes of the 64-byte expansion.
+    Let scalar_len be priv_len
+    If algorithm is equal to Alg.ALG_ED25519:
+        Set scalar_len to 32
+    End If
+    If algorithm is equal to Alg.ALG_ED448:
+        Set scalar_len to 57
+    End If
+
+    Note: Inner CurvePrivateKey = OCTET STRING { scalar_len bytes }.
+    Let inner_octet_len be 1 plus keypair_der_length_bytes(scalar_len) plus scalar_len
+
+    Note: privateKey OCTET STRING wraps the inner_octet.
+    Let private_octet_content_len be inner_octet_len
+    Let private_octet_total be 1 plus keypair_der_length_bytes(private_octet_content_len) plus private_octet_content_len
+
+    Note: AlgorithmIdentifier SEQUENCE { OID } -- 5 bytes for the OID.
+    Let oid_total be 5
+    Let alg_seq_content_len be oid_total
+    Let alg_seq_total be 1 plus keypair_der_length_bytes(alg_seq_content_len) plus alg_seq_content_len
+
+    Note: version INTEGER 0 = 02 01 00.
+    Let version_total be 3
+
+    Let outer_content_len be version_total plus alg_seq_total plus private_octet_total
+    Let outer_header_len be 1 plus keypair_der_length_bytes(outer_content_len)
+    Let outer_total be outer_header_len plus outer_content_len
+
+    Note: Allocate buffer with 4-byte length prefix.
+    Let buf be Arena.arena_allocate(arena, 4 plus outer_total)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int32(buf, 0, outer_total)
+    Let off be 4
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, outer_content_len)
+
+    Note: version INTEGER 0.
+    Memory.memory_set_byte(buf, off, 2)
+    Memory.memory_set_byte(buf, off plus 1, 1)
+    Memory.memory_set_byte(buf, off plus 2, 0)
+    Set off to off plus 3
+
+    Note: AlgorithmIdentifier SEQUENCE.
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, alg_seq_content_len)
+    Set off to off plus keypair_write_oid(algorithm, buf, off)
+
+    Note: privateKey OCTET STRING.
+    Memory.memory_set_byte(buf, off, 4)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, private_octet_content_len)
+
+    Note: inner OCTET STRING with the raw scalar.
+    Memory.memory_set_byte(buf, off, 4)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, scalar_len)
+    Memory.memory_copy(buf plus off, priv_bytes, scalar_len)
+    Set off to off plus scalar_len
+
+    Return buf
+End Process
+
+@Reasoning
+Helper that writes the named-curve OID for the supplied ECDSA algorithm.
+Returns the number of bytes written; the curve OIDs are:
+  P-256: 1.2.840.10045.3.1.7  -> 06 08 2A 86 48 CE 3D 03 01 07 (10 bytes)
+  P-384: 1.3.132.0.34         -> 06 05 2B 81 04 00 22         (7 bytes)
+  P-521: 1.3.132.0.35         -> 06 05 2B 81 04 00 23         (7 bytes)
+@End Reasoning
+
+@Implementation
+Branch on algorithm tag and emit the canonical DER bytes for the
+namedCurve OID. Returns 0 for any non-ECDSA algorithm.
+@End Implementation
+
+@Performance_Hints
+O(1). At most 10 bytes written.
+@End Performance_Hints
+
+@Security_Scope
+Public OID metadata.
+@End Security_Scope
+Process called "keypair_write_named_curve_oid" takes algorithm as Integer, out_buffer as Integer, out_offset as Integer returns Integer:
+    If algorithm is equal to Alg.ALG_ECDSA_P256:
+        Memory.memory_set_byte(out_buffer, out_offset, 6)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, 8)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, 42)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, 134)
+        Memory.memory_set_byte(out_buffer, out_offset plus 4, 72)
+        Memory.memory_set_byte(out_buffer, out_offset plus 5, 206)
+        Memory.memory_set_byte(out_buffer, out_offset plus 6, 61)
+        Memory.memory_set_byte(out_buffer, out_offset plus 7, 3)
+        Memory.memory_set_byte(out_buffer, out_offset plus 8, 1)
+        Memory.memory_set_byte(out_buffer, out_offset plus 9, 7)
+        Return 10
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P384:
+        Memory.memory_set_byte(out_buffer, out_offset, 6)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, 5)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, 43)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, 129)
+        Memory.memory_set_byte(out_buffer, out_offset plus 4, 4)
+        Memory.memory_set_byte(out_buffer, out_offset plus 5, 0)
+        Memory.memory_set_byte(out_buffer, out_offset plus 6, 34)
+        Return 7
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P521:
+        Memory.memory_set_byte(out_buffer, out_offset, 6)
+        Memory.memory_set_byte(out_buffer, out_offset plus 1, 5)
+        Memory.memory_set_byte(out_buffer, out_offset plus 2, 43)
+        Memory.memory_set_byte(out_buffer, out_offset plus 3, 129)
+        Memory.memory_set_byte(out_buffer, out_offset plus 4, 4)
+        Memory.memory_set_byte(out_buffer, out_offset plus 5, 0)
+        Memory.memory_set_byte(out_buffer, out_offset plus 6, 35)
+        Return 7
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Helper that returns the named-curve OID byte count without writing.
+Used during pre-allocation sizing for the RFC 5915 ECPrivateKey SEQUENCE
+parameter field.
+@End Reasoning
+
+@Implementation
+Mirrors keypair_write_named_curve_oid. Returns 10 for P-256, 7 for
+P-384 and P-521, 0 otherwise.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret encoding metadata.
+@End Security_Scope
+Process called "keypair_named_curve_oid_bytes" takes algorithm as Integer returns Integer:
+    If algorithm is equal to Alg.ALG_ECDSA_P256:
+        Return 10
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P384:
+        Return 7
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P521:
+        Return 7
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Encode an unsigned big-endian byte sequence as an ASN.1 DER INTEGER. The
+DER rules require:
+  - Tag 0x02
+  - Length encoded per X.690 8.1.3
+  - Content with no leading zero bytes (canonical form) EXCEPT a single
+    leading 0x00 is prepended whenever the high bit of the first content
+    byte is set, so the INTEGER is unambiguously non-negative.
+
+Used by the RFC 5915 ECPrivateKey and RFC 8017 RSAPrivateKey encoders.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Find the first non-zero byte in src[0..src_len-1] to strip leading
+     zeros from the magnitude.
+  2. Decide whether a 0x00 prefix is needed (high bit of the first
+     non-zero byte is set, OR the magnitude is zero).
+  3. Write tag 0x02, the DER length, the optional prefix byte, then the
+     stripped content bytes.
+  4. Return total bytes written (tag + length-encoding + content).
+@End Implementation
+
+@Performance_Hints
+O(src_len) in the worst case (the leading-zero scan). At RSA-4096 scale
+this is at most 512 byte reads per component.
+@End Performance_Hints
+
+@Security_Scope
+Used on both public and private bigints. For private components the
+caller is responsible for secure handling of the output buffer.
+@End Security_Scope
+Process called "keypair_write_der_integer_unsigned" takes out_buffer as Integer, out_offset as Integer, src as Integer, src_len as Integer returns Integer:
+    Note: Find the index of the first non-zero byte (mag_start). If no
+    Note: byte is non-zero, the magnitude is zero.
+    Let mag_start be 0
+    Let mag_is_zero be 1
+    Let scan_index be 0
+    While scan_index is less than src_len:
+        If Memory.memory_get_byte(src, scan_index) is not equal to 0:
+            Set mag_start to scan_index
+            Set mag_is_zero to 0
+            Set scan_index to src_len
+        Otherwise:
+            Set scan_index to scan_index plus 1
+        End If
+    End While
+
+    Let content_len be 0
+    Let need_zero_prefix be 0
+    If mag_is_zero is equal to 1:
+        Note: Encode INTEGER 0 as one content byte 0x00.
+        Set content_len to 1
+        Set need_zero_prefix to 1
+    Otherwise:
+        Let stripped_len be src_len minus mag_start
+        Let first_byte be Memory.memory_get_byte(src, mag_start)
+        Let high_bit be first_byte divided by 128
+        If high_bit is equal to 1:
+            Set need_zero_prefix to 1
+            Set content_len to stripped_len plus 1
+        Otherwise:
+            Set content_len to stripped_len
+        End If
+    End If
+
+    Let header_len be 1 plus keypair_der_length_bytes(content_len)
+
+    Memory.memory_set_byte(out_buffer, out_offset, 2)
+    Let off be out_offset plus 1
+    Set off to off plus keypair_write_der_length(out_buffer, off, content_len)
+    If need_zero_prefix is equal to 1:
+        Memory.memory_set_byte(out_buffer, off, 0)
+        Set off to off plus 1
+    End If
+    If mag_is_zero is equal to 0:
+        Let copy_len be src_len minus mag_start
+        Memory.memory_copy(out_buffer plus off, src plus mag_start, copy_len)
+        Set off to off plus copy_len
+    End If
+    Return header_len plus content_len
+End Process
+
+@Reasoning
+Helper that returns the number of bytes a DER INTEGER encoding of an
+unsigned big-endian magnitude will consume without writing anything.
+Used during inside-out size computation of ECPrivateKey / RSAPrivateKey
+SEQUENCEs.
+@End Reasoning
+
+@Implementation
+Mirrors keypair_write_der_integer_unsigned: strips leading zeros,
+decides whether a 0x00 prefix byte is required, sums tag + length
+header + content.
+@End Implementation
+
+@Performance_Hints
+O(src_len) in the worst case.
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "keypair_der_integer_unsigned_bytes" takes src as Integer, src_len as Integer returns Integer:
+    Let mag_start be 0
+    Let mag_is_zero be 1
+    Let scan_index be 0
+    While scan_index is less than src_len:
+        If Memory.memory_get_byte(src, scan_index) is not equal to 0:
+            Set mag_start to scan_index
+            Set mag_is_zero to 0
+            Set scan_index to src_len
+        Otherwise:
+            Set scan_index to scan_index plus 1
+        End If
+    End While
+
+    Let content_len be 0
+    If mag_is_zero is equal to 1:
+        Set content_len to 1
+    Otherwise:
+        Let stripped_len be src_len minus mag_start
+        Let first_byte be Memory.memory_get_byte(src, mag_start)
+        Let high_bit be first_byte divided by 128
+        If high_bit is equal to 1:
+            Set content_len to stripped_len plus 1
+        Otherwise:
+            Set content_len to stripped_len
+        End If
+    End If
+
+    Return 1 plus keypair_der_length_bytes(content_len) plus content_len
+End Process
+
+@Reasoning
+Helper that materializes a bignum to a heap-of-arena byte buffer in
+canonical big-endian form (no leading zeros) and writes it as a DER
+INTEGER via keypair_write_der_integer_unsigned. The byte buffer size
+is computed from bigint_byte_length so the buffer fits the magnitude
+exactly. For the zero bigint, emits INTEGER 0 (a single 0x00 content
+byte).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Query bigint_byte_length(bn). Zero result means bn is zero.
+  2. Allocate buffer of that many bytes (or 1 byte for zero).
+  3. Call bigint_to_bytes_be to render bn into the buffer.
+  4. Forward to keypair_write_der_integer_unsigned.
+@End Implementation
+
+@Performance_Hints
+O(byte_length). One materialization + one copy into the output.
+@End Performance_Hints
+
+@Security_Scope
+Used for both public (n, e) and private (d, p, q, dp, dq, qinv)
+bigints. The arena-resident intermediate buffer should be wiped if
+private; the caller of keypair_serialize_pkcs8_rsa handles wiping
+through arena destruction.
+@End Security_Scope
+Process called "keypair_write_der_integer_bigint" takes arena as Integer, out_buffer as Integer, out_offset as Integer, bn as Integer returns Integer:
+    Let bn_len be BigInt.bigint_byte_length(bn)
+    If bn_len is equal to 0:
+        Note: INTEGER 0 - render as a single zero content byte.
+        Let zero_buf be Arena.arena_allocate(arena, 1)
+        If zero_buf is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(zero_buf, 0, 0)
+        Return keypair_write_der_integer_unsigned(out_buffer, out_offset, zero_buf, 1)
+    End If
+    Let mag_buf be Arena.arena_allocate(arena, bn_len)
+    If mag_buf is equal to 0:
+        Return 0
+    End If
+    BigInt.bigint_to_bytes_be(bn, mag_buf, bn_len)
+    Return keypair_write_der_integer_unsigned(out_buffer, out_offset, mag_buf, bn_len)
+End Process
+
+@Reasoning
+Helper that returns the byte count of the DER INTEGER encoding of a
+bignum. Used during inside-out size computation of RSAPrivateKey.
+@End Reasoning
+
+@Implementation
+Materializes bn into an arena byte buffer of bigint_byte_length(bn)
+bytes, then forwards to keypair_der_integer_unsigned_bytes. For zero
+bn, returns the byte count of INTEGER 0 (3: tag + length + zero).
+@End Implementation
+
+@Performance_Hints
+O(byte_length).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "keypair_der_integer_bigint_bytes" takes arena as Integer, bn as Integer returns Integer:
+    Let bn_len be BigInt.bigint_byte_length(bn)
+    If bn_len is equal to 0:
+        Let zero_buf be Arena.arena_allocate(arena, 1)
+        If zero_buf is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(zero_buf, 0, 0)
+        Return keypair_der_integer_unsigned_bytes(zero_buf, 1)
+    End If
+    Let mag_buf be Arena.arena_allocate(arena, bn_len)
+    If mag_buf is equal to 0:
+        Return 0
+    End If
+    BigInt.bigint_to_bytes_be(bn, mag_buf, bn_len)
+    Return keypair_der_integer_unsigned_bytes(mag_buf, bn_len)
+End Process
+
+@Reasoning
+Emit PKCS#8 PrivateKeyInfo for ECDSA private keys per RFC 5208 + RFC 5915.
+The privateKey OCTET STRING wraps an ECPrivateKey SEQUENCE:
+
+  ECPrivateKey ::= SEQUENCE {
+    version        INTEGER (1),
+    privateKey     OCTET STRING,                       -- raw scalar
+    parameters [0] EXPLICIT ECParameters OPTIONAL,     -- namedCurve OID
+    publicKey  [1] EXPLICIT BIT STRING OPTIONAL        -- uncompressed point
+  }
+
+The parameters field is also reflected in the outer AlgorithmIdentifier
+parameters (namedCurve OID), so a strict reader sees the curve twice;
+this is permitted by both RFC 5208 and RFC 5915 and matches how OpenSSL
+emits ECDSA PKCS#8.
+
+The publicKey BIT STRING content is `00 || uncompressed_point` where
+the uncompressed_point follows SEC 1: 0x04 || X || Y.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Source the raw scalar (priv_bytes) and the uncompressed public point
+     (from the KeyPair's PublicKey side).
+  2. Size each ECPrivateKey field inside-out:
+     - INTEGER 1               (3 bytes)
+     - OCTET STRING scalar     (1 + length-bytes + scalar_len)
+     - [0] EXPLICIT namedCurve (2 + curve_oid_len)
+     - [1] EXPLICIT BIT STRING (2 + 2 + pub_len) -- inner BIT STRING includes unused-bits prefix
+  3. Wrap in an OCTET STRING; wrap that plus version + AlgorithmIdentifier
+     in the outer SEQUENCE.
+  4. Allocate and emit.
+@End Implementation
+
+@Performance_Hints
+O(scalar_len + pub_len). One pass.
+@End Performance_Hints
+
+@Security_Scope
+The DER blob holds the private scalar; caller is responsible for secure
+storage and wipe.
+@End Security_Scope
+Process called "keypair_serialize_pkcs8_ecdsa" takes arena as Integer, algorithm as Integer, kp as Integer, priv_bytes as Integer, priv_len as Integer returns Integer:
+    Let pk be KP.keypair_public(kp)
+    If pk is equal to 0:
+        Return 0
+    End If
+    Let pub_bytes be PK.public_key_bytes(pk)
+    Let pub_len be PK.public_key_byte_length(pk)
+    If pub_bytes is equal to 0:
+        Return 0
+    End If
+    Let curve_oid_total be keypair_named_curve_oid_bytes(algorithm)
+    If curve_oid_total is equal to 0:
+        Return 0
+    End If
+
+    Note: ECPrivateKey SEQUENCE sizing (inside-out).
+    Let version_total be 3
+    Let scalar_octet_total be 1 plus keypair_der_length_bytes(priv_len) plus priv_len
+    Let curve_explicit_content_len be curve_oid_total
+    Let curve_explicit_total be 1 plus keypair_der_length_bytes(curve_explicit_content_len) plus curve_explicit_content_len
+    Let bitstring_content_len be 1 plus pub_len
+    Let bitstring_inner_total be 1 plus keypair_der_length_bytes(bitstring_content_len) plus bitstring_content_len
+    Let pub_explicit_total be 1 plus keypair_der_length_bytes(bitstring_inner_total) plus bitstring_inner_total
+
+    Let ec_seq_content_len be version_total plus scalar_octet_total plus curve_explicit_total plus pub_explicit_total
+    Let ec_seq_total be 1 plus keypair_der_length_bytes(ec_seq_content_len) plus ec_seq_content_len
+
+    Note: AlgorithmIdentifier SEQUENCE: id-ecPublicKey OID (9 bytes) + namedCurve OID.
+    Let alg_oid_total be 9
+    Let alg_extra be curve_oid_total
+    Let alg_seq_content_len be alg_oid_total plus alg_extra
+    Let alg_seq_total be 1 plus keypair_der_length_bytes(alg_seq_content_len) plus alg_seq_content_len
+
+    Note: Outer privateKey OCTET STRING wraps the ECPrivateKey SEQUENCE.
+    Let priv_octet_content_len be ec_seq_total
+    Let priv_octet_total be 1 plus keypair_der_length_bytes(priv_octet_content_len) plus priv_octet_content_len
+
+    Let pkcs8_version_total be 3
+    Let outer_content_len be pkcs8_version_total plus alg_seq_total plus priv_octet_total
+    Let outer_total be 1 plus keypair_der_length_bytes(outer_content_len) plus outer_content_len
+
+    Let buf be Arena.arena_allocate(arena, 4 plus outer_total)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int32(buf, 0, outer_total)
+    Let off be 4
+
+    Note: Outer SEQUENCE.
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, outer_content_len)
+
+    Note: version INTEGER 0.
+    Memory.memory_set_byte(buf, off, 2)
+    Memory.memory_set_byte(buf, off plus 1, 1)
+    Memory.memory_set_byte(buf, off plus 2, 0)
+    Set off to off plus 3
+
+    Note: AlgorithmIdentifier SEQUENCE.
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, alg_seq_content_len)
+    Set off to off plus keypair_write_oid(algorithm, buf, off)
+    Set off to off plus keypair_write_named_curve_oid(algorithm, buf, off)
+
+    Note: privateKey OCTET STRING.
+    Memory.memory_set_byte(buf, off, 4)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, priv_octet_content_len)
+
+    Note: ECPrivateKey SEQUENCE.
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, ec_seq_content_len)
+
+    Note:   version INTEGER 1.
+    Memory.memory_set_byte(buf, off, 2)
+    Memory.memory_set_byte(buf, off plus 1, 1)
+    Memory.memory_set_byte(buf, off plus 2, 1)
+    Set off to off plus 3
+
+    Note:   privateKey OCTET STRING - raw scalar.
+    Memory.memory_set_byte(buf, off, 4)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, priv_len)
+    Memory.memory_copy(buf plus off, priv_bytes, priv_len)
+    Set off to off plus priv_len
+
+    Note:   [0] EXPLICIT namedCurve OID.
+    Memory.memory_set_byte(buf, off, 160)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, curve_explicit_content_len)
+    Set off to off plus keypair_write_named_curve_oid(algorithm, buf, off)
+
+    Note:   [1] EXPLICIT BIT STRING publicKey.
+    Memory.memory_set_byte(buf, off, 161)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, bitstring_inner_total)
+    Memory.memory_set_byte(buf, off, 3)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, bitstring_content_len)
+    Memory.memory_set_byte(buf, off, 0)
+    Set off to off plus 1
+    Memory.memory_copy(buf plus off, pub_bytes, pub_len)
+    Set off to off plus pub_len
+
+    Return buf
+End Process
+
+@Reasoning
+Emit PKCS#8 PrivateKeyInfo for RSA private keys per RFC 5208 + RFC 8017.
+The privateKey OCTET STRING wraps a PKCS#1 RSAPrivateKey SEQUENCE:
+
+  RSAPrivateKey ::= SEQUENCE {
+    version           INTEGER (0),
+    modulus           INTEGER (n),
+    publicExponent    INTEGER (e),
+    privateExponent   INTEGER (d),
+    prime1            INTEGER (p),
+    prime2            INTEGER (q),
+    exponent1         INTEGER (dp = d mod (p - 1)),
+    exponent2         INTEGER (dq = d mod (q - 1)),
+    coefficient       INTEGER (qinv = q^(-1) mod p)
+    -- otherPrimeInfos OPTIONAL, omitted for two-prime RSA
+  }
+
+The bignums are extracted from the rsa_private_key holder via the
+rsa_private_get_* accessors and materialized as canonical big-endian
+INTEGERs (no leading zeros, with a 0x00 prefix when the high bit is
+set to preserve non-negative semantics).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Read the rsa_private_key holder pointer from the carried private
+     bytes (the in-tree pack layout stores it at offset 28).
+  2. Size each INTEGER inside-out via keypair_der_integer_bigint_bytes.
+  3. Wrap n..qinv into the inner RSAPrivateKey SEQUENCE.
+  4. Wrap that SEQUENCE in an OCTET STRING.
+  5. Wrap version + AlgorithmIdentifier(rsaEncryption, NULL) + OCTET
+     STRING in the outer PKCS#8 SEQUENCE.
+@End Implementation
+
+@Performance_Hints
+O(modulus_bytes). Eight bigint materializations + one final copy.
+@End Performance_Hints
+
+@Security_Scope
+The DER blob carries all CRT secrets; caller is responsible for secure
+storage and wipe.
+@End Security_Scope
+Process called "keypair_serialize_pkcs8_rsa" takes arena as Integer, algorithm as Integer, sk as Integer returns Integer:
+    Let priv_bytes be SK.private_key_secret_bytes_internal(sk)
+    If priv_bytes is equal to 0:
+        Return 0
+    End If
+    Let priv_holder be Memory.memory_get_int64(priv_bytes, 28)
+    If priv_holder is equal to 0:
+        Return 0
+    End If
+
+    Let bn_n be Rsa.rsa_private_get_n(priv_holder)
+    Let bn_e be Rsa.rsa_private_get_e(priv_holder)
+    Let bn_d be Rsa.rsa_private_get_d(priv_holder)
+    Let bn_p be Rsa.rsa_private_get_p(priv_holder)
+    Let bn_q be Rsa.rsa_private_get_q(priv_holder)
+    Let bn_dp be Rsa.rsa_private_get_dp(priv_holder)
+    Let bn_dq be Rsa.rsa_private_get_dq(priv_holder)
+    Let bn_qinv be Rsa.rsa_private_get_qinv(priv_holder)
+    If bn_n is equal to 0:
+        Return 0
+    End If
+    If bn_e is equal to 0:
+        Return 0
+    End If
+    If bn_d is equal to 0:
+        Return 0
+    End If
+    If bn_p is equal to 0:
+        Return 0
+    End If
+    If bn_q is equal to 0:
+        Return 0
+    End If
+    If bn_dp is equal to 0:
+        Return 0
+    End If
+    If bn_dq is equal to 0:
+        Return 0
+    End If
+    If bn_qinv is equal to 0:
+        Return 0
+    End If
+
+    Let int_version_total be 3
+    Let int_n_total be keypair_der_integer_bigint_bytes(arena, bn_n)
+    Let int_e_total be keypair_der_integer_bigint_bytes(arena, bn_e)
+    Let int_d_total be keypair_der_integer_bigint_bytes(arena, bn_d)
+    Let int_p_total be keypair_der_integer_bigint_bytes(arena, bn_p)
+    Let int_q_total be keypair_der_integer_bigint_bytes(arena, bn_q)
+    Let int_dp_total be keypair_der_integer_bigint_bytes(arena, bn_dp)
+    Let int_dq_total be keypair_der_integer_bigint_bytes(arena, bn_dq)
+    Let int_qinv_total be keypair_der_integer_bigint_bytes(arena, bn_qinv)
+    If int_n_total is equal to 0:
+        Return 0
+    End If
+
+    Let rsapriv_content_len be int_version_total plus int_n_total plus int_e_total plus int_d_total plus int_p_total plus int_q_total plus int_dp_total plus int_dq_total plus int_qinv_total
+    Let rsapriv_seq_total be 1 plus keypair_der_length_bytes(rsapriv_content_len) plus rsapriv_content_len
+
+    Note: AlgorithmIdentifier SEQUENCE: rsaEncryption OID (11 bytes) + NULL (2 bytes).
+    Let alg_seq_content_len be 11 plus 2
+    Let alg_seq_total be 1 plus keypair_der_length_bytes(alg_seq_content_len) plus alg_seq_content_len
+
+    Let priv_octet_content_len be rsapriv_seq_total
+    Let priv_octet_total be 1 plus keypair_der_length_bytes(priv_octet_content_len) plus priv_octet_content_len
+
+    Let pkcs8_version_total be 3
+    Let outer_content_len be pkcs8_version_total plus alg_seq_total plus priv_octet_total
+    Let outer_total be 1 plus keypair_der_length_bytes(outer_content_len) plus outer_content_len
+
+    Let buf be Arena.arena_allocate(arena, 4 plus outer_total)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int32(buf, 0, outer_total)
+    Let off be 4
+
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, outer_content_len)
+
+    Memory.memory_set_byte(buf, off, 2)
+    Memory.memory_set_byte(buf, off plus 1, 1)
+    Memory.memory_set_byte(buf, off plus 2, 0)
+    Set off to off plus 3
+
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, alg_seq_content_len)
+    Set off to off plus keypair_write_oid(algorithm, buf, off)
+    Note: NULL parameters (05 00).
+    Memory.memory_set_byte(buf, off, 5)
+    Memory.memory_set_byte(buf, off plus 1, 0)
+    Set off to off plus 2
+
+    Note: privateKey OCTET STRING.
+    Memory.memory_set_byte(buf, off, 4)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, priv_octet_content_len)
+
+    Note: RSAPrivateKey SEQUENCE.
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, rsapriv_content_len)
+
+    Note: version INTEGER 0.
+    Memory.memory_set_byte(buf, off, 2)
+    Memory.memory_set_byte(buf, off plus 1, 1)
+    Memory.memory_set_byte(buf, off plus 2, 0)
+    Set off to off plus 3
+
+    Set off to off plus keypair_write_der_integer_bigint(arena, buf, off, bn_n)
+    Set off to off plus keypair_write_der_integer_bigint(arena, buf, off, bn_e)
+    Set off to off plus keypair_write_der_integer_bigint(arena, buf, off, bn_d)
+    Set off to off plus keypair_write_der_integer_bigint(arena, buf, off, bn_p)
+    Set off to off plus keypair_write_der_integer_bigint(arena, buf, off, bn_q)
+    Set off to off plus keypair_write_der_integer_bigint(arena, buf, off, bn_dp)
+    Set off to off plus keypair_write_der_integer_bigint(arena, buf, off, bn_dq)
+    Set off to off plus keypair_write_der_integer_bigint(arena, buf, off, bn_qinv)
+
+    Return buf
+End Process
+
+@Reasoning
+Emit PKCS#8 PrivateKeyInfo for ML-KEM / ML-DSA / SLH-DSA private keys.
+NIST FIPS 203/204/205 specify the raw key byte layouts; the PKCS#8
+wrapping convention used here follows IETF draft-ietf-lamps-cms-kyber
+and draft-ietf-lamps-dilithium-certificates: the OCTET STRING wraps the
+raw decapsulation-key / signing-key bytes directly with no inner
+SEQUENCE.
+
+OID assignment for these algorithms is still being finalized in
+draft-ietf-lamps-pq-composite-sigs; this emitter uses the FIPS-aligned
+OIDs registered in NIST's CSOR (Computer Security Objects Register).
+@End Reasoning
+
+@Implementation
+Constructs:
+  SEQUENCE {
+    INTEGER 0
+    SEQUENCE { OID algorithm }
+    OCTET STRING raw_private_key_bytes
+  }
+
+The OCTET STRING content is the raw decapsulation-key bytes (ML-KEM) or
+the raw signing-key bytes (ML-DSA / SLH-DSA) as produced by the in-tree
+keygen routines.
+@End Implementation
+
+@Performance_Hints
+O(priv_len). One pass.
+@End Performance_Hints
+
+@Security_Scope
+Private bytes; wipe after use.
+@End Security_Scope
+Process called "keypair_serialize_pkcs8_pq" takes arena as Integer, algorithm as Integer, priv_bytes as Integer, priv_len as Integer returns Integer:
+    Let oid_total be keypair_oid_byte_count(algorithm)
+    If oid_total is equal to 0:
+        Return 0
+    End If
+
+    Let alg_seq_content_len be oid_total
+    Let alg_seq_total be 1 plus keypair_der_length_bytes(alg_seq_content_len) plus alg_seq_content_len
+
+    Let priv_octet_content_len be priv_len
+    Let priv_octet_total be 1 plus keypair_der_length_bytes(priv_octet_content_len) plus priv_octet_content_len
+
+    Let version_total be 3
+    Let outer_content_len be version_total plus alg_seq_total plus priv_octet_total
+    Let outer_total be 1 plus keypair_der_length_bytes(outer_content_len) plus outer_content_len
+
+    Let buf be Arena.arena_allocate(arena, 4 plus outer_total)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int32(buf, 0, outer_total)
+    Let off be 4
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, outer_content_len)
+
+    Memory.memory_set_byte(buf, off, 2)
+    Memory.memory_set_byte(buf, off plus 1, 1)
+    Memory.memory_set_byte(buf, off plus 2, 0)
+    Set off to off plus 3
+
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, alg_seq_content_len)
+    Set off to off plus keypair_write_oid(algorithm, buf, off)
+
+    Memory.memory_set_byte(buf, off, 4)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, priv_octet_content_len)
+    Memory.memory_copy(buf plus off, priv_bytes, priv_len)
+    Set off to off plus priv_len
+
+    Return buf
+End Process
+
+@Reasoning
+Helper returning the DER byte count of the AlgorithmIdentifier OID for
+the supplied algorithm. Used for sizing the PQ PKCS#8 emission and the
+SPKI emission, mirroring the bytes that keypair_write_oid actually
+emits for each algorithm.
+@End Reasoning
+
+@Implementation
+Direct table: 5 bytes for the RFC 8410 curves (Ed25519/Ed448/X25519/
+X448), 9 bytes for ECDSA-P256/P384/P521, 11 bytes for RSA (both PKCS#1
+v1.5 and RSASSA-PSS share the 11-byte OID encoding because the trailing
+arc difference is one byte), 11 bytes for every NIST CSOR-registered
+PQ OID.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "keypair_oid_byte_count" takes algorithm as Integer returns Integer:
+    Note: Direct table lookup of DER OID byte counts. Classical families
+    Note: have published well-known OIDs whose byte counts are fixed by
+    Note: the OID structure (number of arcs and arc magnitudes). PQ
+    Note: algorithms use NIST CSOR-registered OIDs in the 2.16.840.1.101
+    Note: arc family, each encoding to exactly 11 DER bytes.
+    If algorithm is equal to Alg.ALG_ED25519:
+        Return 5
+    End If
+    If algorithm is equal to Alg.ALG_ED448:
+        Return 5
+    End If
+    If algorithm is equal to Alg.ALG_X25519:
+        Return 5
+    End If
+    If algorithm is equal to Alg.ALG_X448:
+        Return 5
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P256:
+        Return 9
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P384:
+        Return 9
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P521:
+        Return 9
+    End If
+    If Alg.rsa_alg_modulus_bytes(algorithm) is not equal to 0:
+        Return 11
+    End If
+    Note: PQ OIDs registered with NIST CSOR per FIPS 203/204/205:
+    Note:   ML-KEM-512  : 2.16.840.1.101.3.4.4.1  -> 11-byte DER (06 09 60 86 48 01 65 03 04 04 01)
+    Note:   ML-KEM-768  : 2.16.840.1.101.3.4.4.2  -> 11 bytes
+    Note:   ML-KEM-1024 : 2.16.840.1.101.3.4.4.3  -> 11 bytes
+    Note:   ML-DSA-44   : 2.16.840.1.101.3.4.3.17 -> 11 bytes
+    Note:   ML-DSA-65   : 2.16.840.1.101.3.4.3.18 -> 11 bytes
+    Note:   ML-DSA-87   : 2.16.840.1.101.3.4.3.19 -> 11 bytes
+    Note:   SLH-DSA-SHA2-128s : 2.16.840.1.101.3.4.3.20 -> 11 bytes
+    Note:   SLH-DSA-SHA2-128f : 2.16.840.1.101.3.4.3.21 -> 11 bytes
+    Note:   SLH-DSA-SHA2-192s : 2.16.840.1.101.3.4.3.22 -> 11 bytes
+    Note:   SLH-DSA-SHA2-192f : 2.16.840.1.101.3.4.3.23 -> 11 bytes
+    Note:   SLH-DSA-SHA2-256s : 2.16.840.1.101.3.4.3.24 -> 11 bytes
+    Note:   SLH-DSA-SHA2-256f : 2.16.840.1.101.3.4.3.25 -> 11 bytes
+    If algorithm is equal to Alg.ALG_ML_KEM_512:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_ML_KEM_768:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_ML_KEM_1024:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_ML_DSA_44:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_ML_DSA_65:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_ML_DSA_87:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_128S:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_128F:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_192S:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_192F:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_256S:
+        Return 11
+    End If
+    If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_256F:
+        Return 11
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 11: keypair_deserialize_pkcs8 - PKCS#8 PrivateKeyInfo decoding
+Note: ============================================================================
+
+@Reasoning
+Parse a PKCS#8 PrivateKeyInfo DER blob and reconstruct the KeyPair. The
+decoder uses asn1_der.runa's TLV parser. We extract:
+  - The version (must be 0).
+  - The algorithm OID (matched against the table to recover the algorithm tag).
+  - The privateKey OCTET STRING contents.
+For RFC 8410 algorithms (Ed25519/Ed448/X25519/X448) the inner OCTET STRING
+wraps the raw scalar; we unwrap one extra layer.
+
+The public key half of the returned KeyPair is derived from the recovered
+private key by re-running the algorithm's public derivation (scalar mult
+basepoint for Ed25519/Ed448/X25519/X448, or by storing an empty public-
+key handle for RSA/ECDSA when the DER blob does not carry it).
+@End Reasoning
+
+@Implementation
+The decoder is OID-driven: we recognize the 4 RFC-8410 curve OIDs by
+direct byte match against the known OID body bytes inside the DER blob.
+
+The full asn1_der parser tree could be used, but for the curve family
+this matching is mechanical and avoids the asn1_iter overhead. The
+RSA/ECDSA decode path uses the asn1_der parser to walk into the
+AlgorithmIdentifier and pull the OID TLV.
+@End Implementation
+
+@Performance_Hints
+O(blob_length). Single linear scan plus one keygen-from-seed for the
+curve-family case.
+@End Performance_Hints
+
+@Security_Scope
+The DER blob is untrusted input. Length-bounded buffer access is
+maintained throughout; out-of-bounds reads return 0.
+@End Security_Scope
+Process called "keypair_deserialize_pkcs8" takes arena as Integer, der_bytes as Integer, der_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If der_bytes is equal to 0:
+        Return 0
+    End If
+    If der_length is less than 16:
+        Return 0
+    End If
+    Note: Must start with SEQUENCE tag 0x30.
+    Let tag0 be Memory.memory_get_byte(der_bytes, 0)
+    If tag0 is not equal to 48:
+        Return 0
+    End If
+
+    Note: Walk past the outer length encoding to the version INTEGER.
+    Let off be 1
+    Let len_first be Memory.memory_get_byte(der_bytes, off)
+    Set off to off plus 1
+    If len_first is greater than 127:
+        Let extra be len_first minus 128
+        If extra is greater than 4:
+            Return 0
+        End If
+        Set off to off plus extra
+    End If
+
+    Note: Verify version INTEGER 0 (02 01 00).
+    If Memory.memory_get_byte(der_bytes, off) is not equal to 2:
+        Return 0
+    End If
+    If Memory.memory_get_byte(der_bytes, off plus 1) is not equal to 1:
+        Return 0
+    End If
+    If Memory.memory_get_byte(der_bytes, off plus 2) is not equal to 0:
+        Return 0
+    End If
+    Set off to off plus 3
+
+    Note: AlgorithmIdentifier SEQUENCE.
+    If Memory.memory_get_byte(der_bytes, off) is not equal to 48:
+        Return 0
+    End If
+    Set off to off plus 1
+    Let alg_len_first be Memory.memory_get_byte(der_bytes, off)
+    Set off to off plus 1
+    Let alg_content_len be alg_len_first
+    If alg_len_first is greater than 127:
+        Let alg_extra be alg_len_first minus 128
+        If alg_extra is equal to 1:
+            Set alg_content_len to Memory.memory_get_byte(der_bytes, off)
+            Set off to off plus 1
+        End If
+        If alg_extra is equal to 2:
+            Set alg_content_len to (Memory.memory_get_byte(der_bytes, off) multiplied by 256) plus Memory.memory_get_byte(der_bytes, off plus 1)
+            Set off to off plus 2
+        End If
+    End If
+
+    Note: OID inside AlgorithmIdentifier.
+    Let alg_end be off plus alg_content_len
+    If Memory.memory_get_byte(der_bytes, off) is not equal to 6:
+        Return 0
+    End If
+    Let oid_len be Memory.memory_get_byte(der_bytes, off plus 1)
+    Let oid_body_off be off plus 2
+
+    Let algorithm_tag be 0
+    Note: RFC 8410 OIDs (3-byte body 2B 65 70/71/6E/6F).
+    If oid_len is equal to 3:
+        Let b0 be Memory.memory_get_byte(der_bytes, oid_body_off)
+        Let b1 be Memory.memory_get_byte(der_bytes, oid_body_off plus 1)
+        Let b2 be Memory.memory_get_byte(der_bytes, oid_body_off plus 2)
+        If b0 is equal to 43:
+            If b1 is equal to 101:
+                If b2 is equal to 112:
+                    Set algorithm_tag to Alg.ALG_ED25519
+                End If
+                If b2 is equal to 113:
+                    Set algorithm_tag to Alg.ALG_ED448
+                End If
+                If b2 is equal to 110:
+                    Set algorithm_tag to Alg.ALG_X25519
+                End If
+                If b2 is equal to 111:
+                    Set algorithm_tag to Alg.ALG_X448
+                End If
+            End If
+        End If
+    End If
+
+    Note: NIST CSOR PQ OIDs (9-byte body 60 86 48 01 65 03 04 <family> <param>).
+    If oid_len is equal to 9:
+        Let p0 be Memory.memory_get_byte(der_bytes, oid_body_off)
+        Let p1 be Memory.memory_get_byte(der_bytes, oid_body_off plus 1)
+        Let p2 be Memory.memory_get_byte(der_bytes, oid_body_off plus 2)
+        Let p3 be Memory.memory_get_byte(der_bytes, oid_body_off plus 3)
+        Let p4 be Memory.memory_get_byte(der_bytes, oid_body_off plus 4)
+        Let p5 be Memory.memory_get_byte(der_bytes, oid_body_off plus 5)
+        Let p6 be Memory.memory_get_byte(der_bytes, oid_body_off plus 6)
+        Let pf be Memory.memory_get_byte(der_bytes, oid_body_off plus 7)
+        Let pp be Memory.memory_get_byte(der_bytes, oid_body_off plus 8)
+        If p0 is equal to 96:
+            If p1 is equal to 134:
+                If p2 is equal to 72:
+                    If p3 is equal to 1:
+                        If p4 is equal to 101:
+                            If p5 is equal to 3:
+                                If p6 is equal to 4:
+                                    If pf is equal to 4:
+                                        Note: ML-KEM family.
+                                        If pp is equal to 1:
+                                            Set algorithm_tag to Alg.ALG_ML_KEM_512
+                                        End If
+                                        If pp is equal to 2:
+                                            Set algorithm_tag to Alg.ALG_ML_KEM_768
+                                        End If
+                                        If pp is equal to 3:
+                                            Set algorithm_tag to Alg.ALG_ML_KEM_1024
+                                        End If
+                                    End If
+                                    If pf is equal to 3:
+                                        Note: ML-DSA and SLH-DSA families.
+                                        If pp is equal to 17:
+                                            Set algorithm_tag to Alg.ALG_ML_DSA_44
+                                        End If
+                                        If pp is equal to 18:
+                                            Set algorithm_tag to Alg.ALG_ML_DSA_65
+                                        End If
+                                        If pp is equal to 19:
+                                            Set algorithm_tag to Alg.ALG_ML_DSA_87
+                                        End If
+                                        If pp is equal to 20:
+                                            Set algorithm_tag to Alg.ALG_SLH_DSA_SHA2_128S
+                                        End If
+                                        If pp is equal to 21:
+                                            Set algorithm_tag to Alg.ALG_SLH_DSA_SHA2_128F
+                                        End If
+                                        If pp is equal to 22:
+                                            Set algorithm_tag to Alg.ALG_SLH_DSA_SHA2_192S
+                                        End If
+                                        If pp is equal to 23:
+                                            Set algorithm_tag to Alg.ALG_SLH_DSA_SHA2_192F
+                                        End If
+                                        If pp is equal to 24:
+                                            Set algorithm_tag to Alg.ALG_SLH_DSA_SHA2_256S
+                                        End If
+                                        If pp is equal to 25:
+                                            Set algorithm_tag to Alg.ALG_SLH_DSA_SHA2_256F
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Set off to alg_end
+
+    Note: privateKey OCTET STRING.
+    If Memory.memory_get_byte(der_bytes, off) is not equal to 4:
+        Return 0
+    End If
+    Set off to off plus 1
+    Let priv_first be Memory.memory_get_byte(der_bytes, off)
+    Set off to off plus 1
+    Let priv_content_len be priv_first
+    If priv_first is greater than 127:
+        Let priv_extra be priv_first minus 128
+        If priv_extra is equal to 1:
+            Set priv_content_len to Memory.memory_get_byte(der_bytes, off)
+            Set off to off plus 1
+        End If
+        If priv_extra is equal to 2:
+            Set priv_content_len to (Memory.memory_get_byte(der_bytes, off) multiplied by 256) plus Memory.memory_get_byte(der_bytes, off plus 1)
+            Set off to off plus 2
+        End If
+    End If
+
+    Note: For RFC 8410 algorithms unwrap the inner OCTET STRING that
+    Note: holds the raw scalar.
+    If algorithm_tag is equal to Alg.ALG_ED25519:
+        Return keypair_unwrap_rfc8410(arena, der_bytes, off, algorithm_tag)
+    End If
+    If algorithm_tag is equal to Alg.ALG_ED448:
+        Return keypair_unwrap_rfc8410(arena, der_bytes, off, algorithm_tag)
+    End If
+    If algorithm_tag is equal to Alg.ALG_X25519:
+        Return keypair_unwrap_rfc8410(arena, der_bytes, off, algorithm_tag)
+    End If
+    If algorithm_tag is equal to Alg.ALG_X448:
+        Return keypair_unwrap_rfc8410(arena, der_bytes, off, algorithm_tag)
+    End If
+
+    Note: PQ algorithms - reconstitute the keypair by reading the raw
+    Note: private-key bytes from the OCTET STRING content and recovering
+    Note: the public-key bytes from the algorithm-specific layout.
+    If algorithm_tag is equal to Alg.ALG_ML_KEM_512:
+        Return keypair_unwrap_pq_ml_kem(arena, der_bytes, off, priv_content_len, algorithm_tag, 800, 1632, 768)
+    End If
+    If algorithm_tag is equal to Alg.ALG_ML_KEM_768:
+        Return keypair_unwrap_pq_ml_kem(arena, der_bytes, off, priv_content_len, algorithm_tag, 1184, 2400, 1152)
+    End If
+    If algorithm_tag is equal to Alg.ALG_ML_KEM_1024:
+        Return keypair_unwrap_pq_ml_kem(arena, der_bytes, off, priv_content_len, algorithm_tag, 1568, 3168, 1536)
+    End If
+    If algorithm_tag is equal to Alg.ALG_ML_DSA_44:
+        Return keypair_unwrap_pq_ml_dsa(arena, der_bytes, off, priv_content_len, algorithm_tag, 1312, 2560)
+    End If
+    If algorithm_tag is equal to Alg.ALG_ML_DSA_65:
+        Return keypair_unwrap_pq_ml_dsa(arena, der_bytes, off, priv_content_len, algorithm_tag, 1952, 4032)
+    End If
+    If algorithm_tag is equal to Alg.ALG_ML_DSA_87:
+        Return keypair_unwrap_pq_ml_dsa(arena, der_bytes, off, priv_content_len, algorithm_tag, 2592, 4896)
+    End If
+    If algorithm_tag is equal to Alg.ALG_SLH_DSA_SHA2_128S:
+        Return keypair_unwrap_pq_slh_dsa(arena, der_bytes, off, priv_content_len, algorithm_tag, 16, 32, 64)
+    End If
+    If algorithm_tag is equal to Alg.ALG_SLH_DSA_SHA2_128F:
+        Return keypair_unwrap_pq_slh_dsa(arena, der_bytes, off, priv_content_len, algorithm_tag, 16, 32, 64)
+    End If
+    If algorithm_tag is equal to Alg.ALG_SLH_DSA_SHA2_192S:
+        Return keypair_unwrap_pq_slh_dsa(arena, der_bytes, off, priv_content_len, algorithm_tag, 24, 48, 96)
+    End If
+    If algorithm_tag is equal to Alg.ALG_SLH_DSA_SHA2_192F:
+        Return keypair_unwrap_pq_slh_dsa(arena, der_bytes, off, priv_content_len, algorithm_tag, 24, 48, 96)
+    End If
+    If algorithm_tag is equal to Alg.ALG_SLH_DSA_SHA2_256S:
+        Return keypair_unwrap_pq_slh_dsa(arena, der_bytes, off, priv_content_len, algorithm_tag, 32, 64, 128)
+    End If
+    If algorithm_tag is equal to Alg.ALG_SLH_DSA_SHA2_256F:
+        Return keypair_unwrap_pq_slh_dsa(arena, der_bytes, off, priv_content_len, algorithm_tag, 32, 64, 128)
+    End If
+
+    Note: ECDSA / RSA inner-SEQUENCE parsing routes through the algorithm-
+    Note: aware decoder paths in signature.runa, which accept PKCS#8 blobs
+    Note: produced by keypair_serialize_pkcs8_ecdsa and
+    Note: keypair_serialize_pkcs8_rsa directly. This generic walker returns
+    Note: 0 for those families, signaling the caller to dispatch to the
+    Note: algorithm-aware path.
+    Return 0
+End Process
+
+@Reasoning
+Reconstitute an ML-KEM keypair from a PKCS#8 OCTET STRING content. The
+OCTET STRING holds the raw decapsulation key (dk) bytes per FIPS 203
+section 6.2:
+  dk = [ dk_PKE | ek_PKE | H(ek_PKE) | z ]
+with sizes 384*k, 384*k + 32, 32, 32. The encapsulation key ek_PKE
+appears at offset dk_pke_len = 384*k inside dk. We extract it and use
+it as the public key.
+@End Reasoning
+
+@Implementation
+Walks past the OCTET STRING tag/length, copies the raw dk bytes into
+the private-key buffer, copies the embedded ek bytes into the public-
+key buffer, wraps both with PK.public_key_create and SK.private_key_create.
+@End Implementation
+
+@Performance_Hints
+O(dk_size). Two memcopies.
+@End Performance_Hints
+
+@Security_Scope
+The dk bytes are SECRET. After PK/SK wrapping the source buffer can be
+treated as transient arena memory.
+@End Security_Scope
+Process called "keypair_unwrap_pq_ml_kem" takes arena as Integer, buffer as Integer, content_off as Integer, content_len as Integer, algorithm as Integer, pk_bytes as Integer, sk_bytes as Integer, dk_pke_offset as Integer returns Integer:
+    If content_len is not equal to sk_bytes:
+        Return 0
+    End If
+    Let priv_ptr be buffer plus content_off
+    Note: Extract embedded ek from dk: ek starts at offset dk_pke_offset
+    Note: (which is 384*k) within dk, length = 384*k + 32 = pk_bytes.
+    Let ek_ptr be priv_ptr plus dk_pke_offset
+
+    Let sk_holder be SK.private_key_create(arena, algorithm, priv_ptr, sk_bytes)
+    If sk_holder is equal to 0:
+        Return 0
+    End If
+    Let pk_holder be PK.public_key_create(arena, algorithm, ek_ptr, pk_bytes)
+    If pk_holder is equal to 0:
+        Return 0
+    End If
+    Return KP.keypair_from_keys(arena, sk_holder, pk_holder)
+End Process
+
+@Reasoning
+Reconstitute an ML-DSA keypair from a PKCS#8 OCTET STRING content. The
+OCTET STRING holds the raw signing key (sk) bytes per FIPS 204 section
+6.2. The first 32 bytes of sk are rho, which is also the prefix of pk
+(pk = rho || t1_packed). Recovering t1 from sk requires running the
+keygen ExpandA + s1, s2 derivation, which we do via a re-keygen from
+the embedded seed-equivalent.
+
+For wire-format round-trips that only need the algorithm tag and the
+sk bytes preserved, we wrap sk as-is and synthesize a pk holder
+carrying the rho prefix padded with zeros. Callers that need a usable
+public key for verify operations are expected to use the separate
+keypair_from_spki path, where the SPKI carries the canonical t1_packed
+bytes.
+@End Reasoning
+
+@Implementation
+Copies sk bytes into the private-key holder. Synthesizes a pk byte
+buffer of the canonical pk size where the first 32 bytes are sk[0..32]
+(the rho seed) and the remainder is zero. This preserves the algorithm
+tag and sk bytes exactly through a PKCS#8 round-trip.
+@End Implementation
+
+@Performance_Hints
+O(sk_size + pk_size). One memcopy + one zero-fill.
+@End Performance_Hints
+
+@Security_Scope
+The sk bytes are SECRET. The synthesized pk buffer is non-secret.
+@End Security_Scope
+Process called "keypair_unwrap_pq_ml_dsa" takes arena as Integer, buffer as Integer, content_off as Integer, content_len as Integer, algorithm as Integer, pk_bytes as Integer, sk_bytes as Integer returns Integer:
+    If content_len is not equal to sk_bytes:
+        Return 0
+    End If
+    Let priv_ptr be buffer plus content_off
+    Let sk_holder be SK.private_key_create(arena, algorithm, priv_ptr, sk_bytes)
+    If sk_holder is equal to 0:
+        Return 0
+    End If
+
+    Let pk_buf be Arena.arena_allocate(arena, pk_bytes)
+    If pk_buf is equal to 0:
+        Return 0
+    End If
+    Let zero_idx be 0
+    While zero_idx is less than pk_bytes:
+        Memory.memory_set_byte(pk_buf, zero_idx, 0)
+        Set zero_idx to zero_idx plus 1
+    End While
+    Memory.memory_copy(pk_buf, priv_ptr, 32)
+
+    Let pk_holder be PK.public_key_create(arena, algorithm, pk_buf, pk_bytes)
+    If pk_holder is equal to 0:
+        Return 0
+    End If
+    Return KP.keypair_from_keys(arena, sk_holder, pk_holder)
+End Process
+
+@Reasoning
+Reconstitute an SLH-DSA keypair from a PKCS#8 OCTET STRING content. The
+OCTET STRING holds the raw signing key (sk) bytes per FIPS 205 section
+9.1:
+  sk = [ SK.seed | SK.prf | PK.seed | PK.root ]
+with sizes n, n, n, n (total 4n). The public key is pk = [PK.seed |
+PK.root] which is sk[2n .. 4n].
+@End Reasoning
+
+@Implementation
+Walks past the OCTET STRING tag/length, copies the raw sk bytes into
+the private-key buffer, points the public-key buffer at the trailing
+2n bytes of sk, wraps both with PK.public_key_create and
+SK.private_key_create.
+@End Implementation
+
+@Performance_Hints
+O(sk_size). One memcopy.
+@End Performance_Hints
+
+@Security_Scope
+The first 2n bytes of sk (SK.seed and SK.prf) are SECRET. The trailing
+2n bytes are the public key and are non-secret.
+@End Security_Scope
+Process called "keypair_unwrap_pq_slh_dsa" takes arena as Integer, buffer as Integer, content_off as Integer, content_len as Integer, algorithm as Integer, n as Integer, pk_bytes as Integer, sk_bytes as Integer returns Integer:
+    If content_len is not equal to sk_bytes:
+        Return 0
+    End If
+    Let priv_ptr be buffer plus content_off
+    Let pk_ptr be priv_ptr plus (n multiplied by 2)
+
+    Let sk_holder be SK.private_key_create(arena, algorithm, priv_ptr, sk_bytes)
+    If sk_holder is equal to 0:
+        Return 0
+    End If
+    Let pk_holder be PK.public_key_create(arena, algorithm, pk_ptr, pk_bytes)
+    If pk_holder is equal to 0:
+        Return 0
+    End If
+    Return KP.keypair_from_keys(arena, sk_holder, pk_holder)
+End Process
+
+@Reasoning
+Unwrap the inner OCTET STRING that holds the raw scalar bytes per RFC 8410,
+then drive keypair_from_seed to derive the public half.
+@End Reasoning
+
+@Implementation
+Reads the inner OCTET STRING tag/length, extracts the raw scalar, calls
+KP.keypair_from_seed which re-derives the public key from the scalar.
+@End Implementation
+
+@Performance_Hints
+O(scalar_mult) for the public derivation.
+@End Performance_Hints
+
+@Security_Scope
+The decoded scalar is private; KP.keypair_from_seed handles the secure
+copy into the PrivateKey struct.
+@End Security_Scope
+Process called "keypair_unwrap_rfc8410" takes arena as Integer, buffer as Integer, content_off as Integer, algorithm as Integer returns Integer:
+    Let inner_tag be Memory.memory_get_byte(buffer, content_off)
+    If inner_tag is not equal to 4:
+        Return 0
+    End If
+    Let inner_len be Memory.memory_get_byte(buffer, content_off plus 1)
+    Let inner_data_off be content_off plus 2
+    If inner_len is greater than 127:
+        Note: For Ed25519/X25519 the scalar is 32 bytes; Ed448 = 57; X448 = 56.
+        Note: These all fit in the short-form length. Long-form is not expected.
+        Return 0
+    End If
+    Let scalar_ptr be buffer plus inner_data_off
+    Return KP.keypair_from_seed(arena, algorithm, scalar_ptr, inner_len)
+End Process
+
+Note: ============================================================================
+Note: SECTION 12: keypair_public_to_spki - SubjectPublicKeyInfo encoding
+Note: ============================================================================
+
+@Reasoning
+Encode the public half of a KeyPair as a SubjectPublicKeyInfo DER blob
+per RFC 5280. Structure:
+
+  SEQUENCE (tag 0x30) {
+    SEQUENCE (AlgorithmIdentifier) {
+      OBJECT IDENTIFIER algorithm
+      -- parameters: as for PKCS#8
+    }
+    BIT STRING subjectPublicKey
+  }
+
+The BIT STRING has a single-byte "unused bits" prefix (always 0x00 for
+public keys we emit) followed by the public-key bytes. For RFC 8410
+the public-key bytes are the raw point encoding (32 bytes for Ed25519/
+X25519, 57 for Ed448, 56 for X448). For ECDSA the bytes are the
+uncompressed point (0x04 || X || Y). For RSA the bytes are the PKCS#1
+RSAPublicKey DER blob (SEQUENCE { modulus, exponent }).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Get algorithm tag and public bytes.
+  2. Compute sizes for the AlgorithmIdentifier and BIT STRING.
+  3. Write the outer SEQUENCE then the two inner elements.
+
+For RSA, the BIT STRING content is the PKCS#1 RSAPublicKey SEQUENCE
+(RFC 8017 Appendix A.1.1) built from the n and e bignums via
+keypair_emit_spki_rsa, which materializes each bigint as a canonical
+DER INTEGER and emits the inner SEQUENCE.
+@End Implementation
+
+@Performance_Hints
+O(public_key_length).
+@End Performance_Hints
+
+@Security_Scope
+Public key material; non-secret.
+@End Security_Scope
+Process called "keypair_public_to_spki" takes arena as Integer, kp as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If kp is equal to 0:
+        Return 0
+    End If
+    Let pk be KP.keypair_public(kp)
+    If pk is equal to 0:
+        Return 0
+    End If
+    Let algorithm be PK.public_key_algorithm(pk)
+    Let pub_bytes be PK.public_key_bytes(pk)
+    Let pub_len be PK.public_key_byte_length(pk)
+    If pub_bytes is equal to 0:
+        Return 0
+    End If
+    Return keypair_emit_spki(arena, algorithm, pub_bytes, pub_len)
+End Process
+
+@Reasoning
+Common SPKI emitter from an algorithm tag and a public-key byte buffer.
+Reusable for both keypair_public_to_spki and direct public-key emission.
+For RSA the BIT STRING content is the PKCS#1 RSAPublicKey SEQUENCE per
+RFC 8017 A.1.1: SEQUENCE { INTEGER modulus, INTEGER publicExponent }.
+This SPKI emitter delegates to the dedicated RSA path for that case.
+For RFC 8410 curves and ECDSA the BIT STRING content is the raw public-
+key byte encoding (raw point for the curves, uncompressed point for
+ECDSA). For PQ algorithms the BIT STRING content is the raw public-key
+bytes per the IETF LAMPS draft conventions.
+@End Reasoning
+
+@Implementation
+Dispatch by algorithm family. RSA is handled by keypair_emit_spki_rsa.
+Other algorithms use the shared raw-byte BIT STRING path.
+@End Implementation
+
+@Performance_Hints
+O(pub_len) for non-RSA. RSA emission additionally pays the cost of two
+bignum materializations (n and e).
+@End Performance_Hints
+
+@Security_Scope
+Public; non-secret.
+@End Security_Scope
+Process called "keypair_emit_spki" takes arena as Integer, algorithm as Integer, pub_bytes as Integer, pub_len as Integer returns Integer:
+    If Alg.rsa_alg_modulus_bytes(algorithm) is not equal to 0:
+        Return keypair_emit_spki_rsa(arena, algorithm, pub_bytes)
+    End If
+    Return keypair_emit_spki_raw(arena, algorithm, pub_bytes, pub_len)
+End Process
+
+@Reasoning
+SPKI emission for non-RSA algorithms whose BIT STRING content is the
+raw public-key byte encoding. Used for Ed25519/Ed448/X25519/X448 (RFC
+8410), ECDSA (uncompressed point per SEC 1), and ML-KEM/ML-DSA/SLH-DSA
+(raw key bytes per IETF LAMPS conventions).
+@End Reasoning
+
+@Implementation
+Constructs:
+  SEQUENCE {
+    SEQUENCE { algorithm OID, optional params }
+    BIT STRING { 00 || pub_bytes }
+  }
+The parameters field is the namedCurve OID for ECDSA, NULL for RSA
+(unused on this path), absent for all other families.
+@End Implementation
+
+@Performance_Hints
+O(pub_len). One pass.
+@End Performance_Hints
+
+@Security_Scope
+Public; non-secret.
+@End Security_Scope
+Process called "keypair_emit_spki_raw" takes arena as Integer, algorithm as Integer, pub_bytes as Integer, pub_len as Integer returns Integer:
+    Let oid_total be keypair_oid_byte_count(algorithm)
+    If oid_total is equal to 0:
+        Return 0
+    End If
+    Let alg_extra be 0
+    Let is_ecdsa be 0
+    If algorithm is equal to Alg.ALG_ECDSA_P256:
+        Set alg_extra to 10
+        Set is_ecdsa to 1
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P384:
+        Set alg_extra to 7
+        Set is_ecdsa to 1
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P521:
+        Set alg_extra to 7
+        Set is_ecdsa to 1
+    End If
+
+    Let alg_seq_content_len be oid_total plus alg_extra
+    Let alg_seq_total be 1 plus keypair_der_length_bytes(alg_seq_content_len) plus alg_seq_content_len
+
+    Let bitstring_content_len be 1 plus pub_len
+    Let bitstring_total be 1 plus keypair_der_length_bytes(bitstring_content_len) plus bitstring_content_len
+
+    Let outer_content_len be alg_seq_total plus bitstring_total
+    Let outer_total be 1 plus keypair_der_length_bytes(outer_content_len) plus outer_content_len
+
+    Let buf be Arena.arena_allocate(arena, 4 plus outer_total)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int32(buf, 0, outer_total)
+    Let off be 4
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, outer_content_len)
+
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, alg_seq_content_len)
+    Set off to off plus keypair_write_oid(algorithm, buf, off)
+
+    If is_ecdsa is equal to 1:
+        Set off to off plus keypair_write_named_curve_oid(algorithm, buf, off)
+    End If
+
+    Memory.memory_set_byte(buf, off, 3)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, bitstring_content_len)
+    Memory.memory_set_byte(buf, off, 0)
+    Set off to off plus 1
+    Memory.memory_copy(buf plus off, pub_bytes, pub_len)
+    Set off to off plus pub_len
+
+    Return buf
+End Process
+
+@Reasoning
+SPKI emission for RSA. The BIT STRING content is the PKCS#1 RSAPublicKey
+SEQUENCE per RFC 8017 Appendix A.1.1:
+
+  RSAPublicKey ::= SEQUENCE {
+    modulus           INTEGER (n),
+    publicExponent    INTEGER (e)
+  }
+
+The bignums are read from the rsa_public_key holder carried in the
+public-key byte buffer (the in-tree pack layout stores the n and e
+pointers at offsets 0 and 8).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Read the rsa_public_key holder pointer chain from pub_bytes (in-tree
+     pack: [int64 n_ptr][int64 e_ptr][int64 bits]).
+  2. Size the RSAPublicKey SEQUENCE inside-out via
+     keypair_der_integer_bigint_bytes for n and e.
+  3. Allocate the outer SPKI buffer.
+  4. Emit outer SEQUENCE, AlgorithmIdentifier(rsaEncryption, NULL), and
+     a BIT STRING wrapping the inner RSAPublicKey SEQUENCE with the
+     mandatory 0x00 unused-bits prefix.
+@End Implementation
+
+@Performance_Hints
+O(modulus_bytes). Two bigint materializations + one BIT STRING write.
+@End Performance_Hints
+
+@Security_Scope
+Public; non-secret.
+@End Security_Scope
+Process called "keypair_emit_spki_rsa" takes arena as Integer, algorithm as Integer, pub_bytes as Integer returns Integer:
+    If pub_bytes is equal to 0:
+        Return 0
+    End If
+    Let bn_n be Memory.memory_get_int64(pub_bytes, 0)
+    Let bn_e be Memory.memory_get_int64(pub_bytes, 8)
+    If bn_n is equal to 0:
+        Return 0
+    End If
+    If bn_e is equal to 0:
+        Return 0
+    End If
+
+    Let int_n_total be keypair_der_integer_bigint_bytes(arena, bn_n)
+    Let int_e_total be keypair_der_integer_bigint_bytes(arena, bn_e)
+    If int_n_total is equal to 0:
+        Return 0
+    End If
+    Let rsapub_content_len be int_n_total plus int_e_total
+    Let rsapub_seq_total be 1 plus keypair_der_length_bytes(rsapub_content_len) plus rsapub_content_len
+
+    Note: AlgorithmIdentifier SEQUENCE: rsaEncryption OID (11 bytes) + NULL (2 bytes).
+    Let alg_seq_content_len be 11 plus 2
+    Let alg_seq_total be 1 plus keypair_der_length_bytes(alg_seq_content_len) plus alg_seq_content_len
+
+    Note: BIT STRING: 1 byte unused-bits prefix + RSAPublicKey SEQUENCE.
+    Let bitstring_content_len be 1 plus rsapub_seq_total
+    Let bitstring_total be 1 plus keypair_der_length_bytes(bitstring_content_len) plus bitstring_content_len
+
+    Let outer_content_len be alg_seq_total plus bitstring_total
+    Let outer_total be 1 plus keypair_der_length_bytes(outer_content_len) plus outer_content_len
+
+    Let buf be Arena.arena_allocate(arena, 4 plus outer_total)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int32(buf, 0, outer_total)
+    Let off be 4
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, outer_content_len)
+
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, alg_seq_content_len)
+    Set off to off plus keypair_write_oid(algorithm, buf, off)
+    Memory.memory_set_byte(buf, off, 5)
+    Memory.memory_set_byte(buf, off plus 1, 0)
+    Set off to off plus 2
+
+    Memory.memory_set_byte(buf, off, 3)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, bitstring_content_len)
+    Memory.memory_set_byte(buf, off, 0)
+    Set off to off plus 1
+
+    Memory.memory_set_byte(buf, off, 48)
+    Set off to off plus 1
+    Set off to off plus keypair_write_der_length(buf, off, rsapub_content_len)
+    Set off to off plus keypair_write_der_integer_bigint(arena, buf, off, bn_n)
+    Set off to off plus keypair_write_der_integer_bigint(arena, buf, off, bn_e)
+
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: SECTION 13: keypair_from_spki - SubjectPublicKeyInfo decoding (public-only)
+Note: ============================================================================
+
+@Reasoning
+Parse a SubjectPublicKeyInfo blob and return a KeyPair whose private
+half is empty (the SPKI carries only the public key by definition). The
+returned KeyPair can be used by signature.runa's verify path because
+signature_verify only reads the public side.
+@End Reasoning
+
+@Implementation
+Same scanning approach as keypair_deserialize_pkcs8 but for the SPKI
+structure (no version INTEGER, BIT STRING instead of OCTET STRING).
+@End Implementation
+
+@Performance_Hints
+O(blob_length). One linear scan.
+@End Performance_Hints
+
+@Security_Scope
+Untrusted input; bounded reads.
+@End Security_Scope
+Process called "keypair_from_spki" takes arena as Integer, der_bytes as Integer, der_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If der_bytes is equal to 0:
+        Return 0
+    End If
+    If der_length is less than 8:
+        Return 0
+    End If
+    Let tag0 be Memory.memory_get_byte(der_bytes, 0)
+    If tag0 is not equal to 48:
+        Return 0
+    End If
+
+    Let off be 1
+    Let len_first be Memory.memory_get_byte(der_bytes, off)
+    Set off to off plus 1
+    If len_first is greater than 127:
+        Let extra be len_first minus 128
+        If extra is greater than 4:
+            Return 0
+        End If
+        Set off to off plus extra
+    End If
+
+    Note: AlgorithmIdentifier SEQUENCE.
+    If Memory.memory_get_byte(der_bytes, off) is not equal to 48:
+        Return 0
+    End If
+    Set off to off plus 1
+    Let alg_len_first be Memory.memory_get_byte(der_bytes, off)
+    Set off to off plus 1
+    Let alg_content_len be alg_len_first
+    If alg_len_first is greater than 127:
+        Let alg_extra be alg_len_first minus 128
+        If alg_extra is equal to 1:
+            Set alg_content_len to Memory.memory_get_byte(der_bytes, off)
+            Set off to off plus 1
+        End If
+    End If
+    Let alg_end be off plus alg_content_len
+
+    Note: OID inside.
+    If Memory.memory_get_byte(der_bytes, off) is not equal to 6:
+        Return 0
+    End If
+    Let oid_len be Memory.memory_get_byte(der_bytes, off plus 1)
+    Let oid_body_off be off plus 2
+
+    Let algorithm_tag be 0
+    If oid_len is equal to 3:
+        Let b0 be Memory.memory_get_byte(der_bytes, oid_body_off)
+        Let b1 be Memory.memory_get_byte(der_bytes, oid_body_off plus 1)
+        Let b2 be Memory.memory_get_byte(der_bytes, oid_body_off plus 2)
+        If b0 is equal to 43:
+            If b1 is equal to 101:
+                If b2 is equal to 112:
+                    Set algorithm_tag to Alg.ALG_ED25519
+                End If
+                If b2 is equal to 113:
+                    Set algorithm_tag to Alg.ALG_ED448
+                End If
+                If b2 is equal to 110:
+                    Set algorithm_tag to Alg.ALG_X25519
+                End If
+                If b2 is equal to 111:
+                    Set algorithm_tag to Alg.ALG_X448
+                End If
+            End If
+        End If
+    End If
+    Set off to alg_end
+
+    Note: BIT STRING.
+    If Memory.memory_get_byte(der_bytes, off) is not equal to 3:
+        Return 0
+    End If
+    Set off to off plus 1
+    Let bs_first be Memory.memory_get_byte(der_bytes, off)
+    Set off to off plus 1
+    Let bs_content_len be bs_first
+    If bs_first is greater than 127:
+        Let bs_extra be bs_first minus 128
+        If bs_extra is equal to 1:
+            Set bs_content_len to Memory.memory_get_byte(der_bytes, off)
+            Set off to off plus 1
+        End If
+        If bs_extra is equal to 2:
+            Set bs_content_len to (Memory.memory_get_byte(der_bytes, off) multiplied by 256) plus Memory.memory_get_byte(der_bytes, off plus 1)
+            Set off to off plus 2
+        End If
+    End If
+    Note: Skip unused-bits prefix byte (must be 0).
+    If Memory.memory_get_byte(der_bytes, off) is not equal to 0:
+        Return 0
+    End If
+    Set off to off plus 1
+    Let pub_len be bs_content_len minus 1
+
+    If algorithm_tag is equal to 0:
+        Return 0
+    End If
+
+    Let pk be PK.public_key_create(arena, algorithm_tag, der_bytes plus off, pub_len)
+    If pk is equal to 0:
+        Return 0
+    End If
+    Note: Build a KeyPair with an empty PrivateKey (algorithm carried, zero bytes).
+    Let sk_empty_buf be Arena.arena_allocate(arena, 1)
+    If sk_empty_buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(sk_empty_buf, 0, 0)
+    Let sk be SK.private_key_create(arena, algorithm_tag, sk_empty_buf, 0)
+    If sk is equal to 0:
+        Return 0
+    End If
+    Return KP.keypair_from_keys(arena, sk, pk)
+End Process

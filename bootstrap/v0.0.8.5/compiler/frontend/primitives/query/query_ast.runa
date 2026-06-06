@@ -1,0 +1,618 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+QUERY_AST - Generic Relational Query AST (substrate for SQL / RQL)
+==============================================================================
+
+The shared AST for all relational query dialects.  SQL, RQL, and any
+other relational language that targets this substrate produces and
+consumes nodes defined here.  Coverage mirrors the SQL:2016 standard's
+SELECT statement structure (ISO/IEC 9075-2:2016) plus DML and DDL
+infrastructure.
+
+Top-level node kinds:
+
+  Q_SELECT        SELECT statement (clauses below)
+  Q_INSERT        INSERT statement
+  Q_UPDATE        UPDATE statement
+  Q_DELETE        DELETE statement
+  Q_UNION         set operation
+  Q_INTERSECT     set operation
+  Q_EXCEPT        set operation
+
+Clause kinds (children of Q_SELECT):
+
+  Q_SELECT_LIST   list of projection expressions / column references
+  Q_FROM          list of tables/joins
+  Q_WHERE         predicate expression
+  Q_GROUP_BY      list of grouping expressions
+  Q_HAVING        predicate expression
+  Q_ORDER_BY      list of (expression, direction) pairs
+  Q_LIMIT         numeric limit
+  Q_OFFSET        numeric offset
+  Q_JOIN          join (kind, table, ON predicate)
+
+Expression kinds:
+
+  Q_COLUMN        column reference - primary stores name, secondary stores table alias
+  Q_LITERAL       literal value - secondary stores literal type (INT/STR/FLOAT/BOOL/NULL)
+  Q_BINOP         binary op - primary stores operator string, children = [lhs, rhs]
+  Q_UNARYOP       unary op
+  Q_FUNCALL       function call - primary stores name, children = arguments
+  Q_SUBQUERY      nested query - primary 0, children = [subquery_root]
+  Q_CASE          CASE expression - children = [when, then, when, then, ..., else]
+  Q_CAST          CAST(expr AS type) - primary = type name, children = [expr]
+
+Predicate kinds (subset of expressions):
+
+  Q_CMP           comparison op
+  Q_LOGICAL       AND/OR/NOT
+  Q_IN_LIST       expr IN (val1, val2, ...)
+  Q_IN_SUBQUERY   expr IN (subquery)
+  Q_BETWEEN       expr BETWEEN lo AND hi
+  Q_LIKE          expr LIKE pattern
+  Q_IS_NULL       expr IS NULL
+  Q_EXISTS        EXISTS(subquery)
+
+Node record layout (40 bytes, tagged variant):
+
+  off  0  kind tag       Q_*
+  off  8  primary str    name / operator / type
+  off 16  secondary      auxiliary integer / pointer (literal_type, direction, ...)
+  off 24  children list  List of child nodes / clause nodes
+  off 32  payload        for Q_LITERAL: the boxed value (String / Integer)
+
+References:
+  - SQL:2016: ISO/IEC 9075:2016
+  - PostgreSQL grammar https://www.postgresql.org/docs/current/sql-syntax.html
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+
+Note: ============================================================================
+Note: NODE KIND TAGS
+Note: ============================================================================
+
+Constant Q_SELECT as Integer is 1
+Constant Q_INSERT as Integer is 2
+Constant Q_UPDATE as Integer is 3
+Constant Q_DELETE as Integer is 4
+Constant Q_UNION as Integer is 5
+Constant Q_INTERSECT as Integer is 6
+Constant Q_EXCEPT as Integer is 7
+
+Constant Q_SELECT_LIST as Integer is 10
+Constant Q_FROM as Integer is 11
+Constant Q_WHERE as Integer is 12
+Constant Q_GROUP_BY as Integer is 13
+Constant Q_HAVING as Integer is 14
+Constant Q_ORDER_BY as Integer is 15
+Constant Q_LIMIT as Integer is 16
+Constant Q_OFFSET as Integer is 17
+Constant Q_JOIN as Integer is 18
+
+Constant Q_COLUMN as Integer is 20
+Constant Q_LITERAL as Integer is 21
+Constant Q_BINOP as Integer is 22
+Constant Q_UNARYOP as Integer is 23
+Constant Q_FUNCALL as Integer is 24
+Constant Q_SUBQUERY as Integer is 25
+Constant Q_CASE as Integer is 26
+Constant Q_CAST as Integer is 27
+
+Constant Q_CMP as Integer is 30
+Constant Q_LOGICAL as Integer is 31
+Constant Q_IN_LIST as Integer is 32
+Constant Q_IN_SUBQUERY as Integer is 33
+Constant Q_BETWEEN as Integer is 34
+Constant Q_LIKE as Integer is 35
+Constant Q_IS_NULL as Integer is 36
+Constant Q_EXISTS as Integer is 37
+
+Constant Q_ORDER_ASC as Integer is 0
+Constant Q_ORDER_DESC as Integer is 1
+
+Constant Q_JOIN_INNER as Integer is 0
+Constant Q_JOIN_LEFT as Integer is 1
+Constant Q_JOIN_RIGHT as Integer is 2
+Constant Q_JOIN_FULL as Integer is 3
+Constant Q_JOIN_CROSS as Integer is 4
+
+Constant Q_LIT_INTEGER as Integer is 0
+Constant Q_LIT_FLOAT as Integer is 1
+Constant Q_LIT_STRING as Integer is 2
+Constant Q_LIT_BOOL as Integer is 3
+Constant Q_LIT_NULL as Integer is 4
+
+Constant Q_NODE_SIZE as Integer is 40
+Constant Q_OFF_KIND as Integer is 0
+Constant Q_OFF_PRIMARY as Integer is 8
+Constant Q_OFF_SECONDARY as Integer is 16
+Constant Q_OFF_CHILDREN as Integer is 24
+Constant Q_OFF_PAYLOAD as Integer is 32
+
+Note: ============================================================================
+Note: NODE CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Allocate a 40-byte query AST node with kind tag, primary/secondary
+slots, and a freshly allocated empty child List.  Caller is
+responsible for populating children with query_ast_add_child.
+@End Reasoning
+@Implementation
+Two Layout.allocate calls (node + list); on OOM, deallocate the node
+and return 0.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "query_ast_create" takes kind as Integer, primary as Integer, secondary as Integer returns Integer:
+    Let record be proc allocate from Layout with Q_NODE_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    Let children be proc list_create from List
+    If children is equal to 0:
+        proc deallocate from Layout with record
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, Q_OFF_KIND, kind
+    proc memory_set_int64 from Memory with record, Q_OFF_PRIMARY, primary
+    proc memory_set_int64 from Memory with record, Q_OFF_SECONDARY, secondary
+    proc memory_set_int64 from Memory with record, Q_OFF_CHILDREN, children
+    proc memory_set_int64 from Memory with record, Q_OFF_PAYLOAD, 0
+    Return record
+End Process
+
+Process called "query_ast_get_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, Q_OFF_KIND
+End Process
+
+Process called "query_ast_get_primary" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, Q_OFF_PRIMARY
+End Process
+
+Process called "query_ast_get_secondary" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, Q_OFF_SECONDARY
+End Process
+
+Process called "query_ast_get_children" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, Q_OFF_CHILDREN
+End Process
+
+Process called "query_ast_get_payload" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, Q_OFF_PAYLOAD
+End Process
+
+Process called "query_ast_set_payload" takes node as Integer, payload as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with node, Q_OFF_PAYLOAD, payload
+    Return 0
+End Process
+
+Process called "query_ast_add_child" takes parent as Integer, child as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with parent, Q_OFF_CHILDREN
+    Return proc list_push from List with children, child
+End Process
+
+Process called "query_ast_child_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with node, Q_OFF_CHILDREN
+    Return proc list_length from List with children
+End Process
+
+Process called "query_ast_get_child" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with node, Q_OFF_CHILDREN
+    Let count be proc list_length from List with children
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Return proc list_get from List with children, index
+End Process
+
+@Reasoning
+Locate the first child clause with the requested kind (one of the
+Q_SELECT_LIST, Q_FROM, Q_WHERE, ... constants).  Used by serializers
+and planners to pull specific clauses out of a SELECT node.
+@End Reasoning
+@Implementation
+Linear scan of the children list.  Returns 0 if no such clause.
+@End Implementation
+@Performance_Hints
+O(child count).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "query_ast_find_clause" takes node as Integer, clause_kind as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with node, Q_OFF_CHILDREN
+    Let count be proc list_length from List with children
+    Let i be 0
+    While i is less than count:
+        Let c be proc list_get from List with children, i
+        Let k be proc memory_get_int64 from Memory with c, Q_OFF_KIND
+        If k is equal to clause_kind:
+            Return c
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: CONVENIENCE CONSTRUCTORS
+Note: ============================================================================
+
+Process called "qa_column" takes name as Integer, table_alias as Integer returns Integer:
+    Return proc query_ast_create with Q_COLUMN, name, table_alias
+End Process
+
+Process called "qa_literal_integer" takes value as Integer returns Integer:
+    Let node be proc query_ast_create with Q_LITERAL, 0, Q_LIT_INTEGER
+    If node is equal to 0:
+        Return 0
+    End If
+    proc query_ast_set_payload with node, value
+    Return node
+End Process
+
+Process called "qa_literal_string" takes text as Integer returns Integer:
+    Let node be proc query_ast_create with Q_LITERAL, text, Q_LIT_STRING
+    Return node
+End Process
+
+Process called "qa_literal_bool" takes flag as Integer returns Integer:
+    Let node be proc query_ast_create with Q_LITERAL, 0, Q_LIT_BOOL
+    If node is equal to 0:
+        Return 0
+    End If
+    proc query_ast_set_payload with node, flag
+    Return node
+End Process
+
+Process called "qa_literal_null" returns Integer:
+    Return proc query_ast_create with Q_LITERAL, 0, Q_LIT_NULL
+End Process
+
+Process called "qa_binop" takes op as Integer, lhs as Integer, rhs as Integer returns Integer:
+    Let node be proc query_ast_create with Q_BINOP, op, 0
+    If node is equal to 0:
+        Return 0
+    End If
+    proc query_ast_add_child with node, lhs
+    proc query_ast_add_child with node, rhs
+    Return node
+End Process
+
+Process called "qa_cmp" takes op as Integer, lhs as Integer, rhs as Integer returns Integer:
+    Let node be proc query_ast_create with Q_CMP, op, 0
+    If node is equal to 0:
+        Return 0
+    End If
+    proc query_ast_add_child with node, lhs
+    proc query_ast_add_child with node, rhs
+    Return node
+End Process
+
+Process called "qa_funcall" takes name as Integer returns Integer:
+    Return proc query_ast_create with Q_FUNCALL, name, 0
+End Process
+
+Process called "qa_select" returns Integer:
+    Return proc query_ast_create with Q_SELECT, 0, 0
+End Process
+
+Process called "qa_clause" takes kind as Integer returns Integer:
+    Return proc query_ast_create with kind, 0, 0
+End Process
+
+Process called "qa_order_item" takes expr as Integer, direction as Integer returns Integer:
+    Let node be proc query_ast_create with Q_ORDER_BY, 0, direction
+    If node is equal to 0:
+        Return 0
+    End If
+    proc query_ast_add_child with node, expr
+    Return node
+End Process
+
+Process called "qa_join" takes table_name as Integer, kind as Integer, on_pred as Integer returns Integer:
+    Let node be proc query_ast_create with Q_JOIN, table_name, kind
+    If node is equal to 0:
+        Return 0
+    End If
+    If on_pred is not equal to 0:
+        proc query_ast_add_child with node, on_pred
+    End If
+    Return node
+End Process
+
+Process called "qa_limit" takes count as Integer returns Integer:
+    Let node be proc query_ast_create with Q_LIMIT, 0, count
+    Return node
+End Process
+
+Note: ============================================================================
+Note: WALK
+Note: ============================================================================
+
+@Reasoning
+Depth-first pre-order traversal.  Populates the supplied out list with
+every reachable node in the AST.  Visitor pattern equivalent: callers
+that need conditional dispatch can pre-filter the populated list.
+@End Reasoning
+@Implementation
+Iterative two-stack DFS with the work-list bounded by tree size.
+@End Implementation
+@Performance_Hints
+O(node count).
+@End Performance_Hints
+@Security_Scope
+Returns negative on null inputs.
+@End Security_Scope
+Process called "query_ast_walk" takes root as Integer, out_list as Integer returns Integer:
+    If root is equal to 0:
+        Return -1
+    End If
+    If out_list is equal to 0:
+        Return -1
+    End If
+    Let stack be proc list_create from List
+    If stack is equal to 0:
+        Return -1
+    End If
+    proc list_push from List with stack, root
+    While 1 is equal to 1:
+        Let len be proc list_length from List with stack
+        If len is equal to 0:
+            proc list_destroy from List with stack
+            Return 0
+        End If
+        Let top be len minus 1
+        Let cur be proc list_get from List with stack, top
+        proc list_remove from List with stack, top
+        proc list_push from List with out_list, cur
+        Let children be proc memory_get_int64 from Memory with cur, Q_OFF_CHILDREN
+        If children is not equal to 0:
+            Let cc be proc list_length from List with children
+            Let i be cc minus 1
+            While i is greater than or equal to 0:
+                Let c be proc list_get from List with children, i
+                If c is not equal to 0:
+                    proc list_push from List with stack, c
+                End If
+                Set i to i minus 1
+            End While
+        End If
+    End While
+    proc list_destroy from List with stack
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Recursively destroy a query AST node and every descendant.  String
+payloads are caller-owned.
+@End Reasoning
+@Implementation
+For each child invoke query_ast_destroy recursively, destroy the
+backing list, free the record.
+@End Implementation
+@Performance_Hints
+O(total node count).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "query_ast_destroy" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with node, Q_OFF_CHILDREN
+    If children is not equal to 0:
+        Let count be proc list_length from List with children
+        Let i be 0
+        While i is less than count:
+            Let c be proc list_get from List with children, i
+            proc query_ast_destroy with c
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with children
+    End If
+    proc deallocate from Layout with node
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PRETTY PRINTER
+Note: ============================================================================
+
+@Reasoning
+Render the AST to a human-readable string.  Used by EXPLAIN-like
+tooling and diagnostics.  Renders each clause on its own line with a
+short symbolic prefix.
+@End Reasoning
+@Implementation
+Recursive walker writing into a StringBuilder.  Each node kind has a
+custom serialization snippet.
+@End Implementation
+@Performance_Hints
+O(tree size + total string length).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "qa_append_indent" takes sb as Integer, level as Integer returns Integer:
+    Let i be 0
+    Let total be level multiplied by 2
+    While i is less than total:
+        proc stringbuilder_append_char from SB with sb, 32
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "qa_render" takes sb as Integer, node as Integer, level as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, Q_OFF_KIND
+    Let primary be proc memory_get_int64 from Memory with node, Q_OFF_PRIMARY
+    proc qa_append_indent with sb, level
+    If kind is equal to Q_SELECT:
+        proc stringbuilder_append from SB with sb, "SELECT"
+    End If
+    If kind is equal to Q_SELECT_LIST:
+        proc stringbuilder_append from SB with sb, "select_list"
+    End If
+    If kind is equal to Q_FROM:
+        proc stringbuilder_append from SB with sb, "FROM"
+    End If
+    If kind is equal to Q_WHERE:
+        proc stringbuilder_append from SB with sb, "WHERE"
+    End If
+    If kind is equal to Q_GROUP_BY:
+        proc stringbuilder_append from SB with sb, "GROUP BY"
+    End If
+    If kind is equal to Q_HAVING:
+        proc stringbuilder_append from SB with sb, "HAVING"
+    End If
+    If kind is equal to Q_ORDER_BY:
+        proc stringbuilder_append from SB with sb, "ORDER BY"
+    End If
+    If kind is equal to Q_LIMIT:
+        proc stringbuilder_append from SB with sb, "LIMIT "
+        Let limit_n be proc memory_get_int64 from Memory with node, Q_OFF_SECONDARY
+        proc stringbuilder_append_integer from SB with sb, limit_n
+    End If
+    If kind is equal to Q_OFFSET:
+        proc stringbuilder_append from SB with sb, "OFFSET "
+        Let off_n be proc memory_get_int64 from Memory with node, Q_OFF_SECONDARY
+        proc stringbuilder_append_integer from SB with sb, off_n
+    End If
+    If kind is equal to Q_JOIN:
+        proc stringbuilder_append from SB with sb, "JOIN "
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+    End If
+    If kind is equal to Q_COLUMN:
+        proc stringbuilder_append from SB with sb, "column("
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+        proc stringbuilder_append from SB with sb, ")"
+    End If
+    If kind is equal to Q_LITERAL:
+        proc stringbuilder_append from SB with sb, "literal("
+        Let payload be proc memory_get_int64 from Memory with node, Q_OFF_PAYLOAD
+        Let secondary be proc memory_get_int64 from Memory with node, Q_OFF_SECONDARY
+        If secondary is equal to Q_LIT_INTEGER:
+            proc stringbuilder_append_integer from SB with sb, payload
+        Otherwise:
+            If primary is not equal to 0:
+                proc stringbuilder_append from SB with sb, primary
+            End If
+        End If
+        proc stringbuilder_append from SB with sb, ")"
+    End If
+    If kind is equal to Q_BINOP:
+        proc stringbuilder_append from SB with sb, "binop("
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+        proc stringbuilder_append from SB with sb, ")"
+    End If
+    If kind is equal to Q_CMP:
+        proc stringbuilder_append from SB with sb, "cmp("
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+        proc stringbuilder_append from SB with sb, ")"
+    End If
+    If kind is equal to Q_FUNCALL:
+        proc stringbuilder_append from SB with sb, "call "
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+    End If
+    proc stringbuilder_append_char from SB with sb, 10
+    Let cs be proc memory_get_int64 from Memory with node, Q_OFF_CHILDREN
+    If cs is not equal to 0:
+        Let cc be proc list_length from List with cs
+        Let i be 0
+        While i is less than cc:
+            Let cn be proc list_get from List with cs, i
+            proc qa_render with sb, cn, level plus 1
+            Set i to i plus 1
+        End While
+    End If
+    Return 0
+End Process
+
+Process called "query_ast_to_string" takes root as Integer returns Integer:
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc qa_render with sb, root, 0
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process

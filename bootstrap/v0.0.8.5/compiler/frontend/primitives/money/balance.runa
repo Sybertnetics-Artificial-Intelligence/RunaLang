@@ -1,0 +1,204 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+:End Note
+
+Note:
+==============================================================================
+Balance - Current account state derived from ledger entries
+==============================================================================
+
+A Balance is the current state of a single account: a Money value reflecting
+the net of all credits minus debits posted to the account. Balances are
+DERIVED from LedgerEntry records, never stored as the system of record - the
+ledger is the source of truth, the balance is a materialized view.
+
+This primitive provides the fold operation (balance_apply_entry) and the
+balance-creation entry point (balance_zero). Higher tiers maintain balance
+caches and invalidation logic.
+
+Layout (24 bytes):
+    0    account_handle      (int64 LedgerAccount, borrowed)
+    8    current_money       (int64 Money handle, owned)
+    16   last_entry_id       (int64 most recent entry folded in)
+
+Currency invariant: all entries folded into a balance MUST share a currency.
+balance_apply_entry rejects entries with mismatched currency.
+
+References:
+  - FASB ASC 220 (comprehensive income computation)
+  - IAS 1 Presentation of Financial Statements
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/money/money.runa" as Money
+Import "compiler/frontend/primitives/money/ledger_entry.runa" as Entry
+
+Constant BALANCE_SIZE as Integer is 24
+Constant BAL_FIELD_ACCOUNT as Integer is 0
+Constant BAL_FIELD_MONEY as Integer is 8
+Constant BAL_FIELD_LAST_ENTRY_ID as Integer is 16
+
+Constant BALANCE_OK as Integer is 0
+Constant BALANCE_ERR_NULL as Integer is -1
+Constant BALANCE_ERR_CURRENCY_MISMATCH as Integer is -2
+Constant BALANCE_ERR_ALLOC_FAILED as Integer is -3
+
+Process called "balance_zero" takes account as Integer, currency_id as Integer returns Integer:
+    @Reasoning
+    Constructs an empty Balance for the given account and currency. The
+    account is borrowed; the underlying Money is owned by the Balance.
+    @End Reasoning
+    @Implementation
+    money_zero produces the initial amount; allocate and wire up fields.
+    @End Implementation
+    @Performance_Hints
+    Two allocations (Money + Balance).
+    @End Performance_Hints
+    @Security_Scope
+    Validates account and currency_id are non-zero.
+    @End Security_Scope
+
+    If account is equal to 0:
+        Return 0
+    End If
+    If currency_id is equal to 0:
+        Return 0
+    End If
+    Let m be Money.money_zero(currency_id)
+    If m is equal to 0:
+        Return 0
+    End If
+    Let b be Layout.allocate(BALANCE_SIZE)
+    If b is equal to 0:
+        Money.money_destroy(m)
+        Return 0
+    End If
+    MemoryCore.memory_set_int64(b, BAL_FIELD_ACCOUNT, account)
+    MemoryCore.memory_set_int64(b, BAL_FIELD_MONEY, m)
+    MemoryCore.memory_set_int64(b, BAL_FIELD_LAST_ENTRY_ID, 0)
+    Return b
+End Process
+
+Process called "balance_get_account" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(b, BAL_FIELD_ACCOUNT)
+End Process
+
+Process called "balance_get_money" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(b, BAL_FIELD_MONEY)
+End Process
+
+Process called "balance_get_last_entry_id" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(b, BAL_FIELD_LAST_ENTRY_ID)
+End Process
+
+Process called "balance_destroy" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let m be MemoryCore.memory_get_int64(b, BAL_FIELD_MONEY)
+    If m is not equal to 0:
+        Money.money_destroy(m)
+    End If
+    Layout.deallocate(b)
+    Return 1
+End Process
+
+Process called "balance_apply_entry" takes b as Integer, e as Integer returns Integer:
+    @Reasoning
+    Folds a single LedgerEntry into the balance. Computes the sign for
+    the account (+1 if credit, -1 if debit, 0 if not touching), applies
+    the signed money amount, replaces the balance's current money with
+    the result, and updates last_entry_id.
+    @End Reasoning
+    @Implementation
+    1. Determine sign via Entry.ledger_entry_sign_for_account.
+    2. If sign == 0, the entry does not touch the account; return OK
+       without modification.
+    3. Get the entry's money. Currency check it against the balance's
+       money.
+    4. If sign == +1, balance.money += entry.money.
+       If sign == -1, balance.money -= entry.money.
+    5. Replace the balance's owned money with the new result (freeing the
+       prior).
+    6. Update last_entry_id from the entry.
+    @End Implementation
+    @Performance_Hints
+    One Money add/sub + one allocation. Hot path during balance recompute.
+    @End Performance_Hints
+    @Security_Scope
+    Refuses cross-currency entries. The currency-safety guarantee extends
+    to balance derivation.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return BALANCE_ERR_NULL
+    End If
+    If e is equal to 0:
+        Return BALANCE_ERR_NULL
+    End If
+    Let account be MemoryCore.memory_get_int64(b, BAL_FIELD_ACCOUNT)
+    Let sign be Entry.ledger_entry_sign_for_account(e, account)
+    If sign is equal to 0:
+        Return BALANCE_OK
+    End If
+    Let current_money be MemoryCore.memory_get_int64(b, BAL_FIELD_MONEY)
+    Let entry_money be Entry.ledger_entry_get_money(e)
+    If entry_money is equal to 0:
+        Return BALANCE_ERR_NULL
+    End If
+    If Money.money_same_currency(current_money, entry_money) is equal to 0:
+        Return BALANCE_ERR_CURRENCY_MISMATCH
+    End If
+    Let new_money be 0
+    If sign is equal to 1:
+        Set new_money to Money.money_add(current_money, entry_money)
+    Otherwise:
+        Set new_money to Money.money_sub(current_money, entry_money)
+    End If
+    If new_money is equal to 0:
+        Return BALANCE_ERR_ALLOC_FAILED
+    End If
+    Money.money_destroy(current_money)
+    MemoryCore.memory_set_int64(b, BAL_FIELD_MONEY, new_money)
+    Let entry_id be Entry.ledger_entry_get_id(e)
+    MemoryCore.memory_set_int64(b, BAL_FIELD_LAST_ENTRY_ID, entry_id)
+    Return BALANCE_OK
+End Process
+
+Process called "balance_is_positive" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let m be MemoryCore.memory_get_int64(b, BAL_FIELD_MONEY)
+    Return Money.money_is_positive(m)
+End Process
+
+Process called "balance_is_negative" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let m be MemoryCore.memory_get_int64(b, BAL_FIELD_MONEY)
+    Return Money.money_is_negative(m)
+End Process
+
+Process called "balance_is_zero" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let m be MemoryCore.memory_get_int64(b, BAL_FIELD_MONEY)
+    Return Money.money_is_zero(m)
+End Process

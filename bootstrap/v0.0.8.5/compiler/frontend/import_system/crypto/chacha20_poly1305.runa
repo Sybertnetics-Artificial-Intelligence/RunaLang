@@ -1,0 +1,515 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+CHACHA20-POLY1305 AEAD per RFC 8439
+==============================================================================
+
+ChaCha20-Poly1305 AEAD combines the ChaCha20 stream cipher with the Poly1305
+one-time MAC into an authenticated encryption with associated data (AEAD)
+construction per RFC 8439 section 2.8.
+
+Seal (encryption):
+  1. otk = ChaCha20-Block(key, nonce, counter=0)[0..32]   (one-time Poly1305 key)
+  2. ciphertext = ChaCha20-Encrypt(key, nonce, counter=1, plaintext)
+  3. mac_data = AAD || pad16(AAD) || CT || pad16(CT) || le64(len(AAD)) || le64(len(CT))
+  4. tag = Poly1305(otk, mac_data)
+
+Open (decryption):
+  1. Recompute otk identically.
+  2. Recompute the same mac_data from the received AAD and ciphertext.
+  3. Recompute tag = Poly1305(otk, mac_data).
+  4. If constant_time_compare(tag, received_tag) == 1, decrypt; else reject.
+  5. plaintext = ChaCha20-Encrypt(key, nonce, counter=1, ciphertext).
+
+Critical invariant: ChaCha20 keystream block 0 is reserved for the Poly1305
+one-time key; encryption starts at block 1. Mixing these reserves leads to
+key recovery via tag-keystream interaction. See RFC 8439 section 2.6.
+
+Side-channel posture:
+- Constant-time encryption (inherits ChaCha20's constant-time discipline).
+- Constant-time MAC (inherits Poly1305's constant-time discipline).
+- Constant-time tag comparison (uses secure_memory.constant_time_compare).
+- Verify-then-decrypt order in open: tag is checked BEFORE the plaintext
+  is materialized, preventing chosen-ciphertext oracle attacks that would
+  otherwise reveal information about the plaintext on tag failure.
+
+References:
+- RFC 8439, "ChaCha20 and Poly1305 for IETF Protocols", Y. Nir, A. Langley.
+- RFC 7539 (predecessor, now obsoleted).
+- Procter, "A Security Analysis of the Composition of ChaCha20 and Poly1305",
+  2014.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/chacha20.runa" as ChaCha20
+Import "compiler/frontend/import_system/crypto/poly1305.runa" as Poly1305
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as SecureMem
+
+Constant AEAD_KEY_SIZE as Integer is 32
+Constant AEAD_NONCE_SIZE as Integer is 12
+Constant AEAD_TAG_SIZE as Integer is 16
+Constant POLY1305_KEY_SIZE_LOCAL as Integer is 32
+
+Note: ============================================================================
+Note: Internal helper: derive Poly1305 one-time key from (key, nonce)
+Note: ============================================================================
+
+Process called "aead_derive_poly_key" takes arena as Integer, key as Integer, nonce as Integer, otk_out as Integer returns Integer:
+    @Reasoning
+    Computes the 32-byte Poly1305 one-time key as the first 32 bytes of the
+    ChaCha20 keystream at counter = 0 per RFC 8439 section 2.6.
+    @End Reasoning
+
+    @Implementation
+    1. Generate ChaCha20 keystream block at counter = 0 (a full 64-byte block).
+    2. Copy the first 32 bytes into otk_out; discard the rest.
+    3. Securely wipe the temporary 64-byte block.
+    @End Implementation
+
+    @Performance_Hints
+    One ChaCha20 block invocation. Negligible relative to message encryption
+    cost for any plaintext above ~32 bytes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. The keystream block is derived from (key, nonce) only.
+    The trailing 32 bytes are wiped on exit because they originate from
+    the key-derived keystream and could yield additional Poly1305 keys
+    if leaked across multiple AEAD invocations under the same key/nonce.
+
+    Out of scope: catastrophic nonce reuse (a separate concern; see
+    chacha20_poly1305_seal documentation).
+    @End Security_Scope
+
+    Let scratch be proc arena_allocate from Arena with arena, 64
+    If scratch is equal to 0:
+        Return 0
+    End If
+
+    Let rc be proc chacha20_block from ChaCha20 with arena, key, nonce, 0, scratch
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    proc memory_copy from Memory with otk_out, scratch, POLY1305_KEY_SIZE_LOCAL
+    proc secure_zero from SecureMem with scratch, 64
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Internal helper: build mac_data buffer
+Note: ============================================================================
+
+Process called "aead_build_mac_data" takes arena as Integer, aad as Integer, aad_len as Integer, ct as Integer, ct_len as Integer returns Integer:
+    @Reasoning
+    Constructs the mac_data buffer per RFC 8439 section 2.8.1:
+      mac_data = AAD || pad16(AAD) || CT || pad16(CT) || le64(AAD_len) || le64(CT_len)
+    where pad16(X) is the smallest non-negative number of zero bytes
+    that makes |X|+|pad16(X)| a multiple of 16.
+    @End Reasoning
+
+    @Implementation
+    1. Compute pad lengths: aad_pad = (16 - aad_len % 16) % 16,
+       ct_pad = (16 - ct_len % 16) % 16.
+    2. Allocate buffer of size aad_len + aad_pad + ct_len + ct_pad + 16.
+    3. Copy AAD bytes; zero-fill pad region.
+    4. Copy CT bytes; zero-fill pad region.
+    5. Append le64(aad_len) and le64(ct_len).
+    Returns the buffer pointer, or 0 on allocation failure.
+    @End Implementation
+
+    @Performance_Hints
+    O(aad_len + ct_len) work. The two pad fills are negligible.
+    @End Performance_Hints
+
+    @Security_Scope
+    No secret-dependent control flow. The pad lengths are public (derived
+    from aad_len and ct_len).
+    @End Security_Scope
+
+    Let aad_pad be 0
+    Let aad_rem be aad_len modulo by 16
+    If aad_rem is not equal to 0:
+        Set aad_pad to 16 minus aad_rem
+    End If
+    Let ct_pad be 0
+    Let ct_rem be ct_len modulo by 16
+    If ct_rem is not equal to 0:
+        Set ct_pad to 16 minus ct_rem
+    End If
+
+    Let total be aad_len plus aad_pad plus ct_len plus ct_pad plus 16
+    Let buf be proc arena_allocate from Arena with arena, total
+    If buf is equal to 0:
+        Return 0
+    End If
+    proc memory_zero from Memory with buf, total
+
+    Let offset be 0
+    If aad_len is greater than 0:
+        proc memory_copy from Memory with buf plus offset, aad, aad_len
+    End If
+    Set offset to offset plus aad_len plus aad_pad
+
+    If ct_len is greater than 0:
+        proc memory_copy from Memory with buf plus offset, ct, ct_len
+    End If
+    Set offset to offset plus ct_len plus ct_pad
+
+    Note: Append le64(aad_len)
+    Let aad_lo be aad_len bitwise_and 4294967295
+    Let aad_hi be aad_len divided by 4294967296
+    Let aad_v0 be aad_lo bitwise_and 255
+    Let aad_v1 be aad_lo divided by 256
+    Set aad_v1 to aad_v1 bitwise_and 255
+    Let aad_v2 be aad_lo divided by 65536
+    Set aad_v2 to aad_v2 bitwise_and 255
+    Let aad_v3 be aad_lo divided by 16777216
+    Set aad_v3 to aad_v3 bitwise_and 255
+    Let aad_v4 be aad_hi bitwise_and 255
+    Let aad_v5 be aad_hi divided by 256
+    Set aad_v5 to aad_v5 bitwise_and 255
+    Let aad_v6 be aad_hi divided by 65536
+    Set aad_v6 to aad_v6 bitwise_and 255
+    Let aad_v7 be aad_hi divided by 16777216
+    Set aad_v7 to aad_v7 bitwise_and 255
+    proc memory_set_byte from Memory with buf, offset, aad_v0
+    proc memory_set_byte from Memory with buf, offset plus 1, aad_v1
+    proc memory_set_byte from Memory with buf, offset plus 2, aad_v2
+    proc memory_set_byte from Memory with buf, offset plus 3, aad_v3
+    proc memory_set_byte from Memory with buf, offset plus 4, aad_v4
+    proc memory_set_byte from Memory with buf, offset plus 5, aad_v5
+    proc memory_set_byte from Memory with buf, offset plus 6, aad_v6
+    proc memory_set_byte from Memory with buf, offset plus 7, aad_v7
+
+    Note: Append le64(ct_len)
+    Let ct_lo be ct_len bitwise_and 4294967295
+    Let ct_hi be ct_len divided by 4294967296
+    Let ct_v0 be ct_lo bitwise_and 255
+    Let ct_v1 be ct_lo divided by 256
+    Set ct_v1 to ct_v1 bitwise_and 255
+    Let ct_v2 be ct_lo divided by 65536
+    Set ct_v2 to ct_v2 bitwise_and 255
+    Let ct_v3 be ct_lo divided by 16777216
+    Set ct_v3 to ct_v3 bitwise_and 255
+    Let ct_v4 be ct_hi bitwise_and 255
+    Let ct_v5 be ct_hi divided by 256
+    Set ct_v5 to ct_v5 bitwise_and 255
+    Let ct_v6 be ct_hi divided by 65536
+    Set ct_v6 to ct_v6 bitwise_and 255
+    Let ct_v7 be ct_hi divided by 16777216
+    Set ct_v7 to ct_v7 bitwise_and 255
+    proc memory_set_byte from Memory with buf, offset plus 8, ct_v0
+    proc memory_set_byte from Memory with buf, offset plus 9, ct_v1
+    proc memory_set_byte from Memory with buf, offset plus 10, ct_v2
+    proc memory_set_byte from Memory with buf, offset plus 11, ct_v3
+    proc memory_set_byte from Memory with buf, offset plus 12, ct_v4
+    proc memory_set_byte from Memory with buf, offset plus 13, ct_v5
+    proc memory_set_byte from Memory with buf, offset plus 14, ct_v6
+    proc memory_set_byte from Memory with buf, offset plus 15, ct_v7
+
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: AEAD seal (encrypt + authenticate)
+Note: ============================================================================
+
+Process called "chacha20_poly1305_seal" takes arena as Integer, key as Integer, nonce as Integer, aad as Integer, aad_len as Integer, plaintext as Integer, pt_len as Integer, ct_and_tag_out as Integer returns Integer:
+    @Reasoning
+    AEAD encryption per RFC 8439 section 2.8.1. Writes pt_len bytes of
+    ciphertext followed by a 16-byte authentication tag into
+    ct_and_tag_out (a single buffer of size pt_len + 16). The combined
+    layout matches the IETF AEAD output convention and avoids the
+    9-argument dotted-call limit by packing CT and tag in one buffer.
+    @End Reasoning
+
+    @Implementation
+    1. Validate inputs.
+    2. Derive Poly1305 one-time key: otk = ChaCha20-Block(key, nonce, 0)[0..32].
+    3. Encrypt plaintext into ct_and_tag_out[0..pt_len] using
+       ChaCha20-Encrypt(key, nonce, counter=1, plaintext).
+    4. Build mac_data = AAD || pad16 || CT || pad16 || le64(|AAD|) || le64(|CT|).
+    5. Compute tag = Poly1305(otk, mac_data). Write into ct_and_tag_out[pt_len..pt_len+16].
+    6. Securely wipe otk and mac_data.
+
+    Stage1 dotted-call argument limit: chacha20_poly1305_seal takes 8 args
+    (within the 8-arg limit). Internal helpers all keep their dotted-call
+    arity <= 7 to stay safely under the codegen 9-arg threshold.
+    @End Implementation
+
+    @Performance_Hints
+    Dominant cost is the ChaCha20 encryption: ~14 cycles/byte software.
+    Poly1305 adds ~7 cycles/byte. Total ~21 cycles/byte software, or ~3
+    cycles/byte with future SIMD lowering.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time encryption and MAC. The tag computation reads AAD and
+    CT bytes sequentially with no secret-dependent indexing.
+
+    NEVER reuse a (key, nonce) pair across distinct messages. Nonce reuse
+    in any AEAD with a counter-mode stream cipher (including ChaCha20)
+    catastrophically reveals plaintext XOR plaintext between the two
+    messages and additionally exposes the Poly1305 key, allowing tag
+    forgery for arbitrary subsequent messages under the same key. Caller
+    MUST enforce uniqueness of nonces under each key.
+
+    The 12-byte nonce gives 2^96 distinct nonces per key; cryptographically
+    safe for random nonce generation per RFC 8439 section 4.
+
+    Out of scope: protocol-level replay attacks (caller must layer a
+    monotonic counter or similar replay protection if needed).
+
+    References:
+    - RFC 8439 section 2.8.1 (seal pseudocode).
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If nonce is equal to 0:
+        Return 0
+    End If
+    If pt_len is less than 0:
+        Return 0
+    End If
+    If aad_len is less than 0:
+        Return 0
+    End If
+    If ct_and_tag_out is equal to 0:
+        Return 0
+    End If
+    If plaintext is equal to 0:
+        If pt_len is greater than 0:
+            Return 0
+        End If
+    End If
+    If aad is equal to 0:
+        If aad_len is greater than 0:
+            Return 0
+        End If
+    End If
+
+    Note: ---- Step 1: derive Poly1305 one-time key ----
+    Let otk be proc arena_allocate from Arena with arena, POLY1305_KEY_SIZE_LOCAL
+    If otk is equal to 0:
+        Return 0
+    End If
+    Let dk_rc be proc aead_derive_poly_key with arena, key, nonce, otk
+    If dk_rc is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Step 2: encrypt plaintext starting at counter 1 ----
+    If pt_len is greater than 0:
+        Let enc_rc be proc chacha20_encrypt from ChaCha20 with arena, key, nonce, 1, plaintext, pt_len, ct_and_tag_out
+        If enc_rc is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Note: ---- Step 3: build mac_data and compute tag ----
+    Let mac_data be proc aead_build_mac_data with arena, aad, aad_len, ct_and_tag_out, pt_len
+    If mac_data is equal to 0:
+        Return 0
+    End If
+
+    Let aad_pad be 0
+    Let aad_rem be aad_len modulo by 16
+    If aad_rem is not equal to 0:
+        Set aad_pad to 16 minus aad_rem
+    End If
+    Let ct_pad be 0
+    Let ct_rem be pt_len modulo by 16
+    If ct_rem is not equal to 0:
+        Set ct_pad to 16 minus ct_rem
+    End If
+    Let mac_len be aad_len plus aad_pad plus pt_len plus ct_pad plus 16
+
+    Let tag_dst be ct_and_tag_out plus pt_len
+    Let mac_rc be proc poly1305_mac from Poly1305 with arena, otk, mac_data, mac_len, tag_dst
+    If mac_rc is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Wipe secret-derived intermediates ----
+    proc secure_zero from SecureMem with otk, POLY1305_KEY_SIZE_LOCAL
+    proc secure_zero from SecureMem with mac_data, mac_len
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: AEAD open (verify + decrypt)
+Note: ============================================================================
+
+Process called "chacha20_poly1305_open" takes arena as Integer, key as Integer, nonce as Integer, aad as Integer, aad_len as Integer, ct_and_tag as Integer, ct_len as Integer, plaintext_out as Integer returns Integer:
+    @Reasoning
+    AEAD decryption per RFC 8439 section 2.8.2. Verifies the 16-byte tag
+    appended to the ciphertext in constant time; if valid, decrypts the
+    ciphertext into plaintext_out and returns 1; otherwise returns 0
+    without writing to plaintext_out (the tag-then-decrypt order is
+    critical for security per Bellare-Namprempre encrypt-then-MAC).
+
+    The input layout matches seal's output: ct_and_tag[0..ct_len] is the
+    ciphertext, ct_and_tag[ct_len..ct_len+16] is the tag.
+    @End Reasoning
+
+    @Implementation
+    1. Validate inputs (key/nonce non-null, lengths non-negative).
+    2. Derive otk = ChaCha20-Block(key, nonce, 0)[0..32].
+    3. Build mac_data from AAD and the received ciphertext.
+    4. Recompute tag = Poly1305(otk, mac_data).
+    5. constant_time_compare the recomputed tag against the appended tag.
+    6. If equal, decrypt the ciphertext into plaintext_out using
+       ChaCha20-Encrypt(key, nonce, counter=1, ciphertext). Return 1.
+    7. If not equal, return 0. plaintext_out is left untouched
+       (caller MUST not consume it on a failed open).
+    8. Securely wipe otk, mac_data, and the recomputed tag whether
+       open succeeds or fails (a failed verify still leaked key material
+       into the otk buffer).
+    @End Implementation
+
+    @Performance_Hints
+    Same cost as seal: dominated by ChaCha20 encryption + Poly1305 MAC.
+    The constant-time compare on the 16-byte tag adds <1 microsecond.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against:
+    - Tag-bit timing oracles (constant_time_compare).
+    - Chosen-ciphertext oracles that would leak plaintext on tag failure
+      (we verify BEFORE decrypting and never expose intermediate state).
+    - Catastrophic key-recovery from nonce reuse on a SINGLE failed open
+      (the otk is derived from a fixed (key, nonce) so observing the
+      tag-failure path does not reveal the otk; the otk is wiped
+      regardless of outcome).
+
+    Out of scope: side-channel leakage of plaintext via timing of the
+    ChaCha20 decryption (ChaCha20 is constant-time by construction).
+
+    References:
+    - RFC 8439 section 2.8.2 (open pseudocode).
+    - Bellare and Namprempre, "Authenticated Encryption: Relations among
+      notions and analysis of the generic composition paradigm", 2008.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If nonce is equal to 0:
+        Return 0
+    End If
+    If ct_len is less than 0:
+        Return 0
+    End If
+    If aad_len is less than 0:
+        Return 0
+    End If
+    If ct_and_tag is equal to 0:
+        Return 0
+    End If
+    If plaintext_out is equal to 0:
+        If ct_len is greater than 0:
+            Return 0
+        End If
+    End If
+    If aad is equal to 0:
+        If aad_len is greater than 0:
+            Return 0
+        End If
+    End If
+
+    Note: ---- Step 1: derive Poly1305 one-time key ----
+    Let otk be proc arena_allocate from Arena with arena, POLY1305_KEY_SIZE_LOCAL
+    If otk is equal to 0:
+        Return 0
+    End If
+    Let dk_rc be proc aead_derive_poly_key with arena, key, nonce, otk
+    If dk_rc is equal to 0:
+        proc secure_zero from SecureMem with otk, POLY1305_KEY_SIZE_LOCAL
+        Return 0
+    End If
+
+    Note: ---- Step 2: build mac_data over received ciphertext ----
+    Let mac_data be proc aead_build_mac_data with arena, aad, aad_len, ct_and_tag, ct_len
+    If mac_data is equal to 0:
+        proc secure_zero from SecureMem with otk, POLY1305_KEY_SIZE_LOCAL
+        Return 0
+    End If
+
+    Let aad_pad be 0
+    Let aad_rem be aad_len modulo by 16
+    If aad_rem is not equal to 0:
+        Set aad_pad to 16 minus aad_rem
+    End If
+    Let ct_pad be 0
+    Let ct_rem be ct_len modulo by 16
+    If ct_rem is not equal to 0:
+        Set ct_pad to 16 minus ct_rem
+    End If
+    Let mac_len be aad_len plus aad_pad plus ct_len plus ct_pad plus 16
+
+    Note: ---- Step 3: recompute the tag ----
+    Let computed_tag be proc arena_allocate from Arena with arena, AEAD_TAG_SIZE
+    If computed_tag is equal to 0:
+        proc secure_zero from SecureMem with otk, POLY1305_KEY_SIZE_LOCAL
+        proc secure_zero from SecureMem with mac_data, mac_len
+        Return 0
+    End If
+    Let mac_rc be proc poly1305_mac from Poly1305 with arena, otk, mac_data, mac_len, computed_tag
+    If mac_rc is equal to 0:
+        proc secure_zero from SecureMem with otk, POLY1305_KEY_SIZE_LOCAL
+        proc secure_zero from SecureMem with mac_data, mac_len
+        proc secure_zero from SecureMem with computed_tag, AEAD_TAG_SIZE
+        Return 0
+    End If
+
+    Note: ---- Step 4: constant-time tag compare ----
+    Let received_tag be ct_and_tag plus ct_len
+    Let eq be proc constant_time_compare from SecureMem with computed_tag, received_tag, AEAD_TAG_SIZE
+
+    Note: ---- Step 5: wipe regardless of outcome ----
+    proc secure_zero from SecureMem with mac_data, mac_len
+    proc secure_zero from SecureMem with computed_tag, AEAD_TAG_SIZE
+
+    If eq is equal to 0:
+        proc secure_zero from SecureMem with otk, POLY1305_KEY_SIZE_LOCAL
+        Return 0
+    End If
+
+    Note: ---- Step 6: decrypt (XOR with same keystream as seal used) ----
+    If ct_len is greater than 0:
+        Let dec_rc be proc chacha20_encrypt from ChaCha20 with arena, key, nonce, 1, ct_and_tag, ct_len, plaintext_out
+        If dec_rc is equal to 0:
+            proc secure_zero from SecureMem with otk, POLY1305_KEY_SIZE_LOCAL
+            Return 0
+        End If
+    End If
+
+    proc secure_zero from SecureMem with otk, POLY1305_KEY_SIZE_LOCAL
+    Return 1
+End Process

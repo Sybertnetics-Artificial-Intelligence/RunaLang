@@ -1,0 +1,1436 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+==============================================================================
+INI - Configuration files (de-facto format, no single RFC)
+==============================================================================
+
+Pure-Runa INI configuration file parser and serializer. INI has no
+single canonical specification; this implementation handles the union
+of features used across Windows GetPrivateProfileString, Python
+configparser, systemd unit files, and Wine .reg files.
+
+Supported features:
+- Sections: [section_name] and nested [parent.child] notation.
+- Optional sectionless top-level key=value group preceding the first
+  section header.
+- Line comments: ';' (classic Windows) and '#' (modern POSIX).
+- Continuation lines: trailing backslash joins to the next line.
+- Quoted values: "double quoted" and 'single quoted'. Internal escapes
+  inside double quotes follow C conventions (\n, \r, \t, \\ , \").
+- Single quotes are taken literally (no escape processing) per Python
+  configparser conventions.
+- Whitespace around keys and unquoted values is trimmed.
+- Empty values are allowed (key=, key alone, key followed by '=').
+:End Note
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Constant INI_COMMENT_SEMICOLON as Integer is 0
+Constant INI_COMMENT_HASH as Integer is 1
+Constant INI_COMMENT_BOTH as Integer is 2
+
+Constant INI_LINE_ENDING_CRLF as Integer is 0
+Constant INI_LINE_ENDING_LF as Integer is 1
+
+Constant INI_RESULT_OK as Integer is 0
+Constant INI_RESULT_ERROR as Integer is 1
+
+Note: ============================================================================
+Note: TYPE LAYOUTS
+Note: ============================================================================
+Note:
+IniEntry (16 bytes):
+  offset 0 : key   (String pointer)
+  offset 8 : value (String pointer)
+
+IniSection (40 bytes):
+  offset 0 : name           (String pointer or 0 for the sectionless group)
+  offset 8 : entries_ptr    (buffer of IniEntry pointers)
+  offset 16: entry_count    (Integer)
+  offset 24: entry_capacity (Integer)
+  offset 32: parent_section (String pointer of parent name for "parent.child", or 0)
+
+IniDocument (32 bytes):
+  offset 0 : sections_ptr   (buffer of IniSection pointers)
+  offset 8 : section_count  (Integer)
+  offset 16: section_cap    (Integer)
+  offset 24: toplevel       (IniSection pointer for sectionless entries or 0)
+
+IniDialect (32 bytes):
+  offset 0 : comment_char_mode (0=;, 1=#, 2=both)
+  offset 8 : line_endings      (0=CRLF, 1=LF)
+  offset 16: preferred_assign  (0='=', 1=':')
+  offset 24: quote_string_values (0/1; 0=never quote, 1=quote when needed)
+
+IniParseError (24 bytes):
+  offset 0 : line    (Integer, 1-based)
+  offset 8 : column  (Integer, 1-based)
+  offset 16: message (String pointer)
+
+IniResult (16 bytes):
+  offset 0 : variant (0=Ok, 1=Error)
+  offset 8 : payload (IniDocument or IniParseError pointer)
+:End Note
+
+Note: ============================================================================
+Note: BYTE BUILDER (local)
+Note: ============================================================================
+
+Process called "ibb_create" that takes initial_cap as Integer returns Integer:
+    Let b be allocate(24)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let cap be initial_cap
+    If cap is less than 16:
+        Set cap to 16
+    End If
+    Let data be allocate(cap)
+    If data is equal to 0:
+        deallocate(b)
+        Return 0
+    End If
+    __store(b, 0, data)
+    __store(b, 8, 0)
+    __store(b, 16, cap)
+    Return b
+End Process
+
+Process called "ibb_destroy" that takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let data be __load(b, 0)
+    If data is not equal to 0:
+        deallocate(data)
+    End If
+    deallocate(b)
+    Return 1
+End Process
+
+Process called "ibb_reserve" that takes b as Integer, extra as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be __load(b, 8)
+    Let cap be __load(b, 16)
+    Let needed be len plus extra plus 1
+    If needed is less than or equal to cap:
+        Return 1
+    End If
+    Let new_cap be cap
+    While new_cap is less than needed:
+        Set new_cap to new_cap multiplied by 2
+    End While
+    Let new_data be allocate(new_cap)
+    If new_data is equal to 0:
+        Return 0
+    End If
+    Let old_data be __load(b, 0)
+    Let i be 0
+    While i is less than len:
+        __byte_store(new_data, i, __byte_load(old_data, i))
+        Set i to i plus 1
+    End While
+    deallocate(old_data)
+    __store(b, 0, new_data)
+    __store(b, 16, new_cap)
+    Return 1
+End Process
+
+Process called "ibb_append_byte" that takes b as Integer, byte as Integer returns Integer:
+    If ibb_reserve(b, 1) is equal to 0:
+        Return 0
+    End If
+    Let data be __load(b, 0)
+    Let len be __load(b, 8)
+    __byte_store(data, len, byte)
+    __store(b, 8, len plus 1)
+    Return 1
+End Process
+
+Process called "ibb_append_string" that takes b as Integer, s as Integer returns Integer:
+    If s is equal to 0:
+        Return 1
+    End If
+    Let sl be string_length(s)
+    If ibb_reserve(b, sl) is equal to 0:
+        Return 0
+    End If
+    Let data be __load(b, 0)
+    Let len be __load(b, 8)
+    Let i be 0
+    While i is less than sl:
+        __byte_store(data, len plus i, string_char_at(s, i))
+        Set i to i plus 1
+    End While
+    __store(b, 8, len plus sl)
+    Return 1
+End Process
+
+Process called "ibb_finalize" that takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be __load(b, 8)
+    Let data be __load(b, 0)
+    Let result be allocate(len plus 1)
+    If result is equal to 0:
+        ibb_destroy(b)
+        Return 0
+    End If
+    Let i be 0
+    While i is less than len:
+        __byte_store(result, i, __byte_load(data, i))
+        Set i to i plus 1
+    End While
+    __byte_store(result, len, 0)
+    ibb_destroy(b)
+    Return result
+End Process
+
+Note: ============================================================================
+Note: DIALECT
+Note: ============================================================================
+
+Process called "ini_dialect_create" returns Integer:
+    @Reasoning
+        Default INI dialect: both ';' and '#' comments accepted, LF line
+        endings, '=' assignment, no automatic quoting (values are emitted
+        as-is unless quoting was preserved during parsing - this is a
+        deliberate fidelity choice).
+    @End Reasoning
+    @Implementation
+        Allocates 32-byte record with the four dialect knobs.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        No external input.
+    @End Security_Scope
+
+    Let d be allocate(32)
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 0, 2)
+    __store(d, 8, 1)
+    __store(d, 16, 0)
+    __store(d, 24, 1)
+    Return d
+End Process
+
+Process called "ini_dialect_set_comment_mode" that takes d as Integer, mode as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 0, mode)
+    Return 1
+End Process
+
+Process called "ini_dialect_set_line_endings" that takes d as Integer, mode as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 8, mode)
+    Return 1
+End Process
+
+Process called "ini_dialect_set_assign_char" that takes d as Integer, mode as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 16, mode)
+    Return 1
+End Process
+
+Process called "ini_dialect_set_quote_strings" that takes d as Integer, flag as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 24, flag)
+    Return 1
+End Process
+
+Process called "ini_dialect_destroy" that takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    deallocate(d)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ENTRY / SECTION / DOCUMENT
+Note: ============================================================================
+
+Process called "ini_entry_create" that takes key as Integer, value as Integer returns Integer:
+    Let e be allocate(16)
+    If e is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        __store(e, 0, string_duplicate(""))
+    Otherwise:
+        __store(e, 0, string_duplicate(key))
+    End If
+    If value is equal to 0:
+        __store(e, 8, string_duplicate(""))
+    Otherwise:
+        __store(e, 8, string_duplicate(value))
+    End If
+    Return e
+End Process
+
+Process called "ini_entry_key" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 0)
+End Process
+
+Process called "ini_entry_value" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 8)
+End Process
+
+Process called "ini_section_create" that takes name as Integer returns Integer:
+    Let s be allocate(40)
+    If s is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        __store(s, 0, 0)
+    Otherwise:
+        __store(s, 0, string_duplicate(name))
+    End If
+    Let entries be allocate(32)
+    If entries is equal to 0:
+        deallocate(s)
+        Return 0
+    End If
+    __store(s, 8, entries)
+    __store(s, 16, 0)
+    __store(s, 24, 4)
+    __store(s, 32, 0)
+    Return s
+End Process
+
+Process called "ini_section_name" that takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Return __load(s, 0)
+End Process
+
+Process called "ini_section_parent" that takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Return __load(s, 32)
+End Process
+
+Process called "ini_section_set_parent" that takes s as Integer, parent_name as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    If parent_name is equal to 0:
+        __store(s, 32, 0)
+    Otherwise:
+        __store(s, 32, string_duplicate(parent_name))
+    End If
+    Return 1
+End Process
+
+Process called "ini_section_entry_count" that takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Return __load(s, 16)
+End Process
+
+Process called "ini_section_entry_at" that takes s as Integer, index as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let len be __load(s, 16)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to len:
+        Return 0
+    End If
+    Let entries be __load(s, 8)
+    Return __load(entries, index multiplied by 8)
+End Process
+
+Process called "ini_section_append_entry" that takes s as Integer, entry as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let len be __load(s, 16)
+    Let cap be __load(s, 24)
+    If len is greater than or equal to cap:
+        Let new_cap be cap multiplied by 2
+        Let new_entries be allocate(new_cap multiplied by 8)
+        If new_entries is equal to 0:
+            Return 0
+        End If
+        Let old_entries be __load(s, 8)
+        Let i be 0
+        While i is less than len:
+            __store(new_entries, i multiplied by 8, __load(old_entries, i multiplied by 8))
+            Set i to i plus 1
+        End While
+        deallocate(old_entries)
+        __store(s, 8, new_entries)
+        __store(s, 24, new_cap)
+    End If
+    Let entries be __load(s, 8)
+    __store(entries, len multiplied by 8, entry)
+    __store(s, 16, len plus 1)
+    Return 1
+End Process
+
+Process called "ini_section_get" that takes s as Integer, key as Integer returns Integer:
+    Note: Linear search; returns the value of the first matching key or 0.
+    If s is equal to 0:
+        Return 0
+    End If
+    Let len be __load(s, 16)
+    Let entries be __load(s, 8)
+    Let i be 0
+    While i is less than len:
+        Let e be __load(entries, i multiplied by 8)
+        Let k be __load(e, 0)
+        If string_equals(k, key) is equal to 1:
+            Return __load(e, 8)
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "ini_section_set" that takes s as Integer, key as Integer, value as Integer returns Integer:
+    Note: Update existing key in place, otherwise append. Returns 1 on success.
+    If s is equal to 0:
+        Return 0
+    End If
+    Let len be __load(s, 16)
+    Let entries be __load(s, 8)
+    Let i be 0
+    While i is less than len:
+        Let e be __load(entries, i multiplied by 8)
+        Let k be __load(e, 0)
+        If string_equals(k, key) is equal to 1:
+            __store(e, 8, string_duplicate(value))
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Let new_entry be ini_entry_create(key, value)
+    Return ini_section_append_entry(s, new_entry)
+End Process
+
+Process called "ini_document_create" returns Integer:
+    Let doc be allocate(32)
+    If doc is equal to 0:
+        Return 0
+    End If
+    Let sections be allocate(32)
+    If sections is equal to 0:
+        deallocate(doc)
+        Return 0
+    End If
+    __store(doc, 0, sections)
+    __store(doc, 8, 0)
+    __store(doc, 16, 4)
+    __store(doc, 24, 0)
+    Return doc
+End Process
+
+Process called "ini_document_section_count" that takes doc as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Return __load(doc, 8)
+End Process
+
+Process called "ini_document_section_at" that takes doc as Integer, index as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Let len be __load(doc, 8)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to len:
+        Return 0
+    End If
+    Let sections be __load(doc, 0)
+    Return __load(sections, index multiplied by 8)
+End Process
+
+Process called "ini_document_append_section" that takes doc as Integer, section as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Let len be __load(doc, 8)
+    Let cap be __load(doc, 16)
+    If len is greater than or equal to cap:
+        Let new_cap be cap multiplied by 2
+        Let new_sections be allocate(new_cap multiplied by 8)
+        If new_sections is equal to 0:
+            Return 0
+        End If
+        Let old_sections be __load(doc, 0)
+        Let i be 0
+        While i is less than len:
+            __store(new_sections, i multiplied by 8, __load(old_sections, i multiplied by 8))
+            Set i to i plus 1
+        End While
+        deallocate(old_sections)
+        __store(doc, 0, new_sections)
+        __store(doc, 16, new_cap)
+    End If
+    Let sections be __load(doc, 0)
+    __store(sections, len multiplied by 8, section)
+    __store(doc, 8, len plus 1)
+    Return 1
+End Process
+
+Process called "ini_document_toplevel" that takes doc as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Return __load(doc, 24)
+End Process
+
+Process called "ini_document_set_toplevel" that takes doc as Integer, section as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    __store(doc, 24, section)
+    Return 1
+End Process
+
+Process called "ini_document_find_section" that takes doc as Integer, name as Integer returns Integer:
+    Note: Find section by exact name match.
+    If doc is equal to 0:
+        Return 0
+    End If
+    Let len be __load(doc, 8)
+    Let sections be __load(doc, 0)
+    Let i be 0
+    While i is less than len:
+        Let s be __load(sections, i multiplied by 8)
+        Let sn be __load(s, 0)
+        If string_equals(sn, name) is equal to 1:
+            Return s
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: RESULT / ERROR
+Note: ============================================================================
+
+Process called "ini_result_ok" that takes value as Integer returns Integer:
+    Let r be allocate(16)
+    If r is equal to 0:
+        Return 0
+    End If
+    __store(r, 0, 0)
+    __store(r, 8, value)
+    Return r
+End Process
+
+Process called "ini_result_error" that takes err as Integer returns Integer:
+    Let r be allocate(16)
+    If r is equal to 0:
+        Return 0
+    End If
+    __store(r, 0, 1)
+    __store(r, 8, err)
+    Return r
+End Process
+
+Process called "ini_result_is_ok" that takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Let variant be __load(r, 0)
+    If variant is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "ini_result_payload" that takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Return __load(r, 8)
+End Process
+
+Process called "ini_error_create" that takes line as Integer, column as Integer, message as Integer returns Integer:
+    Let e be allocate(24)
+    If e is equal to 0:
+        Return 0
+    End If
+    __store(e, 0, line)
+    __store(e, 8, column)
+    If message is equal to 0:
+        __store(e, 16, string_duplicate(""))
+    Otherwise:
+        __store(e, 16, string_duplicate(message))
+    End If
+    Return e
+End Process
+
+Process called "ini_error_line" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 0)
+End Process
+
+Process called "ini_error_column" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 8)
+End Process
+
+Process called "ini_error_message" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 16)
+End Process
+
+Note: ============================================================================
+Note: PARSE HELPERS
+Note: ============================================================================
+
+Process called "is_ws_byte" that takes c as Integer returns Integer:
+    If c is equal to 32:
+        Return 1
+    End If
+    If c is equal to 9:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "ini_is_comment_start" that takes c as Integer, mode as Integer returns Integer:
+    If mode is equal to 0:
+        If c is equal to 59:
+            Return 1
+        End If
+        Return 0
+    End If
+    If mode is equal to 1:
+        If c is equal to 35:
+            Return 1
+        End If
+        Return 0
+    End If
+    If c is equal to 59:
+        Return 1
+    End If
+    If c is equal to 35:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "string_trim" that takes s as Integer returns Integer:
+    Note: Return a freshly allocated copy of s with leading and trailing
+    Note: ASCII whitespace (space, tab) removed. Caller owns the result.
+    If s is equal to 0:
+        Return string_duplicate("")
+    End If
+    Let n be string_length(s)
+    Let start be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        If start is greater than or equal to n:
+            Set scanning to 0
+        Otherwise:
+            Let c be string_char_at(s, start)
+            If is_ws_byte(c) is equal to 1:
+                Set start to start plus 1
+            Otherwise:
+                Set scanning to 0
+            End If
+        End If
+    End While
+    Let endp be n
+    Let scanning2 be 1
+    While scanning2 is equal to 1:
+        If endp is less than or equal to start:
+            Set scanning2 to 0
+        Otherwise:
+            Let c2 be string_char_at(s, endp minus 1)
+            If is_ws_byte(c2) is equal to 1:
+                Set endp to endp minus 1
+            Otherwise:
+                Set scanning2 to 0
+            End If
+        End If
+    End While
+    Let len be endp minus start
+    Let buf be allocate(len plus 1)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than len:
+        __byte_store(buf, i, string_char_at(s, start plus i))
+        Set i to i plus 1
+    End While
+    __byte_store(buf, len, 0)
+    Return buf
+End Process
+
+Process called "unquote_double" that takes s as Integer returns Integer:
+    Note: Process a double-quoted INI value: returns the inner bytes with
+    Note: \n, \r, \t, \\ , \" escapes resolved. Caller passes a string
+    Note: WITHOUT the enclosing quotes. Caller owns the result.
+    If s is equal to 0:
+        Return string_duplicate("")
+    End If
+    Let n be string_length(s)
+    Let bb be ibb_create(n plus 1)
+    Let i be 0
+    While i is less than n:
+        Let c be string_char_at(s, i)
+        If c is equal to 92:
+            If i plus 1 is less than n:
+                Let nx be string_char_at(s, i plus 1)
+                If nx is equal to 110:
+                    ibb_append_byte(bb, 10)
+                Otherwise:
+                    If nx is equal to 114:
+                        ibb_append_byte(bb, 13)
+                    Otherwise:
+                        If nx is equal to 116:
+                            ibb_append_byte(bb, 9)
+                        Otherwise:
+                            If nx is equal to 92:
+                                ibb_append_byte(bb, 92)
+                            Otherwise:
+                                If nx is equal to 34:
+                                    ibb_append_byte(bb, 34)
+                                Otherwise:
+                                    ibb_append_byte(bb, nx)
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+                Set i to i plus 2
+            Otherwise:
+                ibb_append_byte(bb, c)
+                Set i to i plus 1
+            End If
+        Otherwise:
+            ibb_append_byte(bb, c)
+            Set i to i plus 1
+        End If
+    End While
+    Return ibb_finalize(bb)
+End Process
+
+Process called "logical_line_read" that takes text as Integer, pos_ptr as Integer, line_ptr as Integer returns Integer:
+    Note: Reads one logical INI line starting at *pos_ptr, handling
+    Note: trailing-backslash continuation. The position is advanced past
+    Note: the terminating LF / CRLF / EOF. line_ptr receives the current
+    Note: line number on entry; it is updated to reflect the lines consumed
+    Note: by continuations. Returns a freshly-allocated NUL-terminated
+    Note: string containing the joined logical line (without comments
+    Note: stripped - the caller handles comment stripping). Returns 0 at EOF.
+    Let n be string_length(text)
+    Let pos be __load(pos_ptr, 0)
+    If pos is greater than or equal to n:
+        Return 0
+    End If
+    Let bb be ibb_create(64)
+    Let reading be 1
+    While reading is equal to 1:
+        Let line_start be pos
+        Let cont_after_line be 0
+        Let line_done be 0
+        While line_done is equal to 0:
+            If pos is greater than or equal to n:
+                Set line_done to 1
+            Otherwise:
+                Let c be string_char_at(text, pos)
+                If c is equal to 10:
+                    Set pos to pos plus 1
+                    Let ln_cur be __load(line_ptr, 0)
+                    __store(line_ptr, 0, ln_cur plus 1)
+                    Set line_done to 1
+                Otherwise:
+                    If c is equal to 13:
+                        Set pos to pos plus 1
+                        If pos is less than n:
+                            If string_char_at(text, pos) is equal to 10:
+                                Set pos to pos plus 1
+                            End If
+                        End If
+                        Let ln_cur2 be __load(line_ptr, 0)
+                        __store(line_ptr, 0, ln_cur2 plus 1)
+                        Set line_done to 1
+                    Otherwise:
+                        Set pos to pos plus 1
+                    End If
+                End If
+            End If
+        End While
+        Let raw_end be pos
+        If pos minus line_start is greater than 0:
+            Let probe be raw_end minus 1
+            If probe is greater than or equal to line_start:
+                Let last be string_char_at(text, probe)
+                If last is equal to 10:
+                    Set probe to probe minus 1
+                    If probe is greater than or equal to line_start:
+                        Let last2 be string_char_at(text, probe)
+                        If last2 is equal to 13:
+                            Set probe to probe minus 1
+                        End If
+                    End If
+                Otherwise:
+                    If last is equal to 13:
+                        Set probe to probe minus 1
+                    End If
+                End If
+                If probe is greater than or equal to line_start:
+                    Let final_c be string_char_at(text, probe)
+                    If final_c is equal to 92:
+                        Set cont_after_line to 1
+                    End If
+                End If
+            End If
+        End If
+        Let segment_end be raw_end
+        If cont_after_line is equal to 1:
+            Let scan be raw_end minus 1
+            Let stripped be 0
+            While stripped is equal to 0:
+                If scan is less than line_start:
+                    Set stripped to 1
+                Otherwise:
+                    Let sc be string_char_at(text, scan)
+                    If sc is equal to 10:
+                        Set scan to scan minus 1
+                    Otherwise:
+                        If sc is equal to 13:
+                            Set scan to scan minus 1
+                        Otherwise:
+                            If sc is equal to 92:
+                                Set segment_end to scan
+                                Set scan to scan minus 1
+                                Set stripped to 1
+                            Otherwise:
+                                Set stripped to 1
+                            End If
+                        End If
+                    End If
+                End If
+            End While
+        End If
+        Let copy_i be line_start
+        While copy_i is less than segment_end:
+            Let cc be string_char_at(text, copy_i)
+            If cc is equal to 10:
+                Set copy_i to copy_i plus 1
+            Otherwise:
+                If cc is equal to 13:
+                    Set copy_i to copy_i plus 1
+                Otherwise:
+                    ibb_append_byte(bb, cc)
+                    Set copy_i to copy_i plus 1
+                End If
+            End If
+        End While
+        If cont_after_line is equal to 0:
+            Set reading to 0
+        End If
+    End While
+    __store(pos_ptr, 0, pos)
+    Return ibb_finalize(bb)
+End Process
+
+Process called "strip_comment" that takes line as Integer, comment_mode as Integer returns Integer:
+    Note: Returns a freshly allocated copy of line truncated at the first
+    Note: unquoted comment character matching comment_mode. Comment chars
+    Note: inside double or single quotes are taken literally.
+    If line is equal to 0:
+        Return string_duplicate("")
+    End If
+    Let n be string_length(line)
+    Let bb be ibb_create(n plus 1)
+    Let i be 0
+    Let in_dq be 0
+    Let in_sq be 0
+    Let done be 0
+    While done is equal to 0:
+        If i is greater than or equal to n:
+            Set done to 1
+        Otherwise:
+            Let c be string_char_at(line, i)
+            If in_dq is equal to 1:
+                If c is equal to 92:
+                    ibb_append_byte(bb, c)
+                    Set i to i plus 1
+                    If i is less than n:
+                        ibb_append_byte(bb, string_char_at(line, i))
+                        Set i to i plus 1
+                    End If
+                Otherwise:
+                    If c is equal to 34:
+                        Set in_dq to 0
+                    End If
+                    ibb_append_byte(bb, c)
+                    Set i to i plus 1
+                End If
+            Otherwise:
+                If in_sq is equal to 1:
+                    If c is equal to 39:
+                        Set in_sq to 0
+                    End If
+                    ibb_append_byte(bb, c)
+                    Set i to i plus 1
+                Otherwise:
+                    If ini_is_comment_start(c, comment_mode) is equal to 1:
+                        Set done to 1
+                    Otherwise:
+                        If c is equal to 34:
+                            Set in_dq to 1
+                            ibb_append_byte(bb, c)
+                            Set i to i plus 1
+                        Otherwise:
+                            If c is equal to 39:
+                                Set in_sq to 1
+                                ibb_append_byte(bb, c)
+                                Set i to i plus 1
+                            Otherwise:
+                                ibb_append_byte(bb, c)
+                                Set i to i plus 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return ibb_finalize(bb)
+End Process
+
+Process called "split_section_name" that takes name as Integer returns Integer:
+    Note: Looks for the last '.' in name and returns its index, or -1 if none.
+    Note: Used to detect parent.child sections.
+    If name is equal to 0:
+        Return -1
+    End If
+    Let n be string_length(name)
+    Let i be n minus 1
+    While i is greater than or equal to 0:
+        If string_char_at(name, i) is equal to 46:
+            Return i
+        End If
+        Set i to i minus 1
+    End While
+    Return -1
+End Process
+
+Process called "parse_section_header" that takes line as Integer returns Integer:
+    Note: Given a logical line whose first non-ws byte is '[', parse the
+    Note: section name. Returns a freshly allocated string, or 0 on
+    Note: malformed input.
+    If line is equal to 0:
+        Return 0
+    End If
+    Let n be string_length(line)
+    Let i be 0
+    While i is less than n:
+        Let c be string_char_at(line, i)
+        If is_ws_byte(c) is equal to 1:
+            Set i to i plus 1
+        Otherwise:
+            Set i to n plus 1
+        End If
+    End While
+    If i is equal to n:
+        Return 0
+    End If
+    Set i to i minus n minus 1
+    Let p be 0
+    While p is less than n:
+        Let c2 be string_char_at(line, p)
+        If is_ws_byte(c2) is equal to 0:
+            Set p to n plus 1
+        Otherwise:
+            Set p to p plus 1
+        End If
+    End While
+    If p is greater than n:
+        Set p to p minus n minus 1
+    End If
+    If string_char_at(line, p) is not equal to 91:
+        Return 0
+    End If
+    Set p to p plus 1
+    Let bb be ibb_create(16)
+    Let scanning be 1
+    Let saw_close be 0
+    While scanning is equal to 1:
+        If p is greater than or equal to n:
+            Set scanning to 0
+        Otherwise:
+            Let cc be string_char_at(line, p)
+            If cc is equal to 93:
+                Set saw_close to 1
+                Set scanning to 0
+            Otherwise:
+                ibb_append_byte(bb, cc)
+                Set p to p plus 1
+            End If
+        End If
+    End While
+    If saw_close is equal to 0:
+        ibb_destroy(bb)
+        Return 0
+    End If
+    Let inner be ibb_finalize(bb)
+    Let trimmed be string_trim(inner)
+    deallocate(inner)
+    Return trimmed
+End Process
+
+Process called "parse_kv" that takes line as Integer, key_out_ptr as Integer, value_out_ptr as Integer returns Integer:
+    Note: Parses key '=' or ':' value from line. Stores allocated copies
+    Note: of key and value via the out pointers (which are 1-word slots).
+    Note: Returns 1 on success, 0 if no '=' or ':' present.
+    If line is equal to 0:
+        Return 0
+    End If
+    Let n be string_length(line)
+    Let i be 0
+    Let sep_pos be -1
+    While i is less than n:
+        Let c be string_char_at(line, i)
+        If c is equal to 61:
+            Set sep_pos to i
+            Set i to n
+        Otherwise:
+            If c is equal to 58:
+                Set sep_pos to i
+                Set i to n
+            Otherwise:
+                Set i to i plus 1
+            End If
+        End If
+    End While
+    If sep_pos is less than 0:
+        Note: Bare key with no separator: treat as empty value if non-empty.
+        Let trimmed_key_only be string_trim(line)
+        If string_length(trimmed_key_only) is equal to 0:
+            deallocate(trimmed_key_only)
+            Return 0
+        End If
+        __store(key_out_ptr, 0, trimmed_key_only)
+        __store(value_out_ptr, 0, string_duplicate(""))
+        Return 1
+    End If
+    Let key_buf be allocate(sep_pos plus 1)
+    Let k_i be 0
+    While k_i is less than sep_pos:
+        __byte_store(key_buf, k_i, string_char_at(line, k_i))
+        Set k_i to k_i plus 1
+    End While
+    __byte_store(key_buf, sep_pos, 0)
+    Let trimmed_key be string_trim(key_buf)
+    deallocate(key_buf)
+    Let val_len be n minus sep_pos minus 1
+    Let val_buf be allocate(val_len plus 1)
+    Let v_i be 0
+    While v_i is less than val_len:
+        __byte_store(val_buf, v_i, string_char_at(line, sep_pos plus 1 plus v_i))
+        Set v_i to v_i plus 1
+    End While
+    __byte_store(val_buf, val_len, 0)
+    Let trimmed_val be string_trim(val_buf)
+    deallocate(val_buf)
+    Let tv_len be string_length(trimmed_val)
+    If tv_len is greater than or equal to 2:
+        Let f0 be string_char_at(trimmed_val, 0)
+        Let fl be string_char_at(trimmed_val, tv_len minus 1)
+        If f0 is equal to 34:
+            If fl is equal to 34:
+                Let inner_len be tv_len minus 2
+                Let inner_buf be allocate(inner_len plus 1)
+                Let ii be 0
+                While ii is less than inner_len:
+                    __byte_store(inner_buf, ii, string_char_at(trimmed_val, ii plus 1))
+                    Set ii to ii plus 1
+                End While
+                __byte_store(inner_buf, inner_len, 0)
+                Let unq be unquote_double(inner_buf)
+                deallocate(inner_buf)
+                deallocate(trimmed_val)
+                Set trimmed_val to unq
+            End If
+        Otherwise:
+            If f0 is equal to 39:
+                If fl is equal to 39:
+                    Let inner_len2 be tv_len minus 2
+                    Let inner_buf2 be allocate(inner_len2 plus 1)
+                    Let jj be 0
+                    While jj is less than inner_len2:
+                        __byte_store(inner_buf2, jj, string_char_at(trimmed_val, jj plus 1))
+                        Set jj to jj plus 1
+                    End While
+                    __byte_store(inner_buf2, inner_len2, 0)
+                    deallocate(trimmed_val)
+                    Set trimmed_val to inner_buf2
+                End If
+            End If
+        End If
+    End If
+    __store(key_out_ptr, 0, trimmed_key)
+    __store(value_out_ptr, 0, trimmed_val)
+    Return 1
+End Process
+
+Process called "line_first_non_ws" that takes line as Integer returns Integer:
+    If line is equal to 0:
+        Return -1
+    End If
+    Let n be string_length(line)
+    Let i be 0
+    While i is less than n:
+        If is_ws_byte(string_char_at(line, i)) is equal to 0:
+            Return i
+        End If
+        Set i to i plus 1
+    End While
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: PUBLIC PARSE
+Note: ============================================================================
+
+Process called "ini_parse" that takes text as Integer returns Integer:
+    @Reasoning
+        Parse text as INI configuration, recognising sections, key=value
+        and key:value pairs, line comments (';' or '#'), continuation
+        lines (trailing '\') and quoted values ("..." with C-style
+        escapes, or '...' literal).
+    @End Reasoning
+    @Implementation
+        Reads one logical line at a time via logical_line_read (which
+        absorbs continuation lines into a single buffer), strips
+        comments via strip_comment, and dispatches on the first
+        non-whitespace byte: '[' is a section header; anything else is
+        parsed as key=value. The sectionless prelude is collected into
+        document.toplevel and addressed by accessor functions.
+        parent.child section names are recorded with the parent
+        registered on the IniSection via ini_section_set_parent.
+    @End Implementation
+    @Performance_Hints
+        O(n) in input length. Constant per-line allocation for the
+        logical-line buffer plus the parsed key/value strings.
+    @End Performance_Hints
+    @Security_Scope
+        Input is untrusted. All reads are bounded by string_length.
+        Malformed input (e.g. unterminated '[section]') yields an
+        Error result with line/column.
+    @End Security_Scope
+
+    If text is equal to 0:
+        Let e1 be ini_error_create(1, 1, "null input")
+        Return ini_result_error(e1)
+    End If
+    Let doc be ini_document_create()
+    If doc is equal to 0:
+        Let e2 be ini_error_create(1, 1, "out of memory")
+        Return ini_result_error(e2)
+    End If
+    Let pos_holder be allocate(8)
+    __store(pos_holder, 0, 0)
+    Let line_holder be allocate(8)
+    __store(line_holder, 0, 1)
+    Let current_section be 0
+    Let toplevel_lazy be 0
+    Let reading be 1
+    While reading is equal to 1:
+        Let line_before be __load(line_holder, 0)
+        Let line be logical_line_read(text, pos_holder, line_holder)
+        If line is equal to 0:
+            Set reading to 0
+        Otherwise:
+            Let stripped be strip_comment(line, 2)
+            deallocate(line)
+            Let trimmed be string_trim(stripped)
+            deallocate(stripped)
+            Let tn be string_length(trimmed)
+            If tn is equal to 0:
+                deallocate(trimmed)
+            Otherwise:
+                Let first be string_char_at(trimmed, 0)
+                If first is equal to 91:
+                    Let name be parse_section_header(trimmed)
+                    If name is equal to 0:
+                        Let err_line be line_before
+                        Let e3 be ini_error_create(err_line, 1, "malformed section header")
+                        deallocate(trimmed)
+                        deallocate(pos_holder)
+                        deallocate(line_holder)
+                        Return ini_result_error(e3)
+                    End If
+                    Let sec be ini_section_create(name)
+                    Let dot_pos be split_section_name(name)
+                    If dot_pos is greater than 0:
+                        Let parent_buf be allocate(dot_pos plus 1)
+                        Let pi be 0
+                        While pi is less than dot_pos:
+                            __byte_store(parent_buf, pi, string_char_at(name, pi))
+                            Set pi to pi plus 1
+                        End While
+                        __byte_store(parent_buf, dot_pos, 0)
+                        ini_section_set_parent(sec, parent_buf)
+                        deallocate(parent_buf)
+                    End If
+                    deallocate(name)
+                    ini_document_append_section(doc, sec)
+                    Set current_section to sec
+                    deallocate(trimmed)
+                Otherwise:
+                    Let kv_key_holder be allocate(8)
+                    __store(kv_key_holder, 0, 0)
+                    Let kv_val_holder be allocate(8)
+                    __store(kv_val_holder, 0, 0)
+                    If parse_kv(trimmed, kv_key_holder, kv_val_holder) is equal to 1:
+                        Let k be __load(kv_key_holder, 0)
+                        Let v be __load(kv_val_holder, 0)
+                        Let entry be ini_entry_create(k, v)
+                        deallocate(k)
+                        deallocate(v)
+                        Let target be current_section
+                        If target is equal to 0:
+                            If toplevel_lazy is equal to 0:
+                                Set toplevel_lazy to ini_section_create(0)
+                                ini_document_set_toplevel(doc, toplevel_lazy)
+                            End If
+                            Set target to toplevel_lazy
+                        End If
+                        ini_section_append_entry(target, entry)
+                    End If
+                    deallocate(kv_key_holder)
+                    deallocate(kv_val_holder)
+                    deallocate(trimmed)
+                End If
+            End If
+        End If
+    End While
+    deallocate(pos_holder)
+    deallocate(line_holder)
+    Return ini_result_ok(doc)
+End Process
+
+Note: ============================================================================
+Note: SERIALIZATION
+Note: ============================================================================
+
+Process called "value_needs_quoting" that takes v as Integer returns Integer:
+    Note: True if the value contains leading/trailing whitespace, embedded
+    Note: newlines, embedded quotes, embedded backslashes, or starts with
+    Note: a comment character. Such values are wrapped in double quotes.
+    If v is equal to 0:
+        Return 0
+    End If
+    Let n be string_length(v)
+    If n is equal to 0:
+        Return 0
+    End If
+    Let first be string_char_at(v, 0)
+    If is_ws_byte(first) is equal to 1:
+        Return 1
+    End If
+    Let last be string_char_at(v, n minus 1)
+    If is_ws_byte(last) is equal to 1:
+        Return 1
+    End If
+    Let i be 0
+    While i is less than n:
+        Let c be string_char_at(v, i)
+        If c is equal to 10:
+            Return 1
+        End If
+        If c is equal to 13:
+            Return 1
+        End If
+        If c is equal to 9:
+            Return 1
+        End If
+        If c is equal to 34:
+            Return 1
+        End If
+        If c is equal to 92:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    If first is equal to 59:
+        Return 1
+    End If
+    If first is equal to 35:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "serialize_value_into" that takes b as Integer, value as Integer, dialect as Integer returns Integer:
+    Let quote_strings be __load(dialect, 24)
+    Let needs_q be value_needs_quoting(value)
+    If quote_strings is equal to 0:
+        Set needs_q to 0
+    End If
+    If needs_q is equal to 0:
+        If value is not equal to 0:
+            ibb_append_string(b, value)
+        End If
+        Return 1
+    End If
+    ibb_append_byte(b, 34)
+    Let n be string_length(value)
+    Let i be 0
+    While i is less than n:
+        Let c be string_char_at(value, i)
+        If c is equal to 92:
+            ibb_append_byte(b, 92)
+            ibb_append_byte(b, 92)
+        Otherwise:
+            If c is equal to 34:
+                ibb_append_byte(b, 92)
+                ibb_append_byte(b, 34)
+            Otherwise:
+                If c is equal to 10:
+                    ibb_append_byte(b, 92)
+                    ibb_append_byte(b, 110)
+                Otherwise:
+                    If c is equal to 13:
+                        ibb_append_byte(b, 92)
+                        ibb_append_byte(b, 114)
+                    Otherwise:
+                        If c is equal to 9:
+                            ibb_append_byte(b, 92)
+                            ibb_append_byte(b, 116)
+                        Otherwise:
+                            ibb_append_byte(b, c)
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    ibb_append_byte(b, 34)
+    Return 1
+End Process
+
+Process called "append_eol" that takes b as Integer, dialect as Integer returns Integer:
+    Let mode be __load(dialect, 8)
+    If mode is equal to 0:
+        ibb_append_byte(b, 13)
+        ibb_append_byte(b, 10)
+        Return 1
+    End If
+    ibb_append_byte(b, 10)
+    Return 1
+End Process
+
+Process called "serialize_section_body_into" that takes b as Integer, sec as Integer, dialect as Integer returns Integer:
+    Let assign_mode be __load(dialect, 16)
+    Let assign_byte be 61
+    If assign_mode is equal to 1:
+        Set assign_byte to 58
+    End If
+    Let n be ini_section_entry_count(sec)
+    Let i be 0
+    While i is less than n:
+        Let e be ini_section_entry_at(sec, i)
+        ibb_append_string(b, ini_entry_key(e))
+        ibb_append_byte(b, assign_byte)
+        serialize_value_into(b, ini_entry_value(e), dialect)
+        append_eol(b, dialect)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "ini_serialize" that takes doc as Integer, dialect as Integer returns Integer:
+    @Reasoning
+        Emit doc as INI text. The toplevel sectionless group (if any)
+        is emitted first; then each named section as
+        [name] header followed by its key=value entries.
+    @End Reasoning
+    @Implementation
+        Walks document structure, building output via byte builder.
+        Values that require quoting (whitespace-edged, contain quotes,
+        contain newlines) are emitted in double-quoted form with
+        C-style escapes; this round-trips through ini_parse.
+    @End Implementation
+    @Performance_Hints
+        O(n) in total output bytes.
+    @End Performance_Hints
+    @Security_Scope
+        Pure transform of caller-owned data. No external I/O.
+    @End Security_Scope
+
+    If doc is equal to 0:
+        Return string_duplicate("")
+    End If
+    Let owned_dialect be 0
+    If dialect is equal to 0:
+        Set dialect to ini_dialect_create()
+        Set owned_dialect to 1
+    End If
+    Let b be ibb_create(128)
+    Let tl be ini_document_toplevel(doc)
+    If tl is not equal to 0:
+        serialize_section_body_into(b, tl, dialect)
+    End If
+    Let n be ini_document_section_count(doc)
+    Let i be 0
+    While i is less than n:
+        Let sec be ini_document_section_at(doc, i)
+        ibb_append_byte(b, 91)
+        ibb_append_string(b, ini_section_name(sec))
+        ibb_append_byte(b, 93)
+        append_eol(b, dialect)
+        serialize_section_body_into(b, sec, dialect)
+        Set i to i plus 1
+    End While
+    Let result be ibb_finalize(b)
+    If owned_dialect is equal to 1:
+        ini_dialect_destroy(dialect)
+    End If
+    Return result
+End Process

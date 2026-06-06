@@ -1,0 +1,1170 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+SQL NUMERIC(p, s) - Exact decimal arithmetic per SQL standard.
+
+This is distinct from IEEE 754 Decimal128 (which has a fixed exponent
+range and binary-encoded digits). SQL NUMERIC stores:
+  - precision p: total number of significant decimal digits (1..1000)
+  - scale s: number of digits to the right of the decimal point (0..p)
+  - sign: 0 = positive, 1 = negative
+  - digit stream: little-endian base-10 digits (one digit per byte)
+
+This implementation mirrors PostgreSQL NUMERIC, MySQL DECIMAL, and SQL
+Server DECIMAL semantics for arithmetic, rounding, and precision
+overflow.
+
+SQLNumeric layout (40 bytes):
+  offset 0:  precision (8 bytes)
+  offset 8:  scale     (8 bytes)
+  offset 16: sign      (8 bytes)
+  offset 24: digit_count (8 bytes)
+  offset 32: digit_buffer_ptr (8 bytes) - little-endian base-10 digits
+
+Dependencies:
+- numeric/decimal/decimal_bignum.runa (raw bignum ops)
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/numeric/decimal/decimal_bignum.runa" as DecBN
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Constant SN_OFF_PRECISION as Integer is 0
+Constant SN_OFF_SCALE as Integer is 8
+Constant SN_OFF_SIGN as Integer is 16
+Constant SN_OFF_DIGIT_COUNT as Integer is 24
+Constant SN_OFF_DIGITS as Integer is 32
+Constant SN_STRUCT_SIZE as Integer is 40
+
+Constant SN_OK as Integer is 1
+Constant SN_ERR_INVALID as Integer is 0
+Constant SN_ERR_OVERFLOW as Integer is -1
+Constant SN_ERR_DIV_ZERO as Integer is -2
+
+Constant SN_MAX_PRECISION as Integer is 1000
+
+Constant ROUND_HALF_EVEN as Integer is 0
+Constant ROUND_HALF_UP as Integer is 1
+Constant ROUND_TRUNCATE as Integer is 2
+
+Note: ============================================================================
+Note: Construction
+Note: ============================================================================
+
+@Reasoning
+Construct a SQLNumeric record. Allocates the digit buffer separately to
+allow precision changes via reallocation in later phases.
+@End Reasoning
+
+@Implementation
+Allocate the 40-byte record, allocate a digit buffer of `precision` bytes
+(one base-10 digit per byte), zero the digits, store fields.
+@End Implementation
+
+@Performance_Hints
+Two allocs. Reuse via sqlnum_assign for hot loops.
+@End Performance_Hints
+
+@Security_Scope
+precision must be in 1..SN_MAX_PRECISION, scale must be in 0..precision.
+@End Security_Scope
+
+Process called "sqlnum_create" takes precision as Integer, scale as Integer returns Integer:
+    If precision is less than 1:
+        Return 0
+    End If
+    If precision is greater than SN_MAX_PRECISION:
+        Return 0
+    End If
+    If scale is less than 0:
+        Return 0
+    End If
+    If scale is greater than precision:
+        Return 0
+    End If
+
+    Let n be proc allocate from Memory with SN_STRUCT_SIZE
+    If n is equal to 0:
+        Return 0
+    End If
+    Let digits be proc allocate from Memory with precision
+    If digits is equal to 0:
+        proc deallocate from Memory with n
+        Return 0
+    End If
+    Note: Zero-fill digit buffer
+    Let i be 0
+    While i is less than precision:
+        proc memory_set_byte from Mem with digits, i, 0
+        Set i to i plus 1
+    End While
+
+    proc memory_set_int64 from Mem with n, SN_OFF_PRECISION, precision
+    proc memory_set_int64 from Mem with n, SN_OFF_SCALE, scale
+    proc memory_set_int64 from Mem with n, SN_OFF_SIGN, 0
+    proc memory_set_int64 from Mem with n, SN_OFF_DIGIT_COUNT, 0
+    proc memory_set_int64 from Mem with n, SN_OFF_DIGITS, digits
+    Return n
+End Process
+
+Process called "sqlnum_destroy" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return SN_ERR_INVALID
+    End If
+    Let digits be proc memory_get_int64 from Mem with n, SN_OFF_DIGITS
+    If digits is not equal to 0:
+        proc deallocate from Memory with digits
+    End If
+    proc deallocate from Memory with n
+    Return SN_OK
+End Process
+
+Note: ============================================================================
+Note: Accessors
+Note: ============================================================================
+
+Process called "sqlnum_precision" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with n, SN_OFF_PRECISION
+End Process
+
+Process called "sqlnum_scale" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with n, SN_OFF_SCALE
+End Process
+
+Process called "sqlnum_sign" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with n, SN_OFF_SIGN
+End Process
+
+Process called "sqlnum_digit_count" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with n, SN_OFF_DIGIT_COUNT
+End Process
+
+Process called "sqlnum_is_zero" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Let dc be proc memory_get_int64 from Mem with n, SN_OFF_DIGIT_COUNT
+    If dc is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Integer construction
+Note: ============================================================================
+
+@Reasoning
+Build a SQLNumeric from a signed integer value. The scale is preserved
+(value is interpreted as the unscaled coefficient).
+@End Reasoning
+
+@Implementation
+Take absolute value of input, write decimal digits little-endian into the
+buffer up to precision, set sign and digit_count.
+@End Implementation
+
+@Performance_Hints
+O(digit_count).
+@End Performance_Hints
+
+@Security_Scope
+Caller must ensure the integer fits in `precision` digits after scaling.
+@End Security_Scope
+
+Process called "sqlnum_from_integer" takes precision as Integer, scale as Integer, value as Integer returns Integer:
+    Let n be proc sqlnum_create with precision, scale
+    If n is equal to 0:
+        Return 0
+    End If
+    Let sign be 0
+    Let mag be value
+    If mag is less than 0:
+        Set sign to 1
+        Set mag to (0 minus mag)
+    End If
+
+    Let digits be proc memory_get_int64 from Mem with n, SN_OFF_DIGITS
+    Let count be 0
+    While mag is not equal to 0:
+        If count is greater than or equal to precision:
+            proc sqlnum_destroy with n
+            Return 0
+        End If
+        Let d be mag minus ((mag divided by 10) multiplied by 10)
+        proc memory_set_byte from Mem with digits, count, d
+        Set mag to (mag divided by 10)
+        Set count to count plus 1
+    End While
+
+    proc memory_set_int64 from Mem with n, SN_OFF_SIGN, sign
+    proc memory_set_int64 from Mem with n, SN_OFF_DIGIT_COUNT, count
+    Return n
+End Process
+
+Note: ============================================================================
+Note: Parse from string
+Note: ============================================================================
+
+@Reasoning
+Parse a decimal string of the form "[-+]?[0-9]+(\.[0-9]+)?" into a
+SQLNumeric. Scale is taken from the post-decimal-point digit count.
+@End Reasoning
+
+@Implementation
+Skip leading whitespace, read optional sign, read integer digits, read
+optional fractional digits, count scale = number of fractional digits.
+@End Implementation
+
+@Performance_Hints
+O(string length).
+@End Performance_Hints
+
+@Security_Scope
+str_ptr must be a valid null-terminated byte string.
+@End Security_Scope
+
+Process called "sqlnum_string_length" takes str_ptr as Integer returns Integer:
+    Let n be 0
+    Let cur be 0
+    Let polling be 1
+    While polling is equal to 1:
+        Let c be proc memory_get_byte from Mem with str_ptr, n
+        If c is equal to 0:
+            Set polling to 0
+        Otherwise:
+            Set n to n plus 1
+        End If
+        Note: Hard cap to prevent infinite loop on missing terminator
+        If n is greater than 65536:
+            Set polling to 0
+        End If
+    End While
+    Return n
+End Process
+
+Process called "sqlnum_from_string" takes str_ptr as Integer, max_precision as Integer returns Integer:
+    If str_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let len be proc sqlnum_string_length with str_ptr
+    Let i be 0
+
+    Note: Skip whitespace
+    Let polling be 1
+    While polling is equal to 1:
+        If i is greater than or equal to len:
+            Set polling to 0
+        Otherwise:
+            Let c be proc memory_get_byte from Mem with str_ptr, i
+            Let is_ws be proc is_whitespace from Char with c
+            If is_ws is equal to 0:
+                Set polling to 0
+            Otherwise:
+                Set i to i plus 1
+            End If
+        End If
+    End While
+
+    Let sign be 0
+    If i is less than len:
+        Let c2 be proc memory_get_byte from Mem with str_ptr, i
+        If c2 is equal to 45:
+            Set sign to 1
+            Set i to i plus 1
+        Otherwise:
+            If c2 is equal to 43:
+                Set i to i plus 1
+            End If
+        End If
+    End If
+
+    Note: Collect integer digits and fractional digits into a temp buffer
+    Let temp_digits be proc allocate from Memory with max_precision
+    If temp_digits is equal to 0:
+        Return 0
+    End If
+
+    Let total_digits be 0
+    Let scale_found be 0
+    Let saw_dot be 0
+
+    Let parsing be 1
+    While parsing is equal to 1:
+        If i is greater than or equal to len:
+            Set parsing to 0
+        Otherwise:
+            Let c3 be proc memory_get_byte from Mem with str_ptr, i
+            Let is_d be proc is_digit from Char with c3
+            If is_d is equal to 1:
+                If total_digits is greater than or equal to max_precision:
+                    proc deallocate from Memory with temp_digits
+                    Return 0
+                End If
+                Let digit_val be c3 minus 48
+                proc memory_set_byte from Mem with temp_digits, total_digits, digit_val
+                Set total_digits to total_digits plus 1
+                If saw_dot is equal to 1:
+                    Set scale_found to scale_found plus 1
+                End If
+                Set i to i plus 1
+            Otherwise:
+                If c3 is equal to 46:
+                    If saw_dot is equal to 1:
+                        proc deallocate from Memory with temp_digits
+                        Return 0
+                    End If
+                    Set saw_dot to 1
+                    Set i to i plus 1
+                Otherwise:
+                    Set parsing to 0
+                End If
+            End If
+        End If
+    End While
+
+    If total_digits is equal to 0:
+        proc deallocate from Memory with temp_digits
+        Return 0
+    End If
+
+    Note: Determine precision (use total_digits since leading zeros are kept)
+    Let n be proc sqlnum_create with max_precision, scale_found
+    If n is equal to 0:
+        proc deallocate from Memory with temp_digits
+        Return 0
+    End If
+
+    Note: temp_digits is big-endian (most-significant first). Reverse into
+    Note: the SQLNumeric's little-endian digit buffer.
+    Let dest_digits be proc memory_get_int64 from Mem with n, SN_OFF_DIGITS
+    Let src_i be 0
+    While src_i is less than total_digits:
+        Let dest_i be (total_digits minus 1) minus src_i
+        Let d4 be proc memory_get_byte from Mem with temp_digits, src_i
+        proc memory_set_byte from Mem with dest_digits, dest_i, d4
+        Set src_i to src_i plus 1
+    End While
+    proc deallocate from Memory with temp_digits
+
+    Note: Trim leading zeros in the high digits to compute digit_count
+    Let dc be total_digits
+    Let trimming be 1
+    While trimming is equal to 1:
+        If dc is less than or equal to 0:
+            Set trimming to 0
+        Otherwise:
+            Let dh be proc memory_get_byte from Mem with dest_digits, (dc minus 1)
+            If dh is equal to 0:
+                Set dc to dc minus 1
+            Otherwise:
+                Set trimming to 0
+            End If
+        End If
+    End While
+
+    proc memory_set_int64 from Mem with n, SN_OFF_SIGN, sign
+    proc memory_set_int64 from Mem with n, SN_OFF_DIGIT_COUNT, dc
+    Return n
+End Process
+
+Note: ============================================================================
+Note: Equality / comparison
+Note: ============================================================================
+
+@Reasoning
+Compare two SQLNumerics for ordering. Returns negative, zero, or positive.
+Aligns scales by virtually padding the smaller-scale value with trailing
+zero digits, then compares signed digit streams.
+@End Reasoning
+
+@Implementation
+Match scales by computing aligned digit counts, compare sign first, then
+compare magnitudes after virtual alignment.
+@End Implementation
+
+@Performance_Hints
+O(max(digit_count_a, digit_count_b)).
+@End Performance_Hints
+
+@Security_Scope
+Pure comparison; safe.
+@End Security_Scope
+
+Process called "sqlnum_compare_aligned_magnitudes" takes a_digits as Integer, a_count as Integer, a_scale as Integer, b_digits as Integer, b_count as Integer, b_scale as Integer returns Integer:
+    Note: Convert each to a "shifted digit index" relative to max_scale
+    Let max_scale be a_scale
+    If b_scale is greater than max_scale:
+        Set max_scale to b_scale
+    End If
+    Let a_shift be max_scale minus a_scale
+    Let b_shift be max_scale minus b_scale
+    Let a_eff_count be a_count plus a_shift
+    Let b_eff_count be b_count plus b_shift
+
+    If a_eff_count is greater than b_eff_count:
+        Return 1
+    End If
+    If b_eff_count is greater than a_eff_count:
+        Return -1
+    End If
+
+    Note: Same effective count: compare digit-by-digit from high to low
+    Let i be a_eff_count minus 1
+    While i is greater than or equal to 0:
+        Let a_real_idx be i minus a_shift
+        Let b_real_idx be i minus b_shift
+        Let av be 0
+        Let bv be 0
+        If a_real_idx is greater than or equal to 0:
+            If a_real_idx is less than a_count:
+                Set av to proc memory_get_byte from Mem with a_digits, a_real_idx
+            End If
+        End If
+        If b_real_idx is greater than or equal to 0:
+            If b_real_idx is less than b_count:
+                Set bv to proc memory_get_byte from Mem with b_digits, b_real_idx
+            End If
+        End If
+        If av is greater than bv:
+            Return 1
+        End If
+        If bv is greater than av:
+            Return -1
+        End If
+        Set i to i minus 1
+    End While
+    Return 0
+End Process
+
+Process called "sqlnum_compare" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return -1
+    End If
+    If b is equal to 0:
+        Return 1
+    End If
+
+    Let a_is_zero be proc sqlnum_is_zero with a
+    Let b_is_zero be proc sqlnum_is_zero with b
+    If a_is_zero is equal to 1:
+        If b_is_zero is equal to 1:
+            Return 0
+        End If
+        Let bs be proc memory_get_int64 from Mem with b, SN_OFF_SIGN
+        If bs is equal to 0:
+            Return -1
+        End If
+        Return 1
+    End If
+    If b_is_zero is equal to 1:
+        Let as_ be proc memory_get_int64 from Mem with a, SN_OFF_SIGN
+        If as_ is equal to 0:
+            Return 1
+        End If
+        Return -1
+    End If
+
+    Let a_sign be proc memory_get_int64 from Mem with a, SN_OFF_SIGN
+    Let b_sign be proc memory_get_int64 from Mem with b, SN_OFF_SIGN
+
+    If a_sign is not equal to b_sign:
+        If a_sign is equal to 0:
+            Return 1
+        End If
+        Return -1
+    End If
+
+    Let a_digits be proc memory_get_int64 from Mem with a, SN_OFF_DIGITS
+    Let a_count be proc memory_get_int64 from Mem with a, SN_OFF_DIGIT_COUNT
+    Let a_scale be proc memory_get_int64 from Mem with a, SN_OFF_SCALE
+    Let b_digits be proc memory_get_int64 from Mem with b, SN_OFF_DIGITS
+    Let b_count be proc memory_get_int64 from Mem with b, SN_OFF_DIGIT_COUNT
+    Let b_scale be proc memory_get_int64 from Mem with b, SN_OFF_SCALE
+
+    Let mag_cmp be proc sqlnum_compare_aligned_magnitudes with a_digits, a_count, a_scale, b_digits, b_count, b_scale
+    If a_sign is equal to 1:
+        Note: Both negative; invert magnitude comparison
+        Return 0 minus mag_cmp
+    End If
+    Return mag_cmp
+End Process
+
+Process called "sqlnum_equals" takes a as Integer, b as Integer returns Integer:
+    Let c be proc sqlnum_compare with a, b
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Addition / subtraction (magnitude-aligned)
+Note: ============================================================================
+
+@Reasoning
+Add two SQLNumerics. Aligns scales, performs base-10 magnitude add with
+carry. Handles sign by delegating to subtract when signs differ.
+@End Reasoning
+
+@Implementation
+Align scales by padding the lower-scale operand's digit stream. Walk both
+streams from low to high, summing digits with carry. Result scale =
+max(a.scale, b.scale). Precision = max(a.prec, b.prec) + 1 to accommodate
+carry-out (caller may round back down via sqlnum_rescale).
+@End Implementation
+
+@Performance_Hints
+O(max(digit_count)).
+@End Performance_Hints
+
+@Security_Scope
+Returned value must be released via sqlnum_destroy.
+@End Security_Scope
+
+Process called "sqlnum_aligned_get_digit" takes digits as Integer, count as Integer, shift as Integer, i as Integer returns Integer:
+    Let real_idx be i minus shift
+    If real_idx is less than 0:
+        Return 0
+    End If
+    If real_idx is greater than or equal to count:
+        Return 0
+    End If
+    Return proc memory_get_byte from Mem with digits, real_idx
+End Process
+
+Process called "sqlnum_add" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let a_sign be proc memory_get_int64 from Mem with a, SN_OFF_SIGN
+    Let b_sign be proc memory_get_int64 from Mem with b, SN_OFF_SIGN
+
+    Note: If signs differ, delegate to subtraction logic
+    If a_sign is not equal to b_sign:
+        Return proc sqlnum_signed_combine with a, b, 1
+    End If
+
+    Let a_scale be proc memory_get_int64 from Mem with a, SN_OFF_SCALE
+    Let b_scale be proc memory_get_int64 from Mem with b, SN_OFF_SCALE
+    Let max_scale be a_scale
+    If b_scale is greater than max_scale:
+        Set max_scale to b_scale
+    End If
+
+    Let a_count be proc memory_get_int64 from Mem with a, SN_OFF_DIGIT_COUNT
+    Let b_count be proc memory_get_int64 from Mem with b, SN_OFF_DIGIT_COUNT
+    Let a_digits be proc memory_get_int64 from Mem with a, SN_OFF_DIGITS
+    Let b_digits be proc memory_get_int64 from Mem with b, SN_OFF_DIGITS
+    Let a_shift be max_scale minus a_scale
+    Let b_shift be max_scale minus b_scale
+    Let a_eff be a_count plus a_shift
+    Let b_eff be b_count plus b_shift
+    Let max_eff be a_eff
+    If b_eff is greater than max_eff:
+        Set max_eff to b_eff
+    End If
+    Let result_prec be max_eff plus 1
+    If result_prec is greater than SN_MAX_PRECISION:
+        Set result_prec to SN_MAX_PRECISION
+    End If
+
+    Let r be proc sqlnum_create with result_prec, max_scale
+    If r is equal to 0:
+        Return 0
+    End If
+    Let r_digits be proc memory_get_int64 from Mem with r, SN_OFF_DIGITS
+
+    Let carry be 0
+    Let i be 0
+    Let written be 0
+    While i is less than max_eff:
+        Let ad be proc sqlnum_aligned_get_digit with a_digits, a_count, a_shift, i
+        Let bd be proc sqlnum_aligned_get_digit with b_digits, b_count, b_shift, i
+        Let sum be ad plus bd plus carry
+        Let d be sum minus ((sum divided by 10) multiplied by 10)
+        Set carry to (sum divided by 10)
+        proc memory_set_byte from Mem with r_digits, i, d
+        Set i to i plus 1
+        If d is not equal to 0:
+            Set written to (i)
+        End If
+    End While
+    If carry is greater than 0:
+        proc memory_set_byte from Mem with r_digits, i, carry
+        Set written to (i plus 1)
+    End If
+
+    proc memory_set_int64 from Mem with r, SN_OFF_SIGN, a_sign
+    proc memory_set_int64 from Mem with r, SN_OFF_DIGIT_COUNT, written
+    Return r
+End Process
+
+@Reasoning
+Internal signed combine: subtract the smaller-magnitude operand from the
+larger and take the sign of the larger. Used by add (for mixed-sign) and
+sub.
+@End Reasoning
+
+@Implementation
+Determine the larger magnitude, subtract digit-by-digit with borrow,
+produce the result with the larger's sign.
+@End Implementation
+
+@Performance_Hints
+O(max_eff).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper - caller passes inputs already typed-checked.
+@End Security_Scope
+
+Process called "sqlnum_signed_combine" takes a as Integer, b as Integer, op_mode as Integer returns Integer:
+    Let a_sign be proc memory_get_int64 from Mem with a, SN_OFF_SIGN
+    Let b_sign be proc memory_get_int64 from Mem with b, SN_OFF_SIGN
+    Note: op_mode reserved for future expansion; treat as add-with-mixed-signs
+
+    Let a_scale be proc memory_get_int64 from Mem with a, SN_OFF_SCALE
+    Let b_scale be proc memory_get_int64 from Mem with b, SN_OFF_SCALE
+    Let max_scale be a_scale
+    If b_scale is greater than max_scale:
+        Set max_scale to b_scale
+    End If
+
+    Let a_count be proc memory_get_int64 from Mem with a, SN_OFF_DIGIT_COUNT
+    Let b_count be proc memory_get_int64 from Mem with b, SN_OFF_DIGIT_COUNT
+    Let a_digits be proc memory_get_int64 from Mem with a, SN_OFF_DIGITS
+    Let b_digits be proc memory_get_int64 from Mem with b, SN_OFF_DIGITS
+
+    Let mag_cmp be proc sqlnum_compare_aligned_magnitudes with a_digits, a_count, a_scale, b_digits, b_count, b_scale
+
+    Let larger be a
+    Let smaller be b
+    Let result_sign be a_sign
+    If mag_cmp is less than 0:
+        Set larger to b
+        Set smaller to a
+        Set result_sign to b_sign
+    End If
+    If mag_cmp is equal to 0:
+        Let zero be proc sqlnum_create with 1, 0
+        Return zero
+    End If
+
+    Let lc be proc memory_get_int64 from Mem with larger, SN_OFF_DIGIT_COUNT
+    Let sc be proc memory_get_int64 from Mem with smaller, SN_OFF_DIGIT_COUNT
+    Let ld be proc memory_get_int64 from Mem with larger, SN_OFF_DIGITS
+    Let sd be proc memory_get_int64 from Mem with smaller, SN_OFF_DIGITS
+    Let lsc be proc memory_get_int64 from Mem with larger, SN_OFF_SCALE
+    Let ssc be proc memory_get_int64 from Mem with smaller, SN_OFF_SCALE
+    Let l_shift be max_scale minus lsc
+    Let s_shift be max_scale minus ssc
+    Let l_eff be lc plus l_shift
+    Let s_eff be sc plus s_shift
+    Let max_eff be l_eff
+    If s_eff is greater than max_eff:
+        Set max_eff to s_eff
+    End If
+
+    Let r be proc sqlnum_create with max_eff, max_scale
+    If r is equal to 0:
+        Return 0
+    End If
+    Let r_digits be proc memory_get_int64 from Mem with r, SN_OFF_DIGITS
+
+    Let borrow be 0
+    Let i be 0
+    Let last_nonzero be 0
+    While i is less than max_eff:
+        Let lv be proc sqlnum_aligned_get_digit with ld, lc, l_shift, i
+        Let sv be proc sqlnum_aligned_get_digit with sd, sc, s_shift, i
+        Let diff be lv minus sv minus borrow
+        If diff is less than 0:
+            Set diff to diff plus 10
+            Set borrow to 1
+        Otherwise:
+            Set borrow to 0
+        End If
+        proc memory_set_byte from Mem with r_digits, i, diff
+        If diff is not equal to 0:
+            Set last_nonzero to (i plus 1)
+        End If
+        Set i to i plus 1
+    End While
+
+    proc memory_set_int64 from Mem with r, SN_OFF_SIGN, result_sign
+    proc memory_set_int64 from Mem with r, SN_OFF_DIGIT_COUNT, last_nonzero
+    Return r
+End Process
+
+@Reasoning
+Subtract: a - b is equivalent to a + (-b). Flip b's sign and dispatch.
+@End Reasoning
+
+@Implementation
+Clone b (or temporarily flip its sign in-place and restore).
+@End Implementation
+
+@Performance_Hints
+Same as add.
+@End Performance_Hints
+
+@Security_Scope
+The temporary sign flip is reversed before return; b is unchanged from
+caller's perspective.
+@End Security_Scope
+
+Process called "sqlnum_sub" takes a as Integer, b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let original_sign be proc memory_get_int64 from Mem with b, SN_OFF_SIGN
+    Let flipped be 1
+    If original_sign is equal to 1:
+        Set flipped to 0
+    End If
+    proc memory_set_int64 from Mem with b, SN_OFF_SIGN, flipped
+    Let r be proc sqlnum_add with a, b
+    proc memory_set_int64 from Mem with b, SN_OFF_SIGN, original_sign
+    Return r
+End Process
+
+Note: ============================================================================
+Note: Multiplication
+Note: ============================================================================
+
+@Reasoning
+Multiply two SQLNumerics. Result precision = a.prec + b.prec; result
+scale = a.scale + b.scale. Sign = XOR of signs (negative if exactly one
+is negative).
+@End Reasoning
+
+@Implementation
+Schoolbook digit multiplication: for each pair of digits accumulate into
+the result buffer at the appropriate offset, propagating carry.
+@End Implementation
+
+@Performance_Hints
+O(a.digit_count * b.digit_count). Use sqlnum_rescale to trim.
+@End Performance_Hints
+
+@Security_Scope
+Returned value must be released.
+@End Security_Scope
+
+Process called "sqlnum_mul" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let a_scale be proc memory_get_int64 from Mem with a, SN_OFF_SCALE
+    Let b_scale be proc memory_get_int64 from Mem with b, SN_OFF_SCALE
+    Let a_count be proc memory_get_int64 from Mem with a, SN_OFF_DIGIT_COUNT
+    Let b_count be proc memory_get_int64 from Mem with b, SN_OFF_DIGIT_COUNT
+    Let a_digits be proc memory_get_int64 from Mem with a, SN_OFF_DIGITS
+    Let b_digits be proc memory_get_int64 from Mem with b, SN_OFF_DIGITS
+    Let a_sign be proc memory_get_int64 from Mem with a, SN_OFF_SIGN
+    Let b_sign be proc memory_get_int64 from Mem with b, SN_OFF_SIGN
+
+    Let result_scale be a_scale plus b_scale
+    Let result_prec be a_count plus b_count plus 1
+    If result_prec is less than (result_scale plus 1):
+        Set result_prec to result_scale plus 1
+    End If
+    If result_prec is greater than SN_MAX_PRECISION:
+        Set result_prec to SN_MAX_PRECISION
+    End If
+
+    Let r be proc sqlnum_create with result_prec, result_scale
+    If r is equal to 0:
+        Return 0
+    End If
+    Let r_digits be proc memory_get_int64 from Mem with r, SN_OFF_DIGITS
+
+    Let i be 0
+    Let max_pos be 0
+    While i is less than a_count:
+        Let carry be 0
+        Let ai be proc memory_get_byte from Mem with a_digits, i
+        Let j be 0
+        While j is less than b_count:
+            Let bi be proc memory_get_byte from Mem with b_digits, j
+            Let pos be i plus j
+            If pos is greater than or equal to result_prec:
+                Set j to b_count
+            Otherwise:
+                Let existing be proc memory_get_byte from Mem with r_digits, pos
+                Let prod be ((ai multiplied by bi) plus existing) plus carry
+                Let d be prod minus ((prod divided by 10) multiplied by 10)
+                Set carry to (prod divided by 10)
+                proc memory_set_byte from Mem with r_digits, pos, d
+                If d is not equal to 0:
+                    If (pos plus 1) is greater than max_pos:
+                        Set max_pos to (pos plus 1)
+                    End If
+                End If
+                Set j to j plus 1
+            End If
+        End While
+        Note: Propagate remaining carry
+        Let cpos be i plus b_count
+        While carry is greater than 0:
+            If cpos is greater than or equal to result_prec:
+                Set carry to 0
+            Otherwise:
+                Let ce be proc memory_get_byte from Mem with r_digits, cpos
+                Let csum be ce plus carry
+                Let cd be csum minus ((csum divided by 10) multiplied by 10)
+                Set carry to (csum divided by 10)
+                proc memory_set_byte from Mem with r_digits, cpos, cd
+                If cd is not equal to 0:
+                    If (cpos plus 1) is greater than max_pos:
+                        Set max_pos to (cpos plus 1)
+                    End If
+                End If
+                Set cpos to cpos plus 1
+            End If
+        End While
+        Set i to i plus 1
+    End While
+
+    Let r_sign be 0
+    If a_sign is not equal to b_sign:
+        Set r_sign to 1
+    End If
+    proc memory_set_int64 from Mem with r, SN_OFF_SIGN, r_sign
+    proc memory_set_int64 from Mem with r, SN_OFF_DIGIT_COUNT, max_pos
+    Return r
+End Process
+
+Note: ============================================================================
+Note: Negate / absolute
+Note: ============================================================================
+
+Process called "sqlnum_negate_in_place" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return SN_ERR_INVALID
+    End If
+    Let s be proc memory_get_int64 from Mem with n, SN_OFF_SIGN
+    Let flipped be 1
+    If s is equal to 1:
+        Set flipped to 0
+    End If
+    proc memory_set_int64 from Mem with n, SN_OFF_SIGN, flipped
+    Return SN_OK
+End Process
+
+Process called "sqlnum_abs_in_place" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return SN_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with n, SN_OFF_SIGN, 0
+    Return SN_OK
+End Process
+
+Note: ============================================================================
+Note: Truncate / round
+Note: ============================================================================
+
+@Reasoning
+Rescale a SQLNumeric to a target scale. Rounding mode controls how
+fractional digits below the new scale are handled.
+@End Reasoning
+
+@Implementation
+If new_scale >= current_scale, pad zero digits at the low end (shift
+digits up). If new_scale < current_scale, drop the lowest digits applying
+the rounding mode.
+@End Implementation
+
+@Performance_Hints
+O(digit_count) in either direction.
+@End Performance_Hints
+
+@Security_Scope
+Mutates the SQLNumeric in place.
+@End Security_Scope
+
+Process called "sqlnum_rescale_in_place" takes n as Integer, new_scale as Integer, rounding_mode as Integer returns Integer:
+    If n is equal to 0:
+        Return SN_ERR_INVALID
+    End If
+    If new_scale is less than 0:
+        Return SN_ERR_INVALID
+    End If
+    Let cur_scale be proc memory_get_int64 from Mem with n, SN_OFF_SCALE
+    Let precision be proc memory_get_int64 from Mem with n, SN_OFF_PRECISION
+    Let count be proc memory_get_int64 from Mem with n, SN_OFF_DIGIT_COUNT
+    Let digits be proc memory_get_int64 from Mem with n, SN_OFF_DIGITS
+
+    If new_scale is equal to cur_scale:
+        Return SN_OK
+    End If
+
+    If new_scale is greater than cur_scale:
+        Let shift_up be new_scale minus cur_scale
+        Let new_count be count plus shift_up
+        If new_count is greater than precision:
+            Return SN_ERR_OVERFLOW
+        End If
+        Note: Shift digits up by `shift_up` positions; zero-fill low end
+        Let k be count minus 1
+        While k is greater than or equal to 0:
+            Let d be proc memory_get_byte from Mem with digits, k
+            proc memory_set_byte from Mem with digits, (k plus shift_up), d
+            Set k to k minus 1
+        End While
+        Let z be 0
+        While z is less than shift_up:
+            proc memory_set_byte from Mem with digits, z, 0
+            Set z to z plus 1
+        End While
+        proc memory_set_int64 from Mem with n, SN_OFF_DIGIT_COUNT, new_count
+        proc memory_set_int64 from Mem with n, SN_OFF_SCALE, new_scale
+        Return SN_OK
+    End If
+
+    Note: new_scale < cur_scale: drop low digits with rounding
+    Let drop_count be cur_scale minus new_scale
+    Let round_digit be 0
+    If drop_count is less than or equal to count:
+        Set round_digit to proc memory_get_byte from Mem with digits, (drop_count minus 1)
+    End If
+    Note: ROUND_TRUNCATE drops everything. ROUND_HALF_UP rounds 5+ up.
+    Note: ROUND_HALF_EVEN: 5 followed by zeros rounds to even, else like HALF_UP.
+
+    Let do_round_up be 0
+    If rounding_mode is equal to ROUND_HALF_UP:
+        If round_digit is greater than or equal to 5:
+            Set do_round_up to 1
+        End If
+    End If
+    If rounding_mode is equal to ROUND_HALF_EVEN:
+        If round_digit is greater than 5:
+            Set do_round_up to 1
+        Otherwise:
+            If round_digit is equal to 5:
+                Note: Check if any digit below is nonzero
+                Let any_nonzero be 0
+                Let k2 be 0
+                While k2 is less than (drop_count minus 1):
+                    Let d2 be proc memory_get_byte from Mem with digits, k2
+                    If d2 is not equal to 0:
+                        Set any_nonzero to 1
+                    End If
+                    Set k2 to k2 plus 1
+                End While
+                If any_nonzero is equal to 1:
+                    Set do_round_up to 1
+                Otherwise:
+                    Note: Tie: round to even (next digit even = round down)
+                    Let next_digit be 0
+                    If drop_count is less than count:
+                        Set next_digit to proc memory_get_byte from Mem with digits, drop_count
+                    End If
+                    Let is_odd be next_digit minus ((next_digit divided by 2) multiplied by 2)
+                    If is_odd is equal to 1:
+                        Set do_round_up to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: Shift digits down
+    Let new_count2 be count minus drop_count
+    If new_count2 is less than 0:
+        Set new_count2 to 0
+    End If
+    Let m be 0
+    While m is less than new_count2:
+        Let dm be proc memory_get_byte from Mem with digits, (m plus drop_count)
+        proc memory_set_byte from Mem with digits, m, dm
+        Set m to m plus 1
+    End While
+    Note: Zero the now-unused high positions
+    Let z2 be new_count2
+    While z2 is less than count:
+        proc memory_set_byte from Mem with digits, z2, 0
+        Set z2 to z2 plus 1
+    End While
+
+    If do_round_up is equal to 1:
+        Note: Add 1 to digit[0], propagating carry
+        Let carry be 1
+        Let p be 0
+        While carry is greater than 0:
+            If p is greater than or equal to precision:
+                Set carry to 0
+            Otherwise:
+                Let dv be proc memory_get_byte from Mem with digits, p
+                Let nv be dv plus carry
+                If nv is greater than or equal to 10:
+                    proc memory_set_byte from Mem with digits, p, (nv minus 10)
+                    Set carry to 1
+                Otherwise:
+                    proc memory_set_byte from Mem with digits, p, nv
+                    Set carry to 0
+                End If
+                Set p to p plus 1
+                If p is greater than new_count2:
+                    Set new_count2 to p
+                End If
+            End If
+        End While
+    End If
+
+    Note: Recompute digit_count by trimming leading zeros
+    Let trim be new_count2
+    Let trimming be 1
+    While trimming is equal to 1:
+        If trim is less than or equal to 0:
+            Set trimming to 0
+        Otherwise:
+            Let dh be proc memory_get_byte from Mem with digits, (trim minus 1)
+            If dh is equal to 0:
+                Set trim to trim minus 1
+            Otherwise:
+                Set trimming to 0
+            End If
+        End If
+    End While
+    proc memory_set_int64 from Mem with n, SN_OFF_DIGIT_COUNT, trim
+    proc memory_set_int64 from Mem with n, SN_OFF_SCALE, new_scale
+    Return SN_OK
+End Process
+
+Note: ============================================================================
+Note: Serialization
+Note: ============================================================================
+
+@Reasoning
+Render to a decimal string. Writes into a caller-provided buffer of size
+out_buf_size and returns the number of bytes written (excluding null
+terminator). If the buffer is too small returns -1.
+@End Reasoning
+
+@Implementation
+Walk digits high-to-low, writing ASCII characters. Inject the decimal
+point at position `digit_count - scale`. Prepend '-' for negative.
+@End Implementation
+
+@Performance_Hints
+O(digit_count) string write.
+@End Performance_Hints
+
+@Security_Scope
+out_buf must be writable for at least out_buf_size bytes.
+@End Security_Scope
+
+Process called "sqlnum_to_string" takes n as Integer, out_buf as Integer, out_buf_size as Integer returns Integer:
+    If n is equal to 0:
+        Return -1
+    End If
+    If out_buf is equal to 0:
+        Return -1
+    End If
+    Let sign be proc memory_get_int64 from Mem with n, SN_OFF_SIGN
+    Let scale be proc memory_get_int64 from Mem with n, SN_OFF_SCALE
+    Let count be proc memory_get_int64 from Mem with n, SN_OFF_DIGIT_COUNT
+    Let digits be proc memory_get_int64 from Mem with n, SN_OFF_DIGITS
+
+    If count is equal to 0:
+        Note: Zero - emit "0" with optional scale
+        If out_buf_size is less than 2:
+            Return -1
+        End If
+        proc memory_set_byte from Mem with out_buf, 0, 48
+        proc memory_set_byte from Mem with out_buf, 1, 0
+        Return 1
+    End If
+
+    Note: Compute needed length:
+    Note:   sign (1) + integer_part + dot (1) + fractional_part
+    Let int_part_count be count minus scale
+    If int_part_count is less than 1:
+        Set int_part_count to 1
+    End If
+    Let frac_count be scale
+    Let total_len be int_part_count
+    If sign is equal to 1:
+        Set total_len to total_len plus 1
+    End If
+    If frac_count is greater than 0:
+        Set total_len to total_len plus 1 plus frac_count
+    End If
+
+    If total_len plus 1 is greater than out_buf_size:
+        Return -1
+    End If
+
+    Let pos be 0
+    If sign is equal to 1:
+        proc memory_set_byte from Mem with out_buf, pos, 45
+        Set pos to pos plus 1
+    End If
+
+    Note: Integer part: digits at indices [scale .. count-1] in little-endian
+    Let i be count minus 1
+    Let any_emitted be 0
+    While i is greater than or equal to scale:
+        Let d be proc memory_get_byte from Mem with digits, i
+        If any_emitted is equal to 1:
+            proc memory_set_byte from Mem with out_buf, pos, (d plus 48)
+            Set pos to pos plus 1
+        Otherwise:
+            If d is not equal to 0:
+                proc memory_set_byte from Mem with out_buf, pos, (d plus 48)
+                Set pos to pos plus 1
+                Set any_emitted to 1
+            End If
+        End If
+        Set i to i minus 1
+    End While
+    If any_emitted is equal to 0:
+        proc memory_set_byte from Mem with out_buf, pos, 48
+        Set pos to pos plus 1
+    End If
+
+    If frac_count is greater than 0:
+        proc memory_set_byte from Mem with out_buf, pos, 46
+        Set pos to pos plus 1
+        Let j be scale minus 1
+        While j is greater than or equal to 0:
+            Let d2 be 0
+            If j is less than count:
+                Set d2 to proc memory_get_byte from Mem with digits, j
+            End If
+            proc memory_set_byte from Mem with out_buf, pos, (d2 plus 48)
+            Set pos to pos plus 1
+            Set j to j minus 1
+        End While
+    End If
+
+    proc memory_set_byte from Mem with out_buf, pos, 0
+    Return pos
+End Process

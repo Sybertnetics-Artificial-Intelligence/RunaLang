@@ -1,0 +1,1067 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+ByteBuffer - NIO-style cursor buffer for streaming binary I/O
+==============================================================================
+
+A ByteBuffer is a fixed-capacity byte container with two cursors
+(read_position and write_position) and an explicit byte_order field.
+It models the same data abstraction as java.nio.ByteBuffer, Go's
+bytes.Buffer (when used with positions), and .NET's BinaryReader/
+BinaryWriter pair: produce-side code writes through write_position;
+consume-side code reads through read_position; positions are
+independent until flip() or compact() are invoked.
+
+This module is DISTINCT from the append-only byte_buffer_* API in
+core/bytes.runa. That API is a growable producer-only buffer used for
+in-compiler byte-stream construction. The io/byte_buffer module is the
+streaming I/O primitive used by serialization, wire-format encoders,
+network frame parsers, and file-format readers - everywhere code needs
+typed read/write of multi-byte integers and floats with explicit
+endianness control.
+
+Memory layout for ByteBuffer header (40 bytes):
+  offset  0: data pointer            (Integer, 8 bytes)
+  offset  8: capacity                (Integer, 8 bytes)
+  offset 16: read_position           (Integer, 8 bytes)
+  offset 24: write_position          (Integer, 8 bytes)
+  offset 32: byte_order              (Integer, 8 bytes)
+    0 = BYTE_ORDER_LITTLE_ENDIAN
+    1 = BYTE_ORDER_BIG_ENDIAN
+
+Error codes (returned by every write/read proc):
+   0+ : success, bytes consumed or produced
+   -1 : null buffer or null argument
+   -2 : capacity exhausted (write past capacity)
+   -3 : underflow (read past write_position)
+   -4 : invalid argument (e.g. negative count, capacity <= 0)
+   -5 : allocation failure
+
+References:
+- java.nio.ByteBuffer (JSR 51 / JDK 1.4+) - flip/compact semantics
+- IETF RFC 1700 - byte order conventions for network protocols
+- IEEE 754-2019 - binary32 / binary64 formats for float encoding
+- Microsoft .NET BinaryWriter (System.IO) - typed wire I/O API
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StrCore
+
+Constant BYTEBUF_HEADER_SIZE as Integer is 40
+Constant BYTEBUF_OFFSET_DATA as Integer is 0
+Constant BYTEBUF_OFFSET_CAPACITY as Integer is 8
+Constant BYTEBUF_OFFSET_READ_POS as Integer is 16
+Constant BYTEBUF_OFFSET_WRITE_POS as Integer is 24
+Constant BYTEBUF_OFFSET_ORDER as Integer is 32
+
+Constant BYTE_ORDER_LITTLE_ENDIAN as Integer is 0
+Constant BYTE_ORDER_BIG_ENDIAN as Integer is 1
+
+Constant BYTEBUF_OK as Integer is 0
+Constant BYTEBUF_ERR_NULL as Integer is -1
+Constant BYTEBUF_ERR_OVERFLOW as Integer is -2
+Constant BYTEBUF_ERR_UNDERFLOW as Integer is -3
+Constant BYTEBUF_ERR_INVALID as Integer is -4
+Constant BYTEBUF_ERR_ALLOC as Integer is -5
+
+Note: ============================================================================
+Note: INTERNAL HELPERS - 64-bit integer byte extraction
+Note: ============================================================================
+
+Process called "byte_buffer_internal_low_byte" takes value as Integer, byte_index as Integer returns Integer:
+    @Reasoning
+    Returns the byte at position `byte_index` (0 = least significant)
+    of a 64-bit signed Integer. Implemented with division and modulo so
+    the helper is portable across architectures with different shift
+    semantics.
+    @End Reasoning
+    @Implementation
+    Divide by 256^byte_index, mask with 255.
+    @End Implementation
+    @Performance_Hints
+    Constant-time for byte_index in [0,7].
+    @End Performance_Hints
+    @Security_Scope
+    Pure arithmetic. No memory access.
+    @End Security_Scope
+    Let v be value
+    Let i be 0
+    While i is less than byte_index:
+        Set v to v divided by 256
+        Set i to i plus 1
+    End While
+    Return v bitwise and 255
+End Process
+
+Process called "byte_buffer_internal_pack_le_bytes" takes value as Integer, width as Integer, dest as Integer, offset as Integer returns Integer:
+    @Reasoning
+    Writes `width` (1..8) bytes of `value` into `dest+offset` in
+    little-endian order.
+    @End Reasoning
+    @Implementation
+    Loop 0..width-1 extracting byte i and storing at offset+i.
+    @End Implementation
+    @Performance_Hints
+    O(width) byte writes.
+    @End Performance_Hints
+    @Security_Scope
+    Caller must ensure dest has at least width bytes free at offset.
+    @End Security_Scope
+    Let i be 0
+    While i is less than width:
+        Let b be byte_buffer_internal_low_byte(value, i)
+        Memory.memory_set_byte(dest, offset plus i, b)
+        Set i to i plus 1
+    End While
+    Return width
+End Process
+
+Process called "byte_buffer_internal_pack_be_bytes" takes value as Integer, width as Integer, dest as Integer, offset as Integer returns Integer:
+    @Reasoning
+    Writes `width` bytes in big-endian order: most-significant byte
+    first, least-significant byte last.
+    @End Reasoning
+    @Implementation
+    For each byte position i in 0..width-1, store byte (width-1-i).
+    @End Implementation
+    @Performance_Hints
+    O(width).
+    @End Performance_Hints
+    @Security_Scope
+    Caller must ensure dest has at least width bytes free at offset.
+    @End Security_Scope
+    Let i be 0
+    While i is less than width:
+        Let src_idx be (width minus 1) minus i
+        Let b be byte_buffer_internal_low_byte(value, src_idx)
+        Memory.memory_set_byte(dest, offset plus i, b)
+        Set i to i plus 1
+    End While
+    Return width
+End Process
+
+Process called "byte_buffer_internal_unpack_le_bytes" takes src as Integer, offset as Integer, width as Integer returns Integer:
+    @Reasoning
+    Reassembles `width` little-endian bytes into a 64-bit Integer.
+    @End Reasoning
+    @Implementation
+    For each i in 0..width-1, OR in byte i shifted to position i*8.
+    @End Implementation
+    @Performance_Hints
+    O(width).
+    @End Performance_Hints
+    @Security_Scope
+    Caller must ensure src has at least width bytes readable at offset.
+    @End Security_Scope
+    Let acc be 0
+    Let i be 0
+    While i is less than width:
+        Let b be Memory.memory_get_byte(src, offset plus i)
+        Let multiplier be 1
+        Let j be 0
+        While j is less than i:
+            Set multiplier to multiplier multiplied by 256
+            Set j to j plus 1
+        End While
+        Set acc to acc plus (b multiplied by multiplier)
+        Set i to i plus 1
+    End While
+    Return acc
+End Process
+
+Process called "byte_buffer_internal_unpack_be_bytes" takes src as Integer, offset as Integer, width as Integer returns Integer:
+    @Reasoning
+    Reassembles `width` big-endian bytes into a 64-bit Integer.
+    @End Reasoning
+    @Implementation
+    For each i in 0..width-1, OR in byte i shifted to position (width-1-i)*8.
+    @End Implementation
+    @Performance_Hints
+    O(width).
+    @End Performance_Hints
+    @Security_Scope
+    Caller must ensure src has at least width bytes readable at offset.
+    @End Security_Scope
+    Let acc be 0
+    Let i be 0
+    While i is less than width:
+        Let b be Memory.memory_get_byte(src, offset plus i)
+        Let exponent be (width minus 1) minus i
+        Let multiplier be 1
+        Let j be 0
+        While j is less than exponent:
+            Set multiplier to multiplier multiplied by 256
+            Set j to j plus 1
+        End While
+        Set acc to acc plus (b multiplied by multiplier)
+        Set i to i plus 1
+    End While
+    Return acc
+End Process
+
+Note: ============================================================================
+Note: LIFECYCLE
+Note: ============================================================================
+
+Process called "byte_buffer_create" takes capacity as Integer, byte_order as Integer returns Integer:
+    @Reasoning
+    Allocates a ByteBuffer with the given capacity and byte order.
+    Returns the buffer pointer or 0 on failure. `byte_order` must be
+    BYTE_ORDER_LITTLE_ENDIAN (0) or BYTE_ORDER_BIG_ENDIAN (1); any
+    other value is rejected.
+    @End Reasoning
+    @Implementation
+    Allocate header (40 bytes), allocate backing storage (capacity
+    bytes), initialize all five header fields. On any allocation
+    failure release whatever was already allocated and return 0.
+    @End Implementation
+    @Performance_Hints
+    Two heap allocations. The header layout is fixed so all field
+    accesses are constant-offset loads.
+    @End Performance_Hints
+    @Security_Scope
+    Returned buffer is uninitialized memory; the read cursor is at 0
+    and the write cursor is at 0 so a reader cannot observe the
+    uninitialized region without first writing to it.
+    @End Security_Scope
+    If capacity is less than or equal to 0:
+        Return 0
+    End If
+    If byte_order is less than 0:
+        Return 0
+    End If
+    If byte_order is greater than 1:
+        Return 0
+    End If
+    Let header be allocate(BYTEBUF_HEADER_SIZE)
+    If header is equal to 0:
+        Return 0
+    End If
+    Let data be allocate(capacity)
+    If data is equal to 0:
+        deallocate(header)
+        Return 0
+    End If
+    Memory.memory_set_integer(header, BYTEBUF_OFFSET_DATA, data)
+    Memory.memory_set_integer(header, BYTEBUF_OFFSET_CAPACITY, capacity)
+    Memory.memory_set_integer(header, BYTEBUF_OFFSET_READ_POS, 0)
+    Memory.memory_set_integer(header, BYTEBUF_OFFSET_WRITE_POS, 0)
+    Memory.memory_set_integer(header, BYTEBUF_OFFSET_ORDER, byte_order)
+    Return header
+End Process
+
+Process called "byte_buffer_destroy" takes bb as Integer returns Integer:
+    @Reasoning
+    Releases the backing storage and the header.
+    @End Reasoning
+    @Implementation
+    Free data first, then header. Null pointers are a no-op.
+    @End Implementation
+    @Performance_Hints
+    Two deallocations.
+    @End Performance_Hints
+    @Security_Scope
+    No memory wipe; callers handling secret data must call clear-zero
+    explicitly before destroy if required.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return 0
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    If data is not equal to 0:
+        deallocate(data)
+    End If
+    deallocate(bb)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS
+Note: ============================================================================
+
+Process called "byte_buffer_capacity" takes bb as Integer returns Integer:
+    @Reasoning
+    Returns the buffer's total capacity in bytes.
+    @End Reasoning
+    @Implementation
+    Single header load.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Return Memory.memory_get_integer(bb, BYTEBUF_OFFSET_CAPACITY)
+End Process
+
+Process called "byte_buffer_read_position" takes bb as Integer returns Integer:
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Return Memory.memory_get_integer(bb, BYTEBUF_OFFSET_READ_POS)
+End Process
+
+Process called "byte_buffer_write_position" takes bb as Integer returns Integer:
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Return Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+End Process
+
+Process called "byte_buffer_byte_order" takes bb as Integer returns Integer:
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Return Memory.memory_get_integer(bb, BYTEBUF_OFFSET_ORDER)
+End Process
+
+Process called "byte_buffer_set_byte_order" takes bb as Integer, byte_order as Integer returns Integer:
+    @Reasoning
+    Changes the endianness for subsequent multi-byte reads/writes.
+    Bytes already in the buffer keep their on-wire encoding; the new
+    setting applies to every read or write issued after this proc
+    returns. This matches java.nio.ByteBuffer's order(ByteOrder)
+    semantics.
+    @End Reasoning
+    @Implementation
+    Validate the order value, then store it in the header.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Pure header mutation.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    If byte_order is less than 0:
+        Return BYTEBUF_ERR_INVALID
+    End If
+    If byte_order is greater than 1:
+        Return BYTEBUF_ERR_INVALID
+    End If
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_ORDER, byte_order)
+    Return BYTEBUF_OK
+End Process
+
+Process called "byte_buffer_remaining_write" takes bb as Integer returns Integer:
+    @Reasoning
+    Returns capacity - write_position: the number of bytes that can be
+    appended to the buffer before exhausting capacity.
+    @End Reasoning
+    @Implementation
+    Header subtraction.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let cap be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_CAPACITY)
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    Return cap minus wpos
+End Process
+
+Process called "byte_buffer_remaining_read" takes bb as Integer returns Integer:
+    @Reasoning
+    Returns write_position - read_position: the number of bytes
+    available to consume.
+    @End Reasoning
+    @Implementation
+    Header subtraction.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    Let rpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_READ_POS)
+    Return wpos minus rpos
+End Process
+
+Process called "byte_buffer_clear" takes bb as Integer returns Integer:
+    @Reasoning
+    Resets both cursors to 0. Does NOT zero the backing memory - any
+    bytes previously written remain in the data array but become
+    inaccessible through the cursor API. Callers needing erasure must
+    explicitly zero the buffer.
+    @End Reasoning
+    @Implementation
+    Two header writes.
+    @End Implementation
+    @Performance_Hints
+    O(1). No memory traffic on the data array.
+    @End Performance_Hints
+    @Security_Scope
+    Does not wipe data; for secret material, prefer
+    byte_buffer_clear_zero (if defined) or zero the data pointer
+    manually before clear.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_READ_POS, 0)
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_WRITE_POS, 0)
+    Return BYTEBUF_OK
+End Process
+
+Process called "byte_buffer_flip" takes bb as Integer returns Integer:
+    @Reasoning
+    Java NIO flip semantics: prepare a buffer for read after a write
+    cycle. Sets write_position to the current read_position's high
+    water mark (i.e. the previous write_position becomes the new
+    "limit" for reads) and rewinds the read_position to 0. Concretely:
+    after flip, reads start at the beginning of the data already
+    written and continue up to the previous write_position.
+    @End Reasoning
+    @Implementation
+    Set the new write_position to the old write_position (it already
+    holds the high water mark) and rewind the read_position to 0. The
+    invariant after flip is read_position == 0 and write_position
+    holds the number of bytes producable for reads.
+    @End Implementation
+    @Performance_Hints
+    O(1). The producer is expected to call flip exactly once between
+    write and read phases.
+    @End Performance_Hints
+    @Security_Scope
+    Pure header mutation.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_READ_POS, 0)
+    Return BYTEBUF_OK
+End Process
+
+Process called "byte_buffer_compact" takes bb as Integer returns Integer:
+    @Reasoning
+    Java NIO compact semantics: move the unread region
+    [read_position, write_position) to the front of the buffer, then
+    set read_position to 0 and write_position to (old_write -
+    old_read). This recycles the buffer for streaming I/O patterns
+    where some bytes have been consumed and new bytes must be
+    appended.
+    @End Reasoning
+    @Implementation
+    Use Memory.memory_copy with non-overlapping src/dst guaranteed
+    when read_position > 0; on read_position == 0 it is a no-op.
+    Memory.memory_copy handles forward copy; when source and
+    destination overlap and src > dst (which is always the case here
+    since we move forward by read_position), forward copy is safe.
+    @End Implementation
+    @Performance_Hints
+    O(remaining_read) byte moves on the data buffer.
+    @End Performance_Hints
+    @Security_Scope
+    Pure memmove of caller-owned bytes within a single allocation.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Let rpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_READ_POS)
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    Let remaining be wpos minus rpos
+    If remaining is less than 0:
+        Return BYTEBUF_ERR_INVALID
+    End If
+    If rpos is greater than 0:
+        If remaining is greater than 0:
+            Memory.memory_copy(data, data plus rpos, remaining)
+        End If
+    End If
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_READ_POS, 0)
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_WRITE_POS, remaining)
+    Return BYTEBUF_OK
+End Process
+
+Process called "byte_buffer_slice" takes bb as Integer, start as Integer, len as Integer returns Integer:
+    @Reasoning
+    Returns a new INDEPENDENT ByteBuffer containing a copy of `len`
+    bytes from `bb` starting at offset `start` within the data array.
+    The new buffer has its own allocation; mutations to either buffer
+    do not affect the other. Copy semantics are chosen over view
+    semantics because shared views require lifetime coupling between
+    buffers, and this primitive layer has no garbage collector to
+    enforce that coupling safely.
+    @End Reasoning
+    @Implementation
+    Validate bounds against capacity, allocate a fresh buffer with
+    capacity == len and the same byte order, memory_copy the slice
+    in, and set the new buffer's write_position to len so the slice
+    is immediately consumable.
+    @End Implementation
+    @Performance_Hints
+    O(len) bytes copied. Two allocations on the new buffer.
+    @End Performance_Hints
+    @Security_Scope
+    Validates start/len against capacity; no out-of-bounds read.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return 0
+    End If
+    If start is less than 0:
+        Return 0
+    End If
+    If len is less than 0:
+        Return 0
+    End If
+    Let cap be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_CAPACITY)
+    If start plus len is greater than cap:
+        Return 0
+    End If
+    Let order be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_ORDER)
+    Let new_cap be len
+    If new_cap is equal to 0:
+        Set new_cap to 1
+    End If
+    Let new_bb be byte_buffer_create(new_cap, order)
+    If new_bb is equal to 0:
+        Return 0
+    End If
+    If len is greater than 0:
+        Let src_data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+        Let dst_data be Memory.memory_get_integer(new_bb, BYTEBUF_OFFSET_DATA)
+        Memory.memory_copy(dst_data, src_data plus start, len)
+    End If
+    Memory.memory_set_integer(new_bb, BYTEBUF_OFFSET_WRITE_POS, len)
+    Return new_bb
+End Process
+
+Note: ============================================================================
+Note: WRITE METHODS
+Note: ============================================================================
+
+Process called "byte_buffer_write_byte" takes bb as Integer, b as Integer returns Integer:
+    @Reasoning
+    Writes one byte at write_position and advances write_position by
+    1. Returns 1 on success.
+    @End Reasoning
+    @Implementation
+    Bounds-check write_position + 1 <= capacity, store low 8 bits of b.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let cap be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_CAPACITY)
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    If wpos plus 1 is greater than cap:
+        Return BYTEBUF_ERR_OVERFLOW
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Memory.memory_set_byte(data, wpos, b bitwise and 255)
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_WRITE_POS, wpos plus 1)
+    Return 1
+End Process
+
+Process called "byte_buffer_write_int16" takes bb as Integer, value as Integer returns Integer:
+    @Reasoning
+    Writes a 16-bit signed integer respecting the buffer's byte order.
+    @End Reasoning
+    @Implementation
+    Dispatch to little/big pack based on the order field.
+    @End Implementation
+    @Performance_Hints
+    Two byte writes.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let cap be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_CAPACITY)
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    If wpos plus 2 is greater than cap:
+        Return BYTEBUF_ERR_OVERFLOW
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Let order be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_ORDER)
+    If order is equal to BYTE_ORDER_LITTLE_ENDIAN:
+        byte_buffer_internal_pack_le_bytes(value, 2, data, wpos)
+    Otherwise:
+        byte_buffer_internal_pack_be_bytes(value, 2, data, wpos)
+    End If
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_WRITE_POS, wpos plus 2)
+    Return 2
+End Process
+
+Process called "byte_buffer_write_int32" takes bb as Integer, value as Integer returns Integer:
+    @Reasoning
+    Writes a 32-bit signed integer respecting the buffer's byte order.
+    @End Reasoning
+    @Implementation
+    Dispatch to little/big pack based on the order field.
+    @End Implementation
+    @Performance_Hints
+    Four byte writes.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let cap be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_CAPACITY)
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    If wpos plus 4 is greater than cap:
+        Return BYTEBUF_ERR_OVERFLOW
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Let order be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_ORDER)
+    If order is equal to BYTE_ORDER_LITTLE_ENDIAN:
+        byte_buffer_internal_pack_le_bytes(value, 4, data, wpos)
+    Otherwise:
+        byte_buffer_internal_pack_be_bytes(value, 4, data, wpos)
+    End If
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_WRITE_POS, wpos plus 4)
+    Return 4
+End Process
+
+Process called "byte_buffer_write_int64" takes bb as Integer, value as Integer returns Integer:
+    @Reasoning
+    Writes a 64-bit signed integer respecting the buffer's byte order.
+    @End Reasoning
+    @Implementation
+    Dispatch to little/big pack with width=8.
+    @End Implementation
+    @Performance_Hints
+    Eight byte writes.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let cap be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_CAPACITY)
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    If wpos plus 8 is greater than cap:
+        Return BYTEBUF_ERR_OVERFLOW
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Let order be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_ORDER)
+    If order is equal to BYTE_ORDER_LITTLE_ENDIAN:
+        byte_buffer_internal_pack_le_bytes(value, 8, data, wpos)
+    Otherwise:
+        byte_buffer_internal_pack_be_bytes(value, 8, data, wpos)
+    End If
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_WRITE_POS, wpos plus 8)
+    Return 8
+End Process
+
+Process called "byte_buffer_write_float32" takes bb as Integer, bits as Integer returns Integer:
+    @Reasoning
+    Writes the IEEE 754 binary32 encoding whose 32-bit pattern is
+    given in `bits`. Callers convert their Float to its bit pattern
+    via the float primitive's float_to_bits before invoking this
+    proc; the byte buffer transports raw bit patterns and never
+    converts between Float and Integer representations itself, which
+    keeps the I/O primitive free of float-arithmetic dependencies.
+    @End Reasoning
+    @Implementation
+    Identical to write_int32 since the byte pattern is the same; the
+    name and signature exist so calling code documents intent.
+    @End Implementation
+    @Performance_Hints
+    Four byte writes.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    Return byte_buffer_write_int32(bb, bits)
+End Process
+
+Process called "byte_buffer_write_float64" takes bb as Integer, bits as Integer returns Integer:
+    @Reasoning
+    Writes the IEEE 754 binary64 encoding whose 64-bit pattern is
+    given in `bits`. See write_float32 for the bit-pattern protocol.
+    @End Reasoning
+    @Implementation
+    Identical to write_int64 since the byte pattern is the same.
+    @End Implementation
+    @Performance_Hints
+    Eight byte writes.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    Return byte_buffer_write_int64(bb, bits)
+End Process
+
+Process called "byte_buffer_write_bytes" takes bb as Integer, src as Integer, count as Integer returns Integer:
+    @Reasoning
+    Writes `count` raw bytes from `src` into the buffer at the current
+    write_position and advances the cursor. Returns the byte count on
+    success.
+    @End Reasoning
+    @Implementation
+    Bounds-check, then Memory.memory_copy.
+    @End Implementation
+    @Performance_Hints
+    O(count).
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked. Caller is responsible for the validity of `src`.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    If src is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    If count is less than 0:
+        Return BYTEBUF_ERR_INVALID
+    End If
+    If count is equal to 0:
+        Return 0
+    End If
+    Let cap be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_CAPACITY)
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    If wpos plus count is greater than cap:
+        Return BYTEBUF_ERR_OVERFLOW
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Memory.memory_copy(data plus wpos, src, count)
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_WRITE_POS, wpos plus count)
+    Return count
+End Process
+
+Process called "byte_buffer_write_string_utf8" takes bb as Integer, str as Integer returns Integer:
+    @Reasoning
+    Writes a length-prefixed UTF-8 string: a 32-bit length field
+    (in the buffer's current byte order) followed by the string's
+    bytes. Returns the total bytes written (4 + length) on success.
+    The string is assumed to already be valid UTF-8; this proc does
+    not validate code points.
+    @End Reasoning
+    @Implementation
+    Compute byte length via StrCore.string_length, ensure capacity for
+    4 + length bytes, write the length using the buffer's endianness,
+    then write the string bytes.
+    @End Implementation
+    @Performance_Hints
+    Two writes: length prefix (4 bytes) + payload copy.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked. Empty strings encode as a 4-byte zero length.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    If str is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let length be StrCore.string_length(str)
+    Let cap be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_CAPACITY)
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    Let needed be wpos plus 4 plus length
+    If needed is greater than cap:
+        Return BYTEBUF_ERR_OVERFLOW
+    End If
+    Let len_rc be byte_buffer_write_int32(bb, length)
+    If len_rc is less than 0:
+        Return len_rc
+    End If
+    If length is greater than 0:
+        Let bytes_rc be byte_buffer_write_bytes(bb, str, length)
+        If bytes_rc is less than 0:
+            Return bytes_rc
+        End If
+    End If
+    Return 4 plus length
+End Process
+
+Note: ============================================================================
+Note: READ METHODS
+Note: ============================================================================
+
+Process called "byte_buffer_read_byte" takes bb as Integer returns Integer:
+    @Reasoning
+    Reads one byte at read_position and advances the cursor. Returns
+    -3 (UNDERFLOW) when the read position has reached write_position.
+    Successful reads always return a value in [0, 255].
+    @End Reasoning
+    @Implementation
+    Bounds-check, load byte, advance read_position.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Underflow returns -3 rather than reading past the high water mark.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    Let rpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_READ_POS)
+    If rpos plus 1 is greater than wpos:
+        Return BYTEBUF_ERR_UNDERFLOW
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Let b be Memory.memory_get_byte(data, rpos)
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_READ_POS, rpos plus 1)
+    Return b bitwise and 255
+End Process
+
+Process called "byte_buffer_read_int16" takes bb as Integer returns Integer:
+    @Reasoning
+    Reads a 16-bit signed integer in the buffer's byte order. Returns
+    -3 (UNDERFLOW) when fewer than 2 bytes remain. Sign extension is
+    NOT applied (the result is a non-negative 16-bit unsigned
+    quantity); callers needing signed semantics should sign-extend
+    via a top-bit check.
+    @End Reasoning
+    @Implementation
+    Bounds-check, unpack with endian-correct helper, advance cursor.
+    @End Implementation
+    @Performance_Hints
+    Two byte loads.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    Let rpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_READ_POS)
+    If rpos plus 2 is greater than wpos:
+        Return BYTEBUF_ERR_UNDERFLOW
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Let order be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_ORDER)
+    Let v be 0
+    If order is equal to BYTE_ORDER_LITTLE_ENDIAN:
+        Set v to byte_buffer_internal_unpack_le_bytes(data, rpos, 2)
+    Otherwise:
+        Set v to byte_buffer_internal_unpack_be_bytes(data, rpos, 2)
+    End If
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_READ_POS, rpos plus 2)
+    Return v
+End Process
+
+Process called "byte_buffer_read_int32" takes bb as Integer returns Integer:
+    @Reasoning
+    Reads a 32-bit integer in the buffer's byte order. Returns -3 on
+    underflow.
+    @End Reasoning
+    @Implementation
+    Bounds-check, unpack 4 bytes, advance cursor.
+    @End Implementation
+    @Performance_Hints
+    Four byte loads.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    Let rpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_READ_POS)
+    If rpos plus 4 is greater than wpos:
+        Return BYTEBUF_ERR_UNDERFLOW
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Let order be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_ORDER)
+    Let v be 0
+    If order is equal to BYTE_ORDER_LITTLE_ENDIAN:
+        Set v to byte_buffer_internal_unpack_le_bytes(data, rpos, 4)
+    Otherwise:
+        Set v to byte_buffer_internal_unpack_be_bytes(data, rpos, 4)
+    End If
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_READ_POS, rpos plus 4)
+    Return v
+End Process
+
+Process called "byte_buffer_read_int64" takes bb as Integer returns Integer:
+    @Reasoning
+    Reads a 64-bit integer in the buffer's byte order. Returns -3 on
+    underflow. The full 64-bit signed range round-trips through write
+    + read.
+    @End Reasoning
+    @Implementation
+    Bounds-check, unpack 8 bytes, advance cursor.
+    @End Implementation
+    @Performance_Hints
+    Eight byte loads.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    Let rpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_READ_POS)
+    If rpos plus 8 is greater than wpos:
+        Return BYTEBUF_ERR_UNDERFLOW
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Let order be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_ORDER)
+    Let v be 0
+    If order is equal to BYTE_ORDER_LITTLE_ENDIAN:
+        Set v to byte_buffer_internal_unpack_le_bytes(data, rpos, 8)
+    Otherwise:
+        Set v to byte_buffer_internal_unpack_be_bytes(data, rpos, 8)
+    End If
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_READ_POS, rpos plus 8)
+    Return v
+End Process
+
+Process called "byte_buffer_read_float32" takes bb as Integer returns Integer:
+    @Reasoning
+    Reads the 32-bit IEEE 754 binary32 bit pattern. Callers convert
+    via float_from_bits when they need a Float value.
+    @End Reasoning
+    @Implementation
+    Delegates to read_int32; the bit pattern is identical.
+    @End Implementation
+    @Performance_Hints
+    Four byte loads.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    Return byte_buffer_read_int32(bb)
+End Process
+
+Process called "byte_buffer_read_float64" takes bb as Integer returns Integer:
+    @Reasoning
+    Reads the 64-bit IEEE 754 binary64 bit pattern.
+    @End Reasoning
+    @Implementation
+    Delegates to read_int64.
+    @End Implementation
+    @Performance_Hints
+    Eight byte loads.
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked.
+    @End Security_Scope
+    Return byte_buffer_read_int64(bb)
+End Process
+
+Process called "byte_buffer_read_bytes" takes bb as Integer, dest as Integer, count as Integer returns Integer:
+    @Reasoning
+    Copies `count` bytes from the buffer at read_position into `dest`
+    and advances the cursor by `count`. Returns count on success or
+    -3 on underflow.
+    @End Reasoning
+    @Implementation
+    Bounds-check against write_position, memory_copy, advance.
+    @End Implementation
+    @Performance_Hints
+    O(count).
+    @End Performance_Hints
+    @Security_Scope
+    Bounds-checked. Caller is responsible for dest having `count`
+    bytes of writable storage.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    If dest is equal to 0:
+        Return BYTEBUF_ERR_NULL
+    End If
+    If count is less than 0:
+        Return BYTEBUF_ERR_INVALID
+    End If
+    If count is equal to 0:
+        Return 0
+    End If
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    Let rpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_READ_POS)
+    If rpos plus count is greater than wpos:
+        Return BYTEBUF_ERR_UNDERFLOW
+    End If
+    Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+    Memory.memory_copy(dest, data plus rpos, count)
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_READ_POS, rpos plus count)
+    Return count
+End Process
+
+Process called "byte_buffer_read_string_utf8" takes bb as Integer returns Integer:
+    @Reasoning
+    Reads a length-prefixed UTF-8 string (produced by
+    write_string_utf8) and returns a freshly-allocated, NUL-terminated
+    C-style string pointer. Returns 0 on underflow or allocation
+    failure.
+    @End Reasoning
+    @Implementation
+    Read 32-bit length prefix; bounds-check the payload against the
+    write_position; allocate length+1 bytes; copy from the buffer;
+    NUL-terminate; advance the cursor.
+    @End Implementation
+    @Performance_Hints
+    One length read + one payload copy + one allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Negative or oversized lengths are rejected with a 0 return so the
+    caller can detect a corrupted stream.
+    @End Security_Scope
+    If bb is equal to 0:
+        Return 0
+    End If
+    Let length be byte_buffer_read_int32(bb)
+    If length is less than 0:
+        Return 0
+    End If
+    Let wpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_WRITE_POS)
+    Let rpos be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_READ_POS)
+    If rpos plus length is greater than wpos:
+        Note: Rewind the read of the length prefix so the buffer is
+        Note: left in a consistent state for retry by the caller.
+        Memory.memory_set_integer(bb, BYTEBUF_OFFSET_READ_POS, rpos minus 4)
+        Return 0
+    End If
+    Let out be allocate(length plus 1)
+    If out is equal to 0:
+        Return 0
+    End If
+    If length is greater than 0:
+        Let data be Memory.memory_get_integer(bb, BYTEBUF_OFFSET_DATA)
+        Memory.memory_copy(out, data plus rpos, length)
+    End If
+    Memory.memory_set_byte(out, length, 0)
+    Memory.memory_set_integer(bb, BYTEBUF_OFFSET_READ_POS, rpos plus length)
+    Return out
+End Process

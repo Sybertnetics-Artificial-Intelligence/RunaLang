@@ -1,0 +1,364 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+:End Note
+
+Note:
+==============================================================================
+ExchangeRate - Currency conversion with provenance
+==============================================================================
+
+An ExchangeRate is a typed quadruple (source, target, rate, timestamp,
+provenance) that converts Money(source) into Money(target). The rate is a
+Decimal64 multiplier such that:
+
+    target_amount = source_amount * rate
+
+Conversion is NEVER implicit. Money arithmetic refuses cross-currency
+operations; the only path from USD to EUR is through an explicit
+ExchangeRate. This is the audit invariant for regulated environments.
+
+Layout (40 bytes):
+    0    source_currency    (int64 currency_id)
+    8    target_currency    (int64 currency_id)
+    16   rate_dec64         (int64 Decimal64 handle, owned)
+    24   timestamp_ns       (int64 nanoseconds since epoch, monotonic OR wall)
+    32   provenance_str     (int64 pointer to NUL-terminated identifier)
+
+Provenance examples: "FXAPI:Bloomberg", "ONCHAIN:Uniswap-V3", "ECB:daily-fix",
+"FED:H10", "CHAIN-ORACLE:treasury". Audit trails reference provenance to
+reproduce or dispute a conversion after the fact.
+
+References:
+  - ISO 4217:2015 currency identifiers
+  - SR-1099 reporting requires source-of-rate documentation
+  - EU MiFID II Article 26 audit-trail requirements
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/numeric/decimal/ieee754_decimal64.runa" as Dec64
+Import "compiler/frontend/primitives/money/money.runa" as Money
+Import "compiler/frontend/primitives/money/currency.runa" as Currency
+
+Constant XR_SIZE as Integer is 40
+Constant XR_FIELD_SOURCE as Integer is 0
+Constant XR_FIELD_TARGET as Integer is 8
+Constant XR_FIELD_RATE as Integer is 16
+Constant XR_FIELD_TIMESTAMP as Integer is 24
+Constant XR_FIELD_PROVENANCE as Integer is 32
+
+Constant XR_ROUND_DEFAULT as Integer is 0
+
+Constant XR_OK as Integer is 0
+Constant XR_ERR_NULL as Integer is -1
+Constant XR_ERR_RATE_MISMATCH as Integer is -2
+Constant XR_ERR_INVERSE_ZERO as Integer is -3
+Constant XR_ERR_COMPOSE_MISMATCH as Integer is -4
+
+Process called "exchange_rate_create" takes source_currency as Integer, target_currency as Integer, rate_dec64 as Integer, timestamp_ns as Integer, provenance_str as Integer returns Integer:
+    @Reasoning
+    Builds an ExchangeRate record. The rate handle is OWNED by the record;
+    callers must not destroy it independently. Timestamp is the moment the
+    rate was observed (nanoseconds since some epoch - wall-clock for audit
+    trails, monotonic for cache-validity windows).
+    @End Reasoning
+    @Implementation
+    Single allocation of XR_SIZE bytes plus five field stores.
+    @End Implementation
+    @Performance_Hints
+    One allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Validates both currencies are non-zero and the rate handle is non-zero.
+    Refuses to create a same-currency rate (degenerate; use identity).
+    @End Security_Scope
+
+    If source_currency is equal to 0:
+        Return 0
+    End If
+    If target_currency is equal to 0:
+        Return 0
+    End If
+    If source_currency is equal to target_currency:
+        Return 0
+    End If
+    If rate_dec64 is equal to 0:
+        Return 0
+    End If
+    Let r be Layout.allocate(XR_SIZE)
+    If r is equal to 0:
+        Return 0
+    End If
+    MemoryCore.memory_set_int64(r, XR_FIELD_SOURCE, source_currency)
+    MemoryCore.memory_set_int64(r, XR_FIELD_TARGET, target_currency)
+    MemoryCore.memory_set_int64(r, XR_FIELD_RATE, rate_dec64)
+    MemoryCore.memory_set_int64(r, XR_FIELD_TIMESTAMP, timestamp_ns)
+    MemoryCore.memory_set_int64(r, XR_FIELD_PROVENANCE, provenance_str)
+    Return r
+End Process
+
+Process called "exchange_rate_destroy" takes r as Integer returns Integer:
+    @Reasoning
+    Releases an ExchangeRate and its owned rate handle. The provenance
+    string is a borrowed pointer (typically a static literal) and is not
+    freed.
+    @End Reasoning
+    @Implementation
+    dec64_destroy + Layout.deallocate.
+    @End Implementation
+    @Performance_Hints
+    Two deallocations.
+    @End Performance_Hints
+    @Security_Scope
+    Null-safe.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return 0
+    End If
+    Let rate be MemoryCore.memory_get_int64(r, XR_FIELD_RATE)
+    If rate is not equal to 0:
+        Dec64.dec64_destroy(rate)
+    End If
+    Layout.deallocate(r)
+    Return 1
+End Process
+
+Process called "exchange_rate_get_source" takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(r, XR_FIELD_SOURCE)
+End Process
+
+Process called "exchange_rate_get_target" takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(r, XR_FIELD_TARGET)
+End Process
+
+Process called "exchange_rate_get_rate" takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(r, XR_FIELD_RATE)
+End Process
+
+Process called "exchange_rate_get_timestamp" takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(r, XR_FIELD_TIMESTAMP)
+End Process
+
+Process called "exchange_rate_get_provenance" takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(r, XR_FIELD_PROVENANCE)
+End Process
+
+Process called "exchange_rate_inverse" takes r as Integer returns Integer:
+    @Reasoning
+    Produces the reciprocal rate (target -> source). For a rate of 1.20
+    USD/EUR, the inverse is 0.8333... EUR/USD. Returns 0 if the rate is
+    zero (division-by-zero) or null.
+    @End Reasoning
+    @Implementation
+    Build Decimal64 1.0, divide by the current rate, allocate a new
+    ExchangeRate with swapped source/target and the new rate. Timestamp
+    and provenance are inherited (with " inverse" appended is the caller's
+    job at higher tiers).
+    @End Implementation
+    @Performance_Hints
+    One Decimal64 divide + one allocation for the new rate handle + one
+    allocation for the new ExchangeRate record.
+    @End Performance_Hints
+    @Security_Scope
+    Refuses zero-rate inversion. The dec64_div will signal but we
+    additionally check up front.
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return 0
+    End If
+    Let rate be MemoryCore.memory_get_int64(r, XR_FIELD_RATE)
+    If Dec64.dec64_is_zero(rate) is equal to 1:
+        Return 0
+    End If
+    Let one be Dec64.dec64_from_integer(1)
+    If one is equal to 0:
+        Return 0
+    End If
+    Let inv_rate be Dec64.dec64_div(one, rate, XR_ROUND_DEFAULT)
+    Dec64.dec64_destroy(one)
+    If inv_rate is equal to 0:
+        Return 0
+    End If
+    Let src be MemoryCore.memory_get_int64(r, XR_FIELD_SOURCE)
+    Let tgt be MemoryCore.memory_get_int64(r, XR_FIELD_TARGET)
+    Let ts be MemoryCore.memory_get_int64(r, XR_FIELD_TIMESTAMP)
+    Let prov be MemoryCore.memory_get_int64(r, XR_FIELD_PROVENANCE)
+    Let inv be exchange_rate_create(tgt, src, inv_rate, ts, prov)
+    If inv is equal to 0:
+        Dec64.dec64_destroy(inv_rate)
+        Return 0
+    End If
+    Return inv
+End Process
+
+Process called "exchange_rate_apply" takes r as Integer, m as Integer returns Integer:
+    @Reasoning
+    Converts Money(source_currency) into Money(target_currency) by
+    multiplying by the rate. Returns 0 if the source currency of the rate
+    does not match the money's currency (the explicit-conversion guarantee).
+    @End Reasoning
+    @Implementation
+    1. Validate r.source == m.currency.
+    2. dec64_mul m.amount * r.rate.
+    3. Wrap in fresh Money with currency = r.target.
+    @End Implementation
+    @Performance_Hints
+    One Decimal64 multiply + one Money allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Refuses mismatched source currency: this is the audit invariant. A
+    caller who wants to convert EUR via a USD->JPY rate must compose
+    rates explicitly first (exchange_rate_compose).
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return 0
+    End If
+    If m is equal to 0:
+        Return 0
+    End If
+    Let m_currency be Money.money_get_currency(m)
+    Let r_source be MemoryCore.memory_get_int64(r, XR_FIELD_SOURCE)
+    If m_currency is not equal to r_source:
+        Return 0
+    End If
+    Let amt be Money.money_get_amount(m)
+    Let rate be MemoryCore.memory_get_int64(r, XR_FIELD_RATE)
+    Let new_amt be Dec64.dec64_mul(amt, rate, XR_ROUND_DEFAULT)
+    If new_amt is equal to 0:
+        Return 0
+    End If
+    Let r_target be MemoryCore.memory_get_int64(r, XR_FIELD_TARGET)
+    Let result be Money.money_create(r_target, new_amt)
+    If result is equal to 0:
+        Dec64.dec64_destroy(new_amt)
+        Return 0
+    End If
+    Return result
+End Process
+
+Process called "exchange_rate_compose" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Composes two rates: if a is USD->EUR and b is EUR->JPY, the composed
+    rate is USD->JPY with multiplier (a.rate * b.rate). Requires that
+    a.target == b.source.
+    @End Reasoning
+    @Implementation
+    1. Validate a.target == b.source.
+    2. dec64_mul a.rate * b.rate.
+    3. Build a new ExchangeRate with source=a.source, target=b.target,
+       timestamp = min(a.ts, b.ts) (the oldest member determines staleness),
+       provenance = a.provenance (caller can override at a higher tier
+       to record the composition path).
+    @End Implementation
+    @Performance_Hints
+    One Decimal64 multiply + one allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Refuses to compose non-adjacent rates. This preserves the audit chain.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let a_target be MemoryCore.memory_get_int64(a, XR_FIELD_TARGET)
+    Let b_source be MemoryCore.memory_get_int64(b, XR_FIELD_SOURCE)
+    If a_target is not equal to b_source:
+        Return 0
+    End If
+    Let a_rate be MemoryCore.memory_get_int64(a, XR_FIELD_RATE)
+    Let b_rate be MemoryCore.memory_get_int64(b, XR_FIELD_RATE)
+    Let composed_rate be Dec64.dec64_mul(a_rate, b_rate, XR_ROUND_DEFAULT)
+    If composed_rate is equal to 0:
+        Return 0
+    End If
+    Let a_source be MemoryCore.memory_get_int64(a, XR_FIELD_SOURCE)
+    Let b_target be MemoryCore.memory_get_int64(b, XR_FIELD_TARGET)
+    Let a_ts be MemoryCore.memory_get_int64(a, XR_FIELD_TIMESTAMP)
+    Let b_ts be MemoryCore.memory_get_int64(b, XR_FIELD_TIMESTAMP)
+    Let oldest_ts be a_ts
+    If b_ts is less than a_ts:
+        Set oldest_ts to b_ts
+    End If
+    Let a_prov be MemoryCore.memory_get_int64(a, XR_FIELD_PROVENANCE)
+    Let composed be exchange_rate_create(a_source, b_target, composed_rate, oldest_ts, a_prov)
+    If composed is equal to 0:
+        Dec64.dec64_destroy(composed_rate)
+        Return 0
+    End If
+    Return composed
+End Process
+
+Process called "exchange_rate_age_ns" takes r as Integer, current_time_ns as Integer returns Integer:
+    @Reasoning
+    Returns the age of the rate in nanoseconds (current_time_ns - r.timestamp).
+    Used for staleness checks: if age exceeds the policy threshold, callers
+    refresh the rate before applying.
+    @End Reasoning
+    @Implementation
+    Single subtraction.
+    @End Implementation
+    @Performance_Hints
+    Two loads, one subtract.
+    @End Performance_Hints
+    @Security_Scope
+    Returns 0 on null input. A negative age (timestamp in the future)
+    indicates clock skew and should be treated by callers as "fresh".
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return 0
+    End If
+    Let ts be MemoryCore.memory_get_int64(r, XR_FIELD_TIMESTAMP)
+    Return current_time_ns minus ts
+End Process
+
+Process called "exchange_rate_is_stale" takes r as Integer, current_time_ns as Integer, max_age_ns as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the rate is older than max_age_ns; 0 otherwise. Higher
+    tiers should call this before exchange_rate_apply on any latency-
+    sensitive path (FX market data, on-chain oracle reads).
+    @End Reasoning
+    @Implementation
+    Compare exchange_rate_age_ns to max_age_ns.
+    @End Implementation
+    @Performance_Hints
+    One subtract + one compare.
+    @End Performance_Hints
+    @Security_Scope
+    Null-safe (returns 1 for null, treating null as stale).
+    @End Security_Scope
+
+    If r is equal to 0:
+        Return 1
+    End If
+    Let age be exchange_rate_age_ns(r, current_time_ns)
+    If age is greater than max_age_ns:
+        Return 1
+    End If
+    Return 0
+End Process

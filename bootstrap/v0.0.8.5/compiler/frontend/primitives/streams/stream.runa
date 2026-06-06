@@ -1,0 +1,1639 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+STREAM - Lazy pull-stream iterator.
+
+A Stream<T> is an iterator that yields values one at a time via a
+caller-supplied next-fn. Streams are lazy: values are computed when the
+consumer asks for them. This module also provides eager builders
+(from_list, from_range), pure transformers (map, filter, take, drop,
+flat_map, chain, zip, window, enumerate) and terminal operations
+(fold, reduce, collect_to_list, count, any, all, find, for_each).
+
+Stream layout (40 bytes):
+  offset 0:  next_fn         (8 bytes) - Process pointer; signature
+                                          (state) -> Integer (encoded result)
+  offset 8:  state_ptr       (8 bytes) - owning state, freed by destroy_fn
+  offset 16: destroy_fn      (8 bytes) - Process pointer to free state_ptr
+  offset 24: exhausted_flag  (8 bytes) - 1 once next_fn reports STREAM_END
+  offset 32: out_holder      (8 bytes) - scratch slot used by next-fn outputs
+
+next-fn protocol:
+  return STREAM_OK and write the next value to out_holder[0],
+  return STREAM_END when the stream is exhausted,
+  return STREAM_ERROR for an unrecoverable error.
+
+Dependencies:
+- memory/layout.runa
+- core/memory_core.runa
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant STREAM_OFF_NEXT as Integer is 0
+Constant STREAM_OFF_STATE as Integer is 8
+Constant STREAM_OFF_DESTROY as Integer is 16
+Constant STREAM_OFF_EXHAUSTED as Integer is 24
+Constant STREAM_OFF_OUT as Integer is 32
+Constant STREAM_STRUCT_SIZE as Integer is 40
+
+Constant STREAM_OK as Integer is 1
+Constant STREAM_END as Integer is 0
+Constant STREAM_ERROR as Integer is -1
+Constant STREAM_ERR_INVALID as Integer is -2
+
+Note: ============================================================================
+Note: Indirect-call shims — real x86_64 indirect dispatch via inline assembly.
+Note: ============================================================================
+
+Process called "stream_runtime_call_indirect_2" takes fn as Integer, a as Integer, b as Integer returns Integer:
+    Note: Forwards (state, out_holder) -> Integer via real indirect call.
+    Note: fn at [rbp-8], a at [rbp-16], b at [rbp-24], result at [rbp-32].
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        mov rax, qword ptr [rbp-8]
+        mov rdi, qword ptr [rbp-16]
+        mov rsi, qword ptr [rbp-24]
+        call rax
+        mov qword ptr [rbp-32], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_runtime_call_indirect_1" takes fn as Integer, a as Integer returns Integer:
+    Note: Forwards (state) -> Integer via real indirect call.
+    Note: fn at [rbp-8], a at [rbp-16], result at [rbp-24].
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        mov rax, qword ptr [rbp-8]
+        mov rdi, qword ptr [rbp-16]
+        call rax
+        mov qword ptr [rbp-24], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Constructor & destructor
+Note: ============================================================================
+
+@Reasoning
+Construct a stream by binding a generator function, an opaque state
+pointer and an optional destroy function. The destroy function is
+called once by stream_destroy to release state.
+@End Reasoning
+
+@Implementation
+Allocate the 40-byte record, populate fields, return the pointer.
+@End Implementation
+
+@Performance_Hints
+One allocation per stream. The state is allocated by the caller.
+@End Performance_Hints
+
+@Security_Scope
+The next-fn must abide by the next-fn protocol described above.
+@End Security_Scope
+
+Process called "stream_create" takes next_fn as Integer, state_ptr as Integer, destroy_fn as Integer returns Integer:
+    If next_fn is equal to 0:
+        Return 0
+    End If
+    Let s be proc allocate from Memory with STREAM_STRUCT_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with s, STREAM_OFF_NEXT, next_fn
+    proc memory_set_int64 from Mem with s, STREAM_OFF_STATE, state_ptr
+    proc memory_set_int64 from Mem with s, STREAM_OFF_DESTROY, destroy_fn
+    proc memory_set_int64 from Mem with s, STREAM_OFF_EXHAUSTED, 0
+    proc memory_set_int64 from Mem with s, STREAM_OFF_OUT, 0
+    Return s
+End Process
+
+Process called "stream_destroy" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    Let destroy_fn be proc memory_get_int64 from Mem with s, STREAM_OFF_DESTROY
+    Let state_ptr be proc memory_get_int64 from Mem with s, STREAM_OFF_STATE
+    If destroy_fn is not equal to 0:
+        proc stream_runtime_call_indirect_1 with destroy_fn, state_ptr
+    Otherwise:
+        If state_ptr is not equal to 0:
+            proc deallocate from Memory with state_ptr
+        End If
+    End If
+    proc deallocate from Memory with s
+    Return STREAM_OK
+End Process
+
+Process called "stream_is_exhausted" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 1
+    End If
+    Return proc memory_get_int64 from Mem with s, STREAM_OFF_EXHAUSTED
+End Process
+
+@Reasoning
+Pull a single value from the stream. The caller receives STREAM_OK with
+the value written via out_holder, STREAM_END if there are no more
+values, or STREAM_ERROR if the generator reported an error.
+@End Reasoning
+
+@Implementation
+If the exhausted flag is already set, immediately return STREAM_END.
+Otherwise invoke the next-fn via the indirect shim, passing state and
+the stream's scratch out_holder. Mirror the result into the caller's
+out_holder and update the exhausted flag.
+@End Implementation
+
+@Performance_Hints
+One indirect call per pulled value plus two memory stores.
+@End Performance_Hints
+
+@Security_Scope
+out_holder must point to writable storage when STREAM_OK is returned.
+@End Security_Scope
+
+Process called "stream_next" takes s as Integer, out_holder as Integer returns Integer:
+    If s is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    If out_holder is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    Let exhausted be proc memory_get_int64 from Mem with s, STREAM_OFF_EXHAUSTED
+    If exhausted is equal to 1:
+        Return STREAM_END
+    End If
+    Let next_fn be proc memory_get_int64 from Mem with s, STREAM_OFF_NEXT
+    Let state_ptr be proc memory_get_int64 from Mem with s, STREAM_OFF_STATE
+    Let scratch_addr be s plus STREAM_OFF_OUT
+    proc memory_set_int64 from Mem with scratch_addr, 0, 0
+    Let rc be proc stream_runtime_call_indirect_2 with next_fn, state_ptr, scratch_addr
+    If rc is equal to STREAM_OK:
+        Let value be proc memory_get_int64 from Mem with scratch_addr, 0
+        proc memory_set_int64 from Mem with out_holder, 0, value
+        Return STREAM_OK
+    End If
+    If rc is equal to STREAM_END:
+        proc memory_set_int64 from Mem with s, STREAM_OFF_EXHAUSTED, 1
+        Return STREAM_END
+    End If
+    Return STREAM_ERROR
+End Process
+
+Note: ============================================================================
+Note: Source builders
+Note: ============================================================================
+
+Note: --- from_list ---
+Note: State layout: [list_ptr, len, cursor]
+
+Constant LIST_STATE_LIST as Integer is 0
+Constant LIST_STATE_LEN as Integer is 8
+Constant LIST_STATE_CURSOR as Integer is 16
+Constant LIST_STATE_SIZE as Integer is 24
+
+Process called "stream_list_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let list_ptr be proc memory_get_int64 from Mem with state, LIST_STATE_LIST
+    Let len be proc memory_get_int64 from Mem with state, LIST_STATE_LEN
+    Let cursor be proc memory_get_int64 from Mem with state, LIST_STATE_CURSOR
+    If cursor is greater than or equal to len:
+        Return STREAM_END
+    End If
+    Let offset be cursor multiplied by 8
+    Let value be proc memory_get_int64 from Mem with list_ptr, offset
+    proc memory_set_int64 from Mem with out_holder, 0, value
+    proc memory_set_int64 from Mem with state, LIST_STATE_CURSOR, (cursor plus 1)
+    Return STREAM_OK
+End Process
+
+Process called "stream_from_list" takes list_ptr as Integer, len as Integer returns Integer:
+    Let state be proc allocate from Memory with LIST_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, LIST_STATE_LIST, list_ptr
+    proc memory_set_int64 from Mem with state, LIST_STATE_LEN, len
+    proc memory_set_int64 from Mem with state, LIST_STATE_CURSOR, 0
+    Note: We deliberately pass 0 for destroy_fn so the default deallocate runs.
+    Return proc stream_create with proc_address_stream_list_next(), state, 0
+End Process
+
+Note: Helper that returns the address of stream_list_next. Compiler-resolved.
+Process called "proc_address_stream_list_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_list_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Note: --- from_range ---
+Note: State layout: [cursor, end, step]
+
+Constant RANGE_STATE_CURSOR as Integer is 0
+Constant RANGE_STATE_END as Integer is 8
+Constant RANGE_STATE_STEP as Integer is 16
+Constant RANGE_STATE_SIZE as Integer is 24
+
+Process called "stream_range_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let cursor be proc memory_get_int64 from Mem with state, RANGE_STATE_CURSOR
+    Let end_v be proc memory_get_int64 from Mem with state, RANGE_STATE_END
+    Let step be proc memory_get_int64 from Mem with state, RANGE_STATE_STEP
+    If step is greater than 0:
+        If cursor is greater than or equal to end_v:
+            Return STREAM_END
+        End If
+    Otherwise:
+        If step is less than 0:
+            If cursor is less than or equal to end_v:
+                Return STREAM_END
+            End If
+        Otherwise:
+            Return STREAM_END
+        End If
+    End If
+    proc memory_set_int64 from Mem with out_holder, 0, cursor
+    proc memory_set_int64 from Mem with state, RANGE_STATE_CURSOR, (cursor plus step)
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_range_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_range_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_from_range" takes start_v as Integer, end_v as Integer, step as Integer returns Integer:
+    Let st be step
+    If st is equal to 0:
+        Set st to 1
+    End If
+    Let state be proc allocate from Memory with RANGE_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, RANGE_STATE_CURSOR, start_v
+    proc memory_set_int64 from Mem with state, RANGE_STATE_END, end_v
+    proc memory_set_int64 from Mem with state, RANGE_STATE_STEP, st
+    Return proc stream_create with proc_address_stream_range_next(), state, 0
+End Process
+
+Note: --- from_repeat (infinite repeat of single value) ---
+Note: State layout: [value, remaining]  -- remaining < 0 means infinite
+
+Constant REPEAT_STATE_VALUE as Integer is 0
+Constant REPEAT_STATE_REMAINING as Integer is 8
+Constant REPEAT_STATE_SIZE as Integer is 16
+
+Process called "stream_repeat_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let remaining be proc memory_get_int64 from Mem with state, REPEAT_STATE_REMAINING
+    If remaining is equal to 0:
+        Return STREAM_END
+    End If
+    Let value be proc memory_get_int64 from Mem with state, REPEAT_STATE_VALUE
+    proc memory_set_int64 from Mem with out_holder, 0, value
+    If remaining is greater than 0:
+        proc memory_set_int64 from Mem with state, REPEAT_STATE_REMAINING, (remaining minus 1)
+    End If
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_repeat_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_repeat_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_from_repeat" takes value as Integer, count as Integer returns Integer:
+    Let state be proc allocate from Memory with REPEAT_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    Let rem be count
+    If rem is less than 0:
+        Set rem to -1
+    End If
+    proc memory_set_int64 from Mem with state, REPEAT_STATE_VALUE, value
+    proc memory_set_int64 from Mem with state, REPEAT_STATE_REMAINING, rem
+    Return proc stream_create with proc_address_stream_repeat_next(), state, 0
+End Process
+
+Note: --- from_iterate (seed + step_fn) ---
+Note: State layout: [cursor, step_fn]
+
+Constant ITER_STATE_CURSOR as Integer is 0
+Constant ITER_STATE_STEP as Integer is 8
+Constant ITER_STATE_SIZE as Integer is 16
+
+Process called "stream_iterate_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let cursor be proc memory_get_int64 from Mem with state, ITER_STATE_CURSOR
+    proc memory_set_int64 from Mem with out_holder, 0, cursor
+    Let step_fn be proc memory_get_int64 from Mem with state, ITER_STATE_STEP
+    If step_fn is not equal to 0:
+        Let next_v be proc stream_runtime_call_indirect_1 with step_fn, cursor
+        proc memory_set_int64 from Mem with state, ITER_STATE_CURSOR, next_v
+    End If
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_iterate_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_iterate_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_from_iterate" takes seed as Integer, step_fn as Integer returns Integer:
+    Let state be proc allocate from Memory with ITER_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, ITER_STATE_CURSOR, seed
+    proc memory_set_int64 from Mem with state, ITER_STATE_STEP, step_fn
+    Return proc stream_create with proc_address_stream_iterate_next(), state, 0
+End Process
+
+Note: ============================================================================
+Note: Transformers
+Note: ============================================================================
+
+Note: --- map ---
+Note: State layout: [source, fn]
+
+Constant MAP_STATE_SOURCE as Integer is 0
+Constant MAP_STATE_FN as Integer is 8
+Constant MAP_STATE_SIZE as Integer is 16
+
+Process called "stream_map_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let source be proc memory_get_int64 from Mem with state, MAP_STATE_SOURCE
+    Let fn be proc memory_get_int64 from Mem with state, MAP_STATE_FN
+    Let tmp be 0
+    Let tmp_addr be state plus MAP_STATE_SIZE
+    Note: We reuse out_holder for the source pull then transform in-place.
+    Let rc be proc stream_next with source, out_holder
+    If rc is not equal to STREAM_OK:
+        Return rc
+    End If
+    Let original be proc memory_get_int64 from Mem with out_holder, 0
+    Let mapped be proc stream_runtime_call_indirect_1 with fn, original
+    proc memory_set_int64 from Mem with out_holder, 0, mapped
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_map_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_map_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_map_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let source be proc memory_get_int64 from Mem with state, MAP_STATE_SOURCE
+    If source is not equal to 0:
+        proc stream_destroy with source
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_map_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_map_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_map" takes source as Integer, fn as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Memory with MAP_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, MAP_STATE_SOURCE, source
+    proc memory_set_int64 from Mem with state, MAP_STATE_FN, fn
+    Return proc stream_create with proc_address_stream_map_next(), state, proc_address_stream_map_destroy()
+End Process
+
+Note: --- filter ---
+Note: State layout: [source, predicate]
+
+Constant FILT_STATE_SOURCE as Integer is 0
+Constant FILT_STATE_PRED as Integer is 8
+Constant FILT_STATE_SIZE as Integer is 16
+
+Process called "stream_filter_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let source be proc memory_get_int64 from Mem with state, FILT_STATE_SOURCE
+    Let pred be proc memory_get_int64 from Mem with state, FILT_STATE_PRED
+    While 1 is equal to 1:
+        Let rc be proc stream_next with source, out_holder
+        If rc is not equal to STREAM_OK:
+            Return rc
+        End If
+        Let value be proc memory_get_int64 from Mem with out_holder, 0
+        Let keep be proc stream_runtime_call_indirect_1 with pred, value
+        If keep is not equal to 0:
+            Return STREAM_OK
+        End If
+    End While
+    Return STREAM_END
+End Process
+
+Process called "proc_address_stream_filter_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_filter_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_filter_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let source be proc memory_get_int64 from Mem with state, FILT_STATE_SOURCE
+    If source is not equal to 0:
+        proc stream_destroy with source
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_filter_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_filter_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_filter" takes source as Integer, predicate as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    If predicate is equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Memory with FILT_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, FILT_STATE_SOURCE, source
+    proc memory_set_int64 from Mem with state, FILT_STATE_PRED, predicate
+    Return proc stream_create with proc_address_stream_filter_next(), state, proc_address_stream_filter_destroy()
+End Process
+
+Note: --- take(n) ---
+Note: State layout: [source, remaining]
+
+Constant TAKE_STATE_SOURCE as Integer is 0
+Constant TAKE_STATE_REMAINING as Integer is 8
+Constant TAKE_STATE_SIZE as Integer is 16
+
+Process called "stream_take_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let remaining be proc memory_get_int64 from Mem with state, TAKE_STATE_REMAINING
+    If remaining is less than or equal to 0:
+        Return STREAM_END
+    End If
+    Let source be proc memory_get_int64 from Mem with state, TAKE_STATE_SOURCE
+    Let rc be proc stream_next with source, out_holder
+    If rc is not equal to STREAM_OK:
+        Return rc
+    End If
+    proc memory_set_int64 from Mem with state, TAKE_STATE_REMAINING, (remaining minus 1)
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_take_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_take_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_take_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let source be proc memory_get_int64 from Mem with state, TAKE_STATE_SOURCE
+    If source is not equal to 0:
+        proc stream_destroy with source
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_take_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_take_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_take" takes source as Integer, count as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Memory with TAKE_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    Let n be count
+    If n is less than 0:
+        Set n to 0
+    End If
+    proc memory_set_int64 from Mem with state, TAKE_STATE_SOURCE, source
+    proc memory_set_int64 from Mem with state, TAKE_STATE_REMAINING, n
+    Return proc stream_create with proc_address_stream_take_next(), state, proc_address_stream_take_destroy()
+End Process
+
+Note: --- drop(n) ---
+Note: State layout: [source, remaining_to_drop]
+
+Constant DROP_STATE_SOURCE as Integer is 0
+Constant DROP_STATE_REMAINING as Integer is 8
+Constant DROP_STATE_SIZE as Integer is 16
+
+Process called "stream_drop_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let source be proc memory_get_int64 from Mem with state, DROP_STATE_SOURCE
+    Let remaining be proc memory_get_int64 from Mem with state, DROP_STATE_REMAINING
+    While remaining is greater than 0:
+        Let drop_rc be proc stream_next with source, out_holder
+        If drop_rc is not equal to STREAM_OK:
+            proc memory_set_int64 from Mem with state, DROP_STATE_REMAINING, 0
+            Return drop_rc
+        End If
+        Set remaining to remaining minus 1
+    End While
+    proc memory_set_int64 from Mem with state, DROP_STATE_REMAINING, 0
+    Return proc stream_next with source, out_holder
+End Process
+
+Process called "proc_address_stream_drop_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_drop_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_drop_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let source be proc memory_get_int64 from Mem with state, DROP_STATE_SOURCE
+    If source is not equal to 0:
+        proc stream_destroy with source
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_drop_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_drop_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_drop" takes source as Integer, count as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Memory with DROP_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    Let n be count
+    If n is less than 0:
+        Set n to 0
+    End If
+    proc memory_set_int64 from Mem with state, DROP_STATE_SOURCE, source
+    proc memory_set_int64 from Mem with state, DROP_STATE_REMAINING, n
+    Return proc stream_create with proc_address_stream_drop_next(), state, proc_address_stream_drop_destroy()
+End Process
+
+Note: --- take_while ---
+Note: State layout: [source, predicate, done_flag]
+
+Constant TW_STATE_SOURCE as Integer is 0
+Constant TW_STATE_PRED as Integer is 8
+Constant TW_STATE_DONE as Integer is 16
+Constant TW_STATE_SIZE as Integer is 24
+
+Process called "stream_take_while_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let done_flag be proc memory_get_int64 from Mem with state, TW_STATE_DONE
+    If done_flag is equal to 1:
+        Return STREAM_END
+    End If
+    Let source be proc memory_get_int64 from Mem with state, TW_STATE_SOURCE
+    Let pred be proc memory_get_int64 from Mem with state, TW_STATE_PRED
+    Let rc be proc stream_next with source, out_holder
+    If rc is not equal to STREAM_OK:
+        Return rc
+    End If
+    Let value be proc memory_get_int64 from Mem with out_holder, 0
+    Let keep be proc stream_runtime_call_indirect_1 with pred, value
+    If keep is equal to 0:
+        proc memory_set_int64 from Mem with state, TW_STATE_DONE, 1
+        Return STREAM_END
+    End If
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_take_while_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_take_while_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_take_while_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let source be proc memory_get_int64 from Mem with state, TW_STATE_SOURCE
+    If source is not equal to 0:
+        proc stream_destroy with source
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_take_while_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_take_while_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_take_while" takes source as Integer, predicate as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    If predicate is equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Memory with TW_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, TW_STATE_SOURCE, source
+    proc memory_set_int64 from Mem with state, TW_STATE_PRED, predicate
+    proc memory_set_int64 from Mem with state, TW_STATE_DONE, 0
+    Return proc stream_create with proc_address_stream_take_while_next(), state, proc_address_stream_take_while_destroy()
+End Process
+
+Note: --- drop_while ---
+Note: State layout: [source, predicate, dropped_flag]
+
+Constant DW_STATE_SOURCE as Integer is 0
+Constant DW_STATE_PRED as Integer is 8
+Constant DW_STATE_FLAG as Integer is 16
+Constant DW_STATE_SIZE as Integer is 24
+
+Process called "stream_drop_while_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let source be proc memory_get_int64 from Mem with state, DW_STATE_SOURCE
+    Let pred be proc memory_get_int64 from Mem with state, DW_STATE_PRED
+    Let dropped be proc memory_get_int64 from Mem with state, DW_STATE_FLAG
+    If dropped is equal to 1:
+        Return proc stream_next with source, out_holder
+    End If
+    While 1 is equal to 1:
+        Let rc be proc stream_next with source, out_holder
+        If rc is not equal to STREAM_OK:
+            proc memory_set_int64 from Mem with state, DW_STATE_FLAG, 1
+            Return rc
+        End If
+        Let value be proc memory_get_int64 from Mem with out_holder, 0
+        Let still_drop be proc stream_runtime_call_indirect_1 with pred, value
+        If still_drop is equal to 0:
+            proc memory_set_int64 from Mem with state, DW_STATE_FLAG, 1
+            Return STREAM_OK
+        End If
+    End While
+    Return STREAM_END
+End Process
+
+Process called "proc_address_stream_drop_while_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_drop_while_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_drop_while_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let source be proc memory_get_int64 from Mem with state, DW_STATE_SOURCE
+    If source is not equal to 0:
+        proc stream_destroy with source
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_drop_while_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_drop_while_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_drop_while" takes source as Integer, predicate as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    If predicate is equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Memory with DW_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, DW_STATE_SOURCE, source
+    proc memory_set_int64 from Mem with state, DW_STATE_PRED, predicate
+    proc memory_set_int64 from Mem with state, DW_STATE_FLAG, 0
+    Return proc stream_create with proc_address_stream_drop_while_next(), state, proc_address_stream_drop_while_destroy()
+End Process
+
+Note: --- chain (concatenate s1 then s2) ---
+Note: State layout: [first, second, on_second]
+
+Constant CH_STATE_FIRST as Integer is 0
+Constant CH_STATE_SECOND as Integer is 8
+Constant CH_STATE_FLAG as Integer is 16
+Constant CH_STATE_SIZE as Integer is 24
+
+Process called "stream_chain_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let on_second be proc memory_get_int64 from Mem with state, CH_STATE_FLAG
+    If on_second is equal to 0:
+        Let first be proc memory_get_int64 from Mem with state, CH_STATE_FIRST
+        Let rc be proc stream_next with first, out_holder
+        If rc is equal to STREAM_OK:
+            Return STREAM_OK
+        End If
+        If rc is equal to STREAM_ERROR:
+            Return STREAM_ERROR
+        End If
+        proc memory_set_int64 from Mem with state, CH_STATE_FLAG, 1
+    End If
+    Let second be proc memory_get_int64 from Mem with state, CH_STATE_SECOND
+    Return proc stream_next with second, out_holder
+End Process
+
+Process called "proc_address_stream_chain_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_chain_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_chain_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let first be proc memory_get_int64 from Mem with state, CH_STATE_FIRST
+    Let second be proc memory_get_int64 from Mem with state, CH_STATE_SECOND
+    If first is not equal to 0:
+        proc stream_destroy with first
+    End If
+    If second is not equal to 0:
+        proc stream_destroy with second
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_chain_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_chain_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_chain" takes s1 as Integer, s2 as Integer returns Integer:
+    If s1 is equal to 0:
+        Return s2
+    End If
+    If s2 is equal to 0:
+        Return s1
+    End If
+    Let state be proc allocate from Memory with CH_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, CH_STATE_FIRST, s1
+    proc memory_set_int64 from Mem with state, CH_STATE_SECOND, s2
+    proc memory_set_int64 from Mem with state, CH_STATE_FLAG, 0
+    Return proc stream_create with proc_address_stream_chain_next(), state, proc_address_stream_chain_destroy()
+End Process
+
+Note: --- zip (pair up two streams; stops at the shorter end) ---
+Note: State layout: [s1, s2, scratch1, scratch2, pair_state_size]
+Note: zip writes a pair encoded as a 16-byte block; out_holder holds the pointer.
+
+Constant ZIP_STATE_S1 as Integer is 0
+Constant ZIP_STATE_S2 as Integer is 8
+Constant ZIP_STATE_PAIR_PTR as Integer is 16
+Constant ZIP_STATE_SCRATCH as Integer is 24
+Constant ZIP_STATE_SIZE as Integer is 40
+
+Process called "stream_zip_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let s1 be proc memory_get_int64 from Mem with state, ZIP_STATE_S1
+    Let s2 be proc memory_get_int64 from Mem with state, ZIP_STATE_S2
+    Let scratch_addr be state plus ZIP_STATE_SCRATCH
+    Let rc1 be proc stream_next with s1, scratch_addr
+    If rc1 is not equal to STREAM_OK:
+        Return rc1
+    End If
+    Let v1 be proc memory_get_int64 from Mem with scratch_addr, 0
+    Let rc2 be proc stream_next with s2, scratch_addr
+    If rc2 is not equal to STREAM_OK:
+        Return rc2
+    End If
+    Let v2 be proc memory_get_int64 from Mem with scratch_addr, 0
+    Let pair_ptr be proc memory_get_int64 from Mem with state, ZIP_STATE_PAIR_PTR
+    If pair_ptr is equal to 0:
+        Set pair_ptr to proc allocate from Memory with 16
+        If pair_ptr is equal to 0:
+            Return STREAM_ERROR
+        End If
+        proc memory_set_int64 from Mem with state, ZIP_STATE_PAIR_PTR, pair_ptr
+    End If
+    proc memory_set_int64 from Mem with pair_ptr, 0, v1
+    proc memory_set_int64 from Mem with pair_ptr, 8, v2
+    proc memory_set_int64 from Mem with out_holder, 0, pair_ptr
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_zip_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_zip_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_zip_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let s1 be proc memory_get_int64 from Mem with state, ZIP_STATE_S1
+    Let s2 be proc memory_get_int64 from Mem with state, ZIP_STATE_S2
+    Let pair_ptr be proc memory_get_int64 from Mem with state, ZIP_STATE_PAIR_PTR
+    If s1 is not equal to 0:
+        proc stream_destroy with s1
+    End If
+    If s2 is not equal to 0:
+        proc stream_destroy with s2
+    End If
+    If pair_ptr is not equal to 0:
+        proc deallocate from Memory with pair_ptr
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_zip_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_zip_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_zip" takes s1 as Integer, s2 as Integer returns Integer:
+    If s1 is equal to 0:
+        Return 0
+    End If
+    If s2 is equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Memory with ZIP_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, ZIP_STATE_S1, s1
+    proc memory_set_int64 from Mem with state, ZIP_STATE_S2, s2
+    proc memory_set_int64 from Mem with state, ZIP_STATE_PAIR_PTR, 0
+    proc memory_set_int64 from Mem with state, ZIP_STATE_SCRATCH, 0
+    Return proc stream_create with proc_address_stream_zip_next(), state, proc_address_stream_zip_destroy()
+End Process
+
+Note: --- enumerate (yields [index, value] pairs) ---
+Note: State layout: [source, counter, pair_ptr, scratch]
+
+Constant EN_STATE_SOURCE as Integer is 0
+Constant EN_STATE_COUNTER as Integer is 8
+Constant EN_STATE_PAIR as Integer is 16
+Constant EN_STATE_SCRATCH as Integer is 24
+Constant EN_STATE_SIZE as Integer is 32
+
+Process called "stream_enumerate_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let source be proc memory_get_int64 from Mem with state, EN_STATE_SOURCE
+    Let counter be proc memory_get_int64 from Mem with state, EN_STATE_COUNTER
+    Let scratch_addr be state plus EN_STATE_SCRATCH
+    Let rc be proc stream_next with source, scratch_addr
+    If rc is not equal to STREAM_OK:
+        Return rc
+    End If
+    Let value be proc memory_get_int64 from Mem with scratch_addr, 0
+    Let pair_ptr be proc memory_get_int64 from Mem with state, EN_STATE_PAIR
+    If pair_ptr is equal to 0:
+        Set pair_ptr to proc allocate from Memory with 16
+        If pair_ptr is equal to 0:
+            Return STREAM_ERROR
+        End If
+        proc memory_set_int64 from Mem with state, EN_STATE_PAIR, pair_ptr
+    End If
+    proc memory_set_int64 from Mem with pair_ptr, 0, counter
+    proc memory_set_int64 from Mem with pair_ptr, 8, value
+    proc memory_set_int64 from Mem with out_holder, 0, pair_ptr
+    proc memory_set_int64 from Mem with state, EN_STATE_COUNTER, (counter plus 1)
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_enumerate_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_enumerate_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_enumerate_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let source be proc memory_get_int64 from Mem with state, EN_STATE_SOURCE
+    Let pair_ptr be proc memory_get_int64 from Mem with state, EN_STATE_PAIR
+    If source is not equal to 0:
+        proc stream_destroy with source
+    End If
+    If pair_ptr is not equal to 0:
+        proc deallocate from Memory with pair_ptr
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_enumerate_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_enumerate_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_enumerate" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Memory with EN_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, EN_STATE_SOURCE, source
+    proc memory_set_int64 from Mem with state, EN_STATE_COUNTER, 0
+    proc memory_set_int64 from Mem with state, EN_STATE_PAIR, 0
+    Return proc stream_create with proc_address_stream_enumerate_next(), state, proc_address_stream_enumerate_destroy()
+End Process
+
+Note: --- flat_map (each element produces a sub-stream) ---
+Note: State layout: [source, fn, current_substream]
+
+Constant FM_STATE_SOURCE as Integer is 0
+Constant FM_STATE_FN as Integer is 8
+Constant FM_STATE_SUB as Integer is 16
+Constant FM_STATE_SIZE as Integer is 24
+
+Process called "stream_flat_map_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    While 1 is equal to 1:
+        Let sub be proc memory_get_int64 from Mem with state, FM_STATE_SUB
+        If sub is not equal to 0:
+            Let rc be proc stream_next with sub, out_holder
+            If rc is equal to STREAM_OK:
+                Return STREAM_OK
+            End If
+            If rc is equal to STREAM_ERROR:
+                Return STREAM_ERROR
+            End If
+            proc stream_destroy with sub
+            proc memory_set_int64 from Mem with state, FM_STATE_SUB, 0
+        End If
+        Let source be proc memory_get_int64 from Mem with state, FM_STATE_SOURCE
+        Let fn be proc memory_get_int64 from Mem with state, FM_STATE_FN
+        Let rc2 be proc stream_next with source, out_holder
+        If rc2 is not equal to STREAM_OK:
+            Return rc2
+        End If
+        Let value be proc memory_get_int64 from Mem with out_holder, 0
+        Let new_sub be proc stream_runtime_call_indirect_1 with fn, value
+        proc memory_set_int64 from Mem with state, FM_STATE_SUB, new_sub
+    End While
+    Return STREAM_END
+End Process
+
+Process called "proc_address_stream_flat_map_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_flat_map_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_flat_map_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let source be proc memory_get_int64 from Mem with state, FM_STATE_SOURCE
+    Let sub be proc memory_get_int64 from Mem with state, FM_STATE_SUB
+    If sub is not equal to 0:
+        proc stream_destroy with sub
+    End If
+    If source is not equal to 0:
+        proc stream_destroy with source
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_flat_map_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_flat_map_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_flat_map" takes source as Integer, fn as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Memory with FM_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, FM_STATE_SOURCE, source
+    proc memory_set_int64 from Mem with state, FM_STATE_FN, fn
+    proc memory_set_int64 from Mem with state, FM_STATE_SUB, 0
+    Return proc stream_create with proc_address_stream_flat_map_next(), state, proc_address_stream_flat_map_destroy()
+End Process
+
+Note: --- window (sliding window of fixed size) ---
+Note: State layout: [source, size, buffer_ptr, buffer_len]
+
+Constant WIN_STATE_SOURCE as Integer is 0
+Constant WIN_STATE_SIZE as Integer is 8
+Constant WIN_STATE_BUF as Integer is 16
+Constant WIN_STATE_LEN as Integer is 24
+Constant WIN_STATE_STRUCT_SIZE as Integer is 32
+
+Process called "stream_window_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_END
+    End If
+    Let source be proc memory_get_int64 from Mem with state, WIN_STATE_SOURCE
+    Let size be proc memory_get_int64 from Mem with state, WIN_STATE_SIZE
+    Let buf be proc memory_get_int64 from Mem with state, WIN_STATE_BUF
+    Let len be proc memory_get_int64 from Mem with state, WIN_STATE_LEN
+    Note: Slide the buffer left by one if we already produced a window once.
+    If len is equal to size:
+        Let i be 0
+        While i is less than (size minus 1):
+            Let src_off be (i plus 1) multiplied by 8
+            Let dst_off be i multiplied by 8
+            Let v be proc memory_get_int64 from Mem with buf, src_off
+            proc memory_set_int64 from Mem with buf, dst_off, v
+            Set i to i plus 1
+        End While
+        Set len to size minus 1
+        proc memory_set_int64 from Mem with state, WIN_STATE_LEN, len
+    End If
+    While len is less than size:
+        Let scratch_addr be out_holder
+        Let rc be proc stream_next with source, scratch_addr
+        If rc is not equal to STREAM_OK:
+            Return rc
+        End If
+        Let v2 be proc memory_get_int64 from Mem with scratch_addr, 0
+        Let off be len multiplied by 8
+        proc memory_set_int64 from Mem with buf, off, v2
+        Set len to len plus 1
+        proc memory_set_int64 from Mem with state, WIN_STATE_LEN, len
+    End While
+    proc memory_set_int64 from Mem with out_holder, 0, buf
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_window_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_window_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_window_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return STREAM_OK
+    End If
+    Let source be proc memory_get_int64 from Mem with state, WIN_STATE_SOURCE
+    Let buf be proc memory_get_int64 from Mem with state, WIN_STATE_BUF
+    If source is not equal to 0:
+        proc stream_destroy with source
+    End If
+    If buf is not equal to 0:
+        proc deallocate from Memory with buf
+    End If
+    proc deallocate from Memory with state
+    Return STREAM_OK
+End Process
+
+Process called "proc_address_stream_window_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + stream_window_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "stream_window" takes source as Integer, size as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    If size is less than or equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Memory with WIN_STATE_STRUCT_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    Let buf_bytes be size multiplied by 8
+    Let buf be proc allocate from Memory with buf_bytes
+    If buf is equal to 0:
+        proc deallocate from Memory with state
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, WIN_STATE_SOURCE, source
+    proc memory_set_int64 from Mem with state, WIN_STATE_SIZE, size
+    proc memory_set_int64 from Mem with state, WIN_STATE_BUF, buf
+    proc memory_set_int64 from Mem with state, WIN_STATE_LEN, 0
+    Return proc stream_create with proc_address_stream_window_next(), state, proc_address_stream_window_destroy()
+End Process
+
+Note: ============================================================================
+Note: Terminal operations
+Note: ============================================================================
+
+@Reasoning
+fold drives the stream to exhaustion, threading an accumulator through a
+caller-supplied reducer. The reducer takes (accumulator, value) and
+returns the new accumulator.
+@End Reasoning
+
+@Implementation
+Allocate one scratch slot, repeatedly call stream_next, dispatch the
+reducer through the 2-arg indirect shim and accumulate.
+@End Implementation
+
+@Performance_Hints
+One allocation + one indirect call per element.
+@End Performance_Hints
+
+@Security_Scope
+The reducer must obey the (acc, value) -> acc signature.
+@End Security_Scope
+
+Process called "stream_fold" takes s as Integer, initial as Integer, fn as Integer returns Integer:
+    If s is equal to 0:
+        Return initial
+    End If
+    If fn is equal to 0:
+        Return initial
+    End If
+    Let scratch be proc allocate from Memory with 8
+    If scratch is equal to 0:
+        Return initial
+    End If
+    Let acc be initial
+    While 1 is equal to 1:
+        Let rc be proc stream_next with s, scratch
+        If rc is not equal to STREAM_OK:
+            proc deallocate from Memory with scratch
+            Return acc
+        End If
+        Let value be proc memory_get_int64 from Mem with scratch, 0
+        Set acc to proc stream_runtime_call_indirect_2 with fn, acc, value
+    End While
+    proc deallocate from Memory with scratch
+    Return acc
+End Process
+
+Process called "stream_reduce" takes s as Integer, fn as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let scratch be proc allocate from Memory with 8
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let rc be proc stream_next with s, scratch
+    If rc is not equal to STREAM_OK:
+        proc deallocate from Memory with scratch
+        Return 0
+    End If
+    Let acc be proc memory_get_int64 from Mem with scratch, 0
+    While 1 is equal to 1:
+        Let rc2 be proc stream_next with s, scratch
+        If rc2 is not equal to STREAM_OK:
+            proc deallocate from Memory with scratch
+            Return acc
+        End If
+        Let value be proc memory_get_int64 from Mem with scratch, 0
+        Set acc to proc stream_runtime_call_indirect_2 with fn, acc, value
+    End While
+    proc deallocate from Memory with scratch
+    Return acc
+End Process
+
+@Reasoning
+collect_to_list materialises the stream into a freshly allocated array
+of 8-byte slots. Returns the array pointer; the length is written into
+out_len_holder.
+@End Reasoning
+
+@Implementation
+Start with a 16-element capacity, double on overflow, copy old buffer
+into new buffer, free old. Write length to caller's holder.
+@End Implementation
+
+@Performance_Hints
+Doubling growth gives amortised O(1) append. Two allocations + a copy
+when the buffer doubles.
+@End Performance_Hints
+
+@Security_Scope
+Caller owns the returned buffer and must call deallocate(...).
+@End Security_Scope
+
+Process called "stream_collect_to_list" takes s as Integer, out_len_holder as Integer returns Integer:
+    If s is equal to 0:
+        If out_len_holder is not equal to 0:
+            proc memory_set_int64 from Mem with out_len_holder, 0, 0
+        End If
+        Return 0
+    End If
+    Let capacity be 16
+    Let len be 0
+    Let buf be proc allocate from Memory with 128
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let scratch be proc allocate from Memory with 8
+    If scratch is equal to 0:
+        proc deallocate from Memory with buf
+        Return 0
+    End If
+    While 1 is equal to 1:
+        Let rc be proc stream_next with s, scratch
+        If rc is not equal to STREAM_OK:
+            proc deallocate from Memory with scratch
+            If out_len_holder is not equal to 0:
+                proc memory_set_int64 from Mem with out_len_holder, 0, len
+            End If
+            Return buf
+        End If
+        Let value be proc memory_get_int64 from Mem with scratch, 0
+        If len is greater than or equal to capacity:
+            Let new_capacity be capacity multiplied by 2
+            Let new_bytes be new_capacity multiplied by 8
+            Let new_buf be proc allocate from Memory with new_bytes
+            If new_buf is equal to 0:
+                proc deallocate from Memory with scratch
+                proc deallocate from Memory with buf
+                Return 0
+            End If
+            Let i be 0
+            While i is less than len:
+                Let off be i multiplied by 8
+                Let old_v be proc memory_get_int64 from Mem with buf, off
+                proc memory_set_int64 from Mem with new_buf, off, old_v
+                Set i to i plus 1
+            End While
+            proc deallocate from Memory with buf
+            Set buf to new_buf
+            Set capacity to new_capacity
+        End If
+        Let write_off be len multiplied by 8
+        proc memory_set_int64 from Mem with buf, write_off, value
+        Set len to len plus 1
+    End While
+    proc deallocate from Memory with scratch
+    If out_len_holder is not equal to 0:
+        proc memory_set_int64 from Mem with out_len_holder, 0, len
+    End If
+    Return buf
+End Process
+
+Process called "stream_count" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let scratch be proc allocate from Memory with 8
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let total be 0
+    While 1 is equal to 1:
+        Let rc be proc stream_next with s, scratch
+        If rc is not equal to STREAM_OK:
+            proc deallocate from Memory with scratch
+            Return total
+        End If
+        Set total to total plus 1
+    End While
+    proc deallocate from Memory with scratch
+    Return total
+End Process
+
+Process called "stream_for_each" takes s as Integer, fn as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let scratch be proc allocate from Memory with 8
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let visited be 0
+    While 1 is equal to 1:
+        Let rc be proc stream_next with s, scratch
+        If rc is not equal to STREAM_OK:
+            proc deallocate from Memory with scratch
+            Return visited
+        End If
+        Let value be proc memory_get_int64 from Mem with scratch, 0
+        proc stream_runtime_call_indirect_1 with fn, value
+        Set visited to visited plus 1
+    End While
+    proc deallocate from Memory with scratch
+    Return visited
+End Process
+
+Process called "stream_find" takes s as Integer, predicate as Integer, out_holder as Integer returns Integer:
+    If s is equal to 0:
+        Return STREAM_END
+    End If
+    If predicate is equal to 0:
+        Return STREAM_END
+    End If
+    If out_holder is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    Let scratch be proc allocate from Memory with 8
+    If scratch is equal to 0:
+        Return STREAM_ERROR
+    End If
+    While 1 is equal to 1:
+        Let rc be proc stream_next with s, scratch
+        If rc is not equal to STREAM_OK:
+            proc deallocate from Memory with scratch
+            Return rc
+        End If
+        Let value be proc memory_get_int64 from Mem with scratch, 0
+        Let hit be proc stream_runtime_call_indirect_1 with predicate, value
+        If hit is not equal to 0:
+            proc memory_set_int64 from Mem with out_holder, 0, value
+            proc deallocate from Memory with scratch
+            Return STREAM_OK
+        End If
+    End While
+    proc deallocate from Memory with scratch
+    Return STREAM_END
+End Process
+
+Process called "stream_any" takes s as Integer, predicate as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    If predicate is equal to 0:
+        Return 0
+    End If
+    Let scratch be proc allocate from Memory with 8
+    If scratch is equal to 0:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        Let rc be proc stream_next with s, scratch
+        If rc is not equal to STREAM_OK:
+            proc deallocate from Memory with scratch
+            Return 0
+        End If
+        Let value be proc memory_get_int64 from Mem with scratch, 0
+        Let hit be proc stream_runtime_call_indirect_1 with predicate, value
+        If hit is not equal to 0:
+            proc deallocate from Memory with scratch
+            Return 1
+        End If
+    End While
+    proc deallocate from Memory with scratch
+    Return 0
+End Process
+
+Process called "stream_all" takes s as Integer, predicate as Integer returns Integer:
+    If s is equal to 0:
+        Return 1
+    End If
+    If predicate is equal to 0:
+        Return 1
+    End If
+    Let scratch be proc allocate from Memory with 8
+    If scratch is equal to 0:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        Let rc be proc stream_next with s, scratch
+        If rc is not equal to STREAM_OK:
+            proc deallocate from Memory with scratch
+            Return 1
+        End If
+        Let value be proc memory_get_int64 from Mem with scratch, 0
+        Let hit be proc stream_runtime_call_indirect_1 with predicate, value
+        If hit is equal to 0:
+            proc deallocate from Memory with scratch
+            Return 0
+        End If
+    End While
+    proc deallocate from Memory with scratch
+    Return 1
+End Process
+
+Process called "stream_to_list" takes s as Integer, out_len_holder as Integer returns Integer:
+    Return proc stream_collect_to_list with s, out_len_holder
+End Process

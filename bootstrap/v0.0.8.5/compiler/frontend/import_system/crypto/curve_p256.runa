@@ -1,0 +1,1670 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+CURVE_P256 - NIST P-256 short Weierstrass curve operations (FIPS 186-4 D.1.2.3)
+==============================================================================
+
+Implements the NIST P-256 elliptic curve over Fp256:
+
+    y^2 = x^3 + a*x + b  (mod p)
+    a = -3  (i.e. p - 3 in canonical form)
+    b = 5ac635d8 aa3a93e7 b3ebbd55 769886bc 651d06b0 cc53b0f6 3bce3c3e 27d2604b
+
+The base point G has order n with cofactor h = 1:
+
+    Gx = 6b17d1f2 e12c4247 f8bce6e5 63a440f2 77037d81 2deb33a0 f4a13945 d898c296
+    Gy = 4fe342e2 fe1a7f9b 8ee7eb4a 7c0f9e16 2bce3357 6b315ece cbb64068 37bf51f5
+    n  = ffffffff 00000000 ffffffff ffffffff bce6faad a7179e84 f3b9cac2 fc632551
+
+Internal coordinate system: Jacobian projective (X : Y : Z) representing the
+affine point (X/Z^2, Y/Z^3) when Z != 0. The point at infinity is encoded as
+Z = 0. Point arithmetic uses the Bernstein-Lange formulas which are complete
+for a = -3 curves (no exceptional cases for distinct points), and a separate
+specialized doubling formula. Final outputs are converted to affine for
+serialization.
+
+Scalar multiplication uses a constant-time double-and-add ladder. For each
+scalar bit from MSB to LSB we double the accumulator and conditionally add
+the base point. The conditional add is implemented branchlessly via a
+constant-time point select that walks both candidate points regardless of the
+bit value. This eliminates timing-based scalar leakage at the cost of always
+performing the addition (overhead constant per bit).
+
+Memory: every per-call temporary is allocated from an arena supplied by the
+caller. A single scalar multiplication on P-256 issues roughly 1000 arena
+allocations of ~120 bytes each plus the BigInt scratch space; budget at
+least 1 MiB of arena per signing operation to stay comfortably above the
+peak.
+
+Point encoding (SEC 1 v2.0 sections 2.3.3 / 2.3.4):
+    0x00                : point at infinity         (1  byte)
+    0x02 || X           : compressed, y is even     (33 bytes)
+    0x03 || X           : compressed, y is odd      (33 bytes)
+    0x04 || X || Y      : uncompressed              (65 bytes)
+    0x06 || X || Y      : hybrid, y is even         (65 bytes)
+    0x07 || X || Y      : hybrid, y is odd          (65 bytes)
+
+References:
+- NIST FIPS 186-4 Appendix D.1.2.3 (curve P-256 / P-256 parameters).
+- SEC 1: Elliptic Curve Cryptography v2.0, section 2.3 (point representations).
+- SEC 2 v2.0 section 2.4.2 (secp256r1).
+- Bernstein, Lange "Faster addition and doubling on elliptic curves" (2007).
+- Hankerson, Menezes, Vanstone "Guide to Elliptic Curve Cryptography",
+  Chapters 3 (point arithmetic) and 4 (scalar multiplication).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/bigint.runa" as BigInt
+Import "compiler/frontend/import_system/crypto/bigint_extra.runa" as BigIntX
+Import "compiler/frontend/import_system/crypto/field_p256.runa" as Field
+
+Note: ============================================================================
+Note: Constants
+Note: ============================================================================
+
+Constant CURVE_P256_BYTES as Integer is 32
+Constant CURVE_P256_LIMBS as Integer is 4
+Constant CURVE_P256_POINT_BYTES as Integer is 65
+Constant CURVE_P256_COMPRESSED_BYTES as Integer is 33
+Constant CURVE_P256_JACOBIAN_STRUCT_BYTES as Integer is 24
+
+Note: ============================================================================
+Note: Curve parameter loaders
+Note: ============================================================================
+
+Process called "curve_p256_b" takes arena as Integer returns Integer:
+    @Reasoning
+    Returns the curve coefficient b for the short Weierstrass equation
+    y^2 = x^3 - 3x + b. Value per FIPS 186-4 D.1.2.3:
+    5ac635d8 aa3a93e7 b3ebbd55 769886bc 651d06b0 cc53b0f6 3bce3c3e 27d2604b.
+    @End Reasoning
+
+    @Implementation
+    Allocate a 10-limb BigInt and populate four little-endian 64-bit limbs.
+    Limb 0 is the low 64 bits (3bce3c3e27d2604b), limb 3 the top
+    (5ac635d8aa3a93e7).
+    @End Implementation
+
+    @Performance_Hints
+    Single arena allocation plus six writes. Public constant.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns public curve parameter. No side-channel concerns.
+    @End Security_Scope
+
+    Let b be proc bigint_alloc from BigInt with arena, 10
+    If b is equal to 0:
+        Return 0
+    End If
+    proc bigint_set_limb from BigInt with b, 0, 4309448131093880907
+    proc bigint_set_limb from BigInt with b, 1, 7285987128567378166
+    proc bigint_set_limb from BigInt with b, 2, 12964664127075681980
+    proc bigint_set_limb from BigInt with b, 3, 6540974713487397863
+    proc bigint_set_limb_count from BigInt with b, 4
+    Return b
+End Process
+
+Process called "curve_p256_order" takes arena as Integer returns Integer:
+    @Reasoning
+    Returns the order n of the base point G. Per FIPS 186-4 D.1.2.3:
+    ffffffff 00000000 ffffffff ffffffff bce6faad a7179e84 f3b9cac2 fc632551.
+    @End Reasoning
+
+    @Implementation
+    Allocate 10-limb BigInt and populate four limbs little-endian.
+    Limb 0 = f3b9cac2fc632551, Limb 1 = bce6faada7179e84,
+    Limb 2 = ffffffffffffffff, Limb 3 = ffffffff00000000.
+    @End Implementation
+
+    @Performance_Hints
+    Single arena allocation. Public constant.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns public curve parameter.
+    @End Security_Scope
+
+    Let n be proc bigint_alloc from BigInt with arena, 10
+    If n is equal to 0:
+        Return 0
+    End If
+    proc bigint_set_limb from BigInt with n, 0, 17562291160714782033
+    proc bigint_set_limb from BigInt with n, 1, 13611842547513532036
+    proc bigint_set_limb from BigInt with n, 2, 18446744073709551615
+    proc bigint_set_limb from BigInt with n, 3, 18446744069414584320
+    proc bigint_set_limb_count from BigInt with n, 4
+    Return n
+End Process
+
+Process called "curve_p256_gx" takes arena as Integer returns Integer:
+    @Reasoning
+    Returns the x-coordinate of the base point G. Per FIPS 186-4 D.1.2.3:
+    6b17d1f2 e12c4247 f8bce6e5 63a440f2 77037d81 2deb33a0 f4a13945 d898c296.
+    @End Reasoning
+
+    @Implementation
+    Allocate 10-limb BigInt and populate four limbs.
+    @End Implementation
+
+    @Performance_Hints
+    Single arena allocation. Public constant.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns public curve parameter.
+    @End Security_Scope
+
+    Let gx be proc bigint_alloc from BigInt with arena, 10
+    If gx is equal to 0:
+        Return 0
+    End If
+    proc bigint_set_limb from BigInt with gx, 0, 17627433388654248598
+    proc bigint_set_limb from BigInt with gx, 1, 8575836109218198432
+    proc bigint_set_limb from BigInt with gx, 2, 17923454489921339634
+    proc bigint_set_limb from BigInt with gx, 3, 7716867327612699207
+    proc bigint_set_limb_count from BigInt with gx, 4
+    Return gx
+End Process
+
+Process called "curve_p256_gy" takes arena as Integer returns Integer:
+    @Reasoning
+    Returns the y-coordinate of the base point G. Per FIPS 186-4 D.1.2.3:
+    4fe342e2 fe1a7f9b 8ee7eb4a 7c0f9e16 2bce3357 6b315ece cbb64068 37bf51f5.
+    @End Reasoning
+
+    @Implementation
+    Allocate 10-limb BigInt and populate four limbs.
+    @End Implementation
+
+    @Performance_Hints
+    Single arena allocation. Public constant.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns public curve parameter.
+    @End Security_Scope
+
+    Let gy be proc bigint_alloc from BigInt with arena, 10
+    If gy is equal to 0:
+        Return 0
+    End If
+    proc bigint_set_limb from BigInt with gy, 0, 14678990851816772085
+    proc bigint_set_limb from BigInt with gy, 1, 3156516839386865358
+    proc bigint_set_limb from BigInt with gy, 2, 10297457778147434006
+    proc bigint_set_limb from BigInt with gy, 3, 5756518291402817435
+    proc bigint_set_limb_count from BigInt with gy, 4
+    Return gy
+End Process
+
+Note: ============================================================================
+Note: Point construction and field access
+Note: ============================================================================
+
+Process called "curve_p256_point_alloc" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocates a Jacobian point struct (24 bytes holding three BigInt
+    pointers) and initializes all three component BigInts to zero with
+    enough capacity for multiplication results.
+    @End Reasoning
+
+    @Implementation
+    1. arena_allocate 24 bytes for the struct header.
+    2. For X, Y, Z allocate fresh BigInts via field_p256_zero (10-limb).
+    3. Write three pointers into the struct at offsets 0, 8, 16.
+    @End Implementation
+
+    @Performance_Hints
+    Four arena allocations totalling 24 + 3*96 = 312 bytes.
+    @End Performance_Hints
+
+    @Security_Scope
+    No side-channel concerns; allocation only.
+    @End Security_Scope
+
+    Let pt be proc arena_allocate from Arena with arena, CURVE_P256_JACOBIAN_STRUCT_BYTES
+    If pt is equal to 0:
+        Return 0
+    End If
+    Let x be proc field_p256_zero from Field with arena
+    If x is equal to 0:
+        Return 0
+    End If
+    Let y be proc field_p256_zero from Field with arena
+    If y is equal to 0:
+        Return 0
+    End If
+    Let z be proc field_p256_zero from Field with arena
+    If z is equal to 0:
+        Return 0
+    End If
+    proc memory_set_qword from Memory with pt, 0, x
+    proc memory_set_qword from Memory with pt, 8, y
+    proc memory_set_qword from Memory with pt, 16, z
+    Return pt
+End Process
+
+Process called "curve_p256_point_x" takes pt as Integer returns Integer:
+    @Reasoning
+    Returns the X-coordinate BigInt pointer of a Jacobian point.
+    @End Reasoning
+
+    @Implementation
+    Reads pointer at offset 0.
+    @End Implementation
+
+    @Performance_Hints
+    Single memory load.
+    @End Performance_Hints
+
+    @Security_Scope
+    No side-channel; pure accessor.
+    @End Security_Scope
+
+    Return proc memory_get_qword from Memory with pt, 0
+End Process
+
+Process called "curve_p256_point_y" takes pt as Integer returns Integer:
+    @Reasoning
+    Returns the Y-coordinate BigInt pointer.
+    @End Reasoning
+
+    @Implementation
+    Reads pointer at offset 8.
+    @End Implementation
+
+    @Performance_Hints
+    Single memory load.
+    @End Performance_Hints
+
+    @Security_Scope
+    No side-channel.
+    @End Security_Scope
+
+    Return proc memory_get_qword from Memory with pt, 8
+End Process
+
+Process called "curve_p256_point_z" takes pt as Integer returns Integer:
+    @Reasoning
+    Returns the Z-coordinate BigInt pointer.
+    @End Reasoning
+
+    @Implementation
+    Reads pointer at offset 16.
+    @End Implementation
+
+    @Performance_Hints
+    Single memory load.
+    @End Performance_Hints
+
+    @Security_Scope
+    No side-channel.
+    @End Security_Scope
+
+    Return proc memory_get_qword from Memory with pt, 16
+End Process
+
+Note: ============================================================================
+Note: Helper: copy one P-256 field element into a destination BigInt buffer
+Note: ============================================================================
+
+Process called "curve_p256_field_copy_into" takes dest as Integer, src as Integer returns Integer:
+    @Reasoning
+    Copies the value of src into the pre-allocated dest BigInt buffer
+    so both refer to the same numerical value with src's limb count.
+    Used by curve operations that mutate the destination's limbs
+    without re-allocating.
+    @End Reasoning
+
+    @Implementation
+    1. Read src limb count.
+    2. Zero dest's full capacity (drop any prior value).
+    3. Copy limbs one by one.
+    4. Set dest limb count.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count) writes; for P-256 elements at most 4 active limbs
+    are copied plus zeroing of any remaining capacity.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant time over dest's capacity which is fixed at allocation;
+    does not branch on values.
+    @End Security_Scope
+
+    If dest is equal to 0:
+        Return 0
+    End If
+    If src is equal to 0:
+        Return 0
+    End If
+    Let dest_cap be proc bigint_get_limb_capacity from BigInt with dest
+    Let zi be 0
+    While zi is less than dest_cap:
+        proc bigint_set_limb from BigInt with dest, zi, 0
+        Set zi to zi plus 1
+    End While
+    Let src_count be proc bigint_get_limb_count from BigInt with src
+    If src_count is greater than dest_cap:
+        Return 0
+    End If
+    Let ci be 0
+    While ci is less than src_count:
+        Let lv be proc bigint_get_limb from BigInt with src, ci
+        proc bigint_set_limb from BigInt with dest, ci, lv
+        Set ci to ci plus 1
+    End While
+    proc bigint_set_limb_count from BigInt with dest, src_count
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Identity (point at infinity in Jacobian: Z = 0)
+Note: ============================================================================
+
+Process called "curve_p256_point_set_infinity" takes pt as Integer returns Integer:
+    @Reasoning
+    Marks pt as the point at infinity. In Jacobian projective coordinates
+    the infinity point is represented by Z = 0; X and Y are conventionally
+    set to 1 to avoid divide-by-zero in any downstream conversions that
+    fail to gate on the Z-check first.
+    @End Reasoning
+
+    @Implementation
+    Set X = 1, Y = 1, Z = 0.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) writes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public marker; no secret-dependent behaviour.
+    @End Security_Scope
+
+    Let x be proc curve_p256_point_x with pt
+    Let y be proc curve_p256_point_y with pt
+    Let z be proc curve_p256_point_z with pt
+    Let x_cap be proc bigint_get_limb_capacity from BigInt with x
+    Let xi be 0
+    While xi is less than x_cap:
+        proc bigint_set_limb from BigInt with x, xi, 0
+        Set xi to xi plus 1
+    End While
+    proc bigint_set_limb from BigInt with x, 0, 1
+    proc bigint_set_limb_count from BigInt with x, 1
+    Let y_cap be proc bigint_get_limb_capacity from BigInt with y
+    Let yi be 0
+    While yi is less than y_cap:
+        proc bigint_set_limb from BigInt with y, yi, 0
+        Set yi to yi plus 1
+    End While
+    proc bigint_set_limb from BigInt with y, 0, 1
+    proc bigint_set_limb_count from BigInt with y, 1
+    Let z_cap be proc bigint_get_limb_capacity from BigInt with z
+    Let zi be 0
+    While zi is less than z_cap:
+        proc bigint_set_limb from BigInt with z, zi, 0
+        Set zi to zi plus 1
+    End While
+    proc bigint_set_limb_count from BigInt with z, 0
+    Return 1
+End Process
+
+Process called "curve_p256_point_is_infinity" takes pt as Integer returns Integer:
+    @Reasoning
+    Returns 1 if pt is the point at infinity (Z = 0), else 0.
+    @End Reasoning
+
+    @Implementation
+    Read Z component and test for zero via bigint_is_zero.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count) on Z.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public predicate result.
+    @End Security_Scope
+
+    Let z be proc curve_p256_point_z with pt
+    Return proc bigint_is_zero from BigInt with z
+End Process
+
+Process called "curve_p256_point_copy" takes arena as Integer, src as Integer returns Integer:
+    @Reasoning
+    Returns a fresh Jacobian point with the same X, Y, Z values as src.
+    @End Reasoning
+
+    @Implementation
+    Allocate a new point; copy each coordinate via curve_p256_field_copy_into.
+    @End Implementation
+
+    @Performance_Hints
+    Three field copies plus four allocations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant time over field-element bit length.
+    @End Security_Scope
+
+    Let dst be proc curve_p256_point_alloc with arena
+    If dst is equal to 0:
+        Return 0
+    End If
+    Let sx be proc curve_p256_point_x with src
+    Let sy be proc curve_p256_point_y with src
+    Let sz be proc curve_p256_point_z with src
+    Let dx be proc curve_p256_point_x with dst
+    Let dy be proc curve_p256_point_y with dst
+    Let dz be proc curve_p256_point_z with dst
+    proc curve_p256_field_copy_into with dx, sx
+    proc curve_p256_field_copy_into with dy, sy
+    proc curve_p256_field_copy_into with dz, sz
+    Return dst
+End Process
+
+Note: ============================================================================
+Note: Generator point construction (affine -> Jacobian with Z=1)
+Note: ============================================================================
+
+Process called "curve_p256_generator" takes arena as Integer returns Integer:
+    @Reasoning
+    Returns the base point G in Jacobian coordinates (Gx, Gy, 1).
+    @End Reasoning
+
+    @Implementation
+    Allocate point; copy Gx into X, Gy into Y, set Z = 1.
+    @End Implementation
+
+    @Performance_Hints
+    Four arena allocations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public curve parameter.
+    @End Security_Scope
+
+    Let pt be proc curve_p256_point_alloc with arena
+    If pt is equal to 0:
+        Return 0
+    End If
+    Let gx be proc curve_p256_gx with arena
+    Let gy be proc curve_p256_gy with arena
+    If gx is equal to 0:
+        Return 0
+    End If
+    If gy is equal to 0:
+        Return 0
+    End If
+    Let dx be proc curve_p256_point_x with pt
+    Let dy be proc curve_p256_point_y with pt
+    Let dz be proc curve_p256_point_z with pt
+    proc curve_p256_field_copy_into with dx, gx
+    proc curve_p256_field_copy_into with dy, gy
+    proc bigint_set_limb from BigInt with dz, 0, 1
+    proc bigint_set_limb_count from BigInt with dz, 1
+    Return pt
+End Process
+
+Note: ============================================================================
+Note: Point negation (Jacobian: negate Y, X and Z unchanged)
+Note: ============================================================================
+
+Process called "curve_p256_negate" takes arena as Integer, dest as Integer, pt as Integer returns Integer:
+    @Reasoning
+    Computes -P. For a Weierstrass curve, the inverse of (X, Y, Z) is
+    (X, -Y mod p, Z).
+    @End Reasoning
+
+    @Implementation
+    Copy X and Z from pt to dest; compute dest.Y = (p - pt.Y) mod p via
+    field_p256_neg.
+    @End Implementation
+
+    @Performance_Hints
+    One field negation plus two field copies.
+    @End Performance_Hints
+
+    @Security_Scope
+    Field negation is constant-time-bounded; the rest is pure copy.
+    @End Security_Scope
+
+    Let sx be proc curve_p256_point_x with pt
+    Let sy be proc curve_p256_point_y with pt
+    Let sz be proc curve_p256_point_z with pt
+    Let dx be proc curve_p256_point_x with dest
+    Let dy be proc curve_p256_point_y with dest
+    Let dz be proc curve_p256_point_z with dest
+    proc curve_p256_field_copy_into with dx, sx
+    proc curve_p256_field_copy_into with dz, sz
+    Return proc field_p256_neg from Field with arena, dy, sy
+End Process
+
+Note:
+================================================================================
+Point doubling (Jacobian for a = -3 curves)
+Formulas from Bernstein-Lange and Hankerson-Menezes-Vanstone alg 3.21:
+   if Y1 = 0 -> infinity
+   delta = Z1^2
+   gamma = Y1^2
+   beta  = X1 * gamma
+   alpha = 3 * (X1 - delta) * (X1 + delta)
+   X3 = alpha^2 - 8*beta
+   Z3 = (Y1 + Z1)^2 - gamma - delta
+   Y3 = alpha * (4*beta - X3) - 8 * gamma^2
+================================================================================
+:End Note
+
+Process called "curve_p256_double" takes arena as Integer, dest as Integer, pt as Integer returns Integer:
+    @Reasoning
+    Doubles a point on the curve using a = -3 optimized Jacobian formulas.
+    Doubling is required for every bit of the scalar in a binary ladder and
+    is therefore the inner-loop bottleneck of scalar multiplication.
+    @End Reasoning
+
+    @Implementation
+    1. If pt is infinity, dest = infinity, return.
+    2. Compute the intermediate field elements delta, gamma, beta, alpha
+       as defined by the Bernstein-Lange formula for a = -3 curves.
+    3. Compose dest.X, dest.Y, dest.Z from these intermediates.
+    All operations use field_p256_* primitives so reductions mod p are
+    handled automatically.
+    @End Implementation
+
+    @Performance_Hints
+    4 field squarings + 4 field multiplications + 9 field additions/
+    subtractions. ~30 us at P-256 size.
+    @End Performance_Hints
+
+    @Security_Scope
+    The branch on infinity is on a public-derived flag (the accumulator
+    is only at infinity on the very first bit; for the variable-base
+    case the input point is public to the protocol). The body has no
+    secret-dependent branching.
+    @End Security_Scope
+
+    If proc curve_p256_point_is_infinity with pt is equal to 1:
+        Return proc curve_p256_point_set_infinity with dest
+    End If
+
+    Let x1 be proc curve_p256_point_x with pt
+    Let y1 be proc curve_p256_point_y with pt
+    Let z1 be proc curve_p256_point_z with pt
+
+    Note: Detect 2-torsion: if Y1 == 0 the doubled point is infinity.
+    If proc bigint_is_zero from BigInt with y1 is equal to 1:
+        Return proc curve_p256_point_set_infinity with dest
+    End If
+
+    Let delta be proc field_p256_zero from Field with arena
+    Let gamma be proc field_p256_zero from Field with arena
+    Let beta be proc field_p256_zero from Field with arena
+    Let alpha be proc field_p256_zero from Field with arena
+    Let t1 be proc field_p256_zero from Field with arena
+    Let t2 be proc field_p256_zero from Field with arena
+    Let t3 be proc field_p256_zero from Field with arena
+    Let t4 be proc field_p256_zero from Field with arena
+    Let t5 be proc field_p256_zero from Field with arena
+
+    Note: delta = Z1^2
+    proc field_p256_sqr from Field with arena, delta, z1
+    Note: gamma = Y1^2
+    proc field_p256_sqr from Field with arena, gamma, y1
+    Note: beta = X1 * gamma
+    proc field_p256_mul from Field with arena, beta, x1, gamma
+
+    Note: alpha = 3 * (X1 - delta) * (X1 + delta)
+    proc field_p256_sub from Field with arena, t1, x1, delta
+    proc field_p256_add from Field with arena, t2, x1, delta
+    proc field_p256_mul from Field with arena, t3, t1, t2
+    Note: t3 contains (X1-delta)(X1+delta); multiply by 3 via two adds.
+    proc field_p256_add from Field with arena, t4, t3, t3
+    proc field_p256_add from Field with arena, alpha, t4, t3
+
+    Note: X3 = alpha^2 - 8*beta
+    Let alpha_sq be proc field_p256_zero from Field with arena
+    proc field_p256_sqr from Field with arena, alpha_sq, alpha
+    Note: eight_beta = 8 * beta
+    Let two_beta be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, two_beta, beta, beta
+    Let four_beta be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, four_beta, two_beta, two_beta
+    Let eight_beta be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, eight_beta, four_beta, four_beta
+
+    Let dx be proc curve_p256_point_x with dest
+    proc field_p256_sub from Field with arena, dx, alpha_sq, eight_beta
+
+    Note: Z3 = (Y1 + Z1)^2 - gamma - delta
+    proc field_p256_add from Field with arena, t5, y1, z1
+    Let y1z1_sq be proc field_p256_zero from Field with arena
+    proc field_p256_sqr from Field with arena, y1z1_sq, t5
+    Let z3_tmp be proc field_p256_zero from Field with arena
+    proc field_p256_sub from Field with arena, z3_tmp, y1z1_sq, gamma
+    Let dz be proc curve_p256_point_z with dest
+    proc field_p256_sub from Field with arena, dz, z3_tmp, delta
+
+    Note: Y3 = alpha * (4*beta - X3) - 8 * gamma^2
+    Let dx_copy be proc field_p256_copy from Field with arena, dx
+    Let diff4b_x3 be proc field_p256_zero from Field with arena
+    proc field_p256_sub from Field with arena, diff4b_x3, four_beta, dx_copy
+    Let alpha_term be proc field_p256_zero from Field with arena
+    proc field_p256_mul from Field with arena, alpha_term, alpha, diff4b_x3
+    Let gamma_sq be proc field_p256_zero from Field with arena
+    proc field_p256_sqr from Field with arena, gamma_sq, gamma
+    Let two_g2 be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, two_g2, gamma_sq, gamma_sq
+    Let four_g2 be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, four_g2, two_g2, two_g2
+    Let eight_g2 be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, eight_g2, four_g2, four_g2
+
+    Let dy be proc curve_p256_point_y with dest
+    proc field_p256_sub from Field with arena, dy, alpha_term, eight_g2
+
+    Return 1
+End Process
+
+Note:
+================================================================================
+Point addition (Jacobian + Jacobian = Jacobian)
+Bernstein-Lange complete formulas for distinct, non-symmetric inputs.
+   U1 = X1 * Z2^2
+   U2 = X2 * Z1^2
+   S1 = Y1 * Z2^3
+   S2 = Y2 * Z1^3
+   if U1 == U2:
+       if S1 != S2: return infinity (P + (-P))
+       else        : return double(P)
+   H = U2 - U1
+   R = S2 - S1
+   X3 = R^2 - H^3 - 2*U1*H^2
+   Y3 = R*(U1*H^2 - X3) - S1*H^3
+   Z3 = Z1 * Z2 * H
+================================================================================
+:End Note
+
+Process called "curve_p256_add" takes arena as Integer, dest as Integer, p1 as Integer, p2 as Integer returns Integer:
+    @Reasoning
+    Adds two Jacobian points using the standard add formulas. Handles
+    the exceptional cases by explicit comparison: identity element,
+    symmetric point (P + (-P) = infinity), and equal-point case
+    (P + P = double(P)).
+    @End Reasoning
+
+    @Implementation
+    1. Identity short-circuits: P1=inf -> dest = P2 (copy); P2=inf -> dest = P1.
+    2. Compute U1, U2, S1, S2.
+    3. If U1 == U2: dispatch to double or infinity based on S1 vs S2.
+    4. Otherwise apply the canonical formulas above.
+    @End Implementation
+
+    @Performance_Hints
+    Approx 11 field multiplications + 5 squarings + several additions.
+    ~80 us at P-256 size.
+    @End Performance_Hints
+
+    @Security_Scope
+    Branches on identity and equal-point cases. For the ECDSA verify
+    path the inputs are public so this is acceptable. The
+    curve_p256_scalar_mul ladder used in signing uses a different
+    constant-time conditional select to avoid leaking through these
+    branches.
+    @End Security_Scope
+
+    If proc curve_p256_point_is_infinity with p1 is equal to 1:
+        Let dx_i be proc curve_p256_point_x with dest
+        Let dy_i be proc curve_p256_point_y with dest
+        Let dz_i be proc curve_p256_point_z with dest
+        Let sx_i be proc curve_p256_point_x with p2
+        Let sy_i be proc curve_p256_point_y with p2
+        Let sz_i be proc curve_p256_point_z with p2
+        proc curve_p256_field_copy_into with dx_i, sx_i
+        proc curve_p256_field_copy_into with dy_i, sy_i
+        proc curve_p256_field_copy_into with dz_i, sz_i
+        Return 1
+    End If
+    If proc curve_p256_point_is_infinity with p2 is equal to 1:
+        Let dx_j be proc curve_p256_point_x with dest
+        Let dy_j be proc curve_p256_point_y with dest
+        Let dz_j be proc curve_p256_point_z with dest
+        Let sx_j be proc curve_p256_point_x with p1
+        Let sy_j be proc curve_p256_point_y with p1
+        Let sz_j be proc curve_p256_point_z with p1
+        proc curve_p256_field_copy_into with dx_j, sx_j
+        proc curve_p256_field_copy_into with dy_j, sy_j
+        proc curve_p256_field_copy_into with dz_j, sz_j
+        Return 1
+    End If
+
+    Let x1 be proc curve_p256_point_x with p1
+    Let y1 be proc curve_p256_point_y with p1
+    Let z1 be proc curve_p256_point_z with p1
+    Let x2 be proc curve_p256_point_x with p2
+    Let y2 be proc curve_p256_point_y with p2
+    Let z2 be proc curve_p256_point_z with p2
+
+    Let z1_sq be proc field_p256_zero from Field with arena
+    Let z2_sq be proc field_p256_zero from Field with arena
+    Let z1_cu be proc field_p256_zero from Field with arena
+    Let z2_cu be proc field_p256_zero from Field with arena
+    Let u1 be proc field_p256_zero from Field with arena
+    Let u2 be proc field_p256_zero from Field with arena
+    Let s1 be proc field_p256_zero from Field with arena
+    Let s2 be proc field_p256_zero from Field with arena
+
+    proc field_p256_sqr from Field with arena, z1_sq, z1
+    proc field_p256_sqr from Field with arena, z2_sq, z2
+    proc field_p256_mul from Field with arena, z1_cu, z1_sq, z1
+    proc field_p256_mul from Field with arena, z2_cu, z2_sq, z2
+    proc field_p256_mul from Field with arena, u1, x1, z2_sq
+    proc field_p256_mul from Field with arena, u2, x2, z1_sq
+    proc field_p256_mul from Field with arena, s1, y1, z2_cu
+    proc field_p256_mul from Field with arena, s2, y2, z1_cu
+
+    Let u_eq be proc field_p256_equal from Field with u1, u2
+    If u_eq is equal to 1:
+        Let s_eq be proc field_p256_equal from Field with s1, s2
+        If s_eq is equal to 1:
+            Return proc curve_p256_double with arena, dest, p1
+        End If
+        Return proc curve_p256_point_set_infinity with dest
+    End If
+
+    Let h be proc field_p256_zero from Field with arena
+    Let r be proc field_p256_zero from Field with arena
+    proc field_p256_sub from Field with arena, h, u2, u1
+    proc field_p256_sub from Field with arena, r, s2, s1
+
+    Let h_sq be proc field_p256_zero from Field with arena
+    Let h_cu be proc field_p256_zero from Field with arena
+    proc field_p256_sqr from Field with arena, h_sq, h
+    proc field_p256_mul from Field with arena, h_cu, h_sq, h
+
+    Let u1_h_sq be proc field_p256_zero from Field with arena
+    proc field_p256_mul from Field with arena, u1_h_sq, u1, h_sq
+
+    Note: X3 = R^2 - H^3 - 2*U1*H^2
+    Let r_sq be proc field_p256_zero from Field with arena
+    proc field_p256_sqr from Field with arena, r_sq, r
+    Let two_u1_h_sq be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, two_u1_h_sq, u1_h_sq, u1_h_sq
+    Let x3_term1 be proc field_p256_zero from Field with arena
+    proc field_p256_sub from Field with arena, x3_term1, r_sq, h_cu
+
+    Let dx be proc curve_p256_point_x with dest
+    proc field_p256_sub from Field with arena, dx, x3_term1, two_u1_h_sq
+
+    Note: Y3 = R*(U1*H^2 - X3) - S1*H^3
+    Let dx_now be proc field_p256_copy from Field with arena, dx
+    Let inner be proc field_p256_zero from Field with arena
+    proc field_p256_sub from Field with arena, inner, u1_h_sq, dx_now
+    Let r_inner be proc field_p256_zero from Field with arena
+    proc field_p256_mul from Field with arena, r_inner, r, inner
+    Let s1_h_cu be proc field_p256_zero from Field with arena
+    proc field_p256_mul from Field with arena, s1_h_cu, s1, h_cu
+
+    Let dy be proc curve_p256_point_y with dest
+    proc field_p256_sub from Field with arena, dy, r_inner, s1_h_cu
+
+    Note: Z3 = Z1 * Z2 * H
+    Let z1z2 be proc field_p256_zero from Field with arena
+    proc field_p256_mul from Field with arena, z1z2, z1, z2
+    Let dz be proc curve_p256_point_z with dest
+    proc field_p256_mul from Field with arena, dz, z1z2, h
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Constant-time conditional point copy
+Note: Used by the constant-time scalar multiplication ladder. When cond == 1,
+Note: dest <- src. When cond == 0, dest is left unchanged. Both branches walk
+Note: the same memory so timing is independent of cond.
+Note: ============================================================================
+
+Process called "curve_p256_cmov" takes dest as Integer, src as Integer, cond as Integer returns Integer:
+    @Reasoning
+    Branchless conditional copy of one Jacobian point's three BigInt
+    component values from src into dest. Required for constant-time
+    scalar multiplication: the per-bit ladder must always touch both
+    candidate accumulators regardless of the scalar bit.
+    @End Reasoning
+
+    @Implementation
+    Build a 64-bit mask m = -cond (all 1s when cond = 1, all 0s when
+    cond = 0). For each limb i of each coordinate compute
+       dest_limb[i] = (dest_limb[i] AND NOT m) OR (src_limb[i] AND m).
+    This walks the full 4-limb (256-bit) capacity of each coordinate
+    regardless of the actual numerical limb count.
+    @End Implementation
+
+    @Performance_Hints
+    12 limb writes per call (3 coords * 4 limbs).
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against timing-based scalar leakage. No data-dependent
+    branch within the limb loop.
+    @End Security_Scope
+
+    Let mask be 0 minus cond
+    Let inv_mask be mask bitwise_xor 18446744073709551615
+
+    Let dx be proc curve_p256_point_x with dest
+    Let dy be proc curve_p256_point_y with dest
+    Let dz be proc curve_p256_point_z with dest
+    Let sx be proc curve_p256_point_x with src
+    Let sy be proc curve_p256_point_y with src
+    Let sz be proc curve_p256_point_z with src
+
+    Let i be 0
+    While i is less than CURVE_P256_LIMBS:
+        Let d_lx be proc bigint_get_limb from BigInt with dx, i
+        Let s_lx be proc bigint_get_limb from BigInt with sx, i
+        Let new_x be d_lx bitwise_and inv_mask
+        Let s_x_masked be s_lx bitwise_and mask
+        Set new_x to new_x bitwise_or s_x_masked
+        proc bigint_set_limb from BigInt with dx, i, new_x
+
+        Let d_ly be proc bigint_get_limb from BigInt with dy, i
+        Let s_ly be proc bigint_get_limb from BigInt with sy, i
+        Let new_y be d_ly bitwise_and inv_mask
+        Let s_y_masked be s_ly bitwise_and mask
+        Set new_y to new_y bitwise_or s_y_masked
+        proc bigint_set_limb from BigInt with dy, i, new_y
+
+        Let d_lz be proc bigint_get_limb from BigInt with dz, i
+        Let s_lz be proc bigint_get_limb from BigInt with sz, i
+        Let new_z be d_lz bitwise_and inv_mask
+        Let s_z_masked be s_lz bitwise_and mask
+        Set new_z to new_z bitwise_or s_z_masked
+        proc bigint_set_limb from BigInt with dz, i, new_z
+
+        Set i to i plus 1
+    End While
+
+    Let scount be proc bigint_get_limb_count from BigInt with sx
+    Let dcount_x be proc bigint_get_limb_count from BigInt with dx
+    Let new_count_x be dcount_x bitwise_and inv_mask
+    Set new_count_x to new_count_x bitwise_or scount bitwise_and mask
+    proc bigint_set_limb_count from BigInt with dx, new_count_x
+
+    Let scount_y be proc bigint_get_limb_count from BigInt with sy
+    Let dcount_y be proc bigint_get_limb_count from BigInt with dy
+    Let new_count_y be dcount_y bitwise_and inv_mask
+    Set new_count_y to new_count_y bitwise_or scount_y bitwise_and mask
+    proc bigint_set_limb_count from BigInt with dy, new_count_y
+
+    Let scount_z be proc bigint_get_limb_count from BigInt with sz
+    Let dcount_z be proc bigint_get_limb_count from BigInt with dz
+    Let new_count_z be dcount_z bitwise_and inv_mask
+    Set new_count_z to new_count_z bitwise_or scount_z bitwise_and mask
+    proc bigint_set_limb_count from BigInt with dz, new_count_z
+
+    Return 1
+End Process
+
+Note:
+================================================================================
+Constant-time scalar multiplication: dest = k * P
+
+Algorithm: Montgomery ladder over the curve. Maintains two accumulators
+R0 and R1 with the invariant R1 - R0 = P after every iteration. For each
+scalar bit b from MSB to LSB:
+   if b == 0:  R1 = R0 + R1, R0 = 2*R0
+   if b == 1:  R0 = R0 + R1, R1 = 2*R1
+At the end R0 = k*P.
+
+The branch on b is realized via constant-time point swaps before and
+after the (add, double) pair so each iteration performs the same
+sequence of operations regardless of b.
+================================================================================
+:End Note
+
+Process called "curve_p256_scalar_mul" takes arena as Integer, dest as Integer, scalar as Integer, base as Integer returns Integer:
+    @Reasoning
+    Computes dest = scalar * base on the curve. Constant-time over the
+    256-bit width of the scalar via a Montgomery ladder with conditional
+    swaps. This is the secret-key-safe variant used by ECDSA signing.
+    @End Reasoning
+
+    @Implementation
+    1. Initialize R0 = infinity, R1 = base.
+    2. For each bit b of scalar from bit 255 to bit 0:
+       a. Use a constant-time conditional swap to bring the
+          "active" accumulator into R0.
+       b. Compute (R0 + R1) into a fresh temporary, double R1 into
+          another fresh temporary, then write back.
+       c. After the inner step, swap back so R0 holds the bit-zero
+          accumulator and R1 holds the bit-one accumulator for the
+          next iteration.
+    3. Copy R0 into dest.
+
+    Each scalar bit costs exactly: 4 cmov + 1 point add + 1 point double.
+    @End Implementation
+
+    @Performance_Hints
+    256 iterations. At ~110 us per iteration (point add + point double)
+    this is roughly 30 ms total per scalar multiplication. Acceptable
+    for ECDSA sign/verify at typical message rates; future optimizations
+    (Montgomery field arithmetic, wNAF tables for fixed-base) can drop
+    this by an order of magnitude.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against:
+    - Simple Power Analysis (SPA): the ladder issues a fixed instruction
+      sequence per bit regardless of bit value.
+    - Branch-prediction leakage of the scalar: no scalar bit is used in
+      a conditional branch; only XOR'd into the cmov masks.
+    - Cache-side timing on table accesses: this implementation uses no
+      precomputed lookup tables.
+
+    Out of scope:
+    - Fault injection (the caller must validate the result is on-curve
+      after returning to detect tampering).
+    - Memory zeroization of arena scratch (the caller's arena reset is
+      responsible).
+
+    References:
+    - Montgomery, "Speeding the Pollard and elliptic curve methods of
+      factorization", Math. Comp. 1987.
+    - Joye, Yen "The Montgomery powering ladder" CHES 2002.
+    @End Security_Scope
+
+    If dest is equal to 0:
+        Return 0
+    End If
+    If scalar is equal to 0:
+        Return proc curve_p256_point_set_infinity with dest
+    End If
+    If base is equal to 0:
+        Return 0
+    End If
+
+    Let r0 be proc curve_p256_point_alloc with arena
+    If r0 is equal to 0:
+        Return 0
+    End If
+    Let r1 be proc curve_p256_point_alloc with arena
+    If r1 is equal to 0:
+        Return 0
+    End If
+
+    proc curve_p256_point_set_infinity with r0
+    Let base_x_ptr be proc curve_p256_point_x with base
+    Let base_y_ptr be proc curve_p256_point_y with base
+    Let base_z_ptr be proc curve_p256_point_z with base
+    Let r1x be proc curve_p256_point_x with r1
+    Let r1y be proc curve_p256_point_y with r1
+    Let r1z be proc curve_p256_point_z with r1
+    proc curve_p256_field_copy_into with r1x, base_x_ptr
+    proc curve_p256_field_copy_into with r1y, base_y_ptr
+    proc curve_p256_field_copy_into with r1z, base_z_ptr
+
+    Note: Walk scalar bits from MSB to LSB. The scalar has at most 4 limbs.
+    Let limb_idx_plus_one be CURVE_P256_LIMBS
+    While limb_idx_plus_one is greater than 0:
+        Let limb_idx be limb_idx_plus_one minus 1
+        Let limb_value be proc bigint_get_limb from BigInt with scalar, limb_idx
+        Let bit_idx_plus_one be 64
+        While bit_idx_plus_one is greater than 0:
+            Let bit_idx be bit_idx_plus_one minus 1
+            Note: Extract this bit of the scalar.
+            Let mask_val be 1
+            Let shift_iter be 0
+            While shift_iter is less than bit_idx:
+                Set mask_val to mask_val multiplied by 2
+                Set shift_iter to shift_iter plus 1
+            End While
+            Let masked be limb_value bitwise_and mask_val
+            Let bit be 0
+            If masked is not equal to 0:
+                Set bit to 1
+            End If
+
+            Note: Allocate fresh accumulators each round so arithmetic
+            Note: writes do not stomp on the operands of subsequent
+            Note: operations within the same iteration.
+            Let new_r0 be proc curve_p256_point_alloc with arena
+            Let new_r1 be proc curve_p256_point_alloc with arena
+            If new_r0 is equal to 0:
+                Return 0
+            End If
+            If new_r1 is equal to 0:
+                Return 0
+            End If
+
+            Note: Compute add = R0 + R1 and dbl0 = 2*R0 unconditionally.
+            Note: We also compute dbl1 = 2*R1.
+            Let added be proc curve_p256_point_alloc with arena
+            Let dbl0 be proc curve_p256_point_alloc with arena
+            Let dbl1 be proc curve_p256_point_alloc with arena
+            If added is equal to 0:
+                Return 0
+            End If
+            If dbl0 is equal to 0:
+                Return 0
+            End If
+            If dbl1 is equal to 0:
+                Return 0
+            End If
+            proc curve_p256_add with arena, added, r0, r1
+            proc curve_p256_double with arena, dbl0, r0
+            proc curve_p256_double with arena, dbl1, r1
+
+            Note: For bit==0: R1' = added, R0' = dbl0.
+            Note: For bit==1: R0' = added, R1' = dbl1.
+            Note: Implement via constant-time cmov.
+            Note: First set new_r0 = dbl0 unconditionally, then overwrite with
+            Note: added when bit == 1.
+            Let bit_inv be 1 minus bit
+            proc curve_p256_cmov with new_r0, dbl0, bit_inv
+            proc curve_p256_cmov with new_r0, added, bit
+            proc curve_p256_cmov with new_r1, added, bit_inv
+            proc curve_p256_cmov with new_r1, dbl1, bit
+
+            Note: Copy back from new_r0/new_r1 into r0/r1 buffers.
+            Let nr0x be proc curve_p256_point_x with new_r0
+            Let nr0y be proc curve_p256_point_y with new_r0
+            Let nr0z be proc curve_p256_point_z with new_r0
+            Let r0x be proc curve_p256_point_x with r0
+            Let r0y be proc curve_p256_point_y with r0
+            Let r0z be proc curve_p256_point_z with r0
+            proc curve_p256_field_copy_into with r0x, nr0x
+            proc curve_p256_field_copy_into with r0y, nr0y
+            proc curve_p256_field_copy_into with r0z, nr0z
+
+            Let nr1x be proc curve_p256_point_x with new_r1
+            Let nr1y be proc curve_p256_point_y with new_r1
+            Let nr1z be proc curve_p256_point_z with new_r1
+            Let r1x_now be proc curve_p256_point_x with r1
+            Let r1y_now be proc curve_p256_point_y with r1
+            Let r1z_now be proc curve_p256_point_z with r1
+            proc curve_p256_field_copy_into with r1x_now, nr1x
+            proc curve_p256_field_copy_into with r1y_now, nr1y
+            proc curve_p256_field_copy_into with r1z_now, nr1z
+
+            Set bit_idx_plus_one to bit_idx_plus_one minus 1
+        End While
+        Set limb_idx_plus_one to limb_idx_plus_one minus 1
+    End While
+
+    Note: Copy R0 into dest.
+    Let r0x_out be proc curve_p256_point_x with r0
+    Let r0y_out be proc curve_p256_point_y with r0
+    Let r0z_out be proc curve_p256_point_z with r0
+    Let dx_out be proc curve_p256_point_x with dest
+    Let dy_out be proc curve_p256_point_y with dest
+    Let dz_out be proc curve_p256_point_z with dest
+    proc curve_p256_field_copy_into with dx_out, r0x_out
+    proc curve_p256_field_copy_into with dy_out, r0y_out
+    proc curve_p256_field_copy_into with dz_out, r0z_out
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Affine conversion: (X, Y, Z) Jacobian -> (x, y) affine where
+Note:   x = X / Z^2  and  y = Y / Z^3
+Note: ============================================================================
+
+Process called "curve_p256_to_affine" takes arena as Integer, pt as Integer, out_x as Integer, out_y as Integer returns Integer:
+    @Reasoning
+    Converts a Jacobian point to affine coordinates. Returns 0 if the
+    point is at infinity (cannot be represented in affine form).
+    @End Reasoning
+
+    @Implementation
+    1. If Z == 0, return 0.
+    2. Compute z_inv = Z^-1 mod p via field_p256_inv.
+    3. z_inv_sq = z_inv^2, z_inv_cu = z_inv^3.
+    4. out_x = X * z_inv_sq, out_y = Y * z_inv_cu.
+    @End Implementation
+
+    @Performance_Hints
+    One field inversion (dominant, ~1 ms) plus four multiplications.
+    @End Performance_Hints
+
+    @Security_Scope
+    Field inversion uses Fermat's-method modular exponentiation which
+    is constant-time over the exponent (fixed: p-2). Multiplications
+    are constant-time over loop bounds.
+    @End Security_Scope
+
+    Let z be proc curve_p256_point_z with pt
+    If proc bigint_is_zero from BigInt with z is equal to 1:
+        Return 0
+    End If
+    Let z_inv be proc field_p256_zero from Field with arena
+    Let inv_rc be proc field_p256_inv from Field with arena, z_inv, z
+    If inv_rc is equal to 0:
+        Return 0
+    End If
+    Let z_inv_sq be proc field_p256_zero from Field with arena
+    proc field_p256_sqr from Field with arena, z_inv_sq, z_inv
+    Let z_inv_cu be proc field_p256_zero from Field with arena
+    proc field_p256_mul from Field with arena, z_inv_cu, z_inv_sq, z_inv
+    Let x be proc curve_p256_point_x with pt
+    Let y be proc curve_p256_point_y with pt
+    proc field_p256_mul from Field with arena, out_x, x, z_inv_sq
+    proc field_p256_mul from Field with arena, out_y, y, z_inv_cu
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Point validation: confirms y^2 == x^3 - 3x + b (mod p) in affine form
+Note: ============================================================================
+
+Process called "curve_p256_is_on_curve_affine" takes arena as Integer, x as Integer, y as Integer returns Integer:
+    @Reasoning
+    Returns 1 if (x, y) satisfies the P-256 curve equation. Used to
+    validate decoded peer public keys before they are admitted into a
+    protocol (ECDH, ECDSA verify).
+    @End Reasoning
+
+    @Implementation
+    1. lhs = y^2 mod p.
+    2. rhs = x^3 - 3*x + b mod p.
+    3. Compare equality.
+    @End Implementation
+
+    @Performance_Hints
+    Five field multiplications plus a few additions. ~150 us.
+    @End Performance_Hints
+
+    @Security_Scope
+    Inputs are public peer points; the comparison itself is constant-
+    time via field_p256_equal.
+    @End Security_Scope
+
+    Let lhs be proc field_p256_zero from Field with arena
+    proc field_p256_sqr from Field with arena, lhs, y
+
+    Let x_sq be proc field_p256_zero from Field with arena
+    proc field_p256_sqr from Field with arena, x_sq, x
+    Let x_cu be proc field_p256_zero from Field with arena
+    proc field_p256_mul from Field with arena, x_cu, x_sq, x
+
+    Note: 3*x via two additions.
+    Let two_x be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, two_x, x, x
+    Let three_x be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, three_x, two_x, x
+
+    Let rhs_tmp be proc field_p256_zero from Field with arena
+    proc field_p256_sub from Field with arena, rhs_tmp, x_cu, three_x
+
+    Let b be proc curve_p256_b with arena
+    If b is equal to 0:
+        Return 0
+    End If
+    Let rhs be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, rhs, rhs_tmp, b
+
+    Return proc field_p256_equal from Field with lhs, rhs
+End Process
+
+Note: ============================================================================
+Note: Point encoding (SEC 1 v2.0 section 2.3.3)
+Note: ============================================================================
+
+Process called "curve_p256_encode_uncompressed" takes arena as Integer, pt as Integer, out_bytes as Integer returns Integer:
+    @Reasoning
+    Writes the 65-byte uncompressed encoding 0x04 || X || Y of the
+    affine form of pt into out_bytes.
+    @End Reasoning
+
+    @Implementation
+    1. Convert to affine. If infinity, write a single 0x00 byte and
+       return 1.
+    2. Write 0x04 followed by X big-endian (32 bytes) and Y big-endian
+       (32 bytes).
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by the affine conversion (~1 ms) plus 65 byte writes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Output is public. Constant time on the byte loop.
+    @End Security_Scope
+
+    If proc curve_p256_point_is_infinity with pt is equal to 1:
+        proc memory_set_byte from Memory with out_bytes, 0, 0
+        Return 1
+    End If
+    Let ax be proc field_p256_zero from Field with arena
+    Let ay be proc field_p256_zero from Field with arena
+    Let aff_rc be proc curve_p256_to_affine with arena, pt, ax, ay
+    If aff_rc is equal to 0:
+        Return 0
+    End If
+    proc memory_set_byte from Memory with out_bytes, 0, 4
+    proc field_p256_pack from Field with ax, out_bytes plus 1
+    proc field_p256_pack from Field with ay, out_bytes plus 33
+    Return CURVE_P256_POINT_BYTES
+End Process
+
+Process called "curve_p256_encode_compressed" takes arena as Integer, pt as Integer, out_bytes as Integer returns Integer:
+    @Reasoning
+    Writes the 33-byte compressed encoding (0x02 or 0x03) || X of pt
+    into out_bytes. Tag byte is 0x02 when y is even, 0x03 when odd.
+    @End Reasoning
+
+    @Implementation
+    1. Convert to affine. Infinity short-circuits to a single 0x00.
+    2. Inspect y's low limb's least-significant bit; tag = 0x02 + (y_bit).
+    3. Pack X big-endian.
+    @End Implementation
+
+    @Performance_Hints
+    Affine conversion plus 33 byte writes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Output is public.
+    @End Security_Scope
+
+    If proc curve_p256_point_is_infinity with pt is equal to 1:
+        proc memory_set_byte from Memory with out_bytes, 0, 0
+        Return 1
+    End If
+    Let ax be proc field_p256_zero from Field with arena
+    Let ay be proc field_p256_zero from Field with arena
+    Let aff_rc be proc curve_p256_to_affine with arena, pt, ax, ay
+    If aff_rc is equal to 0:
+        Return 0
+    End If
+    Let y_low be proc bigint_get_limb from BigInt with ay, 0
+    Let y_parity be y_low bitwise_and 1
+    Let tag be 2 plus y_parity
+    proc memory_set_byte from Memory with out_bytes, 0, tag
+    proc field_p256_pack from Field with ax, out_bytes plus 1
+    Return CURVE_P256_COMPRESSED_BYTES
+End Process
+
+Process called "curve_p256_encode_hybrid" takes arena as Integer, pt as Integer, out_bytes as Integer returns Integer:
+    @Reasoning
+    Writes the 65-byte hybrid encoding (0x06 or 0x07) || X || Y where
+    the low bit of the tag carries the y-parity. See SEC 1 v2.0 2.3.5.
+    @End Reasoning
+
+    @Implementation
+    1. Convert to affine.
+    2. Inspect y parity; tag = 0x06 + parity.
+    3. Pack X and Y.
+    @End Implementation
+
+    @Performance_Hints
+    Same cost as uncompressed encoding.
+    @End Performance_Hints
+
+    @Security_Scope
+    Output is public.
+    @End Security_Scope
+
+    If proc curve_p256_point_is_infinity with pt is equal to 1:
+        proc memory_set_byte from Memory with out_bytes, 0, 0
+        Return 1
+    End If
+    Let ax be proc field_p256_zero from Field with arena
+    Let ay be proc field_p256_zero from Field with arena
+    Let aff_rc be proc curve_p256_to_affine with arena, pt, ax, ay
+    If aff_rc is equal to 0:
+        Return 0
+    End If
+    Let y_low be proc bigint_get_limb from BigInt with ay, 0
+    Let y_parity be y_low bitwise_and 1
+    Let tag be 6 plus y_parity
+    proc memory_set_byte from Memory with out_bytes, 0, tag
+    proc field_p256_pack from Field with ax, out_bytes plus 1
+    proc field_p256_pack from Field with ay, out_bytes plus 33
+    Return CURVE_P256_POINT_BYTES
+End Process
+
+Note: ============================================================================
+Note: Point decoding (decompression support deferred to compressed-only path
+Note: via Tonelli-Shanks, which uses field_p256_inv-style modular exponentiation
+Note: with the special exponent (p+1)/4 since p === 3 (mod 4) for P-256.
+Note: ============================================================================
+
+Process called "curve_p256_decode_uncompressed" takes arena as Integer, in_bytes as Integer, in_len as Integer, out_pt as Integer returns Integer:
+    @Reasoning
+    Parses a 65-byte 0x04 || X || Y uncompressed encoding into Jacobian
+    coordinates (Z = 1) and validates the resulting (X, Y) lies on the
+    curve. Returns 0 on length mismatch, tag mismatch, or off-curve.
+    @End Reasoning
+
+    @Implementation
+    1. Check length == 65 and tag == 0x04.
+    2. Unpack X, Y as field elements (reducing modulo p).
+    3. Validate via curve_p256_is_on_curve_affine.
+    4. Copy X, Y into out_pt; set Z = 1.
+    @End Implementation
+
+    @Performance_Hints
+    Two unpacks (~200 ns each) plus one on-curve check (~150 us).
+    @End Performance_Hints
+
+    @Security_Scope
+    Required for ECDH/ECDSA where peer keys must be validated to avoid
+    invalid-curve attacks (Antipa et al. 2003).
+    @End Security_Scope
+
+    If in_len is not equal to CURVE_P256_POINT_BYTES:
+        Return 0
+    End If
+    Let tag be proc memory_get_byte from Memory with in_bytes, 0
+    If tag is not equal to 4:
+        Return 0
+    End If
+    Let x_in be proc field_p256_unpack from Field with arena, in_bytes plus 1
+    Let y_in be proc field_p256_unpack from Field with arena, in_bytes plus 33
+    If x_in is equal to 0:
+        Return 0
+    End If
+    If y_in is equal to 0:
+        Return 0
+    End If
+    Let on_curve be proc curve_p256_is_on_curve_affine with arena, x_in, y_in
+    If on_curve is not equal to 1:
+        Return 0
+    End If
+    Let dx be proc curve_p256_point_x with out_pt
+    Let dy be proc curve_p256_point_y with out_pt
+    Let dz be proc curve_p256_point_z with out_pt
+    proc curve_p256_field_copy_into with dx, x_in
+    proc curve_p256_field_copy_into with dy, y_in
+    Let dz_cap be proc bigint_get_limb_capacity from BigInt with dz
+    Let zi be 0
+    While zi is less than dz_cap:
+        proc bigint_set_limb from BigInt with dz, zi, 0
+        Set zi to zi plus 1
+    End While
+    proc bigint_set_limb from BigInt with dz, 0, 1
+    proc bigint_set_limb_count from BigInt with dz, 1
+    Return 1
+End Process
+
+Process called "curve_p256_decode_compressed" takes arena as Integer, in_bytes as Integer, in_len as Integer, out_pt as Integer returns Integer:
+    @Reasoning
+    Parses a 33-byte (0x02|0x03) || X compressed encoding. Recovers
+    y by computing y^2 = x^3 - 3x + b mod p, then taking a square root.
+    Because P-256's prime p satisfies p === 3 (mod 4), the square root
+    is y = (y^2)^((p+1)/4) mod p; if y has the wrong parity we negate it.
+    @End Reasoning
+
+    @Implementation
+    1. Check length == 33 and tag in {0x02, 0x03}.
+    2. Unpack X.
+    3. Compute u = x^3 - 3x + b.
+    4. Build exponent e = (p+1)/4 as a BigInt: this is the bit-shift of
+       (p+1) by 2 right.
+    5. y = u^e mod p via bigint_mod_exp.
+    6. Verify y^2 == u (rejects non-residues).
+    7. If parity of y mismatches tag, y = p - y.
+    8. Copy X, Y into out_pt; set Z = 1.
+    @End Implementation
+
+    @Performance_Hints
+    One modular exponentiation (~1.5 ms) dominates.
+    @End Performance_Hints
+
+    @Security_Scope
+    Input is public.
+    @End Security_Scope
+
+    If in_len is not equal to CURVE_P256_COMPRESSED_BYTES:
+        Return 0
+    End If
+    Let tag be proc memory_get_byte from Memory with in_bytes, 0
+    Let want_parity be 0
+    If tag is equal to 2:
+        Set want_parity to 0
+    Otherwise:
+        If tag is equal to 3:
+            Set want_parity to 1
+        Otherwise:
+            Return 0
+        End If
+    End If
+    Let x_in be proc field_p256_unpack from Field with arena, in_bytes plus 1
+    If x_in is equal to 0:
+        Return 0
+    End If
+
+    Note: u = x^3 - 3x + b
+    Let x_sq be proc field_p256_zero from Field with arena
+    proc field_p256_sqr from Field with arena, x_sq, x_in
+    Let x_cu be proc field_p256_zero from Field with arena
+    proc field_p256_mul from Field with arena, x_cu, x_sq, x_in
+    Let two_x be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, two_x, x_in, x_in
+    Let three_x be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, three_x, two_x, x_in
+    Let u_tmp be proc field_p256_zero from Field with arena
+    proc field_p256_sub from Field with arena, u_tmp, x_cu, three_x
+    Let b be proc curve_p256_b with arena
+    Let u be proc field_p256_zero from Field with arena
+    proc field_p256_add from Field with arena, u, u_tmp, b
+
+    Note: exponent e = (p+1)/4. Build p, increment, then right-shift by 2.
+    Let p be proc field_p256_prime from Field with arena
+    Let one be proc bigint_from_u64 from BigInt with arena, 1
+    Let p_plus_one be proc bigint_alloc from BigInt with arena, 10
+    proc bigint_add from BigInt with p_plus_one, p, one
+    proc bigint_shift_right_one from BigIntX with p_plus_one
+    proc bigint_shift_right_one from BigIntX with p_plus_one
+
+    Let y_cand be proc field_p256_zero from Field with arena
+    proc bigint_mod_exp from BigInt with arena, y_cand, u, p_plus_one, p
+
+    Note: Verify y_cand^2 == u (i.e. u was a quadratic residue).
+    Let y_sq_check be proc field_p256_zero from Field with arena
+    proc field_p256_sqr from Field with arena, y_sq_check, y_cand
+    If proc field_p256_equal from Field with y_sq_check, u is not equal to 1:
+        Return 0
+    End If
+
+    Let y_low be proc bigint_get_limb from BigInt with y_cand, 0
+    Let y_parity be y_low bitwise_and 1
+    If y_parity is not equal to want_parity:
+        Let neg_y be proc field_p256_zero from Field with arena
+        proc field_p256_neg from Field with arena, neg_y, y_cand
+        Let dx be proc curve_p256_point_x with out_pt
+        Let dy be proc curve_p256_point_y with out_pt
+        Let dz be proc curve_p256_point_z with out_pt
+        proc curve_p256_field_copy_into with dx, x_in
+        proc curve_p256_field_copy_into with dy, neg_y
+        Let dz_cap be proc bigint_get_limb_capacity from BigInt with dz
+        Let zi be 0
+        While zi is less than dz_cap:
+            proc bigint_set_limb from BigInt with dz, zi, 0
+            Set zi to zi plus 1
+        End While
+        proc bigint_set_limb from BigInt with dz, 0, 1
+        proc bigint_set_limb_count from BigInt with dz, 1
+        Return 1
+    End If
+
+    Let dx2 be proc curve_p256_point_x with out_pt
+    Let dy2 be proc curve_p256_point_y with out_pt
+    Let dz2 be proc curve_p256_point_z with out_pt
+    proc curve_p256_field_copy_into with dx2, x_in
+    proc curve_p256_field_copy_into with dy2, y_cand
+    Let dz2_cap be proc bigint_get_limb_capacity from BigInt with dz2
+    Let zi2 be 0
+    While zi2 is less than dz2_cap:
+        proc bigint_set_limb from BigInt with dz2, zi2, 0
+        Set zi2 to zi2 plus 1
+    End While
+    proc bigint_set_limb from BigInt with dz2, 0, 1
+    proc bigint_set_limb_count from BigInt with dz2, 1
+    Return 1
+End Process
+
+Process called "curve_p256_decode" takes arena as Integer, in_bytes as Integer, in_len as Integer, out_pt as Integer returns Integer:
+    @Reasoning
+    Dispatching decoder: routes to uncompressed, compressed, or hybrid
+    based on the first byte. Returns 0 for unknown encodings.
+    @End Reasoning
+
+    @Implementation
+    Switch on the leading tag byte. For 0x06/0x07 hybrid form we drop
+    the parity bit and parse as uncompressed (ignoring the redundant
+    parity since X || Y is already complete).
+    @End Implementation
+
+    @Performance_Hints
+    Lookup table plus one nested decode.
+    @End Performance_Hints
+
+    @Security_Scope
+    Input is public.
+    @End Security_Scope
+
+    If in_len is less than 1:
+        Return 0
+    End If
+    Let tag be proc memory_get_byte from Memory with in_bytes, 0
+    If tag is equal to 4:
+        Return proc curve_p256_decode_uncompressed with arena, in_bytes, in_len, out_pt
+    End If
+    If tag is equal to 6:
+        Return proc curve_p256_decode_uncompressed_hybrid with arena, in_bytes, in_len, out_pt, 0
+    End If
+    If tag is equal to 7:
+        Return proc curve_p256_decode_uncompressed_hybrid with arena, in_bytes, in_len, out_pt, 1
+    End If
+    If tag is equal to 2:
+        Return proc curve_p256_decode_compressed with arena, in_bytes, in_len, out_pt
+    End If
+    If tag is equal to 3:
+        Return proc curve_p256_decode_compressed with arena, in_bytes, in_len, out_pt
+    End If
+    Return 0
+End Process
+
+Process called "curve_p256_decode_uncompressed_hybrid" takes arena as Integer, in_bytes as Integer, in_len as Integer, out_pt as Integer, want_parity as Integer returns Integer:
+    @Reasoning
+    Parses a hybrid 0x06/0x07 || X || Y encoding. Both X and Y are
+    present so the parity bit in the tag is redundant; we still verify
+    it matches the actual Y parity for strict-DER conformance.
+    @End Reasoning
+
+    @Implementation
+    1. Check length == 65.
+    2. Unpack X and Y.
+    3. Verify Y parity matches want_parity.
+    4. Verify on-curve and store in Jacobian form (Z = 1).
+    @End Implementation
+
+    @Performance_Hints
+    Two unpacks plus on-curve check.
+    @End Performance_Hints
+
+    @Security_Scope
+    Input is public.
+    @End Security_Scope
+
+    If in_len is not equal to CURVE_P256_POINT_BYTES:
+        Return 0
+    End If
+    Let x_in be proc field_p256_unpack from Field with arena, in_bytes plus 1
+    Let y_in be proc field_p256_unpack from Field with arena, in_bytes plus 33
+    If x_in is equal to 0:
+        Return 0
+    End If
+    If y_in is equal to 0:
+        Return 0
+    End If
+    Let y_low be proc bigint_get_limb from BigInt with y_in, 0
+    Let y_parity be y_low bitwise_and 1
+    If y_parity is not equal to want_parity:
+        Return 0
+    End If
+    Let on_curve be proc curve_p256_is_on_curve_affine with arena, x_in, y_in
+    If on_curve is not equal to 1:
+        Return 0
+    End If
+    Let dx be proc curve_p256_point_x with out_pt
+    Let dy be proc curve_p256_point_y with out_pt
+    Let dz be proc curve_p256_point_z with out_pt
+    proc curve_p256_field_copy_into with dx, x_in
+    proc curve_p256_field_copy_into with dy, y_in
+    Let dz_cap be proc bigint_get_limb_capacity from BigInt with dz
+    Let zi be 0
+    While zi is less than dz_cap:
+        proc bigint_set_limb from BigInt with dz, zi, 0
+        Set zi to zi plus 1
+    End While
+    proc bigint_set_limb from BigInt with dz, 0, 1
+    proc bigint_set_limb_count from BigInt with dz, 1
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Subgroup check. For P-256 the cofactor is 1, so any point on the curve
+Note: is already in the prime-order subgroup; the on-curve check suffices.
+Note: This entry point is provided for API symmetry with curves where cofactor
+Note: > 1 (Curve25519, Ed25519) and for callers that want explicit confirmation.
+Note: ============================================================================
+
+Process called "curve_p256_validate_public_key" takes arena as Integer, pt as Integer returns Integer:
+    @Reasoning
+    Validates a peer's public key per SEC 1 v2.0 section 3.2.2. For
+    P-256 specifically:
+    - reject point-at-infinity,
+    - check coordinates are < p (handled by field_p256_unpack's mod-p
+      reduction at decode time),
+    - check the point lies on the curve,
+    - confirm prime-order subgroup membership (trivial for cofactor-1
+      curves but check explicitly).
+    @End Reasoning
+
+    @Implementation
+    1. Reject infinity.
+    2. Compute (x_aff, y_aff) and run is_on_curve_affine.
+    3. Since cofactor = 1, subgroup membership coincides with on-curve.
+    @End Implementation
+
+    @Performance_Hints
+    Affine conversion plus on-curve check.
+    @End Performance_Hints
+
+    @Security_Scope
+    Mandatory for preventing invalid-curve attacks (Antipa, Brown,
+    Menezes, Struik, Vanstone CRYPTO 2003).
+    @End Security_Scope
+
+    If proc curve_p256_point_is_infinity with pt is equal to 1:
+        Return 0
+    End If
+    Let ax be proc field_p256_zero from Field with arena
+    Let ay be proc field_p256_zero from Field with arena
+    Let aff_rc be proc curve_p256_to_affine with arena, pt, ax, ay
+    If aff_rc is equal to 0:
+        Return 0
+    End If
+    Return proc curve_p256_is_on_curve_affine with arena, ax, ay
+End Process

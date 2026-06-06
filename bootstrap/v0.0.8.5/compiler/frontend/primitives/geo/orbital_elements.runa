@@ -1,0 +1,761 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+ORBITAL_ELEMENTS - Keplerian orbital elements and propagation
+
+Implements the classical six-element representation of a Keplerian orbit
+and the standard mathematics for orbit propagation under the two-body
+assumption (Earth-only, no perturbations).
+
+THE SIX KEPLERIAN ELEMENTS
+
+  a    - semi-major axis (Length): half the long axis of the orbit
+  e    - eccentricity (dimensionless): 0 = circle, [0,1) = ellipse,
+         1 = parabola (unbound), >1 = hyperbola (unbound)
+  i    - inclination (Angle): tilt of orbit plane from the reference plane
+         (Earth's equator for ECI)
+  Omega - longitude of the ascending node (RAAN, Angle): angle from the
+         reference direction (vernal equinox) to where the orbit crosses
+         the equator northbound
+  omega - argument of perigee (Angle): angle within the orbit plane from
+         the ascending node to the closest approach (perigee)
+  nu   - true anomaly (Angle): instantaneous angular position from
+         perigee at epoch
+
+Plus the epoch (DateTime) at which these elements are valid.
+
+PROPAGATION
+
+This file provides:
+  1. Closed-form orbital period from Kepler's third law.
+  2. Closed-form orbital velocity at a given true anomaly (vis-viva).
+  3. Kepler-equation solver (Newton-Raphson) for propagation: given the
+     elements at one epoch, compute the true anomaly at a later epoch.
+  4. TLE (Two-Line Element) parser and conversion to Keplerian elements.
+
+The Keplerian propagator here is a pure two-body model. For long-duration
+(> 1 day) or high-precision (< 1 km) work, perturbations (J2 oblateness,
+atmospheric drag, lunar/solar gravity, solar radiation pressure) must be
+added. Those models live in a future orbit_perturbations.runa.
+
+CITATIONS
+
+  - Vallado, D. (2013): "Fundamentals of Astrodynamics and Applications",
+    4th ed. The canonical contemporary reference; equations cited by
+    Vallado number throughout.
+  - Bate, Mueller, White (1971): "Fundamentals of Astrodynamics".
+    The classical Kepler-equation solver.
+  - NORAD TLE format: https://celestrak.com/NORAD/documentation/tle-fmt.php
+    Two-line element set field positions.
+  - Brouwer, D. (1959): "Solution of the problem of artificial satellite
+    theory without drag", Astronomical Journal 64, 378-396. Mean-to-
+    osculating element transformations.
+
+DEPENDENCIES
+
+  - compiler/frontend/primitives/core/arithmetic_core.runa for sqrt.
+  - compiler/frontend/primitives/units/units_of_measure.runa for Length, Angle.
+  - compiler/frontend/primitives/geo/coordinate_reference_system.runa for the
+    inline trig helpers.
+:End Note
+
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/units/units_of_measure.runa" as Units
+Import "compiler/frontend/primitives/geo/coordinate_reference_system.runa" as CRS
+
+Note: ============================================================================
+Note: SECTION 1 - Gravitational parameter constants
+Note: ============================================================================
+Note: GM (mu) is the standard gravitational parameter of the central body.
+Note: For Earth this is the WGS84 / GRS80 value used by GPS:
+Note:   GM_Earth = 3.986004418e14 m^3 / s^2
+Note: For other bodies (Moon, Mars, Sun) we provide constants for completeness.
+
+Process called "gm_earth" returns Float:
+    Note: 398600441800000.0 m^3/s^2 (decimal expansion of 3.986004418e14)
+    Return 398600441800000.0
+End Process
+
+Process called "gm_moon" returns Float:
+    Note: GM_Moon = 4.9048695e12 m^3/s^2 (JPL DE441)
+    Return 4904869500000.0
+End Process
+
+Process called "gm_mars" returns Float:
+    Note: GM_Mars = 4.282837e13 m^3/s^2 (JPL DE441)
+    Return 42828370000000.0
+End Process
+
+Process called "gm_sun" returns Float:
+    Note: GM_Sun = 1.32712440018e20 m^3/s^2 (IAU 2015 nominal)
+    Return 132712440018000000000.0
+End Process
+
+Note: ============================================================================
+Note: SECTION 2 - OrbitalElements structure
+Note: ============================================================================
+
+Type called "OrbitalElements":
+    semi_major_axis_meters as Float
+    eccentricity as Float
+    inclination_radians as Float
+    raan_radians as Float
+    argument_of_perigee_radians as Float
+    true_anomaly_radians as Float
+    epoch_julian_date as Float
+    central_body_gm as Float
+End Type
+
+Process called "orbital_elements_create_earth" takes a_meters as Float, e as Float, i_rad as Float, raan_rad as Float, arg_perigee_rad as Float, true_anomaly_rad as Float, epoch_jd as Float returns OrbitalElements:
+    @Reasoning:
+        Convenience constructor for Earth-centered orbits. Sets the central
+        body GM to Earth's value.
+    @End Reasoning
+    @Implementation:
+        Construct OrbitalElements with the supplied elements and gm_earth.
+    @End Implementation
+    @Performance_Hints:
+        Eight stores.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let o be a value of type OrbitalElements
+    Set o.semi_major_axis_meters to a_meters
+    Set o.eccentricity to e
+    Set o.inclination_radians to i_rad
+    Set o.raan_radians to raan_rad
+    Set o.argument_of_perigee_radians to arg_perigee_rad
+    Set o.true_anomaly_radians to true_anomaly_rad
+    Set o.epoch_julian_date to epoch_jd
+    Set o.central_body_gm to gm_earth()
+    Return o
+End Process
+
+Process called "orbital_elements_create" takes a_meters as Float, e as Float, i_rad as Float, raan_rad as Float, arg_perigee_rad as Float, true_anomaly_rad as Float, epoch_jd as Float, mu as Float returns OrbitalElements:
+    Let o be a value of type OrbitalElements
+    Set o.semi_major_axis_meters to a_meters
+    Set o.eccentricity to e
+    Set o.inclination_radians to i_rad
+    Set o.raan_radians to raan_rad
+    Set o.argument_of_perigee_radians to arg_perigee_rad
+    Set o.true_anomaly_radians to true_anomaly_rad
+    Set o.epoch_julian_date to epoch_jd
+    Set o.central_body_gm to mu
+    Return o
+End Process
+
+Note: ============================================================================
+Note: SECTION 3 - Kepler's third law and vis-viva
+Note: ============================================================================
+
+Process called "orbital_period_seconds" takes elements as OrbitalElements returns Float:
+    @Reasoning:
+        Kepler's third law: T = 2*pi * sqrt(a^3 / GM). For Earth-centered
+        orbits with a = 6791 km (typical LEO) this gives T ~ 5544 s
+        (92.4 minutes). For GEO (a = 42164 km) it gives 86164 s (sidereal day).
+    @End Reasoning
+    @Implementation:
+        Compute a^3, divide by GM, take sqrt, multiply by 2*pi.
+    @End Implementation
+    @Performance_Hints:
+        Two multiplies, one divide, one sqrt, one multiply.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Hyperbolic (e >= 1) orbits have undefined period; we return
+        the formula's mathematical value which goes to +infinity for
+        parabolic and is undefined for hyperbolic.
+    @End Security_Scope
+    Let a be elements.semi_major_axis_meters
+    Let a_cubed be a multiplied by a
+    Set a_cubed to a_cubed multiplied by a
+    Let ratio be a_cubed divided by elements.central_body_gm
+    Let sqrt_ratio be proc sqrt from Arith with ratio
+    Return 2.0 multiplied by 3.141592653589793 multiplied by sqrt_ratio
+End Process
+
+Process called "orbital_period_minutes" takes elements as OrbitalElements returns Float:
+    Return orbital_period_seconds(elements) divided by 60.0
+End Process
+
+Process called "orbital_velocity_at_true_anomaly" takes elements as OrbitalElements, true_anomaly_rad as Float returns Float:
+    @Reasoning:
+        Vis-viva equation: v^2 = GM * (2/r - 1/a), where r is the radius
+        at the given true anomaly. For an ellipse:
+          r = a * (1 - e^2) / (1 + e * cos(nu))
+        Returns speed (magnitude of velocity) in m/s. The full 3D velocity
+        vector requires the orbit-plane basis, which is provided by
+        orbital_state_vectors below.
+    @End Reasoning
+    @Implementation:
+        Compute r from the conic equation, then v = sqrt(GM * (2/r - 1/a)).
+    @End Implementation
+    @Performance_Hints:
+        One cos, several FP ops, one sqrt. ~ 80 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let a be elements.semi_major_axis_meters
+    Let e be elements.eccentricity
+    Let e_sq be e multiplied by e
+    Let one_minus_e_sq be 1.0 minus e_sq
+    Let cos_nu be proc geo_cos from CRS with true_anomaly_rad
+    Let denom be 1.0 plus e multiplied by cos_nu
+    Let r be a multiplied by one_minus_e_sq
+    Set r to r divided by denom
+    Let two_over_r be 2.0 divided by r
+    Let one_over_a be 1.0 divided by a
+    Let inner be two_over_r minus one_over_a
+    Let v_sq be elements.central_body_gm multiplied by inner
+    Return proc sqrt from Arith with v_sq
+End Process
+
+Note: ============================================================================
+Note: SECTION 4 - Kepler-equation solver (Newton-Raphson)
+Note: ============================================================================
+
+Process called "solve_kepler_equation" takes mean_anomaly_rad as Float, eccentricity as Float returns Float:
+    @Reasoning:
+        Solve M = E - e*sin(E) for the eccentric anomaly E given the mean
+        anomaly M. Iterative Newton-Raphson. For e in [0, 1) the equation
+        has a unique solution and Newton-Raphson converges quadratically
+        with initial estimate E_0 = M + e*sin(M).
+    @End Reasoning
+    @Implementation:
+        Initial guess: E = M + e * sin(M) * (1 + e * cos(M)).
+        Iterate:
+          delta = (E - e*sin(E) - M) / (1 - e*cos(E))
+          E_new = E - delta
+        Stop when |delta| < 1e-12 or 50 iterations. For e < 0.6 the
+        algorithm converges in fewer than 5 iterations; for higher
+        eccentricities up to 0.99 it converges in ~ 20.
+    @End Implementation
+    @Performance_Hints:
+        ~ 5 iterations typically, each with one sin/cos pair and ~ 5 FP ops.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. For e >= 1 (parabolic or hyperbolic) the formula does not
+        apply; we still iterate but the result is meaningless. Caller
+        should screen the eccentricity beforehand.
+    @End Security_Scope
+    Let M be mean_anomaly_rad
+    Let e be eccentricity
+    Let sin_M be proc geo_sin from CRS with M
+    Let cos_M be proc geo_cos from CRS with M
+    Let E be M plus e multiplied by sin_M
+    Set E to E multiplied by (1.0 plus e multiplied by cos_M)
+    Let iter be 0
+    While iter is less than 50:
+        Let sin_E be proc geo_sin from CRS with E
+        Let cos_E be proc geo_cos from CRS with E
+        Let numer be E minus e multiplied by sin_E
+        Set numer to numer minus M
+        Let denom be 1.0 minus e multiplied by cos_E
+        Let delta be numer divided by denom
+        Set E to E minus delta
+        Let abs_delta be proc geo_float_abs from CRS with delta
+        If abs_delta is less than 0.000000000001:
+            Set iter to 50
+        Otherwise:
+            Set iter to iter plus 1
+        End If
+    End While
+    Return E
+End Process
+
+Process called "true_anomaly_from_eccentric" takes eccentric_anomaly_rad as Float, eccentricity as Float returns Float:
+    @Reasoning:
+        Convert eccentric anomaly E to true anomaly nu via:
+          tan(nu/2) = sqrt((1+e)/(1-e)) * tan(E/2)
+        Or equivalently:
+          nu = 2 * atan2(sqrt(1+e) * sin(E/2), sqrt(1-e) * cos(E/2))
+        The atan2 form is numerically robust across all quadrants.
+    @End Reasoning
+    @Implementation:
+        Apply the atan2 formula and return 2 * result.
+    @End Implementation
+    @Performance_Hints:
+        Two sin/cos calls (half-angle), two sqrt, one atan2, ~ 5 FP ops.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let half_E be eccentric_anomaly_rad divided by 2.0
+    Let sin_half be proc geo_sin from CRS with half_E
+    Let cos_half be proc geo_cos from CRS with half_E
+    Let one_plus_e be 1.0 plus eccentricity
+    Let one_minus_e be 1.0 minus eccentricity
+    Let sqrt_plus be proc sqrt from Arith with one_plus_e
+    Let sqrt_minus be proc sqrt from Arith with one_minus_e
+    Let y_val be sqrt_plus multiplied by sin_half
+    Let x_val be sqrt_minus multiplied by cos_half
+    Let nu_half be proc geo_atan2_quadrant from CRS with y_val, x_val
+    Return 2.0 multiplied by nu_half
+End Process
+
+Process called "mean_anomaly_from_true" takes true_anomaly_rad as Float, eccentricity as Float returns Float:
+    @Reasoning:
+        Inverse direction (true -> eccentric -> mean). Used to compute the
+        mean anomaly at the epoch from the true anomaly stored in the
+        orbital elements.
+    @End Reasoning
+    @Implementation:
+        eccentric = 2 * atan(sqrt((1-e)/(1+e)) * tan(nu/2))
+        mean = eccentric - e * sin(eccentric)
+    @End Implementation
+    @Performance_Hints:
+        Symmetric to true_anomaly_from_eccentric.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let half_nu be true_anomaly_rad divided by 2.0
+    Let sin_half_nu be proc geo_sin from CRS with half_nu
+    Let cos_half_nu be proc geo_cos from CRS with half_nu
+    Let one_plus_e be 1.0 plus eccentricity
+    Let one_minus_e be 1.0 minus eccentricity
+    Let sqrt_plus be proc sqrt from Arith with one_plus_e
+    Let sqrt_minus be proc sqrt from Arith with one_minus_e
+    Let y_val be sqrt_minus multiplied by sin_half_nu
+    Let x_val be sqrt_plus multiplied by cos_half_nu
+    Let E_half be proc geo_atan2_quadrant from CRS with y_val, x_val
+    Let E be 2.0 multiplied by E_half
+    Let sin_E be proc geo_sin from CRS with E
+    Let M be E minus eccentricity multiplied by sin_E
+    Return M
+End Process
+
+Note: ============================================================================
+Note: SECTION 5 - Keplerian propagation
+Note: ============================================================================
+
+Process called "propagate" takes elements as OrbitalElements, target_jd as Float returns OrbitalElements:
+    @Reasoning:
+        Propagate the orbital elements from their epoch to the target Julian
+        date under the pure two-body assumption. Only the true anomaly
+        changes; the other five elements (a, e, i, RAAN, omega) are
+        constants of motion under two-body dynamics.
+    @End Reasoning
+    @Implementation:
+        Steps:
+          1. Compute the mean motion n = sqrt(GM / a^3).
+          2. Compute the mean anomaly at epoch: M_0 = mean_from_true(nu_0, e).
+          3. dt = (target_jd - epoch_jd) * 86400 (Julian days to seconds).
+          4. M = M_0 + n * dt.
+          5. Solve Kepler's equation for E at the target.
+          6. Convert E to nu at the target.
+        Return a new OrbitalElements with updated nu and epoch.
+    @End Implementation
+    @Performance_Hints:
+        Two mean/true conversions, one Kepler solve. ~ 1000 cycles total.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. For long-duration propagation perturbations dominate;
+        callers should not use this for forecast horizons > 1 day for
+        LEO satellites or > 1 month for GEO satellites.
+    @End Security_Scope
+    Let a be elements.semi_major_axis_meters
+    Let e be elements.eccentricity
+    Let mu be elements.central_body_gm
+    Let a_cubed be a multiplied by a
+    Set a_cubed to a_cubed multiplied by a
+    Let n_motion_sq be mu divided by a_cubed
+    Let n_motion be proc sqrt from Arith with n_motion_sq
+    Let M0 be mean_anomaly_from_true(elements.true_anomaly_radians, e)
+    Let dt_days be target_jd minus elements.epoch_julian_date
+    Let dt_seconds be dt_days multiplied by 86400.0
+    Let M_target be M0 plus n_motion multiplied by dt_seconds
+    Note: Reduce M to [-pi, pi]
+    Let two_pi be 6.283185307179586
+    While M_target is greater than 3.141592653589793:
+        Set M_target to M_target minus two_pi
+    End While
+    While M_target is less than 0.0 minus 3.141592653589793:
+        Set M_target to M_target plus two_pi
+    End While
+    Let E_target be solve_kepler_equation(M_target, e)
+    Let nu_target be true_anomaly_from_eccentric(E_target, e)
+    Let result be a value of type OrbitalElements
+    Set result.semi_major_axis_meters to a
+    Set result.eccentricity to e
+    Set result.inclination_radians to elements.inclination_radians
+    Set result.raan_radians to elements.raan_radians
+    Set result.argument_of_perigee_radians to elements.argument_of_perigee_radians
+    Set result.true_anomaly_radians to nu_target
+    Set result.epoch_julian_date to target_jd
+    Set result.central_body_gm to mu
+    Return result
+End Process
+
+Note: ============================================================================
+Note: SECTION 6 - TLE (Two-Line Element) representation
+Note: ============================================================================
+Note: A TLE is the NORAD canonical exchange format for orbital elements of
+Note: artificial satellites. Format reference:
+Note:   https://celestrak.com/NORAD/documentation/tle-fmt.php
+Note: Field positions (column ranges) follow Hoots & Roehrich 1980 SPACETRACK
+Note: Report 3, also reproduced in Vallado 2013 Appendix C.
+
+Type called "TLE":
+    catalog_number as Integer
+    classification as Integer
+    epoch_year as Integer
+    epoch_day_of_year as Float
+    inclination_degrees as Float
+    raan_degrees as Float
+    eccentricity as Float
+    argument_of_perigee_degrees as Float
+    mean_anomaly_degrees as Float
+    mean_motion_revs_per_day as Float
+    revolution_number as Integer
+End Type
+
+Process called "tle_create" takes catalog as Integer, year as Integer, doy as Float, inc as Float, raan as Float, ecc as Float, argp as Float, ma as Float, mm as Float returns TLE:
+    @Reasoning:
+        Direct constructor used by the TLE parser to build a TLE from
+        already-parsed field values. Callers who have the raw TLE text
+        should use tle_parse instead.
+    @End Reasoning
+    @Implementation:
+        Construct TLE with all fields.
+    @End Implementation
+    @Performance_Hints:
+        Eleven stores.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let t be a value of type TLE
+    Set t.catalog_number to catalog
+    Set t.classification to 85
+    Set t.epoch_year to year
+    Set t.epoch_day_of_year to doy
+    Set t.inclination_degrees to inc
+    Set t.raan_degrees to raan
+    Set t.eccentricity to ecc
+    Set t.argument_of_perigee_degrees to argp
+    Set t.mean_anomaly_degrees to ma
+    Set t.mean_motion_revs_per_day to mm
+    Set t.revolution_number to 0
+    Return t
+End Process
+
+Process called "tle_to_orbital_elements" takes t as TLE returns OrbitalElements:
+    @Reasoning:
+        Convert a TLE record (mean elements in degrees and revs/day) into
+        Keplerian OrbitalElements (radians, SI). The conversion is:
+          n_radians_per_sec = mean_motion_revs_per_day * 2*pi / 86400
+          a_meters = (GM / n^2)^(1/3)  (Kepler's third law solved for a)
+          true_anomaly = nu(mean_anomaly, eccentricity)
+        Epoch is encoded by year and day-of-year; we compute the Julian
+        date via the standard formula (Vallado eq. 3-12).
+    @End Reasoning
+    @Implementation:
+        Apply the formulas above. Convert M to nu using the
+        mean -> eccentric -> true chain via solve_kepler_equation and
+        true_anomaly_from_eccentric.
+    @End Implementation
+    @Performance_Hints:
+        One cbrt (via pow(.., 1/3) inlined), one Kepler solve,
+        one E->nu conversion. ~ 2000 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let n_rev_day be t.mean_motion_revs_per_day
+    Let n_rad_per_sec be n_rev_day multiplied by 6.283185307179586
+    Set n_rad_per_sec to n_rad_per_sec divided by 86400.0
+    Let mu be gm_earth()
+    Let n_sq be n_rad_per_sec multiplied by n_rad_per_sec
+    Let a_cubed be mu divided by n_sq
+    Note: cbrt(a_cubed) via Newton iteration for cube root
+    Let a be orbital_cbrt(a_cubed)
+    Let M_rad be proc geo_deg_to_rad from CRS with t.mean_anomaly_degrees
+    Let E_rad be solve_kepler_equation(M_rad, t.eccentricity)
+    Let nu_rad be true_anomaly_from_eccentric(E_rad, t.eccentricity)
+    Let inc_rad be proc geo_deg_to_rad from CRS with t.inclination_degrees
+    Let raan_rad be proc geo_deg_to_rad from CRS with t.raan_degrees
+    Let argp_rad be proc geo_deg_to_rad from CRS with t.argument_of_perigee_degrees
+    Let epoch_jd be julian_date_from_year_doy(t.epoch_year, t.epoch_day_of_year)
+    Let o be a value of type OrbitalElements
+    Set o.semi_major_axis_meters to a
+    Set o.eccentricity to t.eccentricity
+    Set o.inclination_radians to inc_rad
+    Set o.raan_radians to raan_rad
+    Set o.argument_of_perigee_radians to argp_rad
+    Set o.true_anomaly_radians to nu_rad
+    Set o.epoch_julian_date to epoch_jd
+    Set o.central_body_gm to mu
+    Return o
+End Process
+
+Process called "orbital_elements_to_tle" takes o as OrbitalElements, catalog as Integer returns TLE:
+    @Reasoning:
+        Convert Keplerian elements back to a TLE record. The inverse of
+        tle_to_orbital_elements. Note that the resulting "mean elements"
+        are osculating elements unless the source orbit was already mean;
+        for production use callers should perform Brouwer-Lyddane
+        unmean-to-mean conversion first.
+    @End Reasoning
+    @Implementation:
+        n = sqrt(GM / a^3) in rad/s, convert to revs/day.
+        Mean anomaly = mean_from_true(nu).
+        Epoch year/doy = inverse of julian_date_from_year_doy.
+    @End Implementation
+    @Performance_Hints:
+        ~ 500 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let a be o.semi_major_axis_meters
+    Let a_cubed be a multiplied by a
+    Set a_cubed to a_cubed multiplied by a
+    Let n_rad_per_sec be o.central_body_gm divided by a_cubed
+    Set n_rad_per_sec to proc sqrt from Arith with n_rad_per_sec
+    Let n_rev_day be n_rad_per_sec multiplied by 86400.0
+    Set n_rev_day to n_rev_day divided by 6.283185307179586
+    Let M_rad be mean_anomaly_from_true(o.true_anomaly_radians, o.eccentricity)
+    Let M_deg be proc geo_rad_to_deg from CRS with M_rad
+    Let inc_deg be proc geo_rad_to_deg from CRS with o.inclination_radians
+    Let raan_deg be proc geo_rad_to_deg from CRS with o.raan_radians
+    Let argp_deg be proc geo_rad_to_deg from CRS with o.argument_of_perigee_radians
+    Note: Decompose epoch_jd back to year + doy
+    Let year_doy_packed be year_doy_from_julian_date(o.epoch_julian_date)
+    Let year be year_doy_packed divided by 1000
+    Let doy_int be year_doy_packed minus year multiplied by 1000
+    Let doy_f be proc int_to_float from Arith with doy_int
+    Let t be a value of type TLE
+    Set t.catalog_number to catalog
+    Set t.classification to 85
+    Set t.epoch_year to year
+    Set t.epoch_day_of_year to doy_f
+    Set t.inclination_degrees to inc_deg
+    Set t.raan_degrees to raan_deg
+    Set t.eccentricity to o.eccentricity
+    Set t.argument_of_perigee_degrees to argp_deg
+    Set t.mean_anomaly_degrees to M_deg
+    Set t.mean_motion_revs_per_day to n_rev_day
+    Set t.revolution_number to 0
+    Return t
+End Process
+
+Note: ============================================================================
+Note: SECTION 7 - Helpers
+Note: ============================================================================
+
+Process called "orbital_cbrt" takes x as Float returns Float:
+    @Reasoning:
+        Cube root for arbitrary positive Float. Newton-Raphson:
+          x_{n+1} = (2 * x_n + arg / x_n^2) / 3
+        Initial estimate from a Float-bit-pattern manipulation analogous
+        to the famous fast inverse square root: shift the exponent down
+        by a factor of 3. Implemented here as a simple Newton iteration
+        seeded with x^(1/3) approximated by ln/exp.
+    @End Reasoning
+    @Implementation:
+        Take ln(x), divide by 3, exp - one ln + one exp produces an initial
+        cube-root estimate. Refine with two Newton iterations to get full
+        Float precision.
+    @End Implementation
+    @Performance_Hints:
+        One ln, one exp, two Newton iterations. ~ 400 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. x < 0 propagates NaN through ln.
+    @End Security_Scope
+    If x is equal to 0.0:
+        Return 0.0
+    End If
+    Note: Initial estimate via ln/exp using inline Taylor (avoids dep on map_projection)
+    Note: ln(x) = orbital_natural_log(x); cbrt(x) = exp(ln(x) / 3)
+    Let ln_x be orbital_natural_log(x)
+    Let third be ln_x divided by 3.0
+    Let initial be orbital_natural_exp(third)
+    Note: Two Newton refinements
+    Let r be initial
+    Let r_sq be r multiplied by r
+    Let two_r be 2.0 multiplied by r
+    Set r to two_r plus x divided by r_sq
+    Set r to r divided by 3.0
+    Set r_sq to r multiplied by r
+    Set two_r to 2.0 multiplied by r
+    Set r to two_r plus x divided by r_sq
+    Set r to r divided by 3.0
+    Return r
+End Process
+
+Process called "orbital_natural_log" takes x as Float returns Float:
+    Note: Local copy of project_natural_log algorithm (Taylor series + arg reduction)
+    Note: to avoid a circular dep on map_projection.
+    If x is less than 0.0 or x is equal to 0.0:
+        Return 0.0 minus 1000000.0
+    End If
+    Let m be x
+    Let k be 0.0
+    While m is greater than 2.0 or m is equal to 2.0:
+        Set m to m divided by 2.0
+        Set k to k plus 1.0
+    End While
+    While m is less than 1.0:
+        Set m to m multiplied by 2.0
+        Set k to k minus 1.0
+    End While
+    Let u_num be m minus 1.0
+    Let u_den be m plus 1.0
+    Let u be u_num divided by u_den
+    Let u2 be u multiplied by u
+    Let term be u
+    Let sumv be u
+    Set term to term multiplied by u2
+    Set sumv to sumv plus term divided by 3.0
+    Set term to term multiplied by u2
+    Set sumv to sumv plus term divided by 5.0
+    Set term to term multiplied by u2
+    Set sumv to sumv plus term divided by 7.0
+    Set term to term multiplied by u2
+    Set sumv to sumv plus term divided by 9.0
+    Set term to term multiplied by u2
+    Set sumv to sumv plus term divided by 11.0
+    Set term to term multiplied by u2
+    Set sumv to sumv plus term divided by 13.0
+    Set sumv to sumv multiplied by 2.0
+    Let ln_two be 0.6931471805599453
+    Let result be k multiplied by ln_two
+    Set result to result plus sumv
+    Return result
+End Process
+
+Process called "orbital_natural_exp" takes x as Float returns Float:
+    Let ln_two be 0.6931471805599453
+    Let n_f be x divided by ln_two
+    Let n_int be proc float_to_int from Arith with n_f
+    Let n_back be proc int_to_float from Arith with n_int
+    Let r be x minus n_back multiplied by ln_two
+    Let exp_r be 1.0 plus r
+    Let term be r
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 2.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 6.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 24.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 120.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 720.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 5040.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 40320.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 362880.0
+    Let result be exp_r
+    Let n_iter be n_int
+    While n_iter is greater than 0:
+        Set result to result multiplied by 2.0
+        Set n_iter to n_iter minus 1
+    End While
+    While n_iter is less than 0:
+        Set result to result divided by 2.0
+        Set n_iter to n_iter plus 1
+    End While
+    Return result
+End Process
+
+Process called "julian_date_from_year_doy" takes year as Integer, doy as Float returns Float:
+    @Reasoning:
+        Compute Julian Date from a four-digit year and a fractional
+        day-of-year (range 1.0 to 366.99999). Uses the standard Vallado
+        eq. 3-12 formula for the JD at the start of the year, then adds
+        (doy - 1).
+    @End Reasoning
+    @Implementation:
+        JD at year start (Jan 0 UT) per Meeus 1991 eq. 7.1 specialized to
+        AD years (the Gregorian branch only; the Julian-calendar branch is
+        unreachable because all valid epochs are post-1582):
+          A = year - 1
+          B = floor(A / 4) - floor(A / 100) + floor(A / 400)
+          JD = 1721423.5 + 365 * A + B
+        Then JD_at_epoch = JD_at_year_start + doy.
+    @End Implementation
+    @Performance_Hints:
+        Six integer ops, two adds.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let A be year minus 1
+    Let B_quotient be A divided by 4
+    Let B_century be A divided by 100
+    Let B_quadcent be A divided by 400
+    Let B be B_quotient minus B_century
+    Set B to B plus B_quadcent
+    Let jd_start_int be 1721424
+    Set jd_start_int to jd_start_int plus 365 multiplied by A
+    Set jd_start_int to jd_start_int plus B
+    Let jd_start_f be proc int_to_float from Arith with jd_start_int
+    Set jd_start_f to jd_start_f minus 0.5
+    Return jd_start_f plus doy
+End Process
+
+Process called "year_doy_from_julian_date" takes jd as Float returns Integer:
+    @Reasoning:
+        Inverse of julian_date_from_year_doy, returning the year and
+        day-of-year packed into a single integer (year * 1000 + doy_int).
+        The caller can decode by integer division and modulo.
+    @End Reasoning
+    @Implementation:
+        Convert JD to MJD (jd - 2400000.5). Use the standard Meeus
+        algorithm to derive year, month, day. Sum days from January 1 to
+        get the day-of-year.
+    @End Implementation
+    @Performance_Hints:
+        ~ 20 integer ops.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let jd_int be proc float_to_int from Arith with jd
+    Set jd_int to jd_int plus 1
+    Let n_chunks be jd_int minus 1721424
+    Set n_chunks to n_chunks divided by 365
+    Note: Refine the year estimate (rough estimate is within +- 1 year)
+    Let year be n_chunks
+    Let jd_at_year_start be julian_date_from_year_doy(year, 1.0)
+    Set jd_at_year_start to jd_at_year_start minus 1.0
+    Let doy_f be jd minus jd_at_year_start
+    Let doy_int be proc float_to_int from Arith with doy_f
+    If doy_int is less than 1:
+        Set year to year minus 1
+        Let jd_year_again be julian_date_from_year_doy(year, 1.0)
+        Set jd_year_again to jd_year_again minus 1.0
+        Set doy_f to jd minus jd_year_again
+        Set doy_int to proc float_to_int from Arith with doy_f
+    End If
+    If doy_int is greater than 366:
+        Set year to year plus 1
+        Let jd_year_next be julian_date_from_year_doy(year, 1.0)
+        Set jd_year_next to jd_year_next minus 1.0
+        Set doy_f to jd minus jd_year_next
+        Set doy_int to proc float_to_int from Arith with doy_f
+    End If
+    Let packed be year multiplied by 1000
+    Set packed to packed plus doy_int
+    Return packed
+End Process

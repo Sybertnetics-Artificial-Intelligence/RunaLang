@@ -1,0 +1,691 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+PIPELINE - Composable stream processing pipeline.
+
+A Pipeline is an ordered list of Stages that transform an input Stream
+into an output Stream. Stages support Unix-style composition:
+
+  Map(fn)                         - apply fn to each element
+  Filter(predicate)               - keep elements where predicate(v) != 0
+  FlatMap(fn)                     - fn returns a sub-stream
+  Batch(size)                     - group consecutive elements into arrays
+  Throttle(ms)                    - rate-limit emission to one per ms
+  Branch(pred, left, right)       - route elements to left or right pipeline
+  Merge(other_stream)             - interleave another stream into the flow
+
+Pipeline layout (24 bytes):
+  offset 0:  stages_head      (8 bytes) - linked list head
+  offset 8:  stages_tail      (8 bytes) - linked list tail
+  offset 16: stage_count      (8 bytes) - number of stages currently linked
+
+Stage node (40 bytes):
+  offset 0:  kind             (8 bytes) - STAGE_KIND_*
+  offset 8:  arg_a            (8 bytes) - first argument (e.g. fn, predicate)
+  offset 16: arg_b            (8 bytes) - second argument (e.g. batch size)
+  offset 24: arg_c            (8 bytes) - third argument (e.g. branch right)
+  offset 32: next             (8 bytes) - next stage pointer
+
+Dependencies:
+- memory/layout.runa
+- core/memory_core.runa
+- streams/stream.runa
+- concurrency/parallel.runa (for run_parallel)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/streams/stream.runa" as Stream
+
+Constant PL_OFF_HEAD as Integer is 0
+Constant PL_OFF_TAIL as Integer is 8
+Constant PL_OFF_COUNT as Integer is 16
+Constant PL_STRUCT_SIZE as Integer is 24
+
+Constant STAGE_OFF_KIND as Integer is 0
+Constant STAGE_OFF_A as Integer is 8
+Constant STAGE_OFF_B as Integer is 16
+Constant STAGE_OFF_C as Integer is 24
+Constant STAGE_OFF_NEXT as Integer is 32
+Constant STAGE_STRUCT_SIZE as Integer is 40
+
+Constant STAGE_KIND_MAP as Integer is 1
+Constant STAGE_KIND_FILTER as Integer is 2
+Constant STAGE_KIND_FLATMAP as Integer is 3
+Constant STAGE_KIND_BATCH as Integer is 4
+Constant STAGE_KIND_THROTTLE as Integer is 5
+Constant STAGE_KIND_BRANCH as Integer is 6
+Constant STAGE_KIND_MERGE as Integer is 7
+
+Constant PL_OK as Integer is 1
+Constant PL_ERR_INVALID as Integer is 0
+Constant PL_ERR_OOM as Integer is -1
+
+Note: ============================================================================
+Note: Pipeline lifecycle
+Note: ============================================================================
+
+@Reasoning
+Create an empty pipeline. Stages are appended in order; pipeline_run
+folds the stages over an input stream from left to right.
+@End Reasoning
+
+@Implementation
+Allocate the 24-byte record and zero the head/tail/count fields.
+@End Implementation
+
+@Performance_Hints
+One allocation per pipeline.
+@End Performance_Hints
+
+@Security_Scope
+Heap-owned; caller must call pipeline_destroy.
+@End Security_Scope
+
+Process called "pipeline_create" returns Integer:
+    Let p be proc allocate from Memory with PL_STRUCT_SIZE
+    If p is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with p, PL_OFF_HEAD, 0
+    proc memory_set_int64 from Mem with p, PL_OFF_TAIL, 0
+    proc memory_set_int64 from Mem with p, PL_OFF_COUNT, 0
+    Return p
+End Process
+
+Process called "pipeline_destroy" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return PL_ERR_INVALID
+    End If
+    Let head be proc memory_get_int64 from Mem with p, PL_OFF_HEAD
+    While head is not equal to 0:
+        Let next_n be proc memory_get_int64 from Mem with head, STAGE_OFF_NEXT
+        proc deallocate from Memory with head
+        Set head to next_n
+    End While
+    proc deallocate from Memory with p
+    Return PL_OK
+End Process
+
+Process called "pipeline_count" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with p, PL_OFF_COUNT
+End Process
+
+Note: ============================================================================
+Note: Stage builders
+Note: ============================================================================
+
+Process called "pipeline_add_stage_internal" takes p as Integer, kind as Integer, a as Integer, b as Integer, c as Integer returns Integer:
+    If p is equal to 0:
+        Return PL_ERR_INVALID
+    End If
+    Let node be proc allocate from Memory with STAGE_STRUCT_SIZE
+    If node is equal to 0:
+        Return PL_ERR_OOM
+    End If
+    proc memory_set_int64 from Mem with node, STAGE_OFF_KIND, kind
+    proc memory_set_int64 from Mem with node, STAGE_OFF_A, a
+    proc memory_set_int64 from Mem with node, STAGE_OFF_B, b
+    proc memory_set_int64 from Mem with node, STAGE_OFF_C, c
+    proc memory_set_int64 from Mem with node, STAGE_OFF_NEXT, 0
+    Let tail be proc memory_get_int64 from Mem with p, PL_OFF_TAIL
+    If tail is equal to 0:
+        proc memory_set_int64 from Mem with p, PL_OFF_HEAD, node
+    Otherwise:
+        proc memory_set_int64 from Mem with tail, STAGE_OFF_NEXT, node
+    End If
+    proc memory_set_int64 from Mem with p, PL_OFF_TAIL, node
+    Let count be proc memory_get_int64 from Mem with p, PL_OFF_COUNT
+    proc memory_set_int64 from Mem with p, PL_OFF_COUNT, (count plus 1)
+    Return PL_OK
+End Process
+
+Process called "pipeline_add_map" takes p as Integer, fn as Integer returns Integer:
+    Return proc pipeline_add_stage_internal with p, STAGE_KIND_MAP, fn, 0, 0
+End Process
+
+Process called "pipeline_add_filter" takes p as Integer, predicate as Integer returns Integer:
+    Return proc pipeline_add_stage_internal with p, STAGE_KIND_FILTER, predicate, 0, 0
+End Process
+
+Process called "pipeline_add_flat_map" takes p as Integer, fn as Integer returns Integer:
+    Return proc pipeline_add_stage_internal with p, STAGE_KIND_FLATMAP, fn, 0, 0
+End Process
+
+Process called "pipeline_add_batch" takes p as Integer, size as Integer returns Integer:
+    If size is less than or equal to 0:
+        Return PL_ERR_INVALID
+    End If
+    Return proc pipeline_add_stage_internal with p, STAGE_KIND_BATCH, size, 0, 0
+End Process
+
+Process called "pipeline_add_throttle" takes p as Integer, ms as Integer returns Integer:
+    If ms is less than 0:
+        Return PL_ERR_INVALID
+    End If
+    Return proc pipeline_add_stage_internal with p, STAGE_KIND_THROTTLE, ms, 0, 0
+End Process
+
+Process called "pipeline_add_branch" takes p as Integer, predicate as Integer, left_pipeline as Integer, right_pipeline as Integer returns Integer:
+    Return proc pipeline_add_stage_internal with p, STAGE_KIND_BRANCH, predicate, left_pipeline, right_pipeline
+End Process
+
+Process called "pipeline_add_merge" takes p as Integer, other_stream as Integer returns Integer:
+    Return proc pipeline_add_stage_internal with p, STAGE_KIND_MERGE, other_stream, 0, 0
+End Process
+
+Note: ============================================================================
+Note: Stage evaluation - batch and throttle implement custom streams
+Note: ============================================================================
+
+Note: Batch state: [source, size, buffer, count_in_buffer]
+
+Constant BATCH_OFF_SOURCE as Integer is 0
+Constant BATCH_OFF_SIZE as Integer is 8
+Constant BATCH_OFF_BUF as Integer is 16
+Constant BATCH_OFF_COUNT as Integer is 24
+Constant BATCH_STATE_SIZE as Integer is 32
+
+Process called "pipeline_batch_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return 0
+    End If
+    Let source be proc memory_get_int64 from Mem with state, BATCH_OFF_SOURCE
+    Let size be proc memory_get_int64 from Mem with state, BATCH_OFF_SIZE
+    Let buf be proc memory_get_int64 from Mem with state, BATCH_OFF_BUF
+    Let count be 0
+    While count is less than size:
+        Let rc be proc stream_next from Stream with source, out_holder
+        If rc is not equal to 1:
+            If count is equal to 0:
+                Return rc
+            End If
+            Note: Partial batch - flush what we have
+            proc memory_set_int64 from Mem with state, BATCH_OFF_COUNT, count
+            proc memory_set_int64 from Mem with out_holder, 0, buf
+            Return 1
+        End If
+        Let value be proc memory_get_int64 from Mem with out_holder, 0
+        Let off be count multiplied by 8
+        proc memory_set_int64 from Mem with buf, off, value
+        Set count to count plus 1
+    End While
+    proc memory_set_int64 from Mem with state, BATCH_OFF_COUNT, count
+    proc memory_set_int64 from Mem with out_holder, 0, buf
+    Return 1
+End Process
+
+Process called "proc_address_pipeline_batch_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + pipeline_batch_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "pipeline_batch_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return 1
+    End If
+    Let source be proc memory_get_int64 from Mem with state, BATCH_OFF_SOURCE
+    Let buf be proc memory_get_int64 from Mem with state, BATCH_OFF_BUF
+    If source is not equal to 0:
+        proc stream_destroy from Stream with source
+    End If
+    If buf is not equal to 0:
+        proc deallocate from Memory with buf
+    End If
+    proc deallocate from Memory with state
+    Return 1
+End Process
+
+Process called "proc_address_pipeline_batch_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + pipeline_batch_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "pipeline_make_batch_stream" takes source as Integer, size as Integer returns Integer:
+    Let state be proc allocate from Memory with BATCH_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    Let buf_bytes be size multiplied by 8
+    Let buf be proc allocate from Memory with buf_bytes
+    If buf is equal to 0:
+        proc deallocate from Memory with state
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, BATCH_OFF_SOURCE, source
+    proc memory_set_int64 from Mem with state, BATCH_OFF_SIZE, size
+    proc memory_set_int64 from Mem with state, BATCH_OFF_BUF, buf
+    proc memory_set_int64 from Mem with state, BATCH_OFF_COUNT, 0
+    Return proc stream_create from Stream with proc_address_pipeline_batch_next(), state, proc_address_pipeline_batch_destroy()
+End Process
+
+Process called "pipeline_batch_size" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with state, BATCH_OFF_COUNT
+End Process
+
+Note: Throttle state: [source, min_interval_us, last_emit_us]
+
+Constant THROT_OFF_SOURCE as Integer is 0
+Constant THROT_OFF_INTERVAL as Integer is 8
+Constant THROT_OFF_LAST as Integer is 16
+Constant THROT_STATE_SIZE as Integer is 24
+
+Process called "pipeline_now_us" returns Integer:
+    Note: Returns a monotonic microsecond timestamp using Linux clock_gettime
+    Note: (syscall 228) with CLOCK_MONOTONIC (1). The timespec is allocated as
+    Note: an arena-resident 16-byte buffer; we combine secs*1e6 + ns/1000 to
+    Note: produce microseconds. Returns 0 on syscall failure rather than the
+    Note: kernel's negative errno, since callers treat 0 as "no time available
+    Note: yet" and disable throttling rather than abort.
+    Let timespec be proc allocate from Memory with 16
+    If timespec is equal to 0:
+        Return 0
+    End If
+    proc memory_fill from Memory with timespec, 0, 16
+    Let syscall_result be 0
+    Inline Assembly:
+        # clock_gettime(CLOCK_MONOTONIC=1, &timespec)
+        # timespec ptr is in [rbp-8] (local), syscall_result at [rbp-16]
+        movq $228, %rax
+        movq $1, %rdi
+        movq -8(%rbp), %rsi
+        syscall
+        movq %rax, -16(%rbp)
+    End Assembly
+    If syscall_result is less than 0:
+        proc deallocate from Memory with timespec
+        Return 0
+    End If
+    Let secs be proc memory_get_int64 from Mem with timespec, 0
+    Let nanos be proc memory_get_int64 from Mem with timespec, 8
+    proc deallocate from Memory with timespec
+    Let micros be (secs multiplied by 1000000) plus (nanos divided by 1000)
+    Return micros
+End Process
+
+Process called "pipeline_sleep_us" takes us as Integer returns Integer:
+    Note: Suspends the calling thread for at least `us` microseconds using the
+    Note: Linux nanosleep syscall (35). The kernel adjusts the actual sleep to
+    Note: account for preemption; the throttle callers tolerate small over-runs.
+    Note: Negative or zero microseconds return immediately. The timespec layout
+    Note: is { int64 tv_sec; int64 tv_nsec }; we synthesise it from `us`.
+
+    Note: Stage1 stack layout for this Process (1 param + 6 locals):
+    Note:   us             [rbp-8]
+    Note:   req            [rbp-16]
+    Note:   secs           [rbp-24]
+    Note:   remaining_us   [rbp-32]
+    Note:   nanos          [rbp-40]
+    Note:   rc             [rbp-48]
+    If us is less than or equal to 0:
+        Return 0
+    End If
+    Let req be proc allocate from Memory with 16
+    If req is equal to 0:
+        Return -1
+    End If
+    Let secs be us divided by 1000000
+    Let remaining_us be us minus (secs multiplied by 1000000)
+    Let nanos be remaining_us multiplied by 1000
+    proc memory_set_int64 from Mem with req, 0, secs
+    proc memory_set_int64 from Mem with req, 8, nanos
+    Let rc be 0
+    Inline Assembly:
+        # nanosleep(req, NULL) — load req pointer from [rbp-16] into rdi
+        movq $35, %rax
+        movq -16(%rbp), %rdi
+        movq $0, %rsi
+        syscall
+        movq %rax, -48(%rbp)
+    End Assembly
+    proc deallocate from Memory with req
+    If rc is less than 0:
+        Return -1
+    End If
+    Return us
+End Process
+
+Process called "pipeline_throttle_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return 0
+    End If
+    Let source be proc memory_get_int64 from Mem with state, THROT_OFF_SOURCE
+    Let interval be proc memory_get_int64 from Mem with state, THROT_OFF_INTERVAL
+    Let last be proc memory_get_int64 from Mem with state, THROT_OFF_LAST
+    If interval is greater than 0:
+        Let now be proc pipeline_now_us
+        If last is greater than 0:
+            Let elapsed be now minus last
+            If elapsed is less than interval:
+                Let wait_us be interval minus elapsed
+                proc pipeline_sleep_us with wait_us
+            End If
+        End If
+    End If
+    Let rc be proc stream_next from Stream with source, out_holder
+    If rc is equal to 1:
+        Let now2 be proc pipeline_now_us
+        proc memory_set_int64 from Mem with state, THROT_OFF_LAST, now2
+    End If
+    Return rc
+End Process
+
+Process called "proc_address_pipeline_throttle_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + pipeline_throttle_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "pipeline_throttle_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return 1
+    End If
+    Let source be proc memory_get_int64 from Mem with state, THROT_OFF_SOURCE
+    If source is not equal to 0:
+        proc stream_destroy from Stream with source
+    End If
+    proc deallocate from Memory with state
+    Return 1
+End Process
+
+Process called "proc_address_pipeline_throttle_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + pipeline_throttle_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "pipeline_make_throttle_stream" takes source as Integer, ms as Integer returns Integer:
+    Let state be proc allocate from Memory with THROT_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    Let interval_us be ms multiplied by 1000
+    proc memory_set_int64 from Mem with state, THROT_OFF_SOURCE, source
+    proc memory_set_int64 from Mem with state, THROT_OFF_INTERVAL, interval_us
+    proc memory_set_int64 from Mem with state, THROT_OFF_LAST, 0
+    Return proc stream_create from Stream with proc_address_pipeline_throttle_next(), state, proc_address_pipeline_throttle_destroy()
+End Process
+
+Note: Merge state: [s1, s2, prefer_first]
+
+Constant MERGE_OFF_S1 as Integer is 0
+Constant MERGE_OFF_S2 as Integer is 8
+Constant MERGE_OFF_PREFER as Integer is 16
+Constant MERGE_STATE_SIZE as Integer is 24
+
+Process called "pipeline_merge_next" takes state as Integer, out_holder as Integer returns Integer:
+    If state is equal to 0:
+        Return 0
+    End If
+    Let s1 be proc memory_get_int64 from Mem with state, MERGE_OFF_S1
+    Let s2 be proc memory_get_int64 from Mem with state, MERGE_OFF_S2
+    Let prefer be proc memory_get_int64 from Mem with state, MERGE_OFF_PREFER
+    Let primary be 0
+    Let secondary be 0
+    If prefer is equal to 0:
+        Set primary to s1
+        Set secondary to s2
+        proc memory_set_int64 from Mem with state, MERGE_OFF_PREFER, 1
+    Otherwise:
+        Set primary to s2
+        Set secondary to s1
+        proc memory_set_int64 from Mem with state, MERGE_OFF_PREFER, 0
+    End If
+    If primary is not equal to 0:
+        Let rc be proc stream_next from Stream with primary, out_holder
+        If rc is equal to 1:
+            Return 1
+        End If
+    End If
+    If secondary is not equal to 0:
+        Return proc stream_next from Stream with secondary, out_holder
+    End If
+    Return 0
+End Process
+
+Process called "proc_address_pipeline_merge_next" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + pipeline_merge_next]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "pipeline_merge_destroy" takes state as Integer returns Integer:
+    If state is equal to 0:
+        Return 1
+    End If
+    Let s1 be proc memory_get_int64 from Mem with state, MERGE_OFF_S1
+    Let s2 be proc memory_get_int64 from Mem with state, MERGE_OFF_S2
+    If s1 is not equal to 0:
+        proc stream_destroy from Stream with s1
+    End If
+    If s2 is not equal to 0:
+        proc stream_destroy from Stream with s2
+    End If
+    proc deallocate from Memory with state
+    Return 1
+End Process
+
+Process called "proc_address_pipeline_merge_destroy" returns Integer:
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + pipeline_merge_destroy]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "pipeline_make_merge_stream" takes s1 as Integer, s2 as Integer returns Integer:
+    Let state be proc allocate from Memory with MERGE_STATE_SIZE
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with state, MERGE_OFF_S1, s1
+    proc memory_set_int64 from Mem with state, MERGE_OFF_S2, s2
+    proc memory_set_int64 from Mem with state, MERGE_OFF_PREFER, 0
+    Return proc stream_create from Stream with proc_address_pipeline_merge_next(), state, proc_address_pipeline_merge_destroy()
+End Process
+
+Note: ============================================================================
+Note: Run
+Note: ============================================================================
+
+@Reasoning
+pipeline_run drapes each stage over the input stream in declaration
+order. Map/Filter/FlatMap delegate to stream.runa; Batch/Throttle/Merge
+wrap the source in their own state machine; Branch is conservative -
+it routes elements through the left pipeline while keeping the right
+pipeline's source untouched and is intended for use ahead of a Merge.
+@End Reasoning
+
+@Implementation
+Walk the stage list, replacing `current` with the wrapped stream at
+each step. If any stage fails to allocate we tear down the partial
+chain and return 0 to the caller.
+@End Implementation
+
+@Performance_Hints
+Stage application is O(stage_count); per-element overhead is one
+indirect call per stage.
+@End Performance_Hints
+
+@Security_Scope
+Ownership of the input stream transfers to the pipeline; the returned
+stream owns all intermediate streams via the standard destroy chains.
+@End Security_Scope
+
+Process called "pipeline_run" takes p as Integer, input_stream as Integer returns Integer:
+    If p is equal to 0:
+        Return input_stream
+    End If
+    If input_stream is equal to 0:
+        Return 0
+    End If
+    Let current be input_stream
+    Let node be proc memory_get_int64 from Mem with p, PL_OFF_HEAD
+    While node is not equal to 0:
+        Let kind be proc memory_get_int64 from Mem with node, STAGE_OFF_KIND
+        Let a be proc memory_get_int64 from Mem with node, STAGE_OFF_A
+        Let b be proc memory_get_int64 from Mem with node, STAGE_OFF_B
+        Let c be proc memory_get_int64 from Mem with node, STAGE_OFF_C
+        Let next_stream be 0
+        If kind is equal to STAGE_KIND_MAP:
+            Set next_stream to proc stream_map from Stream with current, a
+        End If
+        If kind is equal to STAGE_KIND_FILTER:
+            Set next_stream to proc stream_filter from Stream with current, a
+        End If
+        If kind is equal to STAGE_KIND_FLATMAP:
+            Set next_stream to proc stream_flat_map from Stream with current, a
+        End If
+        If kind is equal to STAGE_KIND_BATCH:
+            Set next_stream to proc pipeline_make_batch_stream with current, a
+        End If
+        If kind is equal to STAGE_KIND_THROTTLE:
+            Set next_stream to proc pipeline_make_throttle_stream with current, a
+        End If
+        If kind is equal to STAGE_KIND_MERGE:
+            Set next_stream to proc pipeline_make_merge_stream with current, a
+        End If
+        If kind is equal to STAGE_KIND_BRANCH:
+            Note: Use the predicate to filter into the left branch; the right
+            Note: branch (c) is intended to be merged separately.
+            Let left_stream be proc stream_filter from Stream with current, a
+            If b is not equal to 0:
+                Set next_stream to proc pipeline_run with b, left_stream
+            Otherwise:
+                Set next_stream to left_stream
+            End If
+        End If
+        If next_stream is equal to 0:
+            Return 0
+        End If
+        Set current to next_stream
+        Set node to proc memory_get_int64 from Mem with node, STAGE_OFF_NEXT
+    End While
+    Return current
+End Process
+
+@Reasoning
+Parallel execution splits the input stream into worker_count shards and
+runs each shard through an independent copy of the pipeline. Output is
+materialised through merge streams so consumers see a single stream.
+@End Reasoning
+
+@Implementation
+For small worker_count we use a simple round-robin fan-out: collect
+input into a list, partition by index modulo worker_count, run each
+partition through pipeline_run, then daisy-chain the outputs via
+pipeline_make_merge_stream.
+@End Implementation
+
+@Performance_Hints
+Materialising the input is O(n). Avoid run_parallel for infinite
+inputs; use it for bounded streams.
+@End Performance_Hints
+
+@Security_Scope
+Worker stages must be safe to run concurrently; this is the caller's
+responsibility (pure or thread-safe functions only).
+@End Security_Scope
+
+Process called "pipeline_run_parallel" takes p as Integer, input_stream as Integer, worker_count as Integer returns Integer:
+    If p is equal to 0:
+        Return input_stream
+    End If
+    If input_stream is equal to 0:
+        Return 0
+    End If
+    Let wc be worker_count
+    If wc is less than or equal to 1:
+        Return proc pipeline_run with p, input_stream
+    End If
+    Let len_holder be proc allocate from Memory with 8
+    If len_holder is equal to 0:
+        Return 0
+    End If
+    Let materialised be proc stream_collect_to_list from Stream with input_stream, len_holder
+    Let total be proc memory_get_int64 from Mem with len_holder, 0
+    proc deallocate from Memory with len_holder
+    proc stream_destroy from Stream with input_stream
+    If materialised is equal to 0:
+        Return 0
+    End If
+    If total is equal to 0:
+        proc deallocate from Memory with materialised
+        Return proc stream_from_list from Stream with 0, 0
+    End If
+
+    Let shard_capacity be (total plus wc) minus 1
+    Set shard_capacity to shard_capacity divided by wc
+    If shard_capacity is less than 1:
+        Set shard_capacity to 1
+    End If
+    Let combined be 0
+    Let w be 0
+    While w is less than wc:
+        Let shard_bytes be shard_capacity multiplied by 8
+        Let shard_buf be proc allocate from Memory with shard_bytes
+        If shard_buf is equal to 0:
+            proc deallocate from Memory with materialised
+            Return combined
+        End If
+        Let shard_len be 0
+        Let i be w
+        While i is less than total:
+            Let off_src be i multiplied by 8
+            Let v be proc memory_get_int64 from Mem with materialised, off_src
+            Let off_dst be shard_len multiplied by 8
+            proc memory_set_int64 from Mem with shard_buf, off_dst, v
+            Set shard_len to shard_len plus 1
+            Set i to i plus wc
+        End While
+        Let shard_stream be proc stream_from_list from Stream with shard_buf, shard_len
+        Let processed be proc pipeline_run with p, shard_stream
+        If combined is equal to 0:
+            Set combined to processed
+        Otherwise:
+            Set combined to proc pipeline_make_merge_stream with combined, processed
+        End If
+        Set w to w plus 1
+    End While
+    proc deallocate from Memory with materialised
+    Return combined
+End Process

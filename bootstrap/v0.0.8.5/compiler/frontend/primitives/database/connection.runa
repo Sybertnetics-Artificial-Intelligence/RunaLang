@@ -1,0 +1,713 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+DATABASE CONNECTION - Generic connection abstraction.
+
+The Connection abstracts over Postgres, MySQL, SQLite and any KV
+backend that implements the four-function driver protocol described
+below. Connections are opened with a ConnectionConfig, transition
+through a small state machine (DISCONNECTED -> CONNECTED -> ...),
+and dispatch to the underlying driver via Process pointers stored in
+the ConnectionConfig.
+
+Driver protocol (each Process is invoked with the connection handle
+plus the operation-specific arguments):
+
+  connect(config_ptr) -> Integer handle      // non-zero on success
+  close(handle) -> Integer
+  execute(handle, sql_ptr, sql_len, params_ptr, param_count) -> Integer rows_affected
+  query(handle, sql_ptr, sql_len, params_ptr, param_count) -> Integer result_set_ptr
+  prepare(handle, sql_ptr, sql_len) -> Integer statement_ptr
+  begin(handle, isolation_level) -> Integer
+  commit(handle) -> Integer
+  rollback(handle) -> Integer
+
+ConnectionConfig layout (96 bytes):
+  offset 0:  driver_kind      (8 bytes) - DRIVER_KIND_* constant
+  offset 8:  host             (8 bytes) - string pointer or 0
+  offset 16: port             (8 bytes)
+  offset 24: database         (8 bytes) - string pointer
+  offset 32: user             (8 bytes) - string pointer
+  offset 40: password         (8 bytes) - string pointer
+  offset 48: connect_fn       (8 bytes) - driver entry point
+  offset 56: close_fn         (8 bytes)
+  offset 64: execute_fn       (8 bytes)
+  offset 72: query_fn         (8 bytes)
+  offset 80: prepare_fn       (8 bytes)
+  offset 88: begin_fn         (8 bytes)
+
+Connection layout (80 bytes):
+  offset 0:  config_ptr       (8 bytes)
+  offset 8:  state            (8 bytes) - CONN_STATE_*
+  offset 16: driver_handle    (8 bytes)
+  offset 24: last_error       (8 bytes)
+  offset 32: mutex_ptr        (8 bytes)
+  offset 40: commit_fn        (8 bytes)
+  offset 48: rollback_fn      (8 bytes)
+  offset 56: in_transaction   (8 bytes)
+  offset 64: prepare_fn_cache (8 bytes)
+  offset 72: options_ptr      (8 bytes) - opaque driver options block
+
+PreparedStatement layout (40 bytes):
+  offset 0:  connection_ptr   (8 bytes)
+  offset 8:  driver_handle    (8 bytes)
+  offset 16: param_count      (8 bytes)
+  offset 24: query_fn         (8 bytes)
+  offset 32: execute_fn       (8 bytes)
+
+Dependencies:
+- threading/sync_core.runa
+- memory/layout.runa
+- core/memory_core.runa
+:End Note
+
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant CFG_OFF_DRIVER as Integer is 0
+Constant CFG_OFF_HOST as Integer is 8
+Constant CFG_OFF_PORT as Integer is 16
+Constant CFG_OFF_DATABASE as Integer is 24
+Constant CFG_OFF_USER as Integer is 32
+Constant CFG_OFF_PASSWORD as Integer is 40
+Constant CFG_OFF_CONNECT as Integer is 48
+Constant CFG_OFF_CLOSE as Integer is 56
+Constant CFG_OFF_EXECUTE as Integer is 64
+Constant CFG_OFF_QUERY as Integer is 72
+Constant CFG_OFF_PREPARE as Integer is 80
+Constant CFG_OFF_BEGIN as Integer is 88
+Constant CFG_STRUCT_SIZE as Integer is 96
+
+Constant CONN_OFF_CONFIG as Integer is 0
+Constant CONN_OFF_STATE as Integer is 8
+Constant CONN_OFF_HANDLE as Integer is 16
+Constant CONN_OFF_LAST_ERR as Integer is 24
+Constant CONN_OFF_MUTEX as Integer is 32
+Constant CONN_OFF_COMMIT as Integer is 40
+Constant CONN_OFF_ROLLBACK as Integer is 48
+Constant CONN_OFF_IN_TX as Integer is 56
+Constant CONN_OFF_PREPARE as Integer is 64
+Constant CONN_OFF_OPTIONS as Integer is 72
+Constant CONN_STRUCT_SIZE as Integer is 80
+
+Constant STMT_OFF_CONN as Integer is 0
+Constant STMT_OFF_HANDLE as Integer is 8
+Constant STMT_OFF_PARAM_COUNT as Integer is 16
+Constant STMT_OFF_QUERY as Integer is 24
+Constant STMT_OFF_EXECUTE as Integer is 32
+Constant STMT_STRUCT_SIZE as Integer is 40
+
+Constant DRIVER_KIND_POSTGRES as Integer is 1
+Constant DRIVER_KIND_MYSQL as Integer is 2
+Constant DRIVER_KIND_SQLITE as Integer is 3
+Constant DRIVER_KIND_KV as Integer is 4
+
+Constant CONN_STATE_DISCONNECTED as Integer is 0
+Constant CONN_STATE_CONNECTED as Integer is 1
+Constant CONN_STATE_IN_TRANSACTION as Integer is 2
+Constant CONN_STATE_CLOSED as Integer is 3
+
+Constant DB_OK as Integer is 1
+Constant DB_ERR_INVALID as Integer is 0
+Constant DB_ERR_DRIVER as Integer is -1
+Constant DB_ERR_STATE as Integer is -2
+Constant DB_ERR_OOM as Integer is -3
+
+Note: ============================================================================
+Note: Indirect-call shims — real x86_64 indirect dispatch via inline assembly.
+Note: The function pointer (parameter 0) is moved into rax, the remaining
+Note: parameters are reloaded into the System V argument registers, and
+Note: `call rax` performs the indirect branch. The callee returns its value
+Note: in rax per the ABI; we store that into the result local's stack slot
+Note: so the Return statement's epilogue reads the correct value.
+Note: ============================================================================
+
+Process called "db_runtime_call_indirect_1" takes fn as Integer, a as Integer returns Integer:
+    Note: fn at [rbp-8], a at [rbp-16], result at [rbp-24].
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        mov rax, qword ptr [rbp-8]
+        mov rdi, qword ptr [rbp-16]
+        call rax
+        mov qword ptr [rbp-24], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "db_runtime_call_indirect_2" takes fn as Integer, a as Integer, b as Integer returns Integer:
+    Note: fn at [rbp-8], a at [rbp-16], b at [rbp-24], result at [rbp-32].
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        mov rax, qword ptr [rbp-8]
+        mov rdi, qword ptr [rbp-16]
+        mov rsi, qword ptr [rbp-24]
+        call rax
+        mov qword ptr [rbp-32], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "db_runtime_call_indirect_3" takes fn as Integer, a as Integer, b as Integer, c as Integer returns Integer:
+    Note: fn at [rbp-8], a..c at [rbp-16..-32], result at [rbp-40].
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        mov rax, qword ptr [rbp-8]
+        mov rdi, qword ptr [rbp-16]
+        mov rsi, qword ptr [rbp-24]
+        mov rdx, qword ptr [rbp-32]
+        call rax
+        mov qword ptr [rbp-40], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "db_runtime_call_indirect_5" takes fn as Integer, a as Integer, b as Integer, c as Integer, d as Integer, e as Integer returns Integer:
+    Note: fn at [rbp-8], a..e at [rbp-16..-48], result at [rbp-56].
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        mov rax, qword ptr [rbp-8]
+        mov rdi, qword ptr [rbp-16]
+        mov rsi, qword ptr [rbp-24]
+        mov rdx, qword ptr [rbp-32]
+        mov rcx, qword ptr [rbp-40]
+        mov r8,  qword ptr [rbp-48]
+        call rax
+        mov qword ptr [rbp-56], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Note: ============================================================================
+Note: ConnectionConfig
+Note: ============================================================================
+
+@Reasoning
+Build a ConnectionConfig in one allocation. The driver callback table
+is wired in by the caller (driver libraries register their entry
+points before opening the connection).
+@End Reasoning
+
+@Implementation
+Allocate 96 bytes, populate fields. All string pointers are borrowed -
+caller owns the lifetime.
+@End Implementation
+
+@Performance_Hints
+A single allocation.
+@End Performance_Hints
+
+@Security_Scope
+Passwords are stored as borrowed pointers; the caller decides whether
+to scrub the source string.
+@End Security_Scope
+
+Process called "config_create" takes driver_kind as Integer returns Integer:
+    Let cfg be proc allocate from Memory with CFG_STRUCT_SIZE
+    If cfg is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_DRIVER, driver_kind
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_HOST, 0
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_PORT, 0
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_DATABASE, 0
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_USER, 0
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_PASSWORD, 0
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_CONNECT, 0
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_CLOSE, 0
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_EXECUTE, 0
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_QUERY, 0
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_PREPARE, 0
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_BEGIN, 0
+    Return cfg
+End Process
+
+Process called "config_destroy" takes cfg as Integer returns Integer:
+    If cfg is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    proc deallocate from Memory with cfg
+    Return DB_OK
+End Process
+
+Process called "config_set_endpoint" takes cfg as Integer, host as Integer, port as Integer returns Integer:
+    If cfg is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_HOST, host
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_PORT, port
+    Return DB_OK
+End Process
+
+Process called "config_set_credentials" takes cfg as Integer, user as Integer, password as Integer returns Integer:
+    If cfg is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_USER, user
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_PASSWORD, password
+    Return DB_OK
+End Process
+
+Process called "config_set_database" takes cfg as Integer, database as Integer returns Integer:
+    If cfg is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_DATABASE, database
+    Return DB_OK
+End Process
+
+Process called "config_set_driver_callbacks" takes cfg as Integer, connect_fn as Integer, close_fn as Integer, execute_fn as Integer, query_fn as Integer returns Integer:
+    If cfg is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_CONNECT, connect_fn
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_CLOSE, close_fn
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_EXECUTE, execute_fn
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_QUERY, query_fn
+    Return DB_OK
+End Process
+
+Process called "config_set_prepare_callback" takes cfg as Integer, prepare_fn as Integer returns Integer:
+    If cfg is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_PREPARE, prepare_fn
+    Return DB_OK
+End Process
+
+Process called "config_set_begin_callback" takes cfg as Integer, begin_fn as Integer returns Integer:
+    If cfg is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with cfg, CFG_OFF_BEGIN, begin_fn
+    Return DB_OK
+End Process
+
+Process called "config_driver_kind" takes cfg as Integer returns Integer:
+    If cfg is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with cfg, CFG_OFF_DRIVER
+End Process
+
+Note: ============================================================================
+Note: Connection lifecycle
+Note: ============================================================================
+
+@Reasoning
+connection_open binds a configuration to a live driver handle. It
+invokes the driver-provided connect callback and stores the returned
+handle; the connection enters CONNECTED state once the callback
+succeeds.
+@End Reasoning
+
+@Implementation
+Allocate the 80-byte connection record, create the guarding mutex,
+copy the commit/rollback/prepare callbacks from the config, then call
+connect via the indirect-call shim. On failure deallocate and surface
+DB_ERR_DRIVER.
+@End Implementation
+
+@Performance_Hints
+One allocation + one mutex_create + one driver call.
+@End Performance_Hints
+
+@Security_Scope
+The driver handle returned by the callback is opaque; we never inspect
+it. Callers must serialise concurrent access through connection_lock.
+@End Security_Scope
+
+Process called "connection_open" takes cfg as Integer returns Integer:
+    If cfg is equal to 0:
+        Return 0
+    End If
+    Let connect_fn be proc memory_get_int64 from Mem with cfg, CFG_OFF_CONNECT
+    If connect_fn is equal to 0:
+        Return 0
+    End If
+    Let c be proc allocate from Memory with CONN_STRUCT_SIZE
+    If c is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc mutex_create from Sync
+    If mtx is equal to 0:
+        proc deallocate from Memory with c
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with c, CONN_OFF_CONFIG, cfg
+    proc memory_set_int64 from Mem with c, CONN_OFF_STATE, CONN_STATE_DISCONNECTED
+    proc memory_set_int64 from Mem with c, CONN_OFF_HANDLE, 0
+    proc memory_set_int64 from Mem with c, CONN_OFF_LAST_ERR, 0
+    proc memory_set_int64 from Mem with c, CONN_OFF_MUTEX, mtx
+    proc memory_set_int64 from Mem with c, CONN_OFF_COMMIT, 0
+    proc memory_set_int64 from Mem with c, CONN_OFF_ROLLBACK, 0
+    proc memory_set_int64 from Mem with c, CONN_OFF_IN_TX, 0
+    Let prep_fn be proc memory_get_int64 from Mem with cfg, CFG_OFF_PREPARE
+    proc memory_set_int64 from Mem with c, CONN_OFF_PREPARE, prep_fn
+    proc memory_set_int64 from Mem with c, CONN_OFF_OPTIONS, 0
+
+    Let handle be proc db_runtime_call_indirect_1 with connect_fn, cfg
+    If handle is equal to 0:
+        proc mutex_destroy from Sync with mtx
+        proc deallocate from Memory with c
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with c, CONN_OFF_HANDLE, handle
+    proc memory_set_int64 from Mem with c, CONN_OFF_STATE, CONN_STATE_CONNECTED
+    Return c
+End Process
+
+Process called "connection_close" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with c, CONN_OFF_STATE
+    If state is equal to CONN_STATE_CLOSED:
+        Return DB_OK
+    End If
+    Let cfg be proc memory_get_int64 from Mem with c, CONN_OFF_CONFIG
+    Let close_fn be proc memory_get_int64 from Mem with cfg, CFG_OFF_CLOSE
+    Let handle be proc memory_get_int64 from Mem with c, CONN_OFF_HANDLE
+    If close_fn is not equal to 0:
+        proc db_runtime_call_indirect_1 with close_fn, handle
+    End If
+    proc memory_set_int64 from Mem with c, CONN_OFF_STATE, CONN_STATE_CLOSED
+    proc memory_set_int64 from Mem with c, CONN_OFF_HANDLE, 0
+    Let mtx be proc memory_get_int64 from Mem with c, CONN_OFF_MUTEX
+    If mtx is not equal to 0:
+        proc mutex_destroy from Sync with mtx
+    End If
+    proc deallocate from Memory with c
+    Return DB_OK
+End Process
+
+Process called "connection_state" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return CONN_STATE_CLOSED
+    End If
+    Return proc memory_get_int64 from Mem with c, CONN_OFF_STATE
+End Process
+
+Process called "connection_is_open" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let state be proc memory_get_int64 from Mem with c, CONN_OFF_STATE
+    If state is equal to CONN_STATE_CONNECTED:
+        Return 1
+    End If
+    If state is equal to CONN_STATE_IN_TRANSACTION:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "connection_last_error" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with c, CONN_OFF_LAST_ERR
+End Process
+
+Process called "connection_handle" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with c, CONN_OFF_HANDLE
+End Process
+
+Process called "connection_lock" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with c, CONN_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Return DB_OK
+End Process
+
+Process called "connection_unlock" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with c, CONN_OFF_MUTEX
+    proc mutex_unlock from Sync with mtx
+    Return DB_OK
+End Process
+
+Note: ============================================================================
+Note: Statement execution
+Note: ============================================================================
+
+@Reasoning
+execute dispatches a DDL/DML statement that returns a rows-affected
+count. The driver receives connection handle, SQL bytes/length, and
+parameter array.
+@End Reasoning
+
+@Implementation
+Validate state, fetch the execute callback, dispatch through the
+5-arg indirect shim. Negative return values are propagated as
+DB_ERR_DRIVER.
+@End Implementation
+
+@Performance_Hints
+One indirect call per statement.
+@End Performance_Hints
+
+@Security_Scope
+sql and params are borrowed pointers.
+@End Security_Scope
+
+Process called "connection_execute" takes c as Integer, sql as Integer, sql_len as Integer, params as Integer, param_count as Integer returns Integer:
+    If c is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    If proc connection_is_open with c is equal to 0:
+        Return DB_ERR_STATE
+    End If
+    Let cfg be proc memory_get_int64 from Mem with c, CONN_OFF_CONFIG
+    Let exec_fn be proc memory_get_int64 from Mem with cfg, CFG_OFF_EXECUTE
+    If exec_fn is equal to 0:
+        Return DB_ERR_DRIVER
+    End If
+    Let handle be proc memory_get_int64 from Mem with c, CONN_OFF_HANDLE
+    Let rc be proc db_runtime_call_indirect_5 with exec_fn, handle, sql, sql_len, params, param_count
+    If rc is less than 0:
+        proc memory_set_int64 from Mem with c, CONN_OFF_LAST_ERR, rc
+    End If
+    Return rc
+End Process
+
+Process called "connection_query" takes c as Integer, sql as Integer, sql_len as Integer, params as Integer, param_count as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    If proc connection_is_open with c is equal to 0:
+        Return 0
+    End If
+    Let cfg be proc memory_get_int64 from Mem with c, CONN_OFF_CONFIG
+    Let query_fn be proc memory_get_int64 from Mem with cfg, CFG_OFF_QUERY
+    If query_fn is equal to 0:
+        Return 0
+    End If
+    Let handle be proc memory_get_int64 from Mem with c, CONN_OFF_HANDLE
+    Let rs be proc db_runtime_call_indirect_5 with query_fn, handle, sql, sql_len, params, param_count
+    Return rs
+End Process
+
+@Reasoning
+prepare returns a PreparedStatement handle that caches the driver-level
+plan and remembers param_count so callers can validate bound arguments
+before invoking execute_prepared.
+@End Reasoning
+
+@Implementation
+Validate state, dispatch prepare via the 3-arg shim. The driver returns
+its own statement handle; we wrap it in our 40-byte PreparedStatement
+record alongside cached function pointers.
+@End Implementation
+
+@Performance_Hints
+Reuses connection's execute/query function pointers to avoid extra
+indirection on later calls.
+@End Performance_Hints
+
+@Security_Scope
+The PreparedStatement holds a borrowed pointer to its connection. Do
+not use it after the connection has been closed.
+@End Security_Scope
+
+Process called "connection_prepare" takes c as Integer, sql as Integer, sql_len as Integer, param_count as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    If proc connection_is_open with c is equal to 0:
+        Return 0
+    End If
+    Let cfg be proc memory_get_int64 from Mem with c, CONN_OFF_CONFIG
+    Let prep_fn be proc memory_get_int64 from Mem with cfg, CFG_OFF_PREPARE
+    If prep_fn is equal to 0:
+        Return 0
+    End If
+    Let handle be proc memory_get_int64 from Mem with c, CONN_OFF_HANDLE
+    Let driver_stmt be proc db_runtime_call_indirect_3 with prep_fn, handle, sql, sql_len
+    If driver_stmt is equal to 0:
+        Return 0
+    End If
+    Let stmt be proc allocate from Memory with STMT_STRUCT_SIZE
+    If stmt is equal to 0:
+        Return 0
+    End If
+    Let exec_fn be proc memory_get_int64 from Mem with cfg, CFG_OFF_EXECUTE
+    Let query_fn be proc memory_get_int64 from Mem with cfg, CFG_OFF_QUERY
+    proc memory_set_int64 from Mem with stmt, STMT_OFF_CONN, c
+    proc memory_set_int64 from Mem with stmt, STMT_OFF_HANDLE, driver_stmt
+    proc memory_set_int64 from Mem with stmt, STMT_OFF_PARAM_COUNT, param_count
+    proc memory_set_int64 from Mem with stmt, STMT_OFF_QUERY, query_fn
+    proc memory_set_int64 from Mem with stmt, STMT_OFF_EXECUTE, exec_fn
+    Return stmt
+End Process
+
+Process called "prepared_statement_execute" takes stmt as Integer, params as Integer, param_count as Integer returns Integer:
+    If stmt is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    Let exec_fn be proc memory_get_int64 from Mem with stmt, STMT_OFF_EXECUTE
+    If exec_fn is equal to 0:
+        Return DB_ERR_DRIVER
+    End If
+    Let driver_stmt be proc memory_get_int64 from Mem with stmt, STMT_OFF_HANDLE
+    Note: For prepared statements the driver accepts (stmt_handle, 0, 0, params, count).
+    Return proc db_runtime_call_indirect_5 with exec_fn, driver_stmt, 0, 0, params, param_count
+End Process
+
+Process called "prepared_statement_query" takes stmt as Integer, params as Integer, param_count as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+    Let query_fn be proc memory_get_int64 from Mem with stmt, STMT_OFF_QUERY
+    If query_fn is equal to 0:
+        Return 0
+    End If
+    Let driver_stmt be proc memory_get_int64 from Mem with stmt, STMT_OFF_HANDLE
+    Return proc db_runtime_call_indirect_5 with query_fn, driver_stmt, 0, 0, params, param_count
+End Process
+
+Process called "prepared_statement_destroy" takes stmt as Integer returns Integer:
+    If stmt is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    proc deallocate from Memory with stmt
+    Return DB_OK
+End Process
+
+Process called "prepared_statement_param_count" takes stmt as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with stmt, STMT_OFF_PARAM_COUNT
+End Process
+
+Note: ============================================================================
+Note: Transaction primitives
+Note: ============================================================================
+
+@Reasoning
+Transactions are implemented through the connection's begin/commit/
+rollback callbacks. The connection tracks in_transaction so that nested
+begin calls fail fast (real nesting requires savepoints).
+@End Reasoning
+
+@Implementation
+begin: lock, check state, dispatch begin via the 2-arg shim, flip state
+to IN_TRANSACTION on success.
+commit/rollback: lock, dispatch via the 1-arg shim, flip state back to
+CONNECTED.
+@End Implementation
+
+@Performance_Hints
+A single driver call per begin/commit/rollback.
+@End Performance_Hints
+
+@Security_Scope
+Callers should pair begin with commit or rollback; leaving a connection
+in IN_TRANSACTION state across logical operations is permitted but
+risks blocking other writers in the driver.
+@End Security_Scope
+
+Process called "connection_begin" takes c as Integer, isolation as Integer returns Integer:
+    If c is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    If proc connection_is_open with c is equal to 0:
+        Return DB_ERR_STATE
+    End If
+    Let state be proc memory_get_int64 from Mem with c, CONN_OFF_STATE
+    If state is equal to CONN_STATE_IN_TRANSACTION:
+        Return DB_ERR_STATE
+    End If
+    Let cfg be proc memory_get_int64 from Mem with c, CONN_OFF_CONFIG
+    Let begin_fn be proc memory_get_int64 from Mem with cfg, CFG_OFF_BEGIN
+    Let handle be proc memory_get_int64 from Mem with c, CONN_OFF_HANDLE
+    If begin_fn is not equal to 0:
+        Let rc be proc db_runtime_call_indirect_2 with begin_fn, handle, isolation
+        If rc is not equal to DB_OK:
+            proc memory_set_int64 from Mem with c, CONN_OFF_LAST_ERR, rc
+            Return DB_ERR_DRIVER
+        End If
+    End If
+    proc memory_set_int64 from Mem with c, CONN_OFF_STATE, CONN_STATE_IN_TRANSACTION
+    proc memory_set_int64 from Mem with c, CONN_OFF_IN_TX, 1
+    Return DB_OK
+End Process
+
+Process called "connection_set_transaction_callbacks" takes c as Integer, commit_fn as Integer, rollback_fn as Integer returns Integer:
+    If c is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with c, CONN_OFF_COMMIT, commit_fn
+    proc memory_set_int64 from Mem with c, CONN_OFF_ROLLBACK, rollback_fn
+    Return DB_OK
+End Process
+
+Process called "connection_commit" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with c, CONN_OFF_STATE
+    If state is not equal to CONN_STATE_IN_TRANSACTION:
+        Return DB_ERR_STATE
+    End If
+    Let commit_fn be proc memory_get_int64 from Mem with c, CONN_OFF_COMMIT
+    Let handle be proc memory_get_int64 from Mem with c, CONN_OFF_HANDLE
+    If commit_fn is not equal to 0:
+        Let rc be proc db_runtime_call_indirect_1 with commit_fn, handle
+        If rc is not equal to DB_OK:
+            proc memory_set_int64 from Mem with c, CONN_OFF_LAST_ERR, rc
+            Return DB_ERR_DRIVER
+        End If
+    End If
+    proc memory_set_int64 from Mem with c, CONN_OFF_STATE, CONN_STATE_CONNECTED
+    proc memory_set_int64 from Mem with c, CONN_OFF_IN_TX, 0
+    Return DB_OK
+End Process
+
+Process called "connection_rollback" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return DB_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with c, CONN_OFF_STATE
+    If state is not equal to CONN_STATE_IN_TRANSACTION:
+        Return DB_ERR_STATE
+    End If
+    Let rollback_fn be proc memory_get_int64 from Mem with c, CONN_OFF_ROLLBACK
+    Let handle be proc memory_get_int64 from Mem with c, CONN_OFF_HANDLE
+    If rollback_fn is not equal to 0:
+        Let rc be proc db_runtime_call_indirect_1 with rollback_fn, handle
+        If rc is not equal to DB_OK:
+            proc memory_set_int64 from Mem with c, CONN_OFF_LAST_ERR, rc
+            Return DB_ERR_DRIVER
+        End If
+    End If
+    proc memory_set_int64 from Mem with c, CONN_OFF_STATE, CONN_STATE_CONNECTED
+    proc memory_set_int64 from Mem with c, CONN_OFF_IN_TX, 0
+    Return DB_OK
+End Process
+
+Process called "connection_in_transaction" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with c, CONN_OFF_IN_TX
+End Process

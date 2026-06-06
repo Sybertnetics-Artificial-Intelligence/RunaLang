@@ -1,0 +1,551 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HASHMAP - Open-Addressing Linear-Probing Hash Map Tier 0 Primitive
+
+This file implements a HashMap distinct from compiler/.../dictionary.runa.
+Where Dictionary uses chained hashing (one linked list per bucket),
+HashMap uses open addressing with linear probing: every entry lives
+directly in the bucket array, displaced linearly forward on collision.
+
+Open addressing wins on cache locality (a hot probe stays in the same
+cache line as the bucket) at the cost of more careful tombstone
+handling for delete.
+
+Entry layout (24 bytes):
+  offset 0:  state (8 bytes; 0 = EMPTY, 1 = OCCUPIED, 2 = TOMBSTONE)
+  offset 8:  key (8 bytes; integer-or-pointer)
+  offset 16: value (8 bytes)
+
+HashMap header (40 bytes):
+  offset 0:  entries (pointer to bucket array)
+  offset 8:  capacity (power of two)
+  offset 16: count (occupied entries)
+  offset 24: tombstones (count of TOMBSTONE entries)
+  offset 32: hash_seed (for hash mixing)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let HASHMAP_HEADER_SIZE be 40
+Let HASHMAP_ENTRY_SIZE be 24
+Let HASHMAP_INITIAL_CAPACITY be 16
+Let HASHMAP_STATE_EMPTY be 0
+Let HASHMAP_STATE_OCCUPIED be 1
+Let HASHMAP_STATE_TOMBSTONE be 2
+Let HASHMAP_LOAD_NUMERATOR be 75
+Let HASHMAP_LOAD_DENOMINATOR be 100
+
+Note: ============================================================================
+Note: HASH HELPERS
+Note: ============================================================================
+
+@Reasoning
+Mix an integer key into a well-distributed bucket index. Uses a
+splitmix64-style multiplicative mix, then masks to the capacity mask.
+@End Reasoning
+
+@Implementation
+h = key XOR (key >> 33);
+h = h * 0xff51afd7ed558ccd;
+h = h XOR (h >> 33);
+h = h * 0xc4ceb9fe1a85ec53;
+h = h XOR (h >> 33);
+return h AND (capacity - 1).
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-cryptographic mix.
+@End Security_Scope
+Process called "hashmap_index" takes key as Integer, capacity as Integer returns Integer:
+    Let h be key
+    Set h to h bitwise xor (h shifted right by 33)
+    Set h to h multiplied by 18397679294719823053
+    Set h to h bitwise xor (h shifted right by 33)
+    Set h to h multiplied by 14181476777654086739
+    Set h to h bitwise xor (h shifted right by 33)
+    Let mask be capacity minus 1
+    Return h bitwise and mask
+End Process
+
+Note: ============================================================================
+Note: ENTRY ADDRESS
+Note: ============================================================================
+
+@Reasoning
+Address of entry slot at index i.
+@End Reasoning
+
+@Implementation
+addr = entries + i * 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated index.
+@End Security_Scope
+Process called "hashmap_entry_addr" takes entries as Integer, i as Integer returns Integer:
+    Return entries plus (i multiplied by HASHMAP_ENTRY_SIZE)
+End Process
+
+Note: ============================================================================
+Note: CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Create an empty HashMap with INITIAL_CAPACITY buckets.
+@End Reasoning
+
+@Implementation
+Allocate header and entries; zero-init entries so every state field is
+EMPTY. Initialize header fields.
+@End Implementation
+
+@Performance_Hints
+Time: O(capacity * 24 / 8) bytes zero-init.
+Space: 40 + 24 * capacity = 40 + 384 bytes initial.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "hashmap_create" returns Integer:
+    Let hm be proc allocate from Layout with HASHMAP_HEADER_SIZE
+    If hm is equal to 0:
+        Return 0
+    End If
+    Let entries_bytes be HASHMAP_INITIAL_CAPACITY multiplied by HASHMAP_ENTRY_SIZE
+    Let entries be proc allocate from Layout with entries_bytes
+    If entries is equal to 0:
+        proc deallocate from Layout with hm
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than entries_bytes:
+        proc memory_set_byte from Memory with entries, zi, 0
+        Set zi to zi plus 1
+    End While
+    proc memory_set_int64 from Memory with hm, 0, entries
+    proc memory_set_int64 from Memory with hm, 8, HASHMAP_INITIAL_CAPACITY
+    proc memory_set_int64 from Memory with hm, 16, 0
+    proc memory_set_int64 from Memory with hm, 24, 0
+    proc memory_set_int64 from Memory with hm, 32, 2654435761
+    Return hm
+End Process
+
+@Reasoning
+Destroy a HashMap.
+@End Reasoning
+
+@Implementation
+Free entries then header.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "hashmap_destroy" takes hm as Integer returns Integer:
+    If hm is equal to 0:
+        Return 0
+    End If
+    Let entries be proc memory_get_int64 from Memory with hm, 0
+    If entries is not equal to 0:
+        proc deallocate from Layout with entries
+    End If
+    proc deallocate from Layout with hm
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PROBE / FIND
+Note: ============================================================================
+
+@Reasoning
+Probe the table starting at the hashed slot, walking linearly forward.
+Returns the slot index where the key was found, or the first EMPTY
+slot encountered if absent. TOMBSTONE entries are skipped during probe
+but recorded as candidate insertion slots.
+@End Reasoning
+
+@Implementation
+1) idx = hash(key) bitwise and (cap - 1).
+2) Loop: read state at idx. If EMPTY, return idx (or first_tombstone if
+   seen). If OCCUPIED and key match, return idx. Otherwise advance:
+   idx = (idx + 1) and mask.
+3) On full table this would loop forever, but the resize keeps load
+   below 0.75 so the loop terminates.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) amortized.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "hashmap_probe" takes hm as Integer, key as Integer returns Integer:
+    Let entries be proc memory_get_int64 from Memory with hm, 0
+    Let capacity be proc memory_get_int64 from Memory with hm, 8
+    Let mask be capacity minus 1
+    Let idx be proc hashmap_index with key, capacity
+    Let first_tombstone be 0 minus 1
+    While 1 is equal to 1:
+        Let addr be proc hashmap_entry_addr with entries, idx
+        Let state be proc memory_get_int64 from Memory with addr, 0
+        If state is equal to HASHMAP_STATE_EMPTY:
+            If first_tombstone is not equal to 0 minus 1:
+                Return first_tombstone
+            End If
+            Return idx
+        End If
+        If state is equal to HASHMAP_STATE_OCCUPIED:
+            Let k be proc memory_get_int64 from Memory with addr, 8
+            If k is equal to key:
+                Return idx
+            End If
+        End If
+        If state is equal to HASHMAP_STATE_TOMBSTONE:
+            If first_tombstone is equal to 0 minus 1:
+                Set first_tombstone to idx
+            End If
+        End If
+        Set idx to (idx plus 1) bitwise and mask
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: RESIZE
+Note: ============================================================================
+
+@Reasoning
+Grow capacity by 2x and re-probe all live entries. Resize triggers
+when (count + tombstones) >= capacity * 3 / 4.
+@End Reasoning
+
+@Implementation
+1) Allocate new bucket array of double capacity, zero-init.
+2) Walk old buckets; for each OCCUPIED entry, recompute slot in the
+   new array and write.
+3) Free old array, install new pointer, update fields.
+@End Implementation
+
+@Performance_Hints
+Time: O(n + capacity). Space: O(2 * old capacity).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure; existing table unchanged.
+@End Security_Scope
+Process called "hashmap_resize" takes hm as Integer returns Integer:
+    Let old_entries be proc memory_get_int64 from Memory with hm, 0
+    Let old_capacity be proc memory_get_int64 from Memory with hm, 8
+    Let new_capacity be old_capacity multiplied by 2
+    Let new_bytes be new_capacity multiplied by HASHMAP_ENTRY_SIZE
+    Let new_entries be proc allocate from Layout with new_bytes
+    If new_entries is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than new_bytes:
+        proc memory_set_byte from Memory with new_entries, zi, 0
+        Set zi to zi plus 1
+    End While
+    Let new_mask be new_capacity minus 1
+    Let i be 0
+    While i is less than old_capacity:
+        Let addr be proc hashmap_entry_addr with old_entries, i
+        Let state be proc memory_get_int64 from Memory with addr, 0
+        If state is equal to HASHMAP_STATE_OCCUPIED:
+            Let k be proc memory_get_int64 from Memory with addr, 8
+            Let v be proc memory_get_int64 from Memory with addr, 16
+            Let new_idx be proc hashmap_index with k, new_capacity
+            While 1 is equal to 1:
+                Let new_addr be proc hashmap_entry_addr with new_entries, new_idx
+                Let new_state be proc memory_get_int64 from Memory with new_addr, 0
+                If new_state is equal to HASHMAP_STATE_EMPTY:
+                    proc memory_set_int64 from Memory with new_addr, 0, HASHMAP_STATE_OCCUPIED
+                    proc memory_set_int64 from Memory with new_addr, 8, k
+                    proc memory_set_int64 from Memory with new_addr, 16, v
+                    Set new_idx to new_capacity
+                End If
+                If new_idx is greater than or equal to new_capacity:
+                    Set new_idx to 0
+                Otherwise:
+                    Set new_idx to (new_idx plus 1) bitwise and new_mask
+                End If
+            End While
+        End If
+        Set i to i plus 1
+    End While
+    proc deallocate from Layout with old_entries
+    proc memory_set_int64 from Memory with hm, 0, new_entries
+    proc memory_set_int64 from Memory with hm, 8, new_capacity
+    proc memory_set_int64 from Memory with hm, 24, 0
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PUBLIC API
+Note: ============================================================================
+
+@Reasoning
+Insert or update a key/value pair.
+@End Reasoning
+
+@Implementation
+1) If (count + tombstones) * LOAD_DENOMINATOR >= capacity * LOAD_NUMERATOR,
+   resize first.
+2) Probe for the key.
+3) If the slot's state is OCCUPIED and key matches, overwrite value.
+4) Else write OCCUPIED + key + value, increment count.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure during resize.
+@End Security_Scope
+Process called "hashmap_set" takes hm as Integer, key as Integer, value as Integer returns Integer:
+    If hm is equal to 0:
+        Return 0
+    End If
+    Let count be proc memory_get_int64 from Memory with hm, 16
+    Let tombs be proc memory_get_int64 from Memory with hm, 24
+    Let cap be proc memory_get_int64 from Memory with hm, 8
+    Let occupancy be count plus tombs
+    Let threshold be (cap multiplied by HASHMAP_LOAD_NUMERATOR) divided by HASHMAP_LOAD_DENOMINATOR
+    If occupancy is greater than or equal to threshold:
+        Let r be proc hashmap_resize with hm
+        If r is equal to 0:
+            Return 0
+        End If
+    End If
+    Let idx be proc hashmap_probe with hm, key
+    Let entries be proc memory_get_int64 from Memory with hm, 0
+    Let addr be proc hashmap_entry_addr with entries, idx
+    Let state be proc memory_get_int64 from Memory with addr, 0
+    If state is equal to HASHMAP_STATE_OCCUPIED:
+        proc memory_set_int64 from Memory with addr, 16, value
+        Return 1
+    End If
+    If state is equal to HASHMAP_STATE_TOMBSTONE:
+        Let new_tombs be tombs minus 1
+        proc memory_set_int64 from Memory with hm, 24, new_tombs
+    End If
+    proc memory_set_int64 from Memory with addr, 0, HASHMAP_STATE_OCCUPIED
+    proc memory_set_int64 from Memory with addr, 8, key
+    proc memory_set_int64 from Memory with addr, 16, value
+    proc memory_set_int64 from Memory with hm, 16, count plus 1
+    Return 1
+End Process
+
+@Reasoning
+Lookup value for key.
+@End Reasoning
+
+@Implementation
+Probe; if slot is OCCUPIED with matching key, return value; else 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "hashmap_get" takes hm as Integer, key as Integer returns Integer:
+    If hm is equal to 0:
+        Return 0
+    End If
+    Let idx be proc hashmap_probe with hm, key
+    Let entries be proc memory_get_int64 from Memory with hm, 0
+    Let addr be proc hashmap_entry_addr with entries, idx
+    Let state be proc memory_get_int64 from Memory with addr, 0
+    If state is not equal to HASHMAP_STATE_OCCUPIED:
+        Return 0
+    End If
+    Let k be proc memory_get_int64 from Memory with addr, 8
+    If k is not equal to key:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with addr, 16
+End Process
+
+@Reasoning
+Containment predicate.
+@End Reasoning
+
+@Implementation
+Probe; return 1 if found.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "hashmap_contains" takes hm as Integer, key as Integer returns Integer:
+    If hm is equal to 0:
+        Return 0
+    End If
+    Let idx be proc hashmap_probe with hm, key
+    Let entries be proc memory_get_int64 from Memory with hm, 0
+    Let addr be proc hashmap_entry_addr with entries, idx
+    Let state be proc memory_get_int64 from Memory with addr, 0
+    If state is not equal to HASHMAP_STATE_OCCUPIED:
+        Return 0
+    End If
+    Let k be proc memory_get_int64 from Memory with addr, 8
+    If k is equal to key:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Remove key by marking the slot as TOMBSTONE. We do not shift entries
+because that would break later probes for keys whose hash chain
+includes the removed slot.
+@End Reasoning
+
+@Implementation
+1) Probe for key.
+2) If found, mark state = TOMBSTONE, decrement count, increment
+   tombstones.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if not present.
+@End Security_Scope
+Process called "hashmap_remove" takes hm as Integer, key as Integer returns Integer:
+    If hm is equal to 0:
+        Return 0
+    End If
+    Let idx be proc hashmap_probe with hm, key
+    Let entries be proc memory_get_int64 from Memory with hm, 0
+    Let addr be proc hashmap_entry_addr with entries, idx
+    Let state be proc memory_get_int64 from Memory with addr, 0
+    If state is not equal to HASHMAP_STATE_OCCUPIED:
+        Return 0
+    End If
+    Let k be proc memory_get_int64 from Memory with addr, 8
+    If k is not equal to key:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with addr, 0, HASHMAP_STATE_TOMBSTONE
+    Let count be proc memory_get_int64 from Memory with hm, 16
+    proc memory_set_int64 from Memory with hm, 16, count minus 1
+    Let tombs be proc memory_get_int64 from Memory with hm, 24
+    proc memory_set_int64 from Memory with hm, 24, tombs plus 1
+    Return 1
+End Process
+
+@Reasoning
+Element count.
+@End Reasoning
+
+@Implementation
+Read count field at offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "hashmap_size" takes hm as Integer returns Integer:
+    If hm is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with hm, 16
+End Process
+
+@Reasoning
+Capacity accessor.
+@End Reasoning
+
+@Implementation
+Read capacity field at offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "hashmap_capacity" takes hm as Integer returns Integer:
+    If hm is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with hm, 8
+End Process
+
+@Reasoning
+Empty predicate.
+@End Reasoning
+
+@Implementation
+Returns 1 if count == 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "hashmap_is_empty" takes hm as Integer returns Integer:
+    If hm is equal to 0:
+        Return 1
+    End If
+    Let count be proc memory_get_int64 from Memory with hm, 16
+    If count is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process

@@ -68,6 +68,8 @@ Process called "token_can_be_identifier" takes token_type as Integer returns Int
     Note: Common variable names that are context-sensitive
     Otherwise If token_type is equal to 132:  Note: TOKEN_COUNT
         Return 1
+    Otherwise If token_type is equal to 133:  Note: TOKEN_NEGATIVE — context-sensitive: still acts as the unary-negation prefix operator in expression-primary position (parser dispatch on TOKEN_NEGATIVE handles `negative <INT>` literally), but legal as a Let-target / parameter / field identifier name. Resolves Bug #371: `Let negative be 0` previously rejected because TOKEN_NEGATIVE was absent from the identifier-eligibility set. Not added to token_can_continue_identifier — must NOT be swallowed as a multi-word continuation, otherwise expression-parsed text like `Let found_index be negative 1` would merge the operator into the binding name.
+        Return 1
     Otherwise If token_type is equal to 124:  Note: TOKEN_POINTER
         Return 1
     Otherwise If token_type is equal to 129:  Note: TOKEN_ERROR
@@ -1034,7 +1036,13 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
                 Let qual_args_size be qual_args_cap multiplied by qual_arg_ptrsize
                 Set qual_args to memory_allocate(qual_args_size)
 
-                Note: Parse arguments until ')'
+                Note: Parse arguments until ')'. Capacity-doubling grow mirrors
+                Note: parser_parse_proc_expression's `with` arg loop so dotted-form
+                Note: calls (Module.fn(a,b,...)) accept the full Runa-supported arg
+                Note: count rather than overflowing the initial 4-slot buffer at the
+                Note: 5th argument. Heap corruption from the overflow surfaced
+                Note: downstream as `[CODEGEN ERROR] Unsupported expression type` with
+                Note: a raw pointer value when stage1 read past the buffer end.
                 Let qual_continue be 1
                 While qual_continue is equal to 1:
                     Let qual_arg_token be memory_get_pointer(parser, 8)
@@ -1042,6 +1050,14 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
                     If qual_arg_type is equal to 49:  Note: TOKEN_RPAREN
                         Set qual_continue to 0
                     Otherwise:
+                        Note: Grow before write: if the next slot is past capacity,
+                        Note: double the capacity and reallocate. Identical pattern to
+                        Note: the proc-from-Module loop.
+                        If qual_argc is greater than or equal to qual_args_cap:
+                            Set qual_args_cap to qual_args_cap multiplied by 2
+                            Set qual_args_size to qual_args_cap multiplied by qual_arg_ptrsize
+                            Set qual_args to memory_reallocate(qual_args, qual_args_size)
+                        End If
                         Note: Use full expression so comparison and logical ops work as
                         Note: args (e.g. `T.assert_true(x is less than y)`).
                         Let qual_arg_expr be parser_parse_expression(parser)
@@ -3700,7 +3716,11 @@ Process called "function_create" takes name as Integer, return_type as Integer r
     Note:   offset  0: name           (pointer, 8 bytes)
     Note:   offset  8: parameters     (pointer, 8 bytes)
     Note:   offset 16: parameter_count (int32, bytes 16-19)
-    Note:   offset 20: (pad, bytes 20-23)
+    Note:   offset 20: parameter_capacity (int32, bytes 20-23) -- BF-0023
+    Note:                Used internally by function_add_parameter for doubled-capacity
+    Note:                growth. All other consumers (codegen, import_system) read
+    Note:                only parameter_count at offset 16; this slot is private to
+    Note:                the parameter-array growth helper and never read elsewhere.
     Note:   offset 24: return_type    (pointer, 8 bytes)
     Note:   offset 32: statements     (pointer, 8 bytes)
     Note:   offset 40: statement_count (int32, bytes 40-43)
@@ -3728,6 +3748,7 @@ Process called "function_create" takes name as Integer, return_type as Integer r
     memory_set_pointer(func, 0, dup_name)
     memory_set_pointer(func, 8, 0)  Note: parameters = NULL
     memory_set_int32(func, 16, 0)  Note: parameter_count = 0
+    memory_set_int32(func, 20, 0)  Note: parameter_capacity = 0 (BF-0023)
     Let dup_type be string_duplicate_parser(return_type)
     memory_set_pointer(func, 24, dup_type)
     memory_set_pointer(func, 32, 0)  Note: statements = NULL
@@ -3787,24 +3808,53 @@ Process called "type_definition_get_source_file" takes type_def as Integer retur
     Return memory_get_pointer(type_def, TYPEDEFINITION_SOURCE_FILE_OFFSET)
 End Process
 
-Note: Add parameter to function
+Note: Add parameter to function.
+Note: BF-0023: Uses doubled-capacity growth with a parameter_capacity field at
+Note: offset 20, mirroring program_add_function. Previously this realloc'd the
+Note: array to exactly new_count * 16 bytes on every call, producing an unrounded
+Note: sequence (16, 32, 48, 64, ...) that triggered glibc's
+Note: `corrupted size vs. prev_size` chunk-header check when two adjacent
+Note: 8-parameter Process declarations parsed back-to-back. With doubled growth,
+Note: 8 parameters allocate at sizes 64 then 128 (only two realloc calls total),
+Note: which lands on glibc's 16-byte-aligned chunk boundaries cleanly.
 Process called "function_add_parameter" takes func as Integer, param_name as Integer, param_type as Integer returns Integer:
+    Let param_size be 16  Note: sizeof(Parameter) = name pointer + type pointer
     Let parameter_count be memory_get_int32(func, 16)
-    Let new_count be parameter_count plus 1
-    Let param_size be 16  Note: sizeof(Parameter) = name plustype
-    Let new_size be new_count multiplied by param_size
-
+    Let parameter_capacity be memory_get_int32(func, 20)
     Let parameters be memory_get_pointer(func, 8)
-    Let new_parameters be memory_reallocate(parameters, new_size)
 
-    Let offset be parameter_count multiplied by param_size
-    Let param_ptr be new_parameters plus offset
+    If parameter_count is greater than or equal to parameter_capacity:
+        Note: Grow with doubled capacity, minimum initial 4. Initial 4 keeps the
+        Note: first allocation at 64 bytes (one glibc chunk), and the common
+        Note: case of <=4 parameters never reallocates again.
+        Let new_capacity be 4
+        If parameter_capacity is greater than 0:
+            Set new_capacity to parameter_capacity multiplied by 2
+        End If
+
+        Let new_alloc_size be new_capacity multiplied by param_size
+        Let new_parameters be memory_allocate(new_alloc_size)
+        If parameters is not equal to 0:
+            Note: Copy existing entries into the new buffer, then release the old.
+            Let used_bytes be parameter_count multiplied by param_size
+            memory_copy(new_parameters, parameters, used_bytes)
+            deallocate(parameters)
+        End If
+
+        memory_set_pointer(func, 8, new_parameters)
+        memory_set_int32(func, 20, new_capacity)
+        Set parameters to new_parameters
+    End If
+
+    Note: Append the new (name, type) pair at index parameter_count.
+    Let slot_offset be parameter_count multiplied by param_size
+    Let param_ptr be parameters plus slot_offset
     Let dup_name be string_duplicate_parser(param_name)
     memory_set_pointer(param_ptr, 0, dup_name)
     Let dup_type be string_duplicate_parser(param_type)
     memory_set_pointer(param_ptr, 8, dup_type)
 
-    memory_set_pointer(func, 8, new_parameters)
+    Let new_count be parameter_count plus 1
     memory_set_int32(func, 16, new_count)
     Return 0
 End Process
@@ -5066,6 +5116,42 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
         End If
     End If
 
+    Note:
+    Handle TOKEN_NEGATIVE BEFORE the generic identifier dispatch (Bug #371 fix).
+    token_can_be_identifier returns 1 for TOKEN_NEGATIVE so that `Let negative be 0`
+    parses (Let-target case), but parser_parse_primary must continue to recognise
+    `negative <INT>` as the unary-negation literal in expression position. If we
+    let the generic identifier branch below see TOKEN_NEGATIVE first, it would
+    swallow the `negative` token as a bare variable name and leave the following
+    integer unparsed (manifesting as `[PARSER ERROR] Unrecognized statement ...
+    (token type 11)` at the next statement boundary). Eat TOKEN_NEGATIVE here
+    and dispatch on the FOLLOWING token: TOKEN_INTEGER (11) -> negation literal;
+    anything else -> bare variable reference (the expression-USE case parallel
+    to the Let-target case).
+    :End Note
+    If token_type is equal to 133:  Note: TOKEN_NEGATIVE
+        Let dummy_neg_eat be parser_eat(parser, 133)
+        Let neg_next_token be memory_get_pointer(parser, 8)
+        Let neg_next_type be memory_get_integer(neg_next_token, 0)
+        If neg_next_type is equal to 11:  Note: TOKEN_INTEGER -> literal form
+            Let neg_value_str be memory_get_pointer(neg_next_token, 8)
+            Let neg_value be string_to_integer(neg_value_str)
+            Let negative_value be -neg_value
+            Let dummy_neg_int_eat be parser_eat(parser, 11)
+            Let neg_expr be expression_create_integer(negative_value)
+            Return neg_expr
+        End If
+
+        Note: Variable-reference fall-through. TOKEN_NEGATIVE was lexed from the
+        Note: literal word "negative", so we hard-code the name; the original
+        Note: token's value buffer is no longer addressable (parser_advance
+        Note: destroyed it during the eat). The returned EXPR_VARIABLE feeds
+        Note: the postfix handler in parser_parse_primary_with_postfix for
+        Note: chained access (e.g. `negative.field`, `negative(args)`).
+        Let neg_var_name be string_duplicate("negative")
+        Return expression_create_variable(neg_var_name)
+    End If
+
     Note: Handle identifier (including context-sensitive keywords and "list containing")
     Let can_be_id be token_can_be_identifier(token_type)
     If can_be_id is equal to 1:
@@ -5981,26 +6067,9 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
         Return expr
     End If
 
-    Note: Handle negative literal
-    If token_type is equal to 133:  Note: TOKEN_NEGATIVE
-        Set dummy10 to parser_eat(parser, 133)
-        Note: Expect an integer after "negative"
-        Let neg_token be memory_get_pointer(parser, 8)
-        Let neg_token_type be memory_get_integer(neg_token, 0)
-        If neg_token_type is not equal to 11:  Note: TOKEN_INTEGER
-            print_string("[PARSER ERROR] Expected integer after 'negative' at line ")
-            Set err_line to memory_get_int32(neg_token, 16)
-            print_integer(err_line)
-            print_newline()
-            exit_with_code(1)
-        End If
-        Set value_str to memory_get_pointer(neg_token, 8)
-        Set value to string_to_integer(value_str)
-        Let negative_value be -value
-        Let dummy11 be parser_eat(parser, 11)
-        Set expr to expression_create_integer(negative_value)
-        Return expr
-    End If
+    Note: TOKEN_NEGATIVE is handled above (before the generic identifier
+    Note: dispatch) to avoid being swallowed by token_can_be_identifier=1
+    Note: for `negative` (Bug #371 fix; see comment block at line ~5119).
 
     Note: Handle lambda expression
     If token_type is equal to 162:  Note: TOKEN_LAMBDA

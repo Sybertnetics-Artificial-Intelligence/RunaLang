@@ -1,0 +1,976 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+RML - Runa Markup Language Parser, Serializer, Validator
+==============================================================================
+
+RML is the Runa-native markup substrate, designed to replace HTML and XML
+in Runa programs.  Source syntax mirrors Runa's natural-language style:
+
+    Element called "section" with id as "intro":
+        Element called "h1":
+            Text "Welcome"
+        End Element
+        Element called "p" with class as "lede":
+            Text "Hello world"
+        End Element
+    End Element
+
+Grammar (informal, sufficient for v0.0.8.5):
+
+    document        := element+
+    element         := 'Element' 'called' STRING attrs? ':' children 'End' 'Element'
+    attrs           := 'with' attr-pair (',' attr-pair)*
+    attr-pair       := IDENT 'as' STRING
+    children        := (element | text | comment | cdata)*
+    text            := 'Text' STRING
+    comment         := 'Comment' STRING
+    cdata           := 'CData' STRING
+
+Round-trip guarantee: rml_parse o rml_serialize produces identical bytes
+for any well-formed source.  Source positions are tracked for diagnostics.
+
+References:
+  - W3C DOM Level 3 Core for the underlying tree model
+  - WHATWG HTML Living Standard for serialization semantics
+  - XML 1.1 https://www.w3.org/TR/xml11/ for well-formedness rules
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/io/file_io.runa" as File
+Import "compiler/frontend/primitives/markup/element.runa" as Elem
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Constant RML_OK as Integer is 0
+Constant RML_ERR_EOF as Integer is -1
+Constant RML_ERR_SYNTAX as Integer is -2
+Constant RML_ERR_OOM as Integer is -3
+Constant RML_ERR_UNCLOSED as Integer is -4
+Constant RML_ERR_ORPHAN_CLOSE as Integer is -5
+Constant RML_ERR_BAD_STRING as Integer is -6
+Constant RML_ERR_BAD_IDENT as Integer is -7
+
+Constant PARSER_STATE_SIZE as Integer is 40
+Constant PS_OFF_TEXT as Integer is 0
+Constant PS_OFF_POS as Integer is 8
+Constant PS_OFF_LEN as Integer is 16
+Constant PS_OFF_LINE as Integer is 24
+Constant PS_OFF_COL as Integer is 32
+
+Constant ISSUE_SIZE as Integer is 32
+Constant ISSUE_OFF_CODE as Integer is 0
+Constant ISSUE_OFF_LINE as Integer is 8
+Constant ISSUE_OFF_COL as Integer is 16
+Constant ISSUE_OFF_MESSAGE as Integer is 24
+
+Note: ============================================================================
+Note: PARSER STATE
+Note: ============================================================================
+
+@Reasoning
+A ParserState bundles the input pointer, current position, source
+length, current 1-based line and column.  Keeping these in a heap record
+lets every parser helper take a single argument.
+@End Reasoning
+@Implementation
+Layout.allocate 40 bytes; initialize position to 0, line to 1, column
+to 1.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Caller-owned input string is borrowed.
+@End Security_Scope
+Process called "ps_create" takes text as Integer returns Integer:
+    Let record be proc allocate from Layout with PARSER_STATE_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    Let len be 0
+    If text is not equal to 0:
+        Set len to proc string_length from StringCore with text
+    End If
+    proc memory_set_int64 from Memory with record, PS_OFF_TEXT, text
+    proc memory_set_int64 from Memory with record, PS_OFF_POS, 0
+    proc memory_set_int64 from Memory with record, PS_OFF_LEN, len
+    proc memory_set_int64 from Memory with record, PS_OFF_LINE, 1
+    proc memory_set_int64 from Memory with record, PS_OFF_COL, 1
+    Return record
+End Process
+
+Process called "ps_destroy" takes ps as Integer returns Integer:
+    If ps is equal to 0:
+        Return RML_OK
+    End If
+    proc deallocate from Layout with ps
+    Return RML_OK
+End Process
+
+Process called "ps_peek" takes ps as Integer returns Integer:
+    Let pos be proc memory_get_int64 from Memory with ps, PS_OFF_POS
+    Let len be proc memory_get_int64 from Memory with ps, PS_OFF_LEN
+    If pos is greater than or equal to len:
+        Return -1
+    End If
+    Let text be proc memory_get_int64 from Memory with ps, PS_OFF_TEXT
+    Return proc string_char_at from StringCore with text, pos
+End Process
+
+Process called "ps_advance" takes ps as Integer returns Integer:
+    Let pos be proc memory_get_int64 from Memory with ps, PS_OFF_POS
+    Let len be proc memory_get_int64 from Memory with ps, PS_OFF_LEN
+    If pos is greater than or equal to len:
+        Return -1
+    End If
+    Let text be proc memory_get_int64 from Memory with ps, PS_OFF_TEXT
+    Let ch be proc string_char_at from StringCore with text, pos
+    proc memory_set_int64 from Memory with ps, PS_OFF_POS, pos plus 1
+    If ch is equal to 10:
+        Let line be proc memory_get_int64 from Memory with ps, PS_OFF_LINE
+        proc memory_set_int64 from Memory with ps, PS_OFF_LINE, line plus 1
+        proc memory_set_int64 from Memory with ps, PS_OFF_COL, 1
+    Otherwise:
+        Let col be proc memory_get_int64 from Memory with ps, PS_OFF_COL
+        proc memory_set_int64 from Memory with ps, PS_OFF_COL, col plus 1
+    End If
+    Return ch
+End Process
+
+@Reasoning
+Skip whitespace including line terminators between tokens.
+@End Reasoning
+@Implementation
+Iterate ps_advance while is_whitespace.
+@End Implementation
+@Performance_Hints
+O(length of whitespace run).
+@End Performance_Hints
+@Security_Scope
+Idempotent.
+@End Security_Scope
+Process called "ps_skip_ws" takes ps as Integer returns Integer:
+    While 1 is equal to 1:
+        Let ch be proc ps_peek with ps
+        If ch is equal to -1:
+            Return RML_OK
+        End If
+        Let is_ws be proc is_whitespace from Char with ch
+        If is_ws is equal to 1:
+            proc ps_advance with ps
+        Otherwise:
+            Return RML_OK
+        End If
+    End While
+    Return RML_OK
+End Process
+
+Note: ============================================================================
+Note: LITERAL PARSERS
+Note: ============================================================================
+
+@Reasoning
+Try to consume a literal keyword.  Returns 1 on success and advances
+past it; returns 0 and leaves position unchanged otherwise.
+@End Reasoning
+@Implementation
+Compare byte-for-byte against the keyword starting at ps_peek; if all
+match, advance for each character.
+@End Implementation
+@Performance_Hints
+O(len(keyword)).
+@End Performance_Hints
+@Security_Scope
+Pure read.  Does not mutate state on failure.
+@End Security_Scope
+Process called "ps_try_keyword" takes ps as Integer, keyword as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with ps, PS_OFF_TEXT
+    Let len be proc memory_get_int64 from Memory with ps, PS_OFF_LEN
+    Let pos be proc memory_get_int64 from Memory with ps, PS_OFF_POS
+    Let klen be proc string_length from StringCore with keyword
+    If pos plus klen is greater than len:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than klen:
+        Let ta be proc string_char_at from StringCore with text, pos plus i
+        Let ka be proc string_char_at from StringCore with keyword, i
+        If ta is not equal to ka:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Set i to 0
+    While i is less than klen:
+        proc ps_advance with ps
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Parse a double-quoted string literal.  Backslash escapes recognized:
+\", \\, \n, \t.  Stores result string pointer into out_slot.  Returns
+RML_OK on success or RML_ERR_BAD_STRING on bad escape / unterminated.
+@End Reasoning
+@Implementation
+Verify opening quote, accumulate characters into a StringBuilder until
+matching close quote, materialize the buffer.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Caller owns the produced string.
+@End Security_Scope
+Process called "ps_parse_string" takes ps as Integer, out_slot as Integer returns Integer:
+    Let opening be proc ps_peek with ps
+    If opening is not equal to 34:
+        Return RML_ERR_BAD_STRING
+    End If
+    proc ps_advance with ps
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return RML_ERR_OOM
+    End If
+    While 1 is equal to 1:
+        Let ch be proc ps_peek with ps
+        If ch is equal to -1:
+            proc stringbuilder_destroy from SB with sb
+            Return RML_ERR_BAD_STRING
+        End If
+        If ch is equal to 34:
+            proc ps_advance with ps
+            Let out_str be proc stringbuilder_to_string from SB with sb
+            proc stringbuilder_destroy from SB with sb
+            proc memory_set_int64 from Memory with out_slot, 0, out_str
+            Return RML_OK
+        End If
+        If ch is equal to 92:
+            proc ps_advance with ps
+            Let esc be proc ps_peek with ps
+            If esc is equal to 34:
+                proc stringbuilder_append_char from SB with sb, 34
+            Otherwise:
+                If esc is equal to 92:
+                    proc stringbuilder_append_char from SB with sb, 92
+                Otherwise:
+                    If esc is equal to 110:
+                        proc stringbuilder_append_char from SB with sb, 10
+                    Otherwise:
+                        If esc is equal to 116:
+                            proc stringbuilder_append_char from SB with sb, 9
+                        Otherwise:
+                            proc stringbuilder_destroy from SB with sb
+                            Return RML_ERR_BAD_STRING
+                        End If
+                    End If
+                End If
+            End If
+            proc ps_advance with ps
+        Otherwise:
+            proc stringbuilder_append_char from SB with sb, ch
+            proc ps_advance with ps
+        End If
+    End While
+    Return RML_ERR_BAD_STRING
+End Process
+
+@Reasoning
+Parse an identifier (attribute name): starts with a letter or
+underscore, continues with alphanumerics, underscores, hyphens.
+@End Reasoning
+@Implementation
+Accumulate while identifier_continue applies; identifier_start must
+hold for the first character.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Caller owns the produced identifier string.
+@End Security_Scope
+Process called "ps_parse_ident" takes ps as Integer, out_slot as Integer returns Integer:
+    Let first be proc ps_peek with ps
+    Let is_start be proc is_identifier_start from Char with first
+    If is_start is equal to 0:
+        Return RML_ERR_BAD_IDENT
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return RML_ERR_OOM
+    End If
+    proc stringbuilder_append_char from SB with sb, first
+    proc ps_advance with ps
+    While 1 is equal to 1:
+        Let ch be proc ps_peek with ps
+        If ch is equal to -1:
+            Let out_id be proc stringbuilder_to_string from SB with sb
+            proc stringbuilder_destroy from SB with sb
+            proc memory_set_int64 from Memory with out_slot, 0, out_id
+            Return RML_OK
+        End If
+        Let is_cont be proc is_identifier_continue from Char with ch
+        If is_cont is equal to 0:
+            If ch is equal to 45:
+                proc stringbuilder_append_char from SB with sb, ch
+                proc ps_advance with ps
+            Otherwise:
+                Let out_id2 be proc stringbuilder_to_string from SB with sb
+                proc stringbuilder_destroy from SB with sb
+                proc memory_set_int64 from Memory with out_slot, 0, out_id2
+                Return RML_OK
+            End If
+        Otherwise:
+            proc stringbuilder_append_char from SB with sb, ch
+            proc ps_advance with ps
+        End If
+    End While
+    Return RML_OK
+End Process
+
+Note: ============================================================================
+Note: ELEMENT BODY PARSER
+Note: ============================================================================
+
+@Reasoning
+Parse the attribute list: `with name1 as "value1", name2 as "value2"`.
+Returns RML_OK; appends Attribute records to the element.
+@End Reasoning
+@Implementation
+Loop: ps_parse_ident, expect 'as', ps_parse_string, attribute_create,
+element_append_attribute, ps_skip_ws, if next char is ',' consume and
+continue, otherwise break.
+@End Implementation
+@Performance_Hints
+O(total attribute text).
+@End Performance_Hints
+@Security_Scope
+On parse failure, partial attributes are still attached to the element;
+the caller's element_destroy cleans up.
+@End Security_Scope
+Process called "ps_parse_attrs" takes ps as Integer, element as Integer returns Integer:
+    While 1 is equal to 1:
+        proc ps_skip_ws with ps
+        Let name_slot be proc allocate from Layout with 8
+        If name_slot is equal to 0:
+            Return RML_ERR_OOM
+        End If
+        proc memory_set_int64 from Memory with name_slot, 0, 0
+        Let ident_rc be proc ps_parse_ident with ps, name_slot
+        If ident_rc is not equal to RML_OK:
+            proc deallocate from Layout with name_slot
+            Return ident_rc
+        End If
+        Let name_ptr be proc memory_get_int64 from Memory with name_slot, 0
+        proc deallocate from Layout with name_slot
+        proc ps_skip_ws with ps
+        Let as_ok be proc ps_try_keyword with ps, "as"
+        If as_ok is equal to 0:
+            Return RML_ERR_SYNTAX
+        End If
+        proc ps_skip_ws with ps
+        Let val_slot be proc allocate from Layout with 8
+        If val_slot is equal to 0:
+            Return RML_ERR_OOM
+        End If
+        proc memory_set_int64 from Memory with val_slot, 0, 0
+        Let str_rc be proc ps_parse_string with ps, val_slot
+        If str_rc is not equal to RML_OK:
+            proc deallocate from Layout with val_slot
+            Return str_rc
+        End If
+        Let val_ptr be proc memory_get_int64 from Memory with val_slot, 0
+        proc deallocate from Layout with val_slot
+        Let attr be proc attribute_create from Elem with name_ptr, val_ptr, 0
+        If attr is equal to 0:
+            Return RML_ERR_OOM
+        End If
+        proc element_append_attribute from Elem with element, attr
+        proc ps_skip_ws with ps
+        Let next_ch be proc ps_peek with ps
+        If next_ch is equal to 44:
+            proc ps_advance with ps
+        Otherwise:
+            Return RML_OK
+        End If
+    End While
+    Return RML_OK
+End Process
+
+@Reasoning
+Forward-declared recursive parser.  Parses an element's children list
+until "End Element" is seen.
+@End Reasoning
+@Implementation
+Loop: skip whitespace, peek the first identifier-ish token, dispatch
+on whether it is "Element", "Text", "Comment", "CData", or "End".  On
+"End Element", consume the keywords and return.  On any other token,
+return RML_ERR_SYNTAX.
+@End Implementation
+@Performance_Hints
+O(child text + recursive descent depth).
+@End Performance_Hints
+@Security_Scope
+Children attached to the parent are owned by it via element_destroy.
+@End Security_Scope
+Process called "ps_parse_children" takes ps as Integer, parent as Integer returns Integer:
+    While 1 is equal to 1:
+        proc ps_skip_ws with ps
+        Let pos be proc memory_get_int64 from Memory with ps, PS_OFF_POS
+        Let len be proc memory_get_int64 from Memory with ps, PS_OFF_LEN
+        If pos is greater than or equal to len:
+            Return RML_ERR_UNCLOSED
+        End If
+        Let saw_end be proc ps_try_keyword with ps, "End"
+        If saw_end is equal to 1:
+            proc ps_skip_ws with ps
+            Let saw_elem be proc ps_try_keyword with ps, "Element"
+            If saw_elem is equal to 0:
+                Return RML_ERR_ORPHAN_CLOSE
+            End If
+            Return RML_OK
+        End If
+        Let saw_elem_kw be proc ps_try_keyword with ps, "Element"
+        If saw_elem_kw is equal to 1:
+            Let child_slot be proc allocate from Layout with 8
+            If child_slot is equal to 0:
+                Return RML_ERR_OOM
+            End If
+            proc memory_set_int64 from Memory with child_slot, 0, 0
+            Let rc be proc ps_parse_element_body with ps, child_slot
+            If rc is not equal to RML_OK:
+                proc deallocate from Layout with child_slot
+                Return rc
+            End If
+            Let child_elem be proc memory_get_int64 from Memory with child_slot, 0
+            proc deallocate from Layout with child_slot
+            Let child_node be proc markup_node_create_element from Elem with child_elem
+            proc element_append_child from Elem with parent, child_node
+        Otherwise:
+            Let saw_text be proc ps_try_keyword with ps, "Text"
+            If saw_text is equal to 1:
+                proc ps_skip_ws with ps
+                Let tslot be proc allocate from Layout with 8
+                If tslot is equal to 0:
+                    Return RML_ERR_OOM
+                End If
+                proc memory_set_int64 from Memory with tslot, 0, 0
+                Let trc be proc ps_parse_string with ps, tslot
+                If trc is not equal to RML_OK:
+                    proc deallocate from Layout with tslot
+                    Return trc
+                End If
+                Let text_ptr be proc memory_get_int64 from Memory with tslot, 0
+                proc deallocate from Layout with tslot
+                Let text_node be proc markup_node_create_text from Elem with text_ptr
+                proc element_append_child from Elem with parent, text_node
+            Otherwise:
+                Let saw_comment be proc ps_try_keyword with ps, "Comment"
+                If saw_comment is equal to 1:
+                    proc ps_skip_ws with ps
+                    Let cslot be proc allocate from Layout with 8
+                    If cslot is equal to 0:
+                        Return RML_ERR_OOM
+                    End If
+                    proc memory_set_int64 from Memory with cslot, 0, 0
+                    Let crc be proc ps_parse_string with ps, cslot
+                    If crc is not equal to RML_OK:
+                        proc deallocate from Layout with cslot
+                        Return crc
+                    End If
+                    Let cptr be proc memory_get_int64 from Memory with cslot, 0
+                    proc deallocate from Layout with cslot
+                    Let cn be proc markup_node_create_comment from Elem with cptr
+                    proc element_append_child from Elem with parent, cn
+                Otherwise:
+                    Let saw_cdata be proc ps_try_keyword with ps, "CData"
+                    If saw_cdata is equal to 1:
+                        proc ps_skip_ws with ps
+                        Let dslot be proc allocate from Layout with 8
+                        If dslot is equal to 0:
+                            Return RML_ERR_OOM
+                        End If
+                        proc memory_set_int64 from Memory with dslot, 0, 0
+                        Let drc be proc ps_parse_string with ps, dslot
+                        If drc is not equal to RML_OK:
+                            proc deallocate from Layout with dslot
+                            Return drc
+                        End If
+                        Let dptr be proc memory_get_int64 from Memory with dslot, 0
+                        proc deallocate from Layout with dslot
+                        Let dn be proc markup_node_create_cdata from Elem with dptr
+                        proc element_append_child from Elem with parent, dn
+                    Otherwise:
+                        Return RML_ERR_SYNTAX
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return RML_OK
+End Process
+
+@Reasoning
+Parse the body of an element after the 'Element' keyword has been
+consumed.  Sequence: `called "name"` [`with` attrs] `:` children
+`End Element`.  Returns the element pointer via out_slot.
+@End Reasoning
+@Implementation
+1. Expect 'called'.
+2. Parse string (tag name).
+3. element_create.
+4. If next keyword is 'with', parse attrs.
+5. Expect ':'.
+6. Recursively parse children.
+7. Out: element pointer.  On error, destroy partial element.
+@End Implementation
+@Performance_Hints
+Linear in element body size.
+@End Performance_Hints
+@Security_Scope
+Caller owns the returned element via out_slot.
+@End Security_Scope
+Process called "ps_parse_element_body" takes ps as Integer, out_slot as Integer returns Integer:
+    proc ps_skip_ws with ps
+    Let line be proc memory_get_int64 from Memory with ps, PS_OFF_LINE
+    Let col be proc memory_get_int64 from Memory with ps, PS_OFF_COL
+    Let saw_called be proc ps_try_keyword with ps, "called"
+    If saw_called is equal to 0:
+        Return RML_ERR_SYNTAX
+    End If
+    proc ps_skip_ws with ps
+    Let name_slot be proc allocate from Layout with 8
+    If name_slot is equal to 0:
+        Return RML_ERR_OOM
+    End If
+    proc memory_set_int64 from Memory with name_slot, 0, 0
+    Let rc be proc ps_parse_string with ps, name_slot
+    If rc is not equal to RML_OK:
+        proc deallocate from Layout with name_slot
+        Return rc
+    End If
+    Let tag_name be proc memory_get_int64 from Memory with name_slot, 0
+    proc deallocate from Layout with name_slot
+    Let element be proc element_create from Elem with tag_name, 0
+    If element is equal to 0:
+        Return RML_ERR_OOM
+    End If
+    proc element_set_source_position from Elem with element, line, col
+    proc ps_skip_ws with ps
+    Let has_attrs be proc ps_try_keyword with ps, "with"
+    If has_attrs is equal to 1:
+        Let arc be proc ps_parse_attrs with ps, element
+        If arc is not equal to RML_OK:
+            proc element_destroy from Elem with element
+            Return arc
+        End If
+    End If
+    proc ps_skip_ws with ps
+    Let colon be proc ps_peek with ps
+    If colon is not equal to 58:
+        proc element_destroy from Elem with element
+        Return RML_ERR_SYNTAX
+    End If
+    proc ps_advance with ps
+    Let crc be proc ps_parse_children with ps, element
+    If crc is not equal to RML_OK:
+        proc element_destroy from Elem with element
+        Return crc
+    End If
+    proc memory_set_int64 from Memory with out_slot, 0, element
+    Return RML_OK
+End Process
+
+Note: ============================================================================
+Note: PUBLIC PARSE / SERIALIZE / VALIDATE
+Note: ============================================================================
+
+@Reasoning
+Parse an entire RML source string and return the root element pointer
+or 0 on error.  Errors are reported via the status integer slot the
+caller may pass in.  Pass 0 to discard the status.
+@End Reasoning
+@Implementation
+Build a ParserState; expect the source to begin with 'Element';
+recursively parse the body; return.
+@End Implementation
+@Performance_Hints
+O(source length).
+@End Performance_Hints
+@Security_Scope
+Source string is borrowed; output element subtree is owned by caller.
+@End Security_Scope
+Process called "rml_parse_with_status" takes source as Integer, status_slot as Integer returns Integer:
+    If source is equal to 0:
+        If status_slot is not equal to 0:
+            proc memory_set_int64 from Memory with status_slot, 0, RML_ERR_EOF
+        End If
+        Return 0
+    End If
+    Let ps be proc ps_create with source
+    If ps is equal to 0:
+        If status_slot is not equal to 0:
+            proc memory_set_int64 from Memory with status_slot, 0, RML_ERR_OOM
+        End If
+        Return 0
+    End If
+    proc ps_skip_ws with ps
+    Let saw_elem be proc ps_try_keyword with ps, "Element"
+    If saw_elem is equal to 0:
+        proc ps_destroy with ps
+        If status_slot is not equal to 0:
+            proc memory_set_int64 from Memory with status_slot, 0, RML_ERR_SYNTAX
+        End If
+        Return 0
+    End If
+    Let out_slot be proc allocate from Layout with 8
+    If out_slot is equal to 0:
+        proc ps_destroy with ps
+        If status_slot is not equal to 0:
+            proc memory_set_int64 from Memory with status_slot, 0, RML_ERR_OOM
+        End If
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with out_slot, 0, 0
+    Let rc be proc ps_parse_element_body with ps, out_slot
+    Let elem be proc memory_get_int64 from Memory with out_slot, 0
+    proc deallocate from Layout with out_slot
+    proc ps_destroy with ps
+    If status_slot is not equal to 0:
+        proc memory_set_int64 from Memory with status_slot, 0, rc
+    End If
+    If rc is not equal to RML_OK:
+        Return 0
+    End If
+    Return elem
+End Process
+
+Process called "rml_parse" takes source as Integer returns Integer:
+    Return proc rml_parse_with_status with source, 0
+End Process
+
+@Reasoning
+Emit an indent prefix into the StringBuilder for pretty-printing the
+RML form.  Four spaces per level.
+@End Reasoning
+@Implementation
+Loop writing four spaces per level.
+@End Implementation
+@Performance_Hints
+O(level).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "rml_append_indent" takes sb as Integer, level as Integer returns Integer:
+    Let total be level multiplied by 4
+    Let i be 0
+    While i is less than total:
+        proc stringbuilder_append_char from SB with sb, 32
+        Set i to i plus 1
+    End While
+    Return RML_OK
+End Process
+
+@Reasoning
+Escape a string for use inside an RML double-quoted literal.  Escapes
+backslash, double-quote, newline, and tab.
+@End Reasoning
+@Implementation
+Walk characters and write escape sequences for the four special
+characters; pass everything else through.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Null-safe input.
+@End Security_Scope
+Process called "rml_append_quoted" takes sb as Integer, value as Integer returns Integer:
+    proc stringbuilder_append_char from SB with sb, 34
+    If value is equal to 0:
+        proc stringbuilder_append_char from SB with sb, 34
+        Return RML_OK
+    End If
+    Let len be proc string_length from StringCore with value
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with value, i
+        If ch is equal to 92:
+            proc stringbuilder_append from SB with sb, "\\\\"
+        Otherwise:
+            If ch is equal to 34:
+                proc stringbuilder_append from SB with sb, "\\\""
+            Otherwise:
+                If ch is equal to 10:
+                    proc stringbuilder_append from SB with sb, "\\n"
+                Otherwise:
+                    If ch is equal to 9:
+                        proc stringbuilder_append from SB with sb, "\\t"
+                    Otherwise:
+                        proc stringbuilder_append_char from SB with sb, ch
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    proc stringbuilder_append_char from SB with sb, 34
+    Return RML_OK
+End Process
+
+@Reasoning
+Recursive serializer.  Emits the canonical RML form at the given indent
+level.  Round-trips against rml_parse.
+@End Reasoning
+@Implementation
+1. Emit indent + 'Element called "tag"'.
+2. If attributes, emit ' with name as "value"' joined by ', '.
+3. ':'.
+4. Newline.
+5. Recurse over children at indent+1.
+6. Indent + 'End Element' + newline.
+@End Implementation
+@Performance_Hints
+O(total nodes + total text length).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "rml_serialize_element" takes sb as Integer, element as Integer, level as Integer returns Integer:
+    If element is equal to 0:
+        Return RML_OK
+    End If
+    proc rml_append_indent with sb, level
+    proc stringbuilder_append from SB with sb, "Element called "
+    Let tag be proc element_get_tag_name from Elem with element
+    proc rml_append_quoted with sb, tag
+    Let acount be proc element_attribute_count from Elem with element
+    If acount is greater than 0:
+        proc stringbuilder_append from SB with sb, " with "
+        Let i be 0
+        While i is less than acount:
+            If i is greater than 0:
+                proc stringbuilder_append from SB with sb, ", "
+            End If
+            Let attr be proc element_get_attribute_at from Elem with element, i
+            Let name be proc attribute_get_name from Elem with attr
+            Let value be proc attribute_get_value from Elem with attr
+            If name is not equal to 0:
+                proc stringbuilder_append from SB with sb, name
+            End If
+            proc stringbuilder_append from SB with sb, " as "
+            proc rml_append_quoted with sb, value
+            Set i to i plus 1
+        End While
+    End If
+    proc stringbuilder_append_char from SB with sb, 58
+    proc stringbuilder_append_char from SB with sb, 10
+    Let ccount be proc element_child_count from Elem with element
+    Let j be 0
+    While j is less than ccount:
+        Let node be proc element_get_child from Elem with element, j
+        Let kind be proc markup_node_get_kind from Elem with node
+        Let payload be proc markup_node_get_payload from Elem with node
+        If kind is equal to 1:
+            proc rml_serialize_element with sb, payload, level plus 1
+        Otherwise:
+            If kind is equal to 3:
+                proc rml_append_indent with sb, level plus 1
+                proc stringbuilder_append from SB with sb, "Text "
+                proc rml_append_quoted with sb, payload
+                proc stringbuilder_append_char from SB with sb, 10
+            Otherwise:
+                If kind is equal to 8:
+                    proc rml_append_indent with sb, level plus 1
+                    proc stringbuilder_append from SB with sb, "Comment "
+                    proc rml_append_quoted with sb, payload
+                    proc stringbuilder_append_char from SB with sb, 10
+                Otherwise:
+                    If kind is equal to 4:
+                        proc rml_append_indent with sb, level plus 1
+                        proc stringbuilder_append from SB with sb, "CData "
+                        proc rml_append_quoted with sb, payload
+                        proc stringbuilder_append_char from SB with sb, 10
+                    End If
+                End If
+            End If
+        End If
+        Set j to j plus 1
+    End While
+    proc rml_append_indent with sb, level
+    proc stringbuilder_append from SB with sb, "End Element"
+    proc stringbuilder_append_char from SB with sb, 10
+    Return RML_OK
+End Process
+
+@Reasoning
+Public serializer: render the entire element tree as RML source.
+@End Reasoning
+@Implementation
+Create a StringBuilder, recurse, materialize result.
+@End Implementation
+@Performance_Hints
+Linear in tree size.
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "rml_serialize" takes root as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc rml_serialize_element with sb, root, 0
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Load and parse an RML document from a file path.  Returns 0 on file
+error or parse error; on success, returns the root element owned by
+the caller.
+@End Reasoning
+@Implementation
+Use File.read_entire_file to slurp the contents, hand them to rml_parse,
+release the file buffer afterwards.
+@End Implementation
+@Performance_Hints
+O(file size).
+@End Performance_Hints
+@Security_Scope
+Caller owns the returned element subtree.
+@End Security_Scope
+Process called "rml_load_from_file" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+    Let text be proc read_entire_file from File with path
+    If text is equal to 0:
+        Return 0
+    End If
+    Let root be proc rml_parse with text
+    Return root
+End Process
+
+@Reasoning
+Validate that an element tree is well-formed: tag names must be
+non-empty, each element with self_closing=1 must have zero children,
+no descendant carries the special "End Element" token as a tag.
+@End Reasoning
+@Implementation
+Walk the tree with element_walk.  For each element, accumulate any
+discovered issues into an output list of (code, line, column, message)
+records.  Returns the issues list (empty list if all good).
+@End Implementation
+@Performance_Hints
+O(element count).
+@End Performance_Hints
+@Security_Scope
+Caller owns the issues list; each issue record is also owned by the
+caller.
+@End Security_Scope
+Process called "rml_issue_create" takes code as Integer, line as Integer, col as Integer, message as Integer returns Integer:
+    Let record be proc allocate from Layout with ISSUE_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, ISSUE_OFF_CODE, code
+    proc memory_set_int64 from Memory with record, ISSUE_OFF_LINE, line
+    proc memory_set_int64 from Memory with record, ISSUE_OFF_COL, col
+    proc memory_set_int64 from Memory with record, ISSUE_OFF_MESSAGE, message
+    Return record
+End Process
+
+Process called "rml_validate_well_formed" takes root as Integer returns Integer:
+    Let issues be proc list_create from List
+    If issues is equal to 0:
+        Return 0
+    End If
+    If root is equal to 0:
+        Return issues
+    End If
+    Let elems be proc list_create from List
+    If elems is equal to 0:
+        Return issues
+    End If
+    proc element_walk from Elem with root, elems
+    Let count be proc list_length from List with elems
+    Let i be 0
+    While i is less than count:
+        Let elem be proc list_get from List with elems, i
+        Let tag be proc element_get_tag_name from Elem with elem
+        Let line be proc element_get_source_line from Elem with elem
+        Let col be proc element_get_source_column from Elem with elem
+        If tag is equal to 0:
+            Let issue be proc rml_issue_create with RML_ERR_BAD_IDENT, line, col, "element has no tag name"
+            If issue is not equal to 0:
+                proc list_push from List with issues, issue
+            End If
+        Otherwise:
+            Let tlen be proc string_length from StringCore with tag
+            If tlen is equal to 0:
+                Let issue2 be proc rml_issue_create with RML_ERR_BAD_IDENT, line, col, "element has empty tag name"
+                If issue2 is not equal to 0:
+                    proc list_push from List with issues, issue2
+                End If
+            End If
+        End If
+        Let self_close be proc element_is_self_closing from Elem with elem
+        Let ccount be proc element_child_count from Elem with elem
+        If self_close is equal to 1:
+            If ccount is greater than 0:
+                Let issue3 be proc rml_issue_create with RML_ERR_ORPHAN_CLOSE, line, col, "self-closing element has children"
+                If issue3 is not equal to 0:
+                    proc list_push from List with issues, issue3
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with elems
+    Return issues
+End Process
+
+Process called "rml_issues_destroy" takes issues as Integer returns Integer:
+    If issues is equal to 0:
+        Return RML_OK
+    End If
+    Let count be proc list_length from List with issues
+    Let i be 0
+    While i is less than count:
+        Let issue be proc list_get from List with issues, i
+        proc deallocate from Layout with issue
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with issues
+    Return RML_OK
+End Process

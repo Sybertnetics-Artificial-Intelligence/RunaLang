@@ -1,0 +1,564 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+RING BUFFER - SPSC Byte Ring Buffer Tier 0 Primitive
+
+This file implements a single-producer single-consumer (SPSC) byte
+ring buffer. It is the building block for streaming pipelines where
+one stage produces bytes and another consumes them - lexer pump-ahead
+buffers, syscall I/O buffering, log line buffering, MIDI/serial-style
+byte streams, etc.
+
+Design notes:
+  - Storage holds capacity + 1 bytes so the empty-vs-full distinction
+    can be made by head == tail (empty) vs head == (tail + 1) mod cap.
+    This avoids carrying a separate size counter on the hot path.
+  - Both head (read cursor) and tail (write cursor) advance modulo
+    the allocated size (capacity + 1).
+  - Wrap-around is handled by splitting reads and writes into at most
+    two contiguous spans against the backing array.
+  - The buffer is not thread-safe by itself; SPSC safety requires the
+    producer and consumer to use proper memory-ordering primitives
+    around the head/tail loads which is outside this module's scope.
+    The structure layout is, however, future-compatible with such
+    primitives because head and tail are aligned at 8-byte offsets.
+
+Ring buffer structure (32 bytes):
+  offset 0:  data pointer  (8 bytes)
+  offset 8:  head index    (8 bytes) - next byte to read
+  offset 16: tail index    (8 bytes) - next byte to write
+  offset 24: alloc_size    (8 bytes) - capacity + 1 (backing array bytes)
+
+Logical capacity reported by rb_capacity is alloc_size - 1.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let RB_HEADER_SIZE be 32
+Let RB_MIN_CAPACITY be 16
+
+Note: ============================================================================
+Note: CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Create a ring buffer with the requested logical byte capacity. The
+internal allocation is capacity + 1 bytes to support the head/tail
+empty-vs-full distinction without a separate count.
+
+A capacity below RB_MIN_CAPACITY is rounded up to RB_MIN_CAPACITY so
+small consumers never pay the cost of allocating a tiny page.
+@End Reasoning
+
+@Implementation
+1) Clamp capacity to at least RB_MIN_CAPACITY.
+2) Allocate the 32-byte header.
+3) Allocate (capacity + 1) bytes for storage; zero it.
+4) Initialize head = 0, tail = 0, alloc_size = capacity + 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(capacity) for the storage zero-fill.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure. The zero-fill of storage prevents
+information leakage between allocations.
+@End Security_Scope
+Process called "rb_create" takes capacity as Integer returns Integer:
+    Let real_capacity be capacity
+    If real_capacity is less than RB_MIN_CAPACITY:
+        Set real_capacity to RB_MIN_CAPACITY
+    End If
+    Let rb be proc allocate from Layout with RB_HEADER_SIZE
+    If rb is equal to 0:
+        Return 0
+    End If
+    Let alloc_size be real_capacity plus 1
+    Let data be proc allocate from Layout with alloc_size
+    If data is equal to 0:
+        proc deallocate from Layout with rb
+        Return 0
+    End If
+    proc memory_fill from Memory with data, 0, alloc_size
+    proc memory_set_int64 from Memory with rb, 0, data
+    proc memory_set_int64 from Memory with rb, 8, 0
+    proc memory_set_int64 from Memory with rb, 16, 0
+    proc memory_set_int64 from Memory with rb, 24, alloc_size
+    Return rb
+End Process
+
+@Reasoning
+Release the ring buffer, freeing storage and header.
+@End Reasoning
+
+@Implementation
+Frees the data pointer (if non-null) then the header.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) at the allocator boundary.
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned; do not double-free.
+@End Security_Scope
+Process called "rb_destroy" takes rb as Integer returns Integer:
+    If rb is equal to 0:
+        Return 0
+    End If
+    Let data be proc memory_get_int64 from Memory with rb, 0
+    If data is not equal to 0:
+        proc deallocate from Layout with data
+    End If
+    proc deallocate from Layout with rb
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: STATE QUERIES
+Note: ============================================================================
+
+@Reasoning
+Logical capacity of the ring buffer (alloc_size - 1).
+@End Reasoning
+
+@Implementation
+Returns alloc_size - 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "rb_capacity" takes rb as Integer returns Integer:
+    If rb is equal to 0:
+        Return 0
+    End If
+    Let alloc_size be proc memory_get_int64 from Memory with rb, 24
+    Return alloc_size minus 1
+End Process
+
+@Reasoning
+Number of bytes currently readable. Computed as (tail - head + alloc_size)
+mod alloc_size, expressed as a positive value.
+@End Reasoning
+
+@Implementation
+1) Read head and tail.
+2) If tail >= head, return tail - head.
+3) Otherwise return tail + alloc_size - head.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "rb_available_read" takes rb as Integer returns Integer:
+    If rb is equal to 0:
+        Return 0
+    End If
+    Let head be proc memory_get_int64 from Memory with rb, 8
+    Let tail be proc memory_get_int64 from Memory with rb, 16
+    Let alloc_size be proc memory_get_int64 from Memory with rb, 24
+    If tail is greater than or equal to head:
+        Return tail minus head
+    End If
+    Return (tail plus alloc_size) minus head
+End Process
+
+@Reasoning
+Number of bytes that can be written before the buffer is full.
+Equal to capacity - available_read.
+@End Reasoning
+
+@Implementation
+Computes capacity - available_read where capacity = alloc_size - 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "rb_available_write" takes rb as Integer returns Integer:
+    If rb is equal to 0:
+        Return 0
+    End If
+    Let alloc_size be proc memory_get_int64 from Memory with rb, 24
+    Let capacity be alloc_size minus 1
+    Let used be proc rb_available_read with rb
+    Return capacity minus used
+End Process
+
+@Reasoning
+Empty predicate: head == tail.
+@End Reasoning
+
+@Implementation
+Returns 1 if head equals tail; otherwise 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "rb_is_empty" takes rb as Integer returns Integer:
+    If rb is equal to 0:
+        Return 1
+    End If
+    Let head be proc memory_get_int64 from Memory with rb, 8
+    Let tail be proc memory_get_int64 from Memory with rb, 16
+    If head is equal to tail:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Full predicate: (tail + 1) mod alloc_size == head.
+@End Reasoning
+
+@Implementation
+1) Compute next_tail = (tail + 1) mod alloc_size.
+2) Return 1 if next_tail equals head.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "rb_is_full" takes rb as Integer returns Integer:
+    If rb is equal to 0:
+        Return 0
+    End If
+    Let head be proc memory_get_int64 from Memory with rb, 8
+    Let tail be proc memory_get_int64 from Memory with rb, 16
+    Let alloc_size be proc memory_get_int64 from Memory with rb, 24
+    Let next_tail be tail plus 1
+    If next_tail is greater than or equal to alloc_size:
+        Set next_tail to next_tail minus alloc_size
+    End If
+    If next_tail is equal to head:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: WRITE PATH
+Note: ============================================================================
+
+@Reasoning
+Write up to count bytes from the source buffer into the ring buffer.
+Writes the minimum of count and available_write bytes, splitting into
+at most two contiguous spans if the write wraps the end of the
+internal storage. Returns the number of bytes actually written.
+@End Reasoning
+
+@Implementation
+1) Empty / null checks.
+2) writable = min(count, available_write).
+3) If writable == 0 return 0.
+4) first_span = min(writable, alloc_size - tail).
+5) memory_copy data + tail <- src, first_span.
+6) Advance tail by first_span; if it reaches alloc_size, wrap to 0.
+7) If writable > first_span, copy remaining from src + first_span.
+8) Update tail in header.
+9) Return writable.
+@End Implementation
+
+@Performance_Hints
+Time: O(count). Two memory_copy calls in the wrap-around case.
+@End Performance_Hints
+
+@Security_Scope
+Bounds-checked against available_write; never writes past capacity.
+Returns 0 for null inputs or count <= 0.
+@End Security_Scope
+Process called "rb_write" takes rb as Integer, src as Integer, count as Integer returns Integer:
+    If rb is equal to 0:
+        Return 0
+    End If
+    If src is equal to 0:
+        Return 0
+    End If
+    If count is less than or equal to 0:
+        Return 0
+    End If
+    Let available be proc rb_available_write with rb
+    Let writable be count
+    If writable is greater than available:
+        Set writable to available
+    End If
+    If writable is equal to 0:
+        Return 0
+    End If
+    Let data be proc memory_get_int64 from Memory with rb, 0
+    Let tail be proc memory_get_int64 from Memory with rb, 16
+    Let alloc_size be proc memory_get_int64 from Memory with rb, 24
+    Let first_span be alloc_size minus tail
+    If first_span is greater than writable:
+        Set first_span to writable
+    End If
+    Let dst_first be data plus tail
+    proc memory_copy from Memory with dst_first, src, first_span
+    Let remaining be writable minus first_span
+    If remaining is greater than 0:
+        Let src_second be src plus first_span
+        proc memory_copy from Memory with data, src_second, remaining
+    End If
+    Let new_tail be tail plus writable
+    If new_tail is greater than or equal to alloc_size:
+        Set new_tail to new_tail minus alloc_size
+    End If
+    proc memory_set_int64 from Memory with rb, 16, new_tail
+    Return writable
+End Process
+
+@Reasoning
+Append a single byte to the buffer. Returns 1 if successful, 0 if the
+buffer is full.
+@End Reasoning
+
+@Implementation
+1) Full check.
+2) Store byte at data[tail].
+3) Advance tail (with wrap).
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if the buffer is full or rb is null.
+@End Security_Scope
+Process called "rb_write_byte" takes rb as Integer, value as Integer returns Integer:
+    If rb is equal to 0:
+        Return 0
+    End If
+    Let full be proc rb_is_full with rb
+    If full is equal to 1:
+        Return 0
+    End If
+    Let data be proc memory_get_int64 from Memory with rb, 0
+    Let tail be proc memory_get_int64 from Memory with rb, 16
+    Let alloc_size be proc memory_get_int64 from Memory with rb, 24
+    Let byte_val be value bitwise and 255
+    proc memory_set_byte from Memory with data, tail, byte_val
+    Let new_tail be tail plus 1
+    If new_tail is greater than or equal to alloc_size:
+        Set new_tail to new_tail minus alloc_size
+    End If
+    proc memory_set_int64 from Memory with rb, 16, new_tail
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: READ PATH
+Note: ============================================================================
+
+@Reasoning
+Read up to max_count bytes into the destination buffer. Returns the
+number of bytes actually read.
+@End Reasoning
+
+@Implementation
+1) Null checks.
+2) readable = min(max_count, available_read).
+3) first_span = min(readable, alloc_size - head).
+4) memory_copy dst <- data + head, first_span.
+5) Advance head by first_span (wrap if needed).
+6) If readable > first_span, copy remaining into dst + first_span.
+7) Update head in header.
+8) Return readable.
+@End Implementation
+
+@Performance_Hints
+Time: O(max_count). Two memory_copy calls in wrap-around case.
+@End Performance_Hints
+
+@Security_Scope
+Bounds-checked against available_read. Returns 0 for null inputs or
+max_count <= 0.
+@End Security_Scope
+Process called "rb_read" takes rb as Integer, dst as Integer, max_count as Integer returns Integer:
+    If rb is equal to 0:
+        Return 0
+    End If
+    If dst is equal to 0:
+        Return 0
+    End If
+    If max_count is less than or equal to 0:
+        Return 0
+    End If
+    Let available be proc rb_available_read with rb
+    Let readable be max_count
+    If readable is greater than available:
+        Set readable to available
+    End If
+    If readable is equal to 0:
+        Return 0
+    End If
+    Let data be proc memory_get_int64 from Memory with rb, 0
+    Let head be proc memory_get_int64 from Memory with rb, 8
+    Let alloc_size be proc memory_get_int64 from Memory with rb, 24
+    Let first_span be alloc_size minus head
+    If first_span is greater than readable:
+        Set first_span to readable
+    End If
+    Let src_first be data plus head
+    proc memory_copy from Memory with dst, src_first, first_span
+    Let remaining be readable minus first_span
+    If remaining is greater than 0:
+        Let dst_second be dst plus first_span
+        proc memory_copy from Memory with dst_second, data, remaining
+    End If
+    Let new_head be head plus readable
+    If new_head is greater than or equal to alloc_size:
+        Set new_head to new_head minus alloc_size
+    End If
+    proc memory_set_int64 from Memory with rb, 8, new_head
+    Return readable
+End Process
+
+@Reasoning
+Remove and return a single byte from the buffer. Returns -1 if the
+buffer is empty so callers can distinguish a real zero byte from
+end-of-stream.
+@End Reasoning
+
+@Implementation
+1) Empty check (return -1).
+2) Load data[head].
+3) Advance head with wrap.
+4) Return byte (0..255 as Integer).
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on empty.
+@End Security_Scope
+Process called "rb_read_byte" takes rb as Integer returns Integer:
+    If rb is equal to 0:
+        Return -1
+    End If
+    Let empty be proc rb_is_empty with rb
+    If empty is equal to 1:
+        Return -1
+    End If
+    Let data be proc memory_get_int64 from Memory with rb, 0
+    Let head be proc memory_get_int64 from Memory with rb, 8
+    Let alloc_size be proc memory_get_int64 from Memory with rb, 24
+    Let byte_val be proc memory_get_byte from Memory with data, head
+    Let new_head be head plus 1
+    If new_head is greater than or equal to alloc_size:
+        Set new_head to new_head minus alloc_size
+    End If
+    proc memory_set_int64 from Memory with rb, 8, new_head
+    Return byte_val
+End Process
+
+@Reasoning
+Peek a single byte from the buffer without advancing the read cursor.
+Returns -1 if the buffer is empty.
+@End Reasoning
+
+@Implementation
+1) Empty check (return -1).
+2) Load data[head] and return.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on empty.
+@End Security_Scope
+Process called "rb_peek_byte" takes rb as Integer returns Integer:
+    If rb is equal to 0:
+        Return -1
+    End If
+    Let empty be proc rb_is_empty with rb
+    If empty is equal to 1:
+        Return -1
+    End If
+    Let data be proc memory_get_int64 from Memory with rb, 0
+    Let head be proc memory_get_int64 from Memory with rb, 8
+    Return proc memory_get_byte from Memory with data, head
+End Process
+
+Note: ============================================================================
+Note: RESET
+Note: ============================================================================
+
+@Reasoning
+Reset the buffer to the empty state without freeing storage.
+Both head and tail are zeroed.
+@End Reasoning
+
+@Implementation
+1) Read current alloc_size.
+2) Set head = 0, tail = 0.
+3) Zero the storage so stale bytes never leak into future reads
+   (defense in depth - the cursor invariants alone are enough).
+@End Implementation
+
+@Performance_Hints
+Time: O(alloc_size) due to the zero fill.
+@End Performance_Hints
+
+@Security_Scope
+Defense-in-depth zero of storage; safe to call on a non-null buffer.
+@End Security_Scope
+Process called "rb_reset" takes rb as Integer returns Integer:
+    If rb is equal to 0:
+        Return 0
+    End If
+    Let data be proc memory_get_int64 from Memory with rb, 0
+    Let alloc_size be proc memory_get_int64 from Memory with rb, 24
+    proc memory_set_int64 from Memory with rb, 8, 0
+    proc memory_set_int64 from Memory with rb, 16, 0
+    If data is not equal to 0:
+        proc memory_fill from Memory with data, 0, alloc_size
+    End If
+    Return 1
+End Process

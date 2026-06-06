@@ -1,0 +1,270 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+WORK-STEALING DEQUE - Per-thread deque with work-stealing.
+
+Single-owner-pushes-and-pops-from-bottom, multiple-stealers-take-from-top.
+Based on the Chase-Lev deque algorithm. Atomic ordering uses the in-tree
+atomic_core.runa primitives: relaxed loads/stores on the owner's bottom
+index, sequentially-consistent CAS on the stealer top index, and acquire
+fences around steal/take to preserve the Chase-Lev consistency invariants.
+
+WSQ layout (32 bytes):
+  offset 0:  bottom_index     (8 bytes) - owner thread reads/writes
+  offset 8:  top_index        (8 bytes) - stealers CAS this
+  offset 16: buffer_ptr       (8 bytes) - circular buffer of task pointers
+  offset 24: buffer_capacity  (8 bytes) - capacity (power of 2)
+
+The buffer stores task pointers. Owner enqueues at bottom (incrementing),
+dequeues from bottom (decrementing). Stealers steal from top via CAS.
+
+Dependencies:
+- core/atomic_core.runa
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant WSQ_OFF_BOTTOM as Integer is 0
+Constant WSQ_OFF_TOP as Integer is 8
+Constant WSQ_OFF_BUFFER as Integer is 16
+Constant WSQ_OFF_CAPACITY as Integer is 24
+Constant WSQ_STRUCT_SIZE as Integer is 32
+
+Constant WSQ_OK as Integer is 1
+Constant WSQ_ERR_INVALID as Integer is 0
+Constant WSQ_ERR_FULL as Integer is -1
+Constant WSQ_EMPTY as Integer is 0
+Constant WSQ_ABORT as Integer is -2
+
+@Reasoning
+Create a fixed-capacity work-stealing queue. The capacity must be a power
+of two so we can use bitwise-and instead of modulo for index masking.
+@End Reasoning
+
+@Implementation
+Allocate the WSQ record and a buffer of capacity * 8 bytes. Initialize
+top and bottom to zero. The caller is responsible for ensuring capacity
+is a power of two; we round non-power-of-two values up.
+@End Implementation
+
+@Performance_Hints
+The capacity is fixed - no resize. Choose a capacity that comfortably
+exceeds expected concurrency level.
+@End Performance_Hints
+
+@Security_Scope
+Stored task pointers must remain valid until they are popped or stolen.
+@End Security_Scope
+
+Process called "wsq_round_up_pow2" takes n as Integer returns Integer:
+    If n is less than or equal to 1:
+        Return 1
+    End If
+    Let p be 1
+    While p is less than n:
+        Set p to p multiplied by 2
+    End While
+    Return p
+End Process
+
+Process called "wsq_create" takes capacity as Integer returns Integer:
+    Let cap be proc wsq_round_up_pow2 with capacity
+    If cap is less than 2:
+        Set cap to 2
+    End If
+
+    Let q be proc allocate from Memory with WSQ_STRUCT_SIZE
+    If q is equal to 0:
+        Return 0
+    End If
+
+    Let buffer_bytes be cap multiplied by 8
+    Let buffer be proc allocate from Memory with buffer_bytes
+    If buffer is equal to 0:
+        proc deallocate from Memory with q
+        Return 0
+    End If
+
+    proc memory_set_int64 from Mem with q, WSQ_OFF_BOTTOM, 0
+    proc memory_set_int64 from Mem with q, WSQ_OFF_TOP, 0
+    proc memory_set_int64 from Mem with q, WSQ_OFF_BUFFER, buffer
+    proc memory_set_int64 from Mem with q, WSQ_OFF_CAPACITY, cap
+    Return q
+End Process
+
+Process called "wsq_destroy" takes q as Integer returns Integer:
+    If q is equal to 0:
+        Return WSQ_ERR_INVALID
+    End If
+    Let buffer be proc memory_get_int64 from Mem with q, WSQ_OFF_BUFFER
+    If buffer is not equal to 0:
+        proc deallocate from Memory with buffer
+    End If
+    proc deallocate from Memory with q
+    Return WSQ_OK
+End Process
+
+@Reasoning
+Owner pushes a task at the bottom. Returns OK on success or FULL if the
+buffer is at capacity.
+@End Reasoning
+
+@Implementation
+Load bottom, load top with acquire, check that bottom - top < capacity,
+write task at buffer[bottom & mask], release-store new bottom.
+@End Implementation
+
+@Performance_Hints
+Single owner - no CAS required. One acquire load + one release store.
+@End Performance_Hints
+
+@Security_Scope
+Caller must be the owning thread.
+@End Security_Scope
+
+Process called "wsq_push" takes q as Integer, task_ptr as Integer returns Integer:
+    If q is equal to 0:
+        Return WSQ_ERR_INVALID
+    End If
+    Let bottom be proc atomic_load_relaxed from Atomic with (q plus WSQ_OFF_BOTTOM)
+    Let top be proc atomic_load_acquire from Atomic with (q plus WSQ_OFF_TOP)
+    Let capacity be proc memory_get_int64 from Mem with q, WSQ_OFF_CAPACITY
+    Let size be bottom minus top
+    If size is greater than or equal to capacity:
+        Return WSQ_ERR_FULL
+    End If
+
+    Let buffer be proc memory_get_int64 from Mem with q, WSQ_OFF_BUFFER
+    Let mask be capacity minus 1
+    Let idx be bottom bitwise and mask
+    Let offset be idx multiplied by 8
+    proc memory_set_int64 from Mem with buffer, offset, task_ptr
+
+    proc atomic_store_release from Atomic with (q plus WSQ_OFF_BOTTOM), (bottom plus 1)
+    Return WSQ_OK
+End Process
+
+@Reasoning
+Owner pops a task from the bottom. Returns 0 if the queue is empty, or
+the task pointer on success.
+@End Reasoning
+
+@Implementation
+Decrement bottom (relaxed), full fence, load top. If bottom < top the
+queue is empty; restore bottom and return 0. If bottom == top there is
+exactly one task and we race with a stealer via CAS on top. Otherwise the
+task is ours.
+@End Implementation
+
+@Performance_Hints
+Most pops are uncontended (single owner). The CAS occurs only when the
+queue has exactly one element.
+@End Performance_Hints
+
+@Security_Scope
+Caller must be the owning thread.
+@End Security_Scope
+
+Process called "wsq_pop_local" takes q as Integer returns Integer:
+    If q is equal to 0:
+        Return 0
+    End If
+    Let old_bottom be proc atomic_load_relaxed from Atomic with (q plus WSQ_OFF_BOTTOM)
+    Let new_bottom be old_bottom minus 1
+    proc atomic_store_seq_cst from Atomic with (q plus WSQ_OFF_BOTTOM), new_bottom
+
+    proc memory_barrier_seq_cst from Atomic
+
+    Let top be proc atomic_load_relaxed from Atomic with (q plus WSQ_OFF_TOP)
+    If new_bottom is less than top:
+        Note: Queue empty - restore bottom
+        proc atomic_store_relaxed from Atomic with (q plus WSQ_OFF_BOTTOM), top
+        Return 0
+    End If
+
+    Let capacity be proc memory_get_int64 from Mem with q, WSQ_OFF_CAPACITY
+    Let buffer be proc memory_get_int64 from Mem with q, WSQ_OFF_BUFFER
+    Let mask be capacity minus 1
+    Let idx be new_bottom bitwise and mask
+    Let offset be idx multiplied by 8
+    Let task_ptr be proc memory_get_int64 from Mem with buffer, offset
+
+    If new_bottom is greater than top:
+        Return task_ptr
+    End If
+
+    Note: Exactly one element - race with stealer
+    Let cas_ok be proc atomic_compare_and_swap from Atomic with (q plus WSQ_OFF_TOP), top, (top plus 1)
+    If cas_ok is equal to 1:
+        proc atomic_store_relaxed from Atomic with (q plus WSQ_OFF_BOTTOM), (top plus 1)
+        Return task_ptr
+    End If
+
+    Note: Stealer won the race
+    proc atomic_store_relaxed from Atomic with (q plus WSQ_OFF_BOTTOM), (top plus 1)
+    Return 0
+End Process
+
+@Reasoning
+Steal a task from the top of another thread's queue. Returns the stolen
+task pointer or 0 if empty/aborted.
+@End Reasoning
+
+@Implementation
+Load top (acquire), load bottom (acquire). If empty return 0. Read task
+at top, CAS top forward. If CAS fails, another stealer beat us.
+@End Implementation
+
+@Performance_Hints
+Steal contention can be high under fan-out. Backoff in caller if many
+consecutive steals fail.
+@End Performance_Hints
+
+@Security_Scope
+Stealable from any thread except the owner (owner uses wsq_pop_local).
+@End Security_Scope
+
+Process called "wsq_steal" takes q as Integer returns Integer:
+    If q is equal to 0:
+        Return 0
+    End If
+    Let top be proc atomic_load_acquire from Atomic with (q plus WSQ_OFF_TOP)
+    proc memory_barrier_seq_cst from Atomic
+    Let bottom be proc atomic_load_acquire from Atomic with (q plus WSQ_OFF_BOTTOM)
+
+    If top is greater than or equal to bottom:
+        Return 0
+    End If
+
+    Let capacity be proc memory_get_int64 from Mem with q, WSQ_OFF_CAPACITY
+    Let buffer be proc memory_get_int64 from Mem with q, WSQ_OFF_BUFFER
+    Let mask be capacity minus 1
+    Let idx be top bitwise and mask
+    Let offset be idx multiplied by 8
+    Let task_ptr be proc memory_get_int64 from Mem with buffer, offset
+
+    Let cas_ok be proc atomic_compare_and_swap from Atomic with (q plus WSQ_OFF_TOP), top, (top plus 1)
+    If cas_ok is equal to 1:
+        Return task_ptr
+    End If
+    Return 0
+End Process
+
+Process called "wsq_size" takes q as Integer returns Integer:
+    If q is equal to 0:
+        Return 0
+    End If
+    Let bottom be proc atomic_load_acquire from Atomic with (q plus WSQ_OFF_BOTTOM)
+    Let top be proc atomic_load_acquire from Atomic with (q plus WSQ_OFF_TOP)
+    Let size be bottom minus top
+    If size is less than 0:
+        Return 0
+    End If
+    Return size
+End Process

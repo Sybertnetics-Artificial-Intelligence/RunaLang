@@ -1,0 +1,406 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+Variable-dimension Float64 vector (VectorN).
+
+Memory layout:
+  Offset 0: dim (Integer, number of Float64 components)
+  Offset 8: pointer to flat Float64 buffer of (dim * 8) bytes
+
+Operations:
+  - allocate(dim) / free
+  - get_dim / set_component / get_component
+  - copy
+  - add / sub / scalar_mul / negate
+  - dot (inner product)
+  - magnitude / magnitude_squared / normalize
+  - distance / distance_squared
+  - lerp
+  - angle_between
+  - project (proj of a onto b)
+
+@Reasoning
+VectorN serves as the foundation for higher-dimensional numeric work:
+machine learning feature vectors, statistical state vectors, simplex
+LP solver columns, and generalized geometry. Its allocator is split
+header + buffer so multiple VectorNs of differing dimensions can share
+the same allocator pool.
+@End Reasoning
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/core/trig_core.runa" as Trig
+
+Constant VECTOR_N_HEADER_BYTES as Integer is 16
+Constant VECTOR_N_LANE_BYTES as Integer is 8
+
+Process called "vn_float_to_bits" takes x as Float returns Integer:
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "vn_bits_to_float" takes b as Integer returns Float:
+    Let result be 0.0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "vector_n_get_dim" takes v as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with v, 0
+End Process
+
+Process called "vector_n_get_buffer" takes v as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+Process called "vector_n_allocate" takes dim as Integer returns Integer:
+    @Reasoning
+        Allocate header (16 bytes) plus a flat buffer (dim * 8 bytes).
+    @End Reasoning
+    @Implementation
+        Two Layout.allocate calls.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Buffer is zeroed by allocator.
+    @End Security_Scope
+    If dim is less than 1:
+        Return 0
+    End If
+    Let v be proc allocate from Layout with VECTOR_N_HEADER_BYTES
+    If v is equal to 0:
+        Return 0
+    End If
+    Let buf be proc allocate from Layout with dim multiplied by VECTOR_N_LANE_BYTES
+    If buf is equal to 0:
+        Let _f be proc deallocate from Layout with v
+        Return 0
+    End If
+    Let _wd be proc memory_set_int64 from Memory with v, 0, dim
+    Let _wb be proc memory_set_int64 from Memory with v, 8, buf
+    Return v
+End Process
+
+Process called "vector_n_free" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let buf be proc vector_n_get_buffer with v
+    If buf is not equal to 0:
+        Let _fb be proc deallocate from Layout with buf
+    End If
+    Let _fv be proc deallocate from Layout with v
+    Return 0
+End Process
+
+Process called "vector_n_set_component" takes v as Integer, idx as Integer, value as Float returns Integer:
+    Let dim be proc vector_n_get_dim with v
+    If idx is greater than (dim minus 1):
+        Return -1
+    End If
+    If idx is less than 0:
+        Return -1
+    End If
+    Let buf be proc vector_n_get_buffer with v
+    Let bits be proc vn_float_to_bits with value
+    Let _w be proc memory_set_int64 from Memory with buf, idx multiplied by VECTOR_N_LANE_BYTES, bits
+    Return 0
+End Process
+
+Process called "vector_n_get_component" takes v as Integer, idx as Integer returns Float:
+    Let dim be proc vector_n_get_dim with v
+    If idx is greater than (dim minus 1):
+        Return 0.0
+    End If
+    If idx is less than 0:
+        Return 0.0
+    End If
+    Let buf be proc vector_n_get_buffer with v
+    Let bits be proc memory_get_int64 from Memory with buf, idx multiplied by VECTOR_N_LANE_BYTES
+    Return proc vn_bits_to_float with bits
+End Process
+
+Process called "vector_n_copy" takes src as Integer, dst as Integer returns Integer:
+    Let dim_s be proc vector_n_get_dim with src
+    Let dim_d be proc vector_n_get_dim with dst
+    If dim_s is not equal to dim_d:
+        Return -1
+    End If
+    Let bs be proc vector_n_get_buffer with src
+    Let bd be proc vector_n_get_buffer with dst
+    Let _c be proc memory_copy from Memory with bd, bs, dim_s multiplied by VECTOR_N_LANE_BYTES
+    Return 0
+End Process
+
+Process called "vector_n_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Lane-wise sum. All three operands must have the same dimension.
+    @End Reasoning
+    @Implementation
+        Loop over dim.
+    @End Implementation
+    @Performance_Hints
+        O(dim).
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe: each step reads both operands then writes result.
+    @End Security_Scope
+    Let da be proc vector_n_get_dim with a
+    Let db be proc vector_n_get_dim with b
+    Let dr be proc vector_n_get_dim with result
+    If da is not equal to db:
+        Return -1
+    End If
+    If da is not equal to dr:
+        Return -1
+    End If
+    Let i be 0
+    While i is less than da:
+        Let av be proc vector_n_get_component with a, i
+        Let bv be proc vector_n_get_component with b, i
+        Let _w be proc vector_n_set_component with result, i, av plus bv
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "vector_n_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let da be proc vector_n_get_dim with a
+    Let db be proc vector_n_get_dim with b
+    Let dr be proc vector_n_get_dim with result
+    If da is not equal to db:
+        Return -1
+    End If
+    If da is not equal to dr:
+        Return -1
+    End If
+    Let i be 0
+    While i is less than da:
+        Let av be proc vector_n_get_component with a, i
+        Let bv be proc vector_n_get_component with b, i
+        Let _w be proc vector_n_set_component with result, i, av minus bv
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "vector_n_scalar_mul" takes v as Integer, s as Float, result as Integer returns Integer:
+    Let dv be proc vector_n_get_dim with v
+    Let dr be proc vector_n_get_dim with result
+    If dv is not equal to dr:
+        Return -1
+    End If
+    Let i be 0
+    While i is less than dv:
+        Let val be proc vector_n_get_component with v, i
+        Let _w be proc vector_n_set_component with result, i, val multiplied by s
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "vector_n_negate" takes v as Integer, result as Integer returns Integer:
+    Let neg_one be 0.0 minus 1.0
+    Let _r be proc vector_n_scalar_mul with v, neg_one, result
+    Return _r
+End Process
+
+Process called "vector_n_dot" takes a as Integer, b as Integer returns Float:
+    @Reasoning
+        Inner product. Returns 0.0 if dimensions disagree (callers should
+        verify dimensions separately if they need that distinction from
+        an actual zero dot).
+    @End Reasoning
+    @Implementation
+        Single-pass accumulator.
+    @End Implementation
+    @Performance_Hints
+        O(dim).
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time on dim.
+    @End Security_Scope
+    Let da be proc vector_n_get_dim with a
+    Let db be proc vector_n_get_dim with b
+    If da is not equal to db:
+        Return 0.0
+    End If
+    Let sum be 0.0
+    Let i be 0
+    While i is less than da:
+        Let av be proc vector_n_get_component with a, i
+        Let bv be proc vector_n_get_component with b, i
+        Set sum to sum plus (av multiplied by bv)
+        Set i to i plus 1
+    End While
+    Return sum
+End Process
+
+Process called "vector_n_magnitude_squared" takes v as Integer returns Float:
+    Let dim be proc vector_n_get_dim with v
+    Let sum be 0.0
+    Let i be 0
+    While i is less than dim:
+        Let val be proc vector_n_get_component with v, i
+        Set sum to sum plus (val multiplied by val)
+        Set i to i plus 1
+    End While
+    Return sum
+End Process
+
+Process called "vector_n_magnitude" takes v as Integer returns Float:
+    Let mag_sq be proc vector_n_magnitude_squared with v
+    Return proc sqrt from Arith with mag_sq
+End Process
+
+Process called "vector_n_normalize" takes v as Integer, result as Integer returns Integer:
+    Let mag be proc vector_n_magnitude with v
+    If mag is equal to 0.0:
+        Return -1
+    End If
+    Let inv be 1.0 divided by mag
+    Let _r be proc vector_n_scalar_mul with v, inv, result
+    Return _r
+End Process
+
+Process called "vector_n_distance" takes a as Integer, b as Integer returns Float:
+    Let da be proc vector_n_get_dim with a
+    Let db be proc vector_n_get_dim with b
+    If da is not equal to db:
+        Return 0.0
+    End If
+    Let sum be 0.0
+    Let i be 0
+    While i is less than da:
+        Let av be proc vector_n_get_component with a, i
+        Let bv be proc vector_n_get_component with b, i
+        Let diff be av minus bv
+        Set sum to sum plus (diff multiplied by diff)
+        Set i to i plus 1
+    End While
+    Return proc sqrt from Arith with sum
+End Process
+
+Process called "vector_n_distance_squared" takes a as Integer, b as Integer returns Float:
+    Let da be proc vector_n_get_dim with a
+    Let db be proc vector_n_get_dim with b
+    If da is not equal to db:
+        Return 0.0
+    End If
+    Let sum be 0.0
+    Let i be 0
+    While i is less than da:
+        Let av be proc vector_n_get_component with a, i
+        Let bv be proc vector_n_get_component with b, i
+        Let diff be av minus bv
+        Set sum to sum plus (diff multiplied by diff)
+        Set i to i plus 1
+    End While
+    Return sum
+End Process
+
+Process called "vector_n_lerp" takes a as Integer, b as Integer, t as Float, result as Integer returns Integer:
+    Let da be proc vector_n_get_dim with a
+    Let db be proc vector_n_get_dim with b
+    Let dr be proc vector_n_get_dim with result
+    If da is not equal to db:
+        Return -1
+    End If
+    If da is not equal to dr:
+        Return -1
+    End If
+    Let i be 0
+    While i is less than da:
+        Let av be proc vector_n_get_component with a, i
+        Let bv be proc vector_n_get_component with b, i
+        Let val be av plus (t multiplied by (bv minus av))
+        Let _w be proc vector_n_set_component with result, i, val
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "vector_n_angle_between" takes a as Integer, b as Integer returns Float:
+    @Reasoning
+        theta = acos( (a . b) / (|a| * |b|) ). Cosine is clamped to
+        [-1, 1] to defeat accumulated rounding.
+    @End Reasoning
+    @Implementation
+        Compose dot + magnitudes + acos.
+    @End Implementation
+    @Performance_Hints
+        Two magnitudes + one dot + one acos.
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0.0 on dimension mismatch or zero vectors.
+    @End Security_Scope
+    Let da be proc vector_n_get_dim with a
+    Let db be proc vector_n_get_dim with b
+    If da is not equal to db:
+        Return 0.0
+    End If
+    Let dot be proc vector_n_dot with a, b
+    Let ma be proc vector_n_magnitude with a
+    Let mb be proc vector_n_magnitude with b
+    Let denom be ma multiplied by mb
+    If denom is equal to 0.0:
+        Return 0.0
+    End If
+    Let cos_t be dot divided by denom
+    If cos_t is greater than 1.0:
+        Set cos_t to 1.0
+    End If
+    Let neg_one be 0.0 minus 1.0
+    If cos_t is less than neg_one:
+        Set cos_t to neg_one
+    End If
+    Let cbits be proc vn_float_to_bits with cos_t
+    Let theta_bits be proc acos from Trig with cbits
+    Return proc vn_bits_to_float with theta_bits
+End Process
+
+Process called "vector_n_project" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Projection of a onto b. Formula: proj_b(a) = (a . b / b . b) * b.
+    @End Reasoning
+    @Implementation
+        Dot + magnitude_squared + scalar_mul.
+    @End Implementation
+    @Performance_Hints
+        Two dots + one division + one scalar_mul.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 on |b| = 0 or dim mismatch.
+    @End Security_Scope
+    Let dab be proc vector_n_get_dim with a
+    Let dbb be proc vector_n_get_dim with b
+    Let dr be proc vector_n_get_dim with result
+    If dab is not equal to dbb:
+        Return -1
+    End If
+    If dab is not equal to dr:
+        Return -1
+    End If
+    Let dot be proc vector_n_dot with a, b
+    Let bb_sq be proc vector_n_magnitude_squared with b
+    If bb_sq is equal to 0.0:
+        Return -1
+    End If
+    Let k be dot divided by bb_sq
+    Let _r be proc vector_n_scalar_mul with b, k, result
+    Return _r
+End Process

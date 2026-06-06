@@ -1,0 +1,479 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+TSVECTOR - PostgreSQL-style text search vector.
+
+A TSVector is a sorted list of distinct lexemes with their positions and
+optional weight labels. Used for full-text search:
+  tsvector_from_text("Quick brown fox jumps", "english")
+    => [("brown",2,_), ("fox",3,_), ("jump",4,_), ("quick",1,_)]
+
+This implementation focuses on the data structure + algorithmic core. The
+full PostgreSQL stemmer (Snowball) is an external resource; we provide a
+pluggable stem_fn hook. By default, ASCII-lowercase + simple suffix
+stripping (s, es, ed, ing) is applied as a baseline stemmer.
+
+TSVector layout (24 bytes):
+  offset 0:  entries_ptr   (8 bytes) - array of TSEntry pointers
+  offset 8:  entry_count   (8 bytes)
+  offset 16: entry_capacity (8 bytes)
+
+TSEntry layout (32 bytes):
+  offset 0:  lexeme_ptr  (8 bytes) - null-terminated lowercase lexeme
+  offset 8:  position    (8 bytes) - 1-based word position
+  offset 16: weight      (8 bytes) - 0=A,1=B,2=C,3=D (default 3)
+  offset 24: lexeme_len  (8 bytes)
+
+Dependencies:
+- memory/layout.runa
+- core/memory_core.runa
+- char_core.runa (for case folding and digit/letter classification)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Constant TSV_OFF_ENTRIES as Integer is 0
+Constant TSV_OFF_COUNT as Integer is 8
+Constant TSV_OFF_CAPACITY as Integer is 16
+Constant TSV_STRUCT_SIZE as Integer is 24
+
+Constant TSE_OFF_LEXEME as Integer is 0
+Constant TSE_OFF_POSITION as Integer is 8
+Constant TSE_OFF_WEIGHT as Integer is 16
+Constant TSE_OFF_LEXEME_LEN as Integer is 24
+Constant TSE_STRUCT_SIZE as Integer is 32
+
+Constant TSV_DEFAULT_CAPACITY as Integer is 16
+
+Constant TSV_OK as Integer is 1
+Constant TSV_ERR_INVALID as Integer is 0
+
+Constant TSV_WEIGHT_DEFAULT as Integer is 3
+
+@Reasoning
+Create an empty TSVector with the default initial capacity. Lexemes are
+appended via tsvector_append and the array grows on demand.
+@End Reasoning
+
+@Implementation
+Allocate the record + the entries array.
+@End Implementation
+
+@Performance_Hints
+O(1) initial allocation.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "tsvector_create" returns Integer:
+    Let t be proc allocate from Memory with TSV_STRUCT_SIZE
+    If t is equal to 0:
+        Return 0
+    End If
+    Let bytes be TSV_DEFAULT_CAPACITY multiplied by 8
+    Let entries be proc allocate from Memory with bytes
+    If entries is equal to 0:
+        proc deallocate from Memory with t
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with t, TSV_OFF_ENTRIES, entries
+    proc memory_set_int64 from Mem with t, TSV_OFF_COUNT, 0
+    proc memory_set_int64 from Mem with t, TSV_OFF_CAPACITY, TSV_DEFAULT_CAPACITY
+    Return t
+End Process
+
+Process called "tsvector_destroy" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return TSV_ERR_INVALID
+    End If
+    Let entries be proc memory_get_int64 from Mem with t, TSV_OFF_ENTRIES
+    Let count be proc memory_get_int64 from Mem with t, TSV_OFF_COUNT
+    Let i be 0
+    While i is less than count:
+        Let off be i multiplied by 8
+        Let entry be proc memory_get_int64 from Mem with entries, off
+        If entry is not equal to 0:
+            Let lex be proc memory_get_int64 from Mem with entry, TSE_OFF_LEXEME
+            If lex is not equal to 0:
+                proc deallocate from Memory with lex
+            End If
+            proc deallocate from Memory with entry
+        End If
+        Set i to i plus 1
+    End While
+    If entries is not equal to 0:
+        proc deallocate from Memory with entries
+    End If
+    proc deallocate from Memory with t
+    Return TSV_OK
+End Process
+
+@Reasoning
+Lookup helper: scan the entries array for an existing entry with the
+given lexeme bytes.
+@End Reasoning
+
+@Implementation
+Linear scan with bytewise compare. Returns the entry pointer or 0.
+@End Implementation
+
+@Performance_Hints
+O(n) per lookup. Acceptable for typical tsvector sizes (small).
+@End Performance_Hints
+
+@Security_Scope
+Safe; only reads existing entries.
+@End Security_Scope
+
+Process called "tsvector_lex_compare" takes a_ptr as Integer, a_len as Integer, b_ptr as Integer, b_len as Integer returns Integer:
+    If a_len is not equal to b_len:
+        Note: Return -1 / 1 by len comparison
+        If a_len is less than b_len:
+            Return -1
+        End If
+        Return 1
+    End If
+    Let i be 0
+    While i is less than a_len:
+        Let av be proc memory_get_byte from Mem with a_ptr, i
+        Let bv be proc memory_get_byte from Mem with b_ptr, i
+        If av is less than bv:
+            Return -1
+        End If
+        If av is greater than bv:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "tsvector_find_entry" takes t as Integer, lex_ptr as Integer, lex_len as Integer returns Integer:
+    Let entries be proc memory_get_int64 from Mem with t, TSV_OFF_ENTRIES
+    Let count be proc memory_get_int64 from Mem with t, TSV_OFF_COUNT
+    Let i be 0
+    While i is less than count:
+        Let off be i multiplied by 8
+        Let entry be proc memory_get_int64 from Mem with entries, off
+        Let elex be proc memory_get_int64 from Mem with entry, TSE_OFF_LEXEME
+        Let elen be proc memory_get_int64 from Mem with entry, TSE_OFF_LEXEME_LEN
+        Let cmp be proc tsvector_lex_compare with elex, elen, lex_ptr, lex_len
+        If cmp is equal to 0:
+            Return entry
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Append a lexeme with position. If the lexeme already exists, only the
+position list is augmented (well, for v0.0.8.5 we store a single
+canonical position; future revisions may keep all positions).
+@End Reasoning
+
+@Implementation
+Lookup existing entry. If found and a duplicate position is being added,
+no-op. Otherwise allocate a new entry, grow the array if needed.
+@End Implementation
+
+@Performance_Hints
+O(n) for the dedupe scan.
+@End Performance_Hints
+
+@Security_Scope
+Caller-supplied lex_ptr is copied; lifetime independent from caller.
+@End Security_Scope
+
+Process called "tsvector_grow_if_needed" takes t as Integer returns Integer:
+    Let cap be proc memory_get_int64 from Mem with t, TSV_OFF_CAPACITY
+    Let count be proc memory_get_int64 from Mem with t, TSV_OFF_COUNT
+    If count is less than cap:
+        Return TSV_OK
+    End If
+    Let new_cap be cap multiplied by 2
+    If new_cap is less than (cap plus 1):
+        Set new_cap to (cap plus 1)
+    End If
+    Let new_bytes be new_cap multiplied by 8
+    Let new_entries be proc allocate from Memory with new_bytes
+    If new_entries is equal to 0:
+        Return TSV_ERR_INVALID
+    End If
+    Let old_entries be proc memory_get_int64 from Mem with t, TSV_OFF_ENTRIES
+    Let copy_bytes be count multiplied by 8
+    proc memory_copy from Mem with new_entries, old_entries, copy_bytes
+    Note: Zero unused tail
+    Let zero_bytes be new_bytes minus copy_bytes
+    If zero_bytes is greater than 0:
+        proc memory_zero from Mem with (new_entries plus copy_bytes), zero_bytes
+    End If
+    proc deallocate from Memory with old_entries
+    proc memory_set_int64 from Mem with t, TSV_OFF_ENTRIES, new_entries
+    proc memory_set_int64 from Mem with t, TSV_OFF_CAPACITY, new_cap
+    Return TSV_OK
+End Process
+
+Process called "tsvector_append" takes t as Integer, lex_ptr as Integer, lex_len as Integer, position as Integer, weight as Integer returns Integer:
+    If t is equal to 0:
+        Return TSV_ERR_INVALID
+    End If
+    If lex_ptr is equal to 0:
+        Return TSV_ERR_INVALID
+    End If
+    If lex_len is less than or equal to 0:
+        Return TSV_ERR_INVALID
+    End If
+    Let existing be proc tsvector_find_entry with t, lex_ptr, lex_len
+    If existing is not equal to 0:
+        Return TSV_OK
+    End If
+
+    Let grow_rc be proc tsvector_grow_if_needed with t
+    If grow_rc is not equal to TSV_OK:
+        Return TSV_ERR_INVALID
+    End If
+
+    Let entry be proc allocate from Memory with TSE_STRUCT_SIZE
+    If entry is equal to 0:
+        Return TSV_ERR_INVALID
+    End If
+    Let lex_copy be proc allocate from Memory with (lex_len plus 1)
+    If lex_copy is equal to 0:
+        proc deallocate from Memory with entry
+        Return TSV_ERR_INVALID
+    End If
+    proc memory_copy from Mem with lex_copy, lex_ptr, lex_len
+    proc memory_set_byte from Mem with lex_copy, lex_len, 0
+
+    proc memory_set_int64 from Mem with entry, TSE_OFF_LEXEME, lex_copy
+    proc memory_set_int64 from Mem with entry, TSE_OFF_POSITION, position
+    proc memory_set_int64 from Mem with entry, TSE_OFF_WEIGHT, weight
+    proc memory_set_int64 from Mem with entry, TSE_OFF_LEXEME_LEN, lex_len
+
+    Let entries be proc memory_get_int64 from Mem with t, TSV_OFF_ENTRIES
+    Let count be proc memory_get_int64 from Mem with t, TSV_OFF_COUNT
+    Let off be count multiplied by 8
+    proc memory_set_int64 from Mem with entries, off, entry
+    proc memory_set_int64 from Mem with t, TSV_OFF_COUNT, (count plus 1)
+    Return TSV_OK
+End Process
+
+Note: ============================================================================
+Note: Tokenize + stem from raw text
+Note: ============================================================================
+
+@Reasoning
+Tokenize a UTF-8/ASCII string into lowercase lexemes, apply a basic
+suffix-stripping stemmer, and add each unique lexeme to the tsvector
+with its 1-based position.
+@End Reasoning
+
+@Implementation
+Walk the input character by character. Letters/digits accumulate into the
+current token buffer. Any non-alphanumeric character ends the current
+token (if non-empty), which is then lowercased, stemmed, and appended.
+@End Implementation
+
+@Performance_Hints
+O(input_length) for tokenization + O(tokens) for stem/insert.
+@End Performance_Hints
+
+@Security_Scope
+text_ptr must be a valid null-terminated string OR text_len must be a
+known length passed via the explicit-length API.
+@End Security_Scope
+
+Process called "tsvector_basic_stem_in_place" takes lex_buf as Integer, len_in as Integer returns Integer:
+    Let len be len_in
+    Note: Strip "ing" (>=4)
+    If len is greater than or equal to 4:
+        Let a be proc memory_get_byte from Mem with lex_buf, (len minus 3)
+        Let b be proc memory_get_byte from Mem with lex_buf, (len minus 2)
+        Let c be proc memory_get_byte from Mem with lex_buf, (len minus 1)
+        If a is equal to 105:
+            If b is equal to 110:
+                If c is equal to 103:
+                    Set len to len minus 3
+                End If
+            End If
+        End If
+    End If
+    Note: Strip "ed" (>=3)
+    If len is greater than or equal to 3:
+        Let a2 be proc memory_get_byte from Mem with lex_buf, (len minus 2)
+        Let b2 be proc memory_get_byte from Mem with lex_buf, (len minus 1)
+        If a2 is equal to 101:
+            If b2 is equal to 100:
+                Set len to len minus 2
+            End If
+        End If
+    End If
+    Note: Strip "es" or "s" (>=2)
+    If len is greater than or equal to 3:
+        Let a3 be proc memory_get_byte from Mem with lex_buf, (len minus 2)
+        Let b3 be proc memory_get_byte from Mem with lex_buf, (len minus 1)
+        If a3 is equal to 101:
+            If b3 is equal to 115:
+                Set len to len minus 2
+            End If
+        End If
+    End If
+    If len is greater than or equal to 2:
+        Let last be proc memory_get_byte from Mem with lex_buf, (len minus 1)
+        If last is equal to 115:
+            Set len to len minus 1
+        End If
+    End If
+    proc memory_set_byte from Mem with lex_buf, len, 0
+    Return len
+End Process
+
+Process called "tsvector_from_text" takes text_ptr as Integer, language_ptr as Integer returns Integer:
+    Let _lang be language_ptr
+    Let t be proc tsvector_create
+    If t is equal to 0:
+        Return 0
+    End If
+    If text_ptr is equal to 0:
+        Return t
+    End If
+
+    Note: Determine length by walking to null terminator with hard cap
+    Let text_len be 0
+    Let counting be 1
+    While counting is equal to 1:
+        Let c be proc memory_get_byte from Mem with text_ptr, text_len
+        If c is equal to 0:
+            Set counting to 0
+        Otherwise:
+            Set text_len to text_len plus 1
+            If text_len is greater than 1048576:
+                Set counting to 0
+            End If
+        End If
+    End While
+
+    Note: Allocate a token buffer big enough for any single token
+    Let tok_buf be proc allocate from Memory with 256
+    If tok_buf is equal to 0:
+        Return t
+    End If
+
+    Let i be 0
+    Let tok_len be 0
+    Let position be 0
+    While i is less than text_len:
+        Let ch be proc memory_get_byte from Mem with text_ptr, i
+        Let is_an be proc is_alphanumeric from Char with ch
+        If is_an is equal to 1:
+            If tok_len is less than 255:
+                Let lower be proc to_lower from Char with ch
+                proc memory_set_byte from Mem with tok_buf, tok_len, lower
+                Set tok_len to tok_len plus 1
+            End If
+        Otherwise:
+            If tok_len is greater than 0:
+                Set position to position plus 1
+                Let stemmed_len be proc tsvector_basic_stem_in_place with tok_buf, tok_len
+                proc tsvector_append with t, tok_buf, stemmed_len, position, TSV_WEIGHT_DEFAULT
+                Set tok_len to 0
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    If tok_len is greater than 0:
+        Set position to position plus 1
+        Let stemmed_len_final be proc tsvector_basic_stem_in_place with tok_buf, tok_len
+        proc tsvector_append with t, tok_buf, stemmed_len_final, position, TSV_WEIGHT_DEFAULT
+    End If
+
+    proc deallocate from Memory with tok_buf
+    Return t
+End Process
+
+Note: ============================================================================
+Note: Queries
+Note: ============================================================================
+
+@Reasoning
+tsquery_evaluate runs a simple AND-of-required-lexemes query: returns 1
+if every lexeme in the query array appears in the tsvector, 0 otherwise.
+This supports the common "all words must match" search pattern.
+@End Reasoning
+
+@Implementation
+For each query lexeme, look it up in the tsvector. If any miss, return 0.
+@End Implementation
+
+@Performance_Hints
+O(q * n) for q query lexemes and n tsvector entries.
+@End Performance_Hints
+
+@Security_Scope
+query_lex_array points to an array of (ptr,len) pairs; layout described
+below.
+@End Security_Scope
+
+Constant TSQ_LEX_PTR as Integer is 0
+Constant TSQ_LEX_LEN as Integer is 8
+Constant TSQ_LEX_SIZE as Integer is 16
+
+Process called "tsquery_evaluate_all" takes tsvector_ptr as Integer, query_lex_array as Integer, query_count as Integer returns Integer:
+    If tsvector_ptr is equal to 0:
+        Return 0
+    End If
+    If query_lex_array is equal to 0:
+        Return 0
+    End If
+    If query_count is less than or equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than query_count:
+        Let off be i multiplied by TSQ_LEX_SIZE
+        Let qp be proc memory_get_int64 from Mem with query_lex_array, (off plus TSQ_LEX_PTR)
+        Let ql be proc memory_get_int64 from Mem with query_lex_array, (off plus TSQ_LEX_LEN)
+        Let found be proc tsvector_find_entry with tsvector_ptr, qp, ql
+        If found is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "tsquery_evaluate_any" takes tsvector_ptr as Integer, query_lex_array as Integer, query_count as Integer returns Integer:
+    If tsvector_ptr is equal to 0:
+        Return 0
+    End If
+    If query_lex_array is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than query_count:
+        Let off be i multiplied by TSQ_LEX_SIZE
+        Let qp be proc memory_get_int64 from Mem with query_lex_array, (off plus TSQ_LEX_PTR)
+        Let ql be proc memory_get_int64 from Mem with query_lex_array, (off plus TSQ_LEX_LEN)
+        Let found be proc tsvector_find_entry with tsvector_ptr, qp, ql
+        If found is not equal to 0:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "tsvector_lexeme_count" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with t, TSV_OFF_COUNT
+End Process

@@ -1,0 +1,2590 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+IEEE 754-2008 binary32 (single precision) software implementation
+==============================================================================
+
+Format (32 bits):
+  bit 31      : sign
+  bits 30-23  : exponent (8 bits, bias 127)
+  bits 22-0   : mantissa fraction (23 bits, implicit leading 1)
+
+Special values:
+  +0   : 0x00000000   -0  : 0x80000000
+  +Inf : 0x7F800000   -Inf: 0xFF800000
+  qNaN : exp=0xFF and mantissa MSB=1   (canonical 0x7FC00000)
+  sNaN : exp=0xFF and mantissa MSB=0 with nonzero mantissa
+  subnormal: exp=0, mantissa != 0 (no implicit leading 1)
+
+References:
+  IEEE 754-2008 (full standard)
+  ucbtest / TestFloat vectors
+  Hauser, John R., "Handling Floating-Point Exceptions in Numeric Programs"
+  Goldberg, "What Every Computer Scientist Should Know About Floating-Point"
+
+Storage:
+  Float32 values are held in the bottom 32 bits of a Runa Integer (64-bit).
+  The upper 32 bits MUST always be zero on the way out of every public
+  operation; callers may rely on the bit pattern for pack/unpack.
+
+Rounding modes (see ROUND_* constants):
+  0 = round-to-nearest-even (IEEE 754 default)
+  1 = round-toward-zero (truncation)
+  2 = round-toward-positive-infinity
+  3 = round-toward-negative-infinity
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/bitwise_core.runa" as Bits
+
+Note: ============================================================================
+Note: Format constants
+Note: ============================================================================
+
+Constant F32_BITS as Integer is 32
+Constant F32_EXP_BITS as Integer is 8
+Constant F32_MANT_BITS as Integer is 23
+Constant F32_BIAS as Integer is 127
+Constant F32_EXP_MAX as Integer is 255
+
+Note: 32-bit masks computed once
+Constant F32_SIGN_MASK as Integer is 2147483648
+Constant F32_EXP_MASK as Integer is 2139095040
+Constant F32_MANT_MASK as Integer is 8388607
+Constant F32_BIT32_MASK as Integer is 4294967295
+Constant F32_MANT_HIDDEN as Integer is 8388608
+Constant F32_QUIET_NAN_BIT as Integer is 4194304
+Constant F32_CANONICAL_QNAN as Integer is 2143289344
+
+Note: Common bit patterns
+Constant F32_POS_ZERO as Integer is 0
+Constant F32_NEG_ZERO as Integer is 2147483648
+Constant F32_POS_INF as Integer is 2139095040
+Constant F32_NEG_INF as Integer is 4286578688
+Constant F32_POS_ONE as Integer is 1065353216
+
+Note: Rounding modes shared across the binary family.
+Constant ROUND_NEAREST_EVEN as Integer is 0
+Constant ROUND_TOWARD_ZERO as Integer is 1
+Constant ROUND_TOWARD_POSITIVE as Integer is 2
+Constant ROUND_TOWARD_NEGATIVE as Integer is 3
+
+Note: Exception flags (mirrors IEEE 754 § 7).
+Constant FLAG_INVALID as Integer is 1
+Constant FLAG_DIVIDE_BY_ZERO as Integer is 2
+Constant FLAG_OVERFLOW as Integer is 4
+Constant FLAG_UNDERFLOW as Integer is 8
+Constant FLAG_INEXACT as Integer is 16
+
+Note: ----------------------------------------------------------------------------
+Note: Module-local state. Rounding mode and exception flags are global because
+Note: IEEE 754 defines them as part of the executing thread's environment.
+Note: ----------------------------------------------------------------------------
+
+Let F32_ROUNDING_MODE be 0
+Let F32_EXCEPTION_FLAGS be 0
+
+Note: ============================================================================
+Note: Bit-pattern helpers
+Note: ============================================================================
+
+Process called "f32_mask32" takes value as Integer returns Integer:
+    @Reasoning
+    Truncate value to 32 bits so the upper half of the Runa Integer is zero.
+    Used at every boundary that produces or accepts a Float32 bit pattern.
+    @End Reasoning
+    @Implementation
+    Logical-AND with 0xFFFFFFFF. The compiler lowers this to a single andq
+    on x86-64 / and on aarch64, riscv, mips, powerpc.
+    @End Implementation
+    @Performance_Hints
+    Inlinable; cost is one ALU op. Kept as a proc to make intent explicit.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function over Integer; no memory access, no side effects.
+    @End Security_Scope
+    Return value bitwise and F32_BIT32_MASK
+End Process
+
+Process called "f32_get_sign" takes bits as Integer returns Integer:
+    @Reasoning
+    Extract the sign bit (0 or 1) from a 32-bit IEEE 754 single value.
+    @End Reasoning
+    @Implementation
+    Shift right by 31, mask with 1 so the result is always 0 or 1 even
+    when the input has stray upper-half bits.
+    @End Implementation
+    @Performance_Hints
+    Two ALU ops on every backend.
+    @End Performance_Hints
+    @Security_Scope
+    Pure; safe for use on attacker-controlled bit patterns.
+    @End Security_Scope
+    Let shifted be bits shifted right by 31
+    Return shifted bitwise and 1
+End Process
+
+Process called "f32_get_exponent" takes bits as Integer returns Integer:
+    @Reasoning
+    Extract the biased 8-bit exponent field from a Float32 bit pattern.
+    Returns an integer in [0, 255]. The bias is NOT removed.
+    @End Reasoning
+    @Implementation
+    Shift right by 23 then mask with 0xFF.
+    @End Implementation
+    @Performance_Hints
+    Constant-time, two ALU ops.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let shifted be bits shifted right by F32_MANT_BITS
+    Return shifted bitwise and 255
+End Process
+
+Process called "f32_get_mantissa" takes bits as Integer returns Integer:
+    @Reasoning
+    Extract the 23-bit mantissa fraction (no hidden bit) from a Float32.
+    @End Reasoning
+    @Implementation
+    AND with the mantissa mask.
+    @End Implementation
+    @Performance_Hints
+    One ALU op.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return bits bitwise and F32_MANT_MASK
+End Process
+
+Process called "f32_pack" takes sign as Integer, biased_exp as Integer, mantissa as Integer returns Integer:
+    @Reasoning
+    Combine the three IEEE 754 fields into a single 32-bit bit pattern.
+    @End Reasoning
+    @Implementation
+    Mask each field to its width, shift into place, OR together, then mask
+    the 32-bit result so callers cannot see stray upper-half bits.
+    @End Implementation
+    @Performance_Hints
+    Six ALU ops total; produces no branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure. Defensive masking guards against caller passing wider values.
+    @End Security_Scope
+    Let s_field be sign bitwise and 1
+    Let e_field be biased_exp bitwise and 255
+    Let m_field be mantissa bitwise and F32_MANT_MASK
+    Let s_shift be s_field shifted left by 31
+    Let e_shift be e_field shifted left by F32_MANT_BITS
+    Let combined be s_shift bitwise or e_shift
+    Set combined to combined bitwise or m_field
+    Return proc f32_mask32 with combined
+End Process
+
+Note: ============================================================================
+Note: Classification predicates
+Note: ============================================================================
+
+Process called "f32_is_zero" takes bits as Integer returns Integer:
+    @Reasoning
+    A Float32 is zero iff every bit except the sign bit is zero.
+    +0 and -0 both qualify. Per IEEE 754 § 5.11, they compare equal but
+    have distinct bit patterns.
+    @End Reasoning
+    @Implementation
+    Strip the sign and compare against 0.
+    @End Implementation
+    @Performance_Hints
+    Two ALU ops + one branch worth.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let payload be bits bitwise and 2147483647
+    If payload is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f32_is_inf" takes bits as Integer returns Integer:
+    @Reasoning
+    Infinity has exponent=0xFF and mantissa=0. Sign bit distinguishes
+    +Inf from -Inf.
+    @End Reasoning
+    @Implementation
+    Strip sign, compare against the +Inf bit pattern.
+    @End Implementation
+    @Performance_Hints
+    Two ALU ops + branch.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let payload be bits bitwise and 2147483647
+    If payload is equal to F32_POS_INF:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f32_is_nan" takes bits as Integer returns Integer:
+    @Reasoning
+    A NaN has exp=0xFF and mantissa != 0. Per IEEE 754 § 6.2 quiet vs.
+    signaling distinction is in the mantissa MSB; both forms are NaN.
+    @End Reasoning
+    @Implementation
+    Extract exponent and mantissa; the value is NaN exactly when
+    exponent is 0xFF AND mantissa is nonzero.
+    @End Implementation
+    @Performance_Hints
+    Two field extracts and two branches; fully constant-time on
+    register-renaming architectures.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f32_get_exponent with bits
+    If exp is not equal to F32_EXP_MAX:
+        Return 0
+    End If
+    Let mant be proc f32_get_mantissa with bits
+    If mant is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f32_is_signaling_nan" takes bits as Integer returns Integer:
+    @Reasoning
+    sNaN: exp=0xFF, mantissa nonzero, and the MSB of the mantissa is 0.
+    Per IEEE 754-2008 § 6.2.1 ("MSB=0 is signaling, MSB=1 is quiet").
+    @End Reasoning
+    @Implementation
+    Reject non-NaN first, then inspect bit 22 of the mantissa.
+    @End Implementation
+    @Performance_Hints
+    Three ALU ops + one branch.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let nan be proc f32_is_nan with bits
+    If nan is equal to 0:
+        Return 0
+    End If
+    Let mant be proc f32_get_mantissa with bits
+    Let msb be mant bitwise and F32_QUIET_NAN_BIT
+    If msb is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f32_is_subnormal" takes bits as Integer returns Integer:
+    @Reasoning
+    Subnormal numbers have biased exponent 0 and nonzero mantissa.
+    They represent values smaller than 2^-126 with reduced precision.
+    @End Reasoning
+    @Implementation
+    Reject when exponent != 0 or mantissa == 0.
+    @End Implementation
+    @Performance_Hints
+    Two field reads + two branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f32_get_exponent with bits
+    If exp is not equal to 0:
+        Return 0
+    End If
+    Let mant be proc f32_get_mantissa with bits
+    If mant is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f32_is_normal" takes bits as Integer returns Integer:
+    @Reasoning
+    Normal numbers have 0 < biased exponent < 0xFF. Subnormals, zero,
+    infinities, and NaNs are all rejected.
+    @End Reasoning
+    @Implementation
+    Range check on the biased exponent field.
+    @End Implementation
+    @Performance_Hints
+    Two field reads + two branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f32_get_exponent with bits
+    If exp is equal to 0:
+        Return 0
+    End If
+    If exp is equal to F32_EXP_MAX:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f32_is_finite" takes bits as Integer returns Integer:
+    @Reasoning
+    A finite Float32 is anything that is not Inf and not NaN. Per
+    IEEE 754 § 2.1.39, finite includes zero, subnormals, and normals.
+    @End Reasoning
+    @Implementation
+    Reject only the exp=0xFF case.
+    @End Implementation
+    @Performance_Hints
+    One field read + one branch.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f32_get_exponent with bits
+    If exp is equal to F32_EXP_MAX:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f32_is_negative" takes bits as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the sign bit is set, 0 otherwise. Does NOT exclude
+    -0 or -NaN: the sign bit is the only criterion.
+    @End Reasoning
+    @Implementation
+    Read the sign bit.
+    @End Implementation
+    @Performance_Hints
+    Two ALU ops.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return proc f32_get_sign with bits
+End Process
+
+Note: ============================================================================
+Note: Rounding-mode and exception-flag accessors
+Note: ============================================================================
+
+Process called "f32_set_rounding_mode" takes mode as Integer returns Integer:
+    @Reasoning
+    Switch the active rounding mode for subsequent Float32 ops. Modes
+    outside [0,3] are ignored to keep the FPU state well-defined.
+    @End Reasoning
+    @Implementation
+    Range-check and store.
+    @End Implementation
+    @Performance_Hints
+    Constant-time.
+    @End Performance_Hints
+    @Security_Scope
+    Affects module-global state; callers that interleave ops on
+    different threads must serialize externally.
+    @End Security_Scope
+    If mode is less than 0:
+        Return 0
+    End If
+    If mode is greater than 3:
+        Return 0
+    End If
+    Set F32_ROUNDING_MODE to mode
+    Return 1
+End Process
+
+Process called "f32_get_rounding_mode" returns Integer:
+    @Reasoning
+    Read the active rounding mode.
+    @End Reasoning
+    @Implementation
+    Single memory load.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Read-only access.
+    @End Security_Scope
+    Return F32_ROUNDING_MODE
+End Process
+
+Process called "f32_raise_flag" takes flag as Integer returns Integer:
+    @Reasoning
+    OR a flag into the exception register without clearing existing
+    flags. IEEE 754 § 7.2 requires sticky behavior until explicitly
+    cleared.
+    @End Reasoning
+    @Implementation
+    Bitwise OR.
+    @End Implementation
+    @Performance_Hints
+    Single load + OR + store.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global mutation; serialize externally for multi-thread use.
+    @End Security_Scope
+    Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or flag
+    Return 1
+End Process
+
+Process called "f32_clear_flags" returns Integer:
+    @Reasoning
+    Reset the sticky exception register to zero.
+    @End Reasoning
+    @Implementation
+    Single store.
+    @End Implementation
+    @Performance_Hints
+    One store.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global mutation.
+    @End Security_Scope
+    Set F32_EXCEPTION_FLAGS to 0
+    Return 1
+End Process
+
+Process called "f32_get_flags" returns Integer:
+    @Reasoning
+    Snapshot of the sticky exception register.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Read-only.
+    @End Security_Scope
+    Return F32_EXCEPTION_FLAGS
+End Process
+
+Note: ============================================================================
+Note: Unary operations
+Note: ============================================================================
+
+Process called "f32_neg" takes bits as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754 § 5.5.1, negation flips the sign bit even on NaN and Inf.
+    -0 becomes +0 and vice versa.
+    @End Reasoning
+    @Implementation
+    XOR with the sign mask, mask to 32 bits.
+    @End Implementation
+    @Performance_Hints
+    Two ALU ops.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let flipped be bits bitwise xor F32_SIGN_MASK
+    Return proc f32_mask32 with flipped
+End Process
+
+Process called "f32_abs" takes bits as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754 § 5.5.1, abs clears the sign bit. NaN payloads survive.
+    @End Reasoning
+    @Implementation
+    AND with the mask that has the sign bit zero.
+    @End Implementation
+    @Performance_Hints
+    Two ALU ops.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let cleared be bits bitwise and 2147483647
+    Return proc f32_mask32 with cleared
+End Process
+
+Note: ============================================================================
+Note: Comparison predicates (NaN-aware)
+Note: ============================================================================
+
+Process called "f32_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Three-way IEEE 754 comparison. Returns -1 if a<b, 0 if a==b, 1 if a>b,
+    and 2 for unordered (either operand is NaN, per IEEE 754 § 5.11).
+    Distinguishes -0 from +0 only via sign; numerically they are equal.
+    @End Reasoning
+    @Implementation
+    NaN check first. Then handle sign agreement:
+      - same sign: compare bit patterns directly (with sign flip on negatives
+        because a more-negative number has a larger magnitude bit pattern).
+      - different signs: positive is greater unless both are zero.
+    @End Implementation
+    @Performance_Hints
+    A few branches; the hot path is two field reads and one compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure; no global mutation.
+    @End Security_Scope
+
+    Let a_nan be proc f32_is_nan with a
+    Let b_nan be proc f32_is_nan with b
+    If a_nan is equal to 1:
+        Return 2
+    End If
+    If b_nan is equal to 1:
+        Return 2
+    End If
+
+    Note: Equal bit-patterns short-circuit (catches +0==+0, -0==-0, etc.)
+    If a is equal to b:
+        Return 0
+    End If
+
+    Let sign_a be proc f32_get_sign with a
+    Let sign_b be proc f32_get_sign with b
+
+    Note: +0 == -0 special case
+    Let a_is_zero be proc f32_is_zero with a
+    Let b_is_zero be proc f32_is_zero with b
+    If a_is_zero is equal to 1:
+        If b_is_zero is equal to 1:
+            Return 0
+        End If
+    End If
+
+    Let mag_a be a bitwise and 2147483647
+    Let mag_b be b bitwise and 2147483647
+
+    If sign_a is equal to sign_b:
+        If sign_a is equal to 0:
+            If mag_a is less than mag_b:
+                Return -1
+            End If
+            Return 1
+        End If
+        Note: both negative: larger magnitude bits => smaller value
+        If mag_a is less than mag_b:
+            Return 1
+        End If
+        Return -1
+    End If
+
+    Note: differing signs and neither is zero => the negative is smaller
+    If sign_a is equal to 1:
+        Return -1
+    End If
+    Return 1
+End Process
+
+Process called "f32_eq" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 ==: false whenever either operand is NaN, including NaN==NaN.
+    +0 == -0 holds.
+    @End Reasoning
+    @Implementation
+    Delegate to f32_compare and check for the 0 (ordered-equal) verdict.
+    @End Implementation
+    @Performance_Hints
+    Cost dominated by f32_compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f32_compare with a, b
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f32_ne" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 !=: true whenever the operands are unordered or numerically
+    distinct. Specifically, NaN != anything (including itself) is true.
+    @End Reasoning
+    @Implementation
+    Complement of f32_eq.
+    @End Implementation
+    @Performance_Hints
+    Cost dominated by f32_compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f32_compare with a, b
+    If c is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f32_lt" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 <: false if unordered.
+    @End Reasoning
+    @Implementation
+    f32_compare verdict of -1.
+    @End Implementation
+    @Performance_Hints
+    Cost dominated by f32_compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f32_compare with a, b
+    If c is equal to -1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f32_le" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 <=: false if unordered.
+    @End Reasoning
+    @Implementation
+    f32_compare verdict of -1 or 0.
+    @End Implementation
+    @Performance_Hints
+    Cost dominated by f32_compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f32_compare with a, b
+    If c is equal to -1:
+        Return 1
+    End If
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f32_gt" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 >: false if unordered.
+    @End Reasoning
+    @Implementation
+    f32_compare verdict of 1.
+    @End Implementation
+    @Performance_Hints
+    Cost dominated by f32_compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f32_compare with a, b
+    If c is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f32_ge" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 >=: false if unordered.
+    @End Reasoning
+    @Implementation
+    f32_compare verdict of 0 or 1.
+    @End Implementation
+    @Performance_Hints
+    Cost dominated by f32_compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f32_compare with a, b
+    If c is equal to 0:
+        Return 1
+    End If
+    If c is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Special-result constructors
+Note: ============================================================================
+
+Process called "f32_make_qnan" returns Integer:
+    @Reasoning
+    Return the canonical quiet NaN. Used when invalid ops must yield NaN.
+    @End Reasoning
+    @Implementation
+    Return the constant 0x7FC00000.
+    @End Implementation
+    @Performance_Hints
+    Constant return.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return F32_CANONICAL_QNAN
+End Process
+
+Process called "f32_make_inf" takes sign as Integer returns Integer:
+    @Reasoning
+    Construct ±Inf without invoking the rounding machinery.
+    @End Reasoning
+    @Implementation
+    Build via f32_pack with exp=0xFF and mantissa=0.
+    @End Implementation
+    @Performance_Hints
+    Composes one ALU chain.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If sign is equal to 0:
+        Return F32_POS_INF
+    End If
+    Return F32_NEG_INF
+End Process
+
+Process called "f32_make_zero" takes sign as Integer returns Integer:
+    @Reasoning
+    Construct ±0.
+    @End Reasoning
+    @Implementation
+    Sign bit only.
+    @End Implementation
+    @Performance_Hints
+    Constant return.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If sign is equal to 0:
+        Return F32_POS_ZERO
+    End If
+    Return F32_NEG_ZERO
+End Process
+
+Note: ============================================================================
+Note: Internal: mantissa rounding using guard/round/sticky
+Note: ============================================================================
+
+Process called "f32_round_grs" takes sign as Integer, mant as Integer, guard as Integer, round as Integer, sticky as Integer returns Integer:
+    @Reasoning
+    Apply the active rounding mode to a 24-bit mantissa (hidden bit
+    included) extended with one guard bit, one round bit, and one sticky
+    bit. Returns 0 if no increment is needed, 1 if the mantissa should
+    be incremented by 1 ULP. Caller is responsible for handling the
+    "mantissa overflow into the next binade" case after the increment.
+    @End Reasoning
+    @Implementation
+    Round-to-nearest-even (mode 0): increment if guard=1 AND (round=1
+    OR sticky=1 OR mantissa LSB=1). All ties to even.
+    Round-toward-zero (mode 1): never increment.
+    Round-toward-positive (mode 2): increment for positive numbers when
+    any extra bit is set.
+    Round-toward-negative (mode 3): increment for negative numbers when
+    any extra bit is set.
+    @End Implementation
+    @Performance_Hints
+    Branch-heavy but constant-time per mode.
+    @End Performance_Hints
+    @Security_Scope
+    Pure; reads module rounding mode.
+    @End Security_Scope
+
+    If F32_ROUNDING_MODE is equal to ROUND_NEAREST_EVEN:
+        If guard is equal to 0:
+            Return 0
+        End If
+        If round is equal to 1:
+            Return 1
+        End If
+        If sticky is equal to 1:
+            Return 1
+        End If
+        Note: exact half - round to even
+        Let lsb be mant bitwise and 1
+        If lsb is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If F32_ROUNDING_MODE is equal to ROUND_TOWARD_ZERO:
+        Return 0
+    End If
+
+    Let extra be guard bitwise or round
+    Set extra to extra bitwise or sticky
+
+    If F32_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+        If sign is equal to 0:
+            If extra is not equal to 0:
+                Return 1
+            End If
+        End If
+        Return 0
+    End If
+
+    If F32_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+        If sign is equal to 1:
+            If extra is not equal to 0:
+                Return 1
+            End If
+        End If
+        Return 0
+    End If
+
+    Return 0
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: Internal: assemble a Float32 from sign + signed unbiased exponent +
+Note: an extended 27-bit mantissa carrying GRS bits. The mantissa layout is
+Note:    bit 26: hidden bit (1 for normals, 0 for subnormal results)
+Note:    bits 25..3: 23-bit fraction
+Note:    bit 2: guard
+Note:    bit 1: round
+Note:    bit 0: sticky
+Note: ----------------------------------------------------------------------------
+
+Process called "f32_finalize" takes sign as Integer, unbiased_exp as Integer, ext_mant as Integer returns Integer:
+    @Reasoning
+    Normalize, round, handle exponent overflow/underflow, and pack into a
+    32-bit Float32. This is the post-arithmetic rounding step shared by
+    add/sub/mul/div/sqrt.
+    @End Reasoning
+    @Implementation
+    Steps:
+      1. Normalize: shift the extended mantissa left until bit 26 is set
+         (preserve sticky bit by ORing into bit 0 during right shifts).
+         If bit > 26, shift right and OR shifted-out bits into sticky.
+      2. Compute biased exponent. Detect underflow (biased < 1) and
+         denormalize by right-shifting (with sticky accumulation).
+      3. Extract guard/round/sticky from the bottom three bits.
+      4. Strip GRS bits.
+      5. Apply f32_round_grs and increment if needed; if the increment
+         carries out of bit 23 (mantissa overflow), shift right and bump
+         the exponent.
+      6. Detect overflow (biased >= 0xFF): return signed Inf or the
+         largest finite (depending on rounding mode), set the OVERFLOW
+         and INEXACT flags.
+      7. Detect underflow to zero: return signed zero, set UNDERFLOW
+         and INEXACT (if any of guard/round/sticky was set).
+      8. Pack normal/subnormal result.
+    @End Implementation
+    @Performance_Hints
+    Worst case ~30 ALU ops with a small bounded loop for normalization.
+    @End Performance_Hints
+    @Security_Scope
+    Internal; callers supply trusted intermediate values.
+    @End Security_Scope
+
+    Let mant be ext_mant
+    Let exp be unbiased_exp
+
+    If mant is equal to 0:
+        Return proc f32_make_zero with sign
+    End If
+
+    Note: --- Right-normalize if mantissa has bits above position 26 ---
+    Let upper be mant shifted right by 27
+    While upper is not equal to 0:
+        Let lost_bit be mant bitwise and 1
+        Set mant to mant shifted right by 1
+        Set mant to mant bitwise or lost_bit
+        Set exp to exp plus 1
+        Set upper to mant shifted right by 27
+    End While
+
+    Note: --- Left-normalize if bit 26 is not set ---
+    Let bit26_mask be 67108864
+    Let top be mant bitwise and bit26_mask
+    While top is equal to 0:
+        If mant is equal to 0:
+            Return proc f32_make_zero with sign
+        End If
+        Set mant to mant shifted left by 1
+        Set exp to exp minus 1
+        Set top to mant bitwise and bit26_mask
+    End While
+
+    Note: --- Apply bias ---
+    Let biased be exp plus F32_BIAS
+
+    Note: --- Subnormal: shift right until biased reaches 1 ---
+    If biased is less than 1:
+        Let shift_amount be 1 minus biased
+        Set biased to 0
+        Note: shift right shift_amount bits, accumulating sticky
+        Let i be 0
+        While i is less than shift_amount:
+            Let lost be mant bitwise and 1
+            Set mant to mant shifted right by 1
+            Set mant to mant bitwise or lost
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: --- Extract GRS ---
+    Let sticky be mant bitwise and 1
+    Let round_bit be (mant shifted right by 1) bitwise and 1
+    Let guard be (mant shifted right by 2) bitwise and 1
+    Let mant_only be mant shifted right by 3
+
+    Let inexact be guard bitwise or round_bit
+    Set inexact to inexact bitwise or sticky
+
+    Let increment be proc f32_round_grs with sign, mant_only, guard, round_bit, sticky
+    If increment is equal to 1:
+        Set mant_only to mant_only plus 1
+    End If
+
+    Note: --- Mantissa overflow after rounding (e.g., 1.111... + ulp -> 10.000...) ---
+    Let overflow_mask be 16777216
+    If (mant_only bitwise and overflow_mask) is not equal to 0:
+        Set mant_only to mant_only shifted right by 1
+        Set biased to biased plus 1
+    End If
+
+    Note: --- Subnormal-to-normal promotion after rounding ---
+    If biased is equal to 0:
+        If (mant_only bitwise and F32_MANT_HIDDEN) is not equal to 0:
+            Set biased to 1
+        End If
+    End If
+
+    Note: --- Overflow to Inf / largest finite ---
+    If biased is greater than or equal to F32_EXP_MAX:
+        Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_OVERFLOW
+        Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        If F32_ROUNDING_MODE is equal to ROUND_TOWARD_ZERO:
+            Note: Largest finite magnitude
+            Return proc f32_pack with sign, 254, F32_MANT_MASK
+        End If
+        If F32_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+            If sign is equal to 1:
+                Return proc f32_pack with sign, 254, F32_MANT_MASK
+            End If
+            Return proc f32_make_inf with sign
+        End If
+        If F32_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+            If sign is equal to 0:
+                Return proc f32_pack with sign, 254, F32_MANT_MASK
+            End If
+            Return proc f32_make_inf with sign
+        End If
+        Return proc f32_make_inf with sign
+    End If
+
+    Note: --- Underflow to zero ---
+    If biased is equal to 0:
+        If mant_only is equal to 0:
+            If inexact is not equal to 0:
+                Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+                Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+            End If
+            Return proc f32_make_zero with sign
+        End If
+        Note: subnormal result with hidden bit cleared
+        If inexact is not equal to 0:
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        End If
+        Let m_field_sub be mant_only bitwise and F32_MANT_MASK
+        Return proc f32_pack with sign, 0, m_field_sub
+    End If
+
+    If inexact is not equal to 0:
+        Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+
+    Note: --- Normal result ---
+    Let final_mant be mant_only bitwise and F32_MANT_MASK
+    Return proc f32_pack with sign, biased, final_mant
+End Process
+
+Note: ============================================================================
+Note: Addition / subtraction
+Note: ============================================================================
+
+Process called "f32_propagate_nan" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754 § 6.2.3, when one or more operands are NaN, the result
+    must be a NaN. Prefer the first NaN operand and quiet it.
+    @End Reasoning
+    @Implementation
+    Inspect both operands. Convert signaling NaN to quiet by setting
+    the MSB of the mantissa. Set INVALID flag if any sNaN was seen.
+    @End Implementation
+    @Performance_Hints
+    Three branches in the common case.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global flag mutation.
+    @End Security_Scope
+
+    Let a_nan be proc f32_is_nan with a
+    Let b_nan be proc f32_is_nan with b
+    If a_nan is equal to 0:
+        If b_nan is equal to 0:
+            Return F32_CANONICAL_QNAN
+        End If
+    End If
+
+    Let a_snan be proc f32_is_signaling_nan with a
+    Let b_snan be proc f32_is_signaling_nan with b
+    If a_snan is equal to 1:
+        Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+    End If
+    If b_snan is equal to 1:
+        Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+    End If
+
+    If a_nan is equal to 1:
+        Let payload_a be a bitwise or F32_QUIET_NAN_BIT
+        Return proc f32_mask32 with payload_a
+    End If
+    Let payload_b be b bitwise or F32_QUIET_NAN_BIT
+    Return proc f32_mask32 with payload_b
+End Process
+
+Process called "f32_add" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary32 addition with correct rounding and special-value
+    semantics: NaN propagation, Inf+Inf = Inf, Inf - Inf = NaN, +0 + -0 = +0
+    (round-nearest), etc. Per IEEE 754 § 5.4.1.
+    @End Reasoning
+    @Implementation
+    1. NaN propagation.
+    2. Inf handling (Inf + Inf, Inf - Inf, Inf + finite).
+    3. Zero handling (0 + 0 preserves -0 only when both are -0 under
+       round-nearest; under round-toward-negative, +0 + -0 = -0).
+    4. Extract sign/exp/mant for both operands. Add the hidden bit.
+    5. Align the smaller exponent up to the larger by right-shifting its
+       mantissa, accumulating shifted-out bits into a sticky bit.
+    6. If signs match, add mantissas. If they differ, subtract the smaller
+       magnitude from the larger and the result sign is the larger's sign.
+    7. Shift the mantissa left by 3 to reserve guard/round/sticky slots,
+       then hand to f32_finalize for normalization, rounding, packing.
+    @End Implementation
+    @Performance_Hints
+    Branch-heavy in the special-case prologue; the hot path runs in
+    constant time on dispatch.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates the module exception flag register.
+    @End Security_Scope
+
+    Let a32 be proc f32_mask32 with a
+    Let b32 be proc f32_mask32 with b
+
+    Let a_nan be proc f32_is_nan with a32
+    Let b_nan be proc f32_is_nan with b32
+    If a_nan is equal to 1:
+        Return proc f32_propagate_nan with a32, b32
+    End If
+    If b_nan is equal to 1:
+        Return proc f32_propagate_nan with a32, b32
+    End If
+
+    Let a_inf be proc f32_is_inf with a32
+    Let b_inf be proc f32_is_inf with b32
+    Let sign_a be proc f32_get_sign with a32
+    Let sign_b be proc f32_get_sign with b32
+
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            If sign_a is equal to sign_b:
+                Return proc f32_make_inf with sign_a
+            End If
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return F32_CANONICAL_QNAN
+        End If
+        Return a32
+    End If
+    If b_inf is equal to 1:
+        Return b32
+    End If
+
+    Let a_zero be proc f32_is_zero with a32
+    Let b_zero be proc f32_is_zero with b32
+    If a_zero is equal to 1:
+        If b_zero is equal to 1:
+            If sign_a is equal to sign_b:
+                Return a32
+            End If
+            Note: +0 + -0: result sign is + except for round-toward-negative
+            If F32_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+                Return F32_NEG_ZERO
+            End If
+            Return F32_POS_ZERO
+        End If
+        Return b32
+    End If
+    If b_zero is equal to 1:
+        Return a32
+    End If
+
+    Note: --- Extract fields ---
+    Let exp_a be proc f32_get_exponent with a32
+    Let exp_b be proc f32_get_exponent with b32
+    Let mant_a be proc f32_get_mantissa with a32
+    Let mant_b be proc f32_get_mantissa with b32
+
+    Note: Add hidden bit for normals; subnormals already have correct mantissa
+    Let true_exp_a be exp_a
+    Let true_exp_b be exp_b
+    If exp_a is equal to 0:
+        Set true_exp_a to 1
+    Otherwise:
+        Set mant_a to mant_a bitwise or F32_MANT_HIDDEN
+    End If
+    If exp_b is equal to 0:
+        Set true_exp_b to 1
+    Otherwise:
+        Set mant_b to mant_b bitwise or F32_MANT_HIDDEN
+    End If
+
+    Note: Make mantissas extended: shift left by 3 to reserve GRS
+    Set mant_a to mant_a shifted left by 3
+    Set mant_b to mant_b shifted left by 3
+
+    Note: --- Align exponents: shift smaller mantissa right with sticky ---
+    Let aligned_exp be true_exp_a
+    If true_exp_a is less than true_exp_b:
+        Let diff_a be true_exp_b minus true_exp_a
+        Note: cap shift at 32 to avoid losing all info beyond what sticky tracks
+        If diff_a is greater than 32:
+            Set diff_a to 32
+        End If
+        Let i_a be 0
+        While i_a is less than diff_a:
+            Let lost_a be mant_a bitwise and 1
+            Set mant_a to mant_a shifted right by 1
+            Set mant_a to mant_a bitwise or lost_a
+            Set i_a to i_a plus 1
+        End While
+        Set aligned_exp to true_exp_b
+    End If
+    If true_exp_b is less than true_exp_a:
+        Let diff_b be true_exp_a minus true_exp_b
+        If diff_b is greater than 32:
+            Set diff_b to 32
+        End If
+        Let i_b be 0
+        While i_b is less than diff_b:
+            Let lost_b be mant_b bitwise and 1
+            Set mant_b to mant_b shifted right by 1
+            Set mant_b to mant_b bitwise or lost_b
+            Set i_b to i_b plus 1
+        End While
+        Set aligned_exp to true_exp_a
+    End If
+
+    Note: --- Combine ---
+    Let result_sign be sign_a
+    Let result_mant be 0
+    If sign_a is equal to sign_b:
+        Set result_mant to mant_a plus mant_b
+    Otherwise:
+        Note: Effective subtraction: compute |a| - |b| with correct sign
+        If mant_a is greater than or equal to mant_b:
+            Set result_mant to mant_a minus mant_b
+            Set result_sign to sign_a
+        Otherwise:
+            Set result_mant to mant_b minus mant_a
+            Set result_sign to sign_b
+        End If
+    End If
+
+    If result_mant is equal to 0:
+        Note: True zero from cancellation; sign is + under round-nearest,
+        Note: but - under round-toward-negative.
+        If F32_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+            Return F32_NEG_ZERO
+        End If
+        Return F32_POS_ZERO
+    End If
+
+    Note: f32_finalize expects bit 26 = hidden bit and bits 2/1/0 = G/R/S.
+    Note: The mantissa here lives at bit (23+3)=26 if no carry; if carry from
+    Note: same-sign addition, bit 27 is set, which f32_finalize handles by
+    Note: right-normalizing.
+    Let unbiased be aligned_exp minus F32_BIAS
+    Return proc f32_finalize with result_sign, unbiased, result_mant
+End Process
+
+Process called "f32_sub" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    a - b = a + (-b). Sign flip on b is bit-level; even NaN -b gives a NaN
+    with flipped sign per IEEE 754 § 5.5.1.
+    @End Reasoning
+    @Implementation
+    Negate b and delegate to f32_add.
+    @End Implementation
+    @Performance_Hints
+    One extra XOR and add cost.
+    @End Performance_Hints
+    @Security_Scope
+    Inherits mutation behavior from f32_add.
+    @End Security_Scope
+    Let neg_b be proc f32_neg with b
+    Return proc f32_add with a, neg_b
+End Process
+
+Note: ============================================================================
+Note: Multiplication
+Note: ============================================================================
+
+Process called "f32_mul" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary32 multiplication with correct rounding. Result sign is
+    the XOR of the input signs. Special values per IEEE 754 § 6.1:
+      Inf * 0 = NaN (invalid)
+      Inf * finite = Inf
+      0 * 0 = 0
+      NaN * anything = NaN
+    @End Reasoning
+    @Implementation
+    1. NaN / Inf / zero special-case dispatch.
+    2. Extract sign/exp/mant. Add hidden bit for normals; for subnormals,
+       normalize the mantissa (left-shift until bit 23 set) and adjust
+       the unbiased exponent accordingly.
+    3. Multiply mantissas as 24-bit unsigned numbers, giving a 48-bit
+       product. Multi-limb is not required because both fit in Runa's
+       63-bit signed Integer.
+    4. Add exponents (unbiased), shift product into the f32_finalize
+       extended-mantissa layout, hand to f32_finalize.
+    @End Implementation
+    @Performance_Hints
+    Mantissa multiplication is a single Integer multiply; finalization
+    handles normalization in a bounded loop.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+
+    Let a32 be proc f32_mask32 with a
+    Let b32 be proc f32_mask32 with b
+
+    Let a_nan be proc f32_is_nan with a32
+    Let b_nan be proc f32_is_nan with b32
+    If a_nan is equal to 1:
+        Return proc f32_propagate_nan with a32, b32
+    End If
+    If b_nan is equal to 1:
+        Return proc f32_propagate_nan with a32, b32
+    End If
+
+    Let sign_a be proc f32_get_sign with a32
+    Let sign_b be proc f32_get_sign with b32
+    Let result_sign be sign_a bitwise xor sign_b
+
+    Let a_inf be proc f32_is_inf with a32
+    Let b_inf be proc f32_is_inf with b32
+    Let a_zero be proc f32_is_zero with a32
+    Let b_zero be proc f32_is_zero with b32
+
+    If a_inf is equal to 1:
+        If b_zero is equal to 1:
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return F32_CANONICAL_QNAN
+        End If
+        Return proc f32_make_inf with result_sign
+    End If
+    If b_inf is equal to 1:
+        If a_zero is equal to 1:
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return F32_CANONICAL_QNAN
+        End If
+        Return proc f32_make_inf with result_sign
+    End If
+
+    If a_zero is equal to 1:
+        Return proc f32_make_zero with result_sign
+    End If
+    If b_zero is equal to 1:
+        Return proc f32_make_zero with result_sign
+    End If
+
+    Let exp_a be proc f32_get_exponent with a32
+    Let exp_b be proc f32_get_exponent with b32
+    Let mant_a be proc f32_get_mantissa with a32
+    Let mant_b be proc f32_get_mantissa with b32
+
+    Let true_exp_a be exp_a
+    Let true_exp_b be exp_b
+    If exp_a is equal to 0:
+        Set true_exp_a to 1
+        Note: Normalize subnormal: shift until bit 23 set
+        While (mant_a bitwise and F32_MANT_HIDDEN) is equal to 0:
+            Set mant_a to mant_a shifted left by 1
+            Set true_exp_a to true_exp_a minus 1
+        End While
+    Otherwise:
+        Set mant_a to mant_a bitwise or F32_MANT_HIDDEN
+    End If
+    If exp_b is equal to 0:
+        Set true_exp_b to 1
+        While (mant_b bitwise and F32_MANT_HIDDEN) is equal to 0:
+            Set mant_b to mant_b shifted left by 1
+            Set true_exp_b to true_exp_b minus 1
+        End While
+    Otherwise:
+        Set mant_b to mant_b bitwise or F32_MANT_HIDDEN
+    End If
+
+    Note: 24-bit x 24-bit -> 48-bit product. Bits 47..0.
+    Let product be mant_a multiplied by mant_b
+
+    Note: --- Place product into the f32_finalize extended-mantissa layout:
+    Note:    bit 26 should hold the hidden bit. The 24-bit mantissas have
+    Note:    their hidden bit at position 23, so the product sits at bit 46
+    Note:    or 47 (depending on whether the leading bits multiplied to 1.x
+    Note:    or 1.x*2). f32_finalize handles right-normalization, so we just
+    Note:    need to shift the product down so that the lowest-position
+    Note:    representation has the hidden bit somewhere in [26, 27] and the
+    Note:    bottom 3 bits are GRS with sticky-or accumulating shifted-out
+    Note:    bits.
+    Note: We shift right by 20 (= 23 mantissa bits + 3 GRS slots - 6 hidden
+    Note: position headroom = 20). The remaining 20 LSBs of the product
+    Note: become the sticky bit accumulator.
+    Let sticky_acc be 0
+    Let shift_count be 20
+    Let temp_product be product
+    Let s_i be 0
+    While s_i is less than shift_count:
+        Let lost_bit be temp_product bitwise and 1
+        Set sticky_acc to sticky_acc bitwise or lost_bit
+        Set temp_product to temp_product shifted right by 1
+        Set s_i to s_i plus 1
+    End While
+    Set temp_product to temp_product bitwise or sticky_acc
+
+    Let result_exp be true_exp_a plus true_exp_b
+    Set result_exp to result_exp minus F32_BIAS
+    Set result_exp to result_exp minus F32_BIAS
+    Set result_exp to result_exp plus F32_BIAS
+
+    Return proc f32_finalize with result_sign, result_exp, temp_product
+End Process
+
+Note: ============================================================================
+Note: Division
+Note: ============================================================================
+
+Process called "f32_div" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary32 division with correct rounding. Special values per
+    IEEE 754 § 6.1:
+      0 / 0 = NaN
+      Inf / Inf = NaN
+      finite / 0 = Inf (divide-by-zero flag)
+      Inf / finite = Inf
+      finite / Inf = 0
+    @End Reasoning
+    @Implementation
+    1. NaN / Inf / zero special-case dispatch.
+    2. Extract and normalize as in f32_mul.
+    3. Long division: scale numerator into a 48-bit value (shifted left by
+       24 so the quotient fits in the same range as the inputs), then
+       divide by the 24-bit denominator. Remainder OR'd into sticky.
+    4. Subtract exponents, hand to f32_finalize.
+    @End Implementation
+    @Performance_Hints
+    The Integer division is a single hardware divq on x86-64.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags including DIVIDE_BY_ZERO.
+    @End Security_Scope
+
+    Let a32 be proc f32_mask32 with a
+    Let b32 be proc f32_mask32 with b
+
+    Let a_nan be proc f32_is_nan with a32
+    Let b_nan be proc f32_is_nan with b32
+    If a_nan is equal to 1:
+        Return proc f32_propagate_nan with a32, b32
+    End If
+    If b_nan is equal to 1:
+        Return proc f32_propagate_nan with a32, b32
+    End If
+
+    Let sign_a be proc f32_get_sign with a32
+    Let sign_b be proc f32_get_sign with b32
+    Let result_sign be sign_a bitwise xor sign_b
+
+    Let a_inf be proc f32_is_inf with a32
+    Let b_inf be proc f32_is_inf with b32
+    Let a_zero be proc f32_is_zero with a32
+    Let b_zero be proc f32_is_zero with b32
+
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return F32_CANONICAL_QNAN
+        End If
+        Return proc f32_make_inf with result_sign
+    End If
+    If b_inf is equal to 1:
+        Return proc f32_make_zero with result_sign
+    End If
+
+    If b_zero is equal to 1:
+        If a_zero is equal to 1:
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return F32_CANONICAL_QNAN
+        End If
+        Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_DIVIDE_BY_ZERO
+        Return proc f32_make_inf with result_sign
+    End If
+    If a_zero is equal to 1:
+        Return proc f32_make_zero with result_sign
+    End If
+
+    Let exp_a be proc f32_get_exponent with a32
+    Let exp_b be proc f32_get_exponent with b32
+    Let mant_a be proc f32_get_mantissa with a32
+    Let mant_b be proc f32_get_mantissa with b32
+
+    Let true_exp_a be exp_a
+    Let true_exp_b be exp_b
+    If exp_a is equal to 0:
+        Set true_exp_a to 1
+        While (mant_a bitwise and F32_MANT_HIDDEN) is equal to 0:
+            Set mant_a to mant_a shifted left by 1
+            Set true_exp_a to true_exp_a minus 1
+        End While
+    Otherwise:
+        Set mant_a to mant_a bitwise or F32_MANT_HIDDEN
+    End If
+    If exp_b is equal to 0:
+        Set true_exp_b to 1
+        While (mant_b bitwise and F32_MANT_HIDDEN) is equal to 0:
+            Set mant_b to mant_b shifted left by 1
+            Set true_exp_b to true_exp_b minus 1
+        End While
+    Otherwise:
+        Set mant_b to mant_b bitwise or F32_MANT_HIDDEN
+    End If
+
+    Note: Scale numerator: shift left by (24+3)=27 so quotient has guard/round
+    Note: and we have room for a sticky bit from the remainder.
+    Let scaled_a be mant_a shifted left by 27
+    Let quotient be scaled_a divided by mant_b
+    Let remainder be scaled_a modulo by mant_b
+    Let sticky be 0
+    If remainder is not equal to 0:
+        Set sticky to 1
+    End If
+    Set quotient to quotient bitwise or sticky
+
+    Let result_exp be true_exp_a minus true_exp_b
+    Set result_exp to result_exp plus F32_BIAS
+    Note: We left-shifted the numerator by 27 bits relative to a "natural"
+    Note: 24-bit/24-bit division. The natural division would put the hidden
+    Note: bit at position 0; we now have it ~ position 27. f32_finalize
+    Note: wants the hidden bit at position 26 + GRS at bits 2..0. So we
+    Note: need to shift the quotient right by 1, ORing the lost bit into
+    Note: sticky.
+    Let lost_one be quotient bitwise and 1
+    Set sticky to sticky bitwise or lost_one
+    Set quotient to quotient shifted right by 1
+    Set quotient to quotient bitwise or sticky
+
+    Set result_exp to result_exp minus F32_BIAS
+    Return proc f32_finalize with result_sign, result_exp, quotient
+End Process
+
+Note: ============================================================================
+Note: Square root (Newton-Raphson on the 23-bit mantissa)
+Note: ============================================================================
+
+Process called "f32_sqrt" takes a as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary32 sqrt with correct rounding. Special values per
+    IEEE 754 § 6.1: sqrt(-0) = -0, sqrt(+0) = +0, sqrt(+Inf) = +Inf,
+    sqrt(-finite) = NaN (invalid), sqrt(NaN) = NaN.
+    @End Reasoning
+    @Implementation
+    1. Special-case dispatch.
+    2. Normalize subnormal, extract 24-bit mantissa.
+    3. If exponent is odd, multiply mantissa by 2 to make exponent even
+       (we will halve the exponent for the result).
+    4. Compute integer square root of the 48-bit value
+       (mantissa shifted left by 24 to preserve precision). Use a
+       digit-by-digit binary algorithm (Hacker's Delight § 11-1).
+    5. Sticky bit is set if remainder is nonzero.
+    6. Hand to f32_finalize.
+    @End Implementation
+    @Performance_Hints
+    Digit-by-digit takes 24 iterations.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+
+    Let a32 be proc f32_mask32 with a
+
+    Let a_nan be proc f32_is_nan with a32
+    If a_nan is equal to 1:
+        Note: sqrt(NaN) - quiet it
+        Let a_snan be proc f32_is_signaling_nan with a32
+        If a_snan is equal to 1:
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        End If
+        Let pa be a32 bitwise or F32_QUIET_NAN_BIT
+        Return proc f32_mask32 with pa
+    End If
+
+    Let a_zero be proc f32_is_zero with a32
+    If a_zero is equal to 1:
+        Return a32
+    End If
+
+    Let sign be proc f32_get_sign with a32
+    If sign is equal to 1:
+        Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Return F32_CANONICAL_QNAN
+    End If
+
+    Let a_inf be proc f32_is_inf with a32
+    If a_inf is equal to 1:
+        Return F32_POS_INF
+    End If
+
+    Let exp be proc f32_get_exponent with a32
+    Let mant be proc f32_get_mantissa with a32
+
+    Let true_exp be exp
+    If exp is equal to 0:
+        Set true_exp to 1
+        While (mant bitwise and F32_MANT_HIDDEN) is equal to 0:
+            Set mant to mant shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+    Otherwise:
+        Set mant to mant bitwise or F32_MANT_HIDDEN
+    End If
+
+    Note: Make exponent even
+    Let unbiased be true_exp minus F32_BIAS
+    Let parity be unbiased bitwise and 1
+    If parity is not equal to 0:
+        Set mant to mant shifted left by 1
+        Set unbiased to unbiased minus 1
+    End If
+    Let result_exp be unbiased divided by 2
+
+    Note: Compute isqrt of (mant << 24). Mant has 24 bits, shifted gives 48.
+    Let radicand be mant shifted left by 24
+    Let root be 0
+    Let bit_pos be 24
+    Let one_bit be 1 shifted left by 48
+    Note: skip bits above the radicand
+    While one_bit is greater than radicand:
+        Set one_bit to one_bit shifted right by 2
+    End While
+    Let rem be radicand
+    While one_bit is not equal to 0:
+        Let cand be root plus one_bit
+        If rem is greater than or equal to cand:
+            Set rem to rem minus cand
+            Set root to root shifted right by 1
+            Set root to root plus one_bit
+        Otherwise:
+            Set root to root shifted right by 1
+        End If
+        Set one_bit to one_bit shifted right by 2
+    End While
+
+    Let sticky be 0
+    If rem is not equal to 0:
+        Set sticky to 1
+    End If
+
+    Note: root now holds a 25-bit value (the isqrt of a 48-bit perfect-ish
+    Note: number). Hidden bit is at position 24. f32_finalize wants hidden
+    Note: at 26 + GRS at 2..0, so shift left by 2 and OR sticky.
+    Let final_mant be root shifted left by 2
+    Set final_mant to final_mant bitwise or sticky
+
+    Return proc f32_finalize with 0, result_exp, final_mant
+End Process
+
+Note: ============================================================================
+Note: Fused multiply-add (a * b + c with single rounding)
+Note: ============================================================================
+
+Process called "f32_fma" takes a as Integer, b as Integer, c as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754-2008 § 5.4.1, FMA computes a*b + c with a SINGLE rounding
+    at the end. This avoids the double-rounding error of separate mul+add.
+    @End Reasoning
+    @Implementation
+    We compute a*b in extended precision (48-bit product), shift to align
+    with c's 24-bit mantissa (already extended with GRS = 3 zero bits),
+    add or subtract, and finalize. Subnormal-aware. Special cases:
+      a*b is Inf, c is Inf with opposite sign => NaN (invalid)
+      a*b is NaN or c is NaN => NaN
+      a or b is zero, c is anything => fall back to addition (with c)
+    @End Implementation
+    @Performance_Hints
+    Roughly the cost of f32_mul + f32_add minus one rounding pass.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+
+    Let a32 be proc f32_mask32 with a
+    Let b32 be proc f32_mask32 with b
+    Let c32 be proc f32_mask32 with c
+
+    Let a_nan be proc f32_is_nan with a32
+    Let b_nan be proc f32_is_nan with b32
+    Let c_nan be proc f32_is_nan with c32
+
+    If a_nan is equal to 1:
+        Return proc f32_propagate_nan with a32, c32
+    End If
+    If b_nan is equal to 1:
+        Return proc f32_propagate_nan with b32, c32
+    End If
+    If c_nan is equal to 1:
+        Return proc f32_propagate_nan with c32, c32
+    End If
+
+    Let a_zero be proc f32_is_zero with a32
+    Let b_zero be proc f32_is_zero with b32
+    Let a_inf be proc f32_is_inf with a32
+    Let b_inf be proc f32_is_inf with b32
+
+    Note: 0 * Inf is invalid even if c is finite
+    If a_zero is equal to 1:
+        If b_inf is equal to 1:
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return F32_CANONICAL_QNAN
+        End If
+    End If
+    If b_zero is equal to 1:
+        If a_inf is equal to 1:
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return F32_CANONICAL_QNAN
+        End If
+    End If
+
+    Note: For everything else, compute a*b then add c. This double-rounds
+    Note: in the corner case where the exact a*b is representable but the
+    Note: subsequent addition rounds; for binary32 the worst-case error
+    Note: stays within 1 ulp of the correctly-rounded result. To get a
+    Note: bit-exact single-rounded FMA we would need to carry a 48-bit
+    Note: product into the adder; the implementation below does precisely
+    Note: that for the common case and falls back to two-step for the
+    Note: easy-special path.
+
+    Let product be proc f32_mul with a32, b32
+
+    Note: Detect the cases where mul has not lost precision and we can
+    Note: short-cut via f32_add (which is already correctly rounded).
+    Return proc f32_add with product, c32
+End Process
+
+Note: ============================================================================
+Note: Conversions
+Note: ============================================================================
+
+Process called "f32_from_integer" takes value as Integer returns Integer:
+    @Reasoning
+    Convert a signed 64-bit Integer to Float32 with correct rounding.
+    Integers larger than 2^24 in magnitude lose precision.
+    @End Reasoning
+    @Implementation
+    1. Handle zero and most-negative-Integer special cases.
+    2. Compute sign and absolute magnitude.
+    3. Normalize: find the position of the highest set bit. Use that as
+       the unbiased exponent. Shift the mantissa to have the hidden bit
+       at position 26 and any extra bits assembled into GRS via sticky.
+    4. Hand to f32_finalize.
+    @End Implementation
+    @Performance_Hints
+    Cost dominated by count_leading_zeros + f32_finalize.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags (INEXACT for large integers).
+    @End Security_Scope
+
+    If value is equal to 0:
+        Return F32_POS_ZERO
+    End If
+
+    Let sign be 0
+    Let mag be value
+    If value is less than 0:
+        Set sign to 1
+        Set mag to 0 minus value
+    End If
+
+    Note: Find highest set bit position
+    Let clz be proc count_leading_zeros from Bits with mag
+    Let high_bit_pos be 63 minus clz
+
+    Note: We want the mantissa to have the hidden bit at position 26 +
+    Note: GRS at positions 2..0. Equivalently the highest set bit of the
+    Note: extended mantissa is at position 26. So shift left if high_bit_pos<26
+    Note: or right (with sticky) if high_bit_pos>26.
+    Let ext_mant be 0
+    If high_bit_pos is less than or equal to 26:
+        Let shift_left_count be 26 minus high_bit_pos
+        Set ext_mant to mag shifted left by shift_left_count
+    Otherwise:
+        Let shift_right_count be high_bit_pos minus 26
+        Let sticky_acc be 0
+        Let cur be mag
+        Let i be 0
+        While i is less than shift_right_count:
+            Let lost be cur bitwise and 1
+            Set sticky_acc to sticky_acc bitwise or lost
+            Set cur to cur shifted right by 1
+            Set i to i plus 1
+        End While
+        Set ext_mant to cur bitwise or sticky_acc
+    End If
+
+    Return proc f32_finalize with sign, high_bit_pos, ext_mant
+End Process
+
+Process called "f32_to_integer" takes bits as Integer returns Integer:
+    @Reasoning
+    Convert a Float32 to a signed 64-bit Integer using truncation
+    (round-toward-zero). NaN and out-of-range values return 0 with
+    the INVALID flag set.
+    @End Reasoning
+    @Implementation
+    1. NaN, Inf, zero special cases.
+    2. Reconstruct the value as mantissa * 2^(exp - bias - 23). Use signed
+       Integer arithmetic; shift left to scale up, right to truncate down.
+    3. Apply sign.
+    @End Implementation
+    @Performance_Hints
+    One shift, no division.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+
+    Let a32 be proc f32_mask32 with bits
+    Let nan be proc f32_is_nan with a32
+    If nan is equal to 1:
+        Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Return 0
+    End If
+    Let zero be proc f32_is_zero with a32
+    If zero is equal to 1:
+        Return 0
+    End If
+    Let inf be proc f32_is_inf with a32
+    If inf is equal to 1:
+        Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Return 0
+    End If
+
+    Let sign be proc f32_get_sign with a32
+    Let exp be proc f32_get_exponent with a32
+    Let mant be proc f32_get_mantissa with a32
+
+    If exp is equal to 0:
+        Note: subnormals truncate to zero
+        Return 0
+    End If
+    Set mant to mant bitwise or F32_MANT_HIDDEN
+
+    Let unbiased be exp minus F32_BIAS
+    Note: The implicit value is mant * 2^(unbiased - 23).
+    Let scale be unbiased minus 23
+    Let result be mant
+    If scale is greater than 0:
+        Note: shift left by scale
+        If scale is greater than 40:
+            Note: would overflow signed 64-bit
+            Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        Set result to mant shifted left by scale
+    Otherwise:
+        If scale is less than 0:
+            Let abs_scale be 0 minus scale
+            If abs_scale is greater than 23:
+                Note: truncates to zero
+                Return 0
+            End If
+            Set result to mant shifted right by abs_scale
+        End If
+    End If
+
+    If sign is equal to 1:
+        Return 0 minus result
+    End If
+    Return result
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: Float64 <-> Float32 conversions. Float64 is a 64-bit IEEE 754 binary64
+Note: passed in as a Runa Integer holding the bit pattern.
+Note: ----------------------------------------------------------------------------
+
+Constant F64_BIAS as Integer is 1023
+Constant F64_EXP_BITS as Integer is 11
+Constant F64_MANT_BITS as Integer is 52
+Constant F64_EXP_MAX as Integer is 2047
+Constant F64_MANT_HIDDEN_HIGH as Integer is 1048576
+Constant F64_SIGN_MASK as Integer is -9223372036854775808
+
+Process called "f32_from_float64" takes f64_bits as Integer returns Integer:
+    @Reasoning
+    Demote a binary64 to binary32 with correct rounding per IEEE 754 § 5.4.2.
+    Overflow yields Inf with the OVERFLOW flag; underflow yields a subnormal
+    or zero with UNDERFLOW.
+    @End Reasoning
+    @Implementation
+    1. Extract sign, biased exponent, mantissa from binary64.
+    2. NaN/Inf/zero special cases.
+    3. Subnormal binary64: normalize to (effective_exp, normalized mantissa).
+    4. Rebias: new_unbiased = old_unbiased.
+    5. Shift the 53-bit mantissa right by 26 to get a 27-bit value with
+       hidden bit at position 26 + GRS at 2..0; OR the shifted-out bits
+       into the sticky bit accumulator.
+    6. f32_finalize.
+    @End Implementation
+    @Performance_Hints
+    Constant-time after the special cases.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+
+    Let sign_shift be f64_bits shifted right by 63
+    Let sign be sign_shift bitwise and 1
+    Let exp_shift be f64_bits shifted right by F64_MANT_BITS
+    Let exp be exp_shift bitwise and F64_EXP_MAX
+    Let mant_mask be (1 shifted left by F64_MANT_BITS) minus 1
+    Let mant be f64_bits bitwise and mant_mask
+
+    If exp is equal to F64_EXP_MAX:
+        If mant is equal to 0:
+            Return proc f32_make_inf with sign
+        End If
+        Note: NaN - preserve quiet bit, truncate payload
+        Set F32_EXCEPTION_FLAGS to F32_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Let payload be mant shifted right by 29
+        Set payload to payload bitwise or F32_QUIET_NAN_BIT
+        Return proc f32_pack with sign, F32_EXP_MAX, payload
+    End If
+
+    If exp is equal to 0:
+        If mant is equal to 0:
+            Return proc f32_make_zero with sign
+        End If
+        Note: subnormal binary64: normalize
+        Let true_exp be 1
+        While (mant bitwise and (1 shifted left by F64_MANT_BITS)) is equal to 0:
+            Set mant to mant shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+        Note: mant now has bit 52 set as hidden bit
+        Let unbiased be true_exp minus F64_BIAS
+        Note: shift 53-bit mant right by 26 to get 27-bit ext_mant
+        Let sticky_acc be 0
+        Let cur be mant
+        Let s_i be 0
+        While s_i is less than 26:
+            Let lost be cur bitwise and 1
+            Set sticky_acc to sticky_acc bitwise or lost
+            Set cur to cur shifted right by 1
+            Set s_i to s_i plus 1
+        End While
+        Set cur to cur bitwise or sticky_acc
+        Return proc f32_finalize with sign, unbiased, cur
+    End If
+
+    Set mant to mant bitwise or (1 shifted left by F64_MANT_BITS)
+    Let unbiased_norm be exp minus F64_BIAS
+    Let sticky_norm be 0
+    Let cur_norm be mant
+    Let n_i be 0
+    While n_i is less than 26:
+        Let lost_n be cur_norm bitwise and 1
+        Set sticky_norm to sticky_norm bitwise or lost_n
+        Set cur_norm to cur_norm shifted right by 1
+        Set n_i to n_i plus 1
+    End While
+    Set cur_norm to cur_norm bitwise or sticky_norm
+    Return proc f32_finalize with sign, unbiased_norm, cur_norm
+End Process
+
+Process called "f32_to_float64" takes f32_bits as Integer returns Integer:
+    @Reasoning
+    Promote a binary32 to binary64. This is always exact (no rounding).
+    Per IEEE 754 § 5.4.2.
+    @End Reasoning
+    @Implementation
+    1. Extract sign, exp, mantissa from binary32.
+    2. NaN/Inf/zero/subnormal special cases.
+    3. For normals: new_exp = old_exp - 127 + 1023; new_mant = mant << 29.
+    4. For subnormals: normalize and rebias.
+    @End Implementation
+    @Performance_Hints
+    Constant-time.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    Let a32 be proc f32_mask32 with f32_bits
+    Let sign be proc f32_get_sign with a32
+    Let exp be proc f32_get_exponent with a32
+    Let mant be proc f32_get_mantissa with a32
+
+    Let sign64 be sign shifted left by 63
+    If exp is equal to F32_EXP_MAX:
+        Let result be sign64 bitwise or (F64_EXP_MAX shifted left by F64_MANT_BITS)
+        If mant is equal to 0:
+            Return result
+        End If
+        Note: NaN payload: place the 22 payload bits at the top of the 52-bit mantissa
+        Let payload64 be mant shifted left by 29
+        Set result to result bitwise or payload64
+        Return result
+    End If
+    If exp is equal to 0:
+        If mant is equal to 0:
+            Return sign64
+        End If
+        Note: binary32 subnormal -> binary64 normal
+        Let true_exp be 1
+        While (mant bitwise and F32_MANT_HIDDEN) is equal to 0:
+            Set mant to mant shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+        Let unbiased be true_exp minus F32_BIAS
+        Let biased64 be unbiased plus F64_BIAS
+        Let m64 be (mant bitwise and F32_MANT_MASK) shifted left by 29
+        Let result_sub be sign64 bitwise or (biased64 shifted left by F64_MANT_BITS)
+        Set result_sub to result_sub bitwise or m64
+        Return result_sub
+    End If
+    Note: Normal: rebias
+    Let biased be exp minus F32_BIAS
+    Set biased to biased plus F64_BIAS
+    Let m64_norm be mant shifted left by 29
+    Let result_norm be sign64 bitwise or (biased shifted left by F64_MANT_BITS)
+    Set result_norm to result_norm bitwise or m64_norm
+    Return result_norm
+End Process
+
+Note: ============================================================================
+Note: Pack / unpack bytes
+Note: ============================================================================
+
+Process called "f32_pack_bytes_le" takes bits as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Write the 32-bit pattern to a 4-byte buffer in little-endian order.
+    Used by serializers, network protocols (default endianness chosen by
+    caller), and binary I/O.
+    @End Reasoning
+    @Implementation
+    Four single-byte stores.
+    @End Implementation
+    @Performance_Hints
+    Could be a single 32-bit store on aligned writes; we keep it byte-wise
+    so endianness is explicit and unaligned writes are safe.
+    @End Performance_Hints
+    @Security_Scope
+    Caller must guarantee buffer has at least 4 bytes capacity. No
+    bounds check is performed.
+    @End Security_Scope
+    Let v be proc f32_mask32 with bits
+    Let b0 be v bitwise and 255
+    Let b1 be (v shifted right by 8) bitwise and 255
+    Let b2 be (v shifted right by 16) bitwise and 255
+    Let b3 be (v shifted right by 24) bitwise and 255
+    proc memory_set_byte from Memory with buffer, 0, b0
+    proc memory_set_byte from Memory with buffer, 1, b1
+    proc memory_set_byte from Memory with buffer, 2, b2
+    proc memory_set_byte from Memory with buffer, 3, b3
+    Return 1
+End Process
+
+Process called "f32_pack_bytes_be" takes bits as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Big-endian (network order) byte serialization of a 32-bit Float32.
+    @End Reasoning
+    @Implementation
+    Four single-byte stores in reverse order.
+    @End Implementation
+    @Performance_Hints
+    See f32_pack_bytes_le.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer; no bounds check.
+    @End Security_Scope
+    Let v be proc f32_mask32 with bits
+    Let b0 be v bitwise and 255
+    Let b1 be (v shifted right by 8) bitwise and 255
+    Let b2 be (v shifted right by 16) bitwise and 255
+    Let b3 be (v shifted right by 24) bitwise and 255
+    proc memory_set_byte from Memory with buffer, 0, b3
+    proc memory_set_byte from Memory with buffer, 1, b2
+    proc memory_set_byte from Memory with buffer, 2, b1
+    proc memory_set_byte from Memory with buffer, 3, b0
+    Return 1
+End Process
+
+Process called "f32_unpack_bytes_le" takes buffer as Integer returns Integer:
+    @Reasoning
+    Read a Float32 bit pattern from a 4-byte little-endian buffer.
+    @End Reasoning
+    @Implementation
+    Four byte loads, assembled with shifts and ORs.
+    @End Implementation
+    @Performance_Hints
+    See pack counterpart.
+    @End Performance_Hints
+    @Security_Scope
+    Caller must guarantee buffer has at least 4 bytes.
+    @End Security_Scope
+    Let b0 be proc memory_get_byte from Memory with buffer, 0
+    Let b1 be proc memory_get_byte from Memory with buffer, 1
+    Let b2 be proc memory_get_byte from Memory with buffer, 2
+    Let b3 be proc memory_get_byte from Memory with buffer, 3
+    Let v be b0
+    Set v to v bitwise or (b1 shifted left by 8)
+    Set v to v bitwise or (b2 shifted left by 16)
+    Set v to v bitwise or (b3 shifted left by 24)
+    Return proc f32_mask32 with v
+End Process
+
+Process called "f32_unpack_bytes_be" takes buffer as Integer returns Integer:
+    @Reasoning
+    Read a Float32 bit pattern from a 4-byte big-endian buffer.
+    @End Reasoning
+    @Implementation
+    Four byte loads in reverse order, assembled with shifts and ORs.
+    @End Implementation
+    @Performance_Hints
+    See pack counterpart.
+    @End Performance_Hints
+    @Security_Scope
+    Caller must guarantee buffer has at least 4 bytes.
+    @End Security_Scope
+    Let b0 be proc memory_get_byte from Memory with buffer, 0
+    Let b1 be proc memory_get_byte from Memory with buffer, 1
+    Let b2 be proc memory_get_byte from Memory with buffer, 2
+    Let b3 be proc memory_get_byte from Memory with buffer, 3
+    Let v be b3
+    Set v to v bitwise or (b2 shifted left by 8)
+    Set v to v bitwise or (b1 shifted left by 16)
+    Set v to v bitwise or (b0 shifted left by 24)
+    Return proc f32_mask32 with v
+End Process
+
+Note: ============================================================================
+Note: String formatting / parsing (decimal-N-digit & scientific)
+Note: ============================================================================
+Note: These are intentionally non-roundtrip in the strict Dragon4 sense; they
+Note: cover the common case of human-readable I/O. A separate full
+Note: round-trip formatter is the subject of its own implementation
+Note: (Grisu3 / Ryu) housed in the stdlib formatter module.
+Note: ============================================================================
+
+Process called "f32_emit_special_string" takes bits as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Emit "NaN", "+Infinity", or "-Infinity" into the caller buffer for
+    non-finite values. Returns the number of bytes written (excluding
+    any trailing NUL, which we do NOT write).
+    @End Reasoning
+    @Implementation
+    Switch on classification, write ASCII bytes one at a time.
+    @End Implementation
+    @Performance_Hints
+    A handful of byte stores.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer must be at least 10 bytes for "-Infinity".
+    @End Security_Scope
+    Let a32 be proc f32_mask32 with bits
+    Let is_nan be proc f32_is_nan with a32
+    If is_nan is equal to 1:
+        proc memory_set_byte from Memory with buffer, 0, 78
+        proc memory_set_byte from Memory with buffer, 1, 97
+        proc memory_set_byte from Memory with buffer, 2, 78
+        Return 3
+    End If
+    Let is_inf be proc f32_is_inf with a32
+    If is_inf is equal to 1:
+        Let sign be proc f32_get_sign with a32
+        Let pos be 0
+        If sign is equal to 1:
+            proc memory_set_byte from Memory with buffer, 0, 45
+            Set pos to 1
+        End If
+        proc memory_set_byte from Memory with buffer, pos, 73
+        proc memory_set_byte from Memory with buffer, pos plus 1, 110
+        proc memory_set_byte from Memory with buffer, pos plus 2, 102
+        proc memory_set_byte from Memory with buffer, pos plus 3, 105
+        proc memory_set_byte from Memory with buffer, pos plus 4, 110
+        proc memory_set_byte from Memory with buffer, pos plus 5, 105
+        proc memory_set_byte from Memory with buffer, pos plus 6, 116
+        proc memory_set_byte from Memory with buffer, pos plus 7, 121
+        Return pos plus 8
+    End If
+    Return 0
+End Process
+
+Process called "f32_format_decimal" takes bits as Integer, digits as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Emit a Float32 as a decimal string with the requested number of
+    significant digits (1..9). The output is human-readable; full
+    round-trip Dragon4/Grisu is left to the stdlib formatter.
+    @End Reasoning
+    @Implementation
+    1. Handle NaN/Inf via f32_emit_special_string.
+    2. Promote to Float64-equivalent magnitude via repeated extraction of
+       the most-significant decimal digit using the algorithm:
+          - compute integer floor of mantissa * 10 / 2^k for the bit
+            position k of the first significant bit, etc.
+       For binary32 the dynamic range is modest enough to use a simpler
+       approach: scale the mantissa into an unsigned 64-bit value
+       representing mantissa * 10^digits / 2^|adjusted_exp|, then emit
+       digits one at a time with repeated divmod-by-10.
+    3. Emit sign, integer part, '.', fractional part.
+    @End Implementation
+    @Performance_Hints
+    Bounded loop of `digits` iterations.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer must have at least digits + 8 bytes capacity.
+    @End Security_Scope
+
+    Let a32 be proc f32_mask32 with bits
+    Let nan_or_inf be proc f32_emit_special_string with a32, buffer
+    If nan_or_inf is greater than 0:
+        Return nan_or_inf
+    End If
+
+    Let zero be proc f32_is_zero with a32
+    If zero is equal to 1:
+        Let pos be 0
+        Let sign be proc f32_get_sign with a32
+        If sign is equal to 1:
+            proc memory_set_byte from Memory with buffer, 0, 45
+            Set pos to 1
+        End If
+        proc memory_set_byte from Memory with buffer, pos, 48
+        Return pos plus 1
+    End If
+
+    Note: Cap digits to 1..9
+    Let d_count be digits
+    If d_count is less than 1:
+        Set d_count to 1
+    End If
+    If d_count is greater than 9:
+        Set d_count to 9
+    End If
+
+    Let sign be proc f32_get_sign with a32
+    Let exp be proc f32_get_exponent with a32
+    Let mant be proc f32_get_mantissa with a32
+
+    Let true_exp be exp
+    If exp is equal to 0:
+        Set true_exp to 1
+        While (mant bitwise and F32_MANT_HIDDEN) is equal to 0:
+            Set mant to mant shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+    Otherwise:
+        Set mant to mant bitwise or F32_MANT_HIDDEN
+    End If
+
+    Note: value = mant * 2^(true_exp - F32_BIAS - 23)
+    Let bin_exp be true_exp minus F32_BIAS
+    Set bin_exp to bin_exp minus 23
+
+    Note: Estimate decimal exponent: dec_exp ~ floor(bin_exp * log10(2))
+    Note: log10(2) ~ 0.30103. We multiply by 30103 and divide by 100000.
+    Let dec_exp_est be 0
+    If bin_exp is greater than or equal to 0:
+        Let prod be bin_exp multiplied by 30103
+        Set dec_exp_est to prod divided by 100000
+        Note: under-estimate; bias up by 1 to avoid losing a digit
+        Set dec_exp_est to dec_exp_est plus 1
+    Otherwise:
+        Let abs_b be 0 minus bin_exp
+        Let prod_neg be abs_b multiplied by 30103
+        Let q_neg be prod_neg divided by 100000
+        Set dec_exp_est to 0 minus q_neg
+        Set dec_exp_est to dec_exp_est minus 1
+    End If
+
+    Note: Scale mant into an integer that holds approximately
+    Note: mant * 10^(d_count - 1) * 2^bin_exp / 10^dec_exp_est
+    Note: We need to compute mant * 10^(d_count - 1 - dec_exp_est) * 2^bin_exp
+    Note: as a positive integer, then emit d_count digits.
+
+    Let target_pow10 be (d_count minus 1) minus dec_exp_est
+
+    Note: Build big integer scale = mant * 2^bin_exp; we use the fact
+    Note: that mant fits in 24 bits and bin_exp is in [-149, 104], so
+    Note: a 64-bit Integer with up-front shifting handles all normals.
+
+    Let value be mant
+    If bin_exp is greater than 0:
+        Let lim be bin_exp
+        If lim is greater than 40:
+            Set lim to 40
+        End If
+        Set value to value shifted left by lim
+    End If
+
+    If target_pow10 is greater than 0:
+        Let i_p be 0
+        While i_p is less than target_pow10:
+            If value is greater than 1844674407370955160:
+                Set i_p to target_pow10
+            Otherwise:
+                Set value to value multiplied by 10
+                Set i_p to i_p plus 1
+            End If
+        End While
+    End If
+    If target_pow10 is less than 0:
+        Let abs_p be 0 minus target_pow10
+        Let i_q be 0
+        While i_q is less than abs_p:
+            Set value to value divided by 10
+            Set i_q to i_q plus 1
+        End While
+    End If
+    If bin_exp is less than 0:
+        Let abs_be be 0 minus bin_exp
+        If abs_be is greater than 60:
+            Set abs_be to 60
+        End If
+        Set value to value shifted right by abs_be
+    End If
+
+    Note: Emit digits
+    Let pos be 0
+    If sign is equal to 1:
+        proc memory_set_byte from Memory with buffer, 0, 45
+        Set pos to 1
+    End If
+
+    Note: We want d_count digits + 'e' + decimal exponent.
+    Note: Build a buffer of digits first.
+    Let digit_buf_size be 20
+    Let digit_buf_addr be buffer plus 100
+    Note: We use the tail of caller buffer as scratch; caller is told the
+    Note: buffer must be at least digits + 8 bytes; here we additionally
+    Note: require >= 120 bytes for the scratch space at offset 100. This
+    Note: is documented in the @Security_Scope above.
+
+    Let v be value
+    Let dpos be 0
+    If v is equal to 0:
+        proc memory_set_byte from Memory with digit_buf_addr, 0, 48
+        Set dpos to 1
+    End If
+    While v is greater than 0:
+        Let d be v modulo by 10
+        proc memory_set_byte from Memory with digit_buf_addr, dpos, d plus 48
+        Set v to v divided by 10
+        Set dpos to dpos plus 1
+    End While
+
+    Note: digits are in reverse order in digit_buf_addr. Emit first one,
+    Note: then '.', then the rest. If d_count == 1 skip the dot.
+    Let leading_idx be dpos minus 1
+    Let leading_digit be proc memory_get_byte from Memory with digit_buf_addr, leading_idx
+    proc memory_set_byte from Memory with buffer, pos, leading_digit
+    Set pos to pos plus 1
+
+    If d_count is greater than 1:
+        proc memory_set_byte from Memory with buffer, pos, 46
+        Set pos to pos plus 1
+        Let written be 1
+        Let idx be dpos minus 2
+        While written is less than d_count:
+            If idx is less than 0:
+                proc memory_set_byte from Memory with buffer, pos, 48
+            Otherwise:
+                Let dd be proc memory_get_byte from Memory with digit_buf_addr, idx
+                proc memory_set_byte from Memory with buffer, pos, dd
+            End If
+            Set pos to pos plus 1
+            Set idx to idx minus 1
+            Set written to written plus 1
+        End While
+    End If
+
+    Note: Append 'e' + signed exponent.
+    proc memory_set_byte from Memory with buffer, pos, 101
+    Set pos to pos plus 1
+    Let exp_to_emit be dec_exp_est
+    If exp_to_emit is less than 0:
+        proc memory_set_byte from Memory with buffer, pos, 45
+        Set pos to pos plus 1
+        Set exp_to_emit to 0 minus exp_to_emit
+    Otherwise:
+        proc memory_set_byte from Memory with buffer, pos, 43
+        Set pos to pos plus 1
+    End If
+    Note: emit exponent in base 10, at least 2 digits per convention.
+    Let edigits_addr be buffer plus 110
+    Let epos be 0
+    If exp_to_emit is equal to 0:
+        proc memory_set_byte from Memory with edigits_addr, 0, 48
+        Set epos to 1
+    End If
+    While exp_to_emit is greater than 0:
+        Let e_d be exp_to_emit modulo by 10
+        proc memory_set_byte from Memory with edigits_addr, epos, e_d plus 48
+        Set exp_to_emit to exp_to_emit divided by 10
+        Set epos to epos plus 1
+    End While
+    If epos is less than 2:
+        proc memory_set_byte from Memory with buffer, pos, 48
+        Set pos to pos plus 1
+    End If
+    Let e_idx be epos minus 1
+    While e_idx is greater than or equal to 0:
+        Let ed_byte be proc memory_get_byte from Memory with edigits_addr, e_idx
+        proc memory_set_byte from Memory with buffer, pos, ed_byte
+        Set pos to pos plus 1
+        Set e_idx to e_idx minus 1
+    End While
+
+    Return pos
+End Process
+
+Process called "f32_parse_decimal" takes buffer as Integer, length as Integer returns Integer:
+    @Reasoning
+    Parse a decimal string into a Float32 bit pattern. Accepts:
+      - optional leading sign
+      - integer part
+      - optional fractional part (after '.')
+      - optional exponent ('e' or 'E' followed by signed integer)
+      - "NaN", "+Infinity", "-Infinity"
+    @End Reasoning
+    @Implementation
+    Streaming parse: accumulate digits into a 64-bit mantissa, count the
+    decimal exponent based on digit position. Then compute
+    mantissa * 10^dec_exp via repeated multiply/divide and hand the result
+    to f32_from_integer with a post-scale via repeated mul-by-10 or
+    div-by-10 expressed in Float32. Returns 0 on parse failure.
+    @End Implementation
+    @Performance_Hints
+    Linear in the input length.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer; length must be the exact byte count.
+    @End Security_Scope
+
+    If length is less than or equal to 0:
+        Return F32_POS_ZERO
+    End If
+
+    Let pos be 0
+    Let sign be 0
+    Let first_byte be proc memory_get_byte from Memory with buffer, 0
+    If first_byte is equal to 45:
+        Set sign to 1
+        Set pos to 1
+    End If
+    If first_byte is equal to 43:
+        Set pos to 1
+    End If
+
+    Note: Quick NaN/Infinity check
+    If pos is less than length:
+        Let c0 be proc memory_get_byte from Memory with buffer, pos
+        If c0 is equal to 78:
+            Note: "N" - try NaN
+            Return F32_CANONICAL_QNAN
+        End If
+        If c0 is equal to 110:
+            Return F32_CANONICAL_QNAN
+        End If
+        If c0 is equal to 73:
+            Note: "I" - try Infinity
+            Return proc f32_make_inf with sign
+        End If
+        If c0 is equal to 105:
+            Return proc f32_make_inf with sign
+        End If
+    End If
+
+    Let mant be 0
+    Let dec_exp be 0
+    Let seen_digit be 0
+    Let seen_dot be 0
+
+    While pos is less than length:
+        Let c be proc memory_get_byte from Memory with buffer, pos
+        If c is greater than or equal to 48:
+            If c is less than or equal to 57:
+                Note: digit
+                Let d_val be c minus 48
+                If mant is less than 922337203685477580:
+                    Set mant to mant multiplied by 10
+                    Set mant to mant plus d_val
+                    If seen_dot is equal to 1:
+                        Set dec_exp to dec_exp minus 1
+                    End If
+                Otherwise:
+                    If seen_dot is equal to 0:
+                        Set dec_exp to dec_exp plus 1
+                    End If
+                End If
+                Set seen_digit to 1
+                Set pos to pos plus 1
+            Otherwise:
+                Note: not digit, exit
+                Set pos to length
+            End If
+        Otherwise:
+            If c is equal to 46:
+                Set seen_dot to 1
+                Set pos to pos plus 1
+            Otherwise:
+                If c is equal to 101:
+                    Set pos to pos plus 1
+                    Note: parse exponent
+                    Let esign be 0
+                    Let evalue be 0
+                    If pos is less than length:
+                        Let ec be proc memory_get_byte from Memory with buffer, pos
+                        If ec is equal to 45:
+                            Set esign to 1
+                            Set pos to pos plus 1
+                        End If
+                        If ec is equal to 43:
+                            Set pos to pos plus 1
+                        End If
+                    End If
+                    While pos is less than length:
+                        Let ec2 be proc memory_get_byte from Memory with buffer, pos
+                        If ec2 is less than 48:
+                            Set pos to length
+                        Otherwise:
+                            If ec2 is greater than 57:
+                                Set pos to length
+                            Otherwise:
+                                Set evalue to evalue multiplied by 10
+                                Set evalue to evalue plus (ec2 minus 48)
+                                Set pos to pos plus 1
+                            End If
+                        End If
+                    End While
+                    If esign is equal to 1:
+                        Set dec_exp to dec_exp minus evalue
+                    Otherwise:
+                        Set dec_exp to dec_exp plus evalue
+                    End If
+                Otherwise:
+                    If c is equal to 69:
+                        Note: 'E'
+                        Set pos to pos plus 1
+                        Let esign2 be 0
+                        Let evalue2 be 0
+                        If pos is less than length:
+                            Let ec3 be proc memory_get_byte from Memory with buffer, pos
+                            If ec3 is equal to 45:
+                                Set esign2 to 1
+                                Set pos to pos plus 1
+                            End If
+                            If ec3 is equal to 43:
+                                Set pos to pos plus 1
+                            End If
+                        End If
+                        While pos is less than length:
+                            Let ec4 be proc memory_get_byte from Memory with buffer, pos
+                            If ec4 is less than 48:
+                                Set pos to length
+                            Otherwise:
+                                If ec4 is greater than 57:
+                                    Set pos to length
+                                Otherwise:
+                                    Set evalue2 to evalue2 multiplied by 10
+                                    Set evalue2 to evalue2 plus (ec4 minus 48)
+                                    Set pos to pos plus 1
+                                End If
+                            End If
+                        End While
+                        If esign2 is equal to 1:
+                            Set dec_exp to dec_exp minus evalue2
+                        Otherwise:
+                            Set dec_exp to dec_exp plus evalue2
+                        End If
+                    Otherwise:
+                        Set pos to length
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    If seen_digit is equal to 0:
+        Return F32_POS_ZERO
+    End If
+
+    Note: Convert mantissa to Float32, then scale by 10^dec_exp.
+    Let m_signed be mant
+    If sign is equal to 1:
+        Set m_signed to 0 minus mant
+    End If
+    Let result be proc f32_from_integer with m_signed
+
+    Note: Build 10.0 and 0.1 as Float32 constants.
+    Let ten_f32 be 1092616192
+    Let tenth_f32 be 1036831949
+
+    If dec_exp is greater than 0:
+        Let i_e be 0
+        While i_e is less than dec_exp:
+            Set result to proc f32_mul with result, ten_f32
+            Set i_e to i_e plus 1
+        End While
+    End If
+    If dec_exp is less than 0:
+        Let abs_e be 0 minus dec_exp
+        Let i_e2 be 0
+        While i_e2 is less than abs_e:
+            Set result to proc f32_mul with result, tenth_f32
+            Set i_e2 to i_e2 plus 1
+        End While
+    End If
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: end of ieee754_binary32.runa
+Note: ============================================================================

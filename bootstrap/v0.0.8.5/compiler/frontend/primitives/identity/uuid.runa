@@ -1,0 +1,1697 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+UUID - Universally Unique Identifier (RFC 9562 / formerly RFC 4122)
+==============================================================================
+
+A UUID is a 128-bit identifier. This module implements every variant
+defined in RFC 9562 (which obsoletes RFC 4122 and adds v6, v7, v8):
+
+  UUIDv1 - time-based (60-bit gregorian time + clock seq + node)
+  UUIDv3 - name-based, MD5 hash of (namespace || name)
+  UUIDv4 - random (122 random bits)
+  UUIDv5 - name-based, SHA-1 hash of (namespace || name)
+  UUIDv6 - reordered time-based (lexicographically sortable)
+  UUIDv7 - Unix epoch ms + random (DB-friendly, the new recommended)
+  UUIDv8 - application-defined
+
+References:
+- RFC 9562: Universally Unique IDentifiers (UUID)
+- IETF draft-peabody-dispatch-new-uuid-format (precursor to RFC 9562)
+- RFC 1321: The MD5 Message-Digest Algorithm (for UUIDv3)
+- FIPS PUB 180-4: Secure Hash Standard (SHA-1 for UUIDv5)
+
+Memory layout for UUID (16 bytes, raw bytes per RFC 9562):
+  bytes 0-3:   time_low / random / hash
+  bytes 4-5:   time_mid / random / hash
+  bytes 6-7:   time_hi_and_version (4-bit version + 12-bit data)
+  bytes 8:     clock_seq_hi_and_reserved (2-bit variant + 6-bit data)
+  bytes 9:     clock_seq_low / random / hash
+  bytes 10-15: node / random / hash
+
+The Bytes primitive is reused as the carrier; uuid.runa exposes a
+typed alias UUID = Bytes-of-16.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StrCore
+Import "compiler/frontend/primitives/core/bytes.runa" as Bytes
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+
+Constant UUID_SIZE as Integer is 16
+
+Note: ============================================================================
+Note: INTERNAL: Bytes-of-16 construction
+Note: ============================================================================
+
+Process called "uuid_internal_alloc" returns Integer:
+    Let buf be allocate(UUID_SIZE)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_fill(buf, 0, UUID_SIZE)
+    Return buf
+End Process
+
+Process called "uuid_internal_set_version_variant" takes buf as Integer, version as Integer returns Integer:
+    Note: Set 4-bit version in the upper nibble of byte 6.
+    Let cur6 be Memory.memory_get_byte(buf, 6)
+    Let lower4 be cur6 minus ((cur6 divided by 16) multiplied by 16)
+    Let new6 be (version multiplied by 16) plus lower4
+    Memory.memory_set_byte(buf, 6, new6)
+    Note: Set variant (RFC 9562 variant 10xx) in upper 2 bits of byte 8.
+    Let cur8 be Memory.memory_get_byte(buf, 8)
+    Let lower6 be cur8 minus ((cur8 divided by 64) multiplied by 64)
+    Let new8 be 128 plus lower6
+    Memory.memory_set_byte(buf, 8, new8)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: INTERNAL: SIMPLE TIME / RANDOM SOURCES
+Note: ============================================================================
+
+Process called "uuid_internal_read_clock_ns" returns Integer:
+    @Reasoning
+        Reads the current monotonic timestamp in nanoseconds via the
+        clock_gettime syscall (linux x86-64 syscall 228). Returns 0
+        on failure. This is sufficient for UUIDv1/v6/v7 timestamp
+        derivation without pulling in the full time_utils stack.
+    @End Reasoning
+    @Implementation
+        Allocate a 16-byte timespec, syscall(228, CLOCK_REALTIME=0,
+        timespec_ptr), read seconds and nanos, combine.
+    @End Implementation
+    @Performance_Hints
+        Single syscall.
+    @End Performance_Hints
+    @Security_Scope
+        Timestamps are not secrets; this proc never reads kernel data
+        beyond the timespec it allocated.
+    @End Security_Scope
+
+    Let timespec be allocate(16)
+    If timespec is equal to 0:
+        Return 0
+    End If
+    Memory.memory_fill(timespec, 0, 16)
+    Let syscall_result be 0
+    Inline Assembly:
+        # syscall_2 inlined: rax=228 (clock_gettime), rdi=0 (REALTIME), rsi=timespec
+        movq $228, %rax
+        movq $0, %rdi
+        movq -8(%rbp), %rsi
+        syscall
+        movq %rax, -16(%rbp)
+    End Assembly
+    If syscall_result is less than 0:
+        deallocate(timespec)
+        Return 0
+    End If
+    Let secs be Memory.memory_get_integer(timespec, 0)
+    Let nanos be Memory.memory_get_integer(timespec, 8)
+    deallocate(timespec)
+    Let ns_total be (secs multiplied by 1000000000) plus nanos
+    Return ns_total
+End Process
+
+Process called "uuid_internal_read_urandom" takes buf as Integer, len as Integer returns Integer:
+    @Reasoning
+        Fills `len` bytes of `buf` with cryptographic-quality random
+        data from the kernel CSPRNG via the cross-platform syscall
+        dispatcher. Returns 1 on success, 0 on failure. The dispatcher
+        routes to getrandom(2) on Linux/BSD/MIPS/RISC-V/PowerPC and
+        getentropy(2) on Darwin/OpenBSD; both are seeded from the
+        kernel's ChaCha20-based pool. The proc name is preserved for
+        callers but no longer reads /dev/urandom directly - the kernel
+        CSPRNG is reached without an open/read/close round-trip.
+    @End Reasoning
+    @Implementation
+        Delegates to Syscall.secure_random_bytes. The dispatcher
+        selects the platform-correct syscall number at runtime via
+        the register_map backend index, so no Linux x86-64 syscall
+        numbers leak into this module.
+    @End Implementation
+    @Performance_Hints
+        One syscall on getrandom platforms; ceil(len/256) syscalls on
+        getentropy platforms (a single syscall for the 16-byte UUID
+        workload).
+    @End Performance_Hints
+    @Security_Scope
+        Cryptographically strong on every supported platform with a
+        wired CSPRNG primitive. Windows currently returns -1 from the
+        dispatcher (BCryptGenRandom FFI not yet bound); on Windows the
+        caller observes the failure and refuses to emit a predictable
+        UUID rather than silently substituting weaker randomness.
+    @End Security_Scope
+
+    If buf is equal to 0:
+        Return 0
+    End If
+    If len is less than 0:
+        Return 0
+    End If
+    If len is equal to 0:
+        Return 1
+    End If
+    Let written be proc secure_random_bytes from Syscall with buf, len
+    If written is less than len:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "uuid_internal_fill_random" takes buf as Integer, len as Integer returns Integer:
+    @Reasoning
+        Primary entropy source for every UUID variant that mixes
+        random bits. Returns 1 on success, 0 on failure. The kernel
+        CSPRNG path through Syscall.secure_random_bytes is the only
+        accepted source: if it fails, this proc reports failure so
+        the caller can refuse to emit a non-cryptographic UUID. The
+        previous xorshift fallback was removed because it produced
+        predictable bytes while the surrounding @Security_Scope
+        claimed CSPRNG quality - a silent downgrade that broke the
+        documented security guarantee.
+    @End Reasoning
+    @Implementation
+        Single call to uuid_internal_read_urandom which dispatches
+        through the platform-aware Syscall module.
+    @End Implementation
+    @Performance_Hints
+        One syscall per UUID on the fast path.
+    @End Performance_Hints
+    @Security_Scope
+        Hard-fails when the kernel CSPRNG is unreachable; never
+        substitutes a deterministic PRNG.
+    @End Security_Scope
+    Return uuid_internal_read_urandom(buf, len)
+End Process
+
+Note: ============================================================================
+Note: MD5 - RFC 1321 (used by UUIDv3 only; not exposed as public API)
+Note: ============================================================================
+
+Process called "uuid_internal_md5_rotl" takes x as Integer, n as Integer returns Integer:
+    Let mask be 4294967295
+    Let masked be x bitwise and mask
+    Let left be (masked multiplied by 1)
+    Let i be 0
+    While i is less than n:
+        Set left to left multiplied by 2
+        Set i to i plus 1
+    End While
+    Let left_low be left bitwise and mask
+    Let right be masked divided by 1
+    Let j be 0
+    While j is less than (32 minus n):
+        Set right to right divided by 2
+        Set j to j plus 1
+    End While
+    Return left_low bitwise or right
+End Process
+
+Process called "uuid_internal_md5_F" takes x as Integer, y as Integer, z as Integer returns Integer:
+    Let mask_xor_z be y bitwise xor z
+    Let mid be x bitwise and mask_xor_z
+    Return mid bitwise xor z
+End Process
+
+Process called "uuid_internal_md5_G" takes x as Integer, y as Integer, z as Integer returns Integer:
+    Let xz be x bitwise and z
+    Let not_z be (4294967295 minus z) bitwise and 4294967295
+    Let yz be y bitwise and not_z
+    Return xz bitwise or yz
+End Process
+
+Process called "uuid_internal_md5_H" takes x as Integer, y as Integer, z as Integer returns Integer:
+    Let xy be x bitwise xor y
+    Return xy bitwise xor z
+End Process
+
+Process called "uuid_internal_md5_I" takes x as Integer, y as Integer, z as Integer returns Integer:
+    Let not_z be (4294967295 minus z) bitwise and 4294967295
+    Let xz be x bitwise or not_z
+    Return y bitwise xor xz
+End Process
+
+Process called "uuid_internal_md5_K" takes i as Integer returns Integer:
+    Note: RFC 1321 K[i] = floor(2^32 * |sin(i+1)|). Compute lookup at runtime
+    Note: by table since we have no float sin in primitives.
+    If i is equal to 0:
+        Return 3614090360
+    End If
+    If i is equal to 1:
+        Return 3905402710
+    End If
+    If i is equal to 2:
+        Return 606105819
+    End If
+    If i is equal to 3:
+        Return 3250441966
+    End If
+    If i is equal to 4:
+        Return 4118548399
+    End If
+    If i is equal to 5:
+        Return 1200080426
+    End If
+    If i is equal to 6:
+        Return 2821735955
+    End If
+    If i is equal to 7:
+        Return 4249261313
+    End If
+    If i is equal to 8:
+        Return 1770035416
+    End If
+    If i is equal to 9:
+        Return 2336552879
+    End If
+    If i is equal to 10:
+        Return 4294925233
+    End If
+    If i is equal to 11:
+        Return 2304563134
+    End If
+    If i is equal to 12:
+        Return 1804603682
+    End If
+    If i is equal to 13:
+        Return 4254626195
+    End If
+    If i is equal to 14:
+        Return 2792965006
+    End If
+    If i is equal to 15:
+        Return 1236535329
+    End If
+    If i is equal to 16:
+        Return 4129170786
+    End If
+    If i is equal to 17:
+        Return 3225465664
+    End If
+    If i is equal to 18:
+        Return 643717713
+    End If
+    If i is equal to 19:
+        Return 3921069994
+    End If
+    If i is equal to 20:
+        Return 3593408605
+    End If
+    If i is equal to 21:
+        Return 38016083
+    End If
+    If i is equal to 22:
+        Return 3634488961
+    End If
+    If i is equal to 23:
+        Return 3889429448
+    End If
+    If i is equal to 24:
+        Return 568446438
+    End If
+    If i is equal to 25:
+        Return 3275163606
+    End If
+    If i is equal to 26:
+        Return 4107603335
+    End If
+    If i is equal to 27:
+        Return 1163531501
+    End If
+    If i is equal to 28:
+        Return 2850285829
+    End If
+    If i is equal to 29:
+        Return 4243563512
+    End If
+    If i is equal to 30:
+        Return 1735328473
+    End If
+    If i is equal to 31:
+        Return 2368359562
+    End If
+    If i is equal to 32:
+        Return 4294588738
+    End If
+    If i is equal to 33:
+        Return 2272392833
+    End If
+    If i is equal to 34:
+        Return 1839030562
+    End If
+    If i is equal to 35:
+        Return 4259657740
+    End If
+    If i is equal to 36:
+        Return 2763975236
+    End If
+    If i is equal to 37:
+        Return 1272893353
+    End If
+    If i is equal to 38:
+        Return 4139469664
+    End If
+    If i is equal to 39:
+        Return 3200236656
+    End If
+    If i is equal to 40:
+        Return 681279174
+    End If
+    If i is equal to 41:
+        Return 3936430074
+    End If
+    If i is equal to 42:
+        Return 3572445317
+    End If
+    If i is equal to 43:
+        Return 76029189
+    End If
+    If i is equal to 44:
+        Return 3654602809
+    End If
+    If i is equal to 45:
+        Return 3873151461
+    End If
+    If i is equal to 46:
+        Return 530742520
+    End If
+    If i is equal to 47:
+        Return 3299628645
+    End If
+    If i is equal to 48:
+        Return 4096336452
+    End If
+    If i is equal to 49:
+        Return 1126891415
+    End If
+    If i is equal to 50:
+        Return 2878612391
+    End If
+    If i is equal to 51:
+        Return 4237533241
+    End If
+    If i is equal to 52:
+        Return 1700485571
+    End If
+    If i is equal to 53:
+        Return 2399980690
+    End If
+    If i is equal to 54:
+        Return 4293915773
+    End If
+    If i is equal to 55:
+        Return 2240044497
+    End If
+    If i is equal to 56:
+        Return 1873313359
+    End If
+    If i is equal to 57:
+        Return 4264355552
+    End If
+    If i is equal to 58:
+        Return 2734768916
+    End If
+    If i is equal to 59:
+        Return 1309151649
+    End If
+    If i is equal to 60:
+        Return 4149444226
+    End If
+    If i is equal to 61:
+        Return 3174756917
+    End If
+    If i is equal to 62:
+        Return 718787259
+    End If
+    If i is equal to 63:
+        Return 3951481745
+    End If
+    Return 0
+End Process
+
+Process called "uuid_internal_md5_shift" takes i as Integer returns Integer:
+    Note: Rotation amounts per round of MD5 (RFC 1321 section 3.4).
+    If i is less than 16:
+        Let r be i minus ((i divided by 4) multiplied by 4)
+        If r is equal to 0:
+            Return 7
+        End If
+        If r is equal to 1:
+            Return 12
+        End If
+        If r is equal to 2:
+            Return 17
+        End If
+        Return 22
+    End If
+    If i is less than 32:
+        Let r2 be i minus ((i divided by 4) multiplied by 4)
+        If r2 is equal to 0:
+            Return 5
+        End If
+        If r2 is equal to 1:
+            Return 9
+        End If
+        If r2 is equal to 2:
+            Return 14
+        End If
+        Return 20
+    End If
+    If i is less than 48:
+        Let r3 be i minus ((i divided by 4) multiplied by 4)
+        If r3 is equal to 0:
+            Return 4
+        End If
+        If r3 is equal to 1:
+            Return 11
+        End If
+        If r3 is equal to 2:
+            Return 16
+        End If
+        Return 23
+    End If
+    Let r4 be i minus ((i divided by 4) multiplied by 4)
+    If r4 is equal to 0:
+        Return 6
+    End If
+    If r4 is equal to 1:
+        Return 10
+    End If
+    If r4 is equal to 2:
+        Return 15
+    End If
+    Return 21
+End Process
+
+Process called "uuid_internal_md5_compute_16" takes input as Integer, input_len as Integer, out16 as Integer returns Integer:
+    @Reasoning
+        Computes the MD5 digest of `input` (input_len bytes) and writes
+        16 raw bytes to out16. Implements RFC 1321 section 3.4 directly
+        with all 64 step constants and rotation amounts.
+    @End Reasoning
+    @Implementation
+        Pad to multiple of 64 bytes per RFC 1321; process each 64-byte
+        block through the four rounds; finalize state and write little-
+        endian.
+    @End Implementation
+    @Performance_Hints
+        O(input_len). One allocation for the padded buffer.
+    @End Performance_Hints
+    @Security_Scope
+        MD5 is broken for collision resistance. UUIDv3 uses it ONLY
+        for deterministic name->id mapping where collision resistance
+        is not the security property in question.
+    @End Security_Scope
+
+    Let mask be 4294967295
+    Let a0 be 1732584193
+    Let b0 be 4023233417
+    Let c0 be 2562383102
+    Let d0 be 271733878
+
+    Note: Compute padded length: input_len + 1 + (56 - (input_len+1) mod 64) + 8
+    Let pad_len be input_len plus 1
+    Let mod_val be pad_len minus ((pad_len divided by 64) multiplied by 64)
+    Let pad_zeros be 0
+    If mod_val is less than or equal to 56:
+        Set pad_zeros to 56 minus mod_val
+    Otherwise:
+        Set pad_zeros to (64 minus mod_val) plus 56
+    End If
+    Let total_len be pad_len plus pad_zeros plus 8
+
+    Let work be allocate(total_len)
+    If work is equal to 0:
+        Return 0
+    End If
+    Memory.memory_fill(work, 0, total_len)
+    Memory.memory_copy(work, input, input_len)
+    Memory.memory_set_byte(work, input_len, 128)
+    Note: Append length in bits as 64-bit little-endian
+    Let bits be input_len multiplied by 8
+    Let off be total_len minus 8
+    Let bi be 0
+    Let bv be bits
+    While bi is less than 8:
+        Let b_lo be bv bitwise and 255
+        Memory.memory_set_byte(work, off plus bi, b_lo)
+        Set bv to bv divided by 256
+        Set bi to bi plus 1
+    End While
+
+    Let block_idx be 0
+    While block_idx is less than total_len:
+        Note: Load 16 32-bit little-endian words
+        Let words be allocate(16 multiplied by 8)
+        If words is equal to 0:
+            deallocate(work)
+            Return 0
+        End If
+        Let k be 0
+        While k is less than 16:
+            Let base be block_idx plus (k multiplied by 4)
+            Let w0 be Memory.memory_get_byte(work, base)
+            Let w1 be Memory.memory_get_byte(work, base plus 1)
+            Let w2 be Memory.memory_get_byte(work, base plus 2)
+            Let w3 be Memory.memory_get_byte(work, base plus 3)
+            Let word_v be w0 plus (w1 multiplied by 256) plus (w2 multiplied by 65536) plus (w3 multiplied by 16777216)
+            Memory.memory_set_integer(words, k multiplied by 8, word_v)
+            Set k to k plus 1
+        End While
+
+        Let A be a0
+        Let B be b0
+        Let C be c0
+        Let D be d0
+        Let i be 0
+        While i is less than 64:
+            Let f be 0
+            Let g be 0
+            If i is less than 16:
+                Set f to uuid_internal_md5_F(B, C, D)
+                Set g to i
+            Otherwise:
+                If i is less than 32:
+                    Set f to uuid_internal_md5_G(B, C, D)
+                    Set g to ((i multiplied by 5) plus 1) minus ((((i multiplied by 5) plus 1) divided by 16) multiplied by 16)
+                Otherwise:
+                    If i is less than 48:
+                        Set f to uuid_internal_md5_H(B, C, D)
+                        Set g to ((i multiplied by 3) plus 5) minus ((((i multiplied by 3) plus 5) divided by 16) multiplied by 16)
+                    Otherwise:
+                        Set f to uuid_internal_md5_I(B, C, D)
+                        Set g to (i multiplied by 7) minus (((i multiplied by 7) divided by 16) multiplied by 16)
+                    End If
+                End If
+            End If
+            Let kval be uuid_internal_md5_K(i)
+            Let mword be Memory.memory_get_integer(words, g multiplied by 8)
+            Let sum1 be (A plus f) bitwise and mask
+            Let sum2 be (sum1 plus kval) bitwise and mask
+            Let sum3 be (sum2 plus mword) bitwise and mask
+            Let shift be uuid_internal_md5_shift(i)
+            Let rotated be uuid_internal_md5_rotl(sum3, shift)
+            Let new_b be (B plus rotated) bitwise and mask
+            Set A to D
+            Set D to C
+            Set C to B
+            Set B to new_b
+            Set i to i plus 1
+        End While
+        deallocate(words)
+
+        Set a0 to (a0 plus A) bitwise and mask
+        Set b0 to (b0 plus B) bitwise and mask
+        Set c0 to (c0 plus C) bitwise and mask
+        Set d0 to (d0 plus D) bitwise and mask
+
+        Set block_idx to block_idx plus 64
+    End While
+
+    deallocate(work)
+
+    Note: Write a0, b0, c0, d0 little-endian
+    Let outvals be allocate(32)
+    Memory.memory_set_integer(outvals, 0, a0)
+    Memory.memory_set_integer(outvals, 8, b0)
+    Memory.memory_set_integer(outvals, 16, c0)
+    Memory.memory_set_integer(outvals, 24, d0)
+    Let idx be 0
+    While idx is less than 4:
+        Let val be Memory.memory_get_integer(outvals, idx multiplied by 8)
+        Let bj be 0
+        While bj is less than 4:
+            Let lobit be val bitwise and 255
+            Memory.memory_set_byte(out16, (idx multiplied by 4) plus bj, lobit)
+            Set val to val divided by 256
+            Set bj to bj plus 1
+        End While
+        Set idx to idx plus 1
+    End While
+    deallocate(outvals)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SHA-1 (used by UUIDv5 only; not exposed as public API)
+Note: ============================================================================
+
+Process called "uuid_internal_sha1_rotl" takes x as Integer, n as Integer returns Integer:
+    Let mask be 4294967295
+    Let masked be x bitwise and mask
+    Let left be masked
+    Let i be 0
+    While i is less than n:
+        Set left to left multiplied by 2
+        Set i to i plus 1
+    End While
+    Let left_low be left bitwise and mask
+    Let right be masked
+    Let j be 0
+    While j is less than (32 minus n):
+        Set right to right divided by 2
+        Set j to j plus 1
+    End While
+    Return left_low bitwise or right
+End Process
+
+Process called "uuid_internal_sha1_compute_20" takes input as Integer, input_len as Integer, out20 as Integer returns Integer:
+    @Reasoning
+        Computes SHA-1 of input bytes and writes 20 raw bytes to out20.
+        Implements FIPS PUB 180-4 section 6.1.
+    @End Reasoning
+    @Implementation
+        Pad to a multiple of 64 bytes (append 1-bit, zeros, then 64-bit
+        big-endian length in bits). Process 80-round main loop per
+        block.
+    @End Implementation
+    @Performance_Hints
+        O(input_len) with one allocation for padded data.
+    @End Performance_Hints
+    @Security_Scope
+        SHA-1 collision resistance is broken (SHAttered 2017). UUIDv5
+        uses it only for deterministic naming as RFC 9562 specifies;
+        do NOT use this helper for security-critical hashing.
+    @End Security_Scope
+
+    Let mask be 4294967295
+    Let h0 be 1732584193
+    Let h1 be 4023233417
+    Let h2 be 2562383102
+    Let h3 be 271733878
+    Let h4 be 3285377520
+
+    Let pad_len be input_len plus 1
+    Let mod_val be pad_len minus ((pad_len divided by 64) multiplied by 64)
+    Let pad_zeros be 0
+    If mod_val is less than or equal to 56:
+        Set pad_zeros to 56 minus mod_val
+    Otherwise:
+        Set pad_zeros to (64 minus mod_val) plus 56
+    End If
+    Let total_len be pad_len plus pad_zeros plus 8
+
+    Let work be allocate(total_len)
+    If work is equal to 0:
+        Return 0
+    End If
+    Memory.memory_fill(work, 0, total_len)
+    Memory.memory_copy(work, input, input_len)
+    Memory.memory_set_byte(work, input_len, 128)
+    Let bits be input_len multiplied by 8
+    Let off be total_len minus 8
+    Let bv be bits
+    Note: Big-endian length
+    Let bi be 7
+    While bi is greater than or equal to 0:
+        Let blow be bv bitwise and 255
+        Memory.memory_set_byte(work, off plus bi, blow)
+        Set bv to bv divided by 256
+        Set bi to bi minus 1
+    End While
+
+    Let block_idx be 0
+    While block_idx is less than total_len:
+        Let w_arr be allocate(80 multiplied by 8)
+        If w_arr is equal to 0:
+            deallocate(work)
+            Return 0
+        End If
+        Let t be 0
+        While t is less than 16:
+            Let base be block_idx plus (t multiplied by 4)
+            Let w0 be Memory.memory_get_byte(work, base)
+            Let w1 be Memory.memory_get_byte(work, base plus 1)
+            Let w2 be Memory.memory_get_byte(work, base plus 2)
+            Let w3 be Memory.memory_get_byte(work, base plus 3)
+            Let wv be (w0 multiplied by 16777216) plus (w1 multiplied by 65536) plus (w2 multiplied by 256) plus w3
+            Memory.memory_set_integer(w_arr, t multiplied by 8, wv)
+            Set t to t plus 1
+        End While
+        Let t2 be 16
+        While t2 is less than 80:
+            Let a_v be Memory.memory_get_integer(w_arr, (t2 minus 3) multiplied by 8)
+            Let b_v be Memory.memory_get_integer(w_arr, (t2 minus 8) multiplied by 8)
+            Let c_v be Memory.memory_get_integer(w_arr, (t2 minus 14) multiplied by 8)
+            Let d_v be Memory.memory_get_integer(w_arr, (t2 minus 16) multiplied by 8)
+            Let xor1 be a_v bitwise xor b_v
+            Let xor2 be xor1 bitwise xor c_v
+            Let xor3 be xor2 bitwise xor d_v
+            Let rotated be uuid_internal_sha1_rotl(xor3, 1)
+            Memory.memory_set_integer(w_arr, t2 multiplied by 8, rotated)
+            Set t2 to t2 plus 1
+        End While
+
+        Let A be h0
+        Let B be h1
+        Let C be h2
+        Let D be h3
+        Let E be h4
+        Let i be 0
+        While i is less than 80:
+            Let f be 0
+            Let kc be 0
+            If i is less than 20:
+                Let bc be B bitwise and C
+                Let not_b be (4294967295 minus B) bitwise and 4294967295
+                Let nb_d be not_b bitwise and D
+                Set f to bc bitwise or nb_d
+                Set kc to 1518500249
+            Otherwise:
+                If i is less than 40:
+                    Let xx be B bitwise xor C
+                    Set f to xx bitwise xor D
+                    Set kc to 1859775393
+                Otherwise:
+                    If i is less than 60:
+                        Let bc2 be B bitwise and C
+                        Let bd be B bitwise and D
+                        Let cd be C bitwise and D
+                        Let ab be bc2 bitwise or bd
+                        Set f to ab bitwise or cd
+                        Set kc to 2400959708
+                    Otherwise:
+                        Let xx2 be B bitwise xor C
+                        Set f to xx2 bitwise xor D
+                        Set kc to 3395469782
+                    End If
+                End If
+            End If
+            Let aroll be uuid_internal_sha1_rotl(A, 5)
+            Let wval be Memory.memory_get_integer(w_arr, i multiplied by 8)
+            Let s1 be (aroll plus f) bitwise and mask
+            Let s2 be (s1 plus E) bitwise and mask
+            Let s3 be (s2 plus kc) bitwise and mask
+            Let temp be (s3 plus wval) bitwise and mask
+            Set E to D
+            Set D to C
+            Set C to uuid_internal_sha1_rotl(B, 30)
+            Set B to A
+            Set A to temp
+            Set i to i plus 1
+        End While
+        deallocate(w_arr)
+
+        Set h0 to (h0 plus A) bitwise and mask
+        Set h1 to (h1 plus B) bitwise and mask
+        Set h2 to (h2 plus C) bitwise and mask
+        Set h3 to (h3 plus D) bitwise and mask
+        Set h4 to (h4 plus E) bitwise and mask
+        Set block_idx to block_idx plus 64
+    End While
+
+    deallocate(work)
+
+    Note: Write h0..h4 as big-endian
+    Let h_arr be allocate(40)
+    Memory.memory_set_integer(h_arr, 0, h0)
+    Memory.memory_set_integer(h_arr, 8, h1)
+    Memory.memory_set_integer(h_arr, 16, h2)
+    Memory.memory_set_integer(h_arr, 24, h3)
+    Memory.memory_set_integer(h_arr, 32, h4)
+    Let idx be 0
+    While idx is less than 5:
+        Let val be Memory.memory_get_integer(h_arr, idx multiplied by 8)
+        Let bj be 3
+        While bj is greater than or equal to 0:
+            Let lobit be val bitwise and 255
+            Memory.memory_set_byte(out20, (idx multiplied by 4) plus bj, lobit)
+            Set val to val divided by 256
+            Set bj to bj minus 1
+        End While
+        Set idx to idx plus 1
+    End While
+    deallocate(h_arr)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: UUID CONSTRUCTORS
+Note: ============================================================================
+
+Process called "uuid_v4" returns Integer:
+    @Reasoning
+        Generates a random UUID per RFC 9562 section 5.4. 122 random
+        bits + 4-bit version + 2-bit variant.
+    @End Reasoning
+    @Implementation
+        Fill 16 bytes with /dev/urandom, then overwrite version/variant
+        bits.
+    @End Implementation
+    @Performance_Hints
+        One syscall + 16 byte writes.
+    @End Performance_Hints
+    @Security_Scope
+        Cryptographic random source when /dev/urandom is available.
+    @End Security_Scope
+
+    Let buf be uuid_internal_alloc()
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let rand_ok be uuid_internal_fill_random(buf, 16)
+    If rand_ok is not equal to 1:
+        deallocate(buf)
+        Return 0
+    End If
+    uuid_internal_set_version_variant(buf, 4)
+    Return buf
+End Process
+
+Process called "uuid_v7" returns Integer:
+    @Reasoning
+        Generates a time-ordered UUID per RFC 9562 section 5.7. Layout:
+            unix_ts_ms      : 48 bits (bytes 0-5)
+            version=7       : 4 bits  (high nibble of byte 6)
+            rand_a          : 12 bits (low 12 bits of bytes 6-7)
+            variant=10      : 2 bits  (high bits of byte 8)
+            rand_b          : 62 bits (rest of bytes 8-15)
+        Excellent as a primary key in databases because it sorts
+        lexicographically by creation time.
+    @End Reasoning
+    @Implementation
+        Read clock as nanoseconds, divide by 1e6 to ms. Fill bytes 6-15
+        with random bits, then stamp version+variant.
+    @End Implementation
+    @Performance_Hints
+        Two syscalls (clock_gettime + urandom read).
+    @End Performance_Hints
+    @Security_Scope
+        Timestamp is observable; random bits are CSPRNG-quality.
+    @End Security_Scope
+
+    Let buf be uuid_internal_alloc()
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let ns be uuid_internal_read_clock_ns()
+    Let ms be ns divided by 1000000
+    Note: Write ms as 48-bit big-endian into bytes 0-5
+    Let b5 be ms bitwise and 255
+    Let m2 be ms divided by 256
+    Let b4 be m2 bitwise and 255
+    Let m3 be m2 divided by 256
+    Let b3 be m3 bitwise and 255
+    Let m4 be m3 divided by 256
+    Let b2 be m4 bitwise and 255
+    Let m5 be m4 divided by 256
+    Let b1 be m5 bitwise and 255
+    Let m6 be m5 divided by 256
+    Let b0 be m6 bitwise and 255
+    Memory.memory_set_byte(buf, 0, b0)
+    Memory.memory_set_byte(buf, 1, b1)
+    Memory.memory_set_byte(buf, 2, b2)
+    Memory.memory_set_byte(buf, 3, b3)
+    Memory.memory_set_byte(buf, 4, b4)
+    Memory.memory_set_byte(buf, 5, b5)
+    Note: Fill bytes 6-15 with random
+    Let scratch be allocate(10)
+    If scratch is equal to 0:
+        deallocate(buf)
+        Return 0
+    End If
+    Let r7_ok be uuid_internal_fill_random(scratch, 10)
+    If r7_ok is not equal to 1:
+        deallocate(scratch)
+        deallocate(buf)
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 10:
+        Memory.memory_set_byte(buf, 6 plus i, Memory.memory_get_byte(scratch, i))
+        Set i to i plus 1
+    End While
+    deallocate(scratch)
+    uuid_internal_set_version_variant(buf, 7)
+    Return buf
+End Process
+
+Process called "uuid_v3" takes namespace_uuid as Integer, name as Integer returns Integer:
+    @Reasoning
+        Name-based UUID using MD5 per RFC 9562 section 5.3. Input is
+        the namespace UUID's 16 bytes concatenated with the name bytes;
+        output is the first 16 bytes of MD5(input) with version 3 and
+        variant stamped in.
+    @End Reasoning
+    @Implementation
+        Build the concatenation in a scratch buffer, MD5 it, copy 16
+        bytes into a new UUID, set version/variant.
+    @End Implementation
+    @Performance_Hints
+        Single MD5 invocation over (16 + |name|) bytes.
+    @End Performance_Hints
+    @Security_Scope
+        MD5 is not collision-resistant; UUIDv3 should not be used to
+        defeat adversaries who can choose names. Prefer UUIDv5 for
+        non-adversarial deterministic identifiers; both should be
+        deprecated in favor of UUIDv4/v7 for new designs.
+    @End Security_Scope
+
+    If namespace_uuid is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let name_len be StrCore.string_length(name)
+    Let total be 16 plus name_len
+    Let scratch be allocate(total)
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(scratch, namespace_uuid, 16)
+    If name_len is greater than 0:
+        Memory.memory_copy(scratch plus 16, name, name_len)
+    End If
+    Let out be uuid_internal_alloc()
+    If out is equal to 0:
+        deallocate(scratch)
+        Return 0
+    End If
+    uuid_internal_md5_compute_16(scratch, total, out)
+    deallocate(scratch)
+    uuid_internal_set_version_variant(out, 3)
+    Return out
+End Process
+
+Process called "uuid_v5" takes namespace_uuid as Integer, name as Integer returns Integer:
+    @Reasoning
+        Name-based UUID using SHA-1 per RFC 9562 section 5.5. Output is
+        the first 16 bytes of SHA-1(namespace || name) with version 5
+        and variant stamped in.
+    @End Reasoning
+    @Implementation
+        Build input, SHA-1 it, copy first 16 bytes, stamp version/variant.
+    @End Implementation
+    @Performance_Hints
+        Single SHA-1 over (16 + |name|) bytes.
+    @End Performance_Hints
+    @Security_Scope
+        SHA-1 collisions are feasible; UUIDv5 is deterministic but not
+        defensible against adversarial input.
+    @End Security_Scope
+
+    If namespace_uuid is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let name_len be StrCore.string_length(name)
+    Let total be 16 plus name_len
+    Let scratch be allocate(total)
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(scratch, namespace_uuid, 16)
+    If name_len is greater than 0:
+        Memory.memory_copy(scratch plus 16, name, name_len)
+    End If
+    Let hash_buf be allocate(20)
+    If hash_buf is equal to 0:
+        deallocate(scratch)
+        Return 0
+    End If
+    uuid_internal_sha1_compute_20(scratch, total, hash_buf)
+    deallocate(scratch)
+    Let out be uuid_internal_alloc()
+    If out is equal to 0:
+        deallocate(hash_buf)
+        Return 0
+    End If
+    Memory.memory_copy(out, hash_buf, 16)
+    deallocate(hash_buf)
+    uuid_internal_set_version_variant(out, 5)
+    Return out
+End Process
+
+Process called "uuid_v1" returns Integer:
+    @Reasoning
+        Time-based UUID per RFC 9562 section 5.1: 60-bit gregorian
+        timestamp (100ns since 1582-10-15) + 14-bit clock sequence +
+        48-bit node ID (random in lieu of MAC address).
+    @End Reasoning
+    @Implementation
+        Read clock_ns, convert to gregorian 100ns ticks
+        (ns/100 + offset), pack low/mid/hi parts into bytes 0-5 and
+        bytes 6-7 (sharing the high nibble with version). Bytes 8-9
+        hold clock_seq, bytes 10-15 hold random node ID.
+    @End Implementation
+    @Performance_Hints
+        One clock read + 8 random bytes.
+    @End Performance_Hints
+    @Security_Scope
+        Discloses creation time. Node ID is random rather than the
+        host MAC to avoid leaking identifying hardware info, matching
+        RFC 9562's note on privacy considerations.
+    @End Security_Scope
+
+    Let buf be uuid_internal_alloc()
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let ns be uuid_internal_read_clock_ns()
+    Let unix_100ns be ns divided by 100
+    Note: Unix epoch -> Gregorian epoch offset = 122192928000000000 in 100ns ticks
+    Let greg be unix_100ns plus 122192928000000000
+
+    Note: Extract time_low (32 bits), time_mid (16 bits), time_hi (12 bits)
+    Let tlow be greg bitwise and 4294967295
+    Let m be greg divided by 4294967296
+    Let tmid be m bitwise and 65535
+    Let h be m divided by 65536
+    Let thi be h bitwise and 4095
+
+    Note: Write time_low big-endian into bytes 0-3
+    Memory.memory_set_byte(buf, 0, (tlow divided by 16777216) bitwise and 255)
+    Memory.memory_set_byte(buf, 1, (tlow divided by 65536) bitwise and 255)
+    Memory.memory_set_byte(buf, 2, (tlow divided by 256) bitwise and 255)
+    Memory.memory_set_byte(buf, 3, tlow bitwise and 255)
+    Memory.memory_set_byte(buf, 4, (tmid divided by 256) bitwise and 255)
+    Memory.memory_set_byte(buf, 5, tmid bitwise and 255)
+    Memory.memory_set_byte(buf, 6, (thi divided by 256) bitwise and 15)
+    Memory.memory_set_byte(buf, 7, thi bitwise and 255)
+
+    Note: Random clock_seq (bytes 8-9) and random node (bytes 10-15)
+    Let scratch be allocate(8)
+    If scratch is equal to 0:
+        deallocate(buf)
+        Return 0
+    End If
+    Let r1_ok be uuid_internal_fill_random(scratch, 8)
+    If r1_ok is not equal to 1:
+        deallocate(scratch)
+        deallocate(buf)
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 8:
+        Memory.memory_set_byte(buf, 8 plus i, Memory.memory_get_byte(scratch, i))
+        Set i to i plus 1
+    End While
+    deallocate(scratch)
+    Note: Set multicast bit in node to mark as randomly-generated
+    Let node_b0 be Memory.memory_get_byte(buf, 10)
+    Set node_b0 to node_b0 bitwise or 1
+    Memory.memory_set_byte(buf, 10, node_b0)
+    uuid_internal_set_version_variant(buf, 1)
+    Return buf
+End Process
+
+Process called "uuid_v6" returns Integer:
+    @Reasoning
+        Reordered time-based UUID per RFC 9562 section 5.6. Same fields
+        as v1 but with the timestamp parts rearranged so that
+        lexicographic byte order matches chronological order.
+    @End Reasoning
+    @Implementation
+        Compute the same 60-bit gregorian timestamp; emit it as
+        big-endian into bytes 0-7 with the version nibble inserted at
+        the right place.
+    @End Implementation
+    @Performance_Hints
+        Same cost as v1.
+    @End Performance_Hints
+    @Security_Scope
+        Same privacy considerations as v1.
+    @End Security_Scope
+
+    Let buf be uuid_internal_alloc()
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let ns be uuid_internal_read_clock_ns()
+    Let unix_100ns be ns divided by 100
+    Let greg be unix_100ns plus 122192928000000000
+
+    Note: v6 packs the high 48 bits of greg into bytes 0-5, the low 12 bits
+    Note: into the low nibble of byte 6 + byte 7.
+    Let high_48 be greg divided by 4096
+    Let low_12 be greg bitwise and 4095
+
+    Memory.memory_set_byte(buf, 0, (high_48 divided by 1099511627776) bitwise and 255)
+    Memory.memory_set_byte(buf, 1, (high_48 divided by 4294967296) bitwise and 255)
+    Memory.memory_set_byte(buf, 2, (high_48 divided by 16777216) bitwise and 255)
+    Memory.memory_set_byte(buf, 3, (high_48 divided by 65536) bitwise and 255)
+    Memory.memory_set_byte(buf, 4, (high_48 divided by 256) bitwise and 255)
+    Memory.memory_set_byte(buf, 5, high_48 bitwise and 255)
+    Memory.memory_set_byte(buf, 6, (low_12 divided by 256) bitwise and 15)
+    Memory.memory_set_byte(buf, 7, low_12 bitwise and 255)
+
+    Let scratch be allocate(8)
+    If scratch is equal to 0:
+        deallocate(buf)
+        Return 0
+    End If
+    Let r6_ok be uuid_internal_fill_random(scratch, 8)
+    If r6_ok is not equal to 1:
+        deallocate(scratch)
+        deallocate(buf)
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 8:
+        Memory.memory_set_byte(buf, 8 plus i, Memory.memory_get_byte(scratch, i))
+        Set i to i plus 1
+    End While
+    deallocate(scratch)
+    uuid_internal_set_version_variant(buf, 6)
+    Return buf
+End Process
+
+Process called "uuid_v8" takes custom_data as Integer returns Integer:
+    @Reasoning
+        Application-defined UUID per RFC 9562 section 5.8. The caller
+        provides 16 bytes of free-form data; we overlay version=8 and
+        variant=10 in the standard positions.
+    @End Reasoning
+    @Implementation
+        Copy 16 bytes from custom_data, then overwrite version/variant.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Caller is responsible for the entropy of custom_data.
+    @End Security_Scope
+
+    If custom_data is equal to 0:
+        Return 0
+    End If
+    Let buf be uuid_internal_alloc()
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(buf, custom_data, 16)
+    uuid_internal_set_version_variant(buf, 8)
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: COMPARISON / INTROSPECTION
+Note: ============================================================================
+
+Process called "uuid_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Byte-wise comparison returning -1/0/1. RFC 9562 specifies
+        no canonical ordering beyond lexicographic on the byte form,
+        which is what UUIDv6/v7 sort by chronologically.
+    @End Reasoning
+    @Implementation
+        Use memory_compare on the 16 raw bytes.
+    @End Implementation
+    @Performance_Hints
+        O(1) - bounded 16-byte compare.
+    @End Performance_Hints
+    @Security_Scope
+        Not constant-time.
+    @End Security_Scope
+
+    If a is equal to b:
+        Return 0
+    End If
+    If a is equal to 0:
+        Return -1
+    End If
+    If b is equal to 0:
+        Return 1
+    End If
+    Return Memory.memory_compare(a, b, 16)
+End Process
+
+Process called "uuid_is_nil" takes u as Integer returns Integer:
+    Note: 1 if all 16 bytes are zero.
+    If u is equal to 0:
+        Return 1
+    End If
+    Let i be 0
+    While i is less than 16:
+        Let b_val be Memory.memory_get_byte(u, i)
+        If b_val is not equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "uuid_is_max" takes u as Integer returns Integer:
+    Note: 1 if all 16 bytes are 0xFF (RFC 9562 "max UUID").
+    If u is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 16:
+        Let b_val be Memory.memory_get_byte(u, i)
+        If b_val is not equal to 255:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "uuid_get_version" takes u as Integer returns Integer:
+    Note: Returns the version nibble (0..15), -1 if u is NULL.
+    If u is equal to 0:
+        Return -1
+    End If
+    Let b6 be Memory.memory_get_byte(u, 6)
+    Return b6 divided by 16
+End Process
+
+Process called "uuid_get_variant" takes u as Integer returns Integer:
+    @Reasoning
+        Returns the variant per RFC 9562 section 4.1:
+            0 = NCS legacy (0xxx)
+            1 = RFC 9562   (10xx)
+            2 = Microsoft  (110x)
+            3 = reserved   (111x)
+    @End Reasoning
+    @Implementation
+        Inspect the top bits of byte 8.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Pure inspection.
+    @End Security_Scope
+
+    If u is equal to 0:
+        Return -1
+    End If
+    Let b8 be Memory.memory_get_byte(u, 8)
+    If b8 is less than 128:
+        Return 0
+    End If
+    If b8 is less than 192:
+        Return 1
+    End If
+    If b8 is less than 224:
+        Return 2
+    End If
+    Return 3
+End Process
+
+Note: ============================================================================
+Note: FORMAT
+Note: ============================================================================
+
+Process called "uuid_internal_hex_char" takes n as Integer returns Integer:
+    If n is less than 10:
+        Return n plus 48
+    End If
+    Return (n minus 10) plus 97
+End Process
+
+Process called "uuid_to_string" takes u as Integer returns Integer:
+    @Reasoning
+        Returns the canonical 36-character lowercase hyphenated form
+        per RFC 9562: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
+    @End Reasoning
+    @Implementation
+        Walk the 16 bytes; emit two hex chars per byte; insert hyphens
+        at positions 8, 13, 18, 23.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Output contains only [0-9a-f-]; safe for logs and URLs.
+    @End Security_Scope
+
+    If u is equal to 0:
+        Return 0
+    End If
+    Let out be allocate(37)
+    If out is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    Let w be 0
+    While i is less than 16:
+        Let bval be Memory.memory_get_byte(u, i)
+        Let hi be bval divided by 16
+        Let lo be bval minus (hi multiplied by 16)
+        Memory.memory_set_byte(out, w, uuid_internal_hex_char(hi))
+        Memory.memory_set_byte(out, w plus 1, uuid_internal_hex_char(lo))
+        Set w to w plus 2
+        If i is equal to 3:
+            Memory.memory_set_byte(out, w, 45)
+            Set w to w plus 1
+        End If
+        If i is equal to 5:
+            Memory.memory_set_byte(out, w, 45)
+            Set w to w plus 1
+        End If
+        If i is equal to 7:
+            Memory.memory_set_byte(out, w, 45)
+            Set w to w plus 1
+        End If
+        If i is equal to 9:
+            Memory.memory_set_byte(out, w, 45)
+            Set w to w plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Memory.memory_set_byte(out, 36, 0)
+    Return out
+End Process
+
+Process called "uuid_to_string_braced" takes u as Integer returns Integer:
+    Note: Microsoft-style {xxxxxxxx-...-xxxxxxxxxxxx} form.
+    If u is equal to 0:
+        Return 0
+    End If
+    Let inner be uuid_to_string(u)
+    If inner is equal to 0:
+        Return 0
+    End If
+    Let out be allocate(39)
+    If out is equal to 0:
+        deallocate(inner)
+        Return 0
+    End If
+    Memory.memory_set_byte(out, 0, 123)
+    Memory.memory_copy(out plus 1, inner, 36)
+    Memory.memory_set_byte(out, 37, 125)
+    Memory.memory_set_byte(out, 38, 0)
+    deallocate(inner)
+    Return out
+End Process
+
+Process called "uuid_to_string_urn" takes u as Integer returns Integer:
+    Note: URN form "urn:uuid:xxxxxxxx-...-xxxxxxxxxxxx" per RFC 4122 section 3.
+    If u is equal to 0:
+        Return 0
+    End If
+    Let inner be uuid_to_string(u)
+    If inner is equal to 0:
+        Return 0
+    End If
+    Let out be allocate(46)
+    If out is equal to 0:
+        deallocate(inner)
+        Return 0
+    End If
+    Memory.memory_set_byte(out, 0, 117)
+    Memory.memory_set_byte(out, 1, 114)
+    Memory.memory_set_byte(out, 2, 110)
+    Memory.memory_set_byte(out, 3, 58)
+    Memory.memory_set_byte(out, 4, 117)
+    Memory.memory_set_byte(out, 5, 117)
+    Memory.memory_set_byte(out, 6, 105)
+    Memory.memory_set_byte(out, 7, 100)
+    Memory.memory_set_byte(out, 8, 58)
+    Memory.memory_copy(out plus 9, inner, 36)
+    Memory.memory_set_byte(out, 45, 0)
+    deallocate(inner)
+    Return out
+End Process
+
+Process called "uuid_internal_hex_val" takes c as Integer returns Integer:
+    If c is greater than or equal to 48:
+        If c is less than or equal to 57:
+            Return c minus 48
+        End If
+    End If
+    If c is greater than or equal to 97:
+        If c is less than or equal to 102:
+            Return c minus 87
+        End If
+    End If
+    If c is greater than or equal to 65:
+        If c is less than or equal to 70:
+            Return c minus 55
+        End If
+    End If
+    Return -1
+End Process
+
+Process called "uuid_from_string" takes str as Integer returns Integer:
+    @Reasoning
+        Parses a UUID string in any of the three accepted forms:
+        canonical 36-char hyphenated, braced (38), or URN (45). Returns
+        0 on syntax error.
+    @End Reasoning
+    @Implementation
+        Strip braces or URN prefix; verify hyphens at the right
+        positions; decode each pair of hex digits.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Strict validation; invalid characters return 0.
+    @End Security_Scope
+
+    If str is equal to 0:
+        Return 0
+    End If
+    Let slen be StrCore.string_length(str)
+    Let off be 0
+    Let expected be 36
+    If slen is equal to 38:
+        Let b0 be Memory.memory_get_byte(str, 0)
+        Let bN be Memory.memory_get_byte(str, 37)
+        If b0 is not equal to 123:
+            Return 0
+        End If
+        If bN is not equal to 125:
+            Return 0
+        End If
+        Set off to 1
+    End If
+    If slen is equal to 45:
+        Note: "urn:uuid:" prefix
+        Let p0 be Memory.memory_get_byte(str, 0)
+        Let p1 be Memory.memory_get_byte(str, 1)
+        Let p2 be Memory.memory_get_byte(str, 2)
+        Let p3 be Memory.memory_get_byte(str, 3)
+        If p0 is not equal to 117:
+            Return 0
+        End If
+        If p1 is not equal to 114:
+            Return 0
+        End If
+        If p2 is not equal to 110:
+            Return 0
+        End If
+        If p3 is not equal to 58:
+            Return 0
+        End If
+        Set off to 9
+    End If
+    If (slen minus off) is not equal to 36:
+        Return 0
+    End If
+    Note: Verify hyphens at positions 8,13,18,23 (relative to off)
+    Let h0 be Memory.memory_get_byte(str, off plus 8)
+    Let h1 be Memory.memory_get_byte(str, off plus 13)
+    Let h2 be Memory.memory_get_byte(str, off plus 18)
+    Let h3 be Memory.memory_get_byte(str, off plus 23)
+    If h0 is not equal to 45:
+        Return 0
+    End If
+    If h1 is not equal to 45:
+        Return 0
+    End If
+    If h2 is not equal to 45:
+        Return 0
+    End If
+    If h3 is not equal to 45:
+        Return 0
+    End If
+    Let out be uuid_internal_alloc()
+    If out is equal to 0:
+        Return 0
+    End If
+    Note: Read 32 hex digits skipping hyphens
+    Let in_pos be off
+    Let out_idx be 0
+    While out_idx is less than 16:
+        Let c1 be Memory.memory_get_byte(str, in_pos)
+        If c1 is equal to 45:
+            Set in_pos to in_pos plus 1
+            Set c1 to Memory.memory_get_byte(str, in_pos)
+        End If
+        Let c2 be Memory.memory_get_byte(str, in_pos plus 1)
+        Let v1 be uuid_internal_hex_val(c1)
+        Let v2 be uuid_internal_hex_val(c2)
+        If v1 is less than 0:
+            deallocate(out)
+            Return 0
+        End If
+        If v2 is less than 0:
+            deallocate(out)
+            Return 0
+        End If
+        Memory.memory_set_byte(out, out_idx, (v1 multiplied by 16) plus v2)
+        Set in_pos to in_pos plus 2
+        Set out_idx to out_idx plus 1
+    End While
+    Return out
+End Process
+
+Process called "uuid_to_bytes" takes u as Integer returns Integer:
+    Note: Wraps the raw UUID buffer in a Bytes header with owns_data=0
+    Note: (borrow semantics). Caller must destroy the Bytes header but
+    Note: the UUID raw bytes remain owned by the original allocation.
+    Note: If you want an independent copy use bytes_from_array(u, 16).
+    If u is equal to 0:
+        Return 0
+    End If
+    Return Bytes.bytes_from_array(u, 16)
+End Process
+
+Process called "uuid_from_bytes" takes b as Integer returns Integer:
+    Note: Copies 16 bytes from a Bytes object into a fresh UUID buffer.
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be Bytes.bytes_length(b)
+    If len is not equal to 16:
+        Return 0
+    End If
+    Let data be Bytes.bytes_data(b)
+    If data is equal to 0:
+        Return 0
+    End If
+    Let out be uuid_internal_alloc()
+    If out is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(out, data, 16)
+    Return out
+End Process
+
+Process called "uuid_destroy" takes u as Integer returns Integer:
+    If u is equal to 0:
+        Return 0
+    End If
+    deallocate(u)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: STANDARD NAMESPACES (RFC 9562 Appendix A)
+Note: ============================================================================
+
+Process called "uuid_namespace_dns" returns Integer:
+    Note: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+    Let u be uuid_internal_alloc()
+    If u is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(u, 0, 107)
+    Memory.memory_set_byte(u, 1, 167)
+    Memory.memory_set_byte(u, 2, 184)
+    Memory.memory_set_byte(u, 3, 16)
+    Memory.memory_set_byte(u, 4, 157)
+    Memory.memory_set_byte(u, 5, 173)
+    Memory.memory_set_byte(u, 6, 17)
+    Memory.memory_set_byte(u, 7, 209)
+    Memory.memory_set_byte(u, 8, 128)
+    Memory.memory_set_byte(u, 9, 180)
+    Memory.memory_set_byte(u, 10, 0)
+    Memory.memory_set_byte(u, 11, 192)
+    Memory.memory_set_byte(u, 12, 79)
+    Memory.memory_set_byte(u, 13, 212)
+    Memory.memory_set_byte(u, 14, 48)
+    Memory.memory_set_byte(u, 15, 200)
+    Return u
+End Process
+
+Process called "uuid_namespace_url" returns Integer:
+    Note: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
+    Let u be uuid_internal_alloc()
+    If u is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(u, 0, 107)
+    Memory.memory_set_byte(u, 1, 167)
+    Memory.memory_set_byte(u, 2, 184)
+    Memory.memory_set_byte(u, 3, 17)
+    Memory.memory_set_byte(u, 4, 157)
+    Memory.memory_set_byte(u, 5, 173)
+    Memory.memory_set_byte(u, 6, 17)
+    Memory.memory_set_byte(u, 7, 209)
+    Memory.memory_set_byte(u, 8, 128)
+    Memory.memory_set_byte(u, 9, 180)
+    Memory.memory_set_byte(u, 10, 0)
+    Memory.memory_set_byte(u, 11, 192)
+    Memory.memory_set_byte(u, 12, 79)
+    Memory.memory_set_byte(u, 13, 212)
+    Memory.memory_set_byte(u, 14, 48)
+    Memory.memory_set_byte(u, 15, 200)
+    Return u
+End Process
+
+Process called "uuid_namespace_oid" returns Integer:
+    Note: 6ba7b812-9dad-11d1-80b4-00c04fd430c8
+    Let u be uuid_internal_alloc()
+    If u is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(u, 0, 107)
+    Memory.memory_set_byte(u, 1, 167)
+    Memory.memory_set_byte(u, 2, 184)
+    Memory.memory_set_byte(u, 3, 18)
+    Memory.memory_set_byte(u, 4, 157)
+    Memory.memory_set_byte(u, 5, 173)
+    Memory.memory_set_byte(u, 6, 17)
+    Memory.memory_set_byte(u, 7, 209)
+    Memory.memory_set_byte(u, 8, 128)
+    Memory.memory_set_byte(u, 9, 180)
+    Memory.memory_set_byte(u, 10, 0)
+    Memory.memory_set_byte(u, 11, 192)
+    Memory.memory_set_byte(u, 12, 79)
+    Memory.memory_set_byte(u, 13, 212)
+    Memory.memory_set_byte(u, 14, 48)
+    Memory.memory_set_byte(u, 15, 200)
+    Return u
+End Process
+
+Process called "uuid_namespace_x500" returns Integer:
+    Note: 6ba7b814-9dad-11d1-80b4-00c04fd430c8
+    Let u be uuid_internal_alloc()
+    If u is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(u, 0, 107)
+    Memory.memory_set_byte(u, 1, 167)
+    Memory.memory_set_byte(u, 2, 184)
+    Memory.memory_set_byte(u, 3, 20)
+    Memory.memory_set_byte(u, 4, 157)
+    Memory.memory_set_byte(u, 5, 173)
+    Memory.memory_set_byte(u, 6, 17)
+    Memory.memory_set_byte(u, 7, 209)
+    Memory.memory_set_byte(u, 8, 128)
+    Memory.memory_set_byte(u, 9, 180)
+    Memory.memory_set_byte(u, 10, 0)
+    Memory.memory_set_byte(u, 11, 192)
+    Memory.memory_set_byte(u, 12, 79)
+    Memory.memory_set_byte(u, 13, 212)
+    Memory.memory_set_byte(u, 14, 48)
+    Memory.memory_set_byte(u, 15, 200)
+    Return u
+End Process

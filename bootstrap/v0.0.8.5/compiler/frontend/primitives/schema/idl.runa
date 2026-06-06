@@ -1,0 +1,3314 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+IDL - Universal Interface Definition Language AST (Tier 1)
+
+A neutral AST that can represent Protocol Buffers, Apache Thrift, and
+Apache Avro IDL service/message declarations losslessly. This module
+provides:
+  - Universal IDL AST (IdlMessage, IdlField, IdlEnum, IdlService,
+    IdlMethod)
+  - Parsers for Protobuf .proto text, Thrift IDL, Avro IDL
+  - Serializers back to each source format
+  - Translation to native Runa Type declarations
+  - Translation to generic Schema AST (schema.runa)
+
+The parsers focus on syntactic shape; semantic checks (e.g. tag-number
+collisions, reserved-range violations) live in higher-layer modules.
+
+Layout (IdlMessage, 32 bytes):
+  offset  0 : name           (8 bytes, String pointer)
+  offset  8 : fields         (8 bytes, List<IdlField>)
+  offset 16 : nested         (8 bytes, List<IdlMessage> nested types)
+  offset 24 : docstring      (8 bytes, String pointer or 0)
+
+Layout (IdlField, 48 bytes):
+  offset  0 : name           (8 bytes, String pointer)
+  offset  8 : type_name      (8 bytes, String pointer e.g. "int32")
+  offset 16 : tag            (8 bytes, Integer wire tag - protobuf only)
+  offset 24 : label          (8 bytes, LABEL_* constant)
+  offset 32 : default_value  (8 bytes, String pointer or 0)
+  offset 40 : docstring      (8 bytes, String pointer or 0)
+
+Layout (IdlEnum, 24 bytes):
+  offset  0 : name           (8 bytes, String pointer)
+  offset  8 : values         (8 bytes, List<IdlEnumValue>)
+  offset 16 : docstring      (8 bytes, String pointer or 0)
+
+Layout (IdlEnumValue, 16 bytes):
+  offset  0 : name           (8 bytes, String pointer)
+  offset  8 : value          (8 bytes, Integer)
+
+Layout (IdlService, 24 bytes):
+  offset  0 : name           (8 bytes, String pointer)
+  offset  8 : methods        (8 bytes, List<IdlMethod>)
+  offset 16 : docstring      (8 bytes, String pointer or 0)
+
+Layout (IdlMethod, 40 bytes):
+  offset  0 : name           (8 bytes, String pointer)
+  offset  8 : input_type     (8 bytes, String pointer - type name)
+  offset 16 : output_type    (8 bytes, String pointer - type name)
+  offset 24 : streaming      (8 bytes, STREAM_* constant)
+  offset 32 : docstring      (8 bytes, String pointer or 0)
+
+Layout (IdlDocument, 32 bytes):
+  offset  0 : package        (8 bytes, String pointer or 0)
+  offset  8 : messages       (8 bytes, List<IdlMessage>)
+  offset 16 : enums          (8 bytes, List<IdlEnum>)
+  offset 24 : services       (8 bytes, List<IdlService>)
+
+References:
+  - Protobuf 3 language guide https://protobuf.dev/programming-guides/proto3/
+  - Apache Thrift IDL         https://thrift.apache.org/docs/idl
+  - Apache Avro IDL           https://avro.apache.org/docs/1.11.1/idl-language/
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/schema/schema.runa" as Schema
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let IDL_MESSAGE_SIZE be 32
+Let IDL_FIELD_SIZE be 48
+Let IDL_ENUM_SIZE be 24
+Let IDL_ENUM_VALUE_SIZE be 16
+Let IDL_SERVICE_SIZE be 24
+Let IDL_METHOD_SIZE be 40
+Let IDL_DOCUMENT_SIZE be 32
+
+Note: Field-label constants per proto2/proto3.
+Let LABEL_OPTIONAL be 1
+Let LABEL_REQUIRED be 2
+Let LABEL_REPEATED be 3
+
+Note: Streaming-mode constants per gRPC.
+Let STREAM_NONE be 0
+Let STREAM_CLIENT be 1
+Let STREAM_SERVER be 2
+Let STREAM_BIDI be 3
+
+Note: ============================================================================
+Note: ENUM VALUE
+Note: ============================================================================
+
+@Reasoning
+Allocate an IdlEnumValue: a (name, integer-value) pair.
+@End Reasoning
+
+@Implementation
+Allocate 16 bytes; duplicate name.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or null name.
+@End Security_Scope
+Process called "idl_enum_value_create" takes name as Integer, value as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let nm be proc string_duplicate from StringPrim with name
+    If nm is equal to 0:
+        Return 0
+    End If
+    Let ev be proc allocate from Layout with IDL_ENUM_VALUE_SIZE
+    If ev is equal to 0:
+        proc deallocate from Layout with nm
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with ev, 0, nm
+    proc memory_set_int64 from Memory with ev, 8, value
+    Return ev
+End Process
+
+@Reasoning
+Free an IdlEnumValue.
+@End Reasoning
+
+@Implementation
+Free name string, then record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe on null.
+@End Security_Scope
+Process called "idl_enum_value_destroy" takes ev as Integer returns Integer:
+    If ev is equal to 0:
+        Return 0
+    End If
+    Let nm be proc memory_get_int64 from Memory with ev, 0
+    If nm is not equal to 0:
+        proc deallocate from Layout with nm
+    End If
+    proc deallocate from Layout with ev
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ENUM
+Note: ============================================================================
+
+@Reasoning
+Allocate an IdlEnum with empty value list.
+@End Reasoning
+
+@Implementation
+Allocate 24 bytes; duplicate name; create empty values list.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or null name.
+@End Security_Scope
+Process called "idl_enum_create" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let nm be proc string_duplicate from StringPrim with name
+    If nm is equal to 0:
+        Return 0
+    End If
+    Let vs be proc list_create from List
+    If vs is equal to 0:
+        proc deallocate from Layout with nm
+        Return 0
+    End If
+    Let e be proc allocate from Layout with IDL_ENUM_SIZE
+    If e is equal to 0:
+        proc deallocate from Layout with nm
+        proc list_destroy from List with vs
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with e, 0, nm
+    proc memory_set_int64 from Memory with e, 8, vs
+    proc memory_set_int64 from Memory with e, 16, 0
+    Return e
+End Process
+
+@Reasoning
+Free an IdlEnum and all enum-value entries.
+@End Reasoning
+
+@Implementation
+Walk values, destroy each. Free name, docstring, record.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over values.
+@End Performance_Hints
+
+@Security_Scope
+Safe on null.
+@End Security_Scope
+Process called "idl_enum_destroy" takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Let nm be proc memory_get_int64 from Memory with e, 0
+    If nm is not equal to 0:
+        proc deallocate from Layout with nm
+    End If
+    Let vs be proc memory_get_int64 from Memory with e, 8
+    If vs is not equal to 0:
+        Let vc be proc list_length from List with vs
+        Let i be 0
+        While i is less than vc:
+            Let ev be proc list_get from List with vs, i
+            If ev is not equal to 0:
+                proc idl_enum_value_destroy with ev
+            End If
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with vs
+    End If
+    Let ds be proc memory_get_int64 from Memory with e, 16
+    If ds is not equal to 0:
+        proc deallocate from Layout with ds
+    End If
+    proc deallocate from Layout with e
+    Return 1
+End Process
+
+@Reasoning
+Append a value to an enum.
+@End Reasoning
+
+@Implementation
+list_push.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "idl_enum_add_value" takes e as Integer, name as Integer, value as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Let vs be proc memory_get_int64 from Memory with e, 8
+    If vs is equal to 0:
+        Return 0
+    End If
+    Let ev be proc idl_enum_value_create with name, value
+    If ev is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with vs, ev
+    Return 1
+End Process
+
+@Reasoning
+Read the enum name.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_enum_name" takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with e, 0
+End Process
+
+@Reasoning
+Read the enum values list.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_enum_values" takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with e, 8
+End Process
+
+Note: ============================================================================
+Note: FIELD
+Note: ============================================================================
+
+@Reasoning
+Allocate an IdlField.
+@End Reasoning
+
+@Implementation
+Allocate 48 bytes; duplicate name and type_name.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|+|type|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or null name/type.
+@End Security_Scope
+Process called "idl_field_create" takes name as Integer, type_name as Integer, tag as Integer, label as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If type_name is equal to 0:
+        Return 0
+    End If
+    Let nm be proc string_duplicate from StringPrim with name
+    If nm is equal to 0:
+        Return 0
+    End If
+    Let tn be proc string_duplicate from StringPrim with type_name
+    If tn is equal to 0:
+        proc deallocate from Layout with nm
+        Return 0
+    End If
+    Let f be proc allocate from Layout with IDL_FIELD_SIZE
+    If f is equal to 0:
+        proc deallocate from Layout with nm
+        proc deallocate from Layout with tn
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with f, 0, nm
+    proc memory_set_int64 from Memory with f, 8, tn
+    proc memory_set_int64 from Memory with f, 16, tag
+    Let lbl be label
+    If lbl is less than 1:
+        Set lbl to LABEL_OPTIONAL
+    End If
+    proc memory_set_int64 from Memory with f, 24, lbl
+    proc memory_set_int64 from Memory with f, 32, 0
+    proc memory_set_int64 from Memory with f, 40, 0
+    Return f
+End Process
+
+@Reasoning
+Free an IdlField and its owned strings.
+@End Reasoning
+
+@Implementation
+Deallocate each non-zero string slot.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe on null.
+@End Security_Scope
+Process called "idl_field_destroy" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Let nm be proc memory_get_int64 from Memory with f, 0
+    If nm is not equal to 0:
+        proc deallocate from Layout with nm
+    End If
+    Let tn be proc memory_get_int64 from Memory with f, 8
+    If tn is not equal to 0:
+        proc deallocate from Layout with tn
+    End If
+    Let dv be proc memory_get_int64 from Memory with f, 32
+    If dv is not equal to 0:
+        proc deallocate from Layout with dv
+    End If
+    Let ds be proc memory_get_int64 from Memory with f, 40
+    If ds is not equal to 0:
+        proc deallocate from Layout with ds
+    End If
+    proc deallocate from Layout with f
+    Return 1
+End Process
+
+@Reasoning
+Field accessor: name.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_field_name" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 0
+End Process
+
+@Reasoning
+Field accessor: type name.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_field_type" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 8
+End Process
+
+@Reasoning
+Field accessor: wire tag (protobuf).
+@End Reasoning
+
+@Implementation
+Load offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_field_tag" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 16
+End Process
+
+@Reasoning
+Field accessor: label (optional/required/repeated).
+@End Reasoning
+
+@Implementation
+Load offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_field_label" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 24
+End Process
+
+Note: ============================================================================
+Note: MESSAGE
+Note: ============================================================================
+
+@Reasoning
+Allocate an IdlMessage.
+@End Reasoning
+
+@Implementation
+Allocate 32 bytes; duplicate name; create fields and nested lists.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or null name.
+@End Security_Scope
+Process called "idl_message_create" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let nm be proc string_duplicate from StringPrim with name
+    If nm is equal to 0:
+        Return 0
+    End If
+    Let fs be proc list_create from List
+    If fs is equal to 0:
+        proc deallocate from Layout with nm
+        Return 0
+    End If
+    Let nested be proc list_create from List
+    If nested is equal to 0:
+        proc list_destroy from List with fs
+        proc deallocate from Layout with nm
+        Return 0
+    End If
+    Let m be proc allocate from Layout with IDL_MESSAGE_SIZE
+    If m is equal to 0:
+        proc list_destroy from List with fs
+        proc list_destroy from List with nested
+        proc deallocate from Layout with nm
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with m, 0, nm
+    proc memory_set_int64 from Memory with m, 8, fs
+    proc memory_set_int64 from Memory with m, 16, nested
+    proc memory_set_int64 from Memory with m, 24, 0
+    Return m
+End Process
+
+@Reasoning
+Free an IdlMessage with all fields and nested messages.
+@End Reasoning
+
+@Implementation
+Walk fields, destroy each. Recursively destroy nested.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over subtree.
+@End Performance_Hints
+
+@Security_Scope
+Safe on null.
+@End Security_Scope
+Process called "idl_message_destroy" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let nm be proc memory_get_int64 from Memory with m, 0
+    If nm is not equal to 0:
+        proc deallocate from Layout with nm
+    End If
+    Let fs be proc memory_get_int64 from Memory with m, 8
+    If fs is not equal to 0:
+        Let fc be proc list_length from List with fs
+        Let i be 0
+        While i is less than fc:
+            Let f be proc list_get from List with fs, i
+            If f is not equal to 0:
+                proc idl_field_destroy with f
+            End If
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with fs
+    End If
+    Let nested be proc memory_get_int64 from Memory with m, 16
+    If nested is not equal to 0:
+        Let nc be proc list_length from List with nested
+        Let j be 0
+        While j is less than nc:
+            Let n be proc list_get from List with nested, j
+            If n is not equal to 0:
+                proc idl_message_destroy with n
+            End If
+            Set j to j plus 1
+        End While
+        proc list_destroy from List with nested
+    End If
+    Let ds be proc memory_get_int64 from Memory with m, 24
+    If ds is not equal to 0:
+        proc deallocate from Layout with ds
+    End If
+    proc deallocate from Layout with m
+    Return 1
+End Process
+
+@Reasoning
+Add a field to a message.
+@End Reasoning
+
+@Implementation
+list_push on the fields list.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "idl_message_add_field" takes m as Integer, field as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    If field is equal to 0:
+        Return 0
+    End If
+    Let fs be proc memory_get_int64 from Memory with m, 8
+    If fs is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with fs, field
+    Return 1
+End Process
+
+@Reasoning
+Read the message name.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_message_name" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with m, 0
+End Process
+
+@Reasoning
+Read the fields list.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_message_fields" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with m, 8
+End Process
+
+Note: ============================================================================
+Note: METHOD + SERVICE
+Note: ============================================================================
+
+@Reasoning
+Allocate an IdlMethod.
+@End Reasoning
+
+@Implementation
+Allocate 40 bytes; duplicate name, input_type, output_type.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|+|input|+|output|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or null arguments.
+@End Security_Scope
+Process called "idl_method_create" takes name as Integer, input_type as Integer, output_type as Integer, streaming as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If input_type is equal to 0:
+        Return 0
+    End If
+    If output_type is equal to 0:
+        Return 0
+    End If
+    Let nm be proc string_duplicate from StringPrim with name
+    If nm is equal to 0:
+        Return 0
+    End If
+    Let it be proc string_duplicate from StringPrim with input_type
+    If it is equal to 0:
+        proc deallocate from Layout with nm
+        Return 0
+    End If
+    Let ot be proc string_duplicate from StringPrim with output_type
+    If ot is equal to 0:
+        proc deallocate from Layout with nm
+        proc deallocate from Layout with it
+        Return 0
+    End If
+    Let mthd be proc allocate from Layout with IDL_METHOD_SIZE
+    If mthd is equal to 0:
+        proc deallocate from Layout with nm
+        proc deallocate from Layout with it
+        proc deallocate from Layout with ot
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with mthd, 0, nm
+    proc memory_set_int64 from Memory with mthd, 8, it
+    proc memory_set_int64 from Memory with mthd, 16, ot
+    proc memory_set_int64 from Memory with mthd, 24, streaming
+    proc memory_set_int64 from Memory with mthd, 32, 0
+    Return mthd
+End Process
+
+@Reasoning
+Free an IdlMethod.
+@End Reasoning
+
+@Implementation
+Deallocate each owned string slot.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe on null.
+@End Security_Scope
+Process called "idl_method_destroy" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let nm be proc memory_get_int64 from Memory with m, 0
+    If nm is not equal to 0:
+        proc deallocate from Layout with nm
+    End If
+    Let it be proc memory_get_int64 from Memory with m, 8
+    If it is not equal to 0:
+        proc deallocate from Layout with it
+    End If
+    Let ot be proc memory_get_int64 from Memory with m, 16
+    If ot is not equal to 0:
+        proc deallocate from Layout with ot
+    End If
+    Let ds be proc memory_get_int64 from Memory with m, 32
+    If ds is not equal to 0:
+        proc deallocate from Layout with ds
+    End If
+    proc deallocate from Layout with m
+    Return 1
+End Process
+
+@Reasoning
+Allocate an IdlService.
+@End Reasoning
+
+@Implementation
+Allocate 24 bytes; duplicate name; create empty methods list.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or null name.
+@End Security_Scope
+Process called "idl_service_create" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let nm be proc string_duplicate from StringPrim with name
+    If nm is equal to 0:
+        Return 0
+    End If
+    Let ms be proc list_create from List
+    If ms is equal to 0:
+        proc deallocate from Layout with nm
+        Return 0
+    End If
+    Let s be proc allocate from Layout with IDL_SERVICE_SIZE
+    If s is equal to 0:
+        proc deallocate from Layout with nm
+        proc list_destroy from List with ms
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with s, 0, nm
+    proc memory_set_int64 from Memory with s, 8, ms
+    proc memory_set_int64 from Memory with s, 16, 0
+    Return s
+End Process
+
+@Reasoning
+Free an IdlService and its methods.
+@End Reasoning
+
+@Implementation
+Walk methods, destroy each. Free name, docstring, record.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over methods.
+@End Performance_Hints
+
+@Security_Scope
+Safe on null.
+@End Security_Scope
+Process called "idl_service_destroy" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let nm be proc memory_get_int64 from Memory with s, 0
+    If nm is not equal to 0:
+        proc deallocate from Layout with nm
+    End If
+    Let ms be proc memory_get_int64 from Memory with s, 8
+    If ms is not equal to 0:
+        Let mc be proc list_length from List with ms
+        Let i be 0
+        While i is less than mc:
+            Let m be proc list_get from List with ms, i
+            If m is not equal to 0:
+                proc idl_method_destroy with m
+            End If
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with ms
+    End If
+    Let ds be proc memory_get_int64 from Memory with s, 16
+    If ds is not equal to 0:
+        proc deallocate from Layout with ds
+    End If
+    proc deallocate from Layout with s
+    Return 1
+End Process
+
+@Reasoning
+Append a method to a service.
+@End Reasoning
+
+@Implementation
+list_push.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "idl_service_add_method" takes s as Integer, method as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    If method is equal to 0:
+        Return 0
+    End If
+    Let ms be proc memory_get_int64 from Memory with s, 8
+    If ms is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with ms, method
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: DOCUMENT
+Note: ============================================================================
+
+@Reasoning
+Allocate an IdlDocument with empty message/enum/service lists and no
+package name.
+@End Reasoning
+
+@Implementation
+Allocate 32 bytes; create three empty lists.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "idl_document_create" returns Integer:
+    Let d be proc allocate from Layout with IDL_DOCUMENT_SIZE
+    If d is equal to 0:
+        Return 0
+    End If
+    Let ms be proc list_create from List
+    Let es be proc list_create from List
+    Let ss be proc list_create from List
+    If ms is equal to 0:
+        proc deallocate from Layout with d
+        Return 0
+    End If
+    If es is equal to 0:
+        proc list_destroy from List with ms
+        proc deallocate from Layout with d
+        Return 0
+    End If
+    If ss is equal to 0:
+        proc list_destroy from List with ms
+        proc list_destroy from List with es
+        proc deallocate from Layout with d
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with d, 0, 0
+    proc memory_set_int64 from Memory with d, 8, ms
+    proc memory_set_int64 from Memory with d, 16, es
+    proc memory_set_int64 from Memory with d, 24, ss
+    Return d
+End Process
+
+@Reasoning
+Free an IdlDocument and every owned message/enum/service.
+@End Reasoning
+
+@Implementation
+Walk each list and call the appropriate destructor.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the document.
+@End Performance_Hints
+
+@Security_Scope
+Safe on null.
+@End Security_Scope
+Process called "idl_document_destroy" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let pkg be proc memory_get_int64 from Memory with d, 0
+    If pkg is not equal to 0:
+        proc deallocate from Layout with pkg
+    End If
+    Let ms be proc memory_get_int64 from Memory with d, 8
+    If ms is not equal to 0:
+        Let mc be proc list_length from List with ms
+        Let i be 0
+        While i is less than mc:
+            Let m be proc list_get from List with ms, i
+            If m is not equal to 0:
+                proc idl_message_destroy with m
+            End If
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with ms
+    End If
+    Let es be proc memory_get_int64 from Memory with d, 16
+    If es is not equal to 0:
+        Let ec be proc list_length from List with es
+        Let j be 0
+        While j is less than ec:
+            Let e be proc list_get from List with es, j
+            If e is not equal to 0:
+                proc idl_enum_destroy with e
+            End If
+            Set j to j plus 1
+        End While
+        proc list_destroy from List with es
+    End If
+    Let ss be proc memory_get_int64 from Memory with d, 24
+    If ss is not equal to 0:
+        Let sc be proc list_length from List with ss
+        Let k be 0
+        While k is less than sc:
+            Let s be proc list_get from List with ss, k
+            If s is not equal to 0:
+                proc idl_service_destroy with s
+            End If
+            Set k to k plus 1
+        End While
+        proc list_destroy from List with ss
+    End If
+    proc deallocate from Layout with d
+    Return 1
+End Process
+
+@Reasoning
+Set the document's package name (duplicated).
+@End Reasoning
+
+@Implementation
+Free prior, duplicate new.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null document.
+@End Security_Scope
+Process called "idl_document_set_package" takes d as Integer, name as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let prior be proc memory_get_int64 from Memory with d, 0
+    If prior is not equal to 0:
+        proc deallocate from Layout with prior
+    End If
+    Let dup be 0
+    If name is not equal to 0:
+        Set dup to proc string_duplicate from StringPrim with name
+    End If
+    proc memory_set_int64 from Memory with d, 0, dup
+    Return 1
+End Process
+
+@Reasoning
+Add a message to the document.
+@End Reasoning
+
+@Implementation
+list_push on offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "idl_document_add_message" takes d as Integer, m as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    If m is equal to 0:
+        Return 0
+    End If
+    Let ms be proc memory_get_int64 from Memory with d, 8
+    If ms is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with ms, m
+    Return 1
+End Process
+
+@Reasoning
+Add an enum to the document.
+@End Reasoning
+
+@Implementation
+list_push on offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "idl_document_add_enum" takes d as Integer, e as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    If e is equal to 0:
+        Return 0
+    End If
+    Let es be proc memory_get_int64 from Memory with d, 16
+    If es is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with es, e
+    Return 1
+End Process
+
+@Reasoning
+Add a service to the document.
+@End Reasoning
+
+@Implementation
+list_push on offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "idl_document_add_service" takes d as Integer, s as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    If s is equal to 0:
+        Return 0
+    End If
+    Let ss be proc memory_get_int64 from Memory with d, 24
+    If ss is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with ss, s
+    Return 1
+End Process
+
+@Reasoning
+Read the document messages list.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_document_messages" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with d, 8
+End Process
+
+@Reasoning
+Read the document enums list.
+@End Reasoning
+
+@Implementation
+Load offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_document_enums" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with d, 16
+End Process
+
+@Reasoning
+Read the document services list.
+@End Reasoning
+
+@Implementation
+Load offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_document_services" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with d, 24
+End Process
+
+Note: ============================================================================
+Note: SHARED LEXER PRIMITIVES (cursor over UTF-8 text)
+Note: ============================================================================
+
+Let CURSOR_SIZE be 24
+
+@Reasoning
+Allocate a lexer cursor over the supplied text.
+@End Reasoning
+
+@Implementation
+Allocate 24 bytes: { text, length, pos }.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "cursor_create" takes text as Integer returns Integer:
+    Let c be proc allocate from Layout with CURSOR_SIZE
+    If c is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with c, 0, text
+    Let length be 0
+    If text is not equal to 0:
+        Set length to proc string_length from StringCore with text
+    End If
+    proc memory_set_int64 from Memory with c, 8, length
+    proc memory_set_int64 from Memory with c, 16, 0
+    Return c
+End Process
+
+@Reasoning
+Free the cursor.
+@End Reasoning
+
+@Implementation
+Deallocate the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe on null.
+@End Security_Scope
+Process called "cursor_destroy" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    proc deallocate from Layout with c
+    Return 1
+End Process
+
+@Reasoning
+Skip whitespace and "//" line comments.
+@End Reasoning
+
+@Implementation
+Advance through space/tab/newline; if seeing "//" advance to end-of-line.
+Repeat until neither pattern matches.
+@End Implementation
+
+@Performance_Hints
+Time: O(k).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "cursor_skip_ws_and_comments" takes c as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with c, 0
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let pos be proc memory_get_int64 from Memory with c, 16
+    Let going be 1
+    While going is equal to 1:
+        If pos is greater than or equal to length:
+            Set going to 0
+        Otherwise:
+            Let ch be proc memory_get_byte from Memory with text, pos
+            Let isw be proc is_whitespace from Char with ch
+            If isw is equal to 1:
+                Set pos to pos plus 1
+            Otherwise:
+                If ch is equal to 47:
+                    If (pos plus 1) is less than length:
+                        Let next_ch be proc memory_get_byte from Memory with text, pos plus 1
+                        If next_ch is equal to 47:
+                            Set pos to pos plus 2
+                            While pos is less than length:
+                                Let cc be proc memory_get_byte from Memory with text, pos
+                                If cc is equal to 10:
+                                    Set pos to length plus 1
+                                Otherwise:
+                                    Set pos to pos plus 1
+                                End If
+                            End While
+                            Set pos to proc memory_get_int64 from Memory with c, 16
+                            Set pos to pos plus 2
+                            Let scan be 1
+                            While scan is equal to 1:
+                                If pos is greater than or equal to length:
+                                    Set scan to 0
+                                Otherwise:
+                                    Let cc2 be proc memory_get_byte from Memory with text, pos
+                                    If cc2 is equal to 10:
+                                        Set pos to pos plus 1
+                                        Set scan to 0
+                                    Otherwise:
+                                        Set pos to pos plus 1
+                                    End If
+                                End If
+                            End While
+                        Otherwise:
+                            Set going to 0
+                        End If
+                    Otherwise:
+                        Set going to 0
+                    End If
+                Otherwise:
+                    Set going to 0
+                End If
+            End If
+        End If
+    End While
+    proc memory_set_int64 from Memory with c, 16, pos
+    Return 1
+End Process
+
+@Reasoning
+Read an identifier (alpha-or-underscore start, then alphanumeric or
+underscore).
+@End Reasoning
+
+@Implementation
+Record start, advance while characters are valid. Substring into a fresh
+String.
+@End Implementation
+
+@Performance_Hints
+Time: O(|id|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if no identifier could be read.
+@End Security_Scope
+Process called "cursor_read_identifier" takes c as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with c, 0
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let pos be proc memory_get_int64 from Memory with c, 16
+    If pos is greater than or equal to length:
+        Return 0
+    End If
+    Let start_ch be proc memory_get_byte from Memory with text, pos
+    Let is_start be proc is_identifier_start from Char with start_ch
+    If is_start is equal to 0:
+        Return 0
+    End If
+    Let start be pos
+    Set pos to pos plus 1
+    While pos is less than length:
+        Let ch be proc memory_get_byte from Memory with text, pos
+        Let cont be proc is_identifier_continue from Char with ch
+        If cont is equal to 0:
+            Set pos to length plus 1
+        Otherwise:
+            Set pos to pos plus 1
+        End If
+    End While
+    Let actual_end be proc memory_get_int64 from Memory with c, 16
+    Set pos to actual_end plus 1
+    Let p2 be actual_end
+    While p2 is less than length:
+        Let cc be proc memory_get_byte from Memory with text, p2
+        Let cont2 be proc is_identifier_continue from Char with cc
+        If cont2 is equal to 0:
+            Set p2 to length plus 1
+        Otherwise:
+            Set p2 to p2 plus 1
+        End If
+    End While
+    Let final_pos be actual_end
+    Let going be 1
+    While going is equal to 1:
+        If final_pos is greater than or equal to length:
+            Set going to 0
+        Otherwise:
+            Let cf be proc memory_get_byte from Memory with text, final_pos
+            Let cont3 be proc is_identifier_continue from Char with cf
+            If cont3 is equal to 1:
+                Set final_pos to final_pos plus 1
+            Otherwise:
+                Set going to 0
+            End If
+        End If
+    End While
+    proc memory_set_int64 from Memory with c, 16, final_pos
+    Let span_len be final_pos minus start
+    Return proc string_substring from StringPrim with text, start, span_len
+End Process
+
+@Reasoning
+Read a non-negative decimal integer.
+@End Reasoning
+
+@Implementation
+Advance through digits, parse via string_to_integer.
+@End Implementation
+
+@Performance_Hints
+Time: O(d) where d is digit count.
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 if no digits available.
+@End Security_Scope
+Process called "cursor_read_integer" takes c as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with c, 0
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let pos be proc memory_get_int64 from Memory with c, 16
+    If pos is greater than or equal to length:
+        Return 0 minus 1
+    End If
+    Let start be pos
+    Let going be 1
+    While going is equal to 1:
+        If pos is greater than or equal to length:
+            Set going to 0
+        Otherwise:
+            Let ch be proc memory_get_byte from Memory with text, pos
+            Let isd be proc is_digit from Char with ch
+            If isd is equal to 1:
+                Set pos to pos plus 1
+            Otherwise:
+                Set going to 0
+            End If
+        End If
+    End While
+    If pos is equal to start:
+        Return 0 minus 1
+    End If
+    proc memory_set_int64 from Memory with c, 16, pos
+    Let span_len be pos minus start
+    Let span be proc string_substring from StringPrim with text, start, span_len
+    Let iv be proc string_to_integer from StringPrim with span
+    proc deallocate from Layout with span
+    Return iv
+End Process
+
+@Reasoning
+Try to consume one specific byte. Returns 1 on success (position
+advanced), 0 otherwise (unchanged).
+@End Reasoning
+
+@Implementation
+Compare next byte, advance if match.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "cursor_eat_byte" takes c as Integer, expected as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with c, 0
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let pos be proc memory_get_int64 from Memory with c, 16
+    If pos is greater than or equal to length:
+        Return 0
+    End If
+    Let ch be proc memory_get_byte from Memory with text, pos
+    If ch is not equal to expected:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with c, 16, pos plus 1
+    Return 1
+End Process
+
+@Reasoning
+Try to consume a literal keyword (followed by a non-identifier
+character). Restores position on failure.
+@End Reasoning
+
+@Implementation
+Compare bytes; verify the next char is non-identifier-continue.
+@End Implementation
+
+@Performance_Hints
+Time: O(|kw|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 1 on match (consumed), 0 otherwise.
+@End Security_Scope
+Process called "cursor_eat_keyword" takes c as Integer, kw as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with c, 0
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let pos be proc memory_get_int64 from Memory with c, 16
+    Let kwlen be proc string_length from StringCore with kw
+    If (pos plus kwlen) is greater than length:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than kwlen:
+        Let a be proc memory_get_byte from Memory with text, pos plus i
+        Let b be proc memory_get_byte from Memory with kw, i
+        If a is not equal to b:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Let after be pos plus kwlen
+    If after is less than length:
+        Let nch be proc memory_get_byte from Memory with text, after
+        Let cont be proc is_identifier_continue from Char with nch
+        If cont is equal to 1:
+            Return 0
+        End If
+    End If
+    proc memory_set_int64 from Memory with c, 16, after
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PROTOBUF PARSER (subset)
+Note: ============================================================================
+
+@Reasoning
+Parse Protocol Buffers .proto text into an IdlDocument. The parser
+recognizes the canonical proto3 grammar subset:
+  syntax = "proto3" ;        (optional)
+  package <name> ;
+  message <Name> { field-list }
+  enum <Name>    { enum-value-list }
+  service <Name> { rpc <Name>(<In>) returns (<Out>); ... }
+
+Each field-line is:
+  [label]? <type> <name> = <tag> ;
+
+Where label is one of "optional", "required", "repeated" (proto2
+labels accepted but stored uniformly).
+@End Reasoning
+
+@Implementation
+Initialize cursor, accumulate document. Loop over top-level declarations
+dispatching on keyword.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over text.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "idl_parse_protobuf" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let doc be proc idl_document_create
+    If doc is equal to 0:
+        Return 0
+    End If
+    Let c be proc cursor_create with source
+    If c is equal to 0:
+        proc idl_document_destroy with doc
+        Return 0
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let progressing be 1
+    While progressing is equal to 1:
+        proc cursor_skip_ws_and_comments with c
+        Let pos be proc memory_get_int64 from Memory with c, 16
+        If pos is greater than or equal to length:
+            Set progressing to 0
+        Otherwise:
+            Let did_syntax be proc cursor_eat_keyword with c, "syntax"
+            If did_syntax is equal to 1:
+                Let skip_to_semi be 1
+                While skip_to_semi is equal to 1:
+                    Let p2 be proc memory_get_int64 from Memory with c, 16
+                    If p2 is greater than or equal to length:
+                        Set skip_to_semi to 0
+                    Otherwise:
+                        Let txt be proc memory_get_int64 from Memory with c, 0
+                        Let ch be proc memory_get_byte from Memory with txt, p2
+                        proc memory_set_int64 from Memory with c, 16, p2 plus 1
+                        If ch is equal to 59:
+                            Set skip_to_semi to 0
+                        End If
+                    End If
+                End While
+            Otherwise:
+                Let did_pkg be proc cursor_eat_keyword with c, "package"
+                If did_pkg is equal to 1:
+                    proc cursor_skip_ws_and_comments with c
+                    Let pname be proc cursor_read_identifier with c
+                    If pname is not equal to 0:
+                        proc idl_document_set_package with doc, pname
+                        proc deallocate from Layout with pname
+                    End If
+                    proc cursor_skip_ws_and_comments with c
+                    proc cursor_eat_byte with c, 59
+                Otherwise:
+                    Let did_msg be proc cursor_eat_keyword with c, "message"
+                    If did_msg is equal to 1:
+                        Let msg be proc parse_protobuf_message with c
+                        If msg is not equal to 0:
+                            proc idl_document_add_message with doc, msg
+                        End If
+                    Otherwise:
+                        Let did_enum be proc cursor_eat_keyword with c, "enum"
+                        If did_enum is equal to 1:
+                            Let en be proc parse_protobuf_enum with c
+                            If en is not equal to 0:
+                                proc idl_document_add_enum with doc, en
+                            End If
+                        Otherwise:
+                            Let did_svc be proc cursor_eat_keyword with c, "service"
+                            If did_svc is equal to 1:
+                                Let svc be proc parse_protobuf_service with c
+                                If svc is not equal to 0:
+                                    proc idl_document_add_service with doc, svc
+                                End If
+                            Otherwise:
+                                Let new_pos be pos plus 1
+                                proc memory_set_int64 from Memory with c, 16, new_pos
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    proc cursor_destroy with c
+    Return doc
+End Process
+
+@Reasoning
+Parse "message <Name> { ...fields... }".
+@End Reasoning
+
+@Implementation
+Read name, expect '{', loop over field-lines until '}'. Each field-line
+parses [label] type name = tag ;
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over body.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "parse_protobuf_message" takes c as Integer returns Integer:
+    proc cursor_skip_ws_and_comments with c
+    Let name be proc cursor_read_identifier with c
+    If name is equal to 0:
+        Return 0
+    End If
+    Let msg be proc idl_message_create with name
+    proc deallocate from Layout with name
+    If msg is equal to 0:
+        Return 0
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let ok_brace be proc cursor_eat_byte with c, 123
+    If ok_brace is equal to 0:
+        proc idl_message_destroy with msg
+        Return 0
+    End If
+    Let going be 1
+    While going is equal to 1:
+        proc cursor_skip_ws_and_comments with c
+        Let closing be proc cursor_eat_byte with c, 125
+        If closing is equal to 1:
+            Set going to 0
+        Otherwise:
+            Let length be proc memory_get_int64 from Memory with c, 8
+            Let pos be proc memory_get_int64 from Memory with c, 16
+            If pos is greater than or equal to length:
+                Set going to 0
+            Otherwise:
+                Let label be LABEL_OPTIONAL
+                Let did_opt be proc cursor_eat_keyword with c, "optional"
+                If did_opt is equal to 1:
+                    Set label to LABEL_OPTIONAL
+                End If
+                Let did_req be proc cursor_eat_keyword with c, "required"
+                If did_req is equal to 1:
+                    Set label to LABEL_REQUIRED
+                End If
+                Let did_rep be proc cursor_eat_keyword with c, "repeated"
+                If did_rep is equal to 1:
+                    Set label to LABEL_REPEATED
+                End If
+                proc cursor_skip_ws_and_comments with c
+                Let tname be proc cursor_read_identifier with c
+                If tname is equal to 0:
+                    Set going to 0
+                Otherwise:
+                    proc cursor_skip_ws_and_comments with c
+                    Let fname be proc cursor_read_identifier with c
+                    If fname is equal to 0:
+                        proc deallocate from Layout with tname
+                        Set going to 0
+                    Otherwise:
+                        proc cursor_skip_ws_and_comments with c
+                        Let ok_eq be proc cursor_eat_byte with c, 61
+                        If ok_eq is equal to 0:
+                            proc deallocate from Layout with tname
+                            proc deallocate from Layout with fname
+                            Set going to 0
+                        Otherwise:
+                            proc cursor_skip_ws_and_comments with c
+                            Let tag be proc cursor_read_integer with c
+                            If tag is less than 1:
+                                proc deallocate from Layout with tname
+                                proc deallocate from Layout with fname
+                                Set going to 0
+                            Otherwise:
+                                proc cursor_skip_ws_and_comments with c
+                                Let ok_semi be 0
+                                Let try_semi be proc cursor_eat_byte with c, 59
+                                If try_semi is equal to 1:
+                                    Set ok_semi to 1
+                                Otherwise:
+                                    Let skip_brackets be 1
+                                    While skip_brackets is equal to 1:
+                                        Let pp be proc memory_get_int64 from Memory with c, 16
+                                        If pp is greater than or equal to length:
+                                            Set skip_brackets to 0
+                                        Otherwise:
+                                            Let txt be proc memory_get_int64 from Memory with c, 0
+                                            Let cch be proc memory_get_byte from Memory with txt, pp
+                                            proc memory_set_int64 from Memory with c, 16, pp plus 1
+                                            If cch is equal to 59:
+                                                Set ok_semi to 1
+                                                Set skip_brackets to 0
+                                            End If
+                                        End If
+                                    End While
+                                End If
+                                Let fld be proc idl_field_create with fname, tname, tag, label
+                                proc deallocate from Layout with tname
+                                proc deallocate from Layout with fname
+                                If fld is not equal to 0:
+                                    proc idl_message_add_field with msg, fld
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return msg
+End Process
+
+@Reasoning
+Parse "enum <Name> { NAME = N ; ... }".
+@End Reasoning
+
+@Implementation
+Read name, eat '{', loop body reading "ident = int ;" until '}'.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "parse_protobuf_enum" takes c as Integer returns Integer:
+    proc cursor_skip_ws_and_comments with c
+    Let name be proc cursor_read_identifier with c
+    If name is equal to 0:
+        Return 0
+    End If
+    Let en be proc idl_enum_create with name
+    proc deallocate from Layout with name
+    If en is equal to 0:
+        Return 0
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let ok_brace be proc cursor_eat_byte with c, 123
+    If ok_brace is equal to 0:
+        proc idl_enum_destroy with en
+        Return 0
+    End If
+    Let going be 1
+    While going is equal to 1:
+        proc cursor_skip_ws_and_comments with c
+        Let closing be proc cursor_eat_byte with c, 125
+        If closing is equal to 1:
+            Set going to 0
+        Otherwise:
+            Let length be proc memory_get_int64 from Memory with c, 8
+            Let pos be proc memory_get_int64 from Memory with c, 16
+            If pos is greater than or equal to length:
+                Set going to 0
+            Otherwise:
+                Let vname be proc cursor_read_identifier with c
+                If vname is equal to 0:
+                    Set going to 0
+                Otherwise:
+                    proc cursor_skip_ws_and_comments with c
+                    Let ok_eq be proc cursor_eat_byte with c, 61
+                    If ok_eq is equal to 0:
+                        proc deallocate from Layout with vname
+                        Set going to 0
+                    Otherwise:
+                        proc cursor_skip_ws_and_comments with c
+                        Let v be proc cursor_read_integer with c
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_byte with c, 59
+                        proc idl_enum_add_value with en, vname, v
+                        proc deallocate from Layout with vname
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return en
+End Process
+
+@Reasoning
+Parse "service <Name> { rpc <Name>(In) returns (Out); ... }".
+@End Reasoning
+
+@Implementation
+Read name, eat '{', loop body reading rpc lines.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "parse_protobuf_service" takes c as Integer returns Integer:
+    proc cursor_skip_ws_and_comments with c
+    Let name be proc cursor_read_identifier with c
+    If name is equal to 0:
+        Return 0
+    End If
+    Let svc be proc idl_service_create with name
+    proc deallocate from Layout with name
+    If svc is equal to 0:
+        Return 0
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let ok_brace be proc cursor_eat_byte with c, 123
+    If ok_brace is equal to 0:
+        proc idl_service_destroy with svc
+        Return 0
+    End If
+    Let going be 1
+    While going is equal to 1:
+        proc cursor_skip_ws_and_comments with c
+        Let closing be proc cursor_eat_byte with c, 125
+        If closing is equal to 1:
+            Set going to 0
+        Otherwise:
+            Let length be proc memory_get_int64 from Memory with c, 8
+            Let pos be proc memory_get_int64 from Memory with c, 16
+            If pos is greater than or equal to length:
+                Set going to 0
+            Otherwise:
+                Let did_rpc be proc cursor_eat_keyword with c, "rpc"
+                If did_rpc is equal to 0:
+                    Set going to 0
+                Otherwise:
+                    proc cursor_skip_ws_and_comments with c
+                    Let mname be proc cursor_read_identifier with c
+                    If mname is equal to 0:
+                        Set going to 0
+                    Otherwise:
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_byte with c, 40
+                        proc cursor_skip_ws_and_comments with c
+                        Let client_stream be 0
+                        Let did_cs be proc cursor_eat_keyword with c, "stream"
+                        If did_cs is equal to 1:
+                            Set client_stream to 1
+                            proc cursor_skip_ws_and_comments with c
+                        End If
+                        Let intype be proc cursor_read_identifier with c
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_byte with c, 41
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_keyword with c, "returns"
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_byte with c, 40
+                        proc cursor_skip_ws_and_comments with c
+                        Let server_stream be 0
+                        Let did_ss be proc cursor_eat_keyword with c, "stream"
+                        If did_ss is equal to 1:
+                            Set server_stream to 1
+                            proc cursor_skip_ws_and_comments with c
+                        End If
+                        Let outtype be proc cursor_read_identifier with c
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_byte with c, 41
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_byte with c, 59
+                        Let stream_mode be STREAM_NONE
+                        If client_stream is equal to 1:
+                            If server_stream is equal to 1:
+                                Set stream_mode to STREAM_BIDI
+                            Otherwise:
+                                Set stream_mode to STREAM_CLIENT
+                            End If
+                        Otherwise:
+                            If server_stream is equal to 1:
+                                Set stream_mode to STREAM_SERVER
+                            End If
+                        End If
+                        Let mthd be proc idl_method_create with mname, intype, outtype, stream_mode
+                        If mthd is not equal to 0:
+                            proc idl_service_add_method with svc, mthd
+                        End If
+                        If mname is not equal to 0:
+                            proc deallocate from Layout with mname
+                        End If
+                        If intype is not equal to 0:
+                            proc deallocate from Layout with intype
+                        End If
+                        If outtype is not equal to 0:
+                            proc deallocate from Layout with outtype
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return svc
+End Process
+
+Note: ============================================================================
+Note: THRIFT PARSER (subset)
+Note: ============================================================================
+
+@Reasoning
+Parse Apache Thrift IDL. Thrift's grammar overlaps protobuf's
+sufficiently that the same primitives (cursor_skip_ws, cursor_eat_keyword)
+serve both. Recognized declarations:
+  namespace <lang> <name>           -> ignored (no Runa namespace concept)
+  struct <Name> { <field-list> }    -> IdlMessage
+  enum <Name> { <name> = <int> ... } -> IdlEnum
+  service <Name> { <fn-list> }       -> IdlService
+
+A Thrift field is "<tag>: [required|optional] <type> <name>;". Compared
+to protobuf, the tag precedes the type instead of trailing the field.
+@End Reasoning
+
+@Implementation
+Same top-level loop as protobuf, dispatching on Thrift's keywords. The
+field parser inverts the order: read integer, ':' , optional label, type,
+name, ';'.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over source.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "idl_parse_thrift" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let doc be proc idl_document_create
+    If doc is equal to 0:
+        Return 0
+    End If
+    Let c be proc cursor_create with source
+    If c is equal to 0:
+        proc idl_document_destroy with doc
+        Return 0
+    End If
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let going be 1
+    While going is equal to 1:
+        proc cursor_skip_ws_and_comments with c
+        Let pos be proc memory_get_int64 from Memory with c, 16
+        If pos is greater than or equal to length:
+            Set going to 0
+        Otherwise:
+            Let did_ns be proc cursor_eat_keyword with c, "namespace"
+            If did_ns is equal to 1:
+                Let skip be 1
+                While skip is equal to 1:
+                    Let p2 be proc memory_get_int64 from Memory with c, 16
+                    If p2 is greater than or equal to length:
+                        Set skip to 0
+                    Otherwise:
+                        Let txt be proc memory_get_int64 from Memory with c, 0
+                        Let ch be proc memory_get_byte from Memory with txt, p2
+                        proc memory_set_int64 from Memory with c, 16, p2 plus 1
+                        If ch is equal to 10:
+                            Set skip to 0
+                        End If
+                    End If
+                End While
+            Otherwise:
+                Let did_struct be proc cursor_eat_keyword with c, "struct"
+                If did_struct is equal to 1:
+                    Let msg be proc parse_thrift_struct with c
+                    If msg is not equal to 0:
+                        proc idl_document_add_message with doc, msg
+                    End If
+                Otherwise:
+                    Let did_enum be proc cursor_eat_keyword with c, "enum"
+                    If did_enum is equal to 1:
+                        Let en be proc parse_protobuf_enum with c
+                        If en is not equal to 0:
+                            proc idl_document_add_enum with doc, en
+                        End If
+                    Otherwise:
+                        Let did_svc be proc cursor_eat_keyword with c, "service"
+                        If did_svc is equal to 1:
+                            Let svc be proc parse_thrift_service with c
+                            If svc is not equal to 0:
+                                proc idl_document_add_service with doc, svc
+                            End If
+                        Otherwise:
+                            Let new_pos be pos plus 1
+                            proc memory_set_int64 from Memory with c, 16, new_pos
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    proc cursor_destroy with c
+    Return doc
+End Process
+
+@Reasoning
+Parse a Thrift struct: { <tag>: [required|optional] <type> <name>; ... }.
+@End Reasoning
+
+@Implementation
+Same as protobuf message but each field is "tag : [label] type name ;".
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "parse_thrift_struct" takes c as Integer returns Integer:
+    proc cursor_skip_ws_and_comments with c
+    Let name be proc cursor_read_identifier with c
+    If name is equal to 0:
+        Return 0
+    End If
+    Let msg be proc idl_message_create with name
+    proc deallocate from Layout with name
+    If msg is equal to 0:
+        Return 0
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let ok_brace be proc cursor_eat_byte with c, 123
+    If ok_brace is equal to 0:
+        proc idl_message_destroy with msg
+        Return 0
+    End If
+    Let going be 1
+    While going is equal to 1:
+        proc cursor_skip_ws_and_comments with c
+        Let closing be proc cursor_eat_byte with c, 125
+        If closing is equal to 1:
+            Set going to 0
+        Otherwise:
+            Let length be proc memory_get_int64 from Memory with c, 8
+            Let pos be proc memory_get_int64 from Memory with c, 16
+            If pos is greater than or equal to length:
+                Set going to 0
+            Otherwise:
+                Let tag be proc cursor_read_integer with c
+                If tag is less than 0:
+                    Set going to 0
+                Otherwise:
+                    proc cursor_skip_ws_and_comments with c
+                    proc cursor_eat_byte with c, 58
+                    proc cursor_skip_ws_and_comments with c
+                    Let label be LABEL_OPTIONAL
+                    Let did_req be proc cursor_eat_keyword with c, "required"
+                    If did_req is equal to 1:
+                        Set label to LABEL_REQUIRED
+                    End If
+                    Let did_opt be proc cursor_eat_keyword with c, "optional"
+                    If did_opt is equal to 1:
+                        Set label to LABEL_OPTIONAL
+                    End If
+                    proc cursor_skip_ws_and_comments with c
+                    Let tname be proc cursor_read_identifier with c
+                    proc cursor_skip_ws_and_comments with c
+                    Let fname be proc cursor_read_identifier with c
+                    proc cursor_skip_ws_and_comments with c
+                    proc cursor_eat_byte with c, 59
+                    If tname is not equal to 0:
+                        If fname is not equal to 0:
+                            Let fld be proc idl_field_create with fname, tname, tag, label
+                            If fld is not equal to 0:
+                                proc idl_message_add_field with msg, fld
+                            End If
+                        End If
+                    End If
+                    If tname is not equal to 0:
+                        proc deallocate from Layout with tname
+                    End If
+                    If fname is not equal to 0:
+                        proc deallocate from Layout with fname
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return msg
+End Process
+
+@Reasoning
+Parse a Thrift service block. Thrift's service grammar is
+"service <Name> { [oneway] <RetType> <name>(<Args>); ... }". We capture
+the method name, the first arg's type as input_type, and the return type
+as output_type. Argument list parsing beyond the first arg is collapsed
+into a single placeholder type since the IDL AST uses message-typed
+arguments.
+@End Reasoning
+
+@Implementation
+Loop body: identifier(return type), identifier(name), '(', read first
+argument's type (or "void"), ')', ';'.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "parse_thrift_service" takes c as Integer returns Integer:
+    proc cursor_skip_ws_and_comments with c
+    Let name be proc cursor_read_identifier with c
+    If name is equal to 0:
+        Return 0
+    End If
+    Let svc be proc idl_service_create with name
+    proc deallocate from Layout with name
+    If svc is equal to 0:
+        Return 0
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let ok_brace be proc cursor_eat_byte with c, 123
+    If ok_brace is equal to 0:
+        proc idl_service_destroy with svc
+        Return 0
+    End If
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let going be 1
+    While going is equal to 1:
+        proc cursor_skip_ws_and_comments with c
+        Let closing be proc cursor_eat_byte with c, 125
+        If closing is equal to 1:
+            Set going to 0
+        Otherwise:
+            Let pos be proc memory_get_int64 from Memory with c, 16
+            If pos is greater than or equal to length:
+                Set going to 0
+            Otherwise:
+                proc cursor_eat_keyword with c, "oneway"
+                proc cursor_skip_ws_and_comments with c
+                Let rtype be proc cursor_read_identifier with c
+                If rtype is equal to 0:
+                    Set going to 0
+                Otherwise:
+                    proc cursor_skip_ws_and_comments with c
+                    Let mname be proc cursor_read_identifier with c
+                    If mname is equal to 0:
+                        proc deallocate from Layout with rtype
+                        Set going to 0
+                    Otherwise:
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_byte with c, 40
+                        proc cursor_skip_ws_and_comments with c
+                        Let arg_pos be proc memory_get_int64 from Memory with c, 16
+                        Let arg_first_ch be proc memory_get_byte from Memory with (proc memory_get_int64 from Memory with c, 0), arg_pos
+                        Let argtype be 0
+                        If arg_first_ch is not equal to 41:
+                            Let skip_arg_index be 1
+                            While skip_arg_index is equal to 1:
+                                Let ap be proc memory_get_int64 from Memory with c, 16
+                                Let atxt be proc memory_get_int64 from Memory with c, 0
+                                Let ach be proc memory_get_byte from Memory with atxt, ap
+                                Let isd be proc is_digit from Char with ach
+                                If isd is equal to 1:
+                                    proc memory_set_int64 from Memory with c, 16, ap plus 1
+                                Otherwise:
+                                    Set skip_arg_index to 0
+                                End If
+                            End While
+                            proc cursor_skip_ws_and_comments with c
+                            proc cursor_eat_byte with c, 58
+                            proc cursor_skip_ws_and_comments with c
+                            Set argtype to proc cursor_read_identifier with c
+                            proc cursor_skip_ws_and_comments with c
+                            proc cursor_read_identifier with c
+                        End If
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_byte with c, 41
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_byte with c, 59
+                        Let chosen_arg be argtype
+                        If chosen_arg is equal to 0:
+                            Set chosen_arg to "void"
+                        End If
+                        Let mthd be proc idl_method_create with mname, chosen_arg, rtype, STREAM_NONE
+                        If mthd is not equal to 0:
+                            proc idl_service_add_method with svc, mthd
+                        End If
+                        proc deallocate from Layout with rtype
+                        proc deallocate from Layout with mname
+                        If argtype is not equal to 0:
+                            proc deallocate from Layout with argtype
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return svc
+End Process
+
+Note: ============================================================================
+Note: AVRO IDL PARSER (subset)
+Note: ============================================================================
+
+@Reasoning
+Parse Apache Avro IDL. Avro IDL grammar:
+  protocol <Name> { <decls> }
+  record <Name> { <type> <name>; ... }
+  enum <Name> { <name>, <name>, ... }
+  <ret-type> <name>(<args>);
+
+Our subset focuses on record (-> IdlMessage), enum (-> IdlEnum), and
+the protocol's top-level message-method declarations (-> IdlMethod
+inside an implicit IdlService named after the protocol).
+@End Reasoning
+
+@Implementation
+Top loop scans "protocol" keyword and then descends into its body.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "idl_parse_avro_idl" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let doc be proc idl_document_create
+    If doc is equal to 0:
+        Return 0
+    End If
+    Let c be proc cursor_create with source
+    If c is equal to 0:
+        proc idl_document_destroy with doc
+        Return 0
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let did_proto be proc cursor_eat_keyword with c, "protocol"
+    If did_proto is equal to 0:
+        proc cursor_destroy with c
+        proc idl_document_destroy with doc
+        Return 0
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let pname be proc cursor_read_identifier with c
+    If pname is not equal to 0:
+        proc idl_document_set_package with doc, pname
+    End If
+    Let svc be 0
+    If pname is not equal to 0:
+        Set svc to proc idl_service_create with pname
+    End If
+    If pname is not equal to 0:
+        proc deallocate from Layout with pname
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let ok_brace be proc cursor_eat_byte with c, 123
+    If ok_brace is equal to 0:
+        If svc is not equal to 0:
+            proc idl_service_destroy with svc
+        End If
+        proc cursor_destroy with c
+        proc idl_document_destroy with doc
+        Return 0
+    End If
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let going be 1
+    While going is equal to 1:
+        proc cursor_skip_ws_and_comments with c
+        Let closing be proc cursor_eat_byte with c, 125
+        If closing is equal to 1:
+            Set going to 0
+        Otherwise:
+            Let pos be proc memory_get_int64 from Memory with c, 16
+            If pos is greater than or equal to length:
+                Set going to 0
+            Otherwise:
+                Let did_record be proc cursor_eat_keyword with c, "record"
+                If did_record is equal to 1:
+                    Let msg be proc parse_avro_record with c
+                    If msg is not equal to 0:
+                        proc idl_document_add_message with doc, msg
+                    End If
+                Otherwise:
+                    Let did_enum be proc cursor_eat_keyword with c, "enum"
+                    If did_enum is equal to 1:
+                        Let en be proc parse_avro_enum with c
+                        If en is not equal to 0:
+                            proc idl_document_add_enum with doc, en
+                        End If
+                    Otherwise:
+                        Set going to 0
+                    End If
+                End If
+            End If
+        End If
+    End While
+    If svc is not equal to 0:
+        proc idl_document_add_service with doc, svc
+    End If
+    proc cursor_destroy with c
+    Return doc
+End Process
+
+@Reasoning
+Parse an Avro record: "record Name { type name; ... }".
+@End Reasoning
+
+@Implementation
+Read name, eat '{', loop reading "type name;" lines.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "parse_avro_record" takes c as Integer returns Integer:
+    proc cursor_skip_ws_and_comments with c
+    Let name be proc cursor_read_identifier with c
+    If name is equal to 0:
+        Return 0
+    End If
+    Let msg be proc idl_message_create with name
+    proc deallocate from Layout with name
+    If msg is equal to 0:
+        Return 0
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let ok_brace be proc cursor_eat_byte with c, 123
+    If ok_brace is equal to 0:
+        proc idl_message_destroy with msg
+        Return 0
+    End If
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let tag be 1
+    Let going be 1
+    While going is equal to 1:
+        proc cursor_skip_ws_and_comments with c
+        Let closing be proc cursor_eat_byte with c, 125
+        If closing is equal to 1:
+            Set going to 0
+        Otherwise:
+            Let pos be proc memory_get_int64 from Memory with c, 16
+            If pos is greater than or equal to length:
+                Set going to 0
+            Otherwise:
+                Let tname be proc cursor_read_identifier with c
+                If tname is equal to 0:
+                    Set going to 0
+                Otherwise:
+                    proc cursor_skip_ws_and_comments with c
+                    Let fname be proc cursor_read_identifier with c
+                    If fname is equal to 0:
+                        proc deallocate from Layout with tname
+                        Set going to 0
+                    Otherwise:
+                        proc cursor_skip_ws_and_comments with c
+                        proc cursor_eat_byte with c, 59
+                        Let fld be proc idl_field_create with fname, tname, tag, LABEL_OPTIONAL
+                        If fld is not equal to 0:
+                            proc idl_message_add_field with msg, fld
+                        End If
+                        proc deallocate from Layout with tname
+                        proc deallocate from Layout with fname
+                        Set tag to tag plus 1
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return msg
+End Process
+
+@Reasoning
+Parse an Avro enum: "enum Name { A, B, C }".
+@End Reasoning
+
+@Implementation
+Read name, eat '{', loop reading identifiers separated by commas.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "parse_avro_enum" takes c as Integer returns Integer:
+    proc cursor_skip_ws_and_comments with c
+    Let name be proc cursor_read_identifier with c
+    If name is equal to 0:
+        Return 0
+    End If
+    Let en be proc idl_enum_create with name
+    proc deallocate from Layout with name
+    If en is equal to 0:
+        Return 0
+    End If
+    proc cursor_skip_ws_and_comments with c
+    Let ok_brace be proc cursor_eat_byte with c, 123
+    If ok_brace is equal to 0:
+        proc idl_enum_destroy with en
+        Return 0
+    End If
+    Let length be proc memory_get_int64 from Memory with c, 8
+    Let value be 0
+    Let going be 1
+    While going is equal to 1:
+        proc cursor_skip_ws_and_comments with c
+        Let closing be proc cursor_eat_byte with c, 125
+        If closing is equal to 1:
+            Set going to 0
+        Otherwise:
+            Let pos be proc memory_get_int64 from Memory with c, 16
+            If pos is greater than or equal to length:
+                Set going to 0
+            Otherwise:
+                Let vname be proc cursor_read_identifier with c
+                If vname is equal to 0:
+                    Set going to 0
+                Otherwise:
+                    proc idl_enum_add_value with en, vname, value
+                    proc deallocate from Layout with vname
+                    Set value to value plus 1
+                    proc cursor_skip_ws_and_comments with c
+                    proc cursor_eat_byte with c, 44
+                End If
+            End If
+        End If
+    End While
+    Return en
+End Process
+
+Note: ============================================================================
+Note: SERIALIZE
+Note: ============================================================================
+
+@Reasoning
+Emit a Protobuf .proto text representation of an IdlDocument.
+@End Reasoning
+
+@Implementation
+StringBuilder. Emit syntax line, package if set, then each message,
+enum, and service. Each message line is "<label> <type> <name> = <tag>;".
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the document.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_serialize_protobuf" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append from SB with sb, "syntax = \"proto3\";\n"
+    Let pkg be proc memory_get_int64 from Memory with d, 0
+    If pkg is not equal to 0:
+        proc stringbuilder_append from SB with sb, "package "
+        proc stringbuilder_append from SB with sb, pkg
+        proc stringbuilder_append from SB with sb, ";\n"
+    End If
+    Let ms be proc memory_get_int64 from Memory with d, 8
+    If ms is not equal to 0:
+        Let mc be proc list_length from List with ms
+        Let i be 0
+        While i is less than mc:
+            Let m be proc list_get from List with ms, i
+            proc emit_protobuf_message with sb, m
+            Set i to i plus 1
+        End While
+    End If
+    Let es be proc memory_get_int64 from Memory with d, 16
+    If es is not equal to 0:
+        Let ec be proc list_length from List with es
+        Let j be 0
+        While j is less than ec:
+            Let e be proc list_get from List with es, j
+            proc emit_protobuf_enum with sb, e
+            Set j to j plus 1
+        End While
+    End If
+    Let ss be proc memory_get_int64 from Memory with d, 24
+    If ss is not equal to 0:
+        Let sc be proc list_length from List with ss
+        Let k be 0
+        While k is less than sc:
+            Let s be proc list_get from List with ss, k
+            proc emit_protobuf_service with sb, s
+            Set k to k plus 1
+        End While
+    End If
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Emit a single message in protobuf .proto syntax.
+@End Reasoning
+
+@Implementation
+Header line, then per-field line, then close.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over fields.
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "emit_protobuf_message" takes sb as Integer, m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append from SB with sb, "message "
+    Let nm be proc memory_get_int64 from Memory with m, 0
+    If nm is not equal to 0:
+        proc stringbuilder_append from SB with sb, nm
+    End If
+    proc stringbuilder_append from SB with sb, " {\n"
+    Let fs be proc memory_get_int64 from Memory with m, 8
+    If fs is not equal to 0:
+        Let fc be proc list_length from List with fs
+        Let i be 0
+        While i is less than fc:
+            Let f be proc list_get from List with fs, i
+            If f is not equal to 0:
+                Let lbl be proc memory_get_int64 from Memory with f, 24
+                proc stringbuilder_append from SB with sb, "  "
+                If lbl is equal to LABEL_REPEATED:
+                    proc stringbuilder_append from SB with sb, "repeated "
+                End If
+                If lbl is equal to LABEL_REQUIRED:
+                    proc stringbuilder_append from SB with sb, "required "
+                End If
+                Let tn be proc memory_get_int64 from Memory with f, 8
+                If tn is not equal to 0:
+                    proc stringbuilder_append from SB with sb, tn
+                End If
+                proc stringbuilder_append_char from SB with sb, 32
+                Let fn be proc memory_get_int64 from Memory with f, 0
+                If fn is not equal to 0:
+                    proc stringbuilder_append from SB with sb, fn
+                End If
+                proc stringbuilder_append from SB with sb, " = "
+                Let tag be proc memory_get_int64 from Memory with f, 16
+                proc stringbuilder_append_integer from SB with sb, tag
+                proc stringbuilder_append from SB with sb, ";\n"
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    proc stringbuilder_append from SB with sb, "}\n"
+    Return 1
+End Process
+
+@Reasoning
+Emit an enum in protobuf .proto syntax.
+@End Reasoning
+
+@Implementation
+Header line, then per-value line "NAME = value;".
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "emit_protobuf_enum" takes sb as Integer, e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append from SB with sb, "enum "
+    Let nm be proc memory_get_int64 from Memory with e, 0
+    If nm is not equal to 0:
+        proc stringbuilder_append from SB with sb, nm
+    End If
+    proc stringbuilder_append from SB with sb, " {\n"
+    Let vs be proc memory_get_int64 from Memory with e, 8
+    If vs is not equal to 0:
+        Let vc be proc list_length from List with vs
+        Let i be 0
+        While i is less than vc:
+            Let ev be proc list_get from List with vs, i
+            If ev is not equal to 0:
+                Let evn be proc memory_get_int64 from Memory with ev, 0
+                Let evv be proc memory_get_int64 from Memory with ev, 8
+                proc stringbuilder_append from SB with sb, "  "
+                If evn is not equal to 0:
+                    proc stringbuilder_append from SB with sb, evn
+                End If
+                proc stringbuilder_append from SB with sb, " = "
+                proc stringbuilder_append_integer from SB with sb, evv
+                proc stringbuilder_append from SB with sb, ";\n"
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    proc stringbuilder_append from SB with sb, "}\n"
+    Return 1
+End Process
+
+@Reasoning
+Emit a service block in protobuf .proto syntax.
+@End Reasoning
+
+@Implementation
+Header, then per-method rpc line.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over methods.
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "emit_protobuf_service" takes sb as Integer, s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append from SB with sb, "service "
+    Let nm be proc memory_get_int64 from Memory with s, 0
+    If nm is not equal to 0:
+        proc stringbuilder_append from SB with sb, nm
+    End If
+    proc stringbuilder_append from SB with sb, " {\n"
+    Let ms be proc memory_get_int64 from Memory with s, 8
+    If ms is not equal to 0:
+        Let mc be proc list_length from List with ms
+        Let i be 0
+        While i is less than mc:
+            Let m be proc list_get from List with ms, i
+            If m is not equal to 0:
+                proc stringbuilder_append from SB with sb, "  rpc "
+                Let mn be proc memory_get_int64 from Memory with m, 0
+                If mn is not equal to 0:
+                    proc stringbuilder_append from SB with sb, mn
+                End If
+                Let inp be proc memory_get_int64 from Memory with m, 8
+                Let outp be proc memory_get_int64 from Memory with m, 16
+                Let stream_mode be proc memory_get_int64 from Memory with m, 24
+                proc stringbuilder_append from SB with sb, " ("
+                If stream_mode is equal to STREAM_CLIENT:
+                    proc stringbuilder_append from SB with sb, "stream "
+                End If
+                If stream_mode is equal to STREAM_BIDI:
+                    proc stringbuilder_append from SB with sb, "stream "
+                End If
+                If inp is not equal to 0:
+                    proc stringbuilder_append from SB with sb, inp
+                End If
+                proc stringbuilder_append from SB with sb, ") returns ("
+                If stream_mode is equal to STREAM_SERVER:
+                    proc stringbuilder_append from SB with sb, "stream "
+                End If
+                If stream_mode is equal to STREAM_BIDI:
+                    proc stringbuilder_append from SB with sb, "stream "
+                End If
+                If outp is not equal to 0:
+                    proc stringbuilder_append from SB with sb, outp
+                End If
+                proc stringbuilder_append from SB with sb, ");\n"
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    proc stringbuilder_append from SB with sb, "}\n"
+    Return 1
+End Process
+
+@Reasoning
+Serialize an IdlDocument as Thrift IDL.
+@End Reasoning
+
+@Implementation
+Walk the document; emit each message as a struct, each enum unchanged,
+each service unchanged.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_serialize_thrift" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let ms be proc memory_get_int64 from Memory with d, 8
+    If ms is not equal to 0:
+        Let mc be proc list_length from List with ms
+        Let i be 0
+        While i is less than mc:
+            Let m be proc list_get from List with ms, i
+            If m is not equal to 0:
+                proc stringbuilder_append from SB with sb, "struct "
+                Let nm be proc memory_get_int64 from Memory with m, 0
+                If nm is not equal to 0:
+                    proc stringbuilder_append from SB with sb, nm
+                End If
+                proc stringbuilder_append from SB with sb, " {\n"
+                Let fs be proc memory_get_int64 from Memory with m, 8
+                If fs is not equal to 0:
+                    Let fc be proc list_length from List with fs
+                    Let j be 0
+                    While j is less than fc:
+                        Let f be proc list_get from List with fs, j
+                        If f is not equal to 0:
+                            proc stringbuilder_append from SB with sb, "  "
+                            Let tag be proc memory_get_int64 from Memory with f, 16
+                            proc stringbuilder_append_integer from SB with sb, tag
+                            proc stringbuilder_append from SB with sb, ": "
+                            Let lbl be proc memory_get_int64 from Memory with f, 24
+                            If lbl is equal to LABEL_REQUIRED:
+                                proc stringbuilder_append from SB with sb, "required "
+                            Otherwise:
+                                proc stringbuilder_append from SB with sb, "optional "
+                            End If
+                            Let tn be proc memory_get_int64 from Memory with f, 8
+                            If tn is not equal to 0:
+                                proc stringbuilder_append from SB with sb, tn
+                            End If
+                            proc stringbuilder_append_char from SB with sb, 32
+                            Let fn be proc memory_get_int64 from Memory with f, 0
+                            If fn is not equal to 0:
+                                proc stringbuilder_append from SB with sb, fn
+                            End If
+                            proc stringbuilder_append from SB with sb, ";\n"
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+                proc stringbuilder_append from SB with sb, "}\n"
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    Let es be proc memory_get_int64 from Memory with d, 16
+    If es is not equal to 0:
+        Let ec be proc list_length from List with es
+        Let k be 0
+        While k is less than ec:
+            Let e be proc list_get from List with es, k
+            proc emit_protobuf_enum with sb, e
+            Set k to k plus 1
+        End While
+    End If
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Serialize an IdlDocument as Avro IDL.
+@End Reasoning
+
+@Implementation
+Wrap in "protocol <package> { ... }". Each message becomes a "record".
+Each enum becomes an Avro-style enum.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_serialize_avro_idl" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append from SB with sb, "protocol "
+    Let pkg be proc memory_get_int64 from Memory with d, 0
+    If pkg is not equal to 0:
+        proc stringbuilder_append from SB with sb, pkg
+    Otherwise:
+        proc stringbuilder_append from SB with sb, "Default"
+    End If
+    proc stringbuilder_append from SB with sb, " {\n"
+    Let ms be proc memory_get_int64 from Memory with d, 8
+    If ms is not equal to 0:
+        Let mc be proc list_length from List with ms
+        Let i be 0
+        While i is less than mc:
+            Let m be proc list_get from List with ms, i
+            If m is not equal to 0:
+                proc stringbuilder_append from SB with sb, "  record "
+                Let nm be proc memory_get_int64 from Memory with m, 0
+                If nm is not equal to 0:
+                    proc stringbuilder_append from SB with sb, nm
+                End If
+                proc stringbuilder_append from SB with sb, " {\n"
+                Let fs be proc memory_get_int64 from Memory with m, 8
+                If fs is not equal to 0:
+                    Let fc be proc list_length from List with fs
+                    Let j be 0
+                    While j is less than fc:
+                        Let f be proc list_get from List with fs, j
+                        If f is not equal to 0:
+                            proc stringbuilder_append from SB with sb, "    "
+                            Let tn be proc memory_get_int64 from Memory with f, 8
+                            If tn is not equal to 0:
+                                proc stringbuilder_append from SB with sb, tn
+                            End If
+                            proc stringbuilder_append_char from SB with sb, 32
+                            Let fn be proc memory_get_int64 from Memory with f, 0
+                            If fn is not equal to 0:
+                                proc stringbuilder_append from SB with sb, fn
+                            End If
+                            proc stringbuilder_append from SB with sb, ";\n"
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+                proc stringbuilder_append from SB with sb, "  }\n"
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    Let es be proc memory_get_int64 from Memory with d, 16
+    If es is not equal to 0:
+        Let ec be proc list_length from List with es
+        Let k be 0
+        While k is less than ec:
+            Let e be proc list_get from List with es, k
+            If e is not equal to 0:
+                proc stringbuilder_append from SB with sb, "  enum "
+                Let nm be proc memory_get_int64 from Memory with e, 0
+                If nm is not equal to 0:
+                    proc stringbuilder_append from SB with sb, nm
+                End If
+                proc stringbuilder_append from SB with sb, " {\n    "
+                Let vs be proc memory_get_int64 from Memory with e, 8
+                If vs is not equal to 0:
+                    Let vc be proc list_length from List with vs
+                    Let v_i be 0
+                    While v_i is less than vc:
+                        Let ev be proc list_get from List with vs, v_i
+                        If ev is not equal to 0:
+                            If v_i is greater than 0:
+                                proc stringbuilder_append from SB with sb, ", "
+                            End If
+                            Let evn be proc memory_get_int64 from Memory with ev, 0
+                            If evn is not equal to 0:
+                                proc stringbuilder_append from SB with sb, evn
+                            End If
+                        End If
+                        Set v_i to v_i plus 1
+                    End While
+                End If
+                proc stringbuilder_append from SB with sb, "\n  }\n"
+            End If
+            Set k to k plus 1
+        End While
+    End If
+    proc stringbuilder_append from SB with sb, "}\n"
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+Note: ============================================================================
+Note: TRANSLATION
+Note: ============================================================================
+
+@Reasoning
+Emit Runa-canonical Type declarations from an IDL document. Each message
+becomes a "Type called <Name>" block; each enum becomes a "Type <Name>
+is ..." union; services are emitted as a block of stub Process
+declarations.
+@End Reasoning
+
+@Implementation
+Walk the document. For each message generate "Type called <Name>:" then
+"    <field> as <runa-type>" lines, ending with "End Type". For enums
+emit "Type <Name> is: | A | B ... End Type".
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_to_runa_types" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let ms be proc memory_get_int64 from Memory with d, 8
+    If ms is not equal to 0:
+        Let mc be proc list_length from List with ms
+        Let i be 0
+        While i is less than mc:
+            Let m be proc list_get from List with ms, i
+            If m is not equal to 0:
+                proc stringbuilder_append from SB with sb, "Type called \""
+                Let nm be proc memory_get_int64 from Memory with m, 0
+                If nm is not equal to 0:
+                    proc stringbuilder_append from SB with sb, nm
+                End If
+                proc stringbuilder_append from SB with sb, "\":\n"
+                Let fs be proc memory_get_int64 from Memory with m, 8
+                If fs is not equal to 0:
+                    Let fc be proc list_length from List with fs
+                    Let j be 0
+                    While j is less than fc:
+                        Let f be proc list_get from List with fs, j
+                        If f is not equal to 0:
+                            proc stringbuilder_append from SB with sb, "    "
+                            Let fn be proc memory_get_int64 from Memory with f, 0
+                            If fn is not equal to 0:
+                                proc stringbuilder_append from SB with sb, fn
+                            End If
+                            proc stringbuilder_append from SB with sb, " as "
+                            Let tn be proc memory_get_int64 from Memory with f, 8
+                            Let mapped be proc map_idl_type_to_runa with tn
+                            proc stringbuilder_append from SB with sb, mapped
+                            proc stringbuilder_append_char from SB with sb, 10
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+                proc stringbuilder_append from SB with sb, "End Type\n\n"
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    Let es be proc memory_get_int64 from Memory with d, 16
+    If es is not equal to 0:
+        Let ec be proc list_length from List with es
+        Let k be 0
+        While k is less than ec:
+            Let e be proc list_get from List with es, k
+            If e is not equal to 0:
+                proc stringbuilder_append from SB with sb, "Type "
+                Let en_name be proc memory_get_int64 from Memory with e, 0
+                If en_name is not equal to 0:
+                    proc stringbuilder_append from SB with sb, en_name
+                End If
+                proc stringbuilder_append from SB with sb, " is:\n"
+                Let vs be proc memory_get_int64 from Memory with e, 8
+                If vs is not equal to 0:
+                    Let vc be proc list_length from List with vs
+                    Let v_i be 0
+                    While v_i is less than vc:
+                        Let ev be proc list_get from List with vs, v_i
+                        If ev is not equal to 0:
+                            proc stringbuilder_append from SB with sb, "    | "
+                            Let evn be proc memory_get_int64 from Memory with ev, 0
+                            If evn is not equal to 0:
+                                proc stringbuilder_append from SB with sb, evn
+                            End If
+                            proc stringbuilder_append_char from SB with sb, 10
+                        End If
+                        Set v_i to v_i plus 1
+                    End While
+                End If
+                proc stringbuilder_append from SB with sb, "End Type\n\n"
+            End If
+            Set k to k plus 1
+        End While
+    End If
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Map a wire-IDL type name (e.g. "int32") to a Runa type name (e.g.
+"Integer"). Unknown types are passed through unchanged.
+@End Reasoning
+
+@Implementation
+Linear comparison against the canonical type table.
+@End Implementation
+
+@Performance_Hints
+Time: O(k) over known types (constant).
+@End Performance_Hints
+
+@Security_Scope
+Returns the input string unchanged for unknown types.
+@End Security_Scope
+Process called "map_idl_type_to_runa" takes wire as Integer returns Integer:
+    If wire is equal to 0:
+        Return "Integer"
+    End If
+    Let m1 be proc string_equals from StringCore with wire, "int32"
+    If m1 is equal to 1:
+        Return "Integer"
+    End If
+    Let m2 be proc string_equals from StringCore with wire, "int64"
+    If m2 is equal to 1:
+        Return "Integer"
+    End If
+    Let m3 be proc string_equals from StringCore with wire, "uint32"
+    If m3 is equal to 1:
+        Return "Integer"
+    End If
+    Let m4 be proc string_equals from StringCore with wire, "uint64"
+    If m4 is equal to 1:
+        Return "Integer"
+    End If
+    Let m5 be proc string_equals from StringCore with wire, "sint32"
+    If m5 is equal to 1:
+        Return "Integer"
+    End If
+    Let m6 be proc string_equals from StringCore with wire, "sint64"
+    If m6 is equal to 1:
+        Return "Integer"
+    End If
+    Let m7 be proc string_equals from StringCore with wire, "fixed32"
+    If m7 is equal to 1:
+        Return "Integer"
+    End If
+    Let m8 be proc string_equals from StringCore with wire, "fixed64"
+    If m8 is equal to 1:
+        Return "Integer"
+    End If
+    Let m9 be proc string_equals from StringCore with wire, "float"
+    If m9 is equal to 1:
+        Return "Float"
+    End If
+    Let m10 be proc string_equals from StringCore with wire, "double"
+    If m10 is equal to 1:
+        Return "Float"
+    End If
+    Let m11 be proc string_equals from StringCore with wire, "bool"
+    If m11 is equal to 1:
+        Return "Boolean"
+    End If
+    Let m12 be proc string_equals from StringCore with wire, "string"
+    If m12 is equal to 1:
+        Return "String"
+    End If
+    Let m13 be proc string_equals from StringCore with wire, "bytes"
+    If m13 is equal to 1:
+        Return "Bytes"
+    End If
+    Return wire
+End Process
+
+@Reasoning
+Translate an IdlMessage into a generic SchemaNode (SCHEMA_OBJECT). Each
+field becomes an ObjectField with the appropriately-typed schema.
+@End Reasoning
+
+@Implementation
+Build a SCHEMA_OBJECT. For each field, decide if its type is one of the
+recognized scalars; build a leaf schema; build ObjectField (required if
+LABEL_REQUIRED, optional otherwise) and attach.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over fields.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "idl_to_schema" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let union_node be proc schema_create_union from Schema
+    If union_node is equal to 0:
+        Return 0
+    End If
+    Let ms be proc memory_get_int64 from Memory with d, 8
+    If ms is not equal to 0:
+        Let mc be proc list_length from List with ms
+        Let i be 0
+        While i is less than mc:
+            Let m be proc list_get from List with ms, i
+            If m is not equal to 0:
+                Let obj be proc schema_create_object from Schema
+                Let fs be proc memory_get_int64 from Memory with m, 8
+                If fs is not equal to 0:
+                    Let fc be proc list_length from List with fs
+                    Let j be 0
+                    While j is less than fc:
+                        Let f be proc list_get from List with fs, j
+                        If f is not equal to 0:
+                            Let fn be proc memory_get_int64 from Memory with f, 0
+                            Let tn be proc memory_get_int64 from Memory with f, 8
+                            Let lbl be proc memory_get_int64 from Memory with f, 24
+                            Let sub be proc leaf_schema_for_idl_type with tn
+                            If sub is not equal to 0:
+                                Let req_flag be 0
+                                If lbl is equal to LABEL_REQUIRED:
+                                    Set req_flag to 1
+                                End If
+                                Let fld be proc object_field_create from Schema with fn, sub, req_flag
+                                If fld is not equal to 0:
+                                    proc schema_object_add_field from Schema with obj, fld
+                                End If
+                            End If
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+                proc schema_union_add_variant from Schema with union_node, obj
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    Return union_node
+End Process
+
+@Reasoning
+Build a leaf SchemaNode for a wire-IDL type name.
+@End Reasoning
+
+@Implementation
+Look up the type; map "int*" to integer schema, "bool" to boolean,
+"string" to string, "bytes" to string (text representation), unknowns to
+a reference node.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "leaf_schema_for_idl_type" takes wire as Integer returns Integer:
+    If wire is equal to 0:
+        Return 0
+    End If
+    Let int_names be proc starts_with_any_int_name with wire
+    If int_names is equal to 1:
+        Return proc schema_create_integer_any from Schema
+    End If
+    Let m_bool be proc string_equals from StringCore with wire, "bool"
+    If m_bool is equal to 1:
+        Return proc schema_create_boolean from Schema
+    End If
+    Let m_string be proc string_equals from StringCore with wire, "string"
+    If m_string is equal to 1:
+        Return proc schema_create_string_any from Schema
+    End If
+    Let m_bytes be proc string_equals from StringCore with wire, "bytes"
+    If m_bytes is equal to 1:
+        Return proc schema_create_string_any from Schema
+    End If
+    Let m_float be proc string_equals from StringCore with wire, "float"
+    If m_float is equal to 1:
+        Return proc schema_create_float_any from Schema
+    End If
+    Let m_double be proc string_equals from StringCore with wire, "double"
+    If m_double is equal to 1:
+        Return proc schema_create_float_any from Schema
+    End If
+    Return proc schema_create_reference from Schema with wire
+End Process
+
+@Reasoning
+Return 1 if the wire-IDL type name is one of the integer aliases.
+@End Reasoning
+
+@Implementation
+Check each int variant by name.
+@End Implementation
+
+@Performance_Hints
+Time: O(k).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "starts_with_any_int_name" takes wire as Integer returns Integer:
+    Let names_int_count be 8
+    Let i be 0
+    While i is less than names_int_count:
+        Let candidate be 0
+        If i is equal to 0:
+            Set candidate to "int32"
+        End If
+        If i is equal to 1:
+            Set candidate to "int64"
+        End If
+        If i is equal to 2:
+            Set candidate to "uint32"
+        End If
+        If i is equal to 3:
+            Set candidate to "uint64"
+        End If
+        If i is equal to 4:
+            Set candidate to "sint32"
+        End If
+        If i is equal to 5:
+            Set candidate to "sint64"
+        End If
+        If i is equal to 6:
+            Set candidate to "fixed32"
+        End If
+        If i is equal to 7:
+            Set candidate to "fixed64"
+        End If
+        If candidate is not equal to 0:
+            Let eq be proc string_equals from StringCore with wire, candidate
+            If eq is equal to 1:
+                Return 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process

@@ -1,0 +1,2025 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+VERSION CONSTRAINT - Semantic Versioning 2.0.0 Primitive (Tier 1)
+
+Implements the Semantic Versioning 2.0.0 specification (https://semver.org)
+plus the constraint-expression sublanguage adopted by Cargo, npm, and
+pyproject. Provides:
+
+  Version record  ........ major . minor . patch [- prerelease] [+ build]
+  VersionConstraint ADT .. Exact / Min / Max / Range / Caret / Tilde / Wildcard
+  version_parse / version_compare / version_satisfies
+
+Layout (Version record, 40 bytes):
+  offset  0 : major        (8 bytes)
+  offset  8 : minor        (8 bytes)
+  offset 16 : patch        (8 bytes)
+  offset 24 : prerelease   (8 bytes, String pointer or 0)
+  offset 32 : build        (8 bytes, String pointer or 0)
+
+Layout (VersionConstraint record, 56 bytes):
+  offset  0 : kind         (8 bytes, see VC_* constants)
+  offset  8 : lower        (8 bytes, Version pointer or 0)
+  offset 16 : upper        (8 bytes, Version pointer or 0)
+  offset 24 : lower_inclusive (8 bytes, 0 or 1)
+  offset 32 : upper_inclusive (8 bytes, 0 or 1)
+  offset 40 : original_text (8 bytes, String pointer or 0 - for diagnostics)
+  offset 48 : wildcard_at  (8 bytes, 0=major, 1=minor, 2=patch, -1 = N/A)
+
+References:
+  - SemVer 2.0.0 .......................... https://semver.org
+  - Cargo manifest format ................. https://doc.rust-lang.org/cargo/reference/manifest.html#the-version-field
+  - npm semver grammar .................... https://github.com/npm/node-semver
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let VERSION_SIZE be 40
+Let VC_SIZE be 56
+
+Note: VersionConstraint kinds.
+Let VC_EXACT be 1
+Let VC_MIN be 2
+Let VC_MAX be 3
+Let VC_RANGE be 4
+Let VC_CARET be 5
+Let VC_TILDE be 6
+Let VC_WILDCARD be 7
+Let VC_ANY be 8
+
+Note: ============================================================================
+Note: VERSION CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Construct a Version record from three numeric components and optional
+prerelease and build metadata strings. SemVer 2.0.0 mandates non-negative
+integers for major/minor/patch with no leading zeros. Prerelease and build
+identifiers are stored as already-validated String pointers (0 for absent).
+@End Reasoning
+
+@Implementation
+Validate each numeric component is non-negative. Allocate the 40-byte
+record and populate fields. The caller retains ownership of any passed
+prerelease / build strings.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). Single 40-byte allocation.
+@End Performance_Hints
+
+@Security_Scope
+Negative components are rejected with sentinel 0 (NULL pointer) so callers
+cannot accidentally construct ill-formed versions.
+@End Security_Scope
+Process called "version_create" takes major as Integer, minor as Integer, patch as Integer, prerelease as Integer, build as Integer returns Integer:
+    If major is less than 0:
+        Return 0
+    End If
+    If minor is less than 0:
+        Return 0
+    End If
+    If patch is less than 0:
+        Return 0
+    End If
+    Let v be proc allocate from Layout with VERSION_SIZE
+    If v is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with v, 0, major
+    proc memory_set_int64 from Memory with v, 8, minor
+    proc memory_set_int64 from Memory with v, 16, patch
+    proc memory_set_int64 from Memory with v, 24, prerelease
+    proc memory_set_int64 from Memory with v, 32, build
+    Return v
+End Process
+
+@Reasoning
+Destroy a Version record and any owned subordinate string allocations.
+Prerelease and build pointers are caller-owned by default; this routine
+deallocates only the record itself. Pair with version_destroy_deep when
+the caller has transferred ownership.
+@End Reasoning
+
+@Implementation
+Free the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not touch the pointer after destroy.
+@End Security_Scope
+Process called "version_destroy" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    proc deallocate from Layout with v
+    Return 1
+End Process
+
+@Reasoning
+Destroy a Version record AND free its owned prerelease and build strings.
+Used by parsers that allocated the strings themselves and hold sole
+ownership.
+@End Reasoning
+
+@Implementation
+Conditionally free each non-null subordinate pointer before freeing the
+record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). Up to three deallocations.
+@End Performance_Hints
+
+@Security_Scope
+Double-free protection is the caller's responsibility; this routine does
+not nil-out the input pointer.
+@End Security_Scope
+Process called "version_destroy_deep" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let pre be proc memory_get_int64 from Memory with v, 24
+    If pre is not equal to 0:
+        proc deallocate from Layout with pre
+    End If
+    Let bld be proc memory_get_int64 from Memory with v, 32
+    If bld is not equal to 0:
+        proc deallocate from Layout with bld
+    End If
+    proc deallocate from Layout with v
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: VERSION FIELD ACCESSORS
+Note: ============================================================================
+
+@Reasoning
+Expose individual SemVer numeric components without forcing callers to
+know the record layout.
+@End Reasoning
+
+@Implementation
+Load the 8-byte field at the documented offset.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on null input to distinguish error from a legitimate 0 major.
+@End Security_Scope
+Process called "version_major" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return -1
+    End If
+    Return proc memory_get_int64 from Memory with v, 0
+End Process
+
+@Reasoning
+Expose the minor component.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on null input.
+@End Security_Scope
+Process called "version_minor" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return -1
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+@Reasoning
+Expose the patch component.
+@End Reasoning
+
+@Implementation
+Load offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on null input.
+@End Security_Scope
+Process called "version_patch" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return -1
+    End If
+    Return proc memory_get_int64 from Memory with v, 16
+End Process
+
+@Reasoning
+Expose the prerelease identifier string pointer per SemVer 2.0.0 Section 9.
+Returns 0 if no prerelease tag is present.
+@End Reasoning
+
+@Implementation
+Load offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not mutate the returned string in place.
+@End Security_Scope
+Process called "version_prerelease" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with v, 24
+End Process
+
+@Reasoning
+Expose the build metadata string pointer per SemVer 2.0.0 Section 10.
+Returns 0 if no build metadata is attached.
+@End Reasoning
+
+@Implementation
+Load offset 32.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not mutate the returned string in place.
+@End Security_Scope
+Process called "version_build" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with v, 32
+End Process
+
+@Reasoning
+True if the version carries a prerelease tag. Per SemVer 2.0.0 Section 9,
+the presence of a prerelease tag makes the version "less than" the
+equivalent release-version with the same numeric components.
+@End Reasoning
+
+@Implementation
+Test prerelease pointer for non-null and nonzero string length. A
+zero-length prerelease string is treated as absent.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "version_is_prerelease" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let pre be proc memory_get_int64 from Memory with v, 24
+    If pre is equal to 0:
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with pre
+    If len is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: VERSION PARSE
+Note: ============================================================================
+
+@Reasoning
+Parse a SemVer 2.0.0 version string of the form
+"MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]". The grammar follows the SemVer
+2.0.0 specification literally:
+
+  - MAJOR / MINOR / PATCH are non-negative integers without leading zeros
+    (except the literal "0").
+  - PRERELEASE is a series of dot-separated identifiers, each composed of
+    ASCII alphanumeric characters and hyphens. Numeric identifiers must
+    not have leading zeros.
+  - BUILD is a series of dot-separated identifiers from the same alphabet,
+    but numeric identifiers may carry leading zeros.
+
+Returns 0 on any malformed input so callers never observe a partial
+Version record.
+@End Reasoning
+
+@Implementation
+Two-pass scanner. Pass one walks the string once to identify the
+delimiters ('.', '-', '+'). Pass two extracts the four substrings, parses
+the three numeric components with bounds checks, and copies the
+prerelease and build identifier strings into freshly-allocated buffers.
+SemVer disallows leading zeros on numeric components longer than one
+character. Each numeric component is checked digit-by-digit before
+calling string_to_integer so we can reject leading zeros explicitly.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the input. Space: O(n) for the prerelease and build
+copies plus the 40-byte record.
+@End Performance_Hints
+
+@Security_Scope
+Strict validation prevents silent acceptance of pseudo-versions such as
+"01.02.03" or "1.2" that some lax parsers tolerate. Per SemVer 2.0.0
+Section 2, only well-formed inputs produce a non-null record.
+@End Security_Scope
+Process called "version_parse" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with text
+    If length is equal to 0:
+        Return 0
+    End If
+
+    Note: Locate the three delimiters: first '.', second '.', then '-' / '+'.
+    Let dot1 be -1
+    Let dot2 be -1
+    Let dash_pos be -1
+    Let plus_pos be -1
+
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with text, i
+        If ch is equal to 46:
+            If dot1 is equal to -1:
+                Set dot1 to i
+            Otherwise:
+                If dot2 is equal to -1:
+                    If dash_pos is equal to -1:
+                        If plus_pos is equal to -1:
+                            Set dot2 to i
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        If ch is equal to 45:
+            If dash_pos is equal to -1:
+                If plus_pos is equal to -1:
+                    Set dash_pos to i
+                End If
+            End If
+        End If
+        If ch is equal to 43:
+            If plus_pos is equal to -1:
+                Set plus_pos to i
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If dot1 is less than 1:
+        Return 0
+    End If
+    If dot2 is less than (dot1 plus 2):
+        Return 0
+    End If
+
+    Note: Determine the end-of-patch boundary.
+    Let patch_end be length
+    If dash_pos is not equal to -1:
+        Set patch_end to dash_pos
+    Otherwise:
+        If plus_pos is not equal to -1:
+            Set patch_end to plus_pos
+        End If
+    End If
+    If patch_end is less than (dot2 plus 2):
+        Return 0
+    End If
+
+    Let major_str be proc string_substring from StringPrim with text, 0, dot1
+    If major_str is equal to 0:
+        Return 0
+    End If
+    Let minor_len be (dot2 minus dot1) minus 1
+    Let minor_str be proc string_substring from StringPrim with text, (dot1 plus 1), minor_len
+    If minor_str is equal to 0:
+        proc deallocate from Layout with major_str
+        Return 0
+    End If
+    Let patch_len be (patch_end minus dot2) minus 1
+    Let patch_str be proc string_substring from StringPrim with text, (dot2 plus 1), patch_len
+    If patch_str is equal to 0:
+        proc deallocate from Layout with major_str
+        proc deallocate from Layout with minor_str
+        Return 0
+    End If
+
+    Let major_valid be proc validate_numeric_identifier with major_str
+    Let minor_valid be proc validate_numeric_identifier with minor_str
+    Let patch_valid be proc validate_numeric_identifier with patch_str
+
+    If major_valid is equal to 0:
+        proc deallocate from Layout with major_str
+        proc deallocate from Layout with minor_str
+        proc deallocate from Layout with patch_str
+        Return 0
+    End If
+    If minor_valid is equal to 0:
+        proc deallocate from Layout with major_str
+        proc deallocate from Layout with minor_str
+        proc deallocate from Layout with patch_str
+        Return 0
+    End If
+    If patch_valid is equal to 0:
+        proc deallocate from Layout with major_str
+        proc deallocate from Layout with minor_str
+        proc deallocate from Layout with patch_str
+        Return 0
+    End If
+
+    Let major_val be proc string_to_integer from StringPrim with major_str
+    Let minor_val be proc string_to_integer from StringPrim with minor_str
+    Let patch_val be proc string_to_integer from StringPrim with patch_str
+    proc deallocate from Layout with major_str
+    proc deallocate from Layout with minor_str
+    proc deallocate from Layout with patch_str
+
+    Note: Extract prerelease identifier substring (between '-' and '+', if any).
+    Let pre_str be 0
+    If dash_pos is not equal to -1:
+        Let pre_start be dash_pos plus 1
+        Let pre_end be length
+        If plus_pos is not equal to -1:
+            If plus_pos is greater than dash_pos:
+                Set pre_end to plus_pos
+            End If
+        End If
+        Let pre_len be pre_end minus pre_start
+        If pre_len is less than 1:
+            Return 0
+        End If
+        Set pre_str to proc string_substring from StringPrim with text, pre_start, pre_len
+        If pre_str is equal to 0:
+            Return 0
+        End If
+        Let pre_ok be proc validate_identifier_series with pre_str, 1
+        If pre_ok is equal to 0:
+            proc deallocate from Layout with pre_str
+            Return 0
+        End If
+    End If
+
+    Let bld_str be 0
+    If plus_pos is not equal to -1:
+        Let bld_start be plus_pos plus 1
+        Let bld_len be length minus bld_start
+        If bld_len is less than 1:
+            If pre_str is not equal to 0:
+                proc deallocate from Layout with pre_str
+            End If
+            Return 0
+        End If
+        Set bld_str to proc string_substring from StringPrim with text, bld_start, bld_len
+        If bld_str is equal to 0:
+            If pre_str is not equal to 0:
+                proc deallocate from Layout with pre_str
+            End If
+            Return 0
+        End If
+        Let bld_ok be proc validate_identifier_series with bld_str, 0
+        If bld_ok is equal to 0:
+            proc deallocate from Layout with bld_str
+            If pre_str is not equal to 0:
+                proc deallocate from Layout with pre_str
+            End If
+            Return 0
+        End If
+    End If
+
+    Let v be proc version_create with major_val, minor_val, patch_val, pre_str, bld_str
+    If v is equal to 0:
+        If pre_str is not equal to 0:
+            proc deallocate from Layout with pre_str
+        End If
+        If bld_str is not equal to 0:
+            proc deallocate from Layout with bld_str
+        End If
+        Return 0
+    End If
+    Return v
+End Process
+
+@Reasoning
+Helper: validate that a substring is a SemVer numeric identifier
+(SemVer 2.0.0 Section 2). All characters must be ASCII digits. Multi-digit
+strings must not begin with '0'. A zero-length identifier is invalid.
+@End Reasoning
+
+@Implementation
+Walk the string. Reject non-digits, reject leading zero on multi-digit
+inputs, accept everything else.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the identifier. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper. Does not allocate.
+@End Security_Scope
+Process called "validate_numeric_identifier" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with s
+    If length is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    Let first_char be proc memory_get_byte from Memory with s, 0
+    Let first_is_digit be proc is_digit from Char with first_char
+    If first_is_digit is equal to 0:
+        Return 0
+    End If
+    If length is greater than 1:
+        If first_char is equal to 48:
+            Return 0
+        End If
+    End If
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with s, i
+        Let ok be proc is_digit from Char with ch
+        If ok is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Helper: validate a dot-separated series of SemVer identifiers (Section 9
+for prerelease, Section 10 for build). Each identifier consists of ASCII
+alphanumeric characters plus '-'. If strict_no_leading_zero is 1 we are
+in prerelease mode and numeric identifiers must not have leading zeros.
+@End Reasoning
+
+@Implementation
+Walk the string. Split on '.', validate each segment per the alphabet
+rule plus the conditional leading-zero rule for numeric-only segments.
+A trailing dot or empty segment is invalid.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the input. Space: O(1) - operates in place.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper. Does not allocate.
+@End Security_Scope
+Process called "validate_identifier_series" takes s as Integer, strict_no_leading_zero as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with s
+    If length is equal to 0:
+        Return 0
+    End If
+    Let seg_start be 0
+    Let i be 0
+    Let result be 1
+    While i is less than length:
+        If result is equal to 0:
+            Set i to length
+        Otherwise:
+            Let ch be proc memory_get_byte from Memory with s, i
+            If ch is equal to 46:
+                Let seg_len be i minus seg_start
+                Let seg_ok be proc validate_single_identifier with s, seg_start, seg_len, strict_no_leading_zero
+                If seg_ok is equal to 0:
+                    Set result to 0
+                End If
+                Set seg_start to i plus 1
+                Set i to i plus 1
+            Otherwise:
+                Set i to i plus 1
+            End If
+        End If
+    End While
+    If result is equal to 0:
+        Return 0
+    End If
+    Let tail_len be length minus seg_start
+    Let tail_ok be proc validate_single_identifier with s, seg_start, tail_len, strict_no_leading_zero
+    Return tail_ok
+End Process
+
+@Reasoning
+Helper: validate one identifier inside the dot-separated series. Range
+[start, start+len) within s. Alphabet: [0-9A-Za-z-]. Length must be > 0.
+If the segment is entirely digits and strict_no_leading_zero is 1, the
+leading-zero rule applies (multi-digit must not begin with '0').
+@End Reasoning
+
+@Implementation
+First scan: enforce alphabet and capture all_digits flag. Second test:
+apply leading-zero rule if the segment is fully numeric.
+@End Implementation
+
+@Performance_Hints
+Time: O(len). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "validate_single_identifier" takes s as Integer, start as Integer, length as Integer, strict_no_leading_zero as Integer returns Integer:
+    If length is less than 1:
+        Return 0
+    End If
+    Let all_digits be 1
+    Let j be 0
+    While j is less than length:
+        Let ch be proc memory_get_byte from Memory with s, start plus j
+        Let is_d be proc is_digit from Char with ch
+        Let is_a be proc is_alpha from Char with ch
+        If is_d is equal to 0:
+            Set all_digits to 0
+            If is_a is equal to 0:
+                If ch is not equal to 45:
+                    Return 0
+                End If
+            End If
+        End If
+        Set j to j plus 1
+    End While
+    If all_digits is equal to 1:
+        If strict_no_leading_zero is equal to 1:
+            If length is greater than 1:
+                Let first_ch be proc memory_get_byte from Memory with s, start
+                If first_ch is equal to 48:
+                    Return 0
+                End If
+            End If
+        End If
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: VERSION FORMAT
+Note: ============================================================================
+
+@Reasoning
+Render a Version record as a SemVer-conformant canonical string. Output
+matches the parser grammar exactly so round-tripping parse + format is
+the identity on valid inputs.
+@End Reasoning
+
+@Implementation
+StringBuilder-assemble "MAJOR.MINOR.PATCH" then append "-PRERELEASE" and
+"+BUILD" if those fields are non-null.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) where n is the rendered length. Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+No external input is interpreted. Caller owns the returned string.
+@End Security_Scope
+Process called "version_to_string" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let major be proc memory_get_int64 from Memory with v, 0
+    Let minor be proc memory_get_int64 from Memory with v, 8
+    Let patch be proc memory_get_int64 from Memory with v, 16
+    Let pre be proc memory_get_int64 from Memory with v, 24
+    Let bld be proc memory_get_int64 from Memory with v, 32
+
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append_integer from SB with sb, major
+    proc stringbuilder_append_char from SB with sb, 46
+    proc stringbuilder_append_integer from SB with sb, minor
+    proc stringbuilder_append_char from SB with sb, 46
+    proc stringbuilder_append_integer from SB with sb, patch
+    If pre is not equal to 0:
+        Let pre_len be proc string_length from StringCore with pre
+        If pre_len is greater than 0:
+            proc stringbuilder_append_char from SB with sb, 45
+            proc stringbuilder_append from SB with sb, pre
+        End If
+    End If
+    If bld is not equal to 0:
+        Let bld_len be proc string_length from StringCore with bld
+        If bld_len is greater than 0:
+            proc stringbuilder_append_char from SB with sb, 43
+            proc stringbuilder_append from SB with sb, bld
+        End If
+    End If
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process
+
+Note: ============================================================================
+Note: VERSION COMPARISON
+Note: ============================================================================
+
+@Reasoning
+Three-way compare two Version records per SemVer 2.0.0 Section 11:
+  1. Numeric major / minor / patch in lexicographic order.
+  2. A version without prerelease tag is greater than one with the same
+     numeric components and a prerelease tag.
+  3. Prerelease identifiers are compared by:
+       a) dot-separated identifiers,
+       b) within each identifier: numeric < alphanumeric,
+       c) numeric identifiers by numeric value,
+       d) alphanumeric identifiers by ASCII order,
+       e) shorter identifier list with all leading identifiers equal
+          ranks lower.
+  4. Build metadata is IGNORED for ordering (Section 10).
+
+Returns -1 / 0 / 1.
+@End Reasoning
+
+@Implementation
+Compare numeric triples first. Then check both prerelease flags. If
+exactly one has a prerelease the one with it is less. If both do, walk
+their dot-separated identifier sequences applying the alphabet-aware
+rule.
+@End Implementation
+
+@Performance_Hints
+Time: O(p) where p is the combined prerelease identifier length. Space:
+O(p) for the segment scratch (per-segment substring allocations).
+@End Performance_Hints
+
+@Security_Scope
+Inputs are not externally controlled at this layer; the parser has
+already enforced format. No state is mutated.
+@End Security_Scope
+Process called "version_compare" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 0
+        End If
+        Return -1
+    End If
+    If b is equal to 0:
+        Return 1
+    End If
+    Let a_major be proc memory_get_int64 from Memory with a, 0
+    Let b_major be proc memory_get_int64 from Memory with b, 0
+    If a_major is less than b_major:
+        Return -1
+    End If
+    If a_major is greater than b_major:
+        Return 1
+    End If
+    Let a_minor be proc memory_get_int64 from Memory with a, 8
+    Let b_minor be proc memory_get_int64 from Memory with b, 8
+    If a_minor is less than b_minor:
+        Return -1
+    End If
+    If a_minor is greater than b_minor:
+        Return 1
+    End If
+    Let a_patch be proc memory_get_int64 from Memory with a, 16
+    Let b_patch be proc memory_get_int64 from Memory with b, 16
+    If a_patch is less than b_patch:
+        Return -1
+    End If
+    If a_patch is greater than b_patch:
+        Return 1
+    End If
+
+    Let a_pre be proc memory_get_int64 from Memory with a, 24
+    Let b_pre be proc memory_get_int64 from Memory with b, 24
+    Let a_has_pre be 0
+    If a_pre is not equal to 0:
+        Let al be proc string_length from StringCore with a_pre
+        If al is greater than 0:
+            Set a_has_pre to 1
+        End If
+    End If
+    Let b_has_pre be 0
+    If b_pre is not equal to 0:
+        Let bl be proc string_length from StringCore with b_pre
+        If bl is greater than 0:
+            Set b_has_pre to 1
+        End If
+    End If
+    If a_has_pre is equal to 0:
+        If b_has_pre is equal to 0:
+            Return 0
+        End If
+        Return 1
+    End If
+    If b_has_pre is equal to 0:
+        Return -1
+    End If
+    Return proc compare_prerelease with a_pre, b_pre
+End Process
+
+@Reasoning
+Helper: compare two prerelease strings per SemVer 2.0.0 Section 11 (4):
+walk dot-separated identifiers; numeric identifiers compare numerically
+and rank below alphanumerics; when one identifier list runs out before
+the other and all preceding identifiers are equal, the shorter list ranks
+lower.
+@End Reasoning
+
+@Implementation
+Two cursors walk both strings simultaneously. For each segment we
+allocate substrings, classify (all-digit vs mixed), and apply the rule.
+Allocations are released as we go to bound resident memory.
+@End Implementation
+
+@Performance_Hints
+Time: O(p) over the combined identifier length. Space: O(p) for
+per-segment scratch substrings (released eagerly).
+@End Performance_Hints
+
+@Security_Scope
+Inputs already validated by the parser.
+@End Security_Scope
+Process called "compare_prerelease" takes a as Integer, b as Integer returns Integer:
+    Let a_len be proc string_length from StringCore with a
+    Let b_len be proc string_length from StringCore with b
+    Let ai be 0
+    Let bi be 0
+    Let result be 0
+    Let done be 0
+    While done is equal to 0:
+        If ai is greater than or equal to a_len:
+            If bi is greater than or equal to b_len:
+                Set done to 1
+            Otherwise:
+                Set result to -1
+                Set done to 1
+            End If
+        Otherwise:
+            If bi is greater than or equal to b_len:
+                Set result to 1
+                Set done to 1
+            Otherwise:
+                Let a_seg_end be ai
+                Let a_break be 0
+                While a_break is equal to 0:
+                    If a_seg_end is greater than or equal to a_len:
+                        Set a_break to 1
+                    Otherwise:
+                        Let ach be proc memory_get_byte from Memory with a, a_seg_end
+                        If ach is equal to 46:
+                            Set a_break to 1
+                        Otherwise:
+                            Set a_seg_end to a_seg_end plus 1
+                        End If
+                    End If
+                End While
+                Let b_seg_end be bi
+                Let b_break be 0
+                While b_break is equal to 0:
+                    If b_seg_end is greater than or equal to b_len:
+                        Set b_break to 1
+                    Otherwise:
+                        Let bch be proc memory_get_byte from Memory with b, b_seg_end
+                        If bch is equal to 46:
+                            Set b_break to 1
+                        Otherwise:
+                            Set b_seg_end to b_seg_end plus 1
+                        End If
+                    End If
+                End While
+                Let a_seg_len be a_seg_end minus ai
+                Let b_seg_len be b_seg_end minus bi
+                Let a_seg be proc string_substring from StringPrim with a, ai, a_seg_len
+                Let b_seg be proc string_substring from StringPrim with b, bi, b_seg_len
+                Let cmp be proc compare_one_identifier with a_seg, b_seg
+                If a_seg is not equal to 0:
+                    proc deallocate from Layout with a_seg
+                End If
+                If b_seg is not equal to 0:
+                    proc deallocate from Layout with b_seg
+                End If
+                If cmp is not equal to 0:
+                    Set result to cmp
+                    Set done to 1
+                Otherwise:
+                    Set ai to a_seg_end plus 1
+                    Set bi to b_seg_end plus 1
+                End If
+            End If
+        End If
+    End While
+    Return result
+End Process
+
+@Reasoning
+Helper: compare a single prerelease identifier pair. Numeric ranks below
+alphanumeric; numerics compare by value; alphanumerics by ASCII order.
+@End Reasoning
+
+@Implementation
+Classify both via all-digit scan. If one is numeric and the other is
+not, numeric < alphanumeric. If both numeric, parse to integers and
+compare. Otherwise, byte-wise lexicographic compare.
+@End Implementation
+
+@Performance_Hints
+Time: O(len). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Inputs validated upstream.
+@End Security_Scope
+Process called "compare_one_identifier" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 0
+        End If
+        Return -1
+    End If
+    If b is equal to 0:
+        Return 1
+    End If
+    Let a_digit be proc identifier_is_numeric with a
+    Let b_digit be proc identifier_is_numeric with b
+    If a_digit is equal to 1:
+        If b_digit is equal to 0:
+            Return -1
+        End If
+        Let av be proc string_to_integer from StringPrim with a
+        Let bv be proc string_to_integer from StringPrim with b
+        If av is less than bv:
+            Return -1
+        End If
+        If av is greater than bv:
+            Return 1
+        End If
+        Return 0
+    End If
+    If b_digit is equal to 1:
+        Return 1
+    End If
+    Return proc string_compare from StringCore with a, b
+End Process
+
+@Reasoning
+Helper: returns 1 if a string is fully composed of ASCII digits, else 0.
+@End Reasoning
+
+@Implementation
+Linear scan checking each byte against is_digit.
+@End Implementation
+
+@Performance_Hints
+Time: O(len). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "identifier_is_numeric" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with s
+    If length is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with s, i
+        Let d be proc is_digit from Char with ch
+        If d is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CONSTRAINT CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Allocate a VersionConstraint record with the supplied kind discriminator
+and bounds. The lower/upper Version pointers are caller-owned references
+(the constraint does not deep-copy). Inclusive flags are 0 or 1.
+wildcard_at is meaningful only for VC_WILDCARD; pass -1 otherwise.
+@End Reasoning
+
+@Implementation
+Allocate 56 bytes and populate fields per the layout comment.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller is responsible for the validity of the supplied Version pointers.
+@End Security_Scope
+Process called "constraint_create" takes kind as Integer, lower as Integer, upper as Integer, lower_inclusive as Integer, upper_inclusive as Integer, original_text as Integer, wildcard_at as Integer returns Integer:
+    If kind is less than VC_EXACT:
+        Return 0
+    End If
+    If kind is greater than VC_ANY:
+        Return 0
+    End If
+    Let c be proc allocate from Layout with VC_SIZE
+    If c is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with c, 0, kind
+    proc memory_set_int64 from Memory with c, 8, lower
+    proc memory_set_int64 from Memory with c, 16, upper
+    proc memory_set_int64 from Memory with c, 24, lower_inclusive
+    proc memory_set_int64 from Memory with c, 32, upper_inclusive
+    proc memory_set_int64 from Memory with c, 40, original_text
+    proc memory_set_int64 from Memory with c, 48, wildcard_at
+    Return c
+End Process
+
+@Reasoning
+Destroy a constraint record. By contract the Version bounds are caller-
+owned and not freed here. Pair with constraint_destroy_deep to release
+the bounds as well.
+@End Reasoning
+
+@Implementation
+Free the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not touch the pointer after destroy.
+@End Security_Scope
+Process called "constraint_destroy" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    proc deallocate from Layout with c
+    Return 1
+End Process
+
+@Reasoning
+Destroy a constraint AND its bound Versions plus its original-text
+string. Used by parsers that own the bounds outright.
+@End Reasoning
+
+@Implementation
+Free each non-null subordinate before freeing the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Double-free protection is the caller's responsibility.
+@End Security_Scope
+Process called "constraint_destroy_deep" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let lo be proc memory_get_int64 from Memory with c, 8
+    If lo is not equal to 0:
+        proc version_destroy_deep with lo
+    End If
+    Let hi be proc memory_get_int64 from Memory with c, 16
+    If hi is not equal to 0:
+        proc version_destroy_deep with hi
+    End If
+    Let txt be proc memory_get_int64 from Memory with c, 40
+    If txt is not equal to 0:
+        proc deallocate from Layout with txt
+    End If
+    proc deallocate from Layout with c
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CONSTRAINT PARSE
+Note: ============================================================================
+
+@Reasoning
+Parse a constraint expression as accepted by Cargo and npm:
+  - "1.2.3"  ............ exact match
+  - "^1.2.3" ............ caret: compatible up to next major
+  - "~1.2.3" ............ tilde: compatible up to next minor
+  - ">=1.2.3" ........... minimum (inclusive)
+  - ">1.2.3" ............ minimum (exclusive)
+  - "<=1.2.3" ........... maximum (inclusive)
+  - "<1.2.3" ............ maximum (exclusive)
+  - "1.2.*" / "1.*" ..... wildcard
+  - "*" ................. any version
+  - ">=1.0.0 <2.0.0" .... range (lower inclusive, upper exclusive)
+A wildcard inside a range is not accepted - the parser rejects mixed
+forms because the union semantics differ across ecosystems.
+@End Reasoning
+
+@Implementation
+Trim leading inline whitespace. Dispatch on first character:
+  '*'  -> VC_ANY
+  '^'  -> VC_CARET
+  '~'  -> VC_TILDE
+  '>'  -> VC_MIN (with optional '=' suffix)
+  '<'  -> VC_MAX (with optional '=' suffix)
+  '='  -> VC_EXACT
+  digit -> VC_EXACT, unless the version body contains '*' -> VC_WILDCARD
+After the operator we delegate the version body to version_parse_relaxed
+which permits the wildcard tail. For two-clause ranges we look for an
+inline-whitespace boundary and parse both halves.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over input. Space: O(n) for the original-text copy and the
+Version sub-records.
+@End Performance_Hints
+
+@Security_Scope
+Strict: any malformed sub-expression aborts the parse with sentinel 0
+so the caller never gets a partially-initialized constraint.
+@End Security_Scope
+Process called "constraint_parse" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let raw_len be proc string_length from StringCore with text
+    If raw_len is equal to 0:
+        Return 0
+    End If
+
+    Let start be 0
+    Let trim_done be 0
+    While trim_done is equal to 0:
+        If start is greater than or equal to raw_len:
+            Set trim_done to 1
+        Otherwise:
+            Let ch be proc memory_get_byte from Memory with text, start
+            Let ws be proc is_inline_whitespace from Char with ch
+            If ws is equal to 1:
+                Set start to start plus 1
+            Otherwise:
+                Set trim_done to 1
+            End If
+        End If
+    End While
+
+    Note: Find an inline-whitespace boundary for two-clause ranges.
+    Let split_pos be -1
+    Let i be start
+    While i is less than raw_len:
+        Let ch2 be proc memory_get_byte from Memory with text, i
+        Let ws2 be proc is_inline_whitespace from Char with ch2
+        If ws2 is equal to 1:
+            Set split_pos to i
+            Set i to raw_len
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+
+    Let original be proc string_duplicate from StringPrim with text
+    If original is equal to 0:
+        Return 0
+    End If
+
+    If split_pos is greater than 0:
+        Note: Two-clause range.
+        Let left_len be split_pos minus start
+        Let left_text be proc string_substring from StringPrim with text, start, left_len
+        If left_text is equal to 0:
+            proc deallocate from Layout with original
+            Return 0
+        End If
+        Let right_start be split_pos plus 1
+        Let rtrim_done be 0
+        While rtrim_done is equal to 0:
+            If right_start is greater than or equal to raw_len:
+                Set rtrim_done to 1
+            Otherwise:
+                Let rch be proc memory_get_byte from Memory with text, right_start
+                Let rws be proc is_inline_whitespace from Char with rch
+                If rws is equal to 1:
+                    Set right_start to right_start plus 1
+                Otherwise:
+                    Set rtrim_done to 1
+                End If
+            End If
+        End While
+        Let right_len be raw_len minus right_start
+        Let right_text be proc string_substring from StringPrim with text, right_start, right_len
+        If right_text is equal to 0:
+            proc deallocate from Layout with original
+            proc deallocate from Layout with left_text
+            Return 0
+        End If
+
+        Let lower_pair be proc parse_comparator with left_text
+        Let upper_pair be proc parse_comparator with right_text
+        proc deallocate from Layout with left_text
+        proc deallocate from Layout with right_text
+        If lower_pair is equal to 0:
+            proc deallocate from Layout with original
+            Return 0
+        End If
+        If upper_pair is equal to 0:
+            proc deallocate from Layout with original
+            Let lv be proc memory_get_int64 from Memory with lower_pair, 0
+            If lv is not equal to 0:
+                proc version_destroy_deep with lv
+            End If
+            proc deallocate from Layout with lower_pair
+            Return 0
+        End If
+
+        Let lv be proc memory_get_int64 from Memory with lower_pair, 0
+        Let lk be proc memory_get_int64 from Memory with lower_pair, 8
+        Let li be proc memory_get_int64 from Memory with lower_pair, 16
+        Let uv be proc memory_get_int64 from Memory with upper_pair, 0
+        Let uk be proc memory_get_int64 from Memory with upper_pair, 8
+        Let ui be proc memory_get_int64 from Memory with upper_pair, 16
+        proc deallocate from Layout with lower_pair
+        proc deallocate from Layout with upper_pair
+
+        If lk is not equal to VC_MIN:
+            proc deallocate from Layout with original
+            If lv is not equal to 0:
+                proc version_destroy_deep with lv
+            End If
+            If uv is not equal to 0:
+                proc version_destroy_deep with uv
+            End If
+            Return 0
+        End If
+        If uk is not equal to VC_MAX:
+            proc deallocate from Layout with original
+            If lv is not equal to 0:
+                proc version_destroy_deep with lv
+            End If
+            If uv is not equal to 0:
+                proc version_destroy_deep with uv
+            End If
+            Return 0
+        End If
+        Return proc constraint_create with VC_RANGE, lv, uv, li, ui, original, -1
+    End If
+
+    Note: Single comparator.
+    Let body_len be raw_len minus start
+    Let body be proc string_substring from StringPrim with text, start, body_len
+    If body is equal to 0:
+        proc deallocate from Layout with original
+        Return 0
+    End If
+    Let pair be proc parse_comparator with body
+    proc deallocate from Layout with body
+    If pair is equal to 0:
+        proc deallocate from Layout with original
+        Return 0
+    End If
+    Let pv be proc memory_get_int64 from Memory with pair, 0
+    Let pk be proc memory_get_int64 from Memory with pair, 8
+    Let pi be proc memory_get_int64 from Memory with pair, 16
+    Let pw be proc memory_get_int64 from Memory with pair, 24
+    proc deallocate from Layout with pair
+
+    If pk is equal to VC_ANY:
+        Return proc constraint_create with VC_ANY, 0, 0, 0, 0, original, -1
+    End If
+    If pk is equal to VC_WILDCARD:
+        Return proc constraint_create with VC_WILDCARD, pv, 0, 1, 0, original, pw
+    End If
+    If pk is equal to VC_EXACT:
+        Return proc constraint_create with VC_EXACT, pv, pv, 1, 1, original, -1
+    End If
+    If pk is equal to VC_MIN:
+        Return proc constraint_create with VC_MIN, pv, 0, pi, 0, original, -1
+    End If
+    If pk is equal to VC_MAX:
+        Return proc constraint_create with VC_MAX, 0, pv, 0, pi, original, -1
+    End If
+    If pk is equal to VC_CARET:
+        Return proc constraint_create with VC_CARET, pv, 0, 1, 0, original, -1
+    End If
+    If pk is equal to VC_TILDE:
+        Return proc constraint_create with VC_TILDE, pv, 0, 1, 0, original, -1
+    End If
+    proc deallocate from Layout with original
+    If pv is not equal to 0:
+        proc version_destroy_deep with pv
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Helper: parse a single comparator expression. Returns a 32-byte transit
+record (later freed by the caller) carrying:
+  offset 0  : Version pointer (owned)
+  offset 8  : kind discriminator
+  offset 16 : inclusive flag
+  offset 24 : wildcard_at (-1 if not a wildcard)
+@End Reasoning
+
+@Implementation
+Dispatch on the first character of the trimmed comparator string,
+extract the version body, and delegate to version_parse or
+version_parse_with_wildcards depending on whether '*' appears.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n) for the version body substring and the 32-byte
+transit record.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper. Returns 0 on any malformed input.
+@End Security_Scope
+Process called "parse_comparator" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with text
+    If length is equal to 0:
+        Return 0
+    End If
+
+    Let first be proc memory_get_byte from Memory with text, 0
+    If first is equal to 42:
+        Let pair be proc allocate from Layout with 32
+        If pair is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with pair, 0, 0
+        proc memory_set_int64 from Memory with pair, 8, VC_ANY
+        proc memory_set_int64 from Memory with pair, 16, 0
+        proc memory_set_int64 from Memory with pair, 24, -1
+        Return pair
+    End If
+
+    Let op_kind be VC_EXACT
+    Let inclusive be 1
+    Let body_start be 0
+    If first is equal to 94:
+        Set op_kind to VC_CARET
+        Set body_start to 1
+    Otherwise:
+        If first is equal to 126:
+            Set op_kind to VC_TILDE
+            Set body_start to 1
+        Otherwise:
+            If first is equal to 61:
+                Set op_kind to VC_EXACT
+                Set body_start to 1
+            Otherwise:
+                If first is equal to 62:
+                    Set op_kind to VC_MIN
+                    Set body_start to 1
+                    If length is greater than 1:
+                        Let second be proc memory_get_byte from Memory with text, 1
+                        If second is equal to 61:
+                            Set inclusive to 1
+                            Set body_start to 2
+                        Otherwise:
+                            Set inclusive to 0
+                        End If
+                    End If
+                Otherwise:
+                    If first is equal to 60:
+                        Set op_kind to VC_MAX
+                        Set body_start to 1
+                        If length is greater than 1:
+                            Let second2 be proc memory_get_byte from Memory with text, 1
+                            If second2 is equal to 61:
+                                Set inclusive to 1
+                                Set body_start to 2
+                            Otherwise:
+                                Set inclusive to 0
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Let body_len be length minus body_start
+    If body_len is less than 1:
+        Return 0
+    End If
+
+    Let body be proc string_substring from StringPrim with text, body_start, body_len
+    If body is equal to 0:
+        Return 0
+    End If
+
+    Let star_pos be -1
+    Let k be 0
+    While k is less than body_len:
+        Let ch be proc memory_get_byte from Memory with body, k
+        If ch is equal to 42:
+            Set star_pos to k
+            Set k to body_len
+        Otherwise:
+            Set k to k plus 1
+        End If
+    End While
+
+    Let v be 0
+    Let w_at be -1
+    If star_pos is equal to -1:
+        Set v to proc version_parse with body
+        If v is equal to 0:
+            proc deallocate from Layout with body
+            Return 0
+        End If
+    Otherwise:
+        If op_kind is not equal to VC_EXACT:
+            proc deallocate from Layout with body
+            Return 0
+        End If
+        Set op_kind to VC_WILDCARD
+        Let wpair be proc parse_wildcard_version with body
+        proc deallocate from Layout with body
+        If wpair is equal to 0:
+            Return 0
+        End If
+        Set v to proc memory_get_int64 from Memory with wpair, 0
+        Set w_at to proc memory_get_int64 from Memory with wpair, 8
+        proc deallocate from Layout with wpair
+        Let pair2 be proc allocate from Layout with 32
+        If pair2 is equal to 0:
+            proc version_destroy_deep with v
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with pair2, 0, v
+        proc memory_set_int64 from Memory with pair2, 8, op_kind
+        proc memory_set_int64 from Memory with pair2, 16, inclusive
+        proc memory_set_int64 from Memory with pair2, 24, w_at
+        Return pair2
+    End If
+    proc deallocate from Layout with body
+
+    Let pair be proc allocate from Layout with 32
+    If pair is equal to 0:
+        proc version_destroy_deep with v
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with pair, 0, v
+    proc memory_set_int64 from Memory with pair, 8, op_kind
+    proc memory_set_int64 from Memory with pair, 16, inclusive
+    proc memory_set_int64 from Memory with pair, 24, w_at
+    Return pair
+End Process
+
+@Reasoning
+Helper: parse a wildcard version body of the form "MAJOR.*", "MAJOR.MINOR.*",
+or "*". Returns a 16-byte transit record with the canonical Version
+substituted for the '*' position and the wildcard_at index (0=major,
+1=minor, 2=patch). The substituted Version uses 0 for the wildcarded
+component and any below it, matching Cargo / npm conventions.
+@End Reasoning
+
+@Implementation
+Walk the components. The '*' must appear in exactly one slot and may not
+co-occur with prerelease or build segments. The companion non-wildcard
+slots must satisfy the numeric-identifier rule.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n) for the substituted Version record plus the
+16-byte transit record.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper. Returns 0 on any malformed input.
+@End Security_Scope
+Process called "parse_wildcard_version" takes body as Integer returns Integer:
+    Let length be proc string_length from StringCore with body
+    If length is equal to 0:
+        Return 0
+    End If
+    Let first be proc memory_get_byte from Memory with body, 0
+    If length is equal to 1:
+        If first is equal to 42:
+            Let v_any be proc version_create with 0, 0, 0, 0, 0
+            If v_any is equal to 0:
+                Return 0
+            End If
+            Let pair be proc allocate from Layout with 16
+            If pair is equal to 0:
+                proc version_destroy_deep with v_any
+                Return 0
+            End If
+            proc memory_set_int64 from Memory with pair, 0, v_any
+            proc memory_set_int64 from Memory with pair, 8, 0
+            Return pair
+        End If
+        Return 0
+    End If
+
+    Let dot1 be -1
+    Let dot2 be -1
+    Let star_pos be -1
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with body, i
+        If ch is equal to 46:
+            If dot1 is equal to -1:
+                Set dot1 to i
+            Otherwise:
+                If dot2 is equal to -1:
+                    Set dot2 to i
+                End If
+            End If
+        End If
+        If ch is equal to 42:
+            Set star_pos to i
+        End If
+        If ch is equal to 45:
+            Return 0
+        End If
+        If ch is equal to 43:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    If star_pos is equal to -1:
+        Return 0
+    End If
+    If star_pos is not equal to (length minus 1):
+        Return 0
+    End If
+    If star_pos is greater than 0:
+        Let prev be proc memory_get_byte from Memory with body, star_pos minus 1
+        If prev is not equal to 46:
+            Return 0
+        End If
+    End If
+
+    Let w_at be 0
+    Let major_val be 0
+    Let minor_val be 0
+    Let patch_val be 0
+    If dot1 is equal to -1:
+        Set w_at to 0
+    Otherwise:
+        Let major_str be proc string_substring from StringPrim with body, 0, dot1
+        Let mv_ok be proc validate_numeric_identifier with major_str
+        If mv_ok is equal to 0:
+            If major_str is not equal to 0:
+                proc deallocate from Layout with major_str
+            End If
+            Return 0
+        End If
+        Set major_val to proc string_to_integer from StringPrim with major_str
+        proc deallocate from Layout with major_str
+        If dot2 is equal to -1:
+            Note: pattern "MAJOR.*"
+            Set w_at to 1
+        Otherwise:
+            Let minor_len be (dot2 minus dot1) minus 1
+            Let minor_str be proc string_substring from StringPrim with body, dot1 plus 1, minor_len
+            Let mvok be proc validate_numeric_identifier with minor_str
+            If mvok is equal to 0:
+                If minor_str is not equal to 0:
+                    proc deallocate from Layout with minor_str
+                End If
+                Return 0
+            End If
+            Set minor_val to proc string_to_integer from StringPrim with minor_str
+            proc deallocate from Layout with minor_str
+            Set w_at to 2
+        End If
+    End If
+
+    Let v be proc version_create with major_val, minor_val, patch_val, 0, 0
+    If v is equal to 0:
+        Return 0
+    End If
+    Let pair be proc allocate from Layout with 16
+    If pair is equal to 0:
+        proc version_destroy_deep with v
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with pair, 0, v
+    proc memory_set_int64 from Memory with pair, 8, w_at
+    Return pair
+End Process
+
+Note: ============================================================================
+Note: CONSTRAINT FIELD ACCESSORS
+Note: ============================================================================
+
+@Reasoning
+Expose the discriminator kind for switch-style dispatch by callers
+without exposing the layout.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input - distinct from VC_EXACT (which is 1) so
+callers can detect error.
+@End Security_Scope
+Process called "constraint_kind" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with c, 0
+End Process
+
+@Reasoning
+Expose the lower-bound Version pointer.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if absent or input is null.
+@End Security_Scope
+Process called "constraint_lower" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with c, 8
+End Process
+
+@Reasoning
+Expose the upper-bound Version pointer.
+@End Reasoning
+
+@Implementation
+Load offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if absent.
+@End Security_Scope
+Process called "constraint_upper" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with c, 16
+End Process
+
+Note: ============================================================================
+Note: CONSTRAINT SATISFACTION
+Note: ============================================================================
+
+@Reasoning
+Test whether a version satisfies a constraint per the documented ADT
+semantics:
+
+  VC_EXACT     : version_compare(v, lower) == 0
+  VC_MIN       : version_compare(v, lower) > 0 or
+                 (lower_inclusive and == 0)
+  VC_MAX       : version_compare(v, upper) < 0 or
+                 (upper_inclusive and == 0)
+  VC_RANGE     : both VC_MIN and VC_MAX bounds satisfied
+  VC_CARET     : v >= lower AND v < upper-cap, where upper-cap depends
+                 on the leading non-zero component (Cargo / npm rule)
+  VC_TILDE     : v >= lower AND v < lower with minor incremented
+  VC_WILDCARD  : v matches lower in all non-wildcarded slots
+  VC_ANY       : always true
+
+Prerelease versions are excluded from caret / tilde / wildcard matches
+unless the lower bound itself is a prerelease (npm semver "includePrerelease"
+default semantics).
+@End Reasoning
+
+@Implementation
+Switch on the kind discriminator and apply the rules using
+version_compare. Caret upper bound:
+  - major > 0 -> bump major: (major+1, 0, 0)
+  - major == 0 and minor > 0 -> (0, minor+1, 0)
+  - major == 0 and minor == 0 -> (0, 0, patch+1)
+Tilde upper bound:
+  - bump minor: (major, minor+1, 0)
+Wildcard slots compare the components up to wildcard_at - 1 inclusive.
+@End Implementation
+
+@Performance_Hints
+Time: O(p) where p is the prerelease identifier length of inputs. Space:
+O(1) plus the temporary Versions allocated for caret / tilde caps.
+@End Performance_Hints
+
+@Security_Scope
+Defends against caller-supplied null Versions; returns 0 on any null
+input. Pre-release exclusion rule prevents accidentally pulling
+"1.0.0-alpha" into a "^1.0.0" range.
+@End Security_Scope
+Process called "version_satisfies" takes v as Integer, c as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    If c is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with c, 0
+    If kind is equal to VC_ANY:
+        Return 1
+    End If
+    Let lo be proc memory_get_int64 from Memory with c, 8
+    Let hi be proc memory_get_int64 from Memory with c, 16
+    Let lo_inc be proc memory_get_int64 from Memory with c, 24
+    Let hi_inc be proc memory_get_int64 from Memory with c, 32
+
+    If kind is equal to VC_EXACT:
+        Let cmp be proc version_compare with v, lo
+        If cmp is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If kind is equal to VC_MIN:
+        Let cmpm be proc version_compare with v, lo
+        If cmpm is greater than 0:
+            Return 1
+        End If
+        If cmpm is equal to 0:
+            If lo_inc is equal to 1:
+                Return 1
+            End If
+        End If
+        Return 0
+    End If
+
+    If kind is equal to VC_MAX:
+        Let cmpx be proc version_compare with v, hi
+        If cmpx is less than 0:
+            Return 1
+        End If
+        If cmpx is equal to 0:
+            If hi_inc is equal to 1:
+                Return 1
+            End If
+        End If
+        Return 0
+    End If
+
+    If kind is equal to VC_RANGE:
+        Let cmplo be proc version_compare with v, lo
+        If cmplo is less than 0:
+            Return 0
+        End If
+        If cmplo is equal to 0:
+            If lo_inc is equal to 0:
+                Return 0
+            End If
+        End If
+        Let cmphi be proc version_compare with v, hi
+        If cmphi is greater than 0:
+            Return 0
+        End If
+        If cmphi is equal to 0:
+            If hi_inc is equal to 0:
+                Return 0
+            End If
+        End If
+        Return 1
+    End If
+
+    If kind is equal to VC_CARET:
+        Return proc satisfies_caret with v, lo
+    End If
+
+    If kind is equal to VC_TILDE:
+        Return proc satisfies_tilde with v, lo
+    End If
+
+    If kind is equal to VC_WILDCARD:
+        Let w_at be proc memory_get_int64 from Memory with c, 48
+        Return proc satisfies_wildcard with v, lo, w_at
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Helper: implement caret rule per Cargo:
+  ^X.Y.Z (X > 0)            -> X.Y.Z <= v < (X+1).0.0
+  ^0.Y.Z (Y > 0)            -> 0.Y.Z <= v < 0.(Y+1).0
+  ^0.0.Z                    -> 0.0.Z <= v < 0.0.(Z+1)
+Pre-release versions are excluded unless lower is itself prerelease.
+@End Reasoning
+
+@Implementation
+Build the upper-cap Version on the heap, run version_compare, free, return.
+@End Implementation
+
+@Performance_Hints
+Time: O(p). Space: O(1) for the transient cap Version.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "satisfies_caret" takes v as Integer, lower as Integer returns Integer:
+    If lower is equal to 0:
+        Return 0
+    End If
+    Let cmp_lo be proc version_compare with v, lower
+    If cmp_lo is less than 0:
+        Return 0
+    End If
+    Let lower_pre be proc version_is_prerelease with lower
+    Let v_pre be proc version_is_prerelease with v
+    If v_pre is equal to 1:
+        If lower_pre is equal to 0:
+            Return 0
+        End If
+    End If
+    Let lo_major be proc memory_get_int64 from Memory with lower, 0
+    Let lo_minor be proc memory_get_int64 from Memory with lower, 8
+    Let lo_patch be proc memory_get_int64 from Memory with lower, 16
+    Let cap_major be 0
+    Let cap_minor be 0
+    Let cap_patch be 0
+    If lo_major is greater than 0:
+        Set cap_major to lo_major plus 1
+        Set cap_minor to 0
+        Set cap_patch to 0
+    Otherwise:
+        If lo_minor is greater than 0:
+            Set cap_major to 0
+            Set cap_minor to lo_minor plus 1
+            Set cap_patch to 0
+        Otherwise:
+            Set cap_major to 0
+            Set cap_minor to 0
+            Set cap_patch to lo_patch plus 1
+        End If
+    End If
+    Let cap be proc version_create with cap_major, cap_minor, cap_patch, 0, 0
+    If cap is equal to 0:
+        Return 0
+    End If
+    Let cmp_hi be proc version_compare with v, cap
+    proc version_destroy with cap
+    If cmp_hi is less than 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Helper: implement tilde rule per Cargo:
+  ~X.Y.Z -> X.Y.Z <= v < X.(Y+1).0
+@End Reasoning
+
+@Implementation
+Build the upper-cap Version, compare, free.
+@End Implementation
+
+@Performance_Hints
+Time: O(p). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "satisfies_tilde" takes v as Integer, lower as Integer returns Integer:
+    If lower is equal to 0:
+        Return 0
+    End If
+    Let cmp_lo be proc version_compare with v, lower
+    If cmp_lo is less than 0:
+        Return 0
+    End If
+    Let lower_pre be proc version_is_prerelease with lower
+    Let v_pre be proc version_is_prerelease with v
+    If v_pre is equal to 1:
+        If lower_pre is equal to 0:
+            Return 0
+        End If
+    End If
+    Let lo_major be proc memory_get_int64 from Memory with lower, 0
+    Let lo_minor be proc memory_get_int64 from Memory with lower, 8
+    Let cap be proc version_create with lo_major, lo_minor plus 1, 0, 0, 0
+    If cap is equal to 0:
+        Return 0
+    End If
+    Let cmp_hi be proc version_compare with v, cap
+    proc version_destroy with cap
+    If cmp_hi is less than 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Helper: implement wildcard rule. Match all components strictly less than
+wildcard_at, treat the wildcarded slot and all lower slots as free.
+@End Reasoning
+
+@Implementation
+Compare major (always required if wildcard_at >= 1) and minor (required
+if wildcard_at >= 2). Pre-release versions are excluded.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "satisfies_wildcard" takes v as Integer, lower as Integer, wildcard_at as Integer returns Integer:
+    If lower is equal to 0:
+        If wildcard_at is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    Let v_pre be proc version_is_prerelease with v
+    If v_pre is equal to 1:
+        Return 0
+    End If
+    If wildcard_at is equal to 0:
+        Return 1
+    End If
+    Let lo_major be proc memory_get_int64 from Memory with lower, 0
+    Let v_major be proc memory_get_int64 from Memory with v, 0
+    If lo_major is not equal to v_major:
+        Return 0
+    End If
+    If wildcard_at is equal to 1:
+        Return 1
+    End If
+    Let lo_minor be proc memory_get_int64 from Memory with lower, 8
+    Let v_minor be proc memory_get_int64 from Memory with v, 8
+    If lo_minor is not equal to v_minor:
+        Return 0
+    End If
+    Return 1
+End Process

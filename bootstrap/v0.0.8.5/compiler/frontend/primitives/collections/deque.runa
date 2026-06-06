@@ -1,0 +1,585 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+DEQUE - Double-Ended Queue (Block-Linked) Tier 0 Primitive
+
+This file implements a deque as a doubly-linked list of fixed-size array
+blocks. Each block holds DEQUE_BLOCK_CAPACITY slots; the block list grows
+at either end with O(1) amortized cost.
+
+Architecture:
+- Doubly-linked chain of blocks. Each block has:
+    offset 0:  prev block pointer (8 bytes)
+    offset 8:  next block pointer (8 bytes)
+    offset 16: head index inside block (8 bytes) - first occupied slot
+    offset 24: tail index inside block (8 bytes) - one past last occupied
+    offset 32+: slot array of DEQUE_BLOCK_CAPACITY * 8 bytes
+- Block size = 32 + DEQUE_BLOCK_CAPACITY * 8 bytes
+- Deque header (48 bytes):
+    offset 0:  head block pointer (8 bytes)
+    offset 8:  tail block pointer (8 bytes)
+    offset 16: size (total element count, 8 bytes)
+    offset 24: head_block index (first occupied slot in head block, 8 bytes)
+    offset 32: tail_block index (one past last occupied slot in tail block, 8 bytes)
+    offset 40: block_capacity (slots per block, 8 bytes)
+
+Behavior:
+- push_front: write into head_block at index (head_block_index - 1).
+  If head_block_index is 0, allocate a new block at the front and write
+  at index (block_capacity - 1).
+- push_back: write into tail_block at tail_block_index, then advance.
+  If tail_block_index hits block_capacity, allocate a new block at back.
+- pop_front / pop_back symmetric, freeing now-empty blocks.
+
+Use cases:
+- BFS/DFS frontiers with both push_front (priority urgent) and push_back
+- Sliding-window algorithms
+- Work-stealing queue backing
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let DEQUE_BLOCK_CAPACITY be 64
+Let DEQUE_ELEMENT_SIZE be 8
+Let DEQUE_BLOCK_HEADER_SIZE be 32
+Let DEQUE_HEADER_SIZE be 48
+Let DEQUE_BLOCK_PREV_OFFSET be 0
+Let DEQUE_BLOCK_NEXT_OFFSET be 8
+Let DEQUE_BLOCK_HEAD_OFFSET be 16
+Let DEQUE_BLOCK_TAIL_OFFSET be 24
+
+Note: ============================================================================
+Note: INTERNAL HELPERS
+Note: ============================================================================
+
+@Reasoning
+Allocate a single deque block. New blocks have prev/next set to 0 and
+head == tail at the block midpoint so subsequent push_front or push_back
+both have room without requiring an immediate second allocation. Choosing
+the midpoint reduces the chance that a mixed-direction workload thrashes
+the block boundary.
+@End Reasoning
+
+@Implementation
+Block size = 32 + 64 * 8 = 544 bytes. Midpoint index = block_capacity / 2.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(BLOCK_CAPACITY) bytes per block.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper; caller controls insertion into the linked structure.
+@End Security_Scope
+Process called "deque_alloc_block" returns Integer:
+    Let block_size be DEQUE_BLOCK_HEADER_SIZE plus (DEQUE_BLOCK_CAPACITY multiplied by DEQUE_ELEMENT_SIZE)
+    Let block be proc allocate from Layout with block_size
+    If block is equal to 0:
+        Return 0
+    End If
+    Let mid be DEQUE_BLOCK_CAPACITY divided by 2
+    proc memory_set_int64 from Memory with block, DEQUE_BLOCK_PREV_OFFSET, 0
+    proc memory_set_int64 from Memory with block, DEQUE_BLOCK_NEXT_OFFSET, 0
+    proc memory_set_int64 from Memory with block, DEQUE_BLOCK_HEAD_OFFSET, mid
+    proc memory_set_int64 from Memory with block, DEQUE_BLOCK_TAIL_OFFSET, mid
+    Return block
+End Process
+
+@Reasoning
+Compute the byte address of slot 'index' within a block. Centralized to
+keep the slot layout (header + slot_index * 8) in one place.
+@End Reasoning
+
+@Implementation
+Address = block + DEQUE_BLOCK_HEADER_SIZE + index * DEQUE_ELEMENT_SIZE.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Trivially inlined.
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated index; no internal bounds check.
+@End Security_Scope
+Process called "deque_block_slot_addr" takes block as Integer, index as Integer returns Integer:
+    Return block plus (DEQUE_BLOCK_HEADER_SIZE plus (index multiplied by DEQUE_ELEMENT_SIZE))
+End Process
+
+Note: ============================================================================
+Note: CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Create an empty deque with exactly one block pre-allocated. Pre-allocation
+removes the null-check from the hot push path; the small fixed cost is
+acceptable for the much-simpler invariants in push/pop.
+@End Reasoning
+
+@Implementation
+Allocate 48 bytes for the deque header, allocate the first block, wire
+head_block == tail_block == that block, size = 0, and inherit the block's
+midpoint indices.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: header (48 bytes) + first block (544 bytes) = 592 bytes.
+@End Performance_Hints
+
+@Security_Scope
+On allocation failure either step returns 0 and frees any partial state.
+@End Security_Scope
+Process called "deque_create" returns Integer:
+    Let dq be proc allocate from Layout with DEQUE_HEADER_SIZE
+    If dq is equal to 0:
+        Return 0
+    End If
+    Let block be proc deque_alloc_block
+    If block is equal to 0:
+        proc deallocate from Layout with dq
+        Return 0
+    End If
+    Let mid be DEQUE_BLOCK_CAPACITY divided by 2
+    proc memory_set_int64 from Memory with dq, 0, block
+    proc memory_set_int64 from Memory with dq, 8, block
+    proc memory_set_int64 from Memory with dq, 16, 0
+    proc memory_set_int64 from Memory with dq, 24, mid
+    proc memory_set_int64 from Memory with dq, 32, mid
+    proc memory_set_int64 from Memory with dq, 40, DEQUE_BLOCK_CAPACITY
+    Return dq
+End Process
+
+@Reasoning
+Walk the block chain freeing each block, then free the deque header.
+Slot contents are opaque words; we do not free them because the deque
+does not own them.
+@End Reasoning
+
+@Implementation
+Start at head_block, save next, free current, advance. Terminate when
+next == 0. Then free header.
+@End Implementation
+
+@Performance_Hints
+Time: O(B) in number of blocks. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must own the deque. Slot pointees are not freed.
+@End Security_Scope
+Process called "deque_destroy" takes dq as Integer returns Integer:
+    If dq is equal to 0:
+        Return 0
+    End If
+    Let cur be proc memory_get_int64 from Memory with dq, 0
+    While cur is not equal to 0:
+        Let next be proc memory_get_int64 from Memory with cur, DEQUE_BLOCK_NEXT_OFFSET
+        proc deallocate from Layout with cur
+        Set cur to next
+    End While
+    proc deallocate from Layout with dq
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SIZE / EMPTY QUERIES
+Note: ============================================================================
+
+@Reasoning
+Returns the total element count. Stored as a field so this is O(1)
+without walking blocks.
+@End Reasoning
+
+@Implementation
+Read 8-byte size field at offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "deque_size" takes dq as Integer returns Integer:
+    If dq is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with dq, 16
+End Process
+
+@Reasoning
+Convenience predicate for empty deque.
+@End Reasoning
+
+@Implementation
+Returns 1 if size == 0, otherwise 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "deque_is_empty" takes dq as Integer returns Integer:
+    If dq is equal to 0:
+        Return 1
+    End If
+    Let sz be proc memory_get_int64 from Memory with dq, 16
+    If sz is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PUSH OPERATIONS
+Note: ============================================================================
+
+@Reasoning
+Push value at the back. If the tail block has room (tail_block_index <
+block_capacity) we write into it. Otherwise we allocate a new block,
+link it after the current tail, and write at index 0.
+@End Reasoning
+
+@Implementation
+1) Read tail_block, tail_block_index.
+2) If index == block_capacity, allocate new block; link prev/next; new
+   block's head = 0, tail = 0; update deque.tail = new block; reset
+   tail_block_index = 0.
+3) Write value at slot address; increment tail_block_index in both the
+   block header and the deque header; increment size.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1) - allocation only when block boundary hit.
+Space: O(1) per push, plus one new block per BLOCK_CAPACITY pushes.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure. Internal state remains consistent on
+failure: the new block is freed before the deque is observed.
+@End Security_Scope
+Process called "deque_push_back" takes dq as Integer, value as Integer returns Integer:
+    If dq is equal to 0:
+        Return 0
+    End If
+    Let tail_block be proc memory_get_int64 from Memory with dq, 8
+    Let tail_idx be proc memory_get_int64 from Memory with dq, 32
+    Let cap be proc memory_get_int64 from Memory with dq, 40
+    If tail_idx is greater than or equal to cap:
+        Let new_block be proc deque_alloc_block
+        If new_block is equal to 0:
+            Return 0
+        End If
+        Note: head and tail in new block start at 0 for a fresh back-block
+        proc memory_set_int64 from Memory with new_block, DEQUE_BLOCK_HEAD_OFFSET, 0
+        proc memory_set_int64 from Memory with new_block, DEQUE_BLOCK_TAIL_OFFSET, 0
+        proc memory_set_int64 from Memory with new_block, DEQUE_BLOCK_PREV_OFFSET, tail_block
+        proc memory_set_int64 from Memory with tail_block, DEQUE_BLOCK_NEXT_OFFSET, new_block
+        proc memory_set_int64 from Memory with dq, 8, new_block
+        Set tail_block to new_block
+        Set tail_idx to 0
+    End If
+    Let addr be proc deque_block_slot_addr with tail_block, tail_idx
+    proc memory_set_int64 from Memory with addr, 0, value
+    Set tail_idx to tail_idx plus 1
+    proc memory_set_int64 from Memory with tail_block, DEQUE_BLOCK_TAIL_OFFSET, tail_idx
+    proc memory_set_int64 from Memory with dq, 32, tail_idx
+    Let sz be proc memory_get_int64 from Memory with dq, 16
+    proc memory_set_int64 from Memory with dq, 16, sz plus 1
+    Return 1
+End Process
+
+@Reasoning
+Push at the front. If head_block_index is 0 we cannot decrement so we
+allocate a new block before the current head and write at index
+(block_capacity - 1).
+@End Reasoning
+
+@Implementation
+1) Read head_block, head_block_index.
+2) If index == 0, allocate new block; link prev/next; set new block's
+   head = block_capacity - 1, tail = block_capacity (full at far end);
+   update deque.head = new block; head_block_index = block_capacity.
+3) Decrement head_block_index, write value at slot, update block.head
+   and deque.head_block_index; increment size.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1). Space: O(1) per push plus one new block per
+BLOCK_CAPACITY front-pushes.
+@End Performance_Hints
+
+@Security_Scope
+Allocation failure returns 0 and leaves the deque unchanged.
+@End Security_Scope
+Process called "deque_push_front" takes dq as Integer, value as Integer returns Integer:
+    If dq is equal to 0:
+        Return 0
+    End If
+    Let head_block be proc memory_get_int64 from Memory with dq, 0
+    Let head_idx be proc memory_get_int64 from Memory with dq, 24
+    Let cap be proc memory_get_int64 from Memory with dq, 40
+    If head_idx is equal to 0:
+        Let new_block be proc deque_alloc_block
+        If new_block is equal to 0:
+            Return 0
+        End If
+        Note: A fresh front-block has head and tail both at cap; we will
+        Note: decrement head below and write at index (cap - 1).
+        proc memory_set_int64 from Memory with new_block, DEQUE_BLOCK_HEAD_OFFSET, cap
+        proc memory_set_int64 from Memory with new_block, DEQUE_BLOCK_TAIL_OFFSET, cap
+        proc memory_set_int64 from Memory with new_block, DEQUE_BLOCK_NEXT_OFFSET, head_block
+        proc memory_set_int64 from Memory with head_block, DEQUE_BLOCK_PREV_OFFSET, new_block
+        proc memory_set_int64 from Memory with dq, 0, new_block
+        Set head_block to new_block
+        Set head_idx to cap
+    End If
+    Set head_idx to head_idx minus 1
+    Let addr be proc deque_block_slot_addr with head_block, head_idx
+    proc memory_set_int64 from Memory with addr, 0, value
+    proc memory_set_int64 from Memory with head_block, DEQUE_BLOCK_HEAD_OFFSET, head_idx
+    proc memory_set_int64 from Memory with dq, 24, head_idx
+    Let sz be proc memory_get_int64 from Memory with dq, 16
+    proc memory_set_int64 from Memory with dq, 16, sz plus 1
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: POP OPERATIONS
+Note: ============================================================================
+
+@Reasoning
+Pop the front element. If after the pop the head block becomes empty
+and there is a successor block, we free the head block and advance.
+This bounds memory at O(size + BLOCK_CAPACITY) and avoids unbounded
+empty-block accumulation under alternating push/pop workloads.
+@End Reasoning
+
+@Implementation
+1) Empty check via size == 0.
+2) Read head_block, head_block_index. The element is at slot[head_idx].
+3) Advance head_block_index, decrement size, update block.head.
+4) If head_block becomes empty (head == tail) and a next block exists,
+   unlink head and free the old block; restore head_block_index from
+   the new head block's head field.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on empty deque; caller must check deque_is_empty first if
+0 is a legitimate slot value.
+@End Security_Scope
+Process called "deque_pop_front" takes dq as Integer returns Integer:
+    If dq is equal to 0:
+        Return 0
+    End If
+    Let sz be proc memory_get_int64 from Memory with dq, 16
+    If sz is equal to 0:
+        Return 0
+    End If
+    Let head_block be proc memory_get_int64 from Memory with dq, 0
+    Let head_idx be proc memory_get_int64 from Memory with dq, 24
+    Let addr be proc deque_block_slot_addr with head_block, head_idx
+    Let value be proc memory_get_int64 from Memory with addr, 0
+    Set head_idx to head_idx plus 1
+    proc memory_set_int64 from Memory with head_block, DEQUE_BLOCK_HEAD_OFFSET, head_idx
+    proc memory_set_int64 from Memory with dq, 24, head_idx
+    proc memory_set_int64 from Memory with dq, 16, sz minus 1
+    Let blk_tail be proc memory_get_int64 from Memory with head_block, DEQUE_BLOCK_TAIL_OFFSET
+    Let next_block be proc memory_get_int64 from Memory with head_block, DEQUE_BLOCK_NEXT_OFFSET
+    If head_idx is greater than or equal to blk_tail:
+        If next_block is not equal to 0:
+            proc memory_set_int64 from Memory with next_block, DEQUE_BLOCK_PREV_OFFSET, 0
+            proc deallocate from Layout with head_block
+            proc memory_set_int64 from Memory with dq, 0, next_block
+            Let new_head_idx be proc memory_get_int64 from Memory with next_block, DEQUE_BLOCK_HEAD_OFFSET
+            proc memory_set_int64 from Memory with dq, 24, new_head_idx
+        End If
+    End If
+    Return value
+End Process
+
+@Reasoning
+Pop the back element. Mirror of pop_front with the tail-block free path.
+@End Reasoning
+
+@Implementation
+1) Empty check.
+2) Read tail_block, tail_block_index. Element is at slot[tail_idx - 1].
+3) Decrement tail_block_index, decrement size.
+4) If the tail block becomes empty (head == tail) and a prev block exists,
+   free the tail block and update deque.tail to prev, restoring
+   tail_block_index from the prev block's tail field.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on empty deque.
+@End Security_Scope
+Process called "deque_pop_back" takes dq as Integer returns Integer:
+    If dq is equal to 0:
+        Return 0
+    End If
+    Let sz be proc memory_get_int64 from Memory with dq, 16
+    If sz is equal to 0:
+        Return 0
+    End If
+    Let tail_block be proc memory_get_int64 from Memory with dq, 8
+    Let tail_idx be proc memory_get_int64 from Memory with dq, 32
+    Set tail_idx to tail_idx minus 1
+    Let addr be proc deque_block_slot_addr with tail_block, tail_idx
+    Let value be proc memory_get_int64 from Memory with addr, 0
+    proc memory_set_int64 from Memory with tail_block, DEQUE_BLOCK_TAIL_OFFSET, tail_idx
+    proc memory_set_int64 from Memory with dq, 32, tail_idx
+    proc memory_set_int64 from Memory with dq, 16, sz minus 1
+    Let blk_head be proc memory_get_int64 from Memory with tail_block, DEQUE_BLOCK_HEAD_OFFSET
+    Let prev_block be proc memory_get_int64 from Memory with tail_block, DEQUE_BLOCK_PREV_OFFSET
+    If tail_idx is less than or equal to blk_head:
+        If prev_block is not equal to 0:
+            proc memory_set_int64 from Memory with prev_block, DEQUE_BLOCK_NEXT_OFFSET, 0
+            proc deallocate from Layout with tail_block
+            proc memory_set_int64 from Memory with dq, 8, prev_block
+            Let new_tail_idx be proc memory_get_int64 from Memory with prev_block, DEQUE_BLOCK_TAIL_OFFSET
+            proc memory_set_int64 from Memory with dq, 32, new_tail_idx
+        End If
+    End If
+    Return value
+End Process
+
+Note: ============================================================================
+Note: PEEK OPERATIONS
+Note: ============================================================================
+
+@Reasoning
+Read the front element without removing it. Exists so callers do not
+have to pop-then-push to inspect.
+@End Reasoning
+
+@Implementation
+If size == 0 return 0. Otherwise read slot[head_block_index] in
+head_block.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Empty returns 0.
+@End Security_Scope
+Process called "deque_peek_front" takes dq as Integer returns Integer:
+    If dq is equal to 0:
+        Return 0
+    End If
+    Let sz be proc memory_get_int64 from Memory with dq, 16
+    If sz is equal to 0:
+        Return 0
+    End If
+    Let head_block be proc memory_get_int64 from Memory with dq, 0
+    Let head_idx be proc memory_get_int64 from Memory with dq, 24
+    Let addr be proc deque_block_slot_addr with head_block, head_idx
+    Return proc memory_get_int64 from Memory with addr, 0
+End Process
+
+@Reasoning
+Read the back element. The tail index is "one past the last", so the
+last element is at slot[tail_idx - 1].
+@End Reasoning
+
+@Implementation
+If empty return 0. Otherwise read slot[tail_block_index - 1] of
+tail_block.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Empty returns 0.
+@End Security_Scope
+Process called "deque_peek_back" takes dq as Integer returns Integer:
+    If dq is equal to 0:
+        Return 0
+    End If
+    Let sz be proc memory_get_int64 from Memory with dq, 16
+    If sz is equal to 0:
+        Return 0
+    End If
+    Let tail_block be proc memory_get_int64 from Memory with dq, 8
+    Let tail_idx be proc memory_get_int64 from Memory with dq, 32
+    Let addr be proc deque_block_slot_addr with tail_block, tail_idx minus 1
+    Return proc memory_get_int64 from Memory with addr, 0
+End Process
+
+Note: ============================================================================
+Note: COMPATIBILITY API - mirrors queue (push_back/pop_front/peek_front)
+Note: ============================================================================
+
+@Reasoning
+Aliases that let a deque be used wherever a queue is expected, so
+callers can substitute a deque without changing call sites.
+@End Reasoning
+
+@Implementation
+Each alias is a one-line forwarder. Optimized to a tail-call by the
+backend.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Inherits semantics from the delegated function.
+@End Security_Scope
+Process called "deque_enqueue" takes dq as Integer, value as Integer returns Integer:
+    Return proc deque_push_back with dq, value
+End Process
+
+@Reasoning
+Forwarder for queue API parity.
+@End Reasoning
+
+@Implementation
+Forwards to deque_pop_front.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Inherits semantics.
+@End Security_Scope
+Process called "deque_dequeue" takes dq as Integer returns Integer:
+    Return proc deque_pop_front with dq
+End Process

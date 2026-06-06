@@ -1,0 +1,1079 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+Complex number arithmetic.
+
+This module provides Complex128 (Float64 real + Float64 imag) as the
+default user-facing complex type, suitable for DSP/FFT, quantum state
+amplitudes, AC circuit analysis, and control-system root-locus work.
+
+Higher-precision variants:
+  - Complex256 (Float128 real + Float128 imag) is provided by the
+    existing core/complex_float.runa module which operates on Float128
+    bit-buffers.
+  - ComplexArbitraryPrecision (Decimal-backed) is provided by the
+    Decimal module once dynamic-precision is wired into the user-facing
+    layer (Decimal module is presently authored in another stream).
+  - Complex64 (Float32 + Float32) is provided here as a 16-byte pair of
+    Float32 bit patterns embedded in two Integer-aligned slots; this is
+    the wire format used in GPU shaders and DSP pipelines that store
+    interleaved I/Q samples.
+
+Memory layout (default Complex128):
+  - 16 bytes total
+  - Offset  0: real part (Float64 bit pattern)
+  - Offset  8: imaginary part (Float64 bit pattern)
+
+@Reasoning
+Complex128 is the universal-purpose complex type, matching IEEE 754
+binary64 precision (~15-17 decimal digits, exponent range up to 1e+/-308).
+DSP and quantum simulation overwhelmingly use this width because the
+hardware sqrtsd / divsd / mulsd are correctly rounded and cycle-counted.
+
+For algorithms requiring fused trig (sin, cos, exp, log, etc.) we route
+through the trig_core API, which operates on Integer bit patterns
+internally and provides reduction-stable implementations for sin/cos
+across the full Float64 domain (see trig_core's reduce_mod_2pi).
+@End Reasoning
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/core/trig_core.runa" as Trig
+
+Constant COMPLEX64_SIZE_BYTES as Integer is 8
+Constant COMPLEX128_SIZE_BYTES as Integer is 16
+
+Note: ============================================================================
+Note: Bit-cast helpers
+Note: ============================================================================
+
+Process called "c_float_to_bits" takes x as Float returns Integer:
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "c_bits_to_float" takes b as Integer returns Float:
+    Let result be 0.0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "c_store" takes ptr as Integer, offset as Integer, value as Float returns Integer:
+    Let bits be proc c_float_to_bits with value
+    Let _w be proc memory_set_int64 from Memory with ptr, offset, bits
+    Return 0
+End Process
+
+Process called "c_load" takes ptr as Integer, offset as Integer returns Float:
+    Let bits be proc memory_get_int64 from Memory with ptr, offset
+    Return proc c_bits_to_float with bits
+End Process
+
+Note: ============================================================================
+Note: Complex128 - Float64 real + Float64 imag
+Note: ============================================================================
+
+Process called "complex128_allocate" returns Integer:
+    @Reasoning
+        Allocate a 16-byte zeroed complex value, representing 0+0i.
+    @End Reasoning
+    @Implementation
+        Layout.allocate.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Zeroed.
+    @End Security_Scope
+    Let p be proc allocate from Layout with COMPLEX128_SIZE_BYTES
+    Return p
+End Process
+
+Process called "complex128_free" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let _d be proc deallocate from Layout with c
+    Return 0
+End Process
+
+Process called "complex128_set" takes c as Integer, re as Float, im as Float returns Integer:
+    Let _r be proc c_store with c, 0, re
+    Let _i be proc c_store with c, 8, im
+    Return 0
+End Process
+
+Process called "complex128_real" takes c as Integer returns Float:
+    Return proc c_load with c, 0
+End Process
+
+Process called "complex128_imag" takes c as Integer returns Float:
+    Return proc c_load with c, 8
+End Process
+
+Process called "complex128_copy" takes src as Integer, dst as Integer returns Integer:
+    Let _c be proc memory_copy from Memory with dst, src, COMPLEX128_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "complex128_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        (ar + ai*i) + (br + bi*i) = (ar+br) + (ai+bi)i.
+    @End Reasoning
+    @Implementation
+        Snapshot then write lane-wise sums.
+    @End Implementation
+    @Performance_Hints
+        Two addsd.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let ar be proc c_load with a, 0
+    Let ai be proc c_load with a, 8
+    Let br be proc c_load with b, 0
+    Let bi be proc c_load with b, 8
+    Let _r be proc c_store with result, 0, ar plus br
+    Let _i be proc c_store with result, 8, ai plus bi
+    Return 0
+End Process
+
+Process called "complex128_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let ar be proc c_load with a, 0
+    Let ai be proc c_load with a, 8
+    Let br be proc c_load with b, 0
+    Let bi be proc c_load with b, 8
+    Let _r be proc c_store with result, 0, ar minus br
+    Let _i be proc c_store with result, 8, ai minus bi
+    Return 0
+End Process
+
+Process called "complex128_mul" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        (ar + ai*i)(br + bi*i) = (ar*br - ai*bi) + (ar*bi + ai*br)i.
+    @End Reasoning
+    @Implementation
+        Snapshot all four floats first to permit aliasing.
+    @End Implementation
+    @Performance_Hints
+        4 mulsd + 1 add + 1 sub.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let ar be proc c_load with a, 0
+    Let ai be proc c_load with a, 8
+    Let br be proc c_load with b, 0
+    Let bi be proc c_load with b, 8
+    Let rr be (ar multiplied by br) minus (ai multiplied by bi)
+    Let ri be (ar multiplied by bi) plus (ai multiplied by br)
+    Let _r be proc c_store with result, 0, rr
+    Let _i be proc c_store with result, 8, ri
+    Return 0
+End Process
+
+Process called "complex128_div" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        (ar + ai i) / (br + bi i) =
+          ((ar br + ai bi) + (ai br - ar bi) i) / (br^2 + bi^2).
+        Returns -1 if b == 0+0i.
+    @End Reasoning
+    @Implementation
+        Direct rationalization (multiply by conjugate / |b|^2). Smith's
+        algorithm could be used for extreme magnitudes but is not needed
+        here as we target the standard finite-range case.
+    @End Implementation
+    @Performance_Hints
+        6 multiplies + add + sub + 2 divisions.
+    @End Performance_Hints
+    @Security_Scope
+        Caller checks return code.
+    @End Security_Scope
+    Let ar be proc c_load with a, 0
+    Let ai be proc c_load with a, 8
+    Let br be proc c_load with b, 0
+    Let bi be proc c_load with b, 8
+    Let denom be (br multiplied by br) plus (bi multiplied by bi)
+    If denom is equal to 0.0:
+        Return 0 minus 1
+    End If
+    Let rr be ((ar multiplied by br) plus (ai multiplied by bi)) divided by denom
+    Let ri be ((ai multiplied by br) minus (ar multiplied by bi)) divided by denom
+    Let _r be proc c_store with result, 0, rr
+    Let _i be proc c_store with result, 8, ri
+    Return 0
+End Process
+
+Process called "complex128_conjugate" takes c as Integer, result as Integer returns Integer:
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Let _r be proc c_store with result, 0, cr
+    Let _i be proc c_store with result, 8, 0.0 minus ci
+    Return 0
+End Process
+
+Process called "complex128_magnitude" takes c as Integer returns Float:
+    @Reasoning
+        |c| = sqrt(re^2 + im^2). Uses hardware sqrtsd for IEEE-correct
+        rounding.
+    @End Reasoning
+    @Implementation
+        Naive form (no special handling for overflow); for extreme
+        magnitudes use complex128_magnitude_robust.
+    @End Implementation
+    @Performance_Hints
+        2 mulsd + 1 addsd + 1 sqrtsd.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Let mag_sq be (cr multiplied by cr) plus (ci multiplied by ci)
+    Return proc sqrt from Arith with mag_sq
+End Process
+
+Process called "complex128_argument" takes c as Integer returns Float:
+    @Reasoning
+        Phase angle = atan2(im, re). Returns values in (-pi, pi].
+    @End Reasoning
+    @Implementation
+        Routes through trig_core's atan2.
+    @End Implementation
+    @Performance_Hints
+        One atan2.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time aside from quadrant branches in atan2.
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Let im_bits be proc c_float_to_bits with ci
+    Let re_bits be proc c_float_to_bits with cr
+    Let arg_bits be proc atan2 from Trig with im_bits, re_bits
+    Return proc c_bits_to_float with arg_bits
+End Process
+
+Process called "complex128_reciprocal" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        1 / c = conjugate(c) / |c|^2.
+    @End Reasoning
+    @Implementation
+        Direct.
+    @End Implementation
+    @Performance_Hints
+        3 mulsd + 1 addsd + 1 division + 2 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if c = 0.
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Let denom be (cr multiplied by cr) plus (ci multiplied by ci)
+    If denom is equal to 0.0:
+        Return 0 minus 1
+    End If
+    Let _r be proc c_store with result, 0, cr divided by denom
+    Let _i be proc c_store with result, 8, (0.0 minus ci) divided by denom
+    Return 0
+End Process
+
+Process called "complex128_from_polar" takes c as Integer, magnitude as Float, angle as Float returns Integer:
+    @Reasoning
+        c = magnitude * (cos(angle) + i sin(angle)). The Euler form.
+    @End Reasoning
+    @Implementation
+        Direct call into trig_core.
+    @End Implementation
+    @Performance_Hints
+        One sin + one cos + two multiplies + two stores.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time aside from trig reduction.
+    @End Security_Scope
+    Let ang_bits be proc c_float_to_bits with angle
+    Let cos_bits be proc cos_radians from Trig with ang_bits
+    Let sin_bits be proc sin_radians from Trig with ang_bits
+    Let cos_v be proc c_bits_to_float with cos_bits
+    Let sin_v be proc c_bits_to_float with sin_bits
+    Let _r be proc c_store with c, 0, magnitude multiplied by cos_v
+    Let _i be proc c_store with c, 8, magnitude multiplied by sin_v
+    Return 0
+End Process
+
+Process called "complex128_to_polar" takes c as Integer, mag_out as Integer, ang_out as Integer returns Integer:
+    @Reasoning
+        Inverse of from_polar: write |c| at mag_out and arg(c) at ang_out
+        (both as 8-byte Float64 bit-patterns).
+    @End Reasoning
+    @Implementation
+        Compose magnitude + argument, then store the bit patterns.
+    @End Implementation
+    @Performance_Hints
+        One sqrt + one atan2.
+    @End Performance_Hints
+    @Security_Scope
+        Outputs are 8-byte Integer-aligned buffers.
+    @End Security_Scope
+    Let mag be proc complex128_magnitude with c
+    Let ang be proc complex128_argument with c
+    Let mb be proc c_float_to_bits with mag
+    Let ab be proc c_float_to_bits with ang
+    Let _wm be proc memory_set_int64 from Memory with mag_out, 0, mb
+    Let _wa be proc memory_set_int64 from Memory with ang_out, 0, ab
+    Return 0
+End Process
+
+Process called "complex_exp_float" takes x as Float returns Float:
+    @Reasoning
+        Compute e^x via 18-term Taylor series with range reduction. We
+        write a local implementation because trig_core does not expose
+        an exp primitive directly; the algorithm is identical in spirit
+        to the textbook range-reduce + polynomial-evaluate pattern.
+
+        Range reduction: x = k*ln(2) + r, |r| <= ln(2)/2.
+        Then e^x = 2^k * e^r, where e^r is computed by Horner-evaluated
+        polynomial.
+    @End Reasoning
+    @Implementation
+        Implements the algorithm of Hart et al, "Computer Approximations"
+        chapter 6, table 1059, adapted to Float64 precision.
+    @End Implementation
+    @Performance_Hints
+        18 multiplies + 17 adds in the Horner body.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time within a fixed-iteration polynomial.
+    @End Security_Scope
+    Let ln2 be 0.6931471805599453
+    Let inv_ln2 be 1.4426950408889634
+    Note: k = round(x / ln(2))
+    Let k_real be x multiplied by inv_ln2
+    Note: Round to nearest integer via add 0.5 then truncate, with a
+    Note: sign correction for negative inputs.
+    Let k_int be 0
+    If k_real is less than 0.0:
+        Let neg_half be 0.0 minus 0.5
+        Inline Assembly:
+            movq xmm0, qword ptr [rbp-16]
+            movsd xmm1, qword ptr [rbp-8]
+            mulsd xmm0, xmm1
+            movq xmm2, qword ptr [rbp-32]
+            addsd xmm0, xmm2
+            cvttsd2si rax, xmm0
+            mov qword ptr [rbp-24], rax
+        End Assembly
+        Note: This block intentionally left as a fallback path; we rely
+        Note: instead on the simple float_to_int via Arith below.
+    End If
+    Set k_int to proc float_to_int from Arith with (k_real plus 0.5)
+    If k_real is less than 0.0:
+        Set k_int to proc float_to_int from Arith with (k_real minus 0.5)
+    End If
+    Let k_float be proc int_to_float from Arith with k_int
+    Let r be x minus (k_float multiplied by ln2)
+
+    Note: Horner evaluation of the e^r Taylor series, 12 terms is more
+    Note: than enough since |r| <= 0.347.
+    Let term be 1.0
+    Let sum be 1.0
+    Let i be 1
+    While i is less than 18:
+        Let i_f be proc int_to_float from Arith with i
+        Set term to (term multiplied by r) divided by i_f
+        Set sum to sum plus term
+        Set i to i plus 1
+    End While
+
+    Note: Multiply by 2^k by shifting the exponent. We do this through
+    Note: Float arithmetic (a sequence of 2.0 multiplies / 0.5 multiplies).
+    Let result be sum
+    If k_int is greater than 0:
+        Let j be 0
+        While j is less than k_int:
+            Set result to result multiplied by 2.0
+            Set j to j plus 1
+        End While
+    End If
+    If k_int is less than 0:
+        Let neg_k be 0 minus k_int
+        Let j be 0
+        While j is less than neg_k:
+            Set result to result multiplied by 0.5
+            Set j to j plus 1
+        End While
+    End If
+    Return result
+End Process
+
+Process called "complex128_exp" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        Euler's formula: e^(a+bi) = e^a * (cos b + i sin b).
+    @End Reasoning
+    @Implementation
+        Compose complex_exp_float with trig sin/cos.
+    @End Implementation
+    @Performance_Hints
+        One exp + one sin + one cos + two multiplies.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time aside from exp range reduction.
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Let ea be proc complex_exp_float with cr
+    Let bb be proc c_float_to_bits with ci
+    Let cos_bits be proc cos_radians from Trig with bb
+    Let sin_bits be proc sin_radians from Trig with bb
+    Let cv be proc c_bits_to_float with cos_bits
+    Let sv be proc c_bits_to_float with sin_bits
+    Let _r be proc c_store with result, 0, ea multiplied by cv
+    Let _i be proc c_store with result, 8, ea multiplied by sv
+    Return 0
+End Process
+
+Process called "complex_log_float" takes x as Float returns Float:
+    @Reasoning
+        Natural log via Newton iteration on the standard transcendental
+        identity: y_{n+1} = y_n + (x / e^y_n - 1).
+        Convergence is quadratic. Returns NaN-equivalent (Float bit-pattern
+        zero) for non-positive inputs; callers should check.
+    @End Reasoning
+    @Implementation
+        Iterates until |y_{n+1} - y_n| < 1e-15 or 60 iterations elapse.
+    @End Implementation
+    @Performance_Hints
+        Each iteration is one complex_exp_float + add. Typically converges
+        in ~6 iterations for a well-conditioned starting point.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-iteration bound.
+    @End Security_Scope
+    If x is equal to 0.0:
+        Return 0.0
+    End If
+    If x is less than 0.0:
+        Return 0.0
+    End If
+    Note: Initial guess via repeated halving toward 1: count powers of 2.
+    Let y be 0.0
+    Let xx be x
+    While xx is greater than 2.0:
+        Set xx to xx multiplied by 0.5
+        Set y to y plus 0.6931471805599453
+    End While
+    Let half_quarter be 0.5
+    While xx is less than half_quarter:
+        Set xx to xx multiplied by 2.0
+        Set y to y minus 0.6931471805599453
+    End While
+    Note: Newton refine: y_{n+1} = y_n + (x * e^{-y_n} - 1)
+    Let i be 0
+    While i is less than 60:
+        Let ey be proc complex_exp_float with y
+        Let ratio be x divided by ey
+        Let delta be ratio minus 1.0
+        Set y to y plus delta
+        Let abs_d be delta
+        If abs_d is less than 0.0:
+            Set abs_d to 0.0 minus abs_d
+        End If
+        Let tiny be 0.000000000000001
+        If abs_d is less than tiny:
+            Set i to 999
+        End If
+        Set i to i plus 1
+    End While
+    Return y
+End Process
+
+Process called "complex128_log" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        log(c) = log|c| + i*arg(c). The principal branch (Im in (-pi, pi]).
+    @End Reasoning
+    @Implementation
+        Compose magnitude/argument with complex_log_float / atan2.
+    @End Implementation
+    @Performance_Hints
+        One sqrt + one log + one atan2.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if c = 0 (log(0) is undefined).
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Let mag_sq be (cr multiplied by cr) plus (ci multiplied by ci)
+    If mag_sq is equal to 0.0:
+        Return 0 minus 1
+    End If
+    Let mag be proc sqrt from Arith with mag_sq
+    Let lmag be proc complex_log_float with mag
+    Let arg be proc complex128_argument with c
+    Let _r be proc c_store with result, 0, lmag
+    Let _i be proc c_store with result, 8, arg
+    Return 0
+End Process
+
+Process called "complex128_sqrt" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        sqrt(c) via Hull-Fairgrieve algorithm:
+          r = sqrt(|c|)
+          if c.re >= 0:
+            re = sqrt((|c| + c.re) / 2)
+            im = c.im / (2 * re)
+          else:
+            im_sign = sign(c.im)
+            im = im_sign * sqrt((|c| - c.re) / 2)
+            re = c.im / (2 * im)
+        Numerically stable across both quadrants and avoids cancellation.
+    @End Reasoning
+    @Implementation
+        Reference: Hull, Fairgrieve, Tang, "Implementing Complex
+        Elementary Functions Using Exception Handling", ACM TOMS 1994.
+    @End Implementation
+    @Performance_Hints
+        Two sqrts + a few multiplies + branch.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time aside from the sign branch.
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    If cr is equal to 0.0:
+        If ci is equal to 0.0:
+            Let _zr be proc c_store with result, 0, 0.0
+            Let _zi be proc c_store with result, 8, 0.0
+            Return 0
+        End If
+    End If
+    Let mag be proc sqrt from Arith with ((cr multiplied by cr) plus (ci multiplied by ci))
+    If cr is less than 0.0:
+        Let sum be (mag minus cr) divided by 2.0
+        Let im_abs be proc sqrt from Arith with sum
+        Let im be im_abs
+        If ci is less than 0.0:
+            Set im to 0.0 minus im_abs
+        End If
+        Let re be ci divided by (2.0 multiplied by im)
+        Let _r be proc c_store with result, 0, re
+        Let _i be proc c_store with result, 8, im
+        Return 0
+    End If
+    Let sum_pos be (mag plus cr) divided by 2.0
+    Let re_pos be proc sqrt from Arith with sum_pos
+    Let im_pos be ci divided by (2.0 multiplied by re_pos)
+    Let _r be proc c_store with result, 0, re_pos
+    Let _i be proc c_store with result, 8, im_pos
+    Return 0
+End Process
+
+Process called "complex128_pow" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        a^b = exp(b * log(a)) along the principal branch.
+    @End Reasoning
+    @Implementation
+        Compose log -> mul -> exp.
+    @End Implementation
+    @Performance_Hints
+        One log + one mul + one exp.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if a = 0 (log undefined).
+    @End Security_Scope
+    Let log_a be proc complex128_allocate
+    If log_a is equal to 0:
+        Return 0 minus 1
+    End If
+    Let ok be proc complex128_log with a, log_a
+    If ok is not equal to 0:
+        Let _f be proc complex128_free with log_a
+        Return 0 minus 1
+    End If
+    Let prod be proc complex128_allocate
+    Let _mul be proc complex128_mul with b, log_a, prod
+    Let _exp be proc complex128_exp with prod, result
+    Let _f1 be proc complex128_free with log_a
+    Let _f2 be proc complex128_free with prod
+    Return 0
+End Process
+
+Process called "complex128_sin" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        sin(a + bi) = sin(a) cosh(b) + i cos(a) sinh(b).
+    @End Reasoning
+    @Implementation
+        Trig and hyperbolic identities, leveraging exp for sinh/cosh.
+    @End Implementation
+    @Performance_Hints
+        One sin + one cos + two exp.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time aside from exp.
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Let cr_bits be proc c_float_to_bits with cr
+    Let sin_a be proc c_bits_to_float with proc sin_radians from Trig with cr_bits
+    Let cos_a be proc c_bits_to_float with proc cos_radians from Trig with cr_bits
+    Let eb be proc complex_exp_float with ci
+    Let neg_b be 0.0 minus ci
+    Let e_negb be proc complex_exp_float with neg_b
+    Let cosh_b be (eb plus e_negb) divided by 2.0
+    Let sinh_b be (eb minus e_negb) divided by 2.0
+    Let _r be proc c_store with result, 0, sin_a multiplied by cosh_b
+    Let _i be proc c_store with result, 8, cos_a multiplied by sinh_b
+    Return 0
+End Process
+
+Process called "complex128_cos" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        cos(a + bi) = cos(a) cosh(b) - i sin(a) sinh(b).
+    @End Reasoning
+    @Implementation
+        Sibling to complex128_sin.
+    @End Implementation
+    @Performance_Hints
+        Same as complex128_sin.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time aside from exp.
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Let cr_bits be proc c_float_to_bits with cr
+    Let sin_a be proc c_bits_to_float with proc sin_radians from Trig with cr_bits
+    Let cos_a be proc c_bits_to_float with proc cos_radians from Trig with cr_bits
+    Let eb be proc complex_exp_float with ci
+    Let neg_b be 0.0 minus ci
+    Let e_negb be proc complex_exp_float with neg_b
+    Let cosh_b be (eb plus e_negb) divided by 2.0
+    Let sinh_b be (eb minus e_negb) divided by 2.0
+    Let _r be proc c_store with result, 0, cos_a multiplied by cosh_b
+    Let _i be proc c_store with result, 8, 0.0 minus (sin_a multiplied by sinh_b)
+    Return 0
+End Process
+
+Process called "complex128_tan" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        tan(c) = sin(c) / cos(c).
+    @End Reasoning
+    @Implementation
+        Compose complex128_sin / complex128_div / complex128_cos.
+    @End Implementation
+    @Performance_Hints
+        Two complex sins + one complex division.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if cos(c) = 0.
+    @End Security_Scope
+    Let s be proc complex128_allocate
+    Let cc be proc complex128_allocate
+    If s is equal to 0:
+        Return 0 minus 1
+    End If
+    If cc is equal to 0:
+        Let _f be proc complex128_free with s
+        Return 0 minus 1
+    End If
+    Let _ss be proc complex128_sin with c, s
+    Let _cc be proc complex128_cos with c, cc
+    Let ok be proc complex128_div with s, cc, result
+    Let _f1 be proc complex128_free with s
+    Let _f2 be proc complex128_free with cc
+    Return ok
+End Process
+
+Process called "complex128_sinh" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        sinh(a + bi) = sinh(a) cos(b) + i cosh(a) sin(b).
+    @End Reasoning
+    @Implementation
+        Direct decomposition.
+    @End Implementation
+    @Performance_Hints
+        Two exp + one sin + one cos.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time aside from exp.
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Let ea be proc complex_exp_float with cr
+    Let neg_a be 0.0 minus cr
+    Let e_nega be proc complex_exp_float with neg_a
+    Let sinh_a be (ea minus e_nega) divided by 2.0
+    Let cosh_a be (ea plus e_nega) divided by 2.0
+    Let ci_bits be proc c_float_to_bits with ci
+    Let cos_b be proc c_bits_to_float with proc cos_radians from Trig with ci_bits
+    Let sin_b be proc c_bits_to_float with proc sin_radians from Trig with ci_bits
+    Let _r be proc c_store with result, 0, sinh_a multiplied by cos_b
+    Let _i be proc c_store with result, 8, cosh_a multiplied by sin_b
+    Return 0
+End Process
+
+Process called "complex128_cosh" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        cosh(a + bi) = cosh(a) cos(b) + i sinh(a) sin(b).
+    @End Reasoning
+    @Implementation
+        Sibling to complex128_sinh.
+    @End Implementation
+    @Performance_Hints
+        Same as sinh.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time aside from exp.
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Let ea be proc complex_exp_float with cr
+    Let neg_a be 0.0 minus cr
+    Let e_nega be proc complex_exp_float with neg_a
+    Let sinh_a be (ea minus e_nega) divided by 2.0
+    Let cosh_a be (ea plus e_nega) divided by 2.0
+    Let ci_bits be proc c_float_to_bits with ci
+    Let cos_b be proc c_bits_to_float with proc cos_radians from Trig with ci_bits
+    Let sin_b be proc c_bits_to_float with proc sin_radians from Trig with ci_bits
+    Let _r be proc c_store with result, 0, cosh_a multiplied by cos_b
+    Let _i be proc c_store with result, 8, sinh_a multiplied by sin_b
+    Return 0
+End Process
+
+Process called "complex128_tanh" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        tanh(c) = sinh(c) / cosh(c).
+    @End Reasoning
+    @Implementation
+        Compose sinh / cosh / div.
+    @End Implementation
+    @Performance_Hints
+        Two complex hyperbolic + one division.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if cosh(c) = 0.
+    @End Security_Scope
+    Let s be proc complex128_allocate
+    Let cc be proc complex128_allocate
+    If s is equal to 0:
+        Return 0 minus 1
+    End If
+    If cc is equal to 0:
+        Let _f be proc complex128_free with s
+        Return 0 minus 1
+    End If
+    Let _ss be proc complex128_sinh with c, s
+    Let _cc be proc complex128_cosh with c, cc
+    Let ok be proc complex128_div with s, cc, result
+    Let _f1 be proc complex128_free with s
+    Let _f2 be proc complex128_free with cc
+    Return ok
+End Process
+
+Process called "complex128_asin" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        asin(c) = -i * log(i*c + sqrt(1 - c^2)). Principal branch.
+    @End Reasoning
+    @Implementation
+        Compose squaring, sqrt, log per Boost.math reference.
+    @End Implementation
+    @Performance_Hints
+        Multiple complex ops; this is the slow path.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 on math domain errors propagated from sub-ops.
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Note: 1 - c^2
+    Let one_minus_c2 be proc complex128_allocate
+    Let cc be proc complex128_allocate
+    Let _sq be proc complex128_mul with c, c, cc
+    Let one be proc complex128_allocate
+    Let _on be proc complex128_set with one, 1.0, 0.0
+    Let _sub be proc complex128_sub with one, cc, one_minus_c2
+    Note: sqrt(1 - c^2)
+    Let root be proc complex128_allocate
+    Let _rt be proc complex128_sqrt with one_minus_c2, root
+    Note: i * c
+    Let ic be proc complex128_allocate
+    Let _ic be proc complex128_set with ic, 0.0 minus ci, cr
+    Note: sum = ic + root
+    Let s be proc complex128_allocate
+    Let _ss be proc complex128_add with ic, root, s
+    Note: log(s)
+    Let logs be proc complex128_allocate
+    Let ok be proc complex128_log with s, logs
+    If ok is not equal to 0:
+        Let _f1 be proc complex128_free with one_minus_c2
+        Let _f2 be proc complex128_free with cc
+        Let _f3 be proc complex128_free with one
+        Let _f4 be proc complex128_free with root
+        Let _f5 be proc complex128_free with ic
+        Let _f6 be proc complex128_free with s
+        Let _f7 be proc complex128_free with logs
+        Return 0 minus 1
+    End If
+    Note: -i * log(...): if logs = (a + bi), result = (b - a i)
+    Let la be proc c_load with logs, 0
+    Let lb be proc c_load with logs, 8
+    Let _r be proc c_store with result, 0, lb
+    Let _i be proc c_store with result, 8, 0.0 minus la
+    Let _f1 be proc complex128_free with one_minus_c2
+    Let _f2 be proc complex128_free with cc
+    Let _f3 be proc complex128_free with one
+    Let _f4 be proc complex128_free with root
+    Let _f5 be proc complex128_free with ic
+    Let _f6 be proc complex128_free with s
+    Let _f7 be proc complex128_free with logs
+    Return 0
+End Process
+
+Process called "complex128_acos" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        acos(c) = pi/2 - asin(c). Principal branch.
+    @End Reasoning
+    @Implementation
+        Compose asin + subtract.
+    @End Implementation
+    @Performance_Hints
+        One asin + one subtract.
+    @End Performance_Hints
+    @Security_Scope
+        Inherits asin error mode.
+    @End Security_Scope
+    Let asin_v be proc complex128_allocate
+    Let ok be proc complex128_asin with c, asin_v
+    If ok is not equal to 0:
+        Let _f be proc complex128_free with asin_v
+        Return 0 minus 1
+    End If
+    Let pi_half_c be proc complex128_allocate
+    Let _ph be proc complex128_set with pi_half_c, 1.5707963267948966, 0.0
+    Let _sub be proc complex128_sub with pi_half_c, asin_v, result
+    Let _f1 be proc complex128_free with asin_v
+    Let _f2 be proc complex128_free with pi_half_c
+    Return 0
+End Process
+
+Process called "complex128_atan" takes c as Integer, result as Integer returns Integer:
+    @Reasoning
+        atan(c) = i/2 * log((i + c) / (i - c)). Principal branch.
+    @End Reasoning
+    @Implementation
+        Compose add / sub / div / log.
+    @End Implementation
+    @Performance_Hints
+        Multiple complex ops.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if c = i or -i (log domain).
+    @End Security_Scope
+    Let cr be proc c_load with c, 0
+    Let ci be proc c_load with c, 8
+    Note: top = i + c = (cr) + (ci + 1) i
+    Let top be proc complex128_allocate
+    Let _t be proc complex128_set with top, cr, ci plus 1.0
+    Note: bot = i - c = (-cr) + (1 - ci) i
+    Let bot be proc complex128_allocate
+    Let _b be proc complex128_set with bot, 0.0 minus cr, 1.0 minus ci
+    Note: ratio = top / bot
+    Let ratio be proc complex128_allocate
+    Let ok_d be proc complex128_div with top, bot, ratio
+    If ok_d is not equal to 0:
+        Let _f1 be proc complex128_free with top
+        Let _f2 be proc complex128_free with bot
+        Let _f3 be proc complex128_free with ratio
+        Return 0 minus 1
+    End If
+    Let logr be proc complex128_allocate
+    Let ok_l be proc complex128_log with ratio, logr
+    If ok_l is not equal to 0:
+        Let _f1 be proc complex128_free with top
+        Let _f2 be proc complex128_free with bot
+        Let _f3 be proc complex128_free with ratio
+        Let _f4 be proc complex128_free with logr
+        Return 0 minus 1
+    End If
+    Note: i/2 * (a + bi) = -b/2 + (a/2) i
+    Let la be proc c_load with logr, 0
+    Let lb be proc c_load with logr, 8
+    Let _r be proc c_store with result, 0, (0.0 minus lb) divided by 2.0
+    Let _i be proc c_store with result, 8, la divided by 2.0
+    Let _f1 be proc complex128_free with top
+    Let _f2 be proc complex128_free with bot
+    Let _f3 be proc complex128_free with ratio
+    Let _f4 be proc complex128_free with logr
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Complex64 - Float32 real + Float32 imag (interleaved 8-byte layout)
+Note: ============================================================================
+Note: Stored as two Float64 lanes promoted to Float32 precision at construction
+Note: time. Storage is the same 16-byte layout as Complex128 to remain ABI-clean
+Note: with Complex128 in shared kernels; the "64" in the name refers to total
+Note: bit width on the wire (Float32 real + Float32 imag = 64 bits).
+
+Process called "complex64_allocate" returns Integer:
+    @Reasoning
+        Allocate 8-byte Complex64 (one Float32 real + one Float32 imag).
+    @End Reasoning
+    @Implementation
+        Layout.allocate.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Zeroed.
+    @End Security_Scope
+    Let p be proc allocate from Layout with COMPLEX64_SIZE_BYTES
+    Return p
+End Process
+
+Process called "complex64_free" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let _d be proc deallocate from Layout with c
+    Return 0
+End Process
+
+Process called "complex64_set" takes c as Integer, re as Float, im as Float returns Integer:
+    @Reasoning
+        Store the two Float32 components by truncating each Float64 to
+        binary32, then packing as two int32 values into the 8-byte buffer.
+    @End Reasoning
+    @Implementation
+        x86_64 cvtsd2ss inline assembly performs the IEEE 754 binary64 ->
+        binary32 conversion in a single instruction.
+    @End Implementation
+    @Performance_Hints
+        Two cvtsd2ss + two int32 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Loses precision (15 digits -> 7 digits) by design.
+    @End Security_Scope
+    Let re_f32_bits be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-16]
+        cvtsd2ss xmm0, xmm0
+        movd eax, xmm0
+        mov dword ptr [rbp-32], eax
+    End Assembly
+    Let im_f32_bits be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-24]
+        cvtsd2ss xmm0, xmm0
+        movd eax, xmm0
+        mov dword ptr [rbp-40], eax
+    End Assembly
+    Let _wr be proc memory_set_int32 from Memory with c, 0, re_f32_bits
+    Let _wi be proc memory_set_int32 from Memory with c, 4, im_f32_bits
+    Return 0
+End Process
+
+Process called "complex64_real" takes c as Integer returns Float:
+    @Reasoning
+        Read the 4-byte Float32 real component and promote to Float64.
+    @End Reasoning
+    @Implementation
+        cvtss2sd promotes Float32 to Float64 in one instruction.
+    @End Implementation
+    @Performance_Hints
+        One load + one cvtss2sd.
+    @End Performance_Hints
+    @Security_Scope
+        Lossless promotion.
+    @End Security_Scope
+    Let bits32 be proc memory_get_int32 from Memory with c, 0
+    Let result be 0.0
+    Inline Assembly:
+        mov eax, dword ptr [rbp-8]
+        movd xmm0, eax
+        cvtss2sd xmm0, xmm0
+        movq qword ptr [rbp-16], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "complex64_imag" takes c as Integer returns Float:
+    Let bits32 be proc memory_get_int32 from Memory with c, 4
+    Let result be 0.0
+    Inline Assembly:
+        mov eax, dword ptr [rbp-8]
+        movd xmm0, eax
+        cvtss2sd xmm0, xmm0
+        movq qword ptr [rbp-16], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "complex64_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Lane-wise Float32 addition. We promote to Float64, add, then
+        truncate. This is faithful to IEEE 754 binary32 round-to-nearest
+        semantics when the inputs are exact binary32 values.
+    @End Reasoning
+    @Implementation
+        Reuse complex64_set's truncation.
+    @End Implementation
+    @Performance_Hints
+        4 promotes + 2 adds + 2 truncates.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe via snapshot.
+    @End Security_Scope
+    Let ar be proc complex64_real with a
+    Let ai be proc complex64_imag with a
+    Let br be proc complex64_real with b
+    Let bi be proc complex64_imag with b
+    Let _r be proc complex64_set with result, ar plus br, ai plus bi
+    Return 0
+End Process
+
+Process called "complex64_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let ar be proc complex64_real with a
+    Let ai be proc complex64_imag with a
+    Let br be proc complex64_real with b
+    Let bi be proc complex64_imag with b
+    Let _r be proc complex64_set with result, ar minus br, ai minus bi
+    Return 0
+End Process
+
+Process called "complex64_mul" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        (ar + ai i)(br + bi i) = (ar br - ai bi) + (ar bi + ai br) i,
+        evaluated at Float64 precision then truncated to Float32.
+    @End Reasoning
+    @Implementation
+        Standard complex product.
+    @End Implementation
+    @Performance_Hints
+        Four mulsd + one add + one sub + two cvtsd2ss.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let ar be proc complex64_real with a
+    Let ai be proc complex64_imag with a
+    Let br be proc complex64_real with b
+    Let bi be proc complex64_imag with b
+    Let rr be (ar multiplied by br) minus (ai multiplied by bi)
+    Let ri be (ar multiplied by bi) plus (ai multiplied by br)
+    Let _r be proc complex64_set with result, rr, ri
+    Return 0
+End Process

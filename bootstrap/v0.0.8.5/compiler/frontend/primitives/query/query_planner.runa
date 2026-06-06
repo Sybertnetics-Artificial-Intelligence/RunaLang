@@ -1,0 +1,1541 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+QUERY_PLANNER - Logical-to-Physical Plan Conversion + Cost Estimation
+==============================================================================
+
+Implements the relational planner phase used by Runa's RQL/SQL pipeline.
+The logical plan is the AST in query_ast.runa with relational operators
+attached to each clause.  The physical plan is the same operator tree
+annotated with execution strategies (Seq scan vs Index lookup, Hash join
+vs Nested-loop join, etc.) and ordered for execution.
+
+The planner runs three standard optimization passes per Selinger et al.
+(System R: "Access Path Selection in a Relational Database Management
+System", 1979), Graefe ("Volcano: An Extensible and Parallel Query
+Evaluation System", 1994), and the Cascades framework (Goetz Graefe,
+1995):
+
+  1. Predicate pushdown (filter as early as possible)
+  2. Projection pushdown (drop unused columns as early as possible)
+  3. Join reordering (place smaller relations on the build side of
+     hash joins; heuristic uses estimated cardinality)
+
+Cost model: each operator has a unit cost (cardinality estimate * a
+per-row processing constant).  Costs propagate up through operators
+following the standard System R formulae.
+
+Records:
+
+  LogicalPlan (48 bytes):
+    off  0  kind        LOP_*
+    off  8  primary     (table name / column name / operator)
+    off 16  cardinality (estimate)
+    off 24  children    List of LogicalPlan
+    off 32  predicate   (query_ast node) or 0
+    off 40  projection  List of column-name strings (LOP_SCAN only;
+                        empty / 0 means project all columns)
+
+  PhysicalPlan (48 bytes):
+    off  0  kind        POP_*
+    off  8  primary     (same as logical, plus access path)
+    off 16  cost        (computed)
+    off 24  children    List of PhysicalPlan
+    off 32  predicate   (query_ast node) or 0
+    off 40  access_path (for scan: INDEX / SEQ / HASH; for join: HASH /
+                        NL / SORT_MERGE)
+
+  TableStatistics (24 bytes):
+    off  0  table name pointer
+    off  8  row count
+    off 16  reserved
+
+References:
+  - System R access path selection: Selinger et al. 1979
+  - Volcano model: Graefe 1994
+  - PostgreSQL planner: https://www.postgresql.org/docs/current/planner-optimizer.html
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/query/query_ast.runa" as QA
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Constant LOP_SCAN as Integer is 1
+Constant LOP_FILTER as Integer is 2
+Constant LOP_PROJECT as Integer is 3
+Constant LOP_JOIN as Integer is 4
+Constant LOP_GROUP as Integer is 5
+Constant LOP_SORT as Integer is 6
+Constant LOP_LIMIT as Integer is 7
+Constant LOP_AGGREGATE as Integer is 8
+Constant LOP_UNION as Integer is 9
+
+Constant POP_SEQ_SCAN as Integer is 1
+Constant POP_INDEX_SCAN as Integer is 2
+Constant POP_FILTER as Integer is 3
+Constant POP_PROJECT as Integer is 4
+Constant POP_HASH_JOIN as Integer is 5
+Constant POP_NL_JOIN as Integer is 6
+Constant POP_SORT_MERGE_JOIN as Integer is 7
+Constant POP_HASH_AGGREGATE as Integer is 8
+Constant POP_SORT_AGGREGATE as Integer is 9
+Constant POP_SORT as Integer is 10
+Constant POP_LIMIT as Integer is 11
+
+Constant LP_SIZE as Integer is 48
+Constant LP_OFF_KIND as Integer is 0
+Constant LP_OFF_PRIMARY as Integer is 8
+Constant LP_OFF_CARD as Integer is 16
+Constant LP_OFF_CHILDREN as Integer is 24
+Constant LP_OFF_PRED as Integer is 32
+Constant LP_OFF_PROJECTION as Integer is 40
+
+Constant PP_SIZE as Integer is 48
+Constant PP_OFF_KIND as Integer is 0
+Constant PP_OFF_PRIMARY as Integer is 8
+Constant PP_OFF_COST as Integer is 16
+Constant PP_OFF_CHILDREN as Integer is 24
+Constant PP_OFF_PRED as Integer is 32
+Constant PP_OFF_ACCESS as Integer is 40
+
+Constant TS_SIZE as Integer is 24
+Constant TS_OFF_NAME as Integer is 0
+Constant TS_OFF_ROWS as Integer is 8
+
+Constant DEFAULT_CARDINALITY as Integer is 1000
+
+Note: ============================================================================
+Note: LOGICAL PLAN CONSTRUCTION
+Note: ============================================================================
+
+Process called "lp_create" takes kind as Integer, primary as Integer returns Integer:
+    Let record be proc allocate from Layout with LP_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    Let children be proc list_create from List
+    If children is equal to 0:
+        proc deallocate from Layout with record
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, LP_OFF_KIND, kind
+    proc memory_set_int64 from Memory with record, LP_OFF_PRIMARY, primary
+    proc memory_set_int64 from Memory with record, LP_OFF_CARD, DEFAULT_CARDINALITY
+    proc memory_set_int64 from Memory with record, LP_OFF_CHILDREN, children
+    proc memory_set_int64 from Memory with record, LP_OFF_PRED, 0
+    proc memory_set_int64 from Memory with record, LP_OFF_PROJECTION, 0
+    Return record
+End Process
+
+Process called "lp_get_kind" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, LP_OFF_KIND
+End Process
+
+Process called "lp_get_primary" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, LP_OFF_PRIMARY
+End Process
+
+Process called "lp_get_cardinality" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, LP_OFF_CARD
+End Process
+
+Process called "lp_set_cardinality" takes p as Integer, n as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with p, LP_OFF_CARD, n
+    Return 0
+End Process
+
+Process called "lp_add_child" takes p as Integer, child as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with p, LP_OFF_CHILDREN
+    Return proc list_push from List with children, child
+End Process
+
+Process called "lp_get_children" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, LP_OFF_CHILDREN
+End Process
+
+Process called "lp_set_predicate" takes p as Integer, pred as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with p, LP_OFF_PRED, pred
+    Return 0
+End Process
+
+Process called "lp_get_predicate" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, LP_OFF_PRED
+End Process
+
+Process called "lp_set_projection" takes p as Integer, projection as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with p, LP_OFF_PROJECTION, projection
+    Return 0
+End Process
+
+Process called "lp_get_projection" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, LP_OFF_PROJECTION
+End Process
+
+Process called "lp_destroy" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with p, LP_OFF_CHILDREN
+    If children is not equal to 0:
+        Let count be proc list_length from List with children
+        Let i be 0
+        While i is less than count:
+            Let c be proc list_get from List with children, i
+            proc lp_destroy with c
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with children
+    End If
+    Let projection be proc memory_get_int64 from Memory with p, LP_OFF_PROJECTION
+    If projection is not equal to 0:
+        proc list_destroy from List with projection
+    End If
+    proc deallocate from Layout with p
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PHYSICAL PLAN CONSTRUCTION
+Note: ============================================================================
+
+Process called "pp_create" takes kind as Integer, primary as Integer, access_path as Integer returns Integer:
+    Let record be proc allocate from Layout with PP_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    Let children be proc list_create from List
+    If children is equal to 0:
+        proc deallocate from Layout with record
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, PP_OFF_KIND, kind
+    proc memory_set_int64 from Memory with record, PP_OFF_PRIMARY, primary
+    proc memory_set_int64 from Memory with record, PP_OFF_COST, 0
+    proc memory_set_int64 from Memory with record, PP_OFF_CHILDREN, children
+    proc memory_set_int64 from Memory with record, PP_OFF_PRED, 0
+    proc memory_set_int64 from Memory with record, PP_OFF_ACCESS, access_path
+    Return record
+End Process
+
+Process called "pp_get_kind" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, PP_OFF_KIND
+End Process
+
+Process called "pp_get_primary" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, PP_OFF_PRIMARY
+End Process
+
+Process called "pp_get_cost" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, PP_OFF_COST
+End Process
+
+Process called "pp_set_cost" takes p as Integer, cost as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with p, PP_OFF_COST, cost
+    Return 0
+End Process
+
+Process called "pp_get_children" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, PP_OFF_CHILDREN
+End Process
+
+Process called "pp_add_child" takes p as Integer, child as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with p, PP_OFF_CHILDREN
+    Return proc list_push from List with children, child
+End Process
+
+Process called "pp_set_predicate" takes p as Integer, pred as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with p, PP_OFF_PRED, pred
+    Return 0
+End Process
+
+Process called "pp_get_predicate" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, PP_OFF_PRED
+End Process
+
+Process called "pp_get_access_path" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with p, PP_OFF_ACCESS
+End Process
+
+Process called "pp_destroy" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with p, PP_OFF_CHILDREN
+    If children is not equal to 0:
+        Let count be proc list_length from List with children
+        Let i be 0
+        While i is less than count:
+            Let c be proc list_get from List with children, i
+            proc pp_destroy with c
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with children
+    End If
+    proc deallocate from Layout with p
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: STATISTICS
+Note: ============================================================================
+
+@Reasoning
+Estimate a table's row count from a statistics list (caller-built),
+falling back to DEFAULT_CARDINALITY when unknown.
+@End Reasoning
+@Implementation
+Linear scan of the statistics list comparing names.
+@End Implementation
+@Performance_Hints
+O(statistics size).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "ts_create" takes name as Integer, rows as Integer returns Integer:
+    Let record be proc allocate from Layout with TS_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, TS_OFF_NAME, name
+    proc memory_set_int64 from Memory with record, TS_OFF_ROWS, rows
+    Return record
+End Process
+
+Process called "ts_destroy" takes ts as Integer returns Integer:
+    If ts is equal to 0:
+        Return 0
+    End If
+    proc deallocate from Layout with ts
+    Return 0
+End Process
+
+Process called "lookup_cardinality" takes statistics as Integer, table_name as Integer returns Integer:
+    If statistics is equal to 0:
+        Return DEFAULT_CARDINALITY
+    End If
+    If table_name is equal to 0:
+        Return DEFAULT_CARDINALITY
+    End If
+    Let count be proc list_length from List with statistics
+    Let i be 0
+    While i is less than count:
+        Let ts be proc list_get from List with statistics, i
+        Let name be proc memory_get_int64 from Memory with ts, TS_OFF_NAME
+        Let eq be proc string_equals from StringCore with name, table_name
+        If eq is equal to 1:
+            Return proc memory_get_int64 from Memory with ts, TS_OFF_ROWS
+        End If
+        Set i to i plus 1
+    End While
+    Return DEFAULT_CARDINALITY
+End Process
+
+Note: ============================================================================
+Note: LOGICAL PLAN BUILDER
+Note: ============================================================================
+
+@Reasoning
+Convert an RQL/SQL query AST root into the unoptimized logical plan
+tree.  Standard System R structure: Scan(table) -> Filter(Where) ->
+Project(Select).  Subsequent passes can pushdown predicates / projections.
+@End Reasoning
+@Implementation
+1. Locate FROM clause; build LOP_SCAN for the leading table.
+2. If WHERE exists, build LOP_FILTER above it with the WHERE predicate.
+3. If GROUP BY exists, build LOP_GROUP.
+4. If ORDER BY exists, build LOP_SORT.
+5. If SELECT list is not 'all', build LOP_PROJECT.
+6. If LIMIT exists, build LOP_LIMIT.
+@End Implementation
+@Performance_Hints
+Linear in query AST size.
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "logical_build" takes query_root as Integer, statistics as Integer returns Integer:
+    If query_root is equal to 0:
+        Return 0
+    End If
+    Let from_clause be proc query_ast_find_clause from QA with query_root, 11
+    If from_clause is equal to 0:
+        Return 0
+    End If
+    Let table_ref be proc query_ast_get_child from QA with from_clause, 0
+    Let table_name be proc query_ast_get_primary from QA with table_ref
+    Let scan be proc lp_create with LOP_SCAN, table_name
+    If scan is equal to 0:
+        Return 0
+    End If
+    Let card be proc lookup_cardinality with statistics, table_name
+    proc lp_set_cardinality with scan, card
+    Let cur be scan
+    Let where_clause be proc query_ast_find_clause from QA with query_root, 12
+    If where_clause is not equal to 0:
+        Let filter be proc lp_create with LOP_FILTER, 0
+        If filter is not equal to 0:
+            Let pred be proc query_ast_get_child from QA with where_clause, 0
+            proc lp_set_predicate with filter, pred
+            Let card2 be proc lp_get_cardinality with cur
+            proc lp_set_cardinality with filter, card2 divided by 4
+            proc lp_add_child with filter, cur
+            Set cur to filter
+        End If
+    End If
+    Let group_clause be proc query_ast_find_clause from QA with query_root, 13
+    If group_clause is not equal to 0:
+        Let group_op be proc lp_create with LOP_GROUP, 0
+        If group_op is not equal to 0:
+            Let cur_card be proc lp_get_cardinality with cur
+            proc lp_set_cardinality with group_op, cur_card divided by 10
+            proc lp_add_child with group_op, cur
+            Set cur to group_op
+        End If
+    End If
+    Let order_clause be proc query_ast_find_clause from QA with query_root, 15
+    If order_clause is not equal to 0:
+        Let sort_op be proc lp_create with LOP_SORT, 0
+        If sort_op is not equal to 0:
+            Let cur_card2 be proc lp_get_cardinality with cur
+            proc lp_set_cardinality with sort_op, cur_card2
+            proc lp_add_child with sort_op, cur
+            Set cur to sort_op
+        End If
+    End If
+    Let select_clause be proc query_ast_find_clause from QA with query_root, 10
+    If select_clause is not equal to 0:
+        Let project_op be proc lp_create with LOP_PROJECT, 0
+        If project_op is not equal to 0:
+            Let cur_card3 be proc lp_get_cardinality with cur
+            proc lp_set_cardinality with project_op, cur_card3
+            Let select_children be proc query_ast_get_children from QA with select_clause
+            If select_children is not equal to 0:
+                Let select_count be proc list_length from List with select_children
+                If select_count is greater than 0:
+                    Let proj_list be proc list_create from List
+                    If proj_list is not equal to 0:
+                        Let si be 0
+                        While si is less than select_count:
+                            Let sexpr be proc list_get from List with select_children, si
+                            Let sek be proc query_ast_get_kind from QA with sexpr
+                            If sek is equal to 20:
+                                Let col_name be proc query_ast_get_primary from QA with sexpr
+                                If col_name is not equal to 0:
+                                    proc list_push from List with proj_list, col_name
+                                End If
+                            End If
+                            Set si to si plus 1
+                        End While
+                        Let pl_count be proc list_length from List with proj_list
+                        If pl_count is greater than 0:
+                            proc lp_set_projection with project_op, proj_list
+                        Otherwise:
+                            proc list_destroy from List with proj_list
+                        End If
+                    End If
+                End If
+            End If
+            proc lp_add_child with project_op, cur
+            Set cur to project_op
+        End If
+    End If
+    Let limit_clause be proc query_ast_find_clause from QA with query_root, 16
+    If limit_clause is not equal to 0:
+        Let limit_n be proc query_ast_get_secondary from QA with limit_clause
+        Let limit_op be proc lp_create with LOP_LIMIT, limit_n
+        If limit_op is not equal to 0:
+            Let cur_card4 be proc lp_get_cardinality with cur
+            If limit_n is less than cur_card4:
+                proc lp_set_cardinality with limit_op, limit_n
+            Otherwise:
+                proc lp_set_cardinality with limit_op, cur_card4
+            End If
+            proc lp_add_child with limit_op, cur
+            Set cur to limit_op
+        End If
+    End If
+    Return cur
+End Process
+
+Note: ============================================================================
+Note: OPTIMIZATION PASSES
+Note: ============================================================================
+
+@Reasoning
+Collect every distinct LOP_SCAN.primary (table identifier) reachable
+from the given plan subtree.  Used by predicate pushdown to decide
+which side of a join a predicate can be pushed onto: a predicate that
+only mentions columns whose table_alias is in the left subtree's set
+can be safely placed below the join on the left input.
+@End Reasoning
+@Implementation
+Recursive DFS.  For LOP_SCAN nodes, push the primary onto out_list if
+not already present (linear-scan dedupe; subtree size is small in
+practice).  For non-scan nodes, recurse into children.
+@End Implementation
+@Performance_Hints
+O(subtree size * distinct tables).
+@End Performance_Hints
+@Security_Scope
+Pure read; out_list owned by the caller.
+@End Security_Scope
+Process called "pred_collect_subtree_tables" takes plan as Integer, out_list as Integer returns Integer:
+    If plan is equal to 0:
+        Return 0
+    End If
+    If out_list is equal to 0:
+        Return 0
+    End If
+    Let k be proc lp_get_kind with plan
+    If k is equal to LOP_SCAN:
+        Let tname be proc lp_get_primary with plan
+        If tname is not equal to 0:
+            Let n be proc list_length from List with out_list
+            Let i be 0
+            Let found be 0
+            While i is less than n:
+                Let existing be proc list_get from List with out_list, i
+                Let eq be proc string_equals from StringCore with existing, tname
+                If eq is equal to 1:
+                    Set found to 1
+                    Set i to n
+                Otherwise:
+                    Set i to i plus 1
+                End If
+            End While
+            If found is equal to 0:
+                proc list_push from List with out_list, tname
+            End If
+        End If
+        Return 0
+    End If
+    Let cs be proc lp_get_children with plan
+    If cs is not equal to 0:
+        Let cc be proc list_length from List with cs
+        Let j be 0
+        While j is less than cc:
+            Let ch be proc list_get from List with cs, j
+            proc pred_collect_subtree_tables with ch, out_list
+            Set j to j plus 1
+        End While
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Collect every distinct table_alias referenced by Q_COLUMN nodes
+inside a query_ast predicate.  Used to classify which side of a join
+a predicate belongs to.
+@End Reasoning
+@Implementation
+Recursive walk over the AST.  At each node read kind; if Q_COLUMN
+(kind == 20), push the secondary slot (table_alias) onto out_list if
+non-zero and not already present.  Recurse into the children list
+otherwise.
+@End Implementation
+@Performance_Hints
+O(predicate AST size).
+@End Performance_Hints
+@Security_Scope
+Pure read.
+@End Security_Scope
+Process called "pred_collect_predicate_tables" takes pred as Integer, out_list as Integer returns Integer:
+    If pred is equal to 0:
+        Return 0
+    End If
+    If out_list is equal to 0:
+        Return 0
+    End If
+    Let k be proc query_ast_get_kind from QA with pred
+    If k is equal to 20:
+        Let alias be proc query_ast_get_secondary from QA with pred
+        If alias is not equal to 0:
+            Let n be proc list_length from List with out_list
+            Let i be 0
+            Let found be 0
+            While i is less than n:
+                Let existing be proc list_get from List with out_list, i
+                Let eq be proc string_equals from StringCore with existing, alias
+                If eq is equal to 1:
+                    Set found to 1
+                    Set i to n
+                Otherwise:
+                    Set i to i plus 1
+                End If
+            End While
+            If found is equal to 0:
+                proc list_push from List with out_list, alias
+            End If
+        End If
+    End If
+    Let cs be proc query_ast_get_children from QA with pred
+    If cs is not equal to 0:
+        Let cc be proc list_length from List with cs
+        Let j be 0
+        While j is less than cc:
+            Let ch be proc list_get from List with cs, j
+            proc pred_collect_predicate_tables with ch, out_list
+            Set j to j plus 1
+        End While
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Decide whether every table_alias referenced by the predicate appears
+in the candidate table_set.  Used to test whether a predicate can be
+pushed onto one side of a join.
+@End Reasoning
+@Implementation
+Build a fresh list of predicate tables via pred_collect_predicate_tables;
+then for each entry, verify it is present in candidate by string equality.
+Returns 1 if every alias is in candidate, otherwise 0.  An empty
+predicate-tables list (constant predicate) returns 1 (push-anywhere).
+@End Implementation
+@Performance_Hints
+O(predicate tables * candidate tables).
+@End Performance_Hints
+@Security_Scope
+Pure read; allocates a temporary list freed before return.
+@End Security_Scope
+Process called "pred_predicate_fits_tables" takes pred as Integer, candidate as Integer returns Integer:
+    If pred is equal to 0:
+        Return 1
+    End If
+    If candidate is equal to 0:
+        Return 0
+    End If
+    Let ptables be proc list_create from List
+    If ptables is equal to 0:
+        Return 0
+    End If
+    proc pred_collect_predicate_tables with pred, ptables
+    Let pn be proc list_length from List with ptables
+    If pn is equal to 0:
+        proc list_destroy from List with ptables
+        Return 1
+    End If
+    Let cn be proc list_length from List with candidate
+    Let i be 0
+    Let ok be 1
+    While i is less than pn:
+        Let palias be proc list_get from List with ptables, i
+        Let j be 0
+        Let found be 0
+        While j is less than cn:
+            Let ct be proc list_get from List with candidate, j
+            Let eq be proc string_equals from StringCore with palias, ct
+            If eq is equal to 1:
+                Set found to 1
+                Set j to cn
+            Otherwise:
+                Set j to j plus 1
+            End If
+        End While
+        If found is equal to 0:
+            Set ok to 0
+            Set i to pn
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+    proc list_destroy from List with ptables
+    Return ok
+End Process
+
+@Reasoning
+Determine whether a query_ast predicate node is a Q_LOGICAL "AND"
+expression that can be split into independent conjuncts.
+@End Reasoning
+@Implementation
+Check kind == Q_LOGICAL (31) and primary string equals "AND".
+@End Implementation
+@Performance_Hints
+O(string compare).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "pred_is_logical_and" takes pred as Integer returns Integer:
+    If pred is equal to 0:
+        Return 0
+    End If
+    Let k be proc query_ast_get_kind from QA with pred
+    If k is not equal to 31:
+        Return 0
+    End If
+    Let prim be proc query_ast_get_primary from QA with pred
+    If prim is equal to 0:
+        Return 0
+    End If
+    Let cmp be proc string_equals from StringCore with prim, "AND"
+    Return cmp
+End Process
+
+@Reasoning
+Recursively split an AND conjunction into its leaf conjuncts and push
+each onto out_list.  Non-AND predicates push themselves as a single
+leaf.  Caller owns out_list and its entries (each entry is a borrowed
+query_ast subtree pointer; the caller must keep the original AST
+alive).
+@End Reasoning
+@Implementation
+If pred_is_logical_and, recurse into every child; otherwise push the
+node itself.
+@End Implementation
+@Performance_Hints
+O(predicate AST size).
+@End Performance_Hints
+@Security_Scope
+Pure read; out_list owned by caller.
+@End Security_Scope
+Process called "pred_split_and" takes pred as Integer, out_list as Integer returns Integer:
+    If pred is equal to 0:
+        Return 0
+    End If
+    If out_list is equal to 0:
+        Return 0
+    End If
+    Let is_and be proc pred_is_logical_and with pred
+    If is_and is equal to 1:
+        Let cs be proc query_ast_get_children from QA with pred
+        If cs is not equal to 0:
+            Let cc be proc list_length from List with cs
+            Let i be 0
+            While i is less than cc:
+                Let ch be proc list_get from List with cs, i
+                proc pred_split_and with ch, out_list
+                Set i to i plus 1
+            End While
+        End If
+        Return 0
+    End If
+    proc list_push from List with out_list, pred
+    Return 0
+End Process
+
+@Reasoning
+Recombine a list of conjuncts into a single query_ast predicate by
+chaining Q_LOGICAL "AND" nodes.  Returns 0 if the list is empty, the
+sole entry if it has one element, or a left-associated AND tree
+otherwise.
+@End Reasoning
+@Implementation
+Build a left-deep tree: acc = entries[0]; for each subsequent entry,
+acc = query_ast_create(Q_LOGICAL, "AND", 0) with [acc, entry] as
+children.
+@End Implementation
+@Performance_Hints
+O(list length).
+@End Performance_Hints
+@Security_Scope
+Allocates new Q_LOGICAL nodes for every AND; the resulting tree shares
+leaf pointers with the input list entries.
+@End Security_Scope
+Process called "pred_combine_and" takes parts as Integer returns Integer:
+    If parts is equal to 0:
+        Return 0
+    End If
+    Let n be proc list_length from List with parts
+    If n is equal to 0:
+        Return 0
+    End If
+    Let acc be proc list_get from List with parts, 0
+    If n is equal to 1:
+        Return acc
+    End If
+    Let i be 1
+    While i is less than n:
+        Let next be proc list_get from List with parts, i
+        Let node be proc query_ast_create from QA with 31, "AND", 0
+        If node is equal to 0:
+            Return acc
+        End If
+        proc query_ast_add_child from QA with node, acc
+        proc query_ast_add_child from QA with node, next
+        Set acc to node
+        Set i to i plus 1
+    End While
+    Return acc
+End Process
+
+@Reasoning
+Wrap a child plan in a new LOP_FILTER carrying the supplied predicate.
+Cardinality estimate inherits 1/4 of the child cardinality (System R
+default selectivity for an unknown predicate).
+@End Reasoning
+@Implementation
+lp_create LOP_FILTER, set predicate, set cardinality, lp_add_child.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns the child unchanged if the filter allocation fails.
+@End Security_Scope
+Process called "pred_wrap_filter" takes child as Integer, predicate as Integer returns Integer:
+    If predicate is equal to 0:
+        Return child
+    End If
+    Let filter be proc lp_create with LOP_FILTER, 0
+    If filter is equal to 0:
+        Return child
+    End If
+    proc lp_set_predicate with filter, predicate
+    Let card be proc lp_get_cardinality with child
+    proc lp_set_cardinality with filter, card divided by 4
+    proc lp_add_child with filter, child
+    Return filter
+End Process
+
+@Reasoning
+Morph the contents of dst into a copy of src, then dispose of src.
+Used by passes that need to replace one LogicalPlan node with another
+while preserving the destination pointer (so callers holding the
+original root pointer keep a valid reference).
+@End Reasoning
+@Implementation
+Copy every slot from src into dst (kind, primary, cardinality,
+children list, predicate, projection list).  Detach the children list
+from src so lp_destroy on src does not free the children we just
+transferred; then call lp_destroy on src.  The previous children list
+that dst held is destroyed first.
+@End Implementation
+@Performance_Hints
+O(1) plus dst's previous subtree size.
+@End Performance_Hints
+@Security_Scope
+Both pointers must be valid LogicalPlan records.  After this call src
+is invalid and dst owns everything src previously owned.
+@End Security_Scope
+Process called "lp_morph_into" takes dst as Integer, src as Integer returns Integer:
+    If dst is equal to 0:
+        Return 0
+    End If
+    If src is equal to 0:
+        Return 0
+    End If
+    Let old_children be proc memory_get_int64 from Memory with dst, LP_OFF_CHILDREN
+    If old_children is not equal to 0:
+        Let oc_count be proc list_length from List with old_children
+        Let oi be 0
+        While oi is less than oc_count:
+            Let oc be proc list_get from List with old_children, oi
+            proc lp_destroy with oc
+            Set oi to oi plus 1
+        End While
+        proc list_destroy from List with old_children
+    End If
+    Let old_projection be proc memory_get_int64 from Memory with dst, LP_OFF_PROJECTION
+    If old_projection is not equal to 0:
+        proc list_destroy from List with old_projection
+    End If
+    Let s_kind be proc memory_get_int64 from Memory with src, LP_OFF_KIND
+    Let s_primary be proc memory_get_int64 from Memory with src, LP_OFF_PRIMARY
+    Let s_card be proc memory_get_int64 from Memory with src, LP_OFF_CARD
+    Let s_children be proc memory_get_int64 from Memory with src, LP_OFF_CHILDREN
+    Let s_pred be proc memory_get_int64 from Memory with src, LP_OFF_PRED
+    Let s_projection be proc memory_get_int64 from Memory with src, LP_OFF_PROJECTION
+    proc memory_set_int64 from Memory with dst, LP_OFF_KIND, s_kind
+    proc memory_set_int64 from Memory with dst, LP_OFF_PRIMARY, s_primary
+    proc memory_set_int64 from Memory with dst, LP_OFF_CARD, s_card
+    proc memory_set_int64 from Memory with dst, LP_OFF_CHILDREN, s_children
+    proc memory_set_int64 from Memory with dst, LP_OFF_PRED, s_pred
+    proc memory_set_int64 from Memory with dst, LP_OFF_PROJECTION, s_projection
+    proc memory_set_int64 from Memory with src, LP_OFF_CHILDREN, 0
+    proc memory_set_int64 from Memory with src, LP_OFF_PROJECTION, 0
+    proc deallocate from Layout with src
+    Return 0
+End Process
+
+@Reasoning
+Predicate pushdown.  Performs two distinct rewrites at every plan node:
+
+  1. Collapse LOP_FILTER above LOP_FILTER by fusing predicates with
+     Q_LOGICAL "AND" and removing the redundant inner filter.
+
+  2. Push LOP_FILTER below LOP_JOIN.  Split the filter predicate into
+     conjuncts; classify each by which side of the join its column
+     references belong to; wrap left-only and right-only conjuncts in
+     new LOP_FILTER nodes on the respective join inputs; merge
+     cross-side conjuncts onto the join's ON predicate.  The original
+     above-join LOP_FILTER is collapsed into the join via lp_morph_into
+     so the caller's root pointer remains valid.
+
+The combination is a canonical predicate-pushdown rewrite per System R
+and Volcano: filters move as close to scans as possible while preserving
+query semantics.
+@End Reasoning
+@Implementation
+Post-order DFS so child subtrees are rewritten before the current node.
+After recursing, inspect the current node's kind and child:
+  * LOP_FILTER over LOP_FILTER -> fuse via Q_LOGICAL "AND" and free
+    the inner filter record.
+  * LOP_FILTER over LOP_JOIN   -> classify, build per-side filter lists,
+    wrap the join's children with new LOP_FILTERs, fuse cross-side
+    conjuncts onto the join's ON predicate (creating one if absent),
+    and morph the LOP_FILTER record into the join via lp_morph_into.
+@End Implementation
+@Performance_Hints
+O(plan size * predicate AST size).
+@End Performance_Hints
+@Security_Scope
+Mutates the plan in place.  Borrowed query_ast pointers in predicate
+slots remain owned by the original AST; callers must keep the AST
+alive for the lifetime of the plan.
+@End Security_Scope
+Process called "predicate_pushdown" takes plan as Integer returns Integer:
+    If plan is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with plan, LP_OFF_CHILDREN
+    If children is not equal to 0:
+        Let count be proc list_length from List with children
+        Let i be 0
+        While i is less than count:
+            Let c be proc list_get from List with children, i
+            proc predicate_pushdown with c
+            Set i to i plus 1
+        End While
+    End If
+    Let kind be proc lp_get_kind with plan
+    If kind is not equal to LOP_FILTER:
+        Return 0
+    End If
+    If children is equal to 0:
+        Return 0
+    End If
+    Let count2 be proc list_length from List with children
+    If count2 is equal to 0:
+        Return 0
+    End If
+    Let child be proc list_get from List with children, 0
+    Let ck be proc lp_get_kind with child
+    If ck is equal to LOP_FILTER:
+        Let outer_pred be proc lp_get_predicate with plan
+        Let inner_pred be proc lp_get_predicate with child
+        Let fused be 0
+        If outer_pred is equal to 0:
+            Set fused to inner_pred
+        Otherwise:
+            If inner_pred is equal to 0:
+                Set fused to outer_pred
+            Otherwise:
+                Set fused to proc query_ast_create from QA with 31, "AND", 0
+                If fused is not equal to 0:
+                    proc query_ast_add_child from QA with fused, outer_pred
+                    proc query_ast_add_child from QA with fused, inner_pred
+                Otherwise:
+                    Set fused to outer_pred
+                End If
+            End If
+        End If
+        proc lp_set_predicate with plan, fused
+        Let ccs be proc lp_get_children with child
+        Let cc_count be proc list_length from List with ccs
+        If cc_count is greater than 0:
+            Let grand be proc list_get from List with ccs, 0
+            proc list_set from List with children, 0, grand
+            proc list_set from List with ccs, 0, 0
+        End If
+        proc lp_destroy with child
+        Return 0
+    End If
+    If ck is equal to LOP_JOIN:
+        Let filter_pred be proc lp_get_predicate with plan
+        If filter_pred is equal to 0:
+            Return 0
+        End If
+        Let join_children be proc lp_get_children with child
+        If join_children is equal to 0:
+            Return 0
+        End If
+        Let jcc be proc list_length from List with join_children
+        If jcc is less than 2:
+            Return 0
+        End If
+        Let left be proc list_get from List with join_children, 0
+        Let right be proc list_get from List with join_children, 1
+        Let left_tables be proc list_create from List
+        Let right_tables be proc list_create from List
+        proc pred_collect_subtree_tables with left, left_tables
+        proc pred_collect_subtree_tables with right, right_tables
+        Let conjuncts be proc list_create from List
+        proc pred_split_and with filter_pred, conjuncts
+        Let left_parts be proc list_create from List
+        Let right_parts be proc list_create from List
+        Let both_parts be proc list_create from List
+        Let cn be proc list_length from List with conjuncts
+        Let ci be 0
+        While ci is less than cn:
+            Let cj be proc list_get from List with conjuncts, ci
+            Let in_left be proc pred_predicate_fits_tables with cj, left_tables
+            Let in_right be proc pred_predicate_fits_tables with cj, right_tables
+            If in_left is equal to 1:
+                proc list_push from List with left_parts, cj
+            Otherwise:
+                If in_right is equal to 1:
+                    proc list_push from List with right_parts, cj
+                Otherwise:
+                    proc list_push from List with both_parts, cj
+                End If
+            End If
+            Set ci to ci plus 1
+        End While
+        Let left_pred be proc pred_combine_and with left_parts
+        Let right_pred be proc pred_combine_and with right_parts
+        Let both_pred be proc pred_combine_and with both_parts
+        If left_pred is not equal to 0:
+            Let new_left be proc pred_wrap_filter with left, left_pred
+            proc predicate_pushdown with new_left
+            proc list_set from List with join_children, 0, new_left
+        End If
+        If right_pred is not equal to 0:
+            Let new_right be proc pred_wrap_filter with right, right_pred
+            proc predicate_pushdown with new_right
+            proc list_set from List with join_children, 1, new_right
+        End If
+        If both_pred is not equal to 0:
+            Let join_on be proc lp_get_predicate with child
+            Let combined be 0
+            If join_on is equal to 0:
+                Set combined to both_pred
+            Otherwise:
+                Set combined to proc query_ast_create from QA with 31, "AND", 0
+                If combined is not equal to 0:
+                    proc query_ast_add_child from QA with combined, join_on
+                    proc query_ast_add_child from QA with combined, both_pred
+                Otherwise:
+                    Set combined to join_on
+                End If
+            End If
+            proc lp_set_predicate with child, combined
+        End If
+        proc list_destroy from List with left_tables
+        proc list_destroy from List with right_tables
+        proc list_destroy from List with conjuncts
+        proc list_destroy from List with left_parts
+        proc list_destroy from List with right_parts
+        proc list_destroy from List with both_parts
+        Let parent_card be proc lp_get_cardinality with plan
+        proc lp_set_cardinality with child, parent_card
+        proc list_set from List with children, 0, 0
+        proc lp_set_predicate with plan, 0
+        proc lp_morph_into with plan, child
+        Return 0
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Projection pushdown.  Collapses LOP_PROJECT(LOP_SCAN(table, *)) into
+LOP_SCAN(table, projection_list) by transferring the project's column
+list into the scan's projection slot and replacing the project node
+with the scan in the parent's child slot.  The freed LOP_PROJECT
+record is released after the transfer.
+@End Reasoning
+@Implementation
+Post-order DFS.  For each child slot in the current plan:
+  1. Recurse into the child first.
+  2. After recursion, if the child is LOP_PROJECT and its own only
+     child is LOP_SCAN, transfer the project's projection list onto
+     the scan (only when the scan currently has no projection), detach
+     the scan from the project's children list, deallocate the project
+     record, and overwrite the parent's slot with the scan pointer.
+The traversal does not collapse a root-level LOP_PROJECT here because
+projection_pushdown is invoked with a stable root pointer that the
+caller still holds; root-level collapse is handled by the public
+planner_optimize wrapper.  This pass is idempotent: a second invocation
+finds no remaining LOP_PROJECT-above-LOP_SCAN patterns and is a no-op.
+@End Implementation
+@Performance_Hints
+O(plan size).
+@End Performance_Hints
+@Security_Scope
+Mutates the plan tree in place.  Frees LOP_PROJECT records that have
+been folded into their scan child.
+@End Security_Scope
+Process called "projection_pushdown" takes plan as Integer returns Integer:
+    If plan is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with plan, LP_OFF_CHILDREN
+    If children is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with children
+    Let i be 0
+    While i is less than count:
+        Let c be proc list_get from List with children, i
+        proc projection_pushdown with c
+        Let new_c be proc list_get from List with children, i
+        Let ck be proc lp_get_kind with new_c
+        If ck is equal to LOP_PROJECT:
+            Let pc be proc lp_get_children with new_c
+            If pc is not equal to 0:
+                Let pcc be proc list_length from List with pc
+                If pcc is equal to 1:
+                    Let grand be proc list_get from List with pc, 0
+                    Let gk be proc lp_get_kind with grand
+                    If gk is equal to LOP_SCAN:
+                        Let proj be proc lp_get_projection with new_c
+                        If proj is not equal to 0:
+                            Let scan_proj be proc lp_get_projection with grand
+                            If scan_proj is equal to 0:
+                                proc lp_set_projection with grand, proj
+                                proc lp_set_projection with new_c, 0
+                            Otherwise:
+                                proc list_destroy from List with proj
+                                proc lp_set_projection with new_c, 0
+                            End If
+                            Let scan_card be proc lp_get_cardinality with grand
+                            Let proj_card be proc lp_get_cardinality with new_c
+                            If proj_card is less than scan_card:
+                                proc lp_set_cardinality with grand, proj_card
+                            End If
+                            proc list_set from List with pc, 0, 0
+                            proc lp_destroy with new_c
+                            proc list_set from List with children, i, grand
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Join reordering heuristic.  For binary LOP_JOIN nodes, ensure the
+build side (left child in the canonical hash-join layout) is the one
+with smaller cardinality, swapping if necessary.
+@End Reasoning
+@Implementation
+Recursive DFS; at each LOP_JOIN compare child cardinalities and swap.
+@End Implementation
+@Performance_Hints
+O(plan size).
+@End Performance_Hints
+@Security_Scope
+Pure structural rewrite.
+@End Security_Scope
+Process called "join_reorder" takes plan as Integer returns Integer:
+    If plan is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with plan, LP_OFF_CHILDREN
+    If children is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with children
+    Let i be 0
+    While i is less than count:
+        Let c be proc list_get from List with children, i
+        proc join_reorder with c
+        Set i to i plus 1
+    End While
+    Let kind be proc lp_get_kind with plan
+    If kind is equal to LOP_JOIN:
+        If count is greater than or equal to 2:
+            Let l be proc list_get from List with children, 0
+            Let r be proc list_get from List with children, 1
+            Let lc be proc lp_get_cardinality with l
+            Let rc be proc lp_get_cardinality with r
+            If rc is less than lc:
+                proc list_set from List with children, 0, r
+                proc list_set from List with children, 1, l
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: LOGICAL -> PHYSICAL CONVERSION
+Note: ============================================================================
+
+@Reasoning
+Convert each logical operator to the lowest-cost physical operator
+implementation.  Defaults assume no indexes are available; callers that
+have index information can layer an additional refinement pass.
+@End Reasoning
+@Implementation
+Switch on logical kind; emit physical kind + default access path:
+  Scan      -> SEQ_SCAN  (no index assumed)
+  Filter    -> POP_FILTER
+  Project   -> POP_PROJECT
+  Join      -> HASH_JOIN by default
+  Group     -> HASH_AGGREGATE
+  Sort      -> POP_SORT
+  Limit     -> POP_LIMIT
+Children are converted recursively.  Costs are computed during the
+conversion using the cost_estimate helper.
+@End Implementation
+@Performance_Hints
+Linear in plan size.
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "logical_to_physical" takes plan as Integer, statistics as Integer returns Integer:
+    If plan is equal to 0:
+        Return 0
+    End If
+    Let lk be proc lp_get_kind with plan
+    Let primary be proc lp_get_primary with plan
+    Let phys_kind be 0
+    Let access be 0
+    If lk is equal to LOP_SCAN:
+        Set phys_kind to POP_SEQ_SCAN
+        Set access to POP_SEQ_SCAN
+    End If
+    If lk is equal to LOP_FILTER:
+        Set phys_kind to POP_FILTER
+    End If
+    If lk is equal to LOP_PROJECT:
+        Set phys_kind to POP_PROJECT
+    End If
+    If lk is equal to LOP_JOIN:
+        Set phys_kind to POP_HASH_JOIN
+        Set access to POP_HASH_JOIN
+    End If
+    If lk is equal to LOP_GROUP:
+        Set phys_kind to POP_HASH_AGGREGATE
+        Set access to POP_HASH_AGGREGATE
+    End If
+    If lk is equal to LOP_SORT:
+        Set phys_kind to POP_SORT
+    End If
+    If lk is equal to LOP_LIMIT:
+        Set phys_kind to POP_LIMIT
+    End If
+    Let pp be proc pp_create with phys_kind, primary, access
+    If pp is equal to 0:
+        Return 0
+    End If
+    Let pred be proc lp_get_predicate with plan
+    If pred is not equal to 0:
+        proc pp_set_predicate with pp, pred
+    End If
+    Let card be proc lp_get_cardinality with plan
+    proc pp_set_cost with pp, card
+    Let lchildren be proc lp_get_children with plan
+    If lchildren is not equal to 0:
+        Let lcount be proc list_length from List with lchildren
+        Let i be 0
+        While i is less than lcount:
+            Let lc be proc list_get from List with lchildren, i
+            Let phys_child be proc logical_to_physical with lc, statistics
+            If phys_child is not equal to 0:
+                proc pp_add_child with pp, phys_child
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    Let primary_cost be proc pp_get_cost with pp
+    Let total be primary_cost
+    Let pchildren be proc pp_get_children with pp
+    If pchildren is not equal to 0:
+        Let pcount be proc list_length from List with pchildren
+        Let j be 0
+        While j is less than pcount:
+            Let pc be proc list_get from List with pchildren, j
+            Let cc be proc pp_get_cost with pc
+            Set total to total plus cc
+            Set j to j plus 1
+        End While
+    End If
+    proc pp_set_cost with pp, total
+    Return pp
+End Process
+
+@Reasoning
+Compute the total cost of a physical plan including its descendants.
+Used by the optimizer to compare alternative plans.
+@End Reasoning
+@Implementation
+Sum of node's own cost slot + recursive sum of children.
+@End Implementation
+@Performance_Hints
+O(plan size).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "cost_estimate" takes plan as Integer, statistics as Integer returns Integer:
+    If plan is equal to 0:
+        Return 0
+    End If
+    Let own be proc memory_get_int64 from Memory with plan, PP_OFF_COST
+    Let children be proc memory_get_int64 from Memory with plan, PP_OFF_CHILDREN
+    Let total be own
+    If children is not equal to 0:
+        Let count be proc list_length from List with children
+        Let i be 0
+        While i is less than count:
+            Let c be proc list_get from List with children, i
+            Set total to total plus proc cost_estimate with c, statistics
+            Set i to i plus 1
+        End While
+    End If
+    Return total
+End Process
+
+@Reasoning
+Run all optimization passes in sequence: predicate pushdown,
+projection pushdown, join reordering.  Each pass mutates the logical
+plan in place.  When the root itself ends up as a LOP_PROJECT directly
+above a LOP_SCAN, the root record is morphed in place into the scan so
+that callers holding the original pointer continue to address a valid
+node after the rewrite.
+@End Reasoning
+@Implementation
+1. Call predicate_pushdown / projection_pushdown / join_reorder for
+   inner-tree rewrites.
+2. After projection_pushdown returns, if the root is now a LOP_PROJECT
+   directly above a LOP_SCAN, transfer the projection list onto the
+   scan and call lp_morph_into to overwrite the root record with the
+   scan's contents.
+@End Implementation
+@Performance_Hints
+O(plan size * pass count).
+@End Performance_Hints
+@Security_Scope
+Pure structural rewrite.  The root pointer remains valid throughout.
+@End Security_Scope
+Process called "planner_optimize" takes plan as Integer returns Integer:
+    proc predicate_pushdown with plan
+    proc projection_pushdown with plan
+    proc join_reorder with plan
+    If plan is equal to 0:
+        Return 0
+    End If
+    Let root_kind be proc lp_get_kind with plan
+    If root_kind is equal to LOP_PROJECT:
+        Let rc be proc lp_get_children with plan
+        If rc is not equal to 0:
+            Let rcc be proc list_length from List with rc
+            If rcc is equal to 1:
+                Let rchild be proc list_get from List with rc, 0
+                Let rgk be proc lp_get_kind with rchild
+                If rgk is equal to LOP_SCAN:
+                    Let rproj be proc lp_get_projection with plan
+                    If rproj is not equal to 0:
+                        Let r_scan_proj be proc lp_get_projection with rchild
+                        If r_scan_proj is equal to 0:
+                            proc lp_set_projection with rchild, rproj
+                            proc lp_set_projection with plan, 0
+                        Otherwise:
+                            proc list_destroy from List with rproj
+                            proc lp_set_projection with plan, 0
+                        End If
+                    End If
+                    Let r_scan_card be proc lp_get_cardinality with rchild
+                    Let r_proj_card be proc lp_get_cardinality with plan
+                    If r_proj_card is less than r_scan_card:
+                        proc lp_set_cardinality with rchild, r_proj_card
+                    End If
+                    proc list_set from List with rc, 0, 0
+                    proc lp_morph_into with plan, rchild
+                End If
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: EXPLAIN PLAN
+Note: ============================================================================
+
+@Reasoning
+Pretty-print a physical plan for inspection.  Produces an indented
+tree akin to PostgreSQL's EXPLAIN output.  Used by tooling and
+diagnostics.
+@End Reasoning
+@Implementation
+Recursive walker writing into a StringBuilder.  Each operator emits
+its name, access path (where applicable), and cost.
+@End Implementation
+@Performance_Hints
+Linear in plan size.
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "explain_op_name" takes kind as Integer returns Integer:
+    If kind is equal to POP_SEQ_SCAN:
+        Return "Seq Scan"
+    End If
+    If kind is equal to POP_INDEX_SCAN:
+        Return "Index Scan"
+    End If
+    If kind is equal to POP_FILTER:
+        Return "Filter"
+    End If
+    If kind is equal to POP_PROJECT:
+        Return "Project"
+    End If
+    If kind is equal to POP_HASH_JOIN:
+        Return "Hash Join"
+    End If
+    If kind is equal to POP_NL_JOIN:
+        Return "Nested Loop"
+    End If
+    If kind is equal to POP_SORT_MERGE_JOIN:
+        Return "Sort Merge Join"
+    End If
+    If kind is equal to POP_HASH_AGGREGATE:
+        Return "HashAggregate"
+    End If
+    If kind is equal to POP_SORT_AGGREGATE:
+        Return "GroupAggregate"
+    End If
+    If kind is equal to POP_SORT:
+        Return "Sort"
+    End If
+    If kind is equal to POP_LIMIT:
+        Return "Limit"
+    End If
+    Return "Unknown"
+End Process
+
+Process called "explain_append_indent" takes sb as Integer, level as Integer returns Integer:
+    Let i be 0
+    Let total be level multiplied by 2
+    While i is less than total:
+        proc stringbuilder_append_char from SB with sb, 32
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "explain_render" takes sb as Integer, plan as Integer, level as Integer returns Integer:
+    If plan is equal to 0:
+        Return 0
+    End If
+    proc explain_append_indent with sb, level
+    proc stringbuilder_append from SB with sb, "-> "
+    Let kind be proc pp_get_kind with plan
+    Let name be proc explain_op_name with kind
+    proc stringbuilder_append from SB with sb, name
+    Let primary be proc pp_get_primary with plan
+    If primary is not equal to 0:
+        Let plen be proc string_length from StringCore with primary
+        If plen is greater than 0:
+            proc stringbuilder_append from SB with sb, " on "
+            proc stringbuilder_append from SB with sb, primary
+        End If
+    End If
+    proc stringbuilder_append from SB with sb, "  (cost="
+    Let cost be proc pp_get_cost with plan
+    proc stringbuilder_append_integer from SB with sb, cost
+    proc stringbuilder_append from SB with sb, ")"
+    proc stringbuilder_append_char from SB with sb, 10
+    Let children be proc pp_get_children with plan
+    If children is not equal to 0:
+        Let count be proc list_length from List with children
+        Let i be 0
+        While i is less than count:
+            Let c be proc list_get from List with children, i
+            proc explain_render with sb, c, level plus 1
+            Set i to i plus 1
+        End While
+    End If
+    Return 0
+End Process
+
+Process called "explain_plan" takes plan as Integer returns Integer:
+    If plan is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc explain_render with sb, plan, 0
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process

@@ -1,0 +1,327 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+X448 - Diffie-Hellman on Curve448 per RFC 7748
+==============================================================================
+
+Implements the X448 elliptic-curve Diffie-Hellman primitive defined in
+RFC 7748 sections 4.2 and 5. Operates on the u-coordinate of the
+Montgomery curve
+
+    y^2 = x^3 + 156326 x^2 + x   (mod 2^448 - 2^224 - 1)
+
+The constant a24 in the Montgomery ladder for X448 is (156326 - 2) / 4
+= 39081 (computable as the integer constant directly).
+
+Constant-time guarantee via the standard Montgomery ladder + CSWAP.
+
+Public API:
+- x448_clamp(private_56):
+    Applies the RFC 7748 5 clamping bits to a 56-byte scalar:
+      private[0]  &= 252       (clear bottom 2 bits)
+      private[55] |= 128       (set top bit)
+
+- x448_scalarmult(private_56, peer_public_56, shared_secret_56):
+    Performs u3 = ladder(private, u2). Clamps the input. Returns 1 on
+    success, 0 on input failure.
+
+- x448_keygen(arena, private_out_56, public_out_56):
+    Generates random scalar, clamps, computes public = ladder(private, 5).
+
+References:
+- RFC 7748 section 5.
+- RFC 7748 section 6.2 (test vectors).
+- M. Hamburg, "Ed448-Goldilocks, a new elliptic curve", 2015.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/field448.runa" as Fe
+Import "compiler/frontend/import_system/crypto/entropy.runa" as Entropy
+
+Constant X448_KEY_BYTES as Integer is 56
+
+Note: ============================================================================
+Note: SECTION 1: Scalar clamping per RFC 7748 section 5 (decodeScalar448)
+Note: ============================================================================
+
+Process called "x448_clamp" takes private_key as Integer returns Integer:
+    @Reasoning
+    Applies RFC 7748 5 clamping for X448 scalars (decodeScalar448):
+      private[0]  &= 252       (clear bottom 2 bits; cofactor=4 for Curve448)
+      private[55] |= 128       (set top bit so ladder starts predictably)
+
+    Note that X448 does NOT clear the top bit (unlike X25519) because
+    the prime p448 is 2^448 - 2^224 - 1 and the full 448-bit range is
+    structurally fine; the only required clamping is the cofactor and
+    the high-bit set.
+    @End Reasoning
+
+    @Implementation
+    Two byte-level mask/or operations on bytes 0 and 55.
+    @End Implementation
+
+    @Security_Scope
+    Constant-time. The clamped output is a function purely of the
+    input bytes.
+    @End Security_Scope
+
+    If private_key is equal to 0:
+        Return 0
+    End If
+    Let b0 be Memory.memory_get_byte(private_key, 0)
+    Memory.memory_set_byte(private_key, 0, b0 bitwise_and 252)
+    Let b55 be Memory.memory_get_byte(private_key, 55)
+    Memory.memory_set_byte(private_key, 55, b55 bitwise_or 128)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Montgomery ladder step
+Note: ============================================================================
+
+Process called "x448_ladder_step" takes arena as Integer, x2 as Integer, z2 as Integer, x3 as Integer, z3 as Integer, x1 as Integer returns Integer:
+    @Reasoning
+    Single Montgomery ladder step for X448, structurally identical to
+    X25519's ladder step but with a24 = 39081 (instead of 121665) and
+    the field448 arithmetic.
+
+      A = x2 + z2
+      B = x2 - z2
+      C = x3 + z3
+      D = x3 - z3
+      DA = D * A
+      CB = C * B
+      x3' = (DA + CB)^2
+      z3' = x1 * (DA - CB)^2
+      AA = A^2
+      BB = B^2
+      x2' = AA * BB
+      E  = AA - BB
+      z2' = E * (BB + a24 * E)
+    @End Reasoning
+
+    @Performance_Hints
+    5 multiplications + 4 squarings + 1 small-mul per step, repeated
+    448 times for the full ladder. Cost roughly 2x X25519's per-bit
+    cost due to the wider field.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time end to end.
+    @End Security_Scope
+
+    Let scratch_A be proc fe448_alloc from Fe with arena
+    Let scratch_B be proc fe448_alloc from Fe with arena
+    Let scratch_C be proc fe448_alloc from Fe with arena
+    Let scratch_D be proc fe448_alloc from Fe with arena
+    Let scratch_DA be proc fe448_alloc from Fe with arena
+    Let scratch_CB be proc fe448_alloc from Fe with arena
+    Let scratch_AA be proc fe448_alloc from Fe with arena
+    Let scratch_BB be proc fe448_alloc from Fe with arena
+    Let scratch_E be proc fe448_alloc from Fe with arena
+    Let scratch_a24 be proc fe448_alloc from Fe with arena
+    Let scratch_T be proc fe448_alloc from Fe with arena
+    Let scratch_T2 be proc fe448_alloc from Fe with arena
+
+    If scratch_A is equal to 0:
+        Return 0
+    End If
+    If scratch_T2 is equal to 0:
+        Return 0
+    End If
+
+    Note: a24 = 39081 as a field element (limb 0 holds it).
+    proc fe448_set_zero from Fe with scratch_a24
+    Memory.memory_set_qword(scratch_a24, 0, 39081)
+
+    proc fe448_add from Fe with scratch_A, x2, z2
+    proc fe448_sub from Fe with scratch_B, x2, z2
+    proc fe448_add from Fe with scratch_C, x3, z3
+    proc fe448_sub from Fe with scratch_D, x3, z3
+    proc fe448_mul from Fe with scratch_DA, scratch_D, scratch_A
+    proc fe448_mul from Fe with scratch_CB, scratch_C, scratch_B
+
+    proc fe448_add from Fe with scratch_T, scratch_DA, scratch_CB
+    proc fe448_sqr from Fe with x3, scratch_T
+
+    proc fe448_sub from Fe with scratch_T, scratch_DA, scratch_CB
+    proc fe448_sqr from Fe with scratch_T2, scratch_T
+    proc fe448_mul from Fe with z3, scratch_T2, x1
+
+    proc fe448_sqr from Fe with scratch_AA, scratch_A
+    proc fe448_sqr from Fe with scratch_BB, scratch_B
+
+    proc fe448_mul from Fe with x2, scratch_AA, scratch_BB
+
+    proc fe448_sub from Fe with scratch_E, scratch_AA, scratch_BB
+    proc fe448_mul from Fe with scratch_T, scratch_a24, scratch_E
+    proc fe448_add from Fe with scratch_T2, scratch_BB, scratch_T
+    proc fe448_mul from Fe with z2, scratch_E, scratch_T2
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Full ladder (448 iterations)
+Note: ============================================================================
+
+Process called "x448_ladder" takes arena as Integer, scalar_56 as Integer, base_u_56 as Integer, out_u_56 as Integer returns Integer:
+    @Reasoning
+    448-iteration Montgomery ladder. Same structural shape as
+    x25519_ladder; iterates from bit 447 down to bit 0, conditionally
+    swapping based on the current scalar bit.
+    @End Reasoning
+
+    @Performance_Hints
+    448 ladder steps + 1 inversion (~448 squarings + ~20 mul).
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let x1 be proc fe448_alloc from Fe with arena
+    Let x2 be proc fe448_alloc from Fe with arena
+    Let z2 be proc fe448_alloc from Fe with arena
+    Let x3 be proc fe448_alloc from Fe with arena
+    Let z3 be proc fe448_alloc from Fe with arena
+    Let inv_z2 be proc fe448_alloc from Fe with arena
+    Let result_u be proc fe448_alloc from Fe with arena
+
+    If x1 is equal to 0:
+        Return 0
+    End If
+    If result_u is equal to 0:
+        Return 0
+    End If
+
+    proc fe448_unpack from Fe with x1, base_u_56
+
+    proc fe448_set_one from Fe with x2
+    proc fe448_set_zero from Fe with z2
+    proc fe448_copy from Fe with x3, x1
+    proc fe448_set_one from Fe with z3
+
+    Let swap be 0
+    Let bit_index be 447
+    While bit_index is greater than 0 minus 1:
+        Let byte_index be bit_index shifted right by 3
+        Let bit_in_byte be bit_index bitwise_and 7
+        Let byte_val be Memory.memory_get_byte(scalar_56, byte_index)
+        Let bit_val be (byte_val shifted right by bit_in_byte) bitwise_and 1
+
+        Let swap_now be swap bitwise_xor bit_val
+        proc fe448_cswap from Fe with x2, x3, swap_now
+        proc fe448_cswap from Fe with z2, z3, swap_now
+        Set swap to bit_val
+
+        proc x448_ladder_step with arena, x2, z2, x3, z3, x1
+
+        Set bit_index to bit_index minus 1
+    End While
+
+    proc fe448_cswap from Fe with x2, x3, swap
+    proc fe448_cswap from Fe with z2, z3, swap
+
+    proc fe448_inv from Fe with arena, inv_z2, z2
+    proc fe448_mul from Fe with result_u, x2, inv_z2
+    proc fe448_pack from Fe with result_u, out_u_56
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Public API
+Note: ============================================================================
+
+Process called "x448_scalarmult" takes arena as Integer, private_key_56 as Integer, peer_public_56 as Integer, shared_secret_56 as Integer returns Integer:
+    @Reasoning
+    Performs X448 scalar mult. Clones the private scalar so we can
+    clamp without modifying caller storage.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time. Private scalar copy is arena-backed.
+    @End Security_Scope
+
+    If private_key_56 is equal to 0:
+        Return 0
+    End If
+    If peer_public_56 is equal to 0:
+        Return 0
+    End If
+    If shared_secret_56 is equal to 0:
+        Return 0
+    End If
+
+    Let private_copy be Arena.arena_allocate(arena, 56)
+    If private_copy is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 56:
+        Let bv be Memory.memory_get_byte(private_key_56, i)
+        Memory.memory_set_byte(private_copy, i, bv)
+        Set i to i plus 1
+    End While
+    proc x448_clamp with private_copy
+
+    Let ladder_rc be proc x448_ladder with arena, private_copy, peer_public_56, shared_secret_56
+    Return ladder_rc
+End Process
+
+Process called "x448_keygen" takes arena as Integer, private_key_out_56 as Integer, public_key_out_56 as Integer returns Integer:
+    @Reasoning
+    Generates an X448 keypair. Draws 56 bytes of entropy, clamps,
+    and computes public = ladder(private, u=5).
+
+    Per RFC 7748 5 the base point u for X448 is 5 (encoded as 56 bytes
+    little-endian: 05 00 00 ... 00).
+    @End Reasoning
+
+    @Security_Scope
+    Private key never leaves the caller's buffer. Entropy source is
+    the kernel CSPRNG. Clamping defends against small-subgroup attacks.
+    @End Security_Scope
+
+    If private_key_out_56 is equal to 0:
+        Return 0
+    End If
+    If public_key_out_56 is equal to 0:
+        Return 0
+    End If
+
+    Let rc_entropy be proc entropy_random_bytes from Entropy with arena, private_key_out_56, 56
+    If rc_entropy is equal to 0:
+        Return 0
+    End If
+    proc x448_clamp with private_key_out_56
+
+    Let base_u be Arena.arena_allocate(arena, 56)
+    If base_u is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(base_u, 0, 5)
+    Let bi be 1
+    While bi is less than 56:
+        Memory.memory_set_byte(base_u, bi, 0)
+        Set bi to bi plus 1
+    End While
+
+    Return proc x448_scalarmult with arena, private_key_out_56, base_u, public_key_out_56
+End Process

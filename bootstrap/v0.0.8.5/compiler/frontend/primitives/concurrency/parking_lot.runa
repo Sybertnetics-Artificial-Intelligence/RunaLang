@@ -1,0 +1,391 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+PARKING LOT - Centralized wait queues for efficient thread parking.
+
+A parking lot is a hash table of address-keyed wait queues. Threads park
+themselves on an address key; wakers unpark by the same key. This is the
+foundation for many lock-free synchronization primitives.
+
+For v0.0.8.5 we provide a working implementation using a fixed-size hash
+table of bucket queues protected by per-bucket mutexes + condvars. This
+matches the Rust parking_lot crate's bucket model and provides:
+  - O(1) average park/unpark
+  - Per-key wait queues (multiple keys can share a bucket but not block
+    each other directly because each waiter is matched on its key)
+  - Symmetric park_one / unpark_one and park_all / unpark_all variants
+
+Lot layout (24 bytes):
+  offset 0:  bucket_table_ptr (8 bytes) - array of bucket pointers
+  offset 8:  bucket_count     (8 bytes) - number of buckets (pow2)
+  offset 16: stats_counter    (8 bytes) - atomic counter of park calls
+
+Bucket layout (24 bytes):
+  offset 0:  mutex_ptr (8 bytes)
+  offset 8:  head_ptr  (8 bytes) - head of linked-list of waiters
+  offset 16: count     (8 bytes) - number of waiters in this bucket
+
+Waiter node (32 bytes):
+  offset 0:  key       (8 bytes) - address key
+  offset 8:  cv_ptr    (8 bytes) - this waiter's private condvar
+  offset 16: next_ptr  (8 bytes)
+  offset 24: signaled  (8 bytes) - 1 once unparked
+
+Dependencies:
+- threading/sync_core.runa
+- core/atomic_core.runa
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant LOT_OFF_BUCKETS as Integer is 0
+Constant LOT_OFF_BUCKET_COUNT as Integer is 8
+Constant LOT_OFF_STATS as Integer is 16
+Constant LOT_STRUCT_SIZE as Integer is 24
+
+Constant BUCKET_OFF_MUTEX as Integer is 0
+Constant BUCKET_OFF_HEAD as Integer is 8
+Constant BUCKET_OFF_COUNT as Integer is 16
+Constant BUCKET_STRUCT_SIZE as Integer is 24
+
+Constant WAITER_OFF_KEY as Integer is 0
+Constant WAITER_OFF_CV as Integer is 8
+Constant WAITER_OFF_NEXT as Integer is 16
+Constant WAITER_OFF_SIGNALED as Integer is 24
+Constant WAITER_STRUCT_SIZE as Integer is 32
+
+Constant LOT_OK as Integer is 1
+Constant LOT_ERR_INVALID as Integer is 0
+
+Constant DEFAULT_BUCKET_COUNT as Integer is 32
+
+@Reasoning
+Create a parking lot with the given bucket count (rounded to a power of
+two and clamped to at least 1).
+@End Reasoning
+
+@Implementation
+Allocate the lot, allocate the bucket table, initialize each bucket with
+its mutex.
+@End Implementation
+
+@Performance_Hints
+Initialization cost is O(bucket_count) - one mutex per bucket.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "lot_round_up_pow2" takes n as Integer returns Integer:
+    If n is less than or equal to 1:
+        Return 1
+    End If
+    Let p be 1
+    While p is less than n:
+        Set p to p multiplied by 2
+    End While
+    Return p
+End Process
+
+Process called "parking_lot_create" takes desired_buckets as Integer returns Integer:
+    Let count be desired_buckets
+    If count is less than or equal to 0:
+        Set count to DEFAULT_BUCKET_COUNT
+    End If
+    Set count to proc lot_round_up_pow2 with count
+
+    Let lot be proc allocate from Memory with LOT_STRUCT_SIZE
+    If lot is equal to 0:
+        Return 0
+    End If
+
+    Let table_bytes be count multiplied by 8
+    Let table be proc allocate from Memory with table_bytes
+    If table is equal to 0:
+        proc deallocate from Memory with lot
+        Return 0
+    End If
+
+    Note: Initialize each bucket pointer
+    Let i be 0
+    While i is less than count:
+        Let bucket be proc allocate from Memory with BUCKET_STRUCT_SIZE
+        If bucket is equal to 0:
+            Note: Roll back already-allocated buckets
+            Let j be 0
+            While j is less than i:
+                Let off_j be j multiplied by 8
+                Let prev_bucket be proc memory_get_int64 from Mem with table, off_j
+                Let prev_mutex be proc memory_get_int64 from Mem with prev_bucket, BUCKET_OFF_MUTEX
+                proc mutex_destroy from Sync with prev_mutex
+                proc deallocate from Memory with prev_bucket
+                Set j to j plus 1
+            End While
+            proc deallocate from Memory with table
+            proc deallocate from Memory with lot
+            Return 0
+        End If
+        Let mutex_ptr be proc mutex_create from Sync
+        If mutex_ptr is equal to 0:
+            proc deallocate from Memory with bucket
+            Let j2 be 0
+            While j2 is less than i:
+                Let off_j2 be j2 multiplied by 8
+                Let prev_bucket2 be proc memory_get_int64 from Mem with table, off_j2
+                Let prev_mutex2 be proc memory_get_int64 from Mem with prev_bucket2, BUCKET_OFF_MUTEX
+                proc mutex_destroy from Sync with prev_mutex2
+                proc deallocate from Memory with prev_bucket2
+                Set j2 to j2 plus 1
+            End While
+            proc deallocate from Memory with table
+            proc deallocate from Memory with lot
+            Return 0
+        End If
+        proc memory_set_int64 from Mem with bucket, BUCKET_OFF_MUTEX, mutex_ptr
+        proc memory_set_int64 from Mem with bucket, BUCKET_OFF_HEAD, 0
+        proc memory_set_int64 from Mem with bucket, BUCKET_OFF_COUNT, 0
+
+        Let off_i be i multiplied by 8
+        proc memory_set_int64 from Mem with table, off_i, bucket
+        Set i to i plus 1
+    End While
+
+    proc memory_set_int64 from Mem with lot, LOT_OFF_BUCKETS, table
+    proc memory_set_int64 from Mem with lot, LOT_OFF_BUCKET_COUNT, count
+    proc memory_set_int64 from Mem with lot, LOT_OFF_STATS, 0
+    Return lot
+End Process
+
+Process called "parking_lot_destroy" takes lot as Integer returns Integer:
+    If lot is equal to 0:
+        Return LOT_ERR_INVALID
+    End If
+    Let table be proc memory_get_int64 from Mem with lot, LOT_OFF_BUCKETS
+    Let count be proc memory_get_int64 from Mem with lot, LOT_OFF_BUCKET_COUNT
+    Let i be 0
+    While i is less than count:
+        Let off_i be i multiplied by 8
+        Let bucket be proc memory_get_int64 from Mem with table, off_i
+        If bucket is not equal to 0:
+            Note: Free any lingering waiters
+            Let waiter be proc memory_get_int64 from Mem with bucket, BUCKET_OFF_HEAD
+            While waiter is not equal to 0:
+                Let next be proc memory_get_int64 from Mem with waiter, WAITER_OFF_NEXT
+                Let wcv be proc memory_get_int64 from Mem with waiter, WAITER_OFF_CV
+                If wcv is not equal to 0:
+                    proc condvar_destroy from Sync with wcv
+                End If
+                proc deallocate from Memory with waiter
+                Set waiter to next
+            End While
+            Let mutex_ptr be proc memory_get_int64 from Mem with bucket, BUCKET_OFF_MUTEX
+            proc mutex_destroy from Sync with mutex_ptr
+            proc deallocate from Memory with bucket
+        End If
+        Set i to i plus 1
+    End While
+    proc deallocate from Memory with table
+    proc deallocate from Memory with lot
+    Return LOT_OK
+End Process
+
+@Reasoning
+Hash a key to a bucket index. Uses a multiplicative mix derived from the
+Knuth golden-ratio constant.
+@End Reasoning
+
+@Implementation
+Multiplicative hash followed by bitwise-and with (count - 1).
+@End Implementation
+
+@Performance_Hints
+O(1) two-op hash.
+@End Performance_Hints
+
+@Security_Scope
+Safe - pure value transformation.
+@End Security_Scope
+
+Process called "lot_hash_key" takes key as Integer, bucket_count as Integer returns Integer:
+    Note: Knuth golden-ratio multiplier (truncated for 64-bit)
+    Let mixed be key multiplied by 2654435761
+    Let mask be bucket_count minus 1
+    Let idx be mixed bitwise and mask
+    If idx is less than 0:
+        Set idx to (0 minus idx)
+        Set idx to idx bitwise and mask
+    End If
+    Return idx
+End Process
+
+@Reasoning
+Park the current thread on `key`. Blocks until unparked.
+@End Reasoning
+
+@Implementation
+Hash key to a bucket, acquire bucket mutex, allocate a waiter node with
+its own private condvar, push onto bucket queue, then loop wait on the
+waiter's condvar until its signaled flag is non-zero. On wake unlink the
+waiter and free it.
+@End Implementation
+
+@Performance_Hints
+Park cost is one mutex acquire + one alloc + one condvar wait.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "parking_lot_park" takes lot as Integer, key as Integer returns Integer:
+    If lot is equal to 0:
+        Return LOT_ERR_INVALID
+    End If
+    Let table be proc memory_get_int64 from Mem with lot, LOT_OFF_BUCKETS
+    Let bucket_count be proc memory_get_int64 from Mem with lot, LOT_OFF_BUCKET_COUNT
+    Let idx be proc lot_hash_key with key, bucket_count
+    Let off_i be idx multiplied by 8
+    Let bucket be proc memory_get_int64 from Mem with table, off_i
+    If bucket is equal to 0:
+        Return LOT_ERR_INVALID
+    End If
+
+    Note: Allocate waiter node
+    Let waiter be proc allocate from Memory with WAITER_STRUCT_SIZE
+    If waiter is equal to 0:
+        Return LOT_ERR_INVALID
+    End If
+    Let wcv be proc condvar_create from Sync
+    If wcv is equal to 0:
+        proc deallocate from Memory with waiter
+        Return LOT_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with waiter, WAITER_OFF_KEY, key
+    proc memory_set_int64 from Mem with waiter, WAITER_OFF_CV, wcv
+    proc memory_set_int64 from Mem with waiter, WAITER_OFF_SIGNALED, 0
+
+    Let mutex_ptr be proc memory_get_int64 from Mem with bucket, BUCKET_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let old_head be proc memory_get_int64 from Mem with bucket, BUCKET_OFF_HEAD
+    proc memory_set_int64 from Mem with waiter, WAITER_OFF_NEXT, old_head
+    proc memory_set_int64 from Mem with bucket, BUCKET_OFF_HEAD, waiter
+    Let bcount be proc memory_get_int64 from Mem with bucket, BUCKET_OFF_COUNT
+    proc memory_set_int64 from Mem with bucket, BUCKET_OFF_COUNT, (bcount plus 1)
+
+    Note: Stats counter (relaxed)
+    proc atomic_fetch_add from Atomic with (lot plus LOT_OFF_STATS), 1
+
+    Note: Wait until signaled
+    Let waiting be 1
+    While waiting is equal to 1:
+        Let signaled be proc memory_get_int64 from Mem with waiter, WAITER_OFF_SIGNALED
+        If signaled is not equal to 0:
+            Set waiting to 0
+        Otherwise:
+            proc condvar_wait from Sync with wcv, mutex_ptr
+        End If
+    End While
+
+    Note: Unlinking already done by the unparker (so the waiter node is
+    Note: not visible to other unparkers). Free here.
+    proc mutex_unlock from Sync with mutex_ptr
+    proc condvar_destroy from Sync with wcv
+    proc deallocate from Memory with waiter
+    Return LOT_OK
+End Process
+
+@Reasoning
+Unpark up to `max` waiters matching `key`. Returns the number unparked.
+Use max=1 for unpark_one, max=large for unpark_all.
+@End Reasoning
+
+@Implementation
+Hash key, lock bucket, walk the waiter list. For each waiter whose key
+matches: unlink, set signaled, signal its condvar. Stop after `max`.
+@End Implementation
+
+@Performance_Hints
+O(bucket_size) in worst case. Bucket count should be tuned so chains stay
+short.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "parking_lot_unpark" takes lot as Integer, key as Integer, max_to_wake as Integer returns Integer:
+    If lot is equal to 0:
+        Return 0
+    End If
+    Let table be proc memory_get_int64 from Mem with lot, LOT_OFF_BUCKETS
+    Let bucket_count be proc memory_get_int64 from Mem with lot, LOT_OFF_BUCKET_COUNT
+    Let idx be proc lot_hash_key with key, bucket_count
+    Let off_i be idx multiplied by 8
+    Let bucket be proc memory_get_int64 from Mem with table, off_i
+    If bucket is equal to 0:
+        Return 0
+    End If
+
+    Let mutex_ptr be proc memory_get_int64 from Mem with bucket, BUCKET_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let woke be 0
+    Let prev be 0
+    Let cur be proc memory_get_int64 from Mem with bucket, BUCKET_OFF_HEAD
+    While cur is not equal to 0:
+        Let next be proc memory_get_int64 from Mem with cur, WAITER_OFF_NEXT
+        Let wkey be proc memory_get_int64 from Mem with cur, WAITER_OFF_KEY
+        If wkey is equal to key:
+            If woke is less than max_to_wake:
+                Note: Unlink cur from list
+                If prev is equal to 0:
+                    proc memory_set_int64 from Mem with bucket, BUCKET_OFF_HEAD, next
+                Otherwise:
+                    proc memory_set_int64 from Mem with prev, WAITER_OFF_NEXT, next
+                End If
+                Let bcount be proc memory_get_int64 from Mem with bucket, BUCKET_OFF_COUNT
+                proc memory_set_int64 from Mem with bucket, BUCKET_OFF_COUNT, (bcount minus 1)
+
+                Note: Signal the waiter
+                proc memory_set_int64 from Mem with cur, WAITER_OFF_SIGNALED, 1
+                Let wcv be proc memory_get_int64 from Mem with cur, WAITER_OFF_CV
+                proc condvar_signal from Sync with wcv
+
+                Set woke to woke plus 1
+                Note: Do not advance prev because cur is unlinked
+            Otherwise:
+                Set prev to cur
+            End If
+        Otherwise:
+            Set prev to cur
+        End If
+        Set cur to next
+    End While
+
+    proc mutex_unlock from Sync with mutex_ptr
+    Return woke
+End Process
+
+Process called "parking_lot_unpark_one" takes lot as Integer, key as Integer returns Integer:
+    Return proc parking_lot_unpark with lot, key, 1
+End Process
+
+Process called "parking_lot_unpark_all" takes lot as Integer, key as Integer returns Integer:
+    Return proc parking_lot_unpark with lot, key, 1000000000
+End Process
+
+Process called "parking_lot_stats_total_parks" takes lot as Integer returns Integer:
+    If lot is equal to 0:
+        Return 0
+    End If
+    Return proc atomic_load_seq_cst from Atomic with (lot plus LOT_OFF_STATS)
+End Process

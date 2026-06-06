@@ -1,0 +1,386 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+:End Note
+
+Note:
+==============================================================================
+Instant - Monotonic Timestamp Primitive
+==============================================================================
+
+An Instant represents a point on the monotonic clock, expressed as a single
+Integer holding nanoseconds since an arbitrary, OS-defined epoch (typically
+the boot moment). Instants are immune to wall-clock skew (NTP adjustments,
+manual clock changes, leap-second smearing) and are the ONLY time source
+suitable for measuring elapsed durations, scheduling timeouts, profiling,
+and any cause-effect ordering that must hold across daylight-saving
+transitions and admin clock corrections.
+
+A 64-bit signed nanosecond counter covers approximately 292 years from its
+reference point, which is sufficient for any process lifetime, any container
+restart cycle, and any conceivable monotonic measurement need. Cross-machine
+correlation MUST use a wall-clock source (DateTime/UTC), never an Instant.
+
+Backing syscall:
+  - POSIX clock_gettime(CLOCK_MONOTONIC, &ts) - Linux, Darwin, *BSD, illumos
+  - Windows: QueryPerformanceCounter through the windows_*_syscall_2 router
+  - The platform syscall router resolves the correct ABI per target.
+
+References:
+  - POSIX.1-2017 clock_gettime, clockid_t (IEEE Std 1003.1-2017)
+  - Linux man-pages: clock_gettime(2), clockid_t(7)
+  - Apple Open Source: xnu/bsd/kern/kern_time.c
+  - RFC 5905 §6 (NTP terminology: "ideal clock", "wall clock" distinction)
+==============================================================================
+:End Note
+
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+
+Note: ============================================================================
+Note: POSIX clockid_t constants (stable across all POSIX-conformant systems)
+Note: ============================================================================
+
+Constant CLOCK_REALTIME as Integer is 0
+Constant CLOCK_MONOTONIC as Integer is 1
+Constant CLOCK_PROCESS_CPUTIME_ID as Integer is 2
+Constant CLOCK_THREAD_CPUTIME_ID as Integer is 3
+Constant CLOCK_MONOTONIC_RAW as Integer is 4
+Constant CLOCK_REALTIME_COARSE as Integer is 5
+Constant CLOCK_MONOTONIC_COARSE as Integer is 6
+Constant CLOCK_BOOTTIME as Integer is 7
+Constant CLOCK_TAI as Integer is 11
+
+Note: timespec layout: { tv_sec: int64 (offset 0), tv_nsec: int64 (offset 8) }
+Constant TIMESPEC_SIZE as Integer is 16
+Constant TIMESPEC_SEC_OFFSET as Integer is 0
+Constant TIMESPEC_NSEC_OFFSET as Integer is 8
+
+Constant NANOS_PER_SECOND as Integer is 1000000000
+
+Note: Error sentinels for instant_now failure paths (rare: clock unavailable).
+Constant INSTANT_ERR_CLOCK_UNAVAILABLE as Integer is -1
+Constant INSTANT_ERR_NULL_BUFFER as Integer is -2
+
+Note: ============================================================================
+Note: Public API
+Note: ============================================================================
+
+Process called "instant_now" returns Integer:
+    @Reasoning
+    Returns the current monotonic clock reading as nanoseconds since the
+    OS-defined monotonic epoch. Used by every elapsed-time measurement,
+    timeout deadline, profiler probe, and ordering check in the system.
+    @End Reasoning
+    @Implementation
+    Allocates a 16-byte timespec on the owned heap, issues a
+    clock_gettime(CLOCK_MONOTONIC, &ts) via the platform syscall router
+    (syscall_2 with SYS_CLOCK_GETTIME), then computes
+    tv_sec * 1_000_000_000 + tv_nsec. On clock_gettime failure (negative
+    return), surfaces INSTANT_ERR_CLOCK_UNAVAILABLE so the caller can
+    distinguish a genuine zero reading from a syscall error.
+    @End Implementation
+    @Performance_Hints
+    One small heap allocation plus one syscall. Linux fast-paths
+    CLOCK_MONOTONIC through the vDSO (no kernel transition), bringing
+    total cost to ~20-50 ns on contemporary x86-64. Allocation cost
+    dominates; callers in hot loops should pass a pre-allocated buffer
+    to instant_now_into.
+    @End Performance_Hints
+    @Security_Scope
+    Read-only syscall, no privilege required, no information leak.
+    Monotonic clock value carries no PII and is not stable across reboots.
+    @End Security_Scope
+    Let timespec_ptr be proc allocate from Layout with TIMESPEC_SIZE
+    If timespec_ptr is equal to 0:
+        Return INSTANT_ERR_NULL_BUFFER
+    End If
+    Let syscall_num be proc SYS_CLOCK_GETTIME from Syscall
+    Let rc be proc syscall_2 from Syscall with syscall_num, CLOCK_MONOTONIC, timespec_ptr
+    If rc is less than 0:
+        Let dummy be proc deallocate from Layout with timespec_ptr
+        Return INSTANT_ERR_CLOCK_UNAVAILABLE
+    End If
+    Let tv_sec be proc memory_get_int64 from MemoryCore with timespec_ptr, TIMESPEC_SEC_OFFSET
+    Let tv_nsec be proc memory_get_int64 from MemoryCore with timespec_ptr, TIMESPEC_NSEC_OFFSET
+    Let dummy2 be proc deallocate from Layout with timespec_ptr
+    Let total_ns be tv_sec multiplied by NANOS_PER_SECOND
+    Set total_ns to total_ns plus tv_nsec
+    Return total_ns
+End Process
+
+Process called "instant_now_into" takes timespec_ptr as Integer returns Integer:
+    @Reasoning
+    Zero-allocation variant of instant_now for hot loops and profilers.
+    Caller provides a 16-byte buffer (TIMESPEC_SIZE) and receives the
+    nanosecond reading as the return value, with the raw timespec written
+    into the buffer for callers who need separate seconds / nanoseconds.
+    @End Reasoning
+    @Implementation
+    Same syscall sequence as instant_now but skips the alloc/free pair.
+    Validates the input pointer; a null pointer returns
+    INSTANT_ERR_NULL_BUFFER. After the syscall, reads tv_sec / tv_nsec
+    out of the supplied buffer and folds them into a single nanosecond
+    counter.
+    @End Implementation
+    @Performance_Hints
+    Removes the heap allocation hot-path from instant_now. Suitable for
+    inner-loop deadline checks. Combined with the Linux vDSO fast path
+    this stays in the 20-40 ns regime on x86-64.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer. The function performs no bounds inference on
+    the buffer beyond requiring a non-null pointer; supplying a buffer
+    smaller than TIMESPEC_SIZE is a programmer error and would corrupt
+    adjacent memory the same way as any direct syscall_2 misuse.
+    @End Security_Scope
+    If timespec_ptr is equal to 0:
+        Return INSTANT_ERR_NULL_BUFFER
+    End If
+    Let syscall_num be proc SYS_CLOCK_GETTIME from Syscall
+    Let rc be proc syscall_2 from Syscall with syscall_num, CLOCK_MONOTONIC, timespec_ptr
+    If rc is less than 0:
+        Return INSTANT_ERR_CLOCK_UNAVAILABLE
+    End If
+    Let tv_sec be proc memory_get_int64 from MemoryCore with timespec_ptr, TIMESPEC_SEC_OFFSET
+    Let tv_nsec be proc memory_get_int64 from MemoryCore with timespec_ptr, TIMESPEC_NSEC_OFFSET
+    Let total_ns be tv_sec multiplied by NANOS_PER_SECOND
+    Set total_ns to total_ns plus tv_nsec
+    Return total_ns
+End Process
+
+Process called "instant_now_raw_clock" takes clock_id as Integer returns Integer:
+    @Reasoning
+    General-purpose reader for any POSIX clockid_t. CLOCK_MONOTONIC is
+    the default exposed by instant_now; this entry point lets advanced
+    callers reach CLOCK_REALTIME (wall clock), CLOCK_TAI (atomic time
+    with leap-second jumps removed - see time_reference.runa), or the
+    process / thread CPU-time counters used by profilers.
+    @End Reasoning
+    @Implementation
+    Same syscall path as instant_now but with the caller-chosen clock_id.
+    Returns the nanosecond reading combined from tv_sec and tv_nsec, or
+    a negative error sentinel on syscall failure.
+    @End Implementation
+    @Performance_Hints
+    Identical cost profile to instant_now. CLOCK_MONOTONIC_COARSE and
+    CLOCK_REALTIME_COARSE are cheaper (~1-2 ns via vDSO with reduced
+    precision) when sub-millisecond resolution is unnecessary.
+    @End Performance_Hints
+    @Security_Scope
+    All POSIX clocks are readable without privilege. CLOCK_REALTIME is
+    affected by admin clock adjustments and MUST NOT be used for
+    elapsed-time measurement.
+    @End Security_Scope
+    Let timespec_ptr be proc allocate from Layout with TIMESPEC_SIZE
+    If timespec_ptr is equal to 0:
+        Return INSTANT_ERR_NULL_BUFFER
+    End If
+    Let syscall_num be proc SYS_CLOCK_GETTIME from Syscall
+    Let rc be proc syscall_2 from Syscall with syscall_num, clock_id, timespec_ptr
+    If rc is less than 0:
+        Let dummy be proc deallocate from Layout with timespec_ptr
+        Return INSTANT_ERR_CLOCK_UNAVAILABLE
+    End If
+    Let tv_sec be proc memory_get_int64 from MemoryCore with timespec_ptr, TIMESPEC_SEC_OFFSET
+    Let tv_nsec be proc memory_get_int64 from MemoryCore with timespec_ptr, TIMESPEC_NSEC_OFFSET
+    Let dummy2 be proc deallocate from Layout with timespec_ptr
+    Let total_ns be tv_sec multiplied by NANOS_PER_SECOND
+    Set total_ns to total_ns plus tv_nsec
+    Return total_ns
+End Process
+
+Process called "instant_elapsed" takes start as Integer, end_value as Integer returns Integer:
+    @Reasoning
+    Computes the nanosecond delta between two Instants. By contract
+    end_value is the later reading and start is the earlier reading,
+    so the result is non-negative for any well-formed pair. Returns a
+    Duration-compatible signed nanosecond count; if the caller has
+    reversed the arguments the result will be negative, which is the
+    same convention as POSIX timersub.
+    @End Reasoning
+    @Implementation
+    Single integer subtraction. No overflow check is required: both
+    operands originate from clock_gettime on the same machine within
+    the 292-year monotonic window, so their difference fits trivially
+    inside a signed 64-bit Integer.
+    @End Implementation
+    @Performance_Hints
+    One arithmetic instruction. Inline-friendly.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function. No side effects, no syscalls.
+    @End Security_Scope
+    Return end_value minus start
+End Process
+
+Process called "instant_add_duration" takes i as Integer, d_ns as Integer returns Integer:
+    @Reasoning
+    Advances or rewinds an Instant by the supplied Duration (expressed
+    in signed nanoseconds via duration_to_nanoseconds). Used by deadline
+    arithmetic - "fire this timer 50 ms from now" - throughout schedulers,
+    timeouts, and rate limiters.
+    @End Reasoning
+    @Implementation
+    Integer addition with no overflow check, for the same reason as
+    instant_elapsed: any plausible deadline horizon stays well inside
+    the monotonic 64-bit range. Pass a negative d_ns to subtract.
+    @End Implementation
+    @Performance_Hints
+    Single instruction; inlinable.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function. No side effects.
+    @End Security_Scope
+    Return i plus d_ns
+End Process
+
+Process called "instant_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Three-way comparison primitive returning -1 if a precedes b, 0 if
+    they are simultaneous, +1 if a follows b. The strict ordering rule
+    follows the C++ <=> and Rust Ordering conventions so callers can
+    chain compares without ambiguity.
+    @End Reasoning
+    @Implementation
+    Two integer compares with early return. Branchless variants exist
+    (e.g. (a > b) - (a < b)) but the compiler already collapses the
+    pair of branches to a flags+set sequence on x86-64.
+    @End Implementation
+    @Performance_Hints
+    Two compares + two branches; ~1 cycle on modern out-of-order cores.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If a is less than b:
+        Return -1
+    End If
+    If a is greater than b:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "instant_is_before" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Predicate form of instant_compare for callers that want a binary
+    result. Returns 1 if a strictly precedes b, 0 otherwise.
+    @End Reasoning
+    @Implementation
+    Single signed compare.
+    @End Implementation
+    @Performance_Hints
+    One compare, one set; inlined to a flag check.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If a is less than b:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "instant_is_after" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Predicate form returning 1 if a strictly follows b, 0 otherwise.
+    Mirrors instant_is_before. Equality returns 0 in both directions,
+    matching strict ordering semantics.
+    @End Reasoning
+    @Implementation
+    Single signed compare.
+    @End Implementation
+    @Performance_Hints
+    Same as instant_is_before.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If a is greater than b:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "instant_min" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Returns the earlier of two Instants. Useful for deadline composition:
+    "wait until the soonest of these expirations".
+    @End Reasoning
+    @Implementation
+    Branch on signed compare; returns the smaller operand.
+    @End Implementation
+    @Performance_Hints
+    Compiles to cmp + cmov on x86-64. Single cycle.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If a is less than b:
+        Return a
+    End If
+    Return b
+End Process
+
+Process called "instant_max" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Returns the later of two Instants. Useful for "latest start" /
+    "no-earlier-than" deadline computations.
+    @End Reasoning
+    @Implementation
+    Branch on signed compare; returns the larger operand.
+    @End Implementation
+    @Performance_Hints
+    cmp + cmov on x86-64. Single cycle.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If a is greater than b:
+        Return a
+    End If
+    Return b
+End Process
+
+Process called "instant_to_nanoseconds" takes i as Integer returns Integer:
+    @Reasoning
+    Identity accessor. Provided so callers can move between the Instant
+    abstraction and raw nanoseconds without reaching into the
+    implementation. If the storage representation ever changes (e.g. to
+    a 128-bit limb pair) this becomes the single migration point.
+    @End Reasoning
+    @Implementation
+    Returns the input unchanged.
+    @End Implementation
+    @Performance_Hints
+    Free; compiler folds away.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    Return i
+End Process
+
+Process called "instant_from_nanoseconds" takes ns as Integer returns Integer:
+    @Reasoning
+    Inverse of instant_to_nanoseconds. Constructs an Instant from a raw
+    nanosecond counter. Used by deserialisers and test fixtures.
+    @End Reasoning
+    @Implementation
+    Returns the input unchanged.
+    @End Implementation
+    @Performance_Hints
+    Free; compiler folds away.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function. The caller is responsible for sourcing ns from a
+    monotonic clock; passing a wall-clock value defeats the type's
+    skew-immunity contract.
+    @End Security_Scope
+    Return ns
+End Process

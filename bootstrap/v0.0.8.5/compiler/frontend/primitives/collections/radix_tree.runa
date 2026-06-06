@@ -1,0 +1,606 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+RADIX TREE - Compressed Prefix Tree Tier 0 Primitive
+
+This file implements a binary radix tree (a.k.a. PATRICIA-trie variant)
+where each edge stores a label (byte sub-string of the key) rather than
+a single byte. Edge labels are compressed so that linear chains of
+single-child nodes collapse into one edge.
+
+The node uses linked-list children (each child knows its edge label)
+rather than a 256-slot array so the memory footprint is proportional
+to the number of distinct edges, not 256 * num_nodes. This gives much
+better memory efficiency for sparse key spaces (IP prefix tables,
+filesystem path tries, etc.).
+
+Node structure (32 bytes):
+  offset 0:  has_value flag (8 bytes)
+  offset 8:  value (8 bytes)
+  offset 16: first_child pointer (8 bytes; head of children linked list)
+  offset 24: next_sibling pointer (8 bytes; used when this node is a child)
+
+Edge label is stored adjacent: when a node is a child, its parent points
+at it. The edge label associated with reaching this node is stored as
+a separate allocation referenced by an "edge label" field. To keep the
+node fixed-size, we store the edge label pointer in a second auxiliary
+record co-allocated with the node:
+
+  Each child slot is actually a "child entry" with:
+    offset 0:  child node pointer (8 bytes)
+    offset 8:  edge label pointer (8 bytes; null-terminated byte string)
+    offset 16: edge label length (8 bytes)
+    offset 24: next sibling entry pointer (8 bytes)
+
+The root has an implicit empty edge label.
+
+Header (16 bytes):
+  offset 0: root node pointer
+  offset 8: entry_count
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let RADIX_NODE_SIZE be 32
+Let RADIX_EDGE_SIZE be 32
+Let RADIX_HEADER_SIZE be 16
+
+Note: ============================================================================
+Note: NODE / EDGE CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Allocate a fresh radix node with no children, no value.
+@End Reasoning
+
+@Implementation
+32-byte alloc, zero-init by allocator suffices.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: 32 bytes.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "radix_node_create" returns Integer:
+    Let node be proc allocate from Layout with RADIX_NODE_SIZE
+    If node is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with node, 0, 0
+    proc memory_set_int64 from Memory with node, 8, 0
+    proc memory_set_int64 from Memory with node, 16, 0
+    proc memory_set_int64 from Memory with node, 24, 0
+    Return node
+End Process
+
+@Reasoning
+Allocate a child edge entry. Stores the child node pointer, the edge
+label byte pointer, and the label length. The label byte string is
+heap-allocated and copied from the caller's buffer to give the radix
+tree ownership.
+@End Reasoning
+
+@Implementation
+1) Allocate 32-byte edge entry.
+2) Allocate (label_len + 1) bytes for the label, copy bytes plus null
+   terminator.
+3) Wire fields.
+@End Implementation
+
+@Performance_Hints
+Time: O(label_len). Space: 32 + (label_len + 1) bytes.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on any allocation failure.
+@End Security_Scope
+Process called "radix_edge_create" takes child as Integer, label_src as Integer, label_off as Integer, label_len as Integer returns Integer:
+    Let edge be proc allocate from Layout with RADIX_EDGE_SIZE
+    If edge is equal to 0:
+        Return 0
+    End If
+    Let label_alloc_size be label_len plus 1
+    Let label be proc allocate from Layout with label_alloc_size
+    If label is equal to 0:
+        proc deallocate from Layout with edge
+        Return 0
+    End If
+    Let i be 0
+    While i is less than label_len:
+        Let src_addr be label_src plus (label_off plus i)
+        Let b be proc memory_get_byte from Memory with src_addr, 0
+        Let dst_addr be label plus i
+        proc memory_set_byte from Memory with dst_addr, 0, b
+        Set i to i plus 1
+    End While
+    Let term_addr be label plus label_len
+    proc memory_set_byte from Memory with term_addr, 0, 0
+    proc memory_set_int64 from Memory with edge, 0, child
+    proc memory_set_int64 from Memory with edge, 8, label
+    proc memory_set_int64 from Memory with edge, 16, label_len
+    proc memory_set_int64 from Memory with edge, 24, 0
+    Return edge
+End Process
+
+Note: ============================================================================
+Note: TREE CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Create empty radix tree.
+@End Reasoning
+
+@Implementation
+Header + root node.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "radix_create" returns Integer:
+    Let tree be proc allocate from Layout with RADIX_HEADER_SIZE
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let root be proc radix_node_create
+    If root is equal to 0:
+        proc deallocate from Layout with tree
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with tree, 0, root
+    proc memory_set_int64 from Memory with tree, 8, 0
+    Return tree
+End Process
+
+@Reasoning
+Free every node, edge entry, and label allocation in the tree.
+@End Reasoning
+
+@Implementation
+Iterative postorder. Maintain a work stack of node pointers. For each
+popped node:
+- Walk its child-edge linked list, pushing each child node onto the
+  stack and freeing the edge label and edge entry.
+- Free the node.
+@End Implementation
+
+@Performance_Hints
+Time: O(N).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "radix_destroy" takes tree as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with tree, 0
+    Let cap be 64
+    Let buf_bytes be cap multiplied by 8
+    Let buf be proc allocate from Layout with buf_bytes
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let sp be 0
+    If root is not equal to 0:
+        proc memory_set_int64 from Memory with buf, 0, root
+        Set sp to 1
+    End If
+    While sp is greater than 0:
+        Set sp to sp minus 1
+        Let off be sp multiplied by 8
+        Let node be proc memory_get_int64 from Memory with buf, off
+        Let edge be proc memory_get_int64 from Memory with node, 16
+        While edge is not equal to 0:
+            Let child be proc memory_get_int64 from Memory with edge, 0
+            Let label be proc memory_get_int64 from Memory with edge, 8
+            Let next_edge be proc memory_get_int64 from Memory with edge, 24
+            Let need be sp plus 1
+            If need is greater than cap:
+                Let new_cap be cap multiplied by 2
+                Let new_bytes be new_cap multiplied by 8
+                Let new_buf be proc allocate from Layout with new_bytes
+                If new_buf is equal to 0:
+                    proc deallocate from Layout with buf
+                    Return 0
+                End If
+                Let copy_bytes be cap multiplied by 8
+                proc memory_copy from Memory with new_buf, buf, copy_bytes
+                proc deallocate from Layout with buf
+                Set buf to new_buf
+                Set cap to new_cap
+            End If
+            Let s_off be sp multiplied by 8
+            proc memory_set_int64 from Memory with buf, s_off, child
+            Set sp to sp plus 1
+            If label is not equal to 0:
+                proc deallocate from Layout with label
+            End If
+            proc deallocate from Layout with edge
+            Set edge to next_edge
+        End While
+        proc deallocate from Layout with node
+    End While
+    proc deallocate from Layout with buf
+    proc deallocate from Layout with tree
+    Return 1
+End Process
+
+@Reasoning
+Entry count accessor.
+@End Reasoning
+
+@Implementation
+Read entry_count at offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "radix_size" takes tree as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with tree, 8
+End Process
+
+Note: ============================================================================
+Note: STRING HELPERS
+Note: ============================================================================
+
+@Reasoning
+Compute strlen for a null-terminated key.
+@End Reasoning
+
+@Implementation
+Loop until null byte.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Caller must supply null-terminated string.
+@End Security_Scope
+Process called "radix_strlen" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While 1 is equal to 1:
+        Let byte be proc memory_get_byte from Memory with s, i
+        If byte is equal to 0:
+            Return i
+        End If
+        Set i to i plus 1
+    End While
+    Return i
+End Process
+
+@Reasoning
+Compute the length of the common prefix between two byte ranges.
+@End Reasoning
+
+@Implementation
+Compare byte-by-byte while both have characters; stop at first
+mismatch or end of either.
+@End Implementation
+
+@Performance_Hints
+Time: O(min(a_len, b_len)).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "radix_common_prefix" takes a as Integer, a_off as Integer, a_len as Integer, b as Integer, b_off as Integer, b_len as Integer returns Integer:
+    Let i be 0
+    Let limit be a_len
+    If b_len is less than limit:
+        Set limit to b_len
+    End If
+    While i is less than limit:
+        Let ab be proc memory_get_byte from Memory with a, a_off plus i
+        Let bb be proc memory_get_byte from Memory with b, b_off plus i
+        If ab is not equal to bb:
+            Return i
+        End If
+        Set i to i plus 1
+    End While
+    Return i
+End Process
+
+Note: ============================================================================
+Note: INSERT / LOOKUP
+Note: ============================================================================
+
+@Reasoning
+Insert key->value, performing edge splitting when necessary. Walks
+down the tree consuming bytes off the key:
+- For each child edge of the current node, compute the common prefix.
+- If common == 0: try next sibling. If none match the first byte,
+  add a new edge containing the rest of the key.
+- If common == edge_label_len: consume edge, advance current key
+  offset, descend into edge's child node, continue outer loop.
+- If common < edge_label_len AND common < remaining key: split the
+  edge at 'common', creating an intermediate node, then add a new
+  edge for the remaining key tail.
+- If common == remaining key length AND common < edge_label_len:
+  split the edge so the intermediate node holds the value.
+@End Reasoning
+
+@Implementation
+Iterative descent with explicit case handling at each step.
+@End Implementation
+
+@Performance_Hints
+Time: O(k) average, where k is key length.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "radix_insert" takes tree as Integer, key as Integer, value as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    Let klen be proc radix_strlen with key
+    Let cur be proc memory_get_int64 from Memory with tree, 0
+    Let k_pos be 0
+    While 1 is equal to 1:
+        If k_pos is equal to klen:
+            Let had be proc memory_get_int64 from Memory with cur, 0
+            proc memory_set_int64 from Memory with cur, 0, 1
+            proc memory_set_int64 from Memory with cur, 8, value
+            If had is equal to 0:
+                Let ec be proc memory_get_int64 from Memory with tree, 8
+                proc memory_set_int64 from Memory with tree, 8, ec plus 1
+            End If
+            Return 1
+        End If
+        Let first_byte be proc memory_get_byte from Memory with key, k_pos
+        Let edge be proc memory_get_int64 from Memory with cur, 16
+        Let prev_edge be 0
+        While edge is not equal to 0:
+            Let label be proc memory_get_int64 from Memory with edge, 8
+            Let llen be proc memory_get_int64 from Memory with edge, 16
+            Let edge_first be proc memory_get_byte from Memory with label, 0
+            If edge_first is equal to first_byte:
+                Let cp be proc radix_common_prefix with key, k_pos, klen minus k_pos, label, 0, llen
+                If cp is equal to llen:
+                    Note: consume entire edge, descend
+                    Set cur to proc memory_get_int64 from Memory with edge, 0
+                    Set k_pos to k_pos plus llen
+                    Set edge to 0 minus 1
+                    Note: marker to break the inner loop and continue outer
+                Otherwise:
+                    Note: edge_label has uncommitted tail; split the edge.
+                    Let split_node be proc radix_node_create
+                    If split_node is equal to 0:
+                        Return 0
+                    End If
+                    Note: New tail-edge takes the leftover bytes of the old edge's label.
+                    Let old_child be proc memory_get_int64 from Memory with edge, 0
+                    Let tail_edge be proc radix_edge_create with old_child, label, cp, llen minus cp
+                    If tail_edge is equal to 0:
+                        proc deallocate from Layout with split_node
+                        Return 0
+                    End If
+                    proc memory_set_int64 from Memory with split_node, 16, tail_edge
+                    Note: Replace the existing edge's child with split_node and shrink its label.
+                    proc memory_set_int64 from Memory with edge, 0, split_node
+                    Note: Truncate the existing label to length cp.
+                    Let new_label be proc allocate from Layout with cp plus 1
+                    If new_label is equal to 0:
+                        Return 0
+                    End If
+                    Let cpi be 0
+                    While cpi is less than cp:
+                        Let src_addr be label plus cpi
+                        Let dst_addr be new_label plus cpi
+                        Let bb be proc memory_get_byte from Memory with src_addr, 0
+                        proc memory_set_byte from Memory with dst_addr, 0, bb
+                        Set cpi to cpi plus 1
+                    End While
+                    Let term_addr be new_label plus cp
+                    proc memory_set_byte from Memory with term_addr, 0, 0
+                    proc deallocate from Layout with label
+                    proc memory_set_int64 from Memory with edge, 8, new_label
+                    proc memory_set_int64 from Memory with edge, 16, cp
+                    Note: Now advance into split_node and continue with the
+                    Note: remaining key suffix.
+                    Set cur to split_node
+                    Set k_pos to k_pos plus cp
+                    Set edge to 0 minus 1
+                End If
+            End If
+            If edge is equal to 0 minus 1:
+                Note: break inner loop, continue outer
+                Set edge to 0
+            Otherwise:
+                If edge is not equal to 0:
+                    Set prev_edge to edge
+                    Set edge to proc memory_get_int64 from Memory with edge, 24
+                End If
+            End If
+        End While
+        If k_pos is less than klen:
+            Note: no matching edge first byte - add a new edge holding the
+            Note: remaining suffix.
+            Let leaf be proc radix_node_create
+            If leaf is equal to 0:
+                Return 0
+            End If
+            proc memory_set_int64 from Memory with leaf, 0, 1
+            proc memory_set_int64 from Memory with leaf, 8, value
+            Let new_edge be proc radix_edge_create with leaf, key, k_pos, klen minus k_pos
+            If new_edge is equal to 0:
+                proc deallocate from Layout with leaf
+                Return 0
+            End If
+            Let old_first be proc memory_get_int64 from Memory with cur, 16
+            proc memory_set_int64 from Memory with new_edge, 24, old_first
+            proc memory_set_int64 from Memory with cur, 16, new_edge
+            Let ec be proc memory_get_int64 from Memory with tree, 8
+            proc memory_set_int64 from Memory with tree, 8, ec plus 1
+            Return 1
+        End If
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Lookup value for key. Walks edges consuming key bytes; returns 0 if
+absent.
+@End Reasoning
+
+@Implementation
+At each step, find the edge whose label starts with the current key
+byte. Match the full label against the next len(label) key bytes; if
+match, advance; else return 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(k).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "radix_lookup" takes tree as Integer, key as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    Let klen be proc radix_strlen with key
+    Let cur be proc memory_get_int64 from Memory with tree, 0
+    Let k_pos be 0
+    While k_pos is less than klen:
+        Let first_byte be proc memory_get_byte from Memory with key, k_pos
+        Let edge be proc memory_get_int64 from Memory with cur, 16
+        Let found be 0
+        While edge is not equal to 0:
+            Let label be proc memory_get_int64 from Memory with edge, 8
+            Let llen be proc memory_get_int64 from Memory with edge, 16
+            Let edge_first be proc memory_get_byte from Memory with label, 0
+            If edge_first is equal to first_byte:
+                If k_pos plus llen is greater than klen:
+                    Return 0
+                End If
+                Let cp be proc radix_common_prefix with key, k_pos, klen minus k_pos, label, 0, llen
+                If cp is equal to llen:
+                    Set cur to proc memory_get_int64 from Memory with edge, 0
+                    Set k_pos to k_pos plus llen
+                    Set found to 1
+                    Set edge to 0
+                Otherwise:
+                    Return 0
+                End If
+            Otherwise:
+                Set edge to proc memory_get_int64 from Memory with edge, 24
+            End If
+        End While
+        If found is equal to 0:
+            Return 0
+        End If
+    End While
+    Let has_value be proc memory_get_int64 from Memory with cur, 0
+    If has_value is equal to 1:
+        Return proc memory_get_int64 from Memory with cur, 8
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Containment predicate distinguishing "absent" from "present with 0".
+@End Reasoning
+
+@Implementation
+Same descent as lookup but returns 1 on terminal has_value flag.
+@End Implementation
+
+@Performance_Hints
+Time: O(k).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "radix_contains" takes tree as Integer, key as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    Let klen be proc radix_strlen with key
+    Let cur be proc memory_get_int64 from Memory with tree, 0
+    Let k_pos be 0
+    While k_pos is less than klen:
+        Let first_byte be proc memory_get_byte from Memory with key, k_pos
+        Let edge be proc memory_get_int64 from Memory with cur, 16
+        Let found be 0
+        While edge is not equal to 0:
+            Let label be proc memory_get_int64 from Memory with edge, 8
+            Let llen be proc memory_get_int64 from Memory with edge, 16
+            Let edge_first be proc memory_get_byte from Memory with label, 0
+            If edge_first is equal to first_byte:
+                If k_pos plus llen is greater than klen:
+                    Return 0
+                End If
+                Let cp be proc radix_common_prefix with key, k_pos, klen minus k_pos, label, 0, llen
+                If cp is equal to llen:
+                    Set cur to proc memory_get_int64 from Memory with edge, 0
+                    Set k_pos to k_pos plus llen
+                    Set found to 1
+                    Set edge to 0
+                Otherwise:
+                    Return 0
+                End If
+            Otherwise:
+                Set edge to proc memory_get_int64 from Memory with edge, 24
+            End If
+        End While
+        If found is equal to 0:
+            Return 0
+        End If
+    End While
+    Return proc memory_get_int64 from Memory with cur, 0
+End Process

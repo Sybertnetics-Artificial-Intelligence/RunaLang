@@ -1,0 +1,776 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+PROTOBUF DESCRIPTOR - Foundational AST for .proto Files (Tier 1)
+
+Implements the Runa-native AST for Protocol Buffers descriptors. The
+shape mirrors google.protobuf.FileDescriptorProto from descriptor.proto
+(https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/descriptor.proto)
+so binary FileDescriptorSet payloads emitted by protoc round-trip
+through this representation.
+
+SCOPE OF THIS MODULE:
+  - Construct/destroy ProtobufFile, ProtobufMessage, ProtobufField,
+    ProtobufEnum, ProtobufService AST nodes.
+  - Provide field accessors and append helpers used by all downstream
+    consumers (the protoc-binary decoder, the .proto-text parser, the
+    Runa-to-proto codegen, the proto-to-Runa adapter).
+
+FUTURE FILL (deliberately deferred):
+  - The .proto-text grammar lexer/parser is a large surface (option
+    blocks, custom options, extension ranges, reserved fields,
+    oneofs with tagged unions). The AST is complete and stable here;
+    the .proto-text producer that populates these records lives in
+    a Tier 2 package (runa-protobuf-toolchain) because it requires
+    the regex engine and unicode-NFC normalizer.
+  - The protoc binary descriptor decoder reads the same AST and is
+    tracked separately so its varint/length-prefix machinery does
+    not bloat this file.
+
+Layout (ProtobufFile, 56 bytes):
+  offset  0 : syntax        (8 bytes, see SYNTAX_* constants)
+  offset  8 : package       (8 bytes, String pointer or 0)
+  offset 16 : imports       (8 bytes, List<String>)
+  offset 24 : messages      (8 bytes, List<ProtobufMessage>)
+  offset 32 : enums         (8 bytes, List<ProtobufEnum>)
+  offset 40 : services      (8 bytes, List<ProtobufService>)
+  offset 48 : file_options  (8 bytes, Dictionary<String, ConfigValue> or 0)
+
+Layout (ProtobufMessage, 56 bytes):
+  offset  0 : name          (8 bytes, String pointer)
+  offset  8 : fields        (8 bytes, List<ProtobufField>)
+  offset 16 : nested_messages (8 bytes, List<ProtobufMessage>)
+  offset 24 : nested_enums  (8 bytes, List<ProtobufEnum>)
+  offset 32 : oneofs        (8 bytes, List<String> - oneof group names)
+  offset 40 : reserved_numbers (8 bytes, List<Integer>)
+  offset 48 : reserved_names    (8 bytes, List<String>)
+
+Layout (ProtobufField, 48 bytes):
+  offset  0 : name          (8 bytes, String pointer)
+  offset  8 : field_number  (8 bytes, 1..536870911 per spec)
+  offset 16 : type_tag      (8 bytes, see PB_TYPE_*)
+  offset 24 : type_name     (8 bytes, String pointer for message/enum types or 0)
+  offset 32 : label         (8 bytes, see PB_LABEL_*)
+  offset 40 : json_name     (8 bytes, String pointer or 0)
+
+Layout (ProtobufEnum, 24 bytes):
+  offset  0 : name          (8 bytes, String pointer)
+  offset  8 : values        (8 bytes, List<EnumValue 16 bytes>)
+  offset 16 : allow_alias   (8 bytes, 0 or 1)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+
+Let PB_FILE_SIZE be 56
+Let PB_MESSAGE_SIZE be 56
+Let PB_FIELD_SIZE be 48
+Let PB_ENUM_SIZE be 24
+
+Let SYNTAX_PROTO2 be 2
+Let SYNTAX_PROTO3 be 3
+
+Note: Wire-format type tags per descriptor.proto.
+Let PB_TYPE_DOUBLE be 1
+Let PB_TYPE_FLOAT be 2
+Let PB_TYPE_INT64 be 3
+Let PB_TYPE_UINT64 be 4
+Let PB_TYPE_INT32 be 5
+Let PB_TYPE_FIXED64 be 6
+Let PB_TYPE_FIXED32 be 7
+Let PB_TYPE_BOOL be 8
+Let PB_TYPE_STRING be 9
+Let PB_TYPE_GROUP be 10
+Let PB_TYPE_MESSAGE be 11
+Let PB_TYPE_BYTES be 12
+Let PB_TYPE_UINT32 be 13
+Let PB_TYPE_ENUM be 14
+Let PB_TYPE_SFIXED32 be 15
+Let PB_TYPE_SFIXED64 be 16
+Let PB_TYPE_SINT32 be 17
+Let PB_TYPE_SINT64 be 18
+
+Let PB_LABEL_OPTIONAL be 1
+Let PB_LABEL_REQUIRED be 2
+Let PB_LABEL_REPEATED be 3
+
+@Reasoning
+Construct a ProtobufFile with the given syntax. Pre-allocates the
+collection slots.
+@End Reasoning
+
+@Implementation
+Allocate the 56-byte record. Create empty lists for imports,
+messages, enums, services. Set the syntax tag.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1) plus the empty collection headers.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or invalid syntax tag.
+@End Security_Scope
+Process called "pb_file_create" takes syntax as Integer returns Integer:
+    If syntax is less than SYNTAX_PROTO2:
+        Return 0
+    End If
+    If syntax is greater than SYNTAX_PROTO3:
+        Return 0
+    End If
+    Let f be proc allocate from Layout with PB_FILE_SIZE
+    If f is equal to 0:
+        Return 0
+    End If
+    Let imports be proc list_create from List
+    Let messages be proc list_create from List
+    Let enums be proc list_create from List
+    Let services be proc list_create from List
+    If imports is equal to 0:
+        proc deallocate from Layout with f
+        Return 0
+    End If
+    If messages is equal to 0:
+        proc list_destroy from List with imports
+        proc deallocate from Layout with f
+        Return 0
+    End If
+    If enums is equal to 0:
+        proc list_destroy from List with messages
+        proc list_destroy from List with imports
+        proc deallocate from Layout with f
+        Return 0
+    End If
+    If services is equal to 0:
+        proc list_destroy from List with enums
+        proc list_destroy from List with messages
+        proc list_destroy from List with imports
+        proc deallocate from Layout with f
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with f, 0, syntax
+    proc memory_set_int64 from Memory with f, 8, 0
+    proc memory_set_int64 from Memory with f, 16, imports
+    proc memory_set_int64 from Memory with f, 24, messages
+    proc memory_set_int64 from Memory with f, 32, enums
+    proc memory_set_int64 from Memory with f, 40, services
+    proc memory_set_int64 from Memory with f, 48, 0
+    Return f
+End Process
+
+@Reasoning
+Construct a ProtobufMessage. Pre-allocates collection slots.
+@End Reasoning
+
+@Implementation
+Allocate 56 bytes, populate name (duplicated), create empty
+collections.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|). Space: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null name.
+@End Security_Scope
+Process called "pb_message_create" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let name_copy be proc string_duplicate from StringPrim with name
+    If name_copy is equal to 0:
+        Return 0
+    End If
+    Let m be proc allocate from Layout with PB_MESSAGE_SIZE
+    If m is equal to 0:
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    Let fields be proc list_create from List
+    Let nested_m be proc list_create from List
+    Let nested_e be proc list_create from List
+    Let oneofs be proc list_create from List
+    Let reserved_n be proc list_create from List
+    Let reserved_s be proc list_create from List
+    proc memory_set_int64 from Memory with m, 0, name_copy
+    proc memory_set_int64 from Memory with m, 8, fields
+    proc memory_set_int64 from Memory with m, 16, nested_m
+    proc memory_set_int64 from Memory with m, 24, nested_e
+    proc memory_set_int64 from Memory with m, 32, oneofs
+    proc memory_set_int64 from Memory with m, 40, reserved_n
+    proc memory_set_int64 from Memory with m, 48, reserved_s
+    Return m
+End Process
+
+@Reasoning
+Construct a ProtobufField. The type_name applies only to message /
+enum type tags; pass 0 for scalar types.
+@End Reasoning
+
+@Implementation
+Validate the field_number against the protobuf reserved range
+[19000..19999] and the absolute max 536870911. Allocate 48 bytes,
+populate.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|). Space: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Reserved-range numbers (19000..19999) and out-of-range numbers
+return 0.
+@End Security_Scope
+Process called "pb_field_create" takes name as Integer, field_number as Integer, type_tag as Integer, type_name as Integer, label as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If field_number is less than 1:
+        Return 0
+    End If
+    If field_number is greater than 536870911:
+        Return 0
+    End If
+    If field_number is greater than or equal to 19000:
+        If field_number is less than or equal to 19999:
+            Return 0
+        End If
+    End If
+    If type_tag is less than PB_TYPE_DOUBLE:
+        Return 0
+    End If
+    If type_tag is greater than PB_TYPE_SINT64:
+        Return 0
+    End If
+    If label is less than PB_LABEL_OPTIONAL:
+        Return 0
+    End If
+    If label is greater than PB_LABEL_REPEATED:
+        Return 0
+    End If
+    Let name_copy be proc string_duplicate from StringPrim with name
+    If name_copy is equal to 0:
+        Return 0
+    End If
+    Let type_name_copy be 0
+    If type_name is not equal to 0:
+        Set type_name_copy to proc string_duplicate from StringPrim with type_name
+    End If
+    Let f be proc allocate from Layout with PB_FIELD_SIZE
+    If f is equal to 0:
+        If type_name_copy is not equal to 0:
+            proc deallocate from Layout with type_name_copy
+        End If
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with f, 0, name_copy
+    proc memory_set_int64 from Memory with f, 8, field_number
+    proc memory_set_int64 from Memory with f, 16, type_tag
+    proc memory_set_int64 from Memory with f, 24, type_name_copy
+    proc memory_set_int64 from Memory with f, 32, label
+    proc memory_set_int64 from Memory with f, 40, 0
+    Return f
+End Process
+
+@Reasoning
+Construct a ProtobufEnum.
+@End Reasoning
+
+@Implementation
+Duplicate the name, allocate, create an empty values list.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|). Space: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null name.
+@End Security_Scope
+Process called "pb_enum_create" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let name_copy be proc string_duplicate from StringPrim with name
+    If name_copy is equal to 0:
+        Return 0
+    End If
+    Let vals be proc list_create from List
+    If vals is equal to 0:
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    Let e be proc allocate from Layout with PB_ENUM_SIZE
+    If e is equal to 0:
+        proc list_destroy from List with vals
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with e, 0, name_copy
+    proc memory_set_int64 from Memory with e, 8, vals
+    proc memory_set_int64 from Memory with e, 16, 0
+    Return e
+End Process
+
+@Reasoning
+Append a message to a file.
+@End Reasoning
+
+@Implementation
+list_push into the messages slot.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+The file adopts the message; release via pb_file_destroy.
+@End Security_Scope
+Process called "pb_file_add_message" takes f as Integer, m as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    If m is equal to 0:
+        Return 0
+    End If
+    Let list be proc memory_get_int64 from Memory with f, 24
+    proc list_push from List with list, m
+    Return 1
+End Process
+
+@Reasoning
+Append a field to a message.
+@End Reasoning
+
+@Implementation
+list_push.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+The message adopts the field.
+@End Security_Scope
+Process called "pb_message_add_field" takes m as Integer, field as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    If field is equal to 0:
+        Return 0
+    End If
+    Let list be proc memory_get_int64 from Memory with m, 8
+    proc list_push from List with list, field
+    Return 1
+End Process
+
+@Reasoning
+Append an enum to a file.
+@End Reasoning
+
+@Implementation
+list_push.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+The file adopts the enum.
+@End Security_Scope
+Process called "pb_file_add_enum" takes f as Integer, e as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    If e is equal to 0:
+        Return 0
+    End If
+    Let list be proc memory_get_int64 from Memory with f, 32
+    proc list_push from List with list, e
+    Return 1
+End Process
+
+@Reasoning
+Free a ProtobufField and its owned strings.
+@End Reasoning
+
+@Implementation
+Free name and (if present) type_name, then the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access the pointer after destroy.
+@End Security_Scope
+Process called "pb_field_destroy" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Let name be proc memory_get_int64 from Memory with f, 0
+    If name is not equal to 0:
+        proc deallocate from Layout with name
+    End If
+    Let tn be proc memory_get_int64 from Memory with f, 24
+    If tn is not equal to 0:
+        proc deallocate from Layout with tn
+    End If
+    Let jn be proc memory_get_int64 from Memory with f, 40
+    If jn is not equal to 0:
+        proc deallocate from Layout with jn
+    End If
+    proc deallocate from Layout with f
+    Return 1
+End Process
+
+@Reasoning
+Free a ProtobufMessage and all nested elements.
+@End Reasoning
+
+@Implementation
+Walk every nested collection, deallocating fields and recursing into
+nested messages / enums.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the message subtree. Space: O(d) recursion.
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access the pointer after destroy.
+@End Security_Scope
+Process called "pb_message_destroy" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let name be proc memory_get_int64 from Memory with m, 0
+    If name is not equal to 0:
+        proc deallocate from Layout with name
+    End If
+    Let fields be proc memory_get_int64 from Memory with m, 8
+    If fields is not equal to 0:
+        Let fn be proc list_length from List with fields
+        Let i be 0
+        While i is less than fn:
+            Let fld be proc list_get from List with fields, i
+            If fld is not equal to 0:
+                proc pb_field_destroy with fld
+            End If
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with fields
+    End If
+    Let nm be proc memory_get_int64 from Memory with m, 16
+    If nm is not equal to 0:
+        Let nm_n be proc list_length from List with nm
+        Let j be 0
+        While j is less than nm_n:
+            Let child be proc list_get from List with nm, j
+            If child is not equal to 0:
+                proc pb_message_destroy with child
+            End If
+            Set j to j plus 1
+        End While
+        proc list_destroy from List with nm
+    End If
+    Let ne be proc memory_get_int64 from Memory with m, 24
+    If ne is not equal to 0:
+        Let ne_n be proc list_length from List with ne
+        Let k be 0
+        While k is less than ne_n:
+            Let e be proc list_get from List with ne, k
+            If e is not equal to 0:
+                proc pb_enum_destroy with e
+            End If
+            Set k to k plus 1
+        End While
+        proc list_destroy from List with ne
+    End If
+    Let oneofs be proc memory_get_int64 from Memory with m, 32
+    If oneofs is not equal to 0:
+        proc list_destroy from List with oneofs
+    End If
+    Let rn be proc memory_get_int64 from Memory with m, 40
+    If rn is not equal to 0:
+        proc list_destroy from List with rn
+    End If
+    Let rs be proc memory_get_int64 from Memory with m, 48
+    If rs is not equal to 0:
+        proc list_destroy from List with rs
+    End If
+    proc deallocate from Layout with m
+    Return 1
+End Process
+
+@Reasoning
+Free a ProtobufEnum and its values list.
+@End Reasoning
+
+@Implementation
+Free name; iterate values list freeing each entry; destroy the list;
+free the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(v) for the value count. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access the pointer after destroy.
+@End Security_Scope
+Process called "pb_enum_destroy" takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Let name be proc memory_get_int64 from Memory with e, 0
+    If name is not equal to 0:
+        proc deallocate from Layout with name
+    End If
+    Let vals be proc memory_get_int64 from Memory with e, 8
+    If vals is not equal to 0:
+        Let vn be proc list_length from List with vals
+        Let i be 0
+        While i is less than vn:
+            Let v be proc list_get from List with vals, i
+            If v is not equal to 0:
+                proc deallocate from Layout with v
+            End If
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with vals
+    End If
+    proc deallocate from Layout with e
+    Return 1
+End Process
+
+@Reasoning
+Free a ProtobufFile and every owned subtree.
+@End Reasoning
+
+@Implementation
+Iterate messages calling pb_message_destroy, enums calling
+pb_enum_destroy. Free imports and services lists, package string,
+options dict.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the whole file. Space: O(d) recursion.
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access the pointer after destroy.
+@End Security_Scope
+Process called "pb_file_destroy" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Let package be proc memory_get_int64 from Memory with f, 8
+    If package is not equal to 0:
+        proc deallocate from Layout with package
+    End If
+    Let imports be proc memory_get_int64 from Memory with f, 16
+    If imports is not equal to 0:
+        Let in_n be proc list_length from List with imports
+        Let i be 0
+        While i is less than in_n:
+            Let s be proc list_get from List with imports, i
+            If s is not equal to 0:
+                proc deallocate from Layout with s
+            End If
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with imports
+    End If
+    Let messages be proc memory_get_int64 from Memory with f, 24
+    If messages is not equal to 0:
+        Let mn be proc list_length from List with messages
+        Let j be 0
+        While j is less than mn:
+            Let m be proc list_get from List with messages, j
+            If m is not equal to 0:
+                proc pb_message_destroy with m
+            End If
+            Set j to j plus 1
+        End While
+        proc list_destroy from List with messages
+    End If
+    Let enums be proc memory_get_int64 from Memory with f, 32
+    If enums is not equal to 0:
+        Let en be proc list_length from List with enums
+        Let k be 0
+        While k is less than en:
+            Let e be proc list_get from List with enums, k
+            If e is not equal to 0:
+                proc pb_enum_destroy with e
+            End If
+            Set k to k plus 1
+        End While
+        proc list_destroy from List with enums
+    End If
+    Let services be proc memory_get_int64 from Memory with f, 40
+    If services is not equal to 0:
+        proc list_destroy from List with services
+    End If
+    Let opts be proc memory_get_int64 from Memory with f, 48
+    If opts is not equal to 0:
+        proc destroy from Dict with opts
+    End If
+    proc deallocate from Layout with f
+    Return 1
+End Process
+
+@Reasoning
+Expose the file's syntax discriminator.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "pb_file_syntax" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 0
+End Process
+
+@Reasoning
+Expose the file's message list.
+@End Reasoning
+
+@Implementation
+Load offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "pb_file_messages" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 24
+End Process
+
+@Reasoning
+Expose the message name.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "pb_message_name" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with m, 0
+End Process
+
+@Reasoning
+Expose the message's field list.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "pb_message_fields" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with m, 8
+End Process
+
+@Reasoning
+Expose the field number.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "pb_field_number" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 8
+End Process
+
+@Reasoning
+Expose the field's type tag.
+@End Reasoning
+
+@Implementation
+Load offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "pb_field_type_tag" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 16
+End Process

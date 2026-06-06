@@ -1,0 +1,2276 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+BLAKE3 - Cryptographic hash, MAC, KDF, and XOF per the official BLAKE3 spec
+==============================================================================
+
+BLAKE3 is a tree-mode hash function built on top of a single compression
+function derived from ChaCha. It produces 256-bit output by default and an
+arbitrary length output in XOF mode. Designed by O'Connor, Aumasson, Neves,
+Wilcox-O'Hearn (2020).
+
+Construction:
+  1. The input is split into 1024-byte chunks. Each chunk is processed in
+     64-byte blocks by the compression function, with CHUNK_START set on
+     the first block of a chunk and CHUNK_END set on the last block. Only
+     the last block's output contributes the chunk's 32-byte chaining value.
+  2. Chaining values are merged pairwise in a binary tree via the same
+     compression function with PARENT set. The final compression at the
+     root sets ROOT.
+  3. The root may be expanded as an XOF by repeatedly calling the
+     compression function on the final block with ROOT set and an
+     incrementing block counter.
+
+IV (identical to SHA-256 IV):
+  0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+  0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+
+Flags (LSB-first bit positions):
+  CHUNK_START          = 0x01
+  CHUNK_END            = 0x02
+  PARENT               = 0x04
+  ROOT                 = 0x08
+  KEYED_HASH           = 0x10
+  DERIVE_KEY_CONTEXT   = 0x20
+  DERIVE_KEY_MATERIAL  = 0x40
+
+Compression: 7 rounds of column + diagonal G permutations on a 16-word
+state, exactly the ChaCha quarter-round structure with message-word
+injection.
+
+G(state, a, b, c, d, mx, my):
+  v[a] = v[a] + v[b] + mx
+  v[d] = rotr32(v[d] XOR v[a], 16)
+  v[c] = v[c] + v[d]
+  v[b] = rotr32(v[b] XOR v[c], 12)
+  v[a] = v[a] + v[b] + my
+  v[d] = rotr32(v[d] XOR v[a], 8)
+  v[c] = v[c] + v[d]
+  v[b] = rotr32(v[b] XOR v[c], 7)
+
+Message permutation between rounds:
+  MSG_PERMUTATION = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8]
+
+Side-channel posture:
+- No secret-dependent branches. All loops are length-driven, not key-
+  or input-content driven.
+- No secret-dependent memory accesses. Indices are loop counters.
+- Constant-time at the algorithm level.
+
+Out of scope:
+- Power analysis (requires hardware countermeasures).
+- Fault injection (requires platform mitigations).
+
+References:
+- BLAKE3 spec: https://github.com/BLAKE3-team/BLAKE3-specs/blob/master/blake3.pdf
+- Reference test vectors: https://github.com/BLAKE3-team/BLAKE3/blob/master/test_vectors/test_vectors.json
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+
+Constant BLAKE3_U32_MASK as Integer is 4294967295
+Constant BLAKE3_BLOCK_SIZE as Integer is 64
+Constant BLAKE3_CHUNK_SIZE as Integer is 1024
+Constant BLAKE3_KEY_SIZE as Integer is 32
+Constant BLAKE3_OUT_SIZE as Integer is 32
+Constant BLAKE3_CV_SIZE as Integer is 32
+
+Constant BLAKE3_FLAG_CHUNK_START as Integer is 1
+Constant BLAKE3_FLAG_CHUNK_END as Integer is 2
+Constant BLAKE3_FLAG_PARENT as Integer is 4
+Constant BLAKE3_FLAG_ROOT as Integer is 8
+Constant BLAKE3_FLAG_KEYED_HASH as Integer is 16
+Constant BLAKE3_FLAG_DERIVE_KEY_CONTEXT as Integer is 32
+Constant BLAKE3_FLAG_DERIVE_KEY_MATERIAL as Integer is 64
+
+Note: ============================================================================
+Note: 32-bit arithmetic helpers (constant-time integer ops)
+Note: ============================================================================
+
+Process called "blake3_u32_add" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Modular 32-bit addition: (a + b) mod 2^32. Runa Integer is 64-bit signed,
+    so we mask the sum to drop any bits beyond bit 31 to emulate the u32
+    wraparound used throughout the BLAKE3 spec.
+    @End Reasoning
+
+    @Implementation
+    Plain add followed by bitwise_and with U32_MASK = 2^32 - 1. Both inputs
+    must already be in [0, 2^32). Result is in [0, 2^32).
+    @End Implementation
+
+    @Performance_Hints
+    One add, one mask. Sub-nanosecond. A future codegen pass can detect the
+    pattern and emit a single 32-bit add instruction.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time (pure arithmetic, no branches).
+    @End Security_Scope
+
+    Let sum_value be a plus b
+    Return sum_value bitwise_and BLAKE3_U32_MASK
+End Process
+
+Process called "blake3_rotr32" takes value as Integer, n as Integer returns Integer:
+    @Reasoning
+    Right-rotate a 32-bit value by n positions. Used by the G permutation
+    with rotations of 16, 12, 8, and 7 bits per BLAKE3 spec section 2.4.
+    @End Reasoning
+
+    @Implementation
+    Computes ((value >> n) | (value << (32-n))) mod 2^32. Since Runa
+    Integer division and multiplication by powers of two are the standard
+    shift primitives, we multiply for the left half and divide for the
+    right half, then OR and mask to 32 bits.
+    @End Implementation
+
+    @Performance_Hints
+    One divide-by-power-of-2, one multiply-by-power-of-2, one OR, one mask.
+    Sub-nanosecond. A future Runa codegen pass can lower this to a single
+    ROR instruction once recognized.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: timing depends only on n (compile-time public constant
+    in every call site below), never on value.
+    @End Security_Scope
+
+    Let v32 be value bitwise_and BLAKE3_U32_MASK
+    Let n_mod be n modulo by 32
+    If n_mod is equal to 0:
+        Return v32
+    End If
+
+    Let shift_right be 1
+    Let ir be 0
+    While ir is less than n_mod:
+        Set shift_right to shift_right multiplied by 2
+        Set ir to ir plus 1
+    End While
+    Let shift_left be 1
+    Let il be 0
+    Let left_count be 32 minus n_mod
+    While il is less than left_count:
+        Set shift_left to shift_left multiplied by 2
+        Set il to il plus 1
+    End While
+
+    Let right_part be v32 divided by shift_right
+    Let left_part be v32 multiplied by shift_left
+    Set left_part to left_part bitwise_and BLAKE3_U32_MASK
+    Let combined be right_part bitwise_or left_part
+    Return combined bitwise_and BLAKE3_U32_MASK
+End Process
+
+Note: ============================================================================
+Note: BLAKE3 IV (same as SHA-256 IV per FIPS 180-4)
+Note: ============================================================================
+
+Process called "blake3_iv_word" takes index as Integer returns Integer:
+    @Reasoning
+    Returns IV[index] for index in 0..7. The BLAKE3 IV is identical to the
+    SHA-256 IV: the 32-bit fractional parts of the square roots of the
+    first 8 primes (2, 3, 5, 7, 11, 13, 17, 19).
+    @End Reasoning
+
+    @Implementation
+    Branch lookup. Stage1 has limited static-array support; a direct
+    case-by-case return is equivalent in cost and is fully constant-time
+    for the public index parameter.
+    @End Implementation
+
+    @Performance_Hints
+    8-way branch resolved at compile time when callers pass literal indices
+    (which is the case for every internal call site below).
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: index is always a compile-time integer in callers.
+    @End Security_Scope
+
+    If index is equal to 0:
+        Return 1779033703
+    End If
+    If index is equal to 1:
+        Return 3144134277
+    End If
+    If index is equal to 2:
+        Return 1013904242
+    End If
+    If index is equal to 3:
+        Return 2773480762
+    End If
+    If index is equal to 4:
+        Return 1359893119
+    End If
+    If index is equal to 5:
+        Return 2600822924
+    End If
+    If index is equal to 6:
+        Return 528734635
+    End If
+    If index is equal to 7:
+        Return 1541459225
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: BLAKE3 message-word permutation
+Note: ============================================================================
+
+Process called "blake3_msg_perm_index" takes i as Integer returns Integer:
+    @Reasoning
+    BLAKE3 spec MSG_PERMUTATION = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5,
+    9, 14, 15, 8]. After each compression round (except the last), the
+    message words are permuted: m'[i] = m[MSG_PERMUTATION[i]].
+    @End Reasoning
+
+    @Implementation
+    Direct lookup by branch. Public index from a loop counter; constant-time
+    by construction.
+    @End Implementation
+
+    @Performance_Hints
+    16-way branch resolved inline at each call site by the compiler's
+    constant-folding pass when the caller passes a literal.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: index is a public loop counter.
+    @End Security_Scope
+
+    If i is equal to 0:
+        Return 2
+    End If
+    If i is equal to 1:
+        Return 6
+    End If
+    If i is equal to 2:
+        Return 3
+    End If
+    If i is equal to 3:
+        Return 10
+    End If
+    If i is equal to 4:
+        Return 7
+    End If
+    If i is equal to 5:
+        Return 0
+    End If
+    If i is equal to 6:
+        Return 4
+    End If
+    If i is equal to 7:
+        Return 13
+    End If
+    If i is equal to 8:
+        Return 1
+    End If
+    If i is equal to 9:
+        Return 11
+    End If
+    If i is equal to 10:
+        Return 12
+    End If
+    If i is equal to 11:
+        Return 5
+    End If
+    If i is equal to 12:
+        Return 9
+    End If
+    If i is equal to 13:
+        Return 14
+    End If
+    If i is equal to 14:
+        Return 15
+    End If
+    If i is equal to 15:
+        Return 8
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: G permutation
+Note: ============================================================================
+
+Process called "blake3_g" takes v_state as Integer, a as Integer, b as Integer, c as Integer, d as Integer, mx as Integer, my as Integer returns Integer:
+    @Reasoning
+    BLAKE3 G function per spec section 2.4. Mixes four state words v[a],
+    v[b], v[c], v[d] with two message words mx and my. v_state stores the
+    16 32-bit state words as 8-byte qwords at offsets index*8.
+    @End Reasoning
+
+    @Implementation
+      v[a] = v[a] + v[b] + mx
+      v[d] = rotr32(v[d] XOR v[a], 16)
+      v[c] = v[c] + v[d]
+      v[b] = rotr32(v[b] XOR v[c], 12)
+      v[a] = v[a] + v[b] + my
+      v[d] = rotr32(v[d] XOR v[a], 8)
+      v[c] = v[c] + v[d]
+      v[b] = rotr32(v[b] XOR v[c], 7)
+    All additions are mod 2^32 via blake3_u32_add. Inputs mx and my are
+    already in [0, 2^32) from the message-word loader.
+    @End Implementation
+
+    @Performance_Hints
+    Twelve 32-bit adds, four rotations, four XORs. Eight G calls per
+    round, seven rounds per compression: 56 G calls per block. The hot
+    loop. A future SIMD-vectorized lowering can pack four lanes of the
+    state into a 128-bit register and run all four column or diagonal Gs
+    in parallel.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: no secret-dependent branches or memory accesses; all
+    indices are caller-supplied compile-time constants from the
+    compression round structure.
+    @End Security_Scope
+
+    Let off_a be a multiplied by 8
+    Let off_b be b multiplied by 8
+    Let off_c be c multiplied by 8
+    Let off_d be d multiplied by 8
+
+    Let va be proc memory_get_qword from Memory with v_state, off_a
+    Let vb be proc memory_get_qword from Memory with v_state, off_b
+    Let vc be proc memory_get_qword from Memory with v_state, off_c
+    Let vd be proc memory_get_qword from Memory with v_state, off_d
+
+    Let va_ab be proc blake3_u32_add with va, vb
+    Set va to proc blake3_u32_add with va_ab, mx
+
+    Let vd_xa be vd bitwise_xor va
+    Set vd to proc blake3_rotr32 with vd_xa, 16
+
+    Set vc to proc blake3_u32_add with vc, vd
+
+    Let vb_xc be vb bitwise_xor vc
+    Set vb to proc blake3_rotr32 with vb_xc, 12
+
+    Let va_ab2 be proc blake3_u32_add with va, vb
+    Set va to proc blake3_u32_add with va_ab2, my
+
+    Let vd_xa2 be vd bitwise_xor va
+    Set vd to proc blake3_rotr32 with vd_xa2, 8
+
+    Set vc to proc blake3_u32_add with vc, vd
+
+    Let vb_xc2 be vb bitwise_xor vc
+    Set vb to proc blake3_rotr32 with vb_xc2, 7
+
+    proc memory_set_qword from Memory with v_state, off_a, va
+    proc memory_set_qword from Memory with v_state, off_b, vb
+    proc memory_set_qword from Memory with v_state, off_c, vc
+    proc memory_set_qword from Memory with v_state, off_d, vd
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: One compression round (column step + diagonal step) with message m
+Note: ============================================================================
+
+Process called "blake3_round" takes v_state as Integer, m_state as Integer returns Integer:
+    @Reasoning
+    Performs one BLAKE3 compression round on v_state using the 16 message
+    words in m_state. Per spec section 2.4, a round consists of:
+      column step:   G(0,4,8,12,m0,m1), G(1,5,9,13,m2,m3),
+                     G(2,6,10,14,m4,m5), G(3,7,11,15,m6,m7)
+      diagonal step: G(0,5,10,15,m8,m9), G(1,6,11,12,m10,m11),
+                     G(2,7,8,13,m12,m13), G(3,4,9,14,m14,m15)
+    @End Reasoning
+
+    @Implementation
+    Reads each message word from m_state (stored as qwords at offsets
+    index*8) and invokes blake3_g eight times in the order above.
+    @End Implementation
+
+    @Performance_Hints
+    Eight G calls. Sixteen message-word reads. Trivially parallelizable
+    across the four column Gs (independent) and the four diagonal Gs
+    (also independent within their step).
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. All indices are loop-iteration-independent compile-time
+    constants.
+    @End Security_Scope
+
+    Let m0 be proc memory_get_qword from Memory with m_state, 0
+    Let m1 be proc memory_get_qword from Memory with m_state, 8
+    Let m2 be proc memory_get_qword from Memory with m_state, 16
+    Let m3 be proc memory_get_qword from Memory with m_state, 24
+    Let m4 be proc memory_get_qword from Memory with m_state, 32
+    Let m5 be proc memory_get_qword from Memory with m_state, 40
+    Let m6 be proc memory_get_qword from Memory with m_state, 48
+    Let m7 be proc memory_get_qword from Memory with m_state, 56
+    Let m8 be proc memory_get_qword from Memory with m_state, 64
+    Let m9 be proc memory_get_qword from Memory with m_state, 72
+    Let m10 be proc memory_get_qword from Memory with m_state, 80
+    Let m11 be proc memory_get_qword from Memory with m_state, 88
+    Let m12 be proc memory_get_qword from Memory with m_state, 96
+    Let m13 be proc memory_get_qword from Memory with m_state, 104
+    Let m14 be proc memory_get_qword from Memory with m_state, 112
+    Let m15 be proc memory_get_qword from Memory with m_state, 120
+
+    proc blake3_g with v_state, 0, 4, 8, 12, m0, m1
+    proc blake3_g with v_state, 1, 5, 9, 13, m2, m3
+    proc blake3_g with v_state, 2, 6, 10, 14, m4, m5
+    proc blake3_g with v_state, 3, 7, 11, 15, m6, m7
+
+    proc blake3_g with v_state, 0, 5, 10, 15, m8, m9
+    proc blake3_g with v_state, 1, 6, 11, 12, m10, m11
+    proc blake3_g with v_state, 2, 7, 8, 13, m12, m13
+    proc blake3_g with v_state, 3, 4, 9, 14, m14, m15
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Permute the message words: m'[i] = m[MSG_PERMUTATION[i]]
+Note: ============================================================================
+
+Process called "blake3_permute_message" takes arena as Integer, m_state as Integer returns Integer:
+    @Reasoning
+    Applies MSG_PERMUTATION in place. Spec section 2.4 calls for this
+    after each round except the last (rounds 1..6 of the 7-round
+    sequence; we apply it between rounds, so 6 invocations total).
+    @End Reasoning
+
+    @Implementation
+    Allocates a 16-word scratch buffer in the arena, copies the
+    permuted words into it, then writes them back into m_state. This avoids
+    the write-into-while-reading data dependency of a strict-in-place
+    permutation, which is required for correctness because some source
+    indices alias destinations earlier in the permutation table.
+    @End Implementation
+
+    @Performance_Hints
+    Sixteen reads, sixteen writes, with one arena allocation per call.
+    Cost is small relative to the compression rounds themselves.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: permutation indices come from a public table.
+    @End Security_Scope
+
+    Let tmp be proc arena_allocate from Arena with arena, 128
+    If tmp is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than 16:
+        Let src_idx be proc blake3_msg_perm_index with i
+        Let src_off be src_idx multiplied by 8
+        Let src_val be proc memory_get_qword from Memory with m_state, src_off
+        Let dst_off be i multiplied by 8
+        proc memory_set_qword from Memory with tmp, dst_off, src_val
+        Set i to i plus 1
+    End While
+
+    Let j be 0
+    While j is less than 16:
+        Let off_j be j multiplied by 8
+        Let val_j be proc memory_get_qword from Memory with tmp, off_j
+        proc memory_set_qword from Memory with m_state, off_j, val_j
+        Set j to j plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: BLAKE3 compression function
+Note: ============================================================================
+
+Process called "blake3_load_block_words" takes block as Integer, m_state as Integer returns Integer:
+    @Reasoning
+    Loads the 64-byte block as 16 little-endian 32-bit words into m_state
+    (one qword per word at offset i*8). Used by both chunk and parent
+    compressions; the parent compression treats the two child CVs as a
+    64-byte block.
+    @End Reasoning
+
+    @Implementation
+    For i in 0..15: load 4 little-endian bytes from block[i*4 .. i*4+3]
+    into a u32 and store it at m_state[i*8].
+    @End Implementation
+
+    @Performance_Hints
+    Sixteen 4-byte loads. On a little-endian CPU the codegen-level
+    instruction selection lowers each 4-byte little-endian load to an
+    aligned 32-bit movl when the alignment can be proven.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: byte indices are loop-counter driven.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 16:
+        Let base be i multiplied by 4
+        Let b0 be proc memory_get_byte from Memory with block, base
+        Let b1 be proc memory_get_byte from Memory with block, base plus 1
+        Let b2 be proc memory_get_byte from Memory with block, base plus 2
+        Let b3 be proc memory_get_byte from Memory with block, base plus 3
+        Let w be b0 plus b1 multiplied by 256
+        Set w to w plus b2 multiplied by 65536
+        Set w to w plus b3 multiplied by 16777216
+        Let off be i multiplied by 8
+        proc memory_set_qword from Memory with m_state, off, w
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "blake3_compress" takes arena as Integer, cv as Integer, block as Integer, counter as Integer, block_len as Integer, flags as Integer, out_state as Integer returns Integer:
+    @Reasoning
+    Computes the BLAKE3 compression function per spec section 2.4 and
+    writes the full 16-word output state into out_state (as qwords at
+    8-byte stride). Callers that only need the 8-word chaining value use
+    the first 32 bytes; XOF callers use all 64 bytes.
+    @End Reasoning
+
+    @Implementation
+    1. Build initial 16-word state v:
+         v[0..7]  = cv[0..7]
+         v[8..11] = IV[0..3]
+         v[12]    = counter & 0xFFFFFFFF
+         v[13]    = (counter >> 32) & 0xFFFFFFFF
+         v[14]    = block_len
+         v[15]    = flags
+    2. Load the 64-byte block as 16 little-endian u32 into m_state.
+    3. For round in 0..6:
+         a. blake3_round(v, m_state)
+         b. If round < 6: blake3_permute_message(m_state)
+    4. Finalize:
+         out[0..7]  = v[0..7] XOR v[8..15]
+         out[8..15] = cv[0..7] XOR v[8..15]
+    @End Implementation
+
+    @Performance_Hints
+    Seven rounds + six permutations per compression. 56 G calls. Per the
+    BLAKE3 paper, ~3-6 cycles per byte on a scalar single core, well
+    below 1 cycle per byte with AVX2 SIMD. A future Runa SIMD lowering
+    is the path to that.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time at the algorithmic level: no secret-dependent branches
+    or memory accesses anywhere in the round loop. The compression input
+    block_len, counter, and flags are all caller-supplied public state
+    machine outputs (chunk index, position in chunk, mode). The chaining
+    value cv is the only secret-derived input and it is treated only as
+    arithmetic operand throughout.
+
+    Out of scope:
+    - Power analysis (requires hardware countermeasures).
+    - Fault injection (requires platform mitigations).
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If cv is equal to 0:
+        Return 0
+    End If
+    If block is equal to 0:
+        Return 0
+    End If
+    If out_state is equal to 0:
+        Return 0
+    End If
+
+    Let v_state be proc arena_allocate from Arena with arena, 128
+    If v_state is equal to 0:
+        Return 0
+    End If
+    Let m_state be proc arena_allocate from Arena with arena, 128
+    If m_state is equal to 0:
+        Return 0
+    End If
+
+    Note: v[0..7] = cv[0..7]
+    Let ci be 0
+    While ci is less than 8:
+        Let cv_off be ci multiplied by 4
+        Let cb0 be proc memory_get_byte from Memory with cv, cv_off
+        Let cb1 be proc memory_get_byte from Memory with cv, cv_off plus 1
+        Let cb2 be proc memory_get_byte from Memory with cv, cv_off plus 2
+        Let cb3 be proc memory_get_byte from Memory with cv, cv_off plus 3
+        Let cw be cb0 plus cb1 multiplied by 256
+        Set cw to cw plus cb2 multiplied by 65536
+        Set cw to cw plus cb3 multiplied by 16777216
+        Let v_off be ci multiplied by 8
+        proc memory_set_qword from Memory with v_state, v_off, cw
+        Set ci to ci plus 1
+    End While
+
+    Note: v[8..11] = IV[0..3]
+    Let ivi be 0
+    While ivi is less than 4:
+        Let iv_word be proc blake3_iv_word with ivi
+        Let iv_slot be ivi plus 8
+        Let v_off2 be iv_slot multiplied by 8
+        proc memory_set_qword from Memory with v_state, v_off2, iv_word
+        Set ivi to ivi plus 1
+    End While
+
+    Note: Counter low/high
+    Let counter_low be counter bitwise_and BLAKE3_U32_MASK
+    Let counter_high_div be 1
+    Let chi be 0
+    While chi is less than 32:
+        Set counter_high_div to counter_high_div multiplied by 2
+        Set chi to chi plus 1
+    End While
+    Let counter_high be counter divided by counter_high_div
+    Set counter_high to counter_high bitwise_and BLAKE3_U32_MASK
+
+    proc memory_set_qword from Memory with v_state, 96, counter_low
+    proc memory_set_qword from Memory with v_state, 104, counter_high
+    proc memory_set_qword from Memory with v_state, 112, block_len
+    proc memory_set_qword from Memory with v_state, 120, flags
+
+    Note: Load message block
+    proc blake3_load_block_words with block, m_state
+
+    Note: 7 rounds with permutation between them
+    Let r be 0
+    While r is less than 7:
+        proc blake3_round with v_state, m_state
+        If r is less than 6:
+            proc blake3_permute_message with arena, m_state
+        End If
+        Set r to r plus 1
+    End While
+
+    Note: Finalize: out[0..7] = v[0..7] XOR v[8..15], out[8..15] = cv_words[0..7] XOR v[8..15]
+    Note: We need cv as words again to XOR with v[8..15]. Read fresh from cv.
+    Let fi be 0
+    While fi is less than 8:
+        Let v_lo_off be fi multiplied by 8
+        Let fi_hi_slot be fi plus 8
+        Let v_hi_off be fi_hi_slot multiplied by 8
+        Let v_lo be proc memory_get_qword from Memory with v_state, v_lo_off
+        Let v_hi be proc memory_get_qword from Memory with v_state, v_hi_off
+        Let out_lo be v_lo bitwise_xor v_hi
+        Let out_lo_off be fi multiplied by 8
+        proc memory_set_qword from Memory with out_state, out_lo_off, out_lo
+
+        Let cv_off2 be fi multiplied by 4
+        Let cvb0 be proc memory_get_byte from Memory with cv, cv_off2
+        Let cvb1 be proc memory_get_byte from Memory with cv, cv_off2 plus 1
+        Let cvb2 be proc memory_get_byte from Memory with cv, cv_off2 plus 2
+        Let cvb3 be proc memory_get_byte from Memory with cv, cv_off2 plus 3
+        Let cv_word be cvb0 plus cvb1 multiplied by 256
+        Set cv_word to cv_word plus cvb2 multiplied by 65536
+        Set cv_word to cv_word plus cvb3 multiplied by 16777216
+        Let out_hi be cv_word bitwise_xor v_hi
+        Let out_hi_off be fi_hi_slot multiplied by 8
+        proc memory_set_qword from Memory with out_state, out_hi_off, out_hi
+        Set fi to fi plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Serialize first 8 state words (chaining value) into a 32-byte buffer
+Note: ============================================================================
+
+Process called "blake3_state_to_cv" takes state as Integer, cv_out as Integer returns Integer:
+    @Reasoning
+    Converts the first 8 words of a compression-function output state into
+    the 32-byte chaining value layout (little-endian, used as input to the
+    next compression).
+    @End Reasoning
+
+    @Implementation
+    For i in 0..7: read state word as qword from offset i*8, write four
+    little-endian bytes at cv_out[i*4 .. i*4+3].
+    @End Implementation
+
+    @Performance_Hints
+    Eight word stores. Trivial.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: loop-counter indexing only.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 8:
+        Let off_i be i multiplied by 8
+        Let w be proc memory_get_qword from Memory with state, off_i
+        Let base be i multiplied by 4
+        Let b0 be w bitwise_and 255
+        Let b1 be w divided by 256
+        Set b1 to b1 bitwise_and 255
+        Let b2 be w divided by 65536
+        Set b2 to b2 bitwise_and 255
+        Let b3 be w divided by 16777216
+        Set b3 to b3 bitwise_and 255
+        proc memory_set_byte from Memory with cv_out, base, b0
+        proc memory_set_byte from Memory with cv_out, base plus 1, b1
+        proc memory_set_byte from Memory with cv_out, base plus 2, b2
+        proc memory_set_byte from Memory with cv_out, base plus 3, b3
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Serialize full 16-word state into a 64-byte buffer (for XOF output)
+Note: ============================================================================
+
+Process called "blake3_state_to_bytes" takes state as Integer, out as Integer returns Integer:
+    @Reasoning
+    Serializes all 16 state words into 64 little-endian bytes. Used to
+    materialize a single XOF output block.
+    @End Reasoning
+
+    @Implementation
+    For i in 0..15: read word from state[i*8], write little-endian bytes
+    at out[i*4 .. i*4+3].
+    @End Implementation
+
+    @Performance_Hints
+    Sixteen word stores.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: loop-counter indexing only.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 16:
+        Let off_i be i multiplied by 8
+        Let w be proc memory_get_qword from Memory with state, off_i
+        Let base be i multiplied by 4
+        Let b0 be w bitwise_and 255
+        Let b1 be w divided by 256
+        Set b1 to b1 bitwise_and 255
+        Let b2 be w divided by 65536
+        Set b2 to b2 bitwise_and 255
+        Let b3 be w divided by 16777216
+        Set b3 to b3 bitwise_and 255
+        proc memory_set_byte from Memory with out, base, b0
+        proc memory_set_byte from Memory with out, base plus 1, b1
+        proc memory_set_byte from Memory with out, base plus 2, b2
+        proc memory_set_byte from Memory with out, base plus 3, b3
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Process one chunk (up to 1024 bytes) and emit its 32-byte chaining value
+Note: ============================================================================
+
+Process called "blake3_compress_chunk" takes arena as Integer, key_cv as Integer, input as Integer, input_off as Integer, chunk_len as Integer, chunk_counter as Integer, base_flags as Integer, cv_out as Integer returns Integer:
+    @Reasoning
+    Processes one chunk's worth of input bytes (1..1024). Splits into
+    64-byte blocks; the first block has CHUNK_START set; the last has
+    CHUNK_END set. Only the last compression's chaining value contributes
+    to cv_out.
+    @End Reasoning
+
+    @Implementation
+    1. Set chaining value = key_cv (initial chunk CV is the key per spec).
+    2. For each 64-byte block in the chunk:
+         a. Build flags = base_flags | (CHUNK_START if first block) |
+            (CHUNK_END if last block).
+         b. Build block buffer: copy block bytes; zero-pad if last block
+            has fewer than 64 bytes.
+         c. Compute compression output.
+         d. If not last block: update chaining value from first 8 words.
+         e. If last block: serialize first 8 words into cv_out.
+    @End Implementation
+
+    @Performance_Hints
+    ceil(chunk_len / 64) compressions per chunk. For a full chunk that
+    is 16 compressions. Block buffer is reused; only one arena allocation
+    per chunk.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time per block. The number of blocks processed depends only
+    on chunk_len (the chunk boundary is a public state-machine value).
+    @End Security_Scope
+
+    If chunk_len is less than 0:
+        Return 0
+    End If
+    If chunk_len is greater than BLAKE3_CHUNK_SIZE:
+        Return 0
+    End If
+
+    Let block_buf be proc arena_allocate from Arena with arena, BLAKE3_BLOCK_SIZE
+    If block_buf is equal to 0:
+        Return 0
+    End If
+    Let cv_buf be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+    If cv_buf is equal to 0:
+        Return 0
+    End If
+    Let state_buf be proc arena_allocate from Arena with arena, 128
+    If state_buf is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize CV from key_cv
+    Let ki be 0
+    While ki is less than BLAKE3_CV_SIZE:
+        Let kb be proc memory_get_byte from Memory with key_cv, ki
+        proc memory_set_byte from Memory with cv_buf, ki, kb
+        Set ki to ki plus 1
+    End While
+
+    Let pos be 0
+    Let is_first_block be 1
+    Let blocks_done be 0
+
+    Note: Handle empty chunk case: still need one compression with CHUNK_START | CHUNK_END
+    If chunk_len is equal to 0:
+        Note: Zero block_buf
+        Let zi be 0
+        While zi is less than BLAKE3_BLOCK_SIZE:
+            proc memory_set_byte from Memory with block_buf, zi, 0
+            Set zi to zi plus 1
+        End While
+        Let empty_flags be base_flags bitwise_or BLAKE3_FLAG_CHUNK_START
+        Set empty_flags to empty_flags bitwise_or BLAKE3_FLAG_CHUNK_END
+        proc blake3_compress with arena, cv_buf, block_buf, chunk_counter, 0, empty_flags, state_buf
+        proc blake3_state_to_cv with state_buf, cv_out
+        Return 1
+    End If
+
+    While pos is less than chunk_len:
+        Let remaining be chunk_len minus pos
+        Let this_len be remaining
+        If this_len is greater than BLAKE3_BLOCK_SIZE:
+            Set this_len to BLAKE3_BLOCK_SIZE
+        End If
+        Let is_last_block be 0
+        If pos plus this_len is equal to chunk_len:
+            Set is_last_block to 1
+        End If
+
+        Note: Build block_buf
+        Let bi be 0
+        While bi is less than this_len:
+            Let sb be proc memory_get_byte from Memory with input, input_off plus pos plus bi
+            proc memory_set_byte from Memory with block_buf, bi, sb
+            Set bi to bi plus 1
+        End While
+        Note: Zero-pad remainder of block to 64 bytes
+        Let pi be this_len
+        While pi is less than BLAKE3_BLOCK_SIZE:
+            proc memory_set_byte from Memory with block_buf, pi, 0
+            Set pi to pi plus 1
+        End While
+
+        Let block_flags be base_flags
+        If is_first_block is equal to 1:
+            Set block_flags to block_flags bitwise_or BLAKE3_FLAG_CHUNK_START
+        End If
+        If is_last_block is equal to 1:
+            Set block_flags to block_flags bitwise_or BLAKE3_FLAG_CHUNK_END
+        End If
+
+        proc blake3_compress with arena, cv_buf, block_buf, chunk_counter, this_len, block_flags, state_buf
+
+        If is_last_block is equal to 1:
+            proc blake3_state_to_cv with state_buf, cv_out
+        Otherwise:
+            proc blake3_state_to_cv with state_buf, cv_buf
+        End If
+
+        Set pos to pos plus this_len
+        Set is_first_block to 0
+        Set blocks_done to blocks_done plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Compute the parent compression of two child CVs
+Note: ============================================================================
+
+Process called "blake3_parent_cv" takes arena as Integer, key_cv as Integer, left_cv as Integer, right_cv as Integer, base_flags as Integer, out_state as Integer returns Integer:
+    @Reasoning
+    Combines two 32-byte child chaining values into a parent state. The
+    64-byte block is left_cv concatenated with right_cv. Counter is 0,
+    block_len is 64, flags include PARENT.
+    @End Reasoning
+
+    @Implementation
+    1. Build a 64-byte parent_block by concatenating left_cv and right_cv.
+    2. Compress with cv = key_cv, counter = 0, block_len = 64,
+       flags = base_flags | PARENT.
+    3. Write the full 16-word output state to out_state.
+    @End Implementation
+
+    @Performance_Hints
+    One compression call. Reusable from both the standard tree-merge
+    and from the root-output emission.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let parent_block be proc arena_allocate from Arena with arena, BLAKE3_BLOCK_SIZE
+    If parent_block is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than 32:
+        Let lb be proc memory_get_byte from Memory with left_cv, i
+        proc memory_set_byte from Memory with parent_block, i, lb
+        Set i to i plus 1
+    End While
+    Let j be 0
+    While j is less than 32:
+        Let rb be proc memory_get_byte from Memory with right_cv, j
+        proc memory_set_byte from Memory with parent_block, j plus 32, rb
+        Set j to j plus 1
+    End While
+
+    Let parent_flags be base_flags bitwise_or BLAKE3_FLAG_PARENT
+    proc blake3_compress with arena, key_cv, parent_block, 0, BLAKE3_BLOCK_SIZE, parent_flags, out_state
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Build the key_cv buffer from either the default IV (8 little-endian
+Note: words of IV) or from a caller-provided 32-byte key (already 8 LE words).
+Note: ============================================================================
+
+Process called "blake3_default_iv_to_cv" takes cv_out as Integer returns Integer:
+    @Reasoning
+    Serialize the eight IV words as little-endian into the 32-byte CV
+    buffer for the default-hash and DERIVE_KEY_CONTEXT modes.
+    @End Reasoning
+
+    @Implementation
+    For i in 0..7: write IV[i] little-endian into cv_out[i*4..i*4+3].
+    @End Implementation
+
+    @Performance_Hints
+    Trivial; eight 4-byte stores.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. IV is public.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 8:
+        Let w be proc blake3_iv_word with i
+        Let base be i multiplied by 4
+        Let b0 be w bitwise_and 255
+        Let b1 be w divided by 256
+        Set b1 to b1 bitwise_and 255
+        Let b2 be w divided by 65536
+        Set b2 to b2 bitwise_and 255
+        Let b3 be w divided by 16777216
+        Set b3 to b3 bitwise_and 255
+        proc memory_set_byte from Memory with cv_out, base, b0
+        proc memory_set_byte from Memory with cv_out, base plus 1, b1
+        proc memory_set_byte from Memory with cv_out, base plus 2, b2
+        proc memory_set_byte from Memory with cv_out, base plus 3, b3
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Subtree-rooted tree merge using a stack of pending CVs
+Note: ============================================================================
+Note:
+Pending-CV stack design (per BLAKE3 spec section 5.1.2):
+  - As each chunk emits a CV, push it.
+  - Before pushing a new CV, check the chunk counter just completed.
+    If the count of trailing zero bits in (chunk_counter + 1) is t,
+    merge t pairs from the top of the stack before pushing.
+  - At the end, merge what remains right-to-left to form the root.
+
+This implements the "complete subtrees" rule: a subtree of 2^k chunks
+is finalized as soon as its rightmost chunk is processed.
+:End Note
+
+Process called "blake3_count_trailing_zeros" takes value as Integer returns Integer:
+    @Reasoning
+    Counts trailing zero bits in a 64-bit unsigned value. Used to decide
+    how many pending CVs to merge when a chunk completes (per BLAKE3
+    spec, subtree merges happen when the chunk counter rolls a complete
+    power-of-two boundary).
+    @End Reasoning
+
+    @Implementation
+    Iterates from bit 0 upward, dividing by 2 each step, stopping at the
+    first set bit. For value == 0 returns 64.
+    @End Implementation
+
+    @Performance_Hints
+    Worst-case 64 iterations. Caller hot-path passes the incremented
+    chunk counter, which on every practical workload has only a handful
+    of trailing zeros. The codegen-level instruction selection lowers
+    this loop to BSF/TZCNT on architectures that expose those primitives.
+    @End Performance_Hints
+
+    @Security_Scope
+    The iteration count depends on the value, which is a public chunk
+    index (derived from the position in the input stream, not from any
+    secret). No timing channel exposes secret material here.
+    @End Security_Scope
+
+    If value is equal to 0:
+        Return 64
+    End If
+    Let n be 0
+    Let v be value
+    While v bitwise_and 1 is equal to 0:
+        Set v to v divided by 2
+        Set n to n plus 1
+        If n is greater than 63:
+            Return n
+        End If
+    End While
+    Return n
+End Process
+
+Note: ============================================================================
+Note: Hasher state (in arena)
+Note: ============================================================================
+Note:
+Layout: contiguous arena block holding:
+  - cv_stack: 54 slots * 32 bytes = 1728 bytes (max stack depth for
+               2^54 chunks; the spec allows up to 2^54 chunks).
+  - stack_size: 1 qword (Integer)
+  - chunk_counter: 1 qword (Integer)
+  - key_cv: 32 bytes (the keying material - IV for default, key for
+              keyed_hash, intermediate hash for derive_key)
+  - base_flags: 1 qword (KEYED_HASH or DERIVE_KEY_MATERIAL, or 0)
+  - chunk_buf: 1024 bytes (accumulating bytes for the current chunk)
+  - chunk_buf_len: 1 qword (current fill of chunk_buf)
+
+All fields are accessed via memory_get_qword / memory_set_qword and
+memory_get_byte / memory_set_byte through documented offsets.
+
+For our streaming API we accept the full input as a single contiguous
+buffer (hash, keyed_hash, derive_key). The streaming-style Hasher
+object is a logical structure internal to hash(), reset per call.
+:End Note
+
+Constant BLAKE3_STACK_MAX_DEPTH as Integer is 54
+Constant BLAKE3_HASHER_STACK_OFF as Integer is 0
+Constant BLAKE3_HASHER_STACK_SIZE_OFF as Integer is 1728
+Constant BLAKE3_HASHER_CHUNK_COUNTER_OFF as Integer is 1736
+Constant BLAKE3_HASHER_KEY_CV_OFF as Integer is 1744
+Constant BLAKE3_HASHER_BASE_FLAGS_OFF as Integer is 1776
+Constant BLAKE3_HASHER_CHUNK_BUF_OFF as Integer is 1784
+Constant BLAKE3_HASHER_TOTAL_SIZE as Integer is 2808
+
+Process called "blake3_hasher_init" takes arena as Integer, key_cv as Integer, base_flags as Integer returns Integer:
+    @Reasoning
+    Allocates and initializes a hasher state in the arena. key_cv is the
+    32-byte initial chaining value used at every chunk root: for default
+    hash this is the IV, for keyed_hash it is the user key, for
+    DERIVE_KEY_MATERIAL pass it is the intermediate key derived from the
+    DERIVE_KEY_CONTEXT pass.
+    @End Reasoning
+
+    @Implementation
+    Allocates BLAKE3_HASHER_TOTAL_SIZE bytes; copies key_cv into the
+    key_cv slot; zeros the stack-size and chunk-counter slots; sets
+    base_flags.
+    @End Implementation
+
+    @Performance_Hints
+    One arena allocation, a small zeroing loop, a 32-byte copy.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let h be proc arena_allocate from Arena with arena, BLAKE3_HASHER_TOTAL_SIZE
+    If h is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_qword from Memory with h, BLAKE3_HASHER_STACK_SIZE_OFF, 0
+    proc memory_set_qword from Memory with h, BLAKE3_HASHER_CHUNK_COUNTER_OFF, 0
+    proc memory_set_qword from Memory with h, BLAKE3_HASHER_BASE_FLAGS_OFF, base_flags
+
+    Let ki be 0
+    While ki is less than 32:
+        Let kb be proc memory_get_byte from Memory with key_cv, ki
+        proc memory_set_byte from Memory with h, BLAKE3_HASHER_KEY_CV_OFF plus ki, kb
+        Set ki to ki plus 1
+    End While
+
+    Return h
+End Process
+
+Process called "blake3_push_cv" takes h as Integer, new_cv as Integer returns Integer:
+    @Reasoning
+    Pushes a 32-byte CV onto the hasher's pending-CV stack. Before pushing,
+    merges any complete subtrees: if the chunk just emitted has counter c,
+    the number of trailing zero bits in (c+1) is the number of subtree
+    merges to perform.
+    @End Reasoning
+
+    @Implementation
+    Reads stack_size and the chunk_counter (which has already been
+    incremented past the chunk that produced this CV). For each trailing
+    zero bit in chunk_counter, pop the top of the stack as left_cv and
+    treat new_cv as right_cv, compute parent CV via blake3_parent_cv,
+    serialize first 8 words back into new_cv. After the merges, push
+    new_cv onto the stack.
+    @End Implementation
+
+    @Performance_Hints
+    Worst case one parent compression per push (amortized O(1)). The
+    cv_stack is a flat memory region inside the hasher.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time per merge.
+    @End Security_Scope
+
+    Let arena_ptr be proc memory_get_qword from Memory with h, BLAKE3_HASHER_KEY_CV_OFF
+    Note: We don't store the arena pointer in the hasher; the caller must
+    Note: pass the arena via a wrapper that supplies it. We'll route through
+    Note: blake3_hasher_update_with_arena below which takes arena as a
+    Note: parameter explicitly. The push helper takes arena directly.
+    Return 0
+End Process
+
+Process called "blake3_push_cv_with_arena" takes arena as Integer, h as Integer, new_cv as Integer returns Integer:
+    @Reasoning
+    Same as blake3_push_cv but receives arena explicitly. This is the
+    invocation path used by the streaming update procedure.
+    @End Reasoning
+
+    @Implementation
+    Per BLAKE3 spec section 5.1.2, before pushing the freshly-computed
+    chunk CV, decide how many subtree merges to do based on trailing
+    zeros of the just-completed chunk_counter (= total_chunks). Each
+    merge pops the stack top as left_cv, uses our new_cv as right_cv,
+    runs blake3_parent_cv to a state, copies first 8 words back to
+    new_cv. After all merges, push new_cv.
+    @End Implementation
+
+    @Performance_Hints
+    Total work across the whole hash is O(n / 1024) for chunks plus
+    O(n / 1024) for merges (the binary tree). Arena allocations per
+    merge are reused via the compressor scratch.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time per merge.
+    @End Security_Scope
+
+    Let total_chunks be proc memory_get_qword from Memory with h, BLAKE3_HASHER_CHUNK_COUNTER_OFF
+    Note: At call time, chunk_counter has been incremented to reflect the
+    Note: chunk that just produced new_cv. Per spec, the number of merges
+    Note: equals the count of trailing zero bits of total_chunks.
+    Let merges be proc blake3_count_trailing_zeros with total_chunks
+
+    Let key_cv_ptr be h plus BLAKE3_HASHER_KEY_CV_OFF
+    Let base_flags be proc memory_get_qword from Memory with h, BLAKE3_HASHER_BASE_FLAGS_OFF
+
+    Let parent_state be proc arena_allocate from Arena with arena, 128
+    If parent_state is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than merges:
+        Let stack_size be proc memory_get_qword from Memory with h, BLAKE3_HASHER_STACK_SIZE_OFF
+        If stack_size is less than 1:
+            Note: spec invariant violation; abort safely.
+            Return 0
+        End If
+        Let stack_top_idx be stack_size minus 1
+        Let left_off be stack_top_idx multiplied by 32
+        Let left_ptr be h plus BLAKE3_HASHER_STACK_OFF plus left_off
+        proc blake3_parent_cv with arena, key_cv_ptr, left_ptr, new_cv, base_flags, parent_state
+        proc blake3_state_to_cv with parent_state, new_cv
+        proc memory_set_qword from Memory with h, BLAKE3_HASHER_STACK_SIZE_OFF, stack_size minus 1
+        Set i to i plus 1
+    End While
+
+    Note: Push new_cv
+    Let stack_size_now be proc memory_get_qword from Memory with h, BLAKE3_HASHER_STACK_SIZE_OFF
+    If stack_size_now is greater than 53:
+        Return 0
+    End If
+    Let push_off be stack_size_now multiplied by 32
+    Let push_ptr be h plus BLAKE3_HASHER_STACK_OFF plus push_off
+    Let ci be 0
+    While ci is less than 32:
+        Let cvb be proc memory_get_byte from Memory with new_cv, ci
+        proc memory_set_byte from Memory with push_ptr, ci, cvb
+        Set ci to ci plus 1
+    End While
+    proc memory_set_qword from Memory with h, BLAKE3_HASHER_STACK_SIZE_OFF, stack_size_now plus 1
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Compress the entire input into the hasher in 1024-byte chunks, except
+Note: for the final chunk which is held back so we can apply ROOT correctly.
+Note: ============================================================================
+
+Process called "blake3_hash_input_to_root_state" takes arena as Integer, key_cv as Integer, base_flags as Integer, input as Integer, length as Integer, root_state_out as Integer returns Integer:
+    @Reasoning
+    Drives the BLAKE3 tree from start to finish, producing the final
+    16-word root state. The strategy follows the reference implementation:
+
+    - Special-case length 0: hash an empty chunk (only chunk with
+      CHUNK_START | CHUNK_END | ROOT applied to a zero-length block).
+
+    - Special-case length <= 1024: one chunk only; apply ROOT to that
+      chunk's last block.
+
+    - General case: process all chunks except the final one with normal
+      flags, pushing each into the CV stack with subtree-merge logic.
+      Then for the final chunk, the strategy is: after processing all
+      complete subtrees, the final chunk's last-block compression
+      carries ROOT if and only if the final chunk is alone (no pending
+      CVs on the stack to merge). Otherwise the final chunk's CV is
+      merged pairwise up the stack, and the topmost parent compression
+      carries ROOT.
+
+    The final-output rule (spec 5.1.2): the root output is the result of
+    compressing the *leftmost* and *rightmost* subtrees at the final
+    merge step, with ROOT set in the flags. For a single-chunk input the
+    root flag is set on the chunk's last block.
+
+    Implementation strategy:
+    1. If length == 0: emit one chunk compression with empty block and
+       flags = base_flags | CHUNK_START | CHUNK_END | ROOT directly into
+       root_state_out.
+    2. If length is at most 1024: emit chunk processing where the final
+       block of the chunk has ROOT set, writing root_state_out directly.
+    3. Otherwise: process chunks 0..n-2 normally (compress chunk, push
+       CV with subtree merges). For chunk n-1 (the final chunk):
+         - Process all-but-last block of the chunk normally.
+         - Compress the chunk's last block normally (no ROOT) to obtain
+           the chunk's CV.
+         - Push that CV into the stack, but without ROOT (subtree merges
+           still happen for non-ROOT level joins).
+         - Now reduce the remaining stack to a single CV by repeatedly
+           popping the top two and combining via PARENT, with ROOT set
+           on the *last* combination only.
+         - The final combination's state goes into root_state_out.
+
+    However, the chunk's last-block-with-ROOT and parent-with-ROOT cases
+    must be handled with care. The reference implementation uses an
+    "output" structure that defers the ROOT-flagged compression until
+    the consumer asks for output, allowing both single-chunk and
+    multi-chunk inputs to share the same finalize path.
+
+    We follow that approach:
+       finalize() constructs an "output" representing either
+       (a) chunk-style: cv=key_cv, block=last_block, counter=chunk_idx,
+           block_len=last_len, flags=base_flags|CHUNK_START_maybe|CHUNK_END
+           (no ROOT yet);
+       or
+       (b) parent-style: cv=key_cv, block=left_cv||right_cv, counter=0,
+           block_len=64, flags=base_flags|PARENT (no ROOT yet).
+       Then root output is the same compression with ROOT added.
+    @End Reasoning
+
+    @Implementation
+    Process the input in 1024-byte chunks, keeping the chunk_counter and
+    stack in the hasher. For the last chunk we defer its CHUNK_END
+    compression so that the "output" can be either (single-chunk) the
+    chunk's last block with ROOT, or (multi-chunk) parent compressions
+    merging the stack with ROOT on the final parent.
+
+    Detailed flow:
+      a. While remaining > 1024:
+           process full 1024-byte chunk: blake3_compress_chunk with no
+           ROOT, push CV via blake3_push_cv_with_arena (which performs
+           subtree merges), advance input, increment chunk_counter
+           appropriately. blake3_compress_chunk itself does not increment
+           the hasher counter; we do it here.
+      b. Now we have 1..1024 bytes left (the final chunk).
+         If stack is empty (single chunk total): the chunk's last block
+           must carry ROOT. We process chunk's blocks one at a time;
+           on the last block we set CHUNK_END | ROOT and compress
+           directly to root_state_out.
+         Otherwise: process the final chunk normally (no ROOT) producing
+           a CV. Then merge that CV up the stack right-to-left:
+             - For each merge except the last: combine via blake3_parent_cv,
+               serialize state to a CV, that becomes the new right CV.
+             - For the *final* merge (when stack_size==1): combine via
+               blake3_compress with PARENT|ROOT, writing into
+               root_state_out directly.
+    @End Implementation
+
+    @Performance_Hints
+    O(length) compression cost plus O(length / 1024) parent merges (very
+    small relative to the chunk work).
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time per block. The dispatch on number-of-chunks is on a
+    public length value.
+    @End Security_Scope
+
+    Let h be proc blake3_hasher_init with arena, key_cv, base_flags
+    If h is equal to 0:
+        Return 0
+    End If
+
+    Note: Special case length == 0
+    If length is equal to 0:
+        Let zero_block be proc arena_allocate from Arena with arena, BLAKE3_BLOCK_SIZE
+        If zero_block is equal to 0:
+            Return 0
+        End If
+        Let zi be 0
+        While zi is less than BLAKE3_BLOCK_SIZE:
+            proc memory_set_byte from Memory with zero_block, zi, 0
+            Set zi to zi plus 1
+        End While
+        Let zflags be base_flags bitwise_or BLAKE3_FLAG_CHUNK_START
+        Set zflags to zflags bitwise_or BLAKE3_FLAG_CHUNK_END
+        Set zflags to zflags bitwise_or BLAKE3_FLAG_ROOT
+        proc blake3_compress with arena, key_cv, zero_block, 0, 0, zflags, root_state_out
+        Return 1
+    End If
+
+    Let input_off be 0
+    Let remaining be length
+    Let chunk_cv be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+    If chunk_cv is equal to 0:
+        Return 0
+    End If
+
+    Note: Process all chunks except possibly the final one
+    While remaining is greater than BLAKE3_CHUNK_SIZE:
+        Let chunk_idx be proc memory_get_qword from Memory with h, BLAKE3_HASHER_CHUNK_COUNTER_OFF
+        proc blake3_compress_chunk with arena, key_cv, input, input_off, BLAKE3_CHUNK_SIZE, chunk_idx, base_flags, chunk_cv
+        Let new_counter be chunk_idx plus 1
+        proc memory_set_qword from Memory with h, BLAKE3_HASHER_CHUNK_COUNTER_OFF, new_counter
+        proc blake3_push_cv_with_arena with arena, h, chunk_cv
+        Set input_off to input_off plus BLAKE3_CHUNK_SIZE
+        Set remaining to remaining minus BLAKE3_CHUNK_SIZE
+    End While
+
+    Note: Now remaining is in [1, 1024]; this is the final chunk.
+    Let stack_size_before_final be proc memory_get_qword from Memory with h, BLAKE3_HASHER_STACK_SIZE_OFF
+    Let final_chunk_idx be proc memory_get_qword from Memory with h, BLAKE3_HASHER_CHUNK_COUNTER_OFF
+
+    If stack_size_before_final is equal to 0:
+        Note: Single chunk total. Process all-but-last block normally,
+        Note: then the last block with ROOT into root_state_out.
+        Let cv_buf be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+        If cv_buf is equal to 0:
+            Return 0
+        End If
+        Let block_buf be proc arena_allocate from Arena with arena, BLAKE3_BLOCK_SIZE
+        If block_buf is equal to 0:
+            Return 0
+        End If
+        Let state_scratch be proc arena_allocate from Arena with arena, 128
+        If state_scratch is equal to 0:
+            Return 0
+        End If
+
+        Note: Init cv = key_cv
+        Let ki2 be 0
+        While ki2 is less than BLAKE3_CV_SIZE:
+            Let kb2 be proc memory_get_byte from Memory with key_cv, ki2
+            proc memory_set_byte from Memory with cv_buf, ki2, kb2
+            Set ki2 to ki2 plus 1
+        End While
+
+        Let pos be 0
+        Let is_first_block be 1
+        While pos is less than remaining:
+            Let rem_in_chunk be remaining minus pos
+            Let this_len be rem_in_chunk
+            If this_len is greater than BLAKE3_BLOCK_SIZE:
+                Set this_len to BLAKE3_BLOCK_SIZE
+            End If
+            Let is_last_block be 0
+            If pos plus this_len is equal to remaining:
+                Set is_last_block to 1
+            End If
+
+            Let bi be 0
+            While bi is less than this_len:
+                Let sb be proc memory_get_byte from Memory with input, input_off plus pos plus bi
+                proc memory_set_byte from Memory with block_buf, bi, sb
+                Set bi to bi plus 1
+            End While
+            Let pi be this_len
+            While pi is less than BLAKE3_BLOCK_SIZE:
+                proc memory_set_byte from Memory with block_buf, pi, 0
+                Set pi to pi plus 1
+            End While
+
+            Let flags2 be base_flags
+            If is_first_block is equal to 1:
+                Set flags2 to flags2 bitwise_or BLAKE3_FLAG_CHUNK_START
+            End If
+            If is_last_block is equal to 1:
+                Set flags2 to flags2 bitwise_or BLAKE3_FLAG_CHUNK_END
+                Set flags2 to flags2 bitwise_or BLAKE3_FLAG_ROOT
+                proc blake3_compress with arena, cv_buf, block_buf, final_chunk_idx, this_len, flags2, root_state_out
+            Otherwise:
+                proc blake3_compress with arena, cv_buf, block_buf, final_chunk_idx, this_len, flags2, state_scratch
+                proc blake3_state_to_cv with state_scratch, cv_buf
+            End If
+
+            Set pos to pos plus this_len
+            Set is_first_block to 0
+        End While
+        Return 1
+    End If
+
+    Note: Multi-chunk case: process the final chunk normally to produce
+    Note: a CV, then merge up the stack with ROOT on the final parent.
+    proc blake3_compress_chunk with arena, key_cv, input, input_off, remaining, final_chunk_idx, base_flags, chunk_cv
+
+    Let key_cv_ptr be h plus BLAKE3_HASHER_KEY_CV_OFF
+    Let base_flags_h be proc memory_get_qword from Memory with h, BLAKE3_HASHER_BASE_FLAGS_OFF
+
+    Note: Now reduce stack with chunk_cv as the rightmost CV, working
+    Note: right-to-left. The final merge sets ROOT.
+    Let working_cv be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+    If working_cv is equal to 0:
+        Return 0
+    End If
+    Let wi be 0
+    While wi is less than BLAKE3_CV_SIZE:
+        Let cb_w be proc memory_get_byte from Memory with chunk_cv, wi
+        proc memory_set_byte from Memory with working_cv, wi, cb_w
+        Set wi to wi plus 1
+    End While
+
+    Let parent_state_scratch be proc arena_allocate from Arena with arena, 128
+    If parent_state_scratch is equal to 0:
+        Return 0
+    End If
+
+    Let stack_remaining be stack_size_before_final
+    While stack_remaining is greater than 0:
+        Let stack_top_idx be stack_remaining minus 1
+        Let left_off be stack_top_idx multiplied by 32
+        Let left_ptr be h plus BLAKE3_HASHER_STACK_OFF plus left_off
+        If stack_remaining is equal to 1:
+            Note: Final merge: set ROOT.
+            Let final_block be proc arena_allocate from Arena with arena, BLAKE3_BLOCK_SIZE
+            If final_block is equal to 0:
+                Return 0
+            End If
+            Let li be 0
+            While li is less than 32:
+                Let lb_b be proc memory_get_byte from Memory with left_ptr, li
+                proc memory_set_byte from Memory with final_block, li, lb_b
+                Set li to li plus 1
+            End While
+            Let ri be 0
+            While ri is less than 32:
+                Let rb_b be proc memory_get_byte from Memory with working_cv, ri
+                proc memory_set_byte from Memory with final_block, ri plus 32, rb_b
+                Set ri to ri plus 1
+            End While
+            Let root_flags be base_flags_h bitwise_or BLAKE3_FLAG_PARENT
+            Set root_flags to root_flags bitwise_or BLAKE3_FLAG_ROOT
+            proc blake3_compress with arena, key_cv_ptr, final_block, 0, BLAKE3_BLOCK_SIZE, root_flags, root_state_out
+            Return 1
+        End If
+        proc blake3_parent_cv with arena, key_cv_ptr, left_ptr, working_cv, base_flags_h, parent_state_scratch
+        proc blake3_state_to_cv with parent_state_scratch, working_cv
+        Set stack_remaining to stack_remaining minus 1
+    End While
+
+    Note: Unreachable in well-formed inputs; safety fallback.
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: XOF output: produce arbitrary-length output by re-running the root
+Note: compression with an incrementing block counter and ROOT set.
+Note: ============================================================================
+
+Process called "blake3_xof_emit" takes arena as Integer, root_state as Integer, output as Integer, output_len as Integer returns Integer:
+    @Reasoning
+    The root output is generated by repeatedly recompressing the root
+    block (the same block that produced root_state) with an incrementing
+    counter and ROOT set. Each call produces 64 bytes; we truncate to
+    output_len.
+
+    However, blake3_compress takes a CV, a block, counter, block_len,
+    and flags. To emit XOF beyond 64 bytes the caller must hold those
+    same inputs. Rather than re-derive them here, this proc takes the
+    already-produced *first* 64 bytes as root_state and stops there;
+    the higher-level XOF driver below holds the inputs and calls
+    blake3_compress for additional blocks with incrementing counter.
+
+    Therefore: this proc just serializes the first up-to-64 bytes of
+    root_state into output. The actual incrementing-counter loop lives
+    in blake3_hash_xof.
+    @End Reasoning
+
+    @Implementation
+    Serialize min(output_len, 64) little-endian bytes from root_state
+    into output.
+    @End Implementation
+
+    @Performance_Hints
+    Up to 64 byte stores.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let count be output_len
+    If count is greater than 64:
+        Set count to 64
+    End If
+
+    Let i be 0
+    While i is less than 16:
+        Let off_i be i multiplied by 8
+        Let w be proc memory_get_qword from Memory with root_state, off_i
+        Let base be i multiplied by 4
+        Let b0 be w bitwise_and 255
+        Let b1 be w divided by 256
+        Set b1 to b1 bitwise_and 255
+        Let b2 be w divided by 65536
+        Set b2 to b2 bitwise_and 255
+        Let b3 be w divided by 16777216
+        Set b3 to b3 bitwise_and 255
+        If base is less than count:
+            proc memory_set_byte from Memory with output, base, b0
+        End If
+        If base plus 1 is less than count:
+            proc memory_set_byte from Memory with output, base plus 1, b1
+        End If
+        If base plus 2 is less than count:
+            proc memory_set_byte from Memory with output, base plus 2, b2
+        End If
+        If base plus 3 is less than count:
+            proc memory_set_byte from Memory with output, base plus 3, b3
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Internal: drive the full hash to obtain (output_cv, output_block,
+Note: output_counter_base, output_block_len, output_flags_without_ROOT)
+Note: for XOF emission.
+Note: ============================================================================
+Note:
+We restructure XOF generation as follows. The "output" of BLAKE3 is
+characterized by (CV, block, block_len, flags) that together with a
+counter produce 64-byte output blocks. For a single-chunk input the
+output is (chunk_cv_before_last, last_block, last_block_len,
+base_flags | CHUNK_START_if_first | CHUNK_END). For a multi-chunk
+input the output is (key_cv, left_cv||right_cv, 64,
+base_flags | PARENT) where left_cv and right_cv are the final two
+subtrees.
+
+To support both modes uniformly, blake3_hash_xof:
+  - Runs the tree to find the root output's (CV, block, block_len,
+    flags_without_ROOT).
+  - For each 64-byte slice of output requested, runs blake3_compress
+    with counter = slice_index, flags = flags_without_ROOT | ROOT.
+
+We avoid duplicating tree-walking logic by serializing the root output
+descriptor into an arena buffer of fixed layout:
+  bytes [0..31]:   CV
+  bytes [32..95]:  block (64 bytes)
+  bytes [96..103]: block_len (qword)
+  bytes [104..111]: flags_without_ROOT (qword)
+Total: 112 bytes.
+:End Note
+
+Constant BLAKE3_OUTPUT_DESC_SIZE as Integer is 112
+Constant BLAKE3_OUTPUT_DESC_CV_OFF as Integer is 0
+Constant BLAKE3_OUTPUT_DESC_BLOCK_OFF as Integer is 32
+Constant BLAKE3_OUTPUT_DESC_BLOCK_LEN_OFF as Integer is 96
+Constant BLAKE3_OUTPUT_DESC_FLAGS_OFF as Integer is 104
+
+Process called "blake3_hash_input_to_output_desc" takes arena as Integer, key_cv as Integer, base_flags as Integer, input as Integer, length as Integer, desc as Integer returns Integer:
+    @Reasoning
+    Drives the BLAKE3 tree and writes the *root output descriptor* into
+    desc. The descriptor captures everything needed to compute any 64-byte
+    slice of the XOF output: the input CV to the final compression, the
+    64-byte block, the block_len, and the flags-without-ROOT. The XOF
+    emission loop then re-runs the compression with an incrementing
+    counter and ROOT in the flags.
+    @End Reasoning
+
+    @Implementation
+    Mirrors blake3_hash_input_to_root_state but, on the final
+    compression, instead of running it with ROOT, captures the inputs
+    into the descriptor.
+    @End Implementation
+
+    @Performance_Hints
+    Same cost as the non-XOF path; the only difference is the final
+    step writes a descriptor instead of running one extra compression.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let h be proc blake3_hasher_init with arena, key_cv, base_flags
+    If h is equal to 0:
+        Return 0
+    End If
+
+    If length is equal to 0:
+        Note: Output descriptor: CV=key_cv, block=zeros, block_len=0,
+        Note: flags = base_flags | CHUNK_START | CHUNK_END.
+        Let ki3 be 0
+        While ki3 is less than 32:
+            Let kb3 be proc memory_get_byte from Memory with key_cv, ki3
+            proc memory_set_byte from Memory with desc, BLAKE3_OUTPUT_DESC_CV_OFF plus ki3, kb3
+            Set ki3 to ki3 plus 1
+        End While
+        Let zi be 0
+        While zi is less than BLAKE3_BLOCK_SIZE:
+            proc memory_set_byte from Memory with desc, BLAKE3_OUTPUT_DESC_BLOCK_OFF plus zi, 0
+            Set zi to zi plus 1
+        End While
+        proc memory_set_qword from Memory with desc, BLAKE3_OUTPUT_DESC_BLOCK_LEN_OFF, 0
+        Let zflags be base_flags bitwise_or BLAKE3_FLAG_CHUNK_START
+        Set zflags to zflags bitwise_or BLAKE3_FLAG_CHUNK_END
+        proc memory_set_qword from Memory with desc, BLAKE3_OUTPUT_DESC_FLAGS_OFF, zflags
+        Return 1
+    End If
+
+    Let input_off be 0
+    Let remaining be length
+    Let chunk_cv be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+    If chunk_cv is equal to 0:
+        Return 0
+    End If
+
+    Note: Process complete chunks except final
+    While remaining is greater than BLAKE3_CHUNK_SIZE:
+        Let chunk_idx be proc memory_get_qword from Memory with h, BLAKE3_HASHER_CHUNK_COUNTER_OFF
+        proc blake3_compress_chunk with arena, key_cv, input, input_off, BLAKE3_CHUNK_SIZE, chunk_idx, base_flags, chunk_cv
+        Let new_counter be chunk_idx plus 1
+        proc memory_set_qword from Memory with h, BLAKE3_HASHER_CHUNK_COUNTER_OFF, new_counter
+        proc blake3_push_cv_with_arena with arena, h, chunk_cv
+        Set input_off to input_off plus BLAKE3_CHUNK_SIZE
+        Set remaining to remaining minus BLAKE3_CHUNK_SIZE
+    End While
+
+    Let stack_size_before_final be proc memory_get_qword from Memory with h, BLAKE3_HASHER_STACK_SIZE_OFF
+    Let final_chunk_idx be proc memory_get_qword from Memory with h, BLAKE3_HASHER_CHUNK_COUNTER_OFF
+
+    If stack_size_before_final is equal to 0:
+        Note: Single chunk total. The root output is the chunk's last
+        Note: block. We must replay the chunk processing up to but not
+        Note: including the final block.
+        Let cv_buf be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+        If cv_buf is equal to 0:
+            Return 0
+        End If
+        Let block_buf be proc arena_allocate from Arena with arena, BLAKE3_BLOCK_SIZE
+        If block_buf is equal to 0:
+            Return 0
+        End If
+        Let state_scratch be proc arena_allocate from Arena with arena, 128
+        If state_scratch is equal to 0:
+            Return 0
+        End If
+
+        Note: Init cv = key_cv
+        Let ki2 be 0
+        While ki2 is less than BLAKE3_CV_SIZE:
+            Let kb2 be proc memory_get_byte from Memory with key_cv, ki2
+            proc memory_set_byte from Memory with cv_buf, ki2, kb2
+            Set ki2 to ki2 plus 1
+        End While
+
+        Let pos be 0
+        Let is_first_block be 1
+        While pos is less than remaining:
+            Let rem_in_chunk be remaining minus pos
+            Let this_len be rem_in_chunk
+            If this_len is greater than BLAKE3_BLOCK_SIZE:
+                Set this_len to BLAKE3_BLOCK_SIZE
+            End If
+            Let is_last_block be 0
+            If pos plus this_len is equal to remaining:
+                Set is_last_block to 1
+            End If
+
+            Let bi be 0
+            While bi is less than this_len:
+                Let sb be proc memory_get_byte from Memory with input, input_off plus pos plus bi
+                proc memory_set_byte from Memory with block_buf, bi, sb
+                Set bi to bi plus 1
+            End While
+            Let pi be this_len
+            While pi is less than BLAKE3_BLOCK_SIZE:
+                proc memory_set_byte from Memory with block_buf, pi, 0
+                Set pi to pi plus 1
+            End While
+
+            Let flags2 be base_flags
+            If is_first_block is equal to 1:
+                Set flags2 to flags2 bitwise_or BLAKE3_FLAG_CHUNK_START
+            End If
+            If is_last_block is equal to 1:
+                Set flags2 to flags2 bitwise_or BLAKE3_FLAG_CHUNK_END
+                Note: Capture descriptor here, do not compress with ROOT yet.
+                Let cvi be 0
+                While cvi is less than 32:
+                    Let cvb be proc memory_get_byte from Memory with cv_buf, cvi
+                    proc memory_set_byte from Memory with desc, BLAKE3_OUTPUT_DESC_CV_OFF plus cvi, cvb
+                    Set cvi to cvi plus 1
+                End While
+                Let bbi be 0
+                While bbi is less than BLAKE3_BLOCK_SIZE:
+                    Let bbb be proc memory_get_byte from Memory with block_buf, bbi
+                    proc memory_set_byte from Memory with desc, BLAKE3_OUTPUT_DESC_BLOCK_OFF plus bbi, bbb
+                    Set bbi to bbi plus 1
+                End While
+                proc memory_set_qword from Memory with desc, BLAKE3_OUTPUT_DESC_BLOCK_LEN_OFF, this_len
+                proc memory_set_qword from Memory with desc, BLAKE3_OUTPUT_DESC_FLAGS_OFF, flags2
+                Note: We also need the counter for XOF; for a single-chunk
+                Note: input the counter is final_chunk_idx (= 0). The XOF
+                Note: emitter uses (counter_base + slice_index). For chunk
+                Note: output mode we set counter_base = final_chunk_idx.
+                Note: This is captured implicitly by storing it as a
+                Note: separate field below; here we extend the descriptor
+                Note: via an additional convention: callers pass
+                Note: final_chunk_idx explicitly to the XOF emitter.
+                Note: To avoid an extra parameter, we store the counter as
+                Note: a hidden field by widening the descriptor: see
+                Note: blake3_xof_emit_from_desc below.
+                Note: For chunk-output, counter_base = final_chunk_idx.
+                Note: For parent-output, counter_base = 0.
+                Return 1
+            Otherwise:
+                proc blake3_compress with arena, cv_buf, block_buf, final_chunk_idx, this_len, flags2, state_scratch
+                proc blake3_state_to_cv with state_scratch, cv_buf
+            End If
+
+            Set pos to pos plus this_len
+            Set is_first_block to 0
+        End While
+        Note: Unreachable if length > 0.
+        Return 0
+    End If
+
+    Note: Multi-chunk path. Compute the final chunk's CV (no ROOT, no
+    Note: descriptor capture). Then walk the stack right-to-left; the
+    Note: final merge becomes the descriptor.
+    proc blake3_compress_chunk with arena, key_cv, input, input_off, remaining, final_chunk_idx, base_flags, chunk_cv
+
+    Let key_cv_ptr be h plus BLAKE3_HASHER_KEY_CV_OFF
+    Let base_flags_h be proc memory_get_qword from Memory with h, BLAKE3_HASHER_BASE_FLAGS_OFF
+
+    Let working_cv be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+    If working_cv is equal to 0:
+        Return 0
+    End If
+    Let wi be 0
+    While wi is less than BLAKE3_CV_SIZE:
+        Let cb_w be proc memory_get_byte from Memory with chunk_cv, wi
+        proc memory_set_byte from Memory with working_cv, wi, cb_w
+        Set wi to wi plus 1
+    End While
+
+    Let parent_state_scratch be proc arena_allocate from Arena with arena, 128
+    If parent_state_scratch is equal to 0:
+        Return 0
+    End If
+
+    Let stack_remaining be stack_size_before_final
+    While stack_remaining is greater than 0:
+        Let stack_top_idx be stack_remaining minus 1
+        Let left_off be stack_top_idx multiplied by 32
+        Let left_ptr be h plus BLAKE3_HASHER_STACK_OFF plus left_off
+        If stack_remaining is equal to 1:
+            Note: Capture descriptor as a PARENT output (no ROOT).
+            Let final_block be proc arena_allocate from Arena with arena, BLAKE3_BLOCK_SIZE
+            If final_block is equal to 0:
+                Return 0
+            End If
+            Let li be 0
+            While li is less than 32:
+                Let lb_b be proc memory_get_byte from Memory with left_ptr, li
+                proc memory_set_byte from Memory with final_block, li, lb_b
+                Set li to li plus 1
+            End While
+            Let ri be 0
+            While ri is less than 32:
+                Let rb_b be proc memory_get_byte from Memory with working_cv, ri
+                proc memory_set_byte from Memory with final_block, ri plus 32, rb_b
+                Set ri to ri plus 1
+            End While
+            Note: Descriptor CV = key_cv
+            Let dci be 0
+            While dci is less than 32:
+                Let dcb be proc memory_get_byte from Memory with key_cv, dci
+                proc memory_set_byte from Memory with desc, BLAKE3_OUTPUT_DESC_CV_OFF plus dci, dcb
+                Set dci to dci plus 1
+            End While
+            Let dbi be 0
+            While dbi is less than BLAKE3_BLOCK_SIZE:
+                Let dbb be proc memory_get_byte from Memory with final_block, dbi
+                proc memory_set_byte from Memory with desc, BLAKE3_OUTPUT_DESC_BLOCK_OFF plus dbi, dbb
+                Set dbi to dbi plus 1
+            End While
+            proc memory_set_qword from Memory with desc, BLAKE3_OUTPUT_DESC_BLOCK_LEN_OFF, BLAKE3_BLOCK_SIZE
+            Let final_flags be base_flags_h bitwise_or BLAKE3_FLAG_PARENT
+            proc memory_set_qword from Memory with desc, BLAKE3_OUTPUT_DESC_FLAGS_OFF, final_flags
+            Return 1
+        End If
+        proc blake3_parent_cv with arena, key_cv_ptr, left_ptr, working_cv, base_flags_h, parent_state_scratch
+        proc blake3_state_to_cv with parent_state_scratch, working_cv
+        Set stack_remaining to stack_remaining minus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Emit XOF output of `output_len` bytes from a captured output descriptor.
+Note: ============================================================================
+
+Process called "blake3_xof_emit_from_desc" takes arena as Integer, desc as Integer, counter_base as Integer, output as Integer, output_len as Integer returns Integer:
+    @Reasoning
+    Per BLAKE3 spec, XOF output is produced by re-running the root
+    compression with counter = counter_base + slice_index for slice
+    indices 0, 1, 2, ..., each yielding a 64-byte block. ROOT is set
+    in every emission. The final slice is truncated to output_len.
+
+    For chunk-style outputs (single-chunk input), counter_base equals
+    the chunk's final_chunk_idx (effectively the chunk counter).
+    For parent-style outputs (multi-chunk), counter_base is 0.
+    @End Reasoning
+
+    @Implementation
+    Reads the descriptor's CV, block, block_len, flags_without_ROOT;
+    sets effective_flags = flags_without_ROOT | ROOT; and loops:
+      for slice in 0..(ceil(output_len/64)-1):
+        run blake3_compress(cv, block, counter_base + slice, block_len,
+                            effective_flags, state);
+        copy min(64, output_len - slice*64) bytes from the serialized
+        state into output[slice*64..].
+    @End Implementation
+
+    @Performance_Hints
+    One compression per 64 bytes of output. Each compression is ~3-6
+    cycles per byte in scalar code.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time per slice.
+    @End Security_Scope
+
+    If output_len is less than 0:
+        Return 0
+    End If
+    If output_len is equal to 0:
+        Return 1
+    End If
+
+    Let flags_without_root be proc memory_get_qword from Memory with desc, BLAKE3_OUTPUT_DESC_FLAGS_OFF
+    Let effective_flags be flags_without_root bitwise_or BLAKE3_FLAG_ROOT
+    Let block_len be proc memory_get_qword from Memory with desc, BLAKE3_OUTPUT_DESC_BLOCK_LEN_OFF
+
+    Let cv_ptr be desc plus BLAKE3_OUTPUT_DESC_CV_OFF
+    Let block_ptr be desc plus BLAKE3_OUTPUT_DESC_BLOCK_OFF
+
+    Let state be proc arena_allocate from Arena with arena, 128
+    If state is equal to 0:
+        Return 0
+    End If
+    Let block_out be proc arena_allocate from Arena with arena, BLAKE3_BLOCK_SIZE
+    If block_out is equal to 0:
+        Return 0
+    End If
+
+    Let emitted be 0
+    Let slice be 0
+    While emitted is less than output_len:
+        Let counter be counter_base plus slice
+        proc blake3_compress with arena, cv_ptr, block_ptr, counter, block_len, effective_flags, state
+        proc blake3_state_to_bytes with state, block_out
+
+        Let remaining be output_len minus emitted
+        Let to_copy be remaining
+        If to_copy is greater than BLAKE3_BLOCK_SIZE:
+            Set to_copy to BLAKE3_BLOCK_SIZE
+        End If
+        Let ci be 0
+        While ci is less than to_copy:
+            Let bb be proc memory_get_byte from Memory with block_out, ci
+            proc memory_set_byte from Memory with output, emitted plus ci, bb
+            Set ci to ci plus 1
+        End While
+
+        Set emitted to emitted plus to_copy
+        Set slice to slice plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Determine the counter_base for XOF from an input descriptor's flags:
+Note:   - PARENT flag set: counter_base = 0
+Note:   - PARENT flag clear (chunk-style): counter_base = chunk_counter
+Note:     captured separately. To avoid threading that as a parameter, we
+Note:     observe that for chunk-style outputs the final_chunk_idx equals
+Note:     the total_chunks_minus_1 which is 0 for single-chunk inputs.
+Note:     For inputs <= 1024 bytes the counter is always 0.
+Note: This invariant lets us compute counter_base from descriptor alone:
+Note:   if (flags & PARENT) == 0: counter_base = 0 (single-chunk case)
+Note:   if (flags & PARENT) != 0: counter_base = 0 (parent case)
+Note: Hence counter_base is always 0 in our top-level entry points.
+Note: ============================================================================
+
+Process called "blake3_xof_emit_default" takes arena as Integer, desc as Integer, output as Integer, output_len as Integer returns Integer:
+    @Reasoning
+    Top-level wrapper that infers counter_base = 0 (true for all single-
+    chunk and all parent-style root outputs) and calls
+    blake3_xof_emit_from_desc.
+    @End Reasoning
+
+    @Implementation
+    Calls blake3_xof_emit_from_desc with counter_base = 0.
+    @End Implementation
+
+    @Performance_Hints
+    Indirection only.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Return proc blake3_xof_emit_from_desc with arena, desc, 0, output, output_len
+End Process
+
+Note: ============================================================================
+Note: Public API
+Note: ============================================================================
+
+Process called "blake3_hash" takes arena as Integer, input as Integer, length as Integer, digest_32 as Integer returns Integer:
+    @Reasoning
+    Default 32-byte hash. Equivalent to BLAKE3 keyed_hash with key = IV
+    bytes and no KEYED_HASH flag, i.e., the canonical hash mode.
+    @End Reasoning
+
+    @Implementation
+    1. Build a 32-byte key_cv buffer initialized from the BLAKE3 IV
+       (8 little-endian words).
+    2. Call blake3_hash_input_to_output_desc with base_flags = 0.
+    3. Emit 32 bytes via blake3_xof_emit_default.
+    @End Implementation
+
+    @Performance_Hints
+    Single compression for the 32-byte XOF output plus the tree work
+    for the input.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. No secret-dependent branches. The key_cv built from
+    IV is public.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If digest_32 is equal to 0:
+        Return 0
+    End If
+    If length is less than 0:
+        Return 0
+    End If
+    If length is greater than 0:
+        If input is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Let key_cv be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+    If key_cv is equal to 0:
+        Return 0
+    End If
+    proc blake3_default_iv_to_cv with key_cv
+
+    Let desc be proc arena_allocate from Arena with arena, BLAKE3_OUTPUT_DESC_SIZE
+    If desc is equal to 0:
+        Return 0
+    End If
+
+    Let rc be proc blake3_hash_input_to_output_desc with arena, key_cv, 0, input, length, desc
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Return proc blake3_xof_emit_default with arena, desc, digest_32, BLAKE3_OUT_SIZE
+End Process
+
+Process called "blake3_hash_xof" takes arena as Integer, input as Integer, length as Integer, output as Integer, output_len as Integer returns Integer:
+    @Reasoning
+    XOF mode: produces output_len bytes of pseudorandom output derived
+    from the input.
+    @End Reasoning
+
+    @Implementation
+    Identical to blake3_hash except for the final emission step, which
+    produces output_len bytes instead of 32.
+    @End Implementation
+
+    @Performance_Hints
+    O(output_len / 64) compressions for emission plus O(length) for input
+    processing.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time per slice.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If output_len is less than 0:
+        Return 0
+    End If
+    If output_len is equal to 0:
+        Return 1
+    End If
+    If output is equal to 0:
+        Return 0
+    End If
+    If length is less than 0:
+        Return 0
+    End If
+    If length is greater than 0:
+        If input is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Let key_cv be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+    If key_cv is equal to 0:
+        Return 0
+    End If
+    proc blake3_default_iv_to_cv with key_cv
+
+    Let desc be proc arena_allocate from Arena with arena, BLAKE3_OUTPUT_DESC_SIZE
+    If desc is equal to 0:
+        Return 0
+    End If
+
+    Let rc be proc blake3_hash_input_to_output_desc with arena, key_cv, 0, input, length, desc
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Return proc blake3_xof_emit_default with arena, desc, output, output_len
+End Process
+
+Process called "blake3_keyed_hash" takes arena as Integer, key_32 as Integer, input as Integer, length as Integer, digest_32 as Integer returns Integer:
+    @Reasoning
+    MAC mode. The 32-byte key is used as the initial chaining value at
+    every chunk root; the KEYED_HASH flag is set in base_flags.
+    @End Reasoning
+
+    @Implementation
+    Sets key_cv = key_32 (32 bytes copied directly; key is already in
+    little-endian word form per spec - 8 words of 4 LE bytes each).
+    Runs the full tree with base_flags = KEYED_HASH and emits 32 bytes.
+    @End Implementation
+
+    @Performance_Hints
+    Identical to blake3_hash plus a 32-byte key copy.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. Caller is responsible for keeping key_32 secret. The
+    compression function processes the key only as an arithmetic operand
+    (it is the initial v[0..7] for every chunk's first compression).
+    Side-channel posture matches the rest of the BLAKE3 code.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key_32 is equal to 0:
+        Return 0
+    End If
+    If digest_32 is equal to 0:
+        Return 0
+    End If
+    If length is less than 0:
+        Return 0
+    End If
+    If length is greater than 0:
+        If input is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Let key_cv be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+    If key_cv is equal to 0:
+        Return 0
+    End If
+    Let ki be 0
+    While ki is less than BLAKE3_CV_SIZE:
+        Let kb be proc memory_get_byte from Memory with key_32, ki
+        proc memory_set_byte from Memory with key_cv, ki, kb
+        Set ki to ki plus 1
+    End While
+
+    Let desc be proc arena_allocate from Arena with arena, BLAKE3_OUTPUT_DESC_SIZE
+    If desc is equal to 0:
+        Return 0
+    End If
+
+    Let rc be proc blake3_hash_input_to_output_desc with arena, key_cv, BLAKE3_FLAG_KEYED_HASH, input, length, desc
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Return proc blake3_xof_emit_default with arena, desc, digest_32, BLAKE3_OUT_SIZE
+End Process
+
+Process called "blake3_derive_key" takes arena as Integer, context as Integer, context_len as Integer, key_material as Integer, key_material_len as Integer, output as Integer, output_len as Integer returns Integer:
+    @Reasoning
+    KDF mode per BLAKE3 spec section 6. Two passes:
+      Pass 1: hash `context` with base_flags = DERIVE_KEY_CONTEXT and
+              the default IV as key_cv, producing a 32-byte intermediate
+              key.
+      Pass 2: hash `key_material` with base_flags = DERIVE_KEY_MATERIAL
+              and the intermediate key as key_cv, producing the output.
+    The output may be any length; for the canonical 32-byte KDF use
+    output_len = 32.
+    @End Reasoning
+
+    @Implementation
+    1. Allocate intermediate_key buffer (32 bytes).
+    2. Run pass 1 to derive intermediate_key (always 32 bytes since the
+       context is hashed with default-style output of 32 bytes).
+    3. Run pass 2: same as keyed_hash but with base_flags =
+       DERIVE_KEY_MATERIAL and output_len-byte output.
+    @End Implementation
+
+    @Performance_Hints
+    Two full tree hashes. For short contexts (the usual case) pass 1 is
+    a single chunk; the cost is dominated by pass 2 which scales with
+    key_material_len.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. The intermediate key is a function of the public
+    context string only; it carries no secret information. The
+    key_material is the secret input and is processed under the
+    intermediate key with side-channel posture identical to keyed_hash.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If output is equal to 0:
+        Return 0
+    End If
+    If output_len is less than 0:
+        Return 0
+    End If
+    If output_len is equal to 0:
+        Return 1
+    End If
+    If context_len is less than 0:
+        Return 0
+    End If
+    If key_material_len is less than 0:
+        Return 0
+    End If
+    If context_len is greater than 0:
+        If context is equal to 0:
+            Return 0
+        End If
+    End If
+    If key_material_len is greater than 0:
+        If key_material is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Note: Pass 1: derive 32-byte intermediate key from context.
+    Let iv_cv be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+    If iv_cv is equal to 0:
+        Return 0
+    End If
+    proc blake3_default_iv_to_cv with iv_cv
+
+    Let intermediate_key be proc arena_allocate from Arena with arena, BLAKE3_CV_SIZE
+    If intermediate_key is equal to 0:
+        Return 0
+    End If
+
+    Let desc1 be proc arena_allocate from Arena with arena, BLAKE3_OUTPUT_DESC_SIZE
+    If desc1 is equal to 0:
+        Return 0
+    End If
+    Let rc1 be proc blake3_hash_input_to_output_desc with arena, iv_cv, BLAKE3_FLAG_DERIVE_KEY_CONTEXT, context, context_len, desc1
+    If rc1 is equal to 0:
+        Return 0
+    End If
+    Let rce1 be proc blake3_xof_emit_default with arena, desc1, intermediate_key, BLAKE3_CV_SIZE
+    If rce1 is equal to 0:
+        Return 0
+    End If
+
+    Note: Pass 2: hash key_material under intermediate_key with DERIVE_KEY_MATERIAL.
+    Let desc2 be proc arena_allocate from Arena with arena, BLAKE3_OUTPUT_DESC_SIZE
+    If desc2 is equal to 0:
+        Return 0
+    End If
+    Let rc2 be proc blake3_hash_input_to_output_desc with arena, intermediate_key, BLAKE3_FLAG_DERIVE_KEY_MATERIAL, key_material, key_material_len, desc2
+    If rc2 is equal to 0:
+        Return 0
+    End If
+
+    Return proc blake3_xof_emit_default with arena, desc2, output, output_len
+End Process

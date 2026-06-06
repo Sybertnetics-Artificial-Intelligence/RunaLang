@@ -1,0 +1,1078 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+URL - RFC 3986 Uniform Resource Identifier Primitive (Tier 1)
+
+Implements URL (and the more general URI) parsing and serialization per
+RFC 3986 (Uniform Resource Identifier: Generic Syntax). Percent-encoding
+helpers follow RFC 3986 section 2.1 and RFC 8141 (URN Syntax).
+
+RFC 3986 generic syntax:
+
+  URI = scheme ":" hier-part [ "?" query ] [ "#" fragment ]
+  hier-part = "//" authority path-abempty / path-absolute / path-rootless / path-empty
+  authority = [ userinfo "@" ] host [ ":" port ]
+
+Record layout (88 bytes):
+  offset 0:  scheme       (pointer to string, or 0)
+  offset 8:  userinfo     (pointer to string, or 0)
+  offset 16: host         (pointer to string, or 0)
+  offset 24: port         (Integer, -1 if absent)
+  offset 32: path         (pointer to string, or 0)
+  offset 40: query        (pointer to string, or 0)
+  offset 48: fragment     (pointer to string, or 0)
+  offset 56: has_authority(1 if "//" authority was present, else 0)
+  offset 64: _reserved_0
+  offset 72: _reserved_1
+  offset 80: _reserved_2
+
+Percent-encoding:
+  Unreserved characters per RFC 3986 section 2.3: ALPHA / DIGIT / "-" / "." / "_" / "~"
+  All other characters in a generic component must be percent-encoded.
+
+Validation:
+  The parser is strict in form (RFC 3986 ABNF) but lenient in component
+  semantics so that scheme-specific rules can layer on top.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let URL_RECORD_SIZE be 88
+Let URL_OFFSET_SCHEME be 0
+Let URL_OFFSET_USERINFO be 8
+Let URL_OFFSET_HOST be 16
+Let URL_OFFSET_PORT be 24
+Let URL_OFFSET_PATH be 32
+Let URL_OFFSET_QUERY be 40
+Let URL_OFFSET_FRAGMENT be 48
+Let URL_OFFSET_HAS_AUTHORITY be 56
+Let URL_PORT_ABSENT be -1
+
+Note: ============================================================================
+Note: STRING HELPERS
+Note: ============================================================================
+
+@Reasoning
+Allocate and copy a substring of a source string into a freshly owned
+buffer with null termination. Used internally by the parser to detach
+parsed components from the input.
+@End Reasoning
+
+@Implementation
+Delegate to StringPrim.string_substring which already handles bounds and
+null termination.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the slice length. Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if input is null or allocation fails so callers can short-circuit.
+@End Security_Scope
+Process called "url_copy_slice" takes src as Integer, start as Integer, length as Integer returns Integer:
+    If src is equal to 0:
+        Return 0
+    End If
+    If length is less than 0:
+        Return 0
+    End If
+    Return proc string_substring from StringPrim with src, start, length
+End Process
+
+Note: ============================================================================
+Note: PERCENT-ENCODING
+Note: ============================================================================
+
+@Reasoning
+Per RFC 3986 section 2.3, unreserved characters are ALPHA, DIGIT, '-',
+'.', '_', and '~'. They must be passed through verbatim. All other bytes
+must be percent-encoded.
+@End Reasoning
+
+@Implementation
+ASCII letter / digit ranges plus the four explicit punctuation characters.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Used by the encoder to make safety-critical inclusion/exclusion decisions.
+@End Security_Scope
+Process called "url_is_unreserved" takes ch as Integer returns Integer:
+    Let is_a be proc is_alpha from Char with ch
+    If is_a is equal to 1:
+        Return 1
+    End If
+    Let is_d be proc is_digit from Char with ch
+    If is_d is equal to 1:
+        Return 1
+    End If
+    If ch is equal to 45:
+        Return 1
+    End If
+    If ch is equal to 46:
+        Return 1
+    End If
+    If ch is equal to 95:
+        Return 1
+    End If
+    If ch is equal to 126:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Convert an integer 0..15 to its uppercase ASCII hex digit. RFC 3986
+section 2.1 mandates uppercase for percent-encoded output, though
+decoders must accept both cases.
+@End Reasoning
+
+@Implementation
+0..9 -> '0'..'9', 10..15 -> 'A'..'F'.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on out-of-range input.
+@End Security_Scope
+Process called "url_hex_digit_char" takes value as Integer returns Integer:
+    If value is less than 0:
+        Return -1
+    End If
+    If value is greater than 15:
+        Return -1
+    End If
+    If value is less than 10:
+        Return value plus 48
+    End If
+    Return value plus 55
+End Process
+
+@Reasoning
+Convert a single ASCII hex digit to its integer value 0..15. RFC 3986
+section 2.1 mandates accepting both cases on input.
+@End Reasoning
+
+@Implementation
+Range tests on '0'..'9', 'a'..'f', 'A'..'F'.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on invalid digit.
+@End Security_Scope
+Process called "url_hex_value" takes ch as Integer returns Integer:
+    If ch is greater than or equal to 48:
+        If ch is less than or equal to 57:
+            Return ch minus 48
+        End If
+    End If
+    If ch is greater than or equal to 97:
+        If ch is less than or equal to 102:
+            Return ch minus 87
+        End If
+    End If
+    If ch is greater than or equal to 65:
+        If ch is less than or equal to 70:
+            Return ch minus 55
+        End If
+    End If
+    Return -1
+End Process
+
+@Reasoning
+Percent-encode a string for inclusion in a URI generic component per
+RFC 3986 section 2.1. Unreserved characters pass through; all others are
+encoded as "%HH" with uppercase hex.
+@End Reasoning
+
+@Implementation
+StringBuilder loop. For each byte: append verbatim if unreserved, else
+append '%' followed by the high and low hex nibbles.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over input length. Space: at most 3n for the output.
+@End Performance_Hints
+
+@Security_Scope
+Encoder must be conservative: never let a raw '%', '/', '?', '#', or '@'
+slip through, because that would alter URI structure downstream.
+@End Security_Scope
+Process called "url_percent_encode" takes input_str as Integer returns Integer:
+    If input_str is equal to 0:
+        Return 0
+    End If
+    Let input_len be proc string_length from StringCore with input_str
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than input_len:
+        Let ch be proc memory_get_byte from Memory with input_str, i
+        Let safe be proc url_is_unreserved with ch
+        If safe is equal to 1:
+            proc stringbuilder_append_char from SB with sb, ch
+        Otherwise:
+            Let high_nibble be ch divided by 16
+            Let low_nibble be ch modulo by 16
+            Let high_ch be proc url_hex_digit_char with high_nibble
+            Let low_ch be proc url_hex_digit_char with low_nibble
+            proc stringbuilder_append_char from SB with sb, 37
+            proc stringbuilder_append_char from SB with sb, high_ch
+            proc stringbuilder_append_char from SB with sb, low_ch
+        End If
+        Set i to i plus 1
+    End While
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process
+
+@Reasoning
+Decode a percent-encoded string per RFC 3986 section 2.1. Reads '%HH'
+triples back to their original byte value; all other bytes pass through.
+Malformed encodings ("%X", "%XY" with non-hex X or Y) return 0 to refuse
+silent corruption.
+@End Reasoning
+
+@Implementation
+StringBuilder loop. On '%' check at least two more bytes are available
+and they are hex digits; combine; emit the resulting byte.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over input length. Space: at most n bytes for the output.
+@End Performance_Hints
+
+@Security_Scope
+Strict validation: any malformed escape rejects the entire input. This
+prevents path-traversal payloads from sneaking through with broken escapes.
+@End Security_Scope
+Process called "url_percent_decode" takes input_str as Integer returns Integer:
+    If input_str is equal to 0:
+        Return 0
+    End If
+    Let input_len be proc string_length from StringCore with input_str
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    Let parse_failed be 0
+    While i is less than input_len:
+        If parse_failed is equal to 0:
+            Let ch be proc memory_get_byte from Memory with input_str, i
+            If ch is equal to 37:
+                If i plus 2 is greater than or equal to input_len:
+                    Set parse_failed to 1
+                Otherwise:
+                    Let h_ch be proc memory_get_byte from Memory with input_str, i plus 1
+                    Let l_ch be proc memory_get_byte from Memory with input_str, i plus 2
+                    Let hv be proc url_hex_value with h_ch
+                    Let lv be proc url_hex_value with l_ch
+                    If hv is less than 0:
+                        Set parse_failed to 1
+                    End If
+                    If lv is less than 0:
+                        Set parse_failed to 1
+                    End If
+                    If parse_failed is equal to 0:
+                        Let decoded be (hv multiplied by 16) plus lv
+                        proc stringbuilder_append_char from SB with sb, decoded
+                        Set i to i plus 3
+                    End If
+                End If
+            Otherwise:
+                proc stringbuilder_append_char from SB with sb, ch
+                Set i to i plus 1
+            End If
+        Otherwise:
+            Set i to input_len
+        End If
+    End While
+    If parse_failed is equal to 1:
+        proc stringbuilder_destroy from SB with sb
+        Return 0
+    End If
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process
+
+Note: ============================================================================
+Note: URL RECORD MANAGEMENT
+Note: ============================================================================
+
+@Reasoning
+Allocate and initialize a fresh URL record with all component pointers
+nulled out and the port set to URL_PORT_ABSENT (-1). Provided as a
+constructor primitive so callers can build a URL field-by-field as well
+as via the full parser.
+@End Reasoning
+
+@Implementation
+Layout-allocate 88 bytes and zero-fill the pointer slots; assign -1 to
+the port slot.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1) - 88 bytes per record.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "url_create" returns Integer:
+    Let url be proc allocate from Layout with URL_RECORD_SIZE
+    If url is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with url, URL_OFFSET_SCHEME, 0
+    proc memory_set_int64 from Memory with url, URL_OFFSET_USERINFO, 0
+    proc memory_set_int64 from Memory with url, URL_OFFSET_HOST, 0
+    proc memory_set_int64 from Memory with url, URL_OFFSET_PORT, URL_PORT_ABSENT
+    proc memory_set_int64 from Memory with url, URL_OFFSET_PATH, 0
+    proc memory_set_int64 from Memory with url, URL_OFFSET_QUERY, 0
+    proc memory_set_int64 from Memory with url, URL_OFFSET_FRAGMENT, 0
+    proc memory_set_int64 from Memory with url, URL_OFFSET_HAS_AUTHORITY, 0
+    proc memory_set_int64 from Memory with url, 64, 0
+    proc memory_set_int64 from Memory with url, 72, 0
+    proc memory_set_int64 from Memory with url, 80, 0
+    Return url
+End Process
+
+@Reasoning
+Free the URL record and every owned component string.
+@End Reasoning
+
+@Implementation
+Deallocate every non-null pointer slot, then the record itself.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) over the fixed slot count.
+@End Performance_Hints
+
+@Security_Scope
+Caller must not touch the pointer after destroy.
+@End Security_Scope
+Process called "url_destroy" takes url as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Let scheme be proc memory_get_int64 from Memory with url, URL_OFFSET_SCHEME
+    If scheme is not equal to 0:
+        proc deallocate from Layout with scheme
+    End If
+    Let userinfo be proc memory_get_int64 from Memory with url, URL_OFFSET_USERINFO
+    If userinfo is not equal to 0:
+        proc deallocate from Layout with userinfo
+    End If
+    Let host be proc memory_get_int64 from Memory with url, URL_OFFSET_HOST
+    If host is not equal to 0:
+        proc deallocate from Layout with host
+    End If
+    Let path be proc memory_get_int64 from Memory with url, URL_OFFSET_PATH
+    If path is not equal to 0:
+        proc deallocate from Layout with path
+    End If
+    Let query be proc memory_get_int64 from Memory with url, URL_OFFSET_QUERY
+    If query is not equal to 0:
+        proc deallocate from Layout with query
+    End If
+    Let fragment be proc memory_get_int64 from Memory with url, URL_OFFSET_FRAGMENT
+    If fragment is not equal to 0:
+        proc deallocate from Layout with fragment
+    End If
+    proc deallocate from Layout with url
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS
+Note: ============================================================================
+
+Process called "url_get_scheme" takes url as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with url, URL_OFFSET_SCHEME
+End Process
+
+Process called "url_get_userinfo" takes url as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with url, URL_OFFSET_USERINFO
+End Process
+
+Process called "url_get_host" takes url as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with url, URL_OFFSET_HOST
+End Process
+
+Process called "url_get_port" takes url as Integer returns Integer:
+    If url is equal to 0:
+        Return URL_PORT_ABSENT
+    End If
+    Return proc memory_get_int64 from Memory with url, URL_OFFSET_PORT
+End Process
+
+Process called "url_get_path" takes url as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with url, URL_OFFSET_PATH
+End Process
+
+Process called "url_get_query" takes url as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with url, URL_OFFSET_QUERY
+End Process
+
+Process called "url_get_fragment" takes url as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with url, URL_OFFSET_FRAGMENT
+End Process
+
+Process called "url_has_authority" takes url as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with url, URL_OFFSET_HAS_AUTHORITY
+End Process
+
+Note: ============================================================================
+Note: SETTERS
+Note: ============================================================================
+
+@Reasoning
+Replace the scheme component. The previous value is freed if owned; the
+new string is owned by the URL record once installed.
+@End Reasoning
+
+@Implementation
+Free existing, store new pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not free the string after passing it in.
+@End Security_Scope
+Process called "url_set_scheme" takes url as Integer, value as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Let old be proc memory_get_int64 from Memory with url, URL_OFFSET_SCHEME
+    If old is not equal to 0:
+        proc deallocate from Layout with old
+    End If
+    proc memory_set_int64 from Memory with url, URL_OFFSET_SCHEME, value
+    Return 1
+End Process
+
+Process called "url_set_userinfo" takes url as Integer, value as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Let old be proc memory_get_int64 from Memory with url, URL_OFFSET_USERINFO
+    If old is not equal to 0:
+        proc deallocate from Layout with old
+    End If
+    proc memory_set_int64 from Memory with url, URL_OFFSET_USERINFO, value
+    Return 1
+End Process
+
+Process called "url_set_host" takes url as Integer, value as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Let old be proc memory_get_int64 from Memory with url, URL_OFFSET_HOST
+    If old is not equal to 0:
+        proc deallocate from Layout with old
+    End If
+    proc memory_set_int64 from Memory with url, URL_OFFSET_HOST, value
+    Return 1
+End Process
+
+Process called "url_set_port" takes url as Integer, port_value as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    If port_value is less than -1:
+        Return 0
+    End If
+    If port_value is greater than 65535:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with url, URL_OFFSET_PORT, port_value
+    Return 1
+End Process
+
+Process called "url_set_path" takes url as Integer, value as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Let old be proc memory_get_int64 from Memory with url, URL_OFFSET_PATH
+    If old is not equal to 0:
+        proc deallocate from Layout with old
+    End If
+    proc memory_set_int64 from Memory with url, URL_OFFSET_PATH, value
+    Return 1
+End Process
+
+Process called "url_set_query" takes url as Integer, value as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Let old be proc memory_get_int64 from Memory with url, URL_OFFSET_QUERY
+    If old is not equal to 0:
+        proc deallocate from Layout with old
+    End If
+    proc memory_set_int64 from Memory with url, URL_OFFSET_QUERY, value
+    Return 1
+End Process
+
+Process called "url_set_fragment" takes url as Integer, value as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Let old be proc memory_get_int64 from Memory with url, URL_OFFSET_FRAGMENT
+    If old is not equal to 0:
+        proc deallocate from Layout with old
+    End If
+    proc memory_set_int64 from Memory with url, URL_OFFSET_FRAGMENT, value
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PARSER
+Note: ============================================================================
+
+@Reasoning
+Validate that a candidate scheme matches RFC 3986 section 3.1 ABNF:
+  scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+@End Reasoning
+
+@Implementation
+First character must be alpha. Subsequent characters: alpha, digit,
+'+', '-', or '.'.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over length. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Rejects "javascript%3a", "data%3a", and any other scheme that requires
+percent-decoding before recognition. Schemes must be in literal form.
+@End Security_Scope
+Process called "url_is_valid_scheme" takes scheme_str as Integer returns Integer:
+    If scheme_str is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with scheme_str
+    If length is equal to 0:
+        Return 0
+    End If
+    Let first be proc memory_get_byte from Memory with scheme_str, 0
+    Let is_a be proc is_alpha from Char with first
+    If is_a is equal to 0:
+        Return 0
+    End If
+    Let i be 1
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with scheme_str, i
+        Let ok be 0
+        Let ca be proc is_alpha from Char with ch
+        If ca is equal to 1:
+            Set ok to 1
+        End If
+        Let cd be proc is_digit from Char with ch
+        If cd is equal to 1:
+            Set ok to 1
+        End If
+        If ch is equal to 43:
+            Set ok to 1
+        End If
+        If ch is equal to 45:
+            Set ok to 1
+        End If
+        If ch is equal to 46:
+            Set ok to 1
+        End If
+        If ok is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Locate the index of the first occurrence of a byte in a string starting
+from a given offset. Returns -1 when the byte is not found.
+@End Reasoning
+
+@Implementation
+Linear scan from start to end-of-string.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over scan distance.
+@End Performance_Hints
+
+@Security_Scope
+No external input; helper.
+@End Security_Scope
+Process called "url_find_byte" takes str as Integer, byte_val as Integer, start as Integer returns Integer:
+    If str is equal to 0:
+        Return -1
+    End If
+    Let length be proc string_length from StringCore with str
+    Let i be start
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with str, i
+        If ch is equal to byte_val:
+            Return i
+        End If
+        Set i to i plus 1
+    End While
+    Return -1
+End Process
+
+@Reasoning
+Parse a URI/URL per RFC 3986 section 3. The parser locates structural
+delimiters in this order:
+  1. scheme separator ':'
+  2. authority introducer "//"
+  3. path / query / fragment via "?" and "#"
+
+It then slices the input into owned component strings and returns a new
+URL record. Returns 0 on any malformation.
+@End Reasoning
+
+@Implementation
+Sequential locate-and-slice:
+  - Find the first ':' before any '/'; everything before it is the scheme.
+  - Validate scheme via ABNF.
+  - If "//" follows the colon, parse authority up to next '/', '?', or '#'.
+    Authority sub-parts: detect '@' for userinfo, ':' for port (only if
+    not inside an IPv6 literal "[...]").
+  - Path runs until '?' or '#' or end-of-string.
+  - Query is between '?' and '#' or end.
+  - Fragment is everything after '#'.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over input length. Space: O(n) for owned component copies.
+@End Performance_Hints
+
+@Security_Scope
+Strict separator handling prevents component confusion attacks. The
+parser refuses inputs with empty schemes, malformed authorities, or
+schemes containing non-ABNF characters.
+@End Security_Scope
+Process called "url_parse" takes input_str as Integer returns Integer:
+    If input_str is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with input_str
+    If length is equal to 0:
+        Return 0
+    End If
+
+    Note: Find scheme separator ':' before any '/', '?', or '#'.
+    Let scheme_end be -1
+    Let i be 0
+    Let stop be 0
+    While i is less than length:
+        If stop is equal to 0:
+            Let ch be proc memory_get_byte from Memory with input_str, i
+            If ch is equal to 58:
+                Set scheme_end to i
+                Set stop to 1
+            End If
+            If ch is equal to 47:
+                Set stop to 1
+            End If
+            If ch is equal to 63:
+                Set stop to 1
+            End If
+            If ch is equal to 35:
+                Set stop to 1
+            End If
+            If stop is equal to 0:
+                Set i to i plus 1
+            End If
+        Otherwise:
+            Set i to length
+        End If
+    End While
+    If scheme_end is less than 1:
+        Return 0
+    End If
+    Let scheme_str be proc url_copy_slice with input_str, 0, scheme_end
+    If scheme_str is equal to 0:
+        Return 0
+    End If
+    Let scheme_ok be proc url_is_valid_scheme with scheme_str
+    If scheme_ok is equal to 0:
+        proc deallocate from Layout with scheme_str
+        Return 0
+    End If
+
+    Let url be proc url_create
+    If url is equal to 0:
+        proc deallocate from Layout with scheme_str
+        Return 0
+    End If
+    proc url_set_scheme with url, scheme_str
+
+    Let pos be scheme_end plus 1
+    Let has_authority be 0
+    Note: Check for "//" introducer.
+    If pos plus 1 is less than or equal to length:
+        If pos plus 1 is less than or equal to length:
+            Let c1 be proc memory_get_byte from Memory with input_str, pos
+            Let c2_ok be 0
+            If pos plus 1 is less than length:
+                Set c2_ok to 1
+            End If
+            If c1 is equal to 47:
+                If c2_ok is equal to 1:
+                    Let c2 be proc memory_get_byte from Memory with input_str, pos plus 1
+                    If c2 is equal to 47:
+                        Set has_authority to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    If has_authority is equal to 1:
+        proc memory_set_int64 from Memory with url, URL_OFFSET_HAS_AUTHORITY, 1
+        Set pos to pos plus 2
+
+        Note: Authority ends at first '/', '?', '#', or EOS.
+        Let auth_end be length
+        Let j be pos
+        Let found_end be 0
+        While j is less than length:
+            If found_end is equal to 0:
+                Let ch be proc memory_get_byte from Memory with input_str, j
+                If ch is equal to 47:
+                    Set auth_end to j
+                    Set found_end to 1
+                End If
+                If ch is equal to 63:
+                    Set auth_end to j
+                    Set found_end to 1
+                End If
+                If ch is equal to 35:
+                    Set auth_end to j
+                    Set found_end to 1
+                End If
+                If found_end is equal to 0:
+                    Set j to j plus 1
+                End If
+            Otherwise:
+                Set j to length
+            End If
+        End While
+
+        Note: Within authority: userinfo@host:port - find rightmost '@' before auth_end.
+        Let at_pos be -1
+        Let k be pos
+        While k is less than auth_end:
+            Let ch be proc memory_get_byte from Memory with input_str, k
+            If ch is equal to 64:
+                Set at_pos to k
+            End If
+            Set k to k plus 1
+        End While
+        Let host_start be pos
+        If at_pos is greater than or equal to 0:
+            Let userinfo_len be at_pos minus pos
+            If userinfo_len is greater than 0:
+                Let userinfo_str be proc url_copy_slice with input_str, pos, userinfo_len
+                If userinfo_str is not equal to 0:
+                    proc url_set_userinfo with url, userinfo_str
+                End If
+            End If
+            Set host_start to at_pos plus 1
+        End If
+
+        Note: Within host:port section - locate ':' but not within IPv6 literal '[...]'.
+        Let port_colon be -1
+        Let m be host_start
+        Let in_brackets be 0
+        While m is less than auth_end:
+            Let ch be proc memory_get_byte from Memory with input_str, m
+            If ch is equal to 91:
+                Set in_brackets to 1
+            End If
+            If ch is equal to 93:
+                Set in_brackets to 0
+            End If
+            If ch is equal to 58:
+                If in_brackets is equal to 0:
+                    Set port_colon to m
+                End If
+            End If
+            Set m to m plus 1
+        End While
+        Let host_end be auth_end
+        If port_colon is greater than or equal to 0:
+            Set host_end to port_colon
+        End If
+        Let host_len be host_end minus host_start
+        If host_len is greater than 0:
+            Let host_str be proc url_copy_slice with input_str, host_start, host_len
+            If host_str is not equal to 0:
+                proc url_set_host with url, host_str
+            End If
+        End If
+        If port_colon is greater than or equal to 0:
+            Let port_text_start be port_colon plus 1
+            Let port_len be auth_end minus port_text_start
+            If port_len is less than 1:
+                proc url_destroy with url
+                Return 0
+            End If
+            If port_len is greater than 5:
+                proc url_destroy with url
+                Return 0
+            End If
+            Let port_value be 0
+            Let pp be 0
+            Let port_failed be 0
+            While pp is less than port_len:
+                If port_failed is equal to 0:
+                    Let pc be proc memory_get_byte from Memory with input_str, port_text_start plus pp
+                    Let is_d be proc is_digit from Char with pc
+                    If is_d is equal to 0:
+                        Set port_failed to 1
+                    Otherwise:
+                        Set port_value to port_value multiplied by 10
+                        Set port_value to port_value plus (pc minus 48)
+                    End If
+                End If
+                Set pp to pp plus 1
+            End While
+            If port_failed is equal to 1:
+                proc url_destroy with url
+                Return 0
+            End If
+            If port_value is greater than 65535:
+                proc url_destroy with url
+                Return 0
+            End If
+            proc url_set_port with url, port_value
+        End If
+        Set pos to auth_end
+    End If
+
+    Note: Path runs until '?' or '#' or EOS.
+    Let path_end be length
+    Let pp be pos
+    Let path_stop be 0
+    While pp is less than length:
+        If path_stop is equal to 0:
+            Let ch be proc memory_get_byte from Memory with input_str, pp
+            If ch is equal to 63:
+                Set path_end to pp
+                Set path_stop to 1
+            End If
+            If ch is equal to 35:
+                Set path_end to pp
+                Set path_stop to 1
+            End If
+            If path_stop is equal to 0:
+                Set pp to pp plus 1
+            End If
+        Otherwise:
+            Set pp to length
+        End If
+    End While
+    Let path_len be path_end minus pos
+    If path_len is greater than 0:
+        Let path_str be proc url_copy_slice with input_str, pos, path_len
+        If path_str is not equal to 0:
+            proc url_set_path with url, path_str
+        End If
+    End If
+    Set pos to path_end
+
+    Note: Query: '?' ... up to '#' or EOS.
+    If pos is less than length:
+        Let ch be proc memory_get_byte from Memory with input_str, pos
+        If ch is equal to 63:
+            Set pos to pos plus 1
+            Let q_end be length
+            Let qq be pos
+            Let q_stop be 0
+            While qq is less than length:
+                If q_stop is equal to 0:
+                    Let qch be proc memory_get_byte from Memory with input_str, qq
+                    If qch is equal to 35:
+                        Set q_end to qq
+                        Set q_stop to 1
+                    End If
+                    If q_stop is equal to 0:
+                        Set qq to qq plus 1
+                    End If
+                Otherwise:
+                    Set qq to length
+                End If
+            End While
+            Let q_len be q_end minus pos
+            If q_len is greater than 0:
+                Let query_str be proc url_copy_slice with input_str, pos, q_len
+                If query_str is not equal to 0:
+                    proc url_set_query with url, query_str
+                End If
+            End If
+            Set pos to q_end
+        End If
+    End If
+
+    Note: Fragment: '#' ... up to EOS.
+    If pos is less than length:
+        Let ch be proc memory_get_byte from Memory with input_str, pos
+        If ch is equal to 35:
+            Set pos to pos plus 1
+            Let f_len be length minus pos
+            If f_len is greater than 0:
+                Let frag_str be proc url_copy_slice with input_str, pos, f_len
+                If frag_str is not equal to 0:
+                    proc url_set_fragment with url, frag_str
+                End If
+            End If
+        End If
+    End If
+
+    Return url
+End Process
+
+Note: ============================================================================
+Note: SERIALIZATION
+Note: ============================================================================
+
+@Reasoning
+Render a URL back to its canonical string form per RFC 3986 section 5.3.
+Reconstruction follows the BNF, including the conditional emission of
+authority, port, query, and fragment separators.
+@End Reasoning
+
+@Implementation
+StringBuilder loop:
+  scheme + ":"
+  if has_authority: "//" + userinfo + "@" + host + ":" + port
+  path
+  if query  not null: "?" + query
+  if fragment not null: "#" + fragment
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Components are not re-encoded; callers are responsible for ensuring each
+component is already percent-encoded if necessary.
+@End Security_Scope
+Process called "url_to_string" takes url as Integer returns Integer:
+    If url is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let scheme be proc memory_get_int64 from Memory with url, URL_OFFSET_SCHEME
+    If scheme is not equal to 0:
+        proc stringbuilder_append from SB with sb, scheme
+        proc stringbuilder_append_char from SB with sb, 58
+    End If
+    Let has_auth be proc memory_get_int64 from Memory with url, URL_OFFSET_HAS_AUTHORITY
+    If has_auth is equal to 1:
+        proc stringbuilder_append_char from SB with sb, 47
+        proc stringbuilder_append_char from SB with sb, 47
+        Let userinfo be proc memory_get_int64 from Memory with url, URL_OFFSET_USERINFO
+        If userinfo is not equal to 0:
+            proc stringbuilder_append from SB with sb, userinfo
+            proc stringbuilder_append_char from SB with sb, 64
+        End If
+        Let host be proc memory_get_int64 from Memory with url, URL_OFFSET_HOST
+        If host is not equal to 0:
+            proc stringbuilder_append from SB with sb, host
+        End If
+        Let port be proc memory_get_int64 from Memory with url, URL_OFFSET_PORT
+        If port is not equal to URL_PORT_ABSENT:
+            proc stringbuilder_append_char from SB with sb, 58
+            proc stringbuilder_append_integer from SB with sb, port
+        End If
+    End If
+    Let path be proc memory_get_int64 from Memory with url, URL_OFFSET_PATH
+    If path is not equal to 0:
+        proc stringbuilder_append from SB with sb, path
+    End If
+    Let query be proc memory_get_int64 from Memory with url, URL_OFFSET_QUERY
+    If query is not equal to 0:
+        proc stringbuilder_append_char from SB with sb, 63
+        proc stringbuilder_append from SB with sb, query
+    End If
+    Let fragment be proc memory_get_int64 from Memory with url, URL_OFFSET_FRAGMENT
+    If fragment is not equal to 0:
+        proc stringbuilder_append_char from SB with sb, 35
+        proc stringbuilder_append from SB with sb, fragment
+    End If
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process

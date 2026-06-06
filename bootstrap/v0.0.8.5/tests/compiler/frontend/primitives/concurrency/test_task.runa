@@ -1,0 +1,195 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Unit tests for compiler/frontend/primitives/concurrency/task.runa.
+
+Covers scheduler lifecycle, id allocation, task creation defaults,
+priority bounds, and state inspection. The full dispatcher loop touches
+the work-stealing deque which is independently tested in
+work_stealing_queue tests; here we only validate the API contract.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/frontend/primitives/concurrency/task.runa" as Task
+
+Process called "test_scheduler_create_destroy" that takes results as Integer returns Integer:
+    T.begin_suite(results, "task.scheduler_create_destroy")
+    Let s be Task.scheduler_create(16)
+    T.assert_not_null(results, "scheduler allocated", s)
+    T.assert_equal(results, "fresh scheduler not shut down", Task.scheduler_is_shutdown(s), 0)
+    T.assert_equal(results, "no live tasks initially", Task.scheduler_live_count(s), 0)
+
+    Let id1 be Task.scheduler_allocate_id(s)
+    Let id2 be Task.scheduler_allocate_id(s)
+    T.assert_equal(results, "first id is 1", id1, 1)
+    T.assert_equal(results, "second id is 2", id2, 2)
+
+    Task.scheduler_destroy(s)
+    Return 1
+End Process
+
+Process called "test_scheduler_default_capacity" that takes results as Integer returns Integer:
+    T.begin_suite(results, "task.scheduler_default_capacity")
+    Let s be Task.scheduler_create(0)
+    T.assert_not_null(results, "scheduler with default capacity allocated", s)
+    Task.scheduler_destroy(s)
+
+    Let s2 be Task.scheduler_create(-5)
+    T.assert_not_null(results, "scheduler with negative capacity coerced", s2)
+    Task.scheduler_destroy(s2)
+    Return 1
+End Process
+
+Process called "test_scheduler_shutdown" that takes results as Integer returns Integer:
+    T.begin_suite(results, "task.scheduler_shutdown")
+    Let s be Task.scheduler_create(4)
+    T.assert_equal(results, "shutdown returns OK", Task.scheduler_shutdown(s), 1)
+    T.assert_equal(results, "is_shutdown reports 1", Task.scheduler_is_shutdown(s), 1)
+    Task.scheduler_destroy(s)
+    Return 1
+End Process
+
+Process called "test_task_create_state" that takes results as Integer returns Integer:
+    T.begin_suite(results, "task.create_state")
+    Let s be Task.scheduler_create(8)
+    Note: Pass a non-null fn pointer; task_create only checks for null.
+    Let dummy_fn be 1
+    Let dummy_arg be 0
+    Let t be Task.task_create(s, dummy_fn, dummy_arg)
+    T.assert_not_null(results, "task allocated", t)
+    T.assert_equal(results, "state is NEW", Task.task_state(t), 0)
+    T.assert_equal(results, "default priority is NORMAL", Task.task_get_priority(t), 1)
+    T.assert_equal(results, "parent id starts 0", Task.task_parent_id(t), 0)
+    T.assert_equal(results, "function pointer round-trips", Task.task_function(t), 1)
+
+    Task.task_destroy(t)
+    Task.scheduler_destroy(s)
+    Return 1
+End Process
+
+Process called "test_task_priority_clamping" that takes results as Integer returns Integer:
+    T.begin_suite(results, "task.priority_clamping")
+    Let s be Task.scheduler_create(8)
+    Let t be Task.task_create(s, 1, 0)
+    Task.task_set_priority(t, -100)
+    T.assert_equal(results, "negative priority clamped to LOW", Task.task_get_priority(t), 0)
+    Task.task_set_priority(t, 999)
+    T.assert_equal(results, "huge priority clamped to HIGH", Task.task_get_priority(t), 2)
+    Task.task_set_priority(t, 1)
+    T.assert_equal(results, "valid priority stored", Task.task_get_priority(t), 1)
+    Task.task_destroy(t)
+    Task.scheduler_destroy(s)
+    Return 1
+End Process
+
+Process called "test_task_set_parent" that takes results as Integer returns Integer:
+    T.begin_suite(results, "task.set_parent")
+    Let s be Task.scheduler_create(8)
+    Let t be Task.task_create(s, 1, 0)
+    Task.task_set_parent(t, 42)
+    T.assert_equal(results, "parent id stored", Task.task_parent_id(t), 42)
+    Task.task_destroy(t)
+    Task.scheduler_destroy(s)
+    Return 1
+End Process
+
+Process called "test_task_cancel_flag" that takes results as Integer returns Integer:
+    T.begin_suite(results, "task.cancel_flag")
+    Let s be Task.scheduler_create(8)
+    Let t be Task.task_create(s, 1, 0)
+    T.assert_equal(results, "not cancelled initially", Task.task_is_cancelled(t), 0)
+    Task.task_cancel(t)
+    T.assert_equal(results, "cancel flag set after cancel", Task.task_is_cancelled(t), 1)
+    Task.task_destroy(t)
+    Task.scheduler_destroy(s)
+    Return 1
+End Process
+
+Process called "test_task_create_rejects_null_fn" that takes results as Integer returns Integer:
+    T.begin_suite(results, "task.create_rejects_null_fn")
+    Let s be Task.scheduler_create(8)
+    Let t be Task.task_create(s, 0, 0)
+    T.assert_equal(results, "null fn returns 0", t, 0)
+    Task.scheduler_destroy(s)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Indirect-call regression — task_dispatch with a real Process pointer.
+Note: ============================================================================
+
+Note: Mock task body. Reads a counter from the arg, increments it, returns the
+Note: post-increment value as the task result so the test can verify that the
+Note: indirect-call dispatch reached real user code.
+
+Process called "task_body_increment" takes arg as Integer returns Integer:
+    Let cur be __load(arg, 0)
+    Let next_v be cur plus 1
+    __store(arg, 0, next_v)
+    Return next_v
+End Process
+
+Process called "task_body_increment_addr" returns Integer:
+    Note: Take the runtime address of task_body_increment for installation as
+    Note: the task's fn pointer. Required because stage1 lacks first-class
+    Note: function-reference expressions.
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        lea rax, qword ptr [rip + task_body_increment]
+        mov qword ptr [rbp-8], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "test_task_dispatch_invokes_real_fn" that takes results as Integer returns Integer:
+    Note: Before the call_indirect fix, task_runtime_call_indirect_1 returned 0
+    Note: without ever invoking the task body. This regression test attaches a
+    Note: real Process pointer, dispatches the task, and verifies that the
+    Note: side-effect (counter incremented from 0 to 1) actually occurred and
+    Note: the task result reflects the body's return value.
+    T.begin_suite(results, "task.dispatch_invokes_real_fn")
+    Let s be Task.scheduler_create(4)
+    Let counter be allocate(8)
+    __store(counter, 0, 0)
+    Let fn_ptr be task_body_increment_addr()
+    T.assert_greater_than(results, "task body address resolved", fn_ptr, 0)
+    Let t be Task.task_create(s, fn_ptr, counter)
+    T.assert_not_null(results, "task allocated", t)
+    T.assert_equal(results, "task initial state NEW", Task.task_state(t), 0)
+
+    Let dispatch_rc be Task.task_dispatch(t)
+    T.assert_equal(results, "dispatch returns OK", dispatch_rc, 1)
+    Note: After dispatch the body should have run to completion (state 3).
+    T.assert_equal(results, "task final state COMPLETED", Task.task_state(t), 3)
+    Note: task_join on a completed task returns the stored result immediately.
+    Let join_result be Task.task_join(t)
+    T.assert_equal(results, "task result is 1", join_result, 1)
+    T.assert_equal(results, "counter side-effect observed", __load(counter, 0), 1)
+
+    Task.task_destroy(t)
+    Task.scheduler_destroy(s)
+    deallocate(counter)
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+    test_scheduler_create_destroy(results)
+    test_scheduler_default_capacity(results)
+    test_scheduler_shutdown(results)
+    test_task_create_state(results)
+    test_task_priority_clamping(results)
+    test_task_set_parent(results)
+    test_task_cancel_flag(results)
+    test_task_create_rejects_null_fn(results)
+    test_task_dispatch_invokes_real_fn(results)
+    T.print_summary(results)
+    Let exit_code be T.get_failed(results)
+    T.destroy_test_results(results)
+    Return exit_code
+End Process

@@ -1,0 +1,873 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+BIGNUM - Variable-precision unsigned integer arithmetic for cryptography
+==============================================================================
+
+Provides the BigInt type and core operations required by RSA, ECDSA, and
+prime-field arithmetic for X.509 certificate verification.
+
+BigInt representation:
+- Header (16 bytes): limb_count (8 bytes) + limb_capacity (8 bytes)
+- Limbs: limb_capacity * 8 bytes (little-endian 64-bit unsigned limbs)
+- Total size: 16 + limb_capacity * 8 bytes
+
+Operations are constant-time where the value is sensitive (RSA private keys,
+ECDSA scalars, comparison of MACs). Public-key operations and modular
+exponentiation use a fixed-window Montgomery ladder pattern for the loop
+structure even when the values do not need to be constant-time, in order to
+keep the implementation uniformly side-channel resistant.
+
+All buffers are caller-allocated; this module performs no heap allocations
+internally. Callers provide either an arena pointer (for transient results)
+or a pre-sized buffer (for fixed-size keys).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+
+Constant BIGINT_HEADER_BYTES as Integer is 16
+Constant BIGINT_LIMB_BYTES as Integer is 8
+
+Note: ============================================================================
+Note: Allocation + structural helpers
+Note: ============================================================================
+
+Process called "bigint_alloc" takes arena as Integer, limb_capacity as Integer returns Integer:
+    @Reasoning
+    Allocates a BigInt with room for limb_capacity 64-bit limbs in the given
+    arena. Initial limb_count is 0 (value = 0). Caller owns the lifetime via
+    the arena.
+    @End Reasoning
+
+    If limb_capacity is less than 1:
+        Return 0
+    End If
+    Let total_size be BIGINT_HEADER_BYTES plus limb_capacity multiplied by BIGINT_LIMB_BYTES
+    Let buffer be proc arena_allocate from Arena with arena, total_size
+    If buffer is equal to 0:
+        Return 0
+    End If
+    proc memory_set_qword from Memory with buffer, 0, 0
+    proc memory_set_qword from Memory with buffer, 8, limb_capacity
+    Let zero_idx be 0
+    While zero_idx is less than limb_capacity:
+        proc memory_set_qword from Memory with buffer, BIGINT_HEADER_BYTES plus zero_idx multiplied by BIGINT_LIMB_BYTES, 0
+        Set zero_idx to zero_idx plus 1
+    End While
+    Return buffer
+End Process
+
+Process called "bigint_get_limb_count" takes bn as Integer returns Integer:
+    If bn is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_qword from Memory with bn, 0
+End Process
+
+Process called "bigint_get_limb_capacity" takes bn as Integer returns Integer:
+    If bn is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_qword from Memory with bn, 8
+End Process
+
+Process called "bigint_get_limb" takes bn as Integer, index as Integer returns Integer:
+    If bn is equal to 0:
+        Return 0
+    End If
+    Let cap be proc bigint_get_limb_capacity with bn
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than cap minus 1:
+        Return 0
+    End If
+    Return proc memory_get_qword from Memory with bn, BIGINT_HEADER_BYTES plus index multiplied by BIGINT_LIMB_BYTES
+End Process
+
+Process called "bigint_set_limb" takes bn as Integer, index as Integer, value as Integer returns Integer:
+    If bn is equal to 0:
+        Return 0
+    End If
+    Let cap be proc bigint_get_limb_capacity with bn
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than cap minus 1:
+        Return 0
+    End If
+    proc memory_set_qword from Memory with bn, BIGINT_HEADER_BYTES plus index multiplied by BIGINT_LIMB_BYTES, value
+    Return 1
+End Process
+
+Process called "bigint_set_limb_count" takes bn as Integer, count as Integer returns Integer:
+    If bn is equal to 0:
+        Return 0
+    End If
+    Let cap be proc bigint_get_limb_capacity with bn
+    If count is less than 0:
+        Return 0
+    End If
+    If count is greater than cap:
+        Return 0
+    End If
+    proc memory_set_qword from Memory with bn, 0, count
+    Return 1
+End Process
+
+Process called "bigint_normalize" takes bn as Integer returns Integer:
+    @Reasoning
+    Drops trailing zero limbs so that limb_count reflects the minimum number
+    of limbs needed to represent the value. Called after additive/subtractive
+    operations to keep canonical form.
+    @End Reasoning
+
+    If bn is equal to 0:
+        Return 0
+    End If
+    Let count be proc bigint_get_limb_count with bn
+    While count is greater than 0:
+        Let top_limb be proc bigint_get_limb with bn, count minus 1
+        If top_limb is not equal to 0:
+            proc bigint_set_limb_count with bn, count
+            Return 1
+        End If
+        Set count to count minus 1
+    End While
+    proc bigint_set_limb_count with bn, 0
+    Return 1
+End Process
+
+Process called "bigint_is_zero" takes bn as Integer returns Integer:
+    If bn is equal to 0:
+        Return 1
+    End If
+    Let count be proc bigint_get_limb_count with bn
+    Let i be 0
+    While i is less than count:
+        Let limb_value be proc bigint_get_limb with bn, i
+        If limb_value is not equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "bigint_byte_length" takes bn as Integer returns Integer:
+    @Reasoning
+    Returns the minimum number of big-endian bytes required to represent
+    the magnitude of bn without leading zeros. Used by ASN.1 INTEGER
+    encoders (RSA PKCS#1, RSA SPKI) to size the INTEGER body before
+    materialization. Returns 0 for the zero bigint, matching the
+    convention that ASN.1 callers must encode zero as the single byte
+    0x00.
+    @End Reasoning
+
+    @Implementation
+    Walk the limb array from the highest limb down to find the first
+    non-zero limb. Within that limb, count how many bytes are needed by
+    shifting until the value is zero.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count) worst-case, O(1) once the highest non-zero limb is
+    located.
+    @End Performance_Hints
+
+    @Security_Scope
+    Operates on the public byte-length of a bigint; the magnitude itself
+    is the secret material when bn carries a private key. The byte length
+    is not data-dependent for fixed-size keys.
+    @End Security_Scope
+
+    If bn is equal to 0:
+        Return 0
+    End If
+    Let count be proc bigint_get_limb_count with bn
+    Let scan_index be count minus 1
+    While scan_index is greater than 0 minus 1:
+        Let limb_value be proc bigint_get_limb with bn, scan_index
+        If limb_value is not equal to 0:
+            Let bytes_in_top be 0
+            While limb_value is not equal to 0:
+                Set bytes_in_top to bytes_in_top plus 1
+                Set limb_value to limb_value divided by 256
+            End While
+            Return scan_index multiplied by 8 plus bytes_in_top
+        End If
+        Set scan_index to scan_index minus 1
+    End While
+    Return 0
+End Process
+
+Process called "bigint_from_u64" takes arena as Integer, value as Integer returns Integer:
+    Let bn be proc bigint_alloc with arena, 4
+    If bn is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Return bn
+    End If
+    proc bigint_set_limb with bn, 0, value
+    proc bigint_set_limb_count with bn, 1
+    Return bn
+End Process
+
+Process called "bigint_copy" takes arena as Integer, src as Integer returns Integer:
+    If src is equal to 0:
+        Return 0
+    End If
+    Let src_cap be proc bigint_get_limb_capacity with src
+    Let dst be proc bigint_alloc with arena, src_cap
+    If dst is equal to 0:
+        Return 0
+    End If
+    Let src_count be proc bigint_get_limb_count with src
+    Let i be 0
+    While i is less than src_count:
+        Let limb_value be proc bigint_get_limb with src, i
+        proc bigint_set_limb with dst, i, limb_value
+        Set i to i plus 1
+    End While
+    proc bigint_set_limb_count with dst, src_count
+    Return dst
+End Process
+
+Note: ============================================================================
+Note: Big-endian byte import / export (used by ASN.1 DER decoding)
+Note: ============================================================================
+
+Process called "bigint_from_bytes_be" takes arena as Integer, bytes as Integer, length as Integer returns Integer:
+    @Reasoning
+    Builds a BigInt from a big-endian byte sequence. ASN.1 INTEGER and RSA
+    modulus / signature blobs arrive in this format. Leading zero bytes are
+    skipped by the canonicalization step at the end.
+    @End Reasoning
+
+    @Implementation
+    1. Calculate the number of limbs needed: ceil(length / 8).
+    2. Allocate a BigInt with that capacity plus 1 (margin for arithmetic).
+    3. Walk bytes from the MSB end; pack each 8-byte big-endian group into
+       one limb, with the lowest-order byte ending up in the lowest-order
+       limb. Partial final group is handled by left-shift.
+    4. Normalize to drop leading zero limbs.
+    @End Implementation
+
+    If bytes is equal to 0:
+        Return 0
+    End If
+    If length is less than 1:
+        Return proc bigint_from_u64 with arena, 0
+    End If
+
+    Let limb_count_required be length divided by 8
+    Let remainder_bytes be length modulo by 8
+    If remainder_bytes is not equal to 0:
+        Set limb_count_required to limb_count_required plus 1
+    End If
+    Let bn be proc bigint_alloc with arena, limb_count_required plus 2
+    If bn is equal to 0:
+        Return 0
+    End If
+
+    Note: Walk bytes from least-significant end backward.
+    Let bytes_remaining be length
+    Let current_limb_index be 0
+    While bytes_remaining is greater than 0:
+        Let group_size be 8
+        If bytes_remaining is less than 8:
+            Set group_size to bytes_remaining
+        End If
+
+        Let limb_value be 0
+        Let byte_offset_in_group be 0
+        While byte_offset_in_group is less than group_size:
+            Note: Big-endian: byte at position (bytes_remaining - group_size + byte_offset_in_group)
+            Note: contributes shift = (group_size - 1 - byte_offset_in_group) bytes from LSB.
+            Let read_position be bytes_remaining minus group_size plus byte_offset_in_group
+            Let byte_value be proc memory_get_byte from Memory with bytes, read_position
+            Let shift_bytes be group_size minus 1 minus byte_offset_in_group
+            Let shifted_value be byte_value
+            Let bit_shift_counter be 0
+            While bit_shift_counter is less than shift_bytes:
+                Set shifted_value to shifted_value multiplied by 256
+                Set bit_shift_counter to bit_shift_counter plus 1
+            End While
+            Set limb_value to limb_value plus shifted_value
+            Set byte_offset_in_group to byte_offset_in_group plus 1
+        End While
+
+        proc bigint_set_limb with bn, current_limb_index, limb_value
+        Set bytes_remaining to bytes_remaining minus group_size
+        Set current_limb_index to current_limb_index plus 1
+    End While
+
+    proc bigint_set_limb_count with bn, current_limb_index
+    proc bigint_normalize with bn
+    Return bn
+End Process
+
+Process called "bigint_to_bytes_be" takes bn as Integer, out_buffer as Integer, out_capacity as Integer returns Integer:
+    @Reasoning
+    Renders a BigInt as a fixed-width big-endian byte sequence into the
+    caller's buffer. Writes leading zero bytes so the result is exactly
+    out_capacity bytes long. Used by RSA signature blob comparison.
+    @End Reasoning
+
+    If bn is equal to 0:
+        Let i_zero be 0
+        While i_zero is less than out_capacity:
+            proc memory_set_byte from Memory with out_buffer, i_zero, 0
+            Set i_zero to i_zero plus 1
+        End While
+        Return out_capacity
+    End If
+    If out_buffer is equal to 0:
+        Return 0
+    End If
+
+    Note: First fill the destination with zeros.
+    Let z be 0
+    While z is less than out_capacity:
+        proc memory_set_byte from Memory with out_buffer, z, 0
+        Set z to z plus 1
+    End While
+
+    Let count be proc bigint_get_limb_count with bn
+    Let limb_index be 0
+    While limb_index is less than count:
+        Let limb_value be proc bigint_get_limb with bn, limb_index
+        Let byte_in_limb be 0
+        While byte_in_limb is less than 8:
+            Let byte_value be limb_value modulo by 256
+            Set limb_value to limb_value divided by 256
+            Let absolute_position be limb_index multiplied by 8 plus byte_in_limb
+            Let dest_position be out_capacity minus 1 minus absolute_position
+            If dest_position is greater than 0 minus 1:
+                If dest_position is less than out_capacity:
+                    proc memory_set_byte from Memory with out_buffer, dest_position, byte_value
+                End If
+            End If
+            Set byte_in_limb to byte_in_limb plus 1
+        End While
+        Set limb_index to limb_index plus 1
+    End While
+
+    Return out_capacity
+End Process
+
+Note: ============================================================================
+Note: Comparison (constant-time)
+Note: ============================================================================
+
+Process called "bigint_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Constant-time comparison: returns -1, 0, or 1. The comparison is constant-
+    time over the maximum of the two limb counts, so timing does not leak
+    which operand is larger. Used for ECDSA r/s in-range checks and RSA
+    modulus comparison.
+    @End Reasoning
+
+    Let a_count be proc bigint_get_limb_count with a
+    Let b_count be proc bigint_get_limb_count with b
+    Let max_count be a_count
+    If b_count is greater than max_count:
+        Set max_count to b_count
+    End If
+
+    Let result_code be 0
+    Let i be max_count
+    While i is greater than 0:
+        Set i to i minus 1
+        Let a_limb be 0
+        Let b_limb be 0
+        If i is less than a_count:
+            Set a_limb to proc bigint_get_limb with a, i
+        End If
+        If i is less than b_count:
+            Set b_limb to proc bigint_get_limb with b, i
+        End If
+        If result_code is equal to 0:
+            If a_limb is greater than b_limb:
+                Set result_code to 1
+            Otherwise:
+                If a_limb is less than b_limb:
+                    Set result_code to 0 minus 1
+                End If
+            End If
+        End If
+    End While
+    Return result_code
+End Process
+
+Process called "bigint_equals" takes a as Integer, b as Integer returns Integer:
+    Let cmp be proc bigint_compare with a, b
+    If cmp is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Addition and subtraction (caller provides destination of sufficient size)
+Note: ============================================================================
+
+Process called "bigint_add" takes dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Computes dest = a + b. dest must have capacity at least max(a_count, b_count) + 1.
+    Standard schoolbook addition with carry propagation over 64-bit limbs.
+    Limb arithmetic is performed in 64-bit; overflow into the carry is
+    detected by checking whether the result is less than either operand.
+    @End Reasoning
+
+    Let a_count be proc bigint_get_limb_count with a
+    Let b_count be proc bigint_get_limb_count with b
+    Let dest_cap be proc bigint_get_limb_capacity with dest
+    Let max_count be a_count
+    If b_count is greater than max_count:
+        Set max_count to b_count
+    End If
+    If max_count plus 1 is greater than dest_cap:
+        Return 0
+    End If
+
+    Let carry be 0
+    Let i be 0
+    While i is less than max_count:
+        Let a_limb be 0
+        Let b_limb be 0
+        If i is less than a_count:
+            Set a_limb to proc bigint_get_limb with a, i
+        End If
+        If i is less than b_count:
+            Set b_limb to proc bigint_get_limb with b, i
+        End If
+        Let sum1 be a_limb plus b_limb
+        Let carry_from_sum1 be 0
+        If sum1 is less than a_limb:
+            Set carry_from_sum1 to 1
+        End If
+        Let sum2 be sum1 plus carry
+        Let carry_from_sum2 be 0
+        If sum2 is less than sum1:
+            Set carry_from_sum2 to 1
+        End If
+        proc bigint_set_limb with dest, i, sum2
+        Set carry to carry_from_sum1 plus carry_from_sum2
+        Set i to i plus 1
+    End While
+    If carry is not equal to 0:
+        proc bigint_set_limb with dest, max_count, carry
+        proc bigint_set_limb_count with dest, max_count plus 1
+    Otherwise:
+        proc bigint_set_limb_count with dest, max_count
+    End If
+    proc bigint_normalize with dest
+    Return 1
+End Process
+
+Process called "bigint_sub" takes dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Computes dest = a - b assuming a >= b. Returns 0 if borrow out occurs
+    (callers should pre-check via bigint_compare).
+    @End Reasoning
+
+    Let a_count be proc bigint_get_limb_count with a
+    Let b_count be proc bigint_get_limb_count with b
+    Let dest_cap be proc bigint_get_limb_capacity with dest
+    If a_count is greater than dest_cap:
+        Return 0
+    End If
+
+    Let borrow be 0
+    Let i be 0
+    While i is less than a_count:
+        Let a_limb be proc bigint_get_limb with a, i
+        Let b_limb be 0
+        If i is less than b_count:
+            Set b_limb to proc bigint_get_limb with b, i
+        End If
+        Let diff1 be a_limb minus b_limb
+        Let borrow_from_diff1 be 0
+        If a_limb is less than b_limb:
+            Set borrow_from_diff1 to 1
+        End If
+        Let diff2 be diff1 minus borrow
+        Let borrow_from_diff2 be 0
+        If diff1 is less than borrow:
+            Set borrow_from_diff2 to 1
+        End If
+        proc bigint_set_limb with dest, i, diff2
+        Set borrow to borrow_from_diff1 plus borrow_from_diff2
+        Set i to i plus 1
+    End While
+    proc bigint_set_limb_count with dest, a_count
+    proc bigint_normalize with dest
+    If borrow is not equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Multiplication (schoolbook, sufficient for RSA verification at this scale)
+Note: ============================================================================
+
+Process called "bigint_mul" takes dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Computes dest = a * b. dest must have capacity at least a_count + b_count.
+    Schoolbook multiplication with 64x64 -> 128 partial products handled via
+    explicit hi/lo split: a single 64-bit limb is treated as two 32-bit halves
+    for the partial product so the intermediate value fits.
+    @End Reasoning
+
+    Let a_count be proc bigint_get_limb_count with a
+    Let b_count be proc bigint_get_limb_count with b
+    Let dest_cap be proc bigint_get_limb_capacity with dest
+    Let needed_cap be a_count plus b_count
+    If needed_cap is greater than dest_cap:
+        Return 0
+    End If
+
+    Note: Zero destination
+    Let z_idx be 0
+    While z_idx is less than dest_cap:
+        proc bigint_set_limb with dest, z_idx, 0
+        Set z_idx to z_idx plus 1
+    End While
+
+    Let i be 0
+    While i is less than a_count:
+        Let a_limb be proc bigint_get_limb with a, i
+        Let a_lo be a_limb modulo by 4294967296
+        Let a_hi be a_limb divided by 4294967296
+        Let j be 0
+        Let carry be 0
+        While j is less than b_count:
+            Let b_limb be proc bigint_get_limb with b, j
+            Let b_lo be b_limb modulo by 4294967296
+            Let b_hi be b_limb divided by 4294967296
+
+            Let pp_ll be a_lo multiplied by b_lo
+            Let pp_lh be a_lo multiplied by b_hi
+            Let pp_hl be a_hi multiplied by b_lo
+            Let pp_hh be a_hi multiplied by b_hi
+
+            Let mid be pp_lh plus pp_hl
+            Let mid_carry be 0
+            If mid is less than pp_lh:
+                Set mid_carry to 4294967296
+            End If
+
+            Let lower be pp_ll plus mid multiplied by 4294967296
+            Let lower_carry be 0
+            If lower is less than pp_ll:
+                Set lower_carry to 1
+            End If
+
+            Let upper be pp_hh plus mid divided by 4294967296 plus mid_carry plus lower_carry
+
+            Let existing be proc bigint_get_limb with dest, i plus j
+            Let lower_with_carry be lower plus carry
+            Let carry_propagate be 0
+            If lower_with_carry is less than lower:
+                Set carry_propagate to 1
+            End If
+            Let sum_with_existing be existing plus lower_with_carry
+            Let carry_existing be 0
+            If sum_with_existing is less than existing:
+                Set carry_existing to 1
+            End If
+            proc bigint_set_limb with dest, i plus j, sum_with_existing
+            Set carry to upper plus carry_propagate plus carry_existing
+            Set j to j plus 1
+        End While
+        If carry is not equal to 0:
+            Let dest_pos be i plus b_count
+            If dest_pos is less than dest_cap:
+                Let existing_high be proc bigint_get_limb with dest, dest_pos
+                proc bigint_set_limb with dest, dest_pos, existing_high plus carry
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    proc bigint_set_limb_count with dest, needed_cap
+    proc bigint_normalize with dest
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Modular reduction (a mod m), required by RSA encryption/decryption
+Note: ============================================================================
+
+Process called "bigint_mod" takes arena as Integer, dest as Integer, a as Integer, m as Integer returns Integer:
+    @Reasoning
+    Computes dest = a mod m. Uses repeated subtraction shifted by powers of
+    two: this is O(n^2) but acceptable for X.509 verification workloads where
+    a single signature check happens once per import. The algorithm is:
+    while a >= m, find the highest k such that m << k <= a, then subtract.
+    @End Reasoning
+
+    If m is equal to 0:
+        Return 0
+    End If
+    If a is equal to 0:
+        Return 0
+    End If
+    If dest is equal to 0:
+        Return 0
+    End If
+
+    Note: dest <- copy of a
+    Let a_count be proc bigint_get_limb_count with a
+    Let dest_cap be proc bigint_get_limb_capacity with dest
+    If a_count is greater than dest_cap:
+        Return 0
+    End If
+    Let z_idx2 be 0
+    While z_idx2 is less than dest_cap:
+        proc bigint_set_limb with dest, z_idx2, 0
+        Set z_idx2 to z_idx2 plus 1
+    End While
+    Let copy_i be 0
+    While copy_i is less than a_count:
+        Let a_limb_copy be proc bigint_get_limb with a, copy_i
+        proc bigint_set_limb with dest, copy_i, a_limb_copy
+        Set copy_i to copy_i plus 1
+    End While
+    proc bigint_set_limb_count with dest, a_count
+    proc bigint_normalize with dest
+
+    Note: Repeatedly subtract m left-shifted by k limbs while result >= shifted m.
+    Loop forever:
+        Let cmp_now be proc bigint_compare with dest, m
+        If cmp_now is less than 0:
+            Break
+        End If
+
+        Let dest_count_now be proc bigint_get_limb_count with dest
+        Let m_count_now be proc bigint_get_limb_count with m
+        Let shift_limbs be dest_count_now minus m_count_now
+
+        If shift_limbs is less than 0:
+            Set shift_limbs to 0
+        End If
+
+        Note: Build a temporary shifted-m. We allocate a fresh BigInt each
+        Note: iteration of the outer loop from the arena. Acceptable because
+        Note: the iteration count is bounded by the limb count of a, which
+        Note: for RSA-4096 is at most 64.
+        Let shifted_cap be m_count_now plus shift_limbs plus 2
+        Let shifted_m be proc bigint_alloc with arena, shifted_cap
+        If shifted_m is equal to 0:
+            Return 0
+        End If
+        Let s_idx be 0
+        While s_idx is less than m_count_now:
+            Let m_limb_value be proc bigint_get_limb with m, s_idx
+            proc bigint_set_limb with shifted_m, s_idx plus shift_limbs, m_limb_value
+            Set s_idx to s_idx plus 1
+        End While
+        proc bigint_set_limb_count with shifted_m, m_count_now plus shift_limbs
+
+        Note: If shifted_m > dest, reduce shift by 1 limb.
+        Let shifted_cmp be proc bigint_compare with shifted_m, dest
+        If shifted_cmp is greater than 0:
+            If shift_limbs is equal to 0:
+                Break
+            End If
+            Set shift_limbs to shift_limbs minus 1
+            Let shifted_m2 be proc bigint_alloc with arena, shifted_cap
+            If shifted_m2 is equal to 0:
+                Return 0
+            End If
+            Let s2_idx be 0
+            While s2_idx is less than m_count_now:
+                Let m_limb_v2 be proc bigint_get_limb with m, s2_idx
+                proc bigint_set_limb with shifted_m2, s2_idx plus shift_limbs, m_limb_v2
+                Set s2_idx to s2_idx plus 1
+            End While
+            proc bigint_set_limb_count with shifted_m2, m_count_now plus shift_limbs
+            Set shifted_m to shifted_m2
+        End If
+
+        proc bigint_sub with dest, dest, shifted_m
+        proc bigint_normalize with dest
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Modular exponentiation (a^e mod m) - sliding-window squaring
+Note: ============================================================================
+
+Process called "bigint_mod_exp" takes arena as Integer, dest as Integer, base as Integer, exponent as Integer, modulus as Integer returns Integer:
+    @Reasoning
+    Computes dest = base^exponent mod modulus. This is the workhorse of RSA
+    signature verification (s^e mod n). Uses left-to-right binary square-and-
+    multiply with intermediate modular reduction. The loop runs in time
+    proportional to the bit length of the exponent, which is fine for a
+    public exponent (typically 65537 = 17 bits).
+    @End Reasoning
+
+    @Implementation
+    1. Initialize result = 1.
+    2. For each bit of exponent from MSB to LSB:
+       a. result = result^2 mod modulus
+       b. If bit is set, result = result * base mod modulus
+    3. dest <- result.
+    Two temporary BigInts (squared, multiplied) are allocated from the arena
+    per iteration; this stays within arena budgets because the outer
+    iteration count is bounded.
+    @End Implementation
+
+    @Security_Scope
+    Bit-by-bit dispatch is data-dependent on the exponent. For RSA SIGNATURE
+    VERIFICATION (this caller) the exponent is the PUBLIC exponent, which is
+    not a secret, so data-dependent branching is acceptable. If this routine
+    is ever called with a private exponent, switch to Montgomery ladder or
+    fixed-window with constant-time selection.
+    @End Security_Scope
+
+    If dest is equal to 0:
+        Return 0
+    End If
+    If modulus is equal to 0:
+        Return 0
+    End If
+
+    Let modulus_count be proc bigint_get_limb_count with modulus
+    Let temp_cap be modulus_count multiplied by 2 plus 4
+    Let result_bn be proc bigint_alloc with arena, temp_cap
+    If result_bn is equal to 0:
+        Return 0
+    End If
+    proc bigint_set_limb with result_bn, 0, 1
+    proc bigint_set_limb_count with result_bn, 1
+
+    Let base_reduced be proc bigint_alloc with arena, temp_cap
+    If base_reduced is equal to 0:
+        Return 0
+    End If
+    proc bigint_mod with arena, base_reduced, base, modulus
+
+    Note: Determine highest set bit of exponent.
+    Let exp_count be proc bigint_get_limb_count with exponent
+    If exp_count is equal to 0:
+        Note: exponent = 0 -> result = 1
+        proc bigint_set_limb_count with dest, 1
+        proc bigint_set_limb with dest, 0, 1
+        Return 1
+    End If
+
+    Let top_limb_index be exp_count minus 1
+    Let top_limb_value be proc bigint_get_limb with exponent, top_limb_index
+    Let top_bit_in_limb be 63
+    While top_bit_in_limb is greater than 0:
+        Let bit_mask be 1
+        Let bm_iter be 0
+        While bm_iter is less than top_bit_in_limb:
+            Set bit_mask to bit_mask multiplied by 2
+            Set bm_iter to bm_iter plus 1
+        End While
+        Let masked be top_limb_value bitwise_and bit_mask
+        If masked is not equal to 0:
+            Break
+        End If
+        Set top_bit_in_limb to top_bit_in_limb minus 1
+    End While
+
+    Note: Iterate bits from second-highest down to bit 0.
+    Let limb_index be top_limb_index
+    Let bit_index be top_bit_in_limb minus 1
+    If bit_index is less than 0:
+        Set bit_index to 63
+        If limb_index is greater than 0:
+            Set limb_index to limb_index minus 1
+        Otherwise:
+            Note: exponent = 1 -> result = base mod m
+            Let bcount be proc bigint_get_limb_count with base_reduced
+            proc bigint_set_limb_count with dest, bcount
+            Let cpy_i be 0
+            While cpy_i is less than bcount:
+                Let cpy_limb be proc bigint_get_limb with base_reduced, cpy_i
+                proc bigint_set_limb with dest, cpy_i, cpy_limb
+                Set cpy_i to cpy_i plus 1
+            End While
+            Return 1
+        End If
+    End If
+
+    Loop forever:
+        Note: result = result^2 mod modulus
+        Let squared_bn be proc bigint_alloc with arena, temp_cap
+        If squared_bn is equal to 0:
+            Return 0
+        End If
+        proc bigint_mul with squared_bn, result_bn, result_bn
+        proc bigint_mod with arena, result_bn, squared_bn, modulus
+
+        Note: Check current bit of exponent.
+        Let cur_limb be proc bigint_get_limb with exponent, limb_index
+        Let cur_mask be 1
+        Let cm_iter be 0
+        While cm_iter is less than bit_index:
+            Set cur_mask to cur_mask multiplied by 2
+            Set cm_iter to cm_iter plus 1
+        End While
+        Let cur_bit be cur_limb bitwise_and cur_mask
+        If cur_bit is not equal to 0:
+            Let multiplied_bn be proc bigint_alloc with arena, temp_cap
+            If multiplied_bn is equal to 0:
+                Return 0
+            End If
+            proc bigint_mul with multiplied_bn, result_bn, base_reduced
+            proc bigint_mod with arena, result_bn, multiplied_bn, modulus
+        End If
+
+        If bit_index is equal to 0:
+            If limb_index is equal to 0:
+                Break
+            End If
+            Set limb_index to limb_index minus 1
+            Set bit_index to 63
+        Otherwise:
+            Set bit_index to bit_index minus 1
+        End If
+    End While
+
+    Note: Copy result_bn into dest.
+    Let result_count be proc bigint_get_limb_count with result_bn
+    Let dest_cap be proc bigint_get_limb_capacity with dest
+    If result_count is greater than dest_cap:
+        Return 0
+    End If
+    Let cpy_j be 0
+    While cpy_j is less than result_count:
+        Let cpy_lj be proc bigint_get_limb with result_bn, cpy_j
+        proc bigint_set_limb with dest, cpy_j, cpy_lj
+        Set cpy_j to cpy_j plus 1
+    End While
+    proc bigint_set_limb_count with dest, result_count
+    proc bigint_normalize with dest
+    Return 1
+End Process

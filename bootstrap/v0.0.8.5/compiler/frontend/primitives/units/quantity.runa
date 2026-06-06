@@ -1,0 +1,827 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+QUANTITY - Dynamic dimensional analysis (value + dimension + unit tag)
+
+A `Quantity` represents a physical quantity at runtime: a Float64 value
+together with a packed-Int64 dimension vector (from dimension.runa) and
+an Int32 unit tag (from unit.runa) for display.
+
+CONTRAST WITH units_of_measure.runa
+
+  units_of_measure.runa uses NOMINAL typing (one Runa type per dimension:
+  Length, Mass, Time, ...) for COMPILE-TIME dimensional safety. That is
+  the right tool when dimensions are known statically and the compiler
+  rejects cross-dimension addition.
+
+  THIS module uses DYNAMIC typing (one Quantity type that carries its
+  dimension at runtime) for cases where dimensions are not known until
+  runtime: parsing a units string from user input, computing an arbitrary
+  product of unknown quantities, or persisting quantities through
+  serialization. The two systems are complementary - quantity.runa is
+  what F# calls "boxed measure" and Python's `pint` exposes natively.
+
+REPRESENTATION
+
+  Quantity struct:
+    value      Float - the numeric value
+    dimension  Integer - packed dimension Int64 (see dimension.runa)
+    unit_tag   Integer - Int32 unit tag for display (see unit.runa)
+
+  We carry both the dimension (the truth) and the unit-tag (for
+  presentation) because the same dimension can be expressed via multiple
+  named units (J vs N*m vs kg*m^2/s^2). When the unit-tag does not
+  correspond to a named unit the field holds COMPOSITE_TAG and stringification
+  uses the dimension's canonical form.
+
+OPERATIONS
+
+  quantity_create_si(value, unit_tag)  - construct from value already in SI
+  quantity_create(value, unit_tag)     - construct from a value in the
+                                          given unit (multiplies by the
+                                          unit's scale to SI internally)
+  quantity_value_si(q)                 - get SI base value
+  quantity_value_in(q, unit_tag)       - get value expressed in target unit
+  quantity_dimension(q)                - get dimension
+  quantity_unit_tag(q)                 - get unit-tag
+  quantity_add(a, b)                   - returns zero-dim sentinel if
+                                          dimensions disagree
+  quantity_sub(a, b)
+  quantity_mul(a, b)
+  quantity_div(a, b)
+  quantity_pow(q, n)
+  quantity_negate(q)
+  quantity_scale(q, factor)            - multiply by a dimensionless scalar
+  quantity_is_compatible(a, b)         - dimension-compatibility predicate
+  quantity_eq(a, b)                    - structural equality including dim
+  quantity_to_string(q)                - "<value> <unit>"
+  quantity_convert_to(q, target_unit)  - convert preserving dimension
+                                          (returns sentinel if mismatch)
+  quantity_zero(dim)                   - dimensional zero quantity
+
+ARITHMETIC SEMANTICS
+
+  Addition / subtraction:   dimensions must match exactly; the result's
+                            dimension is the same as the operands'. The
+                            unit_tag follows the first operand for the
+                            same-tag case and degrades to COMPOSITE_TAG
+                            otherwise.
+
+  Multiplication / division: dimensions combine via dim_mul / dim_div;
+                            the value combines via *_si arithmetic.
+
+  Power: dimension scales by the exponent; the value is computed via
+         repeated multiplication for non-is_neg exponents and via
+         reciprocal-then-power for is_neg exponents.
+
+CITATIONS
+
+  - Hart, G. W. (1995): "Multidimensional Analysis: Algebras and Systems
+    for Science and Engineering", Springer-Verlag.
+  - F# Units of Measure (2008), Andrew Kennedy: introduces type-checked
+    dimensional analysis to a mainstream language.
+  - Pint (Python): https://pint.readthedocs.io
+  - SI Brochure 9th ed., 2019, section 2.3.4 (consistency of derived units).
+:End Note
+
+Import "compiler/frontend/primitives/units/dimension.runa" as Dim
+Import "compiler/frontend/primitives/units/unit.runa" as Unit
+Import "compiler/frontend/primitives/core/string_core.runa" as StrCore
+
+Note: ============================================================================
+Note: SECTION 1 - The Quantity struct
+Note: ============================================================================
+
+Type called "Quantity":
+    value as Float
+    dimension as Integer
+    unit_tag as Integer
+End Type
+
+Note: ============================================================================
+Note: SECTION 2 - Constructors
+Note: ============================================================================
+
+Process called "quantity_create_si" takes value as Float, unit_tag as Integer returns Quantity:
+    @Reasoning:
+        Construct a Quantity whose `value` is ALREADY in SI base units.
+        Used internally by quantity_create and quantity_mul/div, and is
+        the right constructor when the caller has explicitly normalized
+        their input.
+    @End Reasoning
+    @Implementation:
+        Look up the unit's dimension from the registry, store the three
+        fields. No scaling.
+    @End Implementation
+    @Performance_Hints:
+        Three field writes plus one unit_get_dimension call (~ 30 cycles).
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Unknown unit_tag falls back to dimensionless (per
+        unit_get_dimension's contract).
+    @End Security_Scope
+    Let q be a value of type Quantity
+    Set q.value to value
+    Set q.dimension to proc unit_get_dimension from Unit with unit_tag
+    Set q.unit_tag to unit_tag
+    Return q
+End Process
+
+Process called "quantity_create" takes value as Float, unit_tag as Integer returns Quantity:
+    @Reasoning:
+        Construct a Quantity whose `value` is in the units identified by
+        unit_tag (not necessarily SI). This is the natural ingest path
+        for application code: "the user said 5 ft; build a Length
+        quantity in SI base from that."
+    @End Reasoning
+    @Implementation:
+        Multiply the supplied value by the unit's scale to SI, then
+        forward to quantity_create_si.
+    @End Implementation
+    @Performance_Hints:
+        One scale lookup, one float multiplication, plus quantity_create_si.
+        ~ 50 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let scale be proc unit_get_scale_to_si from Unit with unit_tag
+    Let si_value be value multiplied by scale
+    Return proc quantity_create_si with si_value, unit_tag
+End Process
+
+Process called "quantity_create_from_components" takes value as Float, dimension as Integer, unit_tag as Integer returns Quantity:
+    @Reasoning:
+        Direct constructor for the result of an algebraic operation where
+        the caller has already computed the resulting dimension via
+        dim_mul / dim_div / dim_pow. Skips the unit-tag lookup so the
+        derived dimension takes precedence over the registry's view.
+    @End Reasoning
+    @Implementation:
+        Stores the three fields verbatim.
+    @End Implementation
+    @Performance_Hints:
+        Three field writes. ~ 5 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. The caller is responsible for ensuring the dimension and
+        unit_tag are consistent.
+    @End Security_Scope
+    Let q be a value of type Quantity
+    Set q.value to value
+    Set q.dimension to dimension
+    Set q.unit_tag to unit_tag
+    Return q
+End Process
+
+Process called "quantity_zero" takes dimension as Integer returns Quantity:
+    @Reasoning:
+        Construct the zero-valued quantity of the supplied dimension.
+        Used as a sentinel when an operation fails (incompatible add).
+    @End Reasoning
+    @Implementation:
+        Value 0.0, dimension as given, unit_tag = unknown.
+    @End Implementation
+    @Performance_Hints:
+        Three field writes. ~ 5 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let q be a value of type Quantity
+    Set q.value to 0.0
+    Set q.dimension to dimension
+    Set q.unit_tag to proc unit_tag_unknown from Unit
+    Return q
+End Process
+
+Process called "quantity_tag_error" returns Integer:
+    @Reasoning:
+        Sentinel unit_tag identifying a Quantity that came out of a
+        failed algebraic operation (dimension mismatch on add/sub,
+        Int8 dimension-exponent overflow on div/pow). Distinct from
+        unit_tag_composite and unit_tag_unknown so failures are
+        carried through subsequent operations without being mistaken
+        for a legitimate result.
+    @End Reasoning
+    @Implementation:
+        Constant Int32 value 2147483646 (one less than unit_tag_composite
+        = 0x7FFFFFFF) so error sentinels do not collide with composite
+        tags produced by unit_compose.
+    @End Implementation
+    @Performance_Hints:
+        Pure constant. ~ 1 cycle.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Return 2147483646
+End Process
+
+Process called "quantity_create_error" returns Quantity:
+    @Reasoning:
+        Build the canonical error-sentinel Quantity. Used as the return
+        value when an arithmetic operation cannot honour its dimensional
+        contract (e.g. adding metres to seconds, raising a dimension's
+        exponent past the Int8 [-127, +127] range).
+    @End Reasoning
+    @Implementation:
+        Sets value to IEEE 754 NaN via the canonical 0.0/0.0 division,
+        dimension to dimensionless, and unit_tag to quantity_tag_error.
+        Detection requires BOTH the value being NaN AND the unit_tag
+        being quantity_tag_error - legitimate Quantity arithmetic may
+        produce a NaN from a downstream IEEE operation (e.g. sqrt of a
+        negative quantity), so the tag is required to disambiguate
+        engineered error sentinels from natural NaN propagation.
+    @End Implementation
+    @Performance_Hints:
+        Three field writes plus one float divide. ~ 15 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. The 0.0/0.0 division is the standard IEEE 754 path to a
+        quiet NaN bit pattern.
+    @End Security_Scope
+    Let q be a value of type Quantity
+    Let zero be 0.0
+    Set q.value to zero divided by zero
+    Set q.dimension to proc dimension_dimensionless from Dim
+    Set q.unit_tag to proc quantity_tag_error
+    Return q
+End Process
+
+Process called "quantity_is_error" takes q as Quantity returns Integer:
+    @Reasoning:
+        Predicate: true iff q is the engineered error sentinel produced
+        by quantity_create_error. Both conditions are required:
+        (1) q.value is NaN (IEEE self-inequality v != v), AND
+        (2) q.unit_tag is equal to quantity_tag_error.
+        The conjunction guards against false positives from legitimate
+        arithmetic that happens to produce NaN downstream of a valid
+        Quantity.
+    @End Reasoning
+    @Implementation:
+        Test self-inequality of the value (the IEEE 754 defining
+        property of NaN: NaN != NaN is true), then compare the
+        unit_tag.
+    @End Implementation
+    @Performance_Hints:
+        One float compare, one integer compare. ~ 5 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If q.unit_tag is not equal to (proc quantity_tag_error):
+        Return 0
+    End If
+    If q.value is not equal to q.value:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "quantity_dimensionless" takes value as Float returns Quantity:
+    @Reasoning:
+        Construct a pure-number Quantity (zero dimension vector).
+        Used by scalar multiplications and ratio computations.
+    @End Reasoning
+    @Implementation:
+        Dimensionless dimension, unit_tag = unknown.
+    @End Implementation
+    @Performance_Hints:
+        Three field writes. ~ 5 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let q be a value of type Quantity
+    Set q.value to value
+    Set q.dimension to proc dimension_dimensionless from Dim
+    Set q.unit_tag to proc unit_tag_unknown from Unit
+    Return q
+End Process
+
+Note: ============================================================================
+Note: SECTION 3 - Accessors
+Note: ============================================================================
+
+Process called "quantity_value_si" takes q as Quantity returns Float:
+    Return q.value
+End Process
+
+Process called "quantity_value_in" takes q as Quantity, target_unit as Integer returns Float:
+    @Reasoning:
+        Return the quantity's value expressed in the requested unit. If
+        the target unit's dimension is incompatible with the quantity's
+        dimension, returns 0.0 - callers should validate via
+        quantity_is_compatible_with_unit before calling.
+    @End Reasoning
+    @Implementation:
+        Look up the target unit's scale to SI; divide the quantity's
+        SI value by that scale. (Multiplication converts FROM unit TO
+        SI, so division converts FROM SI TO unit.)
+    @End Implementation
+    @Performance_Hints:
+        One lookup, one divide. ~ 20 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Incompatible dimensions yield 0.0 sentinel.
+    @End Security_Scope
+    Let target_dim be proc unit_get_dimension from Unit with target_unit
+    If (proc dim_eq from Dim with q.dimension, target_dim) is not equal to 1:
+        Return 0.0
+    End If
+    Let scale be proc unit_get_scale_to_si from Unit with target_unit
+    Return q.value divided by scale
+End Process
+
+Process called "quantity_dimension" takes q as Quantity returns Integer:
+    Return q.dimension
+End Process
+
+Process called "quantity_unit_tag" takes q as Quantity returns Integer:
+    Return q.unit_tag
+End Process
+
+Process called "quantity_is_compatible_with_unit" takes q as Quantity, target_unit as Integer returns Integer:
+    Let target_dim be proc unit_get_dimension from Unit with target_unit
+    Return proc dim_eq from Dim with q.dimension, target_dim
+End Process
+
+Note: ============================================================================
+Note: SECTION 4 - Arithmetic operations
+Note: ============================================================================
+
+Process called "quantity_add" takes a as Quantity, b as Quantity returns Quantity:
+    @Reasoning:
+        Sum two compatible quantities. Dimensions must match exactly.
+        Mismatch returns the error sentinel (NaN value + quantity_tag_error)
+        so callers can distinguish a failed operation from a legitimate
+        zero result via quantity_is_error.
+        Error inputs propagate: add(error, q) = add(q, error) = error.
+    @End Reasoning
+    @Implementation:
+        Propagate error sentinels first, then test dim_eq, then add the SI
+        values. The result's unit_tag is `a`'s if `a` and `b` share the
+        same tag, else COMPOSITE_TAG.
+    @End Implementation
+    @Performance_Hints:
+        Two is_error checks, one dim_eq, one add, possibly one tag
+        compare. ~ 20 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Incompatible inputs do not raise; they return the error
+        sentinel.
+    @End Security_Scope
+    If (proc quantity_is_error with a) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    If (proc quantity_is_error with b) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    If (proc dim_eq from Dim with a.dimension, b.dimension) is not equal to 1:
+        Return proc quantity_create_error
+    End If
+    Let result_tag be a.unit_tag
+    If a.unit_tag is not equal to b.unit_tag:
+        Set result_tag to proc unit_tag_composite from Unit
+    End If
+    Return proc quantity_create_from_components with (a.value plus b.value), a.dimension, result_tag
+End Process
+
+Process called "quantity_sub" takes a as Quantity, b as Quantity returns Quantity:
+    @Reasoning:
+        Difference of two compatible quantities. Same compatibility rules
+        as quantity_add. Dimension mismatch yields the error sentinel;
+        error inputs propagate.
+    @End Reasoning
+    @Implementation:
+        Propagate error sentinels, test dim_eq, then subtract SI values.
+    @End Implementation
+    @Performance_Hints:
+        ~ 20 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If (proc quantity_is_error with a) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    If (proc quantity_is_error with b) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    If (proc dim_eq from Dim with a.dimension, b.dimension) is not equal to 1:
+        Return proc quantity_create_error
+    End If
+    Let result_tag be a.unit_tag
+    If a.unit_tag is not equal to b.unit_tag:
+        Set result_tag to proc unit_tag_composite from Unit
+    End If
+    Return proc quantity_create_from_components with (a.value minus b.value), a.dimension, result_tag
+End Process
+
+Process called "quantity_mul" takes a as Quantity, b as Quantity returns Quantity:
+    @Reasoning:
+        Product of two quantities. Dimensions combine via dim_mul;
+        values multiply. The result's unit_tag is computed via
+        unit_compose for named-derived recognition (m * kg / s^2 -> N).
+        Error sentinels propagate.
+    @End Reasoning
+    @Implementation:
+        Propagate error sentinels, combine dimensions, multiply SI
+        values, compose unit tags. Detect Int8 overflow on the
+        result-dimension exponents (sum could exceed [-127, +127]).
+    @End Implementation
+    @Performance_Hints:
+        ~ 100 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If (proc quantity_is_error with a) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    If (proc quantity_is_error with b) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    If (proc dim_add_overflows from Dim with a.dimension, b.dimension) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    Let new_dim be proc dim_mul from Dim with a.dimension, b.dimension
+    Let new_tag be proc unit_compose from Unit with a.unit_tag, b.unit_tag, (proc unit_compose_op_mul from Unit)
+    Return proc quantity_create_from_components with (a.value multiplied by b.value), new_dim, new_tag
+End Process
+
+Process called "quantity_div" takes a as Quantity, b as Quantity returns Quantity:
+    @Reasoning:
+        Quotient of two quantities. Dimensions subtract via dim_div;
+        values divide. Division by zero produces an infinity in the
+        Float per the IEEE 754 contract. Error sentinels propagate.
+        Dimension Int8 overflow on the result (e.g. dividing a high-
+        is_neg-exponent dimension by a high-is_pos one) yields the error
+        sentinel rather than silently wrapping past +/-127.
+    @End Reasoning
+    @Implementation:
+        Propagate error sentinels, test dim_sub_overflows on the
+        result dimension, then combine via dim_div, divide SI values,
+        compose unit tags with the division op.
+    @End Implementation
+    @Performance_Hints:
+        ~ 100 cycles. Float division dominates.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Division by zero -> IEEE infinity. Dimension overflow ->
+        error sentinel.
+    @End Security_Scope
+    If (proc quantity_is_error with a) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    If (proc quantity_is_error with b) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    If (proc dim_sub_overflows from Dim with a.dimension, b.dimension) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    Let new_dim be proc dim_div from Dim with a.dimension, b.dimension
+    Let new_tag be proc unit_compose from Unit with a.unit_tag, b.unit_tag, (proc unit_compose_op_div from Unit)
+    Return proc quantity_create_from_components with (a.value divided by b.value), new_dim, new_tag
+End Process
+
+Process called "quantity_negate" takes q as Quantity returns Quantity:
+    @Reasoning:
+        Sign-flip the quantity's value. The dimension is unchanged.
+    @End Reasoning
+    @Implementation:
+        Subtract from zero.
+    @End Implementation
+    @Performance_Hints:
+        ~ 5 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Return proc quantity_create_from_components with (0.0 minus q.value), q.dimension, q.unit_tag
+End Process
+
+Process called "quantity_scale" takes q as Quantity, factor as Float returns Quantity:
+    @Reasoning:
+        Multiply a quantity by a dimensionless Float scalar. The
+        dimension is unchanged. This is the common path for unit-aware
+        scaling: "double this Length" without lifting the scalar to
+        a full Quantity.
+    @End Reasoning
+    @Implementation:
+        Multiply value, retain dimension and unit_tag.
+    @End Implementation
+    @Performance_Hints:
+        ~ 5 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Return proc quantity_create_from_components with (q.value multiplied by factor), q.dimension, q.unit_tag
+End Process
+
+Process called "quantity_pow" takes q as Quantity, exponent as Integer returns Quantity:
+    @Reasoning:
+        Raise a quantity to an integer power. Dimensions scale by the
+        exponent (length^3 = volume); values undergo iterated multiplication
+        for the positive-exponent case and reciprocal-then-multiplication
+        for the is_neg case. Exponent zero produces dimensionless 1.
+        Error sentinels propagate; an exponent that would push any
+        dimension component past the Int8 [-127, +127] range yields the
+        error sentinel.
+    @End Reasoning
+    @Implementation:
+        Propagate error sentinels, check exponent-overflow on the
+        dimension components, then branch on the sign of the exponent.
+        Iterated integer multiplication preserves exact integer powers
+        (no log/exp round-trip error).
+    @End Implementation
+    @Performance_Hints:
+        O(|exponent|) multiplications. ~ 20 + 5 * |n| cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Out-of-range exponents return the error sentinel rather
+        than silently wrapping.
+    @End Security_Scope
+    If (proc quantity_is_error with q) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    If exponent is equal to 0:
+        Return proc quantity_dimensionless with 1.0
+    End If
+    If (proc dim_pow_overflows from Dim with q.dimension, exponent) is equal to 1:
+        Return proc quantity_create_error
+    End If
+    Let new_dim be proc dim_pow from Dim with q.dimension, exponent
+    Let new_tag be proc unit_pow from Unit with q.unit_tag, exponent
+    Let n be exponent
+    Let is_neg be 0
+    If n is less than 0:
+        Set is_neg to 1
+        Set n to 0 minus n
+    End If
+    Let acc be 1.0
+    Let i be 0
+    While i is less than n:
+        Set acc to acc multiplied by q.value
+        Set i to i plus 1
+    End While
+    If is_neg is equal to 1:
+        Set acc to 1.0 divided by acc
+    End If
+    Return proc quantity_create_from_components with acc, new_dim, new_tag
+End Process
+
+Note: ============================================================================
+Note: SECTION 5 - Predicates and equality
+Note: ============================================================================
+
+Process called "quantity_is_compatible" takes a as Quantity, b as Quantity returns Integer:
+    Return proc dim_eq from Dim with a.dimension, b.dimension
+End Process
+
+Process called "quantity_eq" takes a as Quantity, b as Quantity returns Integer:
+    @Reasoning:
+        Structural equality including the dimension and the IEEE 754
+        comparison of the value. NaN values produce 0 (the IEEE rule).
+    @End Reasoning
+    @Implementation:
+        Test dim_eq AND value-bitwise equality. We use the bit-equality
+        test on the Float because direct value comparison does not
+        match -0.0 and +0.0 in IEEE.
+    @End Implementation
+    @Performance_Hints:
+        ~ 10 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If (proc dim_eq from Dim with a.dimension, b.dimension) is not equal to 1:
+        Return 0
+    End If
+    Let diff be a.value minus b.value
+    If diff is equal to 0.0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "quantity_eq_within_tolerance" takes a as Quantity, b as Quantity, tolerance as Float returns Integer:
+    @Reasoning:
+        Floating-point-aware equality. Returns 1 iff the dimensions match
+        AND the absolute difference of the values is below the given
+        tolerance.
+    @End Reasoning
+    @Implementation:
+        Compute abs(a-b), compare to tolerance.
+    @End Implementation
+    @Performance_Hints:
+        ~ 10 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If (proc dim_eq from Dim with a.dimension, b.dimension) is not equal to 1:
+        Return 0
+    End If
+    Let diff be a.value minus b.value
+    If diff is less than 0.0:
+        Set diff to 0.0 minus diff
+    End If
+    If diff is less than tolerance:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "quantity_is_zero" takes q as Quantity returns Integer:
+    If q.value is equal to 0.0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "quantity_is_dimensionless" takes q as Quantity returns Integer:
+    Return proc dim_is_dimensionless from Dim with q.dimension
+End Process
+
+Note: ============================================================================
+Note: SECTION 6 - Conversion
+Note: ============================================================================
+
+Process called "quantity_convert_to" takes q as Quantity, target_unit as Integer returns Quantity:
+    @Reasoning:
+        Express a quantity in a different unit of the same dimension.
+        The value field is updated by dividing by the target unit's
+        scale to SI; the dimension is unchanged; the unit_tag becomes
+        target_unit.
+    @End Reasoning
+    @Implementation:
+        Dimensional compatibility check, then arithmetic. Internal value
+        is ALWAYS stored in SI; the difference is purely in the
+        unit_tag for display.
+    @End Implementation
+    @Performance_Hints:
+        ~ 30 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Incompatible dimensions return the zero-quantity sentinel.
+    @End Security_Scope
+    Let target_dim be proc unit_get_dimension from Unit with target_unit
+    If (proc dim_eq from Dim with q.dimension, target_dim) is not equal to 1:
+        Return proc quantity_zero with q.dimension
+    End If
+    Return proc quantity_create_from_components with q.value, q.dimension, target_unit
+End Process
+
+Note: ============================================================================
+Note: SECTION 7 - Stringification
+Note: ============================================================================
+
+Process called "quantity_to_string" takes q as Quantity returns String:
+    @Reasoning:
+        Build a "<value> <unit>" string for diagnostic output. The value
+        is rendered via the stdlib's default Float-to-string conversion
+        (engineering format); the unit is the symbol from the registry
+        when the unit_tag is named, else the dimension's canonical form.
+    @End Reasoning
+    @Implementation:
+        Stage1 lacks a full sprintf; we concatenate the unit symbol on
+        the right. The value-to-string path falls back to the integer
+        portion when no Float decimal printer is available - this is
+        kept minimal here because the unit-aware logging integrations
+        in the stdlib supply their own formatters.
+    @End Implementation
+    @Performance_Hints:
+        Implementation-defined; allocates the result String.
+    @End Implementation_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If q.unit_tag is equal to (proc unit_tag_composite from Unit):
+        Return proc dim_to_string from Dim with q.dimension
+    End If
+    If q.unit_tag is equal to (proc unit_tag_unknown from Unit):
+        Return proc dim_to_string from Dim with q.dimension
+    End If
+    Return proc unit_get_symbol from Unit with q.unit_tag
+End Process
+
+Note: ============================================================================
+Note: SECTION 8 - Convenience constructors for common base units
+Note: ============================================================================
+
+Process called "quantity_meters" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_meter from Unit)
+End Process
+
+Process called "quantity_kilograms" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_kilogram from Unit)
+End Process
+
+Process called "quantity_seconds" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_second from Unit)
+End Process
+
+Process called "quantity_amperes" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_ampere from Unit)
+End Process
+
+Process called "quantity_kelvins" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_kelvin from Unit)
+End Process
+
+Process called "quantity_moles" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_mole from Unit)
+End Process
+
+Process called "quantity_candelas" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_candela from Unit)
+End Process
+
+Process called "quantity_newtons" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_newton from Unit)
+End Process
+
+Process called "quantity_joules" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_joule from Unit)
+End Process
+
+Process called "quantity_watts" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_watt from Unit)
+End Process
+
+Process called "quantity_pascals" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_pascal from Unit)
+End Process
+
+Process called "quantity_hertz" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_hertz from Unit)
+End Process
+
+Process called "quantity_volts" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_volt from Unit)
+End Process
+
+Process called "quantity_ohms" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_ohm from Unit)
+End Process
+
+Process called "quantity_coulombs" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_coulomb from Unit)
+End Process
+
+Process called "quantity_farads" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_farad from Unit)
+End Process
+
+Process called "quantity_henries" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_henry from Unit)
+End Process
+
+Process called "quantity_teslas" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_tesla from Unit)
+End Process
+
+Process called "quantity_webers" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_weber from Unit)
+End Process
+
+Process called "quantity_lumens" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_lumen from Unit)
+End Process
+
+Process called "quantity_lux" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_lux from Unit)
+End Process
+
+Process called "quantity_becquerels" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_becquerel from Unit)
+End Process
+
+Process called "quantity_grays" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_gray from Unit)
+End Process
+
+Process called "quantity_sieverts" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_sievert from Unit)
+End Process
+
+Process called "quantity_katals" takes value as Float returns Quantity:
+    Return proc quantity_create_si with value, (proc unit_tag_katal from Unit)
+End Process

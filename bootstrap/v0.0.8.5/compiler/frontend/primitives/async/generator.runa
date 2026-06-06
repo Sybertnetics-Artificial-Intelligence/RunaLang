@@ -1,0 +1,183 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+GENERATOR<T> - Coroutine-style producer of values.
+
+A Generator wraps a producer function that yields values lazily. Each call
+to generator_next either produces the next value or signals exhaustion.
+
+This is implemented as a stack-resumable iterator backed by a channel and
+a producer thread. The producer thread pushes values into the channel;
+generator_next pulls from the channel.
+
+Generator layout (40 bytes):
+  offset 0:  channel_ptr   (8 bytes)
+  offset 8:  producer_fn   (8 bytes)
+  offset 16: producer_data (8 bytes)
+  offset 24: thread_id     (8 bytes)
+  offset 32: state         (8 bytes) (0=created, 1=running, 2=completed)
+
+Dependencies:
+- concurrency/channel.runa
+- threading/thread_core.runa
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/concurrency/channel.runa" as Chan
+Import "compiler/frontend/primitives/threading/thread_core.runa" as ThreadCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant GEN_OFF_CHANNEL as Integer is 0
+Constant GEN_OFF_PRODUCER as Integer is 8
+Constant GEN_OFF_DATA as Integer is 16
+Constant GEN_OFF_THREAD as Integer is 24
+Constant GEN_OFF_STATE as Integer is 32
+Constant GEN_STRUCT_SIZE as Integer is 40
+
+Constant GEN_STATE_CREATED as Integer is 0
+Constant GEN_STATE_RUNNING as Integer is 1
+Constant GEN_STATE_COMPLETED as Integer is 2
+
+Constant GEN_OK as Integer is 1
+Constant GEN_DONE as Integer is 0
+Constant GEN_ERR_INVALID as Integer is -1
+
+@Reasoning
+Create a generator that will produce values via the supplied producer
+function. The producer signature is takes (channel_ptr, data_ptr) returns Integer
+and is expected to channel_send values then channel_close at exhaustion.
+@End Reasoning
+
+@Implementation
+Allocate the generator, create a bounded channel (capacity 16 by default
+to provide backpressure), store the producer pointer + data.
+@End Implementation
+
+@Performance_Hints
+One alloc + one channel create.
+@End Performance_Hints
+
+@Security_Scope
+producer_fn must remain valid until generator_destroy.
+@End Security_Scope
+
+Process called "generator_create" takes producer_fn as Integer, producer_data as Integer returns Integer:
+    Let g be proc allocate from Memory with GEN_STRUCT_SIZE
+    If g is equal to 0:
+        Return 0
+    End If
+    Let ch be proc channel_create from Chan with 16
+    If ch is equal to 0:
+        proc deallocate from Memory with g
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with g, GEN_OFF_CHANNEL, ch
+    proc memory_set_int64 from Mem with g, GEN_OFF_PRODUCER, producer_fn
+    proc memory_set_int64 from Mem with g, GEN_OFF_DATA, producer_data
+    proc memory_set_int64 from Mem with g, GEN_OFF_THREAD, 0
+    proc memory_set_int64 from Mem with g, GEN_OFF_STATE, GEN_STATE_CREATED
+    Return g
+End Process
+
+@Reasoning
+Push a value into the generator's output channel. Called by the producer
+function from its own thread.
+@End Reasoning
+
+@Implementation
+Channel-send a value pointer.
+@End Implementation
+
+@Performance_Hints
+One channel send.
+@End Performance_Hints
+
+@Security_Scope
+Called from the producer side.
+@End Security_Scope
+
+Process called "generator_yield" takes g as Integer, value_ptr as Integer returns Integer:
+    If g is equal to 0:
+        Return GEN_ERR_INVALID
+    End If
+    Let ch be proc memory_get_int64 from Mem with g, GEN_OFF_CHANNEL
+    Return proc channel_send from Chan with ch, value_ptr
+End Process
+
+@Reasoning
+Producer signals completion. Closes the channel so generator_next returns
+GEN_DONE.
+@End Reasoning
+
+@Implementation
+Channel-close the output channel and mark generator as completed.
+@End Implementation
+
+@Performance_Hints
+One channel close.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "generator_complete" takes g as Integer returns Integer:
+    If g is equal to 0:
+        Return GEN_ERR_INVALID
+    End If
+    Let ch be proc memory_get_int64 from Mem with g, GEN_OFF_CHANNEL
+    proc channel_close from Chan with ch
+    proc memory_set_int64 from Mem with g, GEN_OFF_STATE, GEN_STATE_COMPLETED
+    Return GEN_OK
+End Process
+
+@Reasoning
+Consumer pulls the next value. Blocks until the producer yields or
+completes.
+@End Reasoning
+
+@Implementation
+Channel-receive from the output channel. Translate channel return code
+into GEN_OK / GEN_DONE.
+@End Implementation
+
+@Performance_Hints
+One channel receive.
+@End Performance_Hints
+
+@Security_Scope
+out_value_holder must point to writable 8-byte storage.
+@End Security_Scope
+
+Process called "generator_next" takes g as Integer, out_value_holder as Integer returns Integer:
+    If g is equal to 0:
+        Return GEN_ERR_INVALID
+    End If
+    If out_value_holder is equal to 0:
+        Return GEN_ERR_INVALID
+    End If
+    Let ch be proc memory_get_int64 from Mem with g, GEN_OFF_CHANNEL
+    Let rc be proc channel_receive from Chan with ch, out_value_holder
+    If rc is equal to 1:
+        Return GEN_OK
+    End If
+    proc memory_set_int64 from Mem with out_value_holder, 0, 0
+    Return GEN_DONE
+End Process
+
+Process called "generator_destroy" takes g as Integer returns Integer:
+    If g is equal to 0:
+        Return GEN_ERR_INVALID
+    End If
+    Let ch be proc memory_get_int64 from Mem with g, GEN_OFF_CHANNEL
+    If ch is not equal to 0:
+        proc channel_close from Chan with ch
+        proc channel_destroy from Chan with ch
+    End If
+    proc deallocate from Memory with g
+    Return GEN_OK
+End Process

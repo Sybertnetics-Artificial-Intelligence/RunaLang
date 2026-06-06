@@ -1,0 +1,1545 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+SELECTOR - CSS Selector AST + Parser + Specificity calculator (Tier 1)
+==============================================================================
+
+Implements the Selector substrate per the W3C CSS Selectors Level 4
+specification (https://www.w3.org/TR/selectors-4/).  The AST covers:
+
+  - Universal selector              *
+  - Type selector                   div
+  - Class selector                  .name
+  - ID selector                     #name
+  - Attribute selector              [attr], [attr=val], [attr~=val],
+                                    [attr|=val], [attr^=val],
+                                    [attr$=val], [attr*=val]
+  - Pseudo-class                    :hover, :nth-child(2n+1), ...
+  - Pseudo-element                  ::before, ::after, ...
+  - Compound selector               (.foo.bar)
+  - Complex selector                (.foo > .bar + .baz)
+  - Selector list                   (.foo, .bar)
+
+Combinators (W3C Selectors 4 section 5):
+  COMBINATOR_DESCENDANT       0   space
+  COMBINATOR_CHILD            1   '>'
+  COMBINATOR_ADJACENT_SIB     2   '+'
+  COMBINATOR_GENERAL_SIB      3   '~'
+  COMBINATOR_COLUMN           4   '||'
+
+Selector node layout (40-byte tagged record):
+  off  0  kind tag      SEL_KIND_*
+  off  8  primary str   (NUL-terminated) - tag name / class / id / attr
+                        name / pseudo name
+  off 16  secondary str (NUL-terminated) - attr value / pseudo argument
+  off 24  attr op       ATTR_OP_*   (only meaningful for attribute selectors)
+  off 32  child list    List of selector nodes (compound parts /
+                        complex sequence / list members)
+
+Attribute operators (CSS Selectors 4 section 6.2):
+  ATTR_OP_PRESENT   0    [attr]
+  ATTR_OP_EQ        1    [attr=value]
+  ATTR_OP_INCLUDES  2    [attr~=value]
+  ATTR_OP_DASHMATCH 3    [attr|=value]
+  ATTR_OP_PREFIX    4    [attr^=value]
+  ATTR_OP_SUFFIX    5    [attr$=value]
+  ATTR_OP_SUBSTR    6    [attr*=value]
+
+For a complex selector, the children list is laid out as
+[ piece, combinator-record, piece, combinator-record, piece, ... ] where
+the combinator-record is itself a selector node of kind SEL_KIND_COMBINATOR
+with attr_op storing the combinator id.
+
+Specificity (CSS Selectors 4 section 17):
+  selector_specificity returns three integers packed in a 24-byte buffer:
+    off  0  a   (id count)
+    off  8  b   (class / attribute / pseudo-class count)
+    off 16  c   (type / pseudo-element count)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Note: ============================================================================
+Note: TAG CONSTANTS
+Note: ============================================================================
+
+Constant SEL_KIND_UNIVERSAL as Integer is 1
+Constant SEL_KIND_TYPE as Integer is 2
+Constant SEL_KIND_CLASS as Integer is 3
+Constant SEL_KIND_ID as Integer is 4
+Constant SEL_KIND_ATTRIBUTE as Integer is 5
+Constant SEL_KIND_PSEUDO_CLASS as Integer is 6
+Constant SEL_KIND_PSEUDO_ELEMENT as Integer is 7
+Constant SEL_KIND_COMPOUND as Integer is 8
+Constant SEL_KIND_COMPLEX as Integer is 9
+Constant SEL_KIND_LIST as Integer is 10
+Constant SEL_KIND_COMBINATOR as Integer is 11
+
+Constant COMBINATOR_DESCENDANT as Integer is 0
+Constant COMBINATOR_CHILD as Integer is 1
+Constant COMBINATOR_ADJACENT_SIB as Integer is 2
+Constant COMBINATOR_GENERAL_SIB as Integer is 3
+Constant COMBINATOR_COLUMN as Integer is 4
+
+Constant ATTR_OP_PRESENT as Integer is 0
+Constant ATTR_OP_EQ as Integer is 1
+Constant ATTR_OP_INCLUDES as Integer is 2
+Constant ATTR_OP_DASHMATCH as Integer is 3
+Constant ATTR_OP_PREFIX as Integer is 4
+Constant ATTR_OP_SUFFIX as Integer is 5
+Constant ATTR_OP_SUBSTR as Integer is 6
+
+Constant SEL_RECORD_SIZE as Integer is 40
+Constant SEL_OFF_KIND as Integer is 0
+Constant SEL_OFF_PRIMARY as Integer is 8
+Constant SEL_OFF_SECONDARY as Integer is 16
+Constant SEL_OFF_ATTR_OP as Integer is 24
+Constant SEL_OFF_CHILDREN as Integer is 32
+
+Constant SEL_OK as Integer is 0
+Constant SEL_NULL as Integer is -1
+Constant SEL_PARSE_FAIL as Integer is -2
+
+Constant ASCII_SPACE as Integer is 32
+Constant ASCII_TAB as Integer is 9
+Constant ASCII_NEWLINE as Integer is 10
+Constant ASCII_DOT as Integer is 46
+Constant ASCII_HASH as Integer is 35
+Constant ASCII_LBRACKET as Integer is 91
+Constant ASCII_RBRACKET as Integer is 93
+Constant ASCII_LPAREN as Integer is 40
+Constant ASCII_RPAREN as Integer is 41
+Constant ASCII_COLON as Integer is 58
+Constant ASCII_GT as Integer is 62
+Constant ASCII_PLUS as Integer is 43
+Constant ASCII_TILDE as Integer is 126
+Constant ASCII_PIPE as Integer is 124
+Constant ASCII_STAR as Integer is 42
+Constant ASCII_EQ as Integer is 61
+Constant ASCII_CARET as Integer is 94
+Constant ASCII_DOLLAR as Integer is 36
+Constant ASCII_QUOTE as Integer is 34
+Constant ASCII_APOS as Integer is 39
+Constant ASCII_BACKSLASH as Integer is 92
+Constant ASCII_COMMA as Integer is 44
+Constant ASCII_UNDERSCORE as Integer is 95
+Constant ASCII_DASH as Integer is 45
+
+Note: ============================================================================
+Note: RECORD ALLOCATION
+Note: ============================================================================
+
+@Reasoning
+Allocate a tagged 40-byte selector record with all slots initialized.
+@End Reasoning
+@Implementation
+Layout.allocate; zero attr_op and children slots by default.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "sel_alloc" takes kind as Integer, primary as Integer, secondary as Integer returns Integer:
+    Let rec be proc allocate from Layout with SEL_RECORD_SIZE
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, SEL_OFF_KIND, kind
+    proc memory_set_int64 from Memory with rec, SEL_OFF_PRIMARY, primary
+    proc memory_set_int64 from Memory with rec, SEL_OFF_SECONDARY, secondary
+    proc memory_set_int64 from Memory with rec, SEL_OFF_ATTR_OP, 0
+    proc memory_set_int64 from Memory with rec, SEL_OFF_CHILDREN, 0
+    Return rec
+End Process
+
+Note: ============================================================================
+Note: PUBLIC CONSTRUCTORS
+Note: ============================================================================
+
+@Reasoning
+Construct the universal selector '*'.
+@End Reasoning
+@Implementation
+sel_alloc with SEL_KIND_UNIVERSAL.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "selector_universal" returns Integer:
+    Return proc sel_alloc with SEL_KIND_UNIVERSAL, 0, 0
+End Process
+
+@Reasoning
+Construct a type selector matching a specific tag name per CSS
+Selectors 4 section 5.1.
+@End Reasoning
+@Implementation
+sel_alloc with SEL_KIND_TYPE.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned tag name.
+@End Security_Scope
+Process called "selector_type" takes tag_name as Integer returns Integer:
+    Return proc sel_alloc with SEL_KIND_TYPE, tag_name, 0
+End Process
+
+@Reasoning
+Construct a class selector '.name' per CSS Selectors 4 section 6.6.
+@End Reasoning
+@Implementation
+sel_alloc with SEL_KIND_CLASS.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned class name.
+@End Security_Scope
+Process called "selector_class" takes class_name as Integer returns Integer:
+    Return proc sel_alloc with SEL_KIND_CLASS, class_name, 0
+End Process
+
+@Reasoning
+Construct an ID selector '#name' per CSS Selectors 4 section 6.7.
+@End Reasoning
+@Implementation
+sel_alloc with SEL_KIND_ID.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned ID name.
+@End Security_Scope
+Process called "selector_id" takes id_name as Integer returns Integer:
+    Return proc sel_alloc with SEL_KIND_ID, id_name, 0
+End Process
+
+@Reasoning
+Construct an attribute selector per CSS Selectors 4 section 6.2.
+@End Reasoning
+@Implementation
+sel_alloc + write attribute operator.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned attribute name and value.
+@End Security_Scope
+Process called "selector_attribute" takes attr_name as Integer, value as Integer, op as Integer returns Integer:
+    Let rec be proc sel_alloc with SEL_KIND_ATTRIBUTE, attr_name, value
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, SEL_OFF_ATTR_OP, op
+    Return rec
+End Process
+
+@Reasoning
+Construct a pseudo-class ':name' per CSS Selectors 4 section 8.  Argument
+may be 0 for argument-less pseudo-classes (':hover'), or a duplicated
+string for parameterised pseudo-classes (':nth-child(2n+1)').
+@End Reasoning
+@Implementation
+sel_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned name and argument.
+@End Security_Scope
+Process called "selector_pseudo_class" takes name as Integer, argument as Integer returns Integer:
+    Return proc sel_alloc with SEL_KIND_PSEUDO_CLASS, name, argument
+End Process
+
+@Reasoning
+Construct a pseudo-element '::name' per CSS Selectors 4 section 3.7.
+@End Reasoning
+@Implementation
+sel_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned name.
+@End Security_Scope
+Process called "selector_pseudo_element" takes name as Integer returns Integer:
+    Return proc sel_alloc with SEL_KIND_PSEUDO_ELEMENT, name, 0
+End Process
+
+@Reasoning
+Construct a compound selector: a sequence of simple selectors that all
+apply to the same element (CSS Selectors 4 section 11).
+@End Reasoning
+@Implementation
+sel_alloc + write child list.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned child list.
+@End Security_Scope
+Process called "selector_compound" takes children_list as Integer returns Integer:
+    Let rec be proc sel_alloc with SEL_KIND_COMPOUND, 0, 0
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, SEL_OFF_CHILDREN, children_list
+    Return rec
+End Process
+
+@Reasoning
+Construct a complex selector: a sequence of compound selectors connected
+by combinators (CSS Selectors 4 section 12).  children_list contains
+alternating compound and combinator records.
+@End Reasoning
+@Implementation
+sel_alloc + write child list.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned child list.
+@End Security_Scope
+Process called "selector_complex" takes children_list as Integer returns Integer:
+    Let rec be proc sel_alloc with SEL_KIND_COMPLEX, 0, 0
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, SEL_OFF_CHILDREN, children_list
+    Return rec
+End Process
+
+@Reasoning
+Construct a selector list: comma-separated alternatives that share the
+same declaration block (CSS Selectors 4 section 5.2).
+@End Reasoning
+@Implementation
+sel_alloc + write child list.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned child list.
+@End Security_Scope
+Process called "selector_list_create" takes children_list as Integer returns Integer:
+    Let rec be proc sel_alloc with SEL_KIND_LIST, 0, 0
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, SEL_OFF_CHILDREN, children_list
+    Return rec
+End Process
+
+@Reasoning
+Construct a combinator marker record.  combinator_id is one of
+COMBINATOR_* constants.  Used inside complex selectors between compound
+pieces.
+@End Reasoning
+@Implementation
+sel_alloc with SEL_KIND_COMBINATOR; attr_op slot reused to store the
+combinator id since combinators have no other state.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "selector_combinator" takes combinator_id as Integer returns Integer:
+    Let rec be proc sel_alloc with SEL_KIND_COMBINATOR, 0, 0
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, SEL_OFF_ATTR_OP, combinator_id
+    Return rec
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS
+Note: ============================================================================
+
+Process called "selector_kind" takes sel as Integer returns Integer:
+    If sel is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with sel, SEL_OFF_KIND
+End Process
+
+Process called "selector_primary" takes sel as Integer returns Integer:
+    If sel is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with sel, SEL_OFF_PRIMARY
+End Process
+
+Process called "selector_secondary" takes sel as Integer returns Integer:
+    If sel is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with sel, SEL_OFF_SECONDARY
+End Process
+
+Process called "selector_attr_op" takes sel as Integer returns Integer:
+    If sel is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with sel, SEL_OFF_ATTR_OP
+End Process
+
+Process called "selector_children" takes sel as Integer returns Integer:
+    If sel is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with sel, SEL_OFF_CHILDREN
+End Process
+
+Process called "selector_combinator_id" takes sel as Integer returns Integer:
+    If sel is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with sel, SEL_OFF_ATTR_OP
+End Process
+
+Note: ============================================================================
+Note: DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Recursively destroy a selector node.  Releases owned strings and
+children list.
+@End Reasoning
+@Implementation
+Walk children destroying each recursively; free strings owned per kind.
+@End Implementation
+@Performance_Hints
+O(subtree size).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "selector_destroy" takes sel as Integer returns Integer:
+    If sel is equal to 0:
+        Return SEL_OK
+    End If
+    Let kind be proc memory_get_int64 from Memory with sel, SEL_OFF_KIND
+    Let primary be proc memory_get_int64 from Memory with sel, SEL_OFF_PRIMARY
+    Let secondary be proc memory_get_int64 from Memory with sel, SEL_OFF_SECONDARY
+    Let children be proc memory_get_int64 from Memory with sel, SEL_OFF_CHILDREN
+
+    If children is not equal to 0:
+        Let cc be proc list_length from List with children
+        Let i be 0
+        While i is less than cc:
+            Let c be proc list_get from List with children, i
+            proc selector_destroy with c
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with children
+    End If
+
+    Let owns_primary be 0
+    If kind is equal to SEL_KIND_TYPE:
+        Set owns_primary to 1
+    End If
+    If kind is equal to SEL_KIND_CLASS:
+        Set owns_primary to 1
+    End If
+    If kind is equal to SEL_KIND_ID:
+        Set owns_primary to 1
+    End If
+    If kind is equal to SEL_KIND_ATTRIBUTE:
+        Set owns_primary to 1
+    End If
+    If kind is equal to SEL_KIND_PSEUDO_CLASS:
+        Set owns_primary to 1
+    End If
+    If kind is equal to SEL_KIND_PSEUDO_ELEMENT:
+        Set owns_primary to 1
+    End If
+    If owns_primary is equal to 1:
+        If primary is not equal to 0:
+            proc deallocate from Layout with primary
+        End If
+    End If
+    Let owns_secondary be 0
+    If kind is equal to SEL_KIND_ATTRIBUTE:
+        Set owns_secondary to 1
+    End If
+    If kind is equal to SEL_KIND_PSEUDO_CLASS:
+        Set owns_secondary to 1
+    End If
+    If owns_secondary is equal to 1:
+        If secondary is not equal to 0:
+            proc deallocate from Layout with secondary
+        End If
+    End If
+
+    proc deallocate from Layout with sel
+    Return SEL_OK
+End Process
+
+Note: ============================================================================
+Note: SPECIFICITY
+Note: ============================================================================
+
+@Reasoning
+Compute selector specificity per CSS Selectors 4 section 17.
+
+  - a (ID count):                    +1 per ID selector
+  - b (class/attr/pseudo-class):     +1 per class selector, attribute
+                                      selector, or pseudo-class
+  - c (type/pseudo-element):         +1 per type selector or pseudo-
+                                      element
+
+The universal selector contributes 0 in every column.  Returns a
+24-byte heap buffer the caller owns (slots 0/8/16 = a/b/c).
+@End Reasoning
+@Implementation
+Allocate a 24-byte buffer.  Recursive walker accumulates counters.
+@End Implementation
+@Performance_Hints
+O(subtree size).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "selector_specificity" takes sel as Integer returns Integer:
+    Let buf be proc allocate from Layout with 24
+    If buf is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with buf, 0, 0
+    proc memory_set_int64 from Memory with buf, 8, 0
+    proc memory_set_int64 from Memory with buf, 16, 0
+    proc selector_specificity_accumulate with sel, buf
+    Return buf
+End Process
+
+@Reasoning
+Walk the selector subtree adding to the running specificity counters in
+buf.  Internal recursion target for selector_specificity.
+@End Reasoning
+@Implementation
+Switch on kind; aggregate.  Compound/Complex/List recurse into children.
+@End Implementation
+@Performance_Hints
+O(subtree size).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "selector_specificity_accumulate" takes sel as Integer, buf as Integer returns Integer:
+    If sel is equal to 0:
+        Return SEL_OK
+    End If
+    Let kind be proc memory_get_int64 from Memory with sel, SEL_OFF_KIND
+    Let a be proc memory_get_int64 from Memory with buf, 0
+    Let b be proc memory_get_int64 from Memory with buf, 8
+    Let c be proc memory_get_int64 from Memory with buf, 16
+
+    If kind is equal to SEL_KIND_ID:
+        Set a to a plus 1
+    End If
+    If kind is equal to SEL_KIND_CLASS:
+        Set b to b plus 1
+    End If
+    If kind is equal to SEL_KIND_ATTRIBUTE:
+        Set b to b plus 1
+    End If
+    If kind is equal to SEL_KIND_PSEUDO_CLASS:
+        Set b to b plus 1
+    End If
+    If kind is equal to SEL_KIND_TYPE:
+        Set c to c plus 1
+    End If
+    If kind is equal to SEL_KIND_PSEUDO_ELEMENT:
+        Set c to c plus 1
+    End If
+
+    proc memory_set_int64 from Memory with buf, 0, a
+    proc memory_set_int64 from Memory with buf, 8, b
+    proc memory_set_int64 from Memory with buf, 16, c
+
+    If kind is equal to SEL_KIND_COMPOUND:
+        Let children be proc memory_get_int64 from Memory with sel, SEL_OFF_CHILDREN
+        If children is not equal to 0:
+            Let cc be proc list_length from List with children
+            Let i be 0
+            While i is less than cc:
+                Let ch be proc list_get from List with children, i
+                proc selector_specificity_accumulate with ch, buf
+                Set i to i plus 1
+            End While
+        End If
+    End If
+    If kind is equal to SEL_KIND_COMPLEX:
+        Let children2 be proc memory_get_int64 from Memory with sel, SEL_OFF_CHILDREN
+        If children2 is not equal to 0:
+            Let cc2 be proc list_length from List with children2
+            Let j be 0
+            While j is less than cc2:
+                Let ch2 be proc list_get from List with children2, j
+                proc selector_specificity_accumulate with ch2, buf
+                Set j to j plus 1
+            End While
+        End If
+    End If
+    Return SEL_OK
+End Process
+
+@Reasoning
+Read the 'a' (ID count) component of a specificity buffer.
+@End Reasoning
+@Implementation
+Load at offset 0.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "specificity_a" takes buf as Integer returns Integer:
+    If buf is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with buf, 0
+End Process
+
+@Reasoning
+Read the 'b' component.
+@End Reasoning
+@Implementation
+Load at offset 8.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "specificity_b" takes buf as Integer returns Integer:
+    If buf is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with buf, 8
+End Process
+
+@Reasoning
+Read the 'c' component.
+@End Reasoning
+@Implementation
+Load at offset 16.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "specificity_c" takes buf as Integer returns Integer:
+    If buf is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with buf, 16
+End Process
+
+@Reasoning
+Free a specificity buffer.
+@End Reasoning
+@Implementation
+Layout.deallocate.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "specificity_destroy" takes buf as Integer returns Integer:
+    If buf is equal to 0:
+        Return SEL_OK
+    End If
+    proc deallocate from Layout with buf
+    Return SEL_OK
+End Process
+
+@Reasoning
+Compare two specificity buffers per CSS Selectors 4 section 17: order
+first by a, then by b, then by c.  Returns -1, 0, or 1.
+@End Reasoning
+@Implementation
+Three-way lexicographic compare.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "specificity_compare" takes lhs as Integer, rhs as Integer returns Integer:
+    Let la be proc specificity_a with lhs
+    Let lb be proc specificity_b with lhs
+    Let lc be proc specificity_c with lhs
+    Let ra be proc specificity_a with rhs
+    Let rb be proc specificity_b with rhs
+    Let rc be proc specificity_c with rhs
+    If la is less than ra:
+        Return -1
+    End If
+    If la is greater than ra:
+        Return 1
+    End If
+    If lb is less than rb:
+        Return -1
+    End If
+    If lb is greater than rb:
+        Return 1
+    End If
+    If lc is less than rc:
+        Return -1
+    End If
+    If lc is greater than rc:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PARSER HELPERS
+Note: ============================================================================
+
+@Reasoning
+Skip ASCII whitespace at and after pos in text; return new offset.
+@End Reasoning
+@Implementation
+Linear scan.
+@End Implementation
+@Performance_Hints
+O(ws length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sel_skip_ws" takes text as Integer, pos as Integer, len as Integer returns Integer:
+    Let p be pos
+    While p is less than len:
+        Let b be proc string_char_at from StringCore with text, p
+        Let is_ws be 0
+        If b is equal to ASCII_SPACE:
+            Set is_ws to 1
+        End If
+        If b is equal to ASCII_TAB:
+            Set is_ws to 1
+        End If
+        If b is equal to ASCII_NEWLINE:
+            Set is_ws to 1
+        End If
+        If is_ws is equal to 0:
+            Set p to len plus 1
+        End If
+        If is_ws is equal to 1:
+            Set p to p plus 1
+        End If
+    End While
+    If p is greater than len:
+        Set p to p minus 1
+    End If
+    Return p
+End Process
+
+@Reasoning
+Read a CSS identifier per CSS Syntax Level 3 section 4.1.  Identifiers
+start with letter, underscore, hyphen-and-non-digit, or hyphen-hyphen,
+and continue with letters, digits, underscores, hyphens (this primitive
+covers the ASCII subset; full CSS escape handling is out of scope here).
+Returns end offset; the caller substrings [pos, end).
+@End Reasoning
+@Implementation
+Linear scan.
+@End Implementation
+@Performance_Hints
+O(ident length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sel_read_ident_end" takes text as Integer, pos as Integer, len as Integer returns Integer:
+    Let p be pos
+    While p is less than len:
+        Let b be proc string_char_at from StringCore with text, p
+        Let ok be 0
+        Let is_letter be proc is_alpha from Char with b
+        If is_letter is equal to 1:
+            Set ok to 1
+        End If
+        Let is_digit be proc is_digit from Char with b
+        If is_digit is equal to 1:
+            Set ok to 1
+        End If
+        If b is equal to ASCII_UNDERSCORE:
+            Set ok to 1
+        End If
+        If b is equal to ASCII_DASH:
+            Set ok to 1
+        End If
+        If ok is equal to 0:
+            Return p
+        End If
+        Set p to p plus 1
+    End While
+    Return p
+End Process
+
+@Reasoning
+Read a quoted string literal (single or double quoted).  Returns the
+offset just past the closing quote and writes the duplicated body string
+into the slot pointed at by out_string_slot.  Backslash escapes pass
+through verbatim for now (full CSS escape unescaping is out of scope).
+Returns -1 on unterminated literal.
+@End Reasoning
+@Implementation
+Walk to matching quote, allocate substring body.
+@End Implementation
+@Performance_Hints
+O(string length).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "sel_read_string" takes text as Integer, pos as Integer, len as Integer, out_string_slot as Integer returns Integer:
+    If pos is greater than or equal to len:
+        Return -1
+    End If
+    Let quote be proc string_char_at from StringCore with text, pos
+    If quote is not equal to ASCII_QUOTE:
+        If quote is not equal to ASCII_APOS:
+            Return -1
+        End If
+    End If
+    Let start be pos plus 1
+    Let p be start
+    While p is less than len:
+        Let b be proc string_char_at from StringCore with text, p
+        If b is equal to ASCII_BACKSLASH:
+            Set p to p plus 2
+        End If
+        If b is not equal to ASCII_BACKSLASH:
+            If b is equal to quote:
+                Let body be proc string_substring from StringPrim with text, start, p minus start
+                proc memory_set_int64 from Memory with out_string_slot, 0, body
+                Return p plus 1
+            End If
+            Set p to p plus 1
+        End If
+    End While
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: PARSER (single-compound + complex with combinators + list)
+Note: ============================================================================
+
+@Reasoning
+Parse one simple selector starting at pos.  Returns end offset on
+success and writes the new selector node pointer into out_slot, or
+returns -1 on failure.  Recognises:
+
+  *                       (universal)
+  tag                     (type)
+  .name / #name           (class / id)
+  [attr], [attr op value] (attribute)
+  ::name                  (pseudo-element)
+  :name(arg)              (pseudo-class, optionally with argument)
+@End Reasoning
+@Implementation
+Look at the next byte and dispatch.  String literals inside attribute
+values are read with sel_read_string.
+@End Implementation
+@Performance_Hints
+O(token length).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "sel_parse_simple" takes text as Integer, pos as Integer, len as Integer, out_slot as Integer returns Integer:
+    If pos is greater than or equal to len:
+        Return -1
+    End If
+    Let c be proc string_char_at from StringCore with text, pos
+    If c is equal to ASCII_STAR:
+        Let n be proc selector_universal
+        proc memory_set_int64 from Memory with out_slot, 0, n
+        Return pos plus 1
+    End If
+    If c is equal to ASCII_DOT:
+        Let name_end be proc sel_read_ident_end with text, pos plus 1, len
+        If name_end is equal to (pos plus 1):
+            Return -1
+        End If
+        Let name be proc string_substring from StringPrim with text, pos plus 1, name_end minus (pos plus 1)
+        Let n2 be proc selector_class with name
+        proc memory_set_int64 from Memory with out_slot, 0, n2
+        Return name_end
+    End If
+    If c is equal to ASCII_HASH:
+        Let name_end2 be proc sel_read_ident_end with text, pos plus 1, len
+        If name_end2 is equal to (pos plus 1):
+            Return -1
+        End If
+        Let name2 be proc string_substring from StringPrim with text, pos plus 1, name_end2 minus (pos plus 1)
+        Let n3 be proc selector_id with name2
+        proc memory_set_int64 from Memory with out_slot, 0, n3
+        Return name_end2
+    End If
+    If c is equal to ASCII_LBRACKET:
+        Return proc sel_parse_attribute with text, pos, len, out_slot
+    End If
+    If c is equal to ASCII_COLON:
+        Note: Could be pseudo-element (::) or pseudo-class (:).
+        If (pos plus 1) is less than len:
+            Let nc be proc string_char_at from StringCore with text, pos plus 1
+            If nc is equal to ASCII_COLON:
+                Let pe_end be proc sel_read_ident_end with text, pos plus 2, len
+                If pe_end is equal to (pos plus 2):
+                    Return -1
+                End If
+                Let pe_name be proc string_substring from StringPrim with text, pos plus 2, pe_end minus (pos plus 2)
+                Let n4 be proc selector_pseudo_element with pe_name
+                proc memory_set_int64 from Memory with out_slot, 0, n4
+                Return pe_end
+            End If
+            If nc is not equal to ASCII_COLON:
+                Let pc_end be proc sel_read_ident_end with text, pos plus 1, len
+                If pc_end is equal to (pos plus 1):
+                    Return -1
+                End If
+                Let pc_name be proc string_substring from StringPrim with text, pos plus 1, pc_end minus (pos plus 1)
+                Let arg_str be 0
+                If pc_end is less than len:
+                    Let nb be proc string_char_at from StringCore with text, pc_end
+                    If nb is equal to ASCII_LPAREN:
+                        Let arg_start be pc_end plus 1
+                        Let arg_scan be arg_start
+                        Let depth be 1
+                        While arg_scan is less than len:
+                            Let ab be proc string_char_at from StringCore with text, arg_scan
+                            If ab is equal to ASCII_LPAREN:
+                                Set depth to depth plus 1
+                            End If
+                            If ab is equal to ASCII_RPAREN:
+                                Set depth to depth minus 1
+                                If depth is equal to 0:
+                                    Set arg_str to (proc string_substring from StringPrim with text, arg_start, arg_scan minus arg_start)
+                                    Set pc_end to arg_scan plus 1
+                                    Set arg_scan to len
+                                End If
+                            End If
+                            If depth is not equal to 0:
+                                Set arg_scan to arg_scan plus 1
+                            End If
+                        End While
+                        If arg_str is equal to 0:
+                            Return -1
+                        End If
+                    End If
+                End If
+                Let n5 be proc selector_pseudo_class with pc_name, arg_str
+                proc memory_set_int64 from Memory with out_slot, 0, n5
+                Return pc_end
+            End If
+        End If
+    End If
+    Note: Type selector (tag name).
+    Let is_letter be proc is_alpha from Char with c
+    If is_letter is equal to 1:
+        Let tag_end be proc sel_read_ident_end with text, pos, len
+        Let tag_name be proc string_substring from StringPrim with text, pos, tag_end minus pos
+        Let n6 be proc selector_type with tag_name
+        proc memory_set_int64 from Memory with out_slot, 0, n6
+        Return tag_end
+    End If
+    If c is equal to ASCII_UNDERSCORE:
+        Let tag_end2 be proc sel_read_ident_end with text, pos, len
+        Let tag_name2 be proc string_substring from StringPrim with text, pos, tag_end2 minus pos
+        Let n7 be proc selector_type with tag_name2
+        proc memory_set_int64 from Memory with out_slot, 0, n7
+        Return tag_end2
+    End If
+    Return -1
+End Process
+
+@Reasoning
+Parse an attribute selector starting at the '[' at offset pos.
+@End Reasoning
+@Implementation
+Skip '['; read identifier (attribute name); optionally read operator and
+value (string or identifier); require ']'.
+@End Implementation
+@Performance_Hints
+O(span length).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "sel_parse_attribute" takes text as Integer, pos as Integer, len as Integer, out_slot as Integer returns Integer:
+    Let p be pos plus 1
+    Set p to (proc sel_skip_ws with text, p, len)
+    Let name_end be proc sel_read_ident_end with text, p, len
+    If name_end is equal to p:
+        Return -1
+    End If
+    Let attr_name be proc string_substring from StringPrim with text, p, name_end minus p
+    Set p to (proc sel_skip_ws with text, name_end, len)
+    Let op be ATTR_OP_PRESENT
+    Let value be 0
+
+    If p is less than len:
+        Let op_byte be proc string_char_at from StringCore with text, p
+        If op_byte is equal to ASCII_EQ:
+            Set op to ATTR_OP_EQ
+            Set p to p plus 1
+        End If
+        If op_byte is equal to ASCII_TILDE:
+            Set op to ATTR_OP_INCLUDES
+            Set p to p plus 2
+        End If
+        If op_byte is equal to ASCII_PIPE:
+            Set op to ATTR_OP_DASHMATCH
+            Set p to p plus 2
+        End If
+        If op_byte is equal to ASCII_CARET:
+            Set op to ATTR_OP_PREFIX
+            Set p to p plus 2
+        End If
+        If op_byte is equal to ASCII_DOLLAR:
+            Set op to ATTR_OP_SUFFIX
+            Set p to p plus 2
+        End If
+        If op_byte is equal to ASCII_STAR:
+            Set op to ATTR_OP_SUBSTR
+            Set p to p plus 2
+        End If
+    End If
+    If op is not equal to ATTR_OP_PRESENT:
+        Set p to (proc sel_skip_ws with text, p, len)
+        If p is greater than or equal to len:
+            proc deallocate from Layout with attr_name
+            Return -1
+        End If
+        Let vb be proc string_char_at from StringCore with text, p
+        Let value_slot be proc allocate from Layout with 8
+        proc memory_set_int64 from Memory with value_slot, 0, 0
+        If vb is equal to ASCII_QUOTE:
+            Let after_str be proc sel_read_string with text, p, len, value_slot
+            If after_str is less than 0:
+                proc deallocate from Layout with value_slot
+                proc deallocate from Layout with attr_name
+                Return -1
+            End If
+            Set value to (proc memory_get_int64 from Memory with value_slot, 0)
+            Set p to after_str
+        End If
+        If vb is equal to ASCII_APOS:
+            Let after_str2 be proc sel_read_string with text, p, len, value_slot
+            If after_str2 is less than 0:
+                proc deallocate from Layout with value_slot
+                proc deallocate from Layout with attr_name
+                Return -1
+            End If
+            Set value to (proc memory_get_int64 from Memory with value_slot, 0)
+            Set p to after_str2
+        End If
+        If vb is not equal to ASCII_QUOTE:
+            If vb is not equal to ASCII_APOS:
+                Let val_end be proc sel_read_ident_end with text, p, len
+                If val_end is equal to p:
+                    proc deallocate from Layout with value_slot
+                    proc deallocate from Layout with attr_name
+                    Return -1
+                End If
+                Set value to (proc string_substring from StringPrim with text, p, val_end minus p)
+                Set p to val_end
+            End If
+        End If
+        proc deallocate from Layout with value_slot
+    End If
+    Set p to (proc sel_skip_ws with text, p, len)
+    If p is greater than or equal to len:
+        proc deallocate from Layout with attr_name
+        If value is not equal to 0:
+            proc deallocate from Layout with value
+        End If
+        Return -1
+    End If
+    Let last be proc string_char_at from StringCore with text, p
+    If last is not equal to ASCII_RBRACKET:
+        proc deallocate from Layout with attr_name
+        If value is not equal to 0:
+            proc deallocate from Layout with value
+        End If
+        Return -1
+    End If
+    Let n be proc selector_attribute with attr_name, value, op
+    proc memory_set_int64 from Memory with out_slot, 0, n
+    Return p plus 1
+End Process
+
+@Reasoning
+Parse a compound selector: one or more simple selectors with no
+intervening whitespace (CSS Selectors 4 section 11).
+@End Reasoning
+@Implementation
+Loop calling sel_parse_simple until the next byte is whitespace, a
+combinator character, ',', or end-of-input.  Wrap the list in a
+SEL_KIND_COMPOUND node.  If only one simple selector was parsed, return
+that simple selector directly (compound elision).
+@End Implementation
+@Performance_Hints
+O(compound length).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "sel_parse_compound" takes text as Integer, pos as Integer, len as Integer, out_slot as Integer returns Integer:
+    Let p be pos
+    Let parts be proc list_create from List
+    Let slot be proc allocate from Layout with 8
+    Let keep_going be 1
+    While keep_going is equal to 1:
+        proc memory_set_int64 from Memory with slot, 0, 0
+        Let new_p be proc sel_parse_simple with text, p, len, slot
+        If new_p is less than 0:
+            Set keep_going to 0
+        End If
+        If new_p is greater than or equal to 0:
+            Let node be proc memory_get_int64 from Memory with slot, 0
+            proc list_push from List with parts, node
+            Set p to new_p
+            If p is greater than or equal to len:
+                Set keep_going to 0
+            End If
+            If p is less than len:
+                Let nb be proc string_char_at from StringCore with text, p
+                Let stop be 0
+                If nb is equal to ASCII_SPACE:
+                    Set stop to 1
+                End If
+                If nb is equal to ASCII_TAB:
+                    Set stop to 1
+                End If
+                If nb is equal to ASCII_NEWLINE:
+                    Set stop to 1
+                End If
+                If nb is equal to ASCII_COMMA:
+                    Set stop to 1
+                End If
+                If nb is equal to ASCII_GT:
+                    Set stop to 1
+                End If
+                If nb is equal to ASCII_PLUS:
+                    Set stop to 1
+                End If
+                If nb is equal to ASCII_TILDE:
+                    Set stop to 1
+                End If
+                If stop is equal to 1:
+                    Set keep_going to 0
+                End If
+            End If
+        End If
+    End While
+    proc deallocate from Layout with slot
+    Let parts_count be proc list_length from List with parts
+    If parts_count is equal to 0:
+        proc list_destroy from List with parts
+        Return -1
+    End If
+    If parts_count is equal to 1:
+        Let only be proc list_get from List with parts, 0
+        proc list_destroy from List with parts
+        proc memory_set_int64 from Memory with out_slot, 0, only
+        Return p
+    End If
+    Let compound be proc selector_compound with parts
+    proc memory_set_int64 from Memory with out_slot, 0, compound
+    Return p
+End Process
+
+@Reasoning
+Parse a complex selector: compound selectors connected by combinators.
+@End Reasoning
+@Implementation
+Repeatedly parse a compound, then look for an optional combinator.  When
+a combinator is seen, emit a SEL_KIND_COMBINATOR record between the
+compounds in the children list.  Wrap the list in a SEL_KIND_COMPLEX
+node if more than one piece was parsed, else return the single compound.
+@End Implementation
+@Performance_Hints
+O(input length).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "sel_parse_complex" takes text as Integer, pos as Integer, len as Integer, out_slot as Integer returns Integer:
+    Let p be proc sel_skip_ws with text, pos, len
+    Let pieces be proc list_create from List
+    Let slot be proc allocate from Layout with 8
+    proc memory_set_int64 from Memory with slot, 0, 0
+    Let first_end be proc sel_parse_compound with text, p, len, slot
+    If first_end is less than 0:
+        proc deallocate from Layout with slot
+        proc list_destroy from List with pieces
+        Return -1
+    End If
+    Let first be proc memory_get_int64 from Memory with slot, 0
+    proc list_push from List with pieces, first
+    Set p to first_end
+
+    Let keep_going be 1
+    While keep_going is equal to 1:
+        Let ws_p be proc sel_skip_ws with text, p, len
+        If ws_p is greater than or equal to len:
+            Set keep_going to 0
+        End If
+        If ws_p is less than len:
+            Let cb be proc string_char_at from StringCore with text, ws_p
+            If cb is equal to ASCII_COMMA:
+                Set keep_going to 0
+            End If
+            If cb is not equal to ASCII_COMMA:
+                Let combinator_id be -1
+                Let combinator_advance be 0
+                If cb is equal to ASCII_GT:
+                    Set combinator_id to COMBINATOR_CHILD
+                    Set combinator_advance to 1
+                End If
+                If cb is equal to ASCII_PLUS:
+                    Set combinator_id to COMBINATOR_ADJACENT_SIB
+                    Set combinator_advance to 1
+                End If
+                If cb is equal to ASCII_TILDE:
+                    Set combinator_id to COMBINATOR_GENERAL_SIB
+                    Set combinator_advance to 1
+                End If
+                If combinator_id is equal to -1:
+                    Note: Implicit descendant combinator if whitespace separated.
+                    If ws_p is greater than p:
+                        Set combinator_id to COMBINATOR_DESCENDANT
+                        Set combinator_advance to 0
+                    End If
+                End If
+                If combinator_id is equal to -1:
+                    Set keep_going to 0
+                End If
+                If combinator_id is not equal to -1:
+                    Set p to ws_p plus combinator_advance
+                    Let comb_p be proc sel_skip_ws with text, p, len
+                    proc memory_set_int64 from Memory with slot, 0, 0
+                    Let next_end be proc sel_parse_compound with text, comb_p, len, slot
+                    If next_end is less than 0:
+                        Set keep_going to 0
+                    End If
+                    If next_end is greater than or equal to 0:
+                        Let comb_node be proc selector_combinator with combinator_id
+                        proc list_push from List with pieces, comb_node
+                        Let next_piece be proc memory_get_int64 from Memory with slot, 0
+                        proc list_push from List with pieces, next_piece
+                        Set p to next_end
+                    End If
+                End If
+            End If
+        End If
+    End While
+    proc deallocate from Layout with slot
+
+    Let pcount be proc list_length from List with pieces
+    If pcount is equal to 1:
+        Let only_piece be proc list_get from List with pieces, 0
+        proc list_destroy from List with pieces
+        proc memory_set_int64 from Memory with out_slot, 0, only_piece
+        Return p
+    End If
+    Let complex be proc selector_complex with pieces
+    proc memory_set_int64 from Memory with out_slot, 0, complex
+    Return p
+End Process
+
+@Reasoning
+Parse a CSS selector list per CSS Selectors 4 section 5.2: one or more
+complex selectors separated by commas.  Returns a single complex
+selector if only one was parsed; otherwise a SEL_KIND_LIST wrapper.
+@End Reasoning
+@Implementation
+Loop calling sel_parse_complex, consuming commas in between.
+@End Implementation
+@Performance_Hints
+O(input length).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM or parse failure.
+@End Security_Scope
+Process called "selector_parse" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with text
+    Let p be 0
+    Let pieces be proc list_create from List
+    Let slot be proc allocate from Layout with 8
+    Let parse_ok be 1
+    Let keep_going be 1
+    While keep_going is equal to 1:
+        Set p to (proc sel_skip_ws with text, p, len)
+        If p is greater than or equal to len:
+            Set keep_going to 0
+        End If
+        If p is less than len:
+            proc memory_set_int64 from Memory with slot, 0, 0
+            Let new_p be proc sel_parse_complex with text, p, len, slot
+            If new_p is less than 0:
+                Set parse_ok to 0
+                Set keep_going to 0
+            End If
+            If new_p is greater than or equal to 0:
+                Let piece be proc memory_get_int64 from Memory with slot, 0
+                proc list_push from List with pieces, piece
+                Set p to new_p
+                Set p to (proc sel_skip_ws with text, p, len)
+                If p is greater than or equal to len:
+                    Set keep_going to 0
+                End If
+                If p is less than len:
+                    Let cb be proc string_char_at from StringCore with text, p
+                    If cb is equal to ASCII_COMMA:
+                        Set p to p plus 1
+                    End If
+                    If cb is not equal to ASCII_COMMA:
+                        Set keep_going to 0
+                    End If
+                End If
+            End If
+        End If
+    End While
+    proc deallocate from Layout with slot
+    Let count be proc list_length from List with pieces
+    If parse_ok is equal to 0:
+        Note: free anything we accumulated.
+        Let i be 0
+        While i is less than count:
+            Let piece2 be proc list_get from List with pieces, i
+            proc selector_destroy with piece2
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with pieces
+        Return 0
+    End If
+    If count is equal to 0:
+        proc list_destroy from List with pieces
+        Return 0
+    End If
+    If count is equal to 1:
+        Let only be proc list_get from List with pieces, 0
+        proc list_destroy from List with pieces
+        Return only
+    End If
+    Return proc selector_list_create with pieces
+End Process
+
+Note: ============================================================================
+Note: SERIALIZER
+Note: ============================================================================
+
+@Reasoning
+Serialize a selector AST back to its CSS source representation per CSS
+Selectors 4 section 17.6.
+@End Reasoning
+@Implementation
+Walk the tree, emit characters into a StringBuilder.
+@End Implementation
+@Performance_Hints
+O(tree size).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "selector_serialize" takes sel as Integer returns Integer:
+    Let sb be proc stringbuilder_create from SB
+    proc sel_serialize_to_sb with sb, sel
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process
+
+Process called "sel_serialize_to_sb" takes sb as Integer, sel as Integer returns Integer:
+    If sel is equal to 0:
+        Return SEL_OK
+    End If
+    Let kind be proc memory_get_int64 from Memory with sel, SEL_OFF_KIND
+    Let primary be proc memory_get_int64 from Memory with sel, SEL_OFF_PRIMARY
+    Let secondary be proc memory_get_int64 from Memory with sel, SEL_OFF_SECONDARY
+    Let attr_op be proc memory_get_int64 from Memory with sel, SEL_OFF_ATTR_OP
+    Let children be proc memory_get_int64 from Memory with sel, SEL_OFF_CHILDREN
+
+    If kind is equal to SEL_KIND_UNIVERSAL:
+        proc stringbuilder_append_char from SB with sb, ASCII_STAR
+    End If
+    If kind is equal to SEL_KIND_TYPE:
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+    End If
+    If kind is equal to SEL_KIND_CLASS:
+        proc stringbuilder_append_char from SB with sb, ASCII_DOT
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+    End If
+    If kind is equal to SEL_KIND_ID:
+        proc stringbuilder_append_char from SB with sb, ASCII_HASH
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+    End If
+    If kind is equal to SEL_KIND_ATTRIBUTE:
+        proc stringbuilder_append_char from SB with sb, ASCII_LBRACKET
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+        If attr_op is not equal to ATTR_OP_PRESENT:
+            If attr_op is equal to ATTR_OP_EQ:
+                proc stringbuilder_append_char from SB with sb, ASCII_EQ
+            End If
+            If attr_op is equal to ATTR_OP_INCLUDES:
+                proc stringbuilder_append from SB with sb, "~="
+            End If
+            If attr_op is equal to ATTR_OP_DASHMATCH:
+                proc stringbuilder_append from SB with sb, "|="
+            End If
+            If attr_op is equal to ATTR_OP_PREFIX:
+                proc stringbuilder_append from SB with sb, "^="
+            End If
+            If attr_op is equal to ATTR_OP_SUFFIX:
+                proc stringbuilder_append from SB with sb, "$="
+            End If
+            If attr_op is equal to ATTR_OP_SUBSTR:
+                proc stringbuilder_append from SB with sb, "*="
+            End If
+            proc stringbuilder_append_char from SB with sb, ASCII_QUOTE
+            If secondary is not equal to 0:
+                proc stringbuilder_append from SB with sb, secondary
+            End If
+            proc stringbuilder_append_char from SB with sb, ASCII_QUOTE
+        End If
+        proc stringbuilder_append_char from SB with sb, ASCII_RBRACKET
+    End If
+    If kind is equal to SEL_KIND_PSEUDO_CLASS:
+        proc stringbuilder_append_char from SB with sb, ASCII_COLON
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+        If secondary is not equal to 0:
+            proc stringbuilder_append_char from SB with sb, ASCII_LPAREN
+            proc stringbuilder_append from SB with sb, secondary
+            proc stringbuilder_append_char from SB with sb, ASCII_RPAREN
+        End If
+    End If
+    If kind is equal to SEL_KIND_PSEUDO_ELEMENT:
+        proc stringbuilder_append_char from SB with sb, ASCII_COLON
+        proc stringbuilder_append_char from SB with sb, ASCII_COLON
+        If primary is not equal to 0:
+            proc stringbuilder_append from SB with sb, primary
+        End If
+    End If
+    If kind is equal to SEL_KIND_COMPOUND:
+        If children is not equal to 0:
+            Let cc be proc list_length from List with children
+            Let i be 0
+            While i is less than cc:
+                Let c be proc list_get from List with children, i
+                proc sel_serialize_to_sb with sb, c
+                Set i to i plus 1
+            End While
+        End If
+    End If
+    If kind is equal to SEL_KIND_COMPLEX:
+        If children is not equal to 0:
+            Let cc2 be proc list_length from List with children
+            Let j be 0
+            While j is less than cc2:
+                Let c2 be proc list_get from List with children, j
+                proc sel_serialize_to_sb with sb, c2
+                Set j to j plus 1
+            End While
+        End If
+    End If
+    If kind is equal to SEL_KIND_LIST:
+        If children is not equal to 0:
+            Let cc3 be proc list_length from List with children
+            Let k be 0
+            While k is less than cc3:
+                If k is greater than 0:
+                    proc stringbuilder_append from SB with sb, ", "
+                End If
+                Let c3 be proc list_get from List with children, k
+                proc sel_serialize_to_sb with sb, c3
+                Set k to k plus 1
+            End While
+        End If
+    End If
+    If kind is equal to SEL_KIND_COMBINATOR:
+        Let cid be attr_op
+        If cid is equal to COMBINATOR_DESCENDANT:
+            proc stringbuilder_append_char from SB with sb, ASCII_SPACE
+        End If
+        If cid is equal to COMBINATOR_CHILD:
+            proc stringbuilder_append from SB with sb, " > "
+        End If
+        If cid is equal to COMBINATOR_ADJACENT_SIB:
+            proc stringbuilder_append from SB with sb, " + "
+        End If
+        If cid is equal to COMBINATOR_GENERAL_SIB:
+            proc stringbuilder_append from SB with sb, " ~ "
+        End If
+        If cid is equal to COMBINATOR_COLUMN:
+            proc stringbuilder_append from SB with sb, " || "
+        End If
+    End If
+    Return SEL_OK
+End Process

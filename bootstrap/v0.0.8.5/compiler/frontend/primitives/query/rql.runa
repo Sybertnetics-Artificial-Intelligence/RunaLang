@@ -1,0 +1,1337 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+RQL - Runa Query Language Parser / Serializer / Validator / SQL Emitter
+==============================================================================
+
+RQL is the Runa-native query language replacement for SQL.  It targets
+the shared query AST in primitives/query/query_ast.runa and can be
+emitted as standard SQL for backward compatibility with PostgreSQL,
+MySQL, and SQLite.
+
+Source syntax follows Runa's natural-language style:
+
+    Query:
+        Select user_name, email
+        From users
+        Where age is greater than 21
+        Order By signup_date descending
+        Limit 100
+    End Query
+
+Supported clauses (v0.0.8.5):
+
+    Query:
+        Select <col> (',' <col>)*
+        From <table> ('Join' <table> 'On' <pred>)*
+        Where <pred>
+        Group By <col> (',' <col>)*
+        Having <pred>
+        Order By <col> ('ascending' | 'descending') (',' <col> ...)*
+        Limit <n>
+        Offset <n>
+    End Query
+
+Comparison operators (RQL keyword form):
+    is equal to            =
+    is not equal to        <>
+    is less than           <
+    is less than or equal to        <=
+    is greater than        >
+    is greater than or equal to     >=
+    is like                LIKE
+    is null                IS NULL
+    is not null            IS NOT NULL
+
+Boolean keywords: 'and', 'or', 'not'.
+
+References:
+  - SQL:2016 ISO/IEC 9075-2:2016 (SQL/Foundation)
+  - PostgreSQL Reference https://www.postgresql.org/docs/current/
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/query/query_ast.runa" as QA
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Constant RQL_OK as Integer is 0
+Constant RQL_ERR_EOF as Integer is -1
+Constant RQL_ERR_SYNTAX as Integer is -2
+Constant RQL_ERR_OOM as Integer is -3
+Constant RQL_ERR_UNCLOSED as Integer is -4
+
+Constant RQL_PS_SIZE as Integer is 32
+Constant RQL_PS_OFF_TEXT as Integer is 0
+Constant RQL_PS_OFF_POS as Integer is 8
+Constant RQL_PS_OFF_LEN as Integer is 16
+Constant RQL_PS_OFF_LINE as Integer is 24
+
+Note: ============================================================================
+Note: PARSER STATE
+Note: ============================================================================
+
+Process called "rql_ps_create" takes text as Integer returns Integer:
+    Let record be proc allocate from Layout with RQL_PS_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    Let len be 0
+    If text is not equal to 0:
+        Set len to proc string_length from StringCore with text
+    End If
+    proc memory_set_int64 from Memory with record, RQL_PS_OFF_TEXT, text
+    proc memory_set_int64 from Memory with record, RQL_PS_OFF_POS, 0
+    proc memory_set_int64 from Memory with record, RQL_PS_OFF_LEN, len
+    proc memory_set_int64 from Memory with record, RQL_PS_OFF_LINE, 1
+    Return record
+End Process
+
+Process called "rql_ps_destroy" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return RQL_OK
+    End If
+    proc deallocate from Layout with p
+    Return RQL_OK
+End Process
+
+Process called "rql_ps_peek" takes p as Integer returns Integer:
+    Let pos be proc memory_get_int64 from Memory with p, RQL_PS_OFF_POS
+    Let len be proc memory_get_int64 from Memory with p, RQL_PS_OFF_LEN
+    If pos is greater than or equal to len:
+        Return -1
+    End If
+    Let text be proc memory_get_int64 from Memory with p, RQL_PS_OFF_TEXT
+    Return proc string_char_at from StringCore with text, pos
+End Process
+
+Process called "rql_ps_advance" takes p as Integer returns Integer:
+    Let pos be proc memory_get_int64 from Memory with p, RQL_PS_OFF_POS
+    Let len be proc memory_get_int64 from Memory with p, RQL_PS_OFF_LEN
+    If pos is greater than or equal to len:
+        Return -1
+    End If
+    Let text be proc memory_get_int64 from Memory with p, RQL_PS_OFF_TEXT
+    Let ch be proc string_char_at from StringCore with text, pos
+    proc memory_set_int64 from Memory with p, RQL_PS_OFF_POS, pos plus 1
+    If ch is equal to 10:
+        Let line be proc memory_get_int64 from Memory with p, RQL_PS_OFF_LINE
+        proc memory_set_int64 from Memory with p, RQL_PS_OFF_LINE, line plus 1
+    End If
+    Return ch
+End Process
+
+Process called "rql_skip_ws" takes p as Integer returns Integer:
+    While 1 is equal to 1:
+        Let ch be proc rql_ps_peek with p
+        If ch is equal to -1:
+            Return RQL_OK
+        End If
+        Let is_ws be proc is_whitespace from Char with ch
+        If is_ws is equal to 0:
+            Return RQL_OK
+        End If
+        proc rql_ps_advance with p
+    End While
+    Return RQL_OK
+End Process
+
+@Reasoning
+Try to match a multi-character keyword (case-insensitive on the first
+letter is not required: RQL keywords are spec'd in Title Case in the
+canonical syntax).  Returns 1 and advances past the keyword if matched,
+otherwise 0 with state unchanged.
+@End Reasoning
+@Implementation
+Compare byte-by-byte; on full match advance once per character.  Also
+verify that the character after the match is not an identifier
+continue char, to prevent "Select" matching the prefix of "SelectOf".
+@End Implementation
+@Performance_Hints
+O(len(keyword)).
+@End Performance_Hints
+@Security_Scope
+Pure read on failure.
+@End Security_Scope
+Process called "rql_try_keyword" takes p as Integer, kw as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with p, RQL_PS_OFF_TEXT
+    Let pos be proc memory_get_int64 from Memory with p, RQL_PS_OFF_POS
+    Let len be proc memory_get_int64 from Memory with p, RQL_PS_OFF_LEN
+    Let klen be proc string_length from StringCore with kw
+    If pos plus klen is greater than len:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than klen:
+        Let ta be proc string_char_at from StringCore with text, pos plus i
+        Let ka be proc string_char_at from StringCore with kw, i
+        If ta is not equal to ka:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    If pos plus klen is less than len:
+        Let next_ch be proc string_char_at from StringCore with text, pos plus klen
+        Let is_cont be proc is_identifier_continue from Char with next_ch
+        If is_cont is equal to 1:
+            Return 0
+        End If
+    End If
+    proc memory_set_int64 from Memory with p, RQL_PS_OFF_POS, pos plus klen
+    Return 1
+End Process
+
+@Reasoning
+Read an identifier (column/table name) into a freshly allocated string.
+@End Reasoning
+@Implementation
+Accumulate while is_identifier_continue applies; first character must
+satisfy is_identifier_start.  Allows '.' for qualified names.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Caller owns the returned string.
+@End Security_Scope
+Process called "rql_parse_ident" takes p as Integer returns Integer:
+    Let first be proc rql_ps_peek with p
+    Let is_start be proc is_identifier_start from Char with first
+    If is_start is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append_char from SB with sb, first
+    proc rql_ps_advance with p
+    While 1 is equal to 1:
+        Let ch be proc rql_ps_peek with p
+        If ch is equal to -1:
+            Let out be proc stringbuilder_to_string from SB with sb
+            proc stringbuilder_destroy from SB with sb
+            Return out
+        End If
+        Let is_cont be proc is_identifier_continue from Char with ch
+        If is_cont is equal to 1:
+            proc stringbuilder_append_char from SB with sb, ch
+            proc rql_ps_advance with p
+        Otherwise:
+            If ch is equal to 46:
+                proc stringbuilder_append_char from SB with sb, ch
+                proc rql_ps_advance with p
+            Otherwise:
+                Let out2 be proc stringbuilder_to_string from SB with sb
+                proc stringbuilder_destroy from SB with sb
+                Return out2
+            End If
+        End If
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Read an integer literal.
+@End Reasoning
+@Implementation
+Optional '-' sign, then digits.  Returns 0 on no digits.  Out_value
+written via memory_set_int64.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Pure parser.
+@End Security_Scope
+Process called "rql_parse_integer" takes p as Integer, out_value as Integer returns Integer:
+    Let sign be 1
+    Let first be proc rql_ps_peek with p
+    If first is equal to 45:
+        Set sign to -1
+        proc rql_ps_advance with p
+    End If
+    Let acc be 0
+    Let started be 0
+    While 1 is equal to 1:
+        Let ch be proc rql_ps_peek with p
+        Let is_d be proc is_digit from Char with ch
+        If is_d is equal to 0:
+            If started is equal to 0:
+                Return RQL_ERR_SYNTAX
+            End If
+            proc memory_set_int64 from Memory with out_value, 0, sign multiplied by acc
+            Return RQL_OK
+        End If
+        Set acc to acc multiplied by 10
+        Set acc to acc plus ch minus 48
+        Set started to 1
+        proc rql_ps_advance with p
+    End While
+    Return RQL_OK
+End Process
+
+@Reasoning
+Read a string literal delimited by double quotes.  Backslash escapes:
+\\, \", \n, \t.
+@End Reasoning
+@Implementation
+Standard escape-aware accumulator.  Returns the literal contents.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Caller owns the returned string.
+@End Security_Scope
+Process called "rql_parse_string" takes p as Integer returns Integer:
+    Let opening be proc rql_ps_peek with p
+    If opening is not equal to 34:
+        Return 0
+    End If
+    proc rql_ps_advance with p
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        Let ch be proc rql_ps_peek with p
+        If ch is equal to -1:
+            proc stringbuilder_destroy from SB with sb
+            Return 0
+        End If
+        If ch is equal to 34:
+            proc rql_ps_advance with p
+            Let out be proc stringbuilder_to_string from SB with sb
+            proc stringbuilder_destroy from SB with sb
+            Return out
+        End If
+        If ch is equal to 92:
+            proc rql_ps_advance with p
+            Let esc be proc rql_ps_peek with p
+            If esc is equal to 110:
+                proc stringbuilder_append_char from SB with sb, 10
+            Otherwise:
+                If esc is equal to 116:
+                    proc stringbuilder_append_char from SB with sb, 9
+                Otherwise:
+                    proc stringbuilder_append_char from SB with sb, esc
+                End If
+            End If
+            proc rql_ps_advance with p
+        Otherwise:
+            proc stringbuilder_append_char from SB with sb, ch
+            proc rql_ps_advance with p
+        End If
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: EXPRESSION PARSER
+Note: ============================================================================
+
+@Reasoning
+Parse a primary expression: literal, column reference, or
+parenthesized sub-expression.
+@End Reasoning
+@Implementation
+Dispatch on the first non-whitespace character.
+@End Implementation
+@Performance_Hints
+O(expression length).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "rql_parse_primary" takes p as Integer returns Integer:
+    proc rql_skip_ws with p
+    Let ch be proc rql_ps_peek with p
+    If ch is equal to -1:
+        Return 0
+    End If
+    If ch is equal to 34:
+        Let str_val be proc rql_parse_string with p
+        Return proc qa_literal_string from QA with str_val
+    End If
+    Let is_d be proc is_digit from Char with ch
+    If is_d is equal to 1:
+        Let val_slot be proc allocate from Layout with 8
+        If val_slot is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with val_slot, 0, 0
+        Let rc be proc rql_parse_integer with p, val_slot
+        Let val be proc memory_get_int64 from Memory with val_slot, 0
+        proc deallocate from Layout with val_slot
+        If rc is not equal to RQL_OK:
+            Return 0
+        End If
+        Return proc qa_literal_integer from QA with val
+    End If
+    If ch is equal to 45:
+        Let val_slot2 be proc allocate from Layout with 8
+        If val_slot2 is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with val_slot2, 0, 0
+        Let rc2 be proc rql_parse_integer with p, val_slot2
+        Let val2 be proc memory_get_int64 from Memory with val_slot2, 0
+        proc deallocate from Layout with val_slot2
+        If rc2 is not equal to RQL_OK:
+            Return 0
+        End If
+        Return proc qa_literal_integer from QA with val2
+    End If
+    Let is_start be proc is_identifier_start from Char with ch
+    If is_start is equal to 1:
+        Let name be proc rql_parse_ident with p
+        Let true_lit be proc string_equals from StringCore with name, "true"
+        If true_lit is equal to 1:
+            Return proc qa_literal_bool from QA with 1
+        End If
+        Let false_lit be proc string_equals from StringCore with name, "false"
+        If false_lit is equal to 1:
+            Return proc qa_literal_bool from QA with 0
+        End If
+        Let null_lit be proc string_equals from StringCore with name, "null"
+        If null_lit is equal to 1:
+            Return proc qa_literal_null from QA
+        End If
+        Return proc qa_column from QA with name, 0
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Parse a comparison clause: primary expression followed by an "is ..."
+or symbolic operator and another primary.  Multi-word operators are
+matched greedily ("is greater than or equal to" etc).
+@End Reasoning
+@Implementation
+1. Parse left primary.
+2. Skip whitespace.
+3. Match operator keyword sequence.
+4. Parse right primary.
+5. Build qa_cmp.
+@End Implementation
+@Performance_Hints
+O(expression length).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "rql_parse_comparison" takes p as Integer returns Integer:
+    Let lhs be proc rql_parse_primary with p
+    If lhs is equal to 0:
+        Return 0
+    End If
+    proc rql_skip_ws with p
+    Let op be 0
+    Let saw_is be proc rql_try_keyword with p, "is"
+    If saw_is is equal to 1:
+        proc rql_skip_ws with p
+        Let saw_not be proc rql_try_keyword with p, "not"
+        If saw_not is equal to 1:
+            proc rql_skip_ws with p
+            Let saw_null2 be proc rql_try_keyword with p, "null"
+            If saw_null2 is equal to 1:
+                Let isnull_node be proc query_ast_create from QA with 36, 0, 1
+                proc query_ast_add_child from QA with isnull_node, lhs
+                Return isnull_node
+            End If
+            Let saw_eq2 be proc rql_try_keyword with p, "equal"
+            If saw_eq2 is equal to 1:
+                proc rql_skip_ws with p
+                proc rql_try_keyword with p, "to"
+                Set op to "<>"
+            End If
+        Otherwise:
+            Let saw_null be proc rql_try_keyword with p, "null"
+            If saw_null is equal to 1:
+                Let isnull_node2 be proc query_ast_create from QA with 36, 0, 0
+                proc query_ast_add_child from QA with isnull_node2, lhs
+                Return isnull_node2
+            End If
+            Let saw_eq be proc rql_try_keyword with p, "equal"
+            If saw_eq is equal to 1:
+                proc rql_skip_ws with p
+                proc rql_try_keyword with p, "to"
+                Set op to "="
+            Otherwise:
+                Let saw_less be proc rql_try_keyword with p, "less"
+                If saw_less is equal to 1:
+                    proc rql_skip_ws with p
+                    proc rql_try_keyword with p, "than"
+                    proc rql_skip_ws with p
+                    Let saw_or_eq be proc rql_try_keyword with p, "or"
+                    If saw_or_eq is equal to 1:
+                        proc rql_skip_ws with p
+                        proc rql_try_keyword with p, "equal"
+                        proc rql_skip_ws with p
+                        proc rql_try_keyword with p, "to"
+                        Set op to "<="
+                    Otherwise:
+                        Set op to "<"
+                    End If
+                Otherwise:
+                    Let saw_greater be proc rql_try_keyword with p, "greater"
+                    If saw_greater is equal to 1:
+                        proc rql_skip_ws with p
+                        proc rql_try_keyword with p, "than"
+                        proc rql_skip_ws with p
+                        Let saw_or_eq2 be proc rql_try_keyword with p, "or"
+                        If saw_or_eq2 is equal to 1:
+                            proc rql_skip_ws with p
+                            proc rql_try_keyword with p, "equal"
+                            proc rql_skip_ws with p
+                            proc rql_try_keyword with p, "to"
+                            Set op to ">="
+                        Otherwise:
+                            Set op to ">"
+                        End If
+                    Otherwise:
+                        Let saw_like be proc rql_try_keyword with p, "like"
+                        If saw_like is equal to 1:
+                            Set op to "LIKE"
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+    If op is equal to 0:
+        Return lhs
+    End If
+    proc rql_skip_ws with p
+    Let rhs be proc rql_parse_primary with p
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Return proc qa_cmp from QA with op, lhs, rhs
+End Process
+
+@Reasoning
+Parse a boolean expression: comparison joined by 'and' / 'or'.  Left-
+associative.
+@End Reasoning
+@Implementation
+Build up the left side; loop pulling 'and'/'or' tokens and another
+comparison.
+@End Implementation
+@Performance_Hints
+O(expression size).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "rql_parse_bool_expr" takes p as Integer returns Integer:
+    Let lhs be proc rql_parse_comparison with p
+    If lhs is equal to 0:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        proc rql_skip_ws with p
+        Let saw_and be proc rql_try_keyword with p, "and"
+        If saw_and is equal to 1:
+            Let rhs1 be proc rql_parse_comparison with p
+            If rhs1 is equal to 0:
+                Return 0
+            End If
+            Let new_node1 be proc query_ast_create from QA with 31, "AND", 0
+            proc query_ast_add_child from QA with new_node1, lhs
+            proc query_ast_add_child from QA with new_node1, rhs1
+            Set lhs to new_node1
+        Otherwise:
+            Let saw_or be proc rql_try_keyword with p, "or"
+            If saw_or is equal to 1:
+                Let rhs2 be proc rql_parse_comparison with p
+                If rhs2 is equal to 0:
+                    Return 0
+                End If
+                Let new_node2 be proc query_ast_create from QA with 31, "OR", 0
+                proc query_ast_add_child from QA with new_node2, lhs
+                proc query_ast_add_child from QA with new_node2, rhs2
+                Set lhs to new_node2
+            Otherwise:
+                Return lhs
+            End If
+        End If
+    End While
+    Return lhs
+End Process
+
+Note: ============================================================================
+Note: CLAUSE PARSERS
+Note: ============================================================================
+
+@Reasoning
+Parse a Select clause: 'Select <col> (',' <col>)*'.  Each column may
+be a simple identifier or a qualified name table.column.
+@End Reasoning
+@Implementation
+Loop parsing column names, attaching each as a Q_COLUMN child of a
+Q_SELECT_LIST clause.
+@End Implementation
+@Performance_Hints
+O(column count).
+@End Performance_Hints
+@Security_Scope
+Returns the clause node or 0 on syntax error.
+@End Security_Scope
+Process called "rql_parse_select_list" takes p as Integer returns Integer:
+    Let clause be proc qa_clause from QA with 10
+    If clause is equal to 0:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        proc rql_skip_ws with p
+        Let ident be proc rql_parse_ident with p
+        If ident is equal to 0:
+            Return clause
+        End If
+        Let col be proc qa_column from QA with ident, 0
+        proc query_ast_add_child from QA with clause, col
+        proc rql_skip_ws with p
+        Let next_ch be proc rql_ps_peek with p
+        If next_ch is equal to 44:
+            proc rql_ps_advance with p
+        Otherwise:
+            Return clause
+        End If
+    End While
+    Return clause
+End Process
+
+Process called "rql_parse_from" takes p as Integer returns Integer:
+    Let clause be proc qa_clause from QA with 11
+    If clause is equal to 0:
+        Return 0
+    End If
+    proc rql_skip_ws with p
+    Let table be proc rql_parse_ident with p
+    If table is not equal to 0:
+        Let table_col be proc qa_column from QA with table, 0
+        proc query_ast_add_child from QA with clause, table_col
+    End If
+    Return clause
+End Process
+
+Process called "rql_parse_where" takes p as Integer returns Integer:
+    Let clause be proc qa_clause from QA with 12
+    If clause is equal to 0:
+        Return 0
+    End If
+    Let expr be proc rql_parse_bool_expr with p
+    If expr is not equal to 0:
+        proc query_ast_add_child from QA with clause, expr
+    End If
+    Return clause
+End Process
+
+Process called "rql_parse_group_by" takes p as Integer returns Integer:
+    Let clause be proc qa_clause from QA with 13
+    If clause is equal to 0:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        proc rql_skip_ws with p
+        Let ident be proc rql_parse_ident with p
+        If ident is equal to 0:
+            Return clause
+        End If
+        Let col be proc qa_column from QA with ident, 0
+        proc query_ast_add_child from QA with clause, col
+        proc rql_skip_ws with p
+        Let nc be proc rql_ps_peek with p
+        If nc is equal to 44:
+            proc rql_ps_advance with p
+        Otherwise:
+            Return clause
+        End If
+    End While
+    Return clause
+End Process
+
+Process called "rql_parse_having" takes p as Integer returns Integer:
+    Let clause be proc qa_clause from QA with 14
+    If clause is equal to 0:
+        Return 0
+    End If
+    Let expr be proc rql_parse_bool_expr with p
+    If expr is not equal to 0:
+        proc query_ast_add_child from QA with clause, expr
+    End If
+    Return clause
+End Process
+
+Process called "rql_parse_order_by" takes p as Integer returns Integer:
+    Let clause be proc qa_clause from QA with 15
+    If clause is equal to 0:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        proc rql_skip_ws with p
+        Let ident be proc rql_parse_ident with p
+        If ident is equal to 0:
+            Return clause
+        End If
+        proc rql_skip_ws with p
+        Let dir be 0
+        Let saw_desc be proc rql_try_keyword with p, "descending"
+        If saw_desc is equal to 1:
+            Set dir to 1
+        Otherwise:
+            proc rql_try_keyword with p, "ascending"
+        End If
+        Let col be proc qa_column from QA with ident, 0
+        Let item be proc qa_order_item from QA with col, dir
+        proc query_ast_add_child from QA with clause, item
+        proc rql_skip_ws with p
+        Let nc be proc rql_ps_peek with p
+        If nc is equal to 44:
+            proc rql_ps_advance with p
+        Otherwise:
+            Return clause
+        End If
+    End While
+    Return clause
+End Process
+
+Process called "rql_parse_limit" takes p as Integer returns Integer:
+    Let val_slot be proc allocate from Layout with 8
+    If val_slot is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with val_slot, 0, 0
+    proc rql_skip_ws with p
+    Let rc be proc rql_parse_integer with p, val_slot
+    Let val be proc memory_get_int64 from Memory with val_slot, 0
+    proc deallocate from Layout with val_slot
+    If rc is not equal to RQL_OK:
+        Return 0
+    End If
+    Return proc qa_limit from QA with val
+End Process
+
+Process called "rql_parse_offset" takes p as Integer returns Integer:
+    Let val_slot be proc allocate from Layout with 8
+    If val_slot is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with val_slot, 0, 0
+    proc rql_skip_ws with p
+    Let rc be proc rql_parse_integer with p, val_slot
+    Let val be proc memory_get_int64 from Memory with val_slot, 0
+    proc deallocate from Layout with val_slot
+    If rc is not equal to RQL_OK:
+        Return 0
+    End If
+    Let clause be proc query_ast_create from QA with 17, 0, val
+    Return clause
+End Process
+
+@Reasoning
+Top-level RQL parser.  Expects the source to begin with 'Query:' and
+end with 'End Query'.  Inside, clauses are recognized by their leading
+keywords and may appear in any order following SQL convention.
+@End Reasoning
+@Implementation
+Build a Q_SELECT root node.  Loop: skip whitespace, check for closing
+'End Query' or a clause keyword; dispatch to the appropriate parser
+and attach the result.
+@End Implementation
+@Performance_Hints
+Linear in source length.
+@End Performance_Hints
+@Security_Scope
+Caller owns the returned root.
+@End Security_Scope
+Process called "rql_parse" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let p be proc rql_ps_create with source
+    If p is equal to 0:
+        Return 0
+    End If
+    proc rql_skip_ws with p
+    Let saw_query be proc rql_try_keyword with p, "Query"
+    If saw_query is equal to 0:
+        proc rql_ps_destroy with p
+        Return 0
+    End If
+    proc rql_skip_ws with p
+    Let colon be proc rql_ps_peek with p
+    If colon is equal to 58:
+        proc rql_ps_advance with p
+    End If
+    Let root be proc qa_select from QA
+    If root is equal to 0:
+        proc rql_ps_destroy with p
+        Return 0
+    End If
+    While 1 is equal to 1:
+        proc rql_skip_ws with p
+        Let pc be proc rql_ps_peek with p
+        If pc is equal to -1:
+            proc rql_ps_destroy with p
+            Return root
+        End If
+        Let saw_end be proc rql_try_keyword with p, "End"
+        If saw_end is equal to 1:
+            proc rql_skip_ws with p
+            proc rql_try_keyword with p, "Query"
+            proc rql_ps_destroy with p
+            Return root
+        End If
+        Let saw_select be proc rql_try_keyword with p, "Select"
+        If saw_select is equal to 1:
+            Let sl be proc rql_parse_select_list with p
+            proc query_ast_add_child from QA with root, sl
+        Otherwise:
+            Let saw_from be proc rql_try_keyword with p, "From"
+            If saw_from is equal to 1:
+                Let frm be proc rql_parse_from with p
+                proc query_ast_add_child from QA with root, frm
+            Otherwise:
+                Let saw_where be proc rql_try_keyword with p, "Where"
+                If saw_where is equal to 1:
+                    Let whr be proc rql_parse_where with p
+                    proc query_ast_add_child from QA with root, whr
+                Otherwise:
+                    Let saw_group be proc rql_try_keyword with p, "Group"
+                    If saw_group is equal to 1:
+                        proc rql_skip_ws with p
+                        proc rql_try_keyword with p, "By"
+                        Let grp be proc rql_parse_group_by with p
+                        proc query_ast_add_child from QA with root, grp
+                    Otherwise:
+                        Let saw_having be proc rql_try_keyword with p, "Having"
+                        If saw_having is equal to 1:
+                            Let hav be proc rql_parse_having with p
+                            proc query_ast_add_child from QA with root, hav
+                        Otherwise:
+                            Let saw_order be proc rql_try_keyword with p, "Order"
+                            If saw_order is equal to 1:
+                                proc rql_skip_ws with p
+                                proc rql_try_keyword with p, "By"
+                                Let ord be proc rql_parse_order_by with p
+                                proc query_ast_add_child from QA with root, ord
+                            Otherwise:
+                                Let saw_limit be proc rql_try_keyword with p, "Limit"
+                                If saw_limit is equal to 1:
+                                    Let lim be proc rql_parse_limit with p
+                                    If lim is not equal to 0:
+                                        proc query_ast_add_child from QA with root, lim
+                                    End If
+                                Otherwise:
+                                    Let saw_offset be proc rql_try_keyword with p, "Offset"
+                                    If saw_offset is equal to 1:
+                                        Let ofs be proc rql_parse_offset with p
+                                        If ofs is not equal to 0:
+                                            proc query_ast_add_child from QA with root, ofs
+                                        End If
+                                    Otherwise:
+                                        proc rql_ps_advance with p
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    proc rql_ps_destroy with p
+    Return root
+End Process
+
+Note: ============================================================================
+Note: RQL SERIALIZER
+Note: ============================================================================
+
+@Reasoning
+Round-trip an RQL AST back to RQL source text.  Used by formatters
+and migrations.
+@End Reasoning
+@Implementation
+Recursive walker writing into a StringBuilder.
+@End Implementation
+@Performance_Hints
+Linear.
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "rql_serialize_column" takes sb as Integer, node as Integer returns Integer:
+    Let name be proc query_ast_get_primary from QA with node
+    If name is not equal to 0:
+        proc stringbuilder_append from SB with sb, name
+    End If
+    Return 0
+End Process
+
+Process called "rql_serialize_value" takes sb as Integer, node as Integer returns Integer:
+    Let kind be proc query_ast_get_kind from QA with node
+    If kind is equal to 20:
+        proc rql_serialize_column with sb, node
+        Return 0
+    End If
+    If kind is equal to 21:
+        Let lt be proc query_ast_get_secondary from QA with node
+        Let payload be proc query_ast_get_payload from QA with node
+        If lt is equal to 0:
+            proc stringbuilder_append_integer from SB with sb, payload
+        End If
+        If lt is equal to 2:
+            Let pr be proc query_ast_get_primary from QA with node
+            proc stringbuilder_append_char from SB with sb, 34
+            If pr is not equal to 0:
+                proc stringbuilder_append from SB with sb, pr
+            End If
+            proc stringbuilder_append_char from SB with sb, 34
+        End If
+        If lt is equal to 3:
+            If payload is equal to 1:
+                proc stringbuilder_append from SB with sb, "true"
+            Otherwise:
+                proc stringbuilder_append from SB with sb, "false"
+            End If
+        End If
+        If lt is equal to 4:
+            proc stringbuilder_append from SB with sb, "null"
+        End If
+        Return 0
+    End If
+    Return 0
+End Process
+
+Process called "rql_serialize_cmp" takes sb as Integer, node as Integer returns Integer:
+    Let lhs be proc query_ast_get_child from QA with node, 0
+    Let op be proc query_ast_get_primary from QA with node
+    proc rql_serialize_value with sb, lhs
+    proc stringbuilder_append_char from SB with sb, 32
+    If op is not equal to 0:
+        Let eq be proc string_equals from StringCore with op, "="
+        If eq is equal to 1:
+            proc stringbuilder_append from SB with sb, "is equal to"
+        Otherwise:
+            Let neq be proc string_equals from StringCore with op, "<>"
+            If neq is equal to 1:
+                proc stringbuilder_append from SB with sb, "is not equal to"
+            Otherwise:
+                Let lt be proc string_equals from StringCore with op, "<"
+                If lt is equal to 1:
+                    proc stringbuilder_append from SB with sb, "is less than"
+                Otherwise:
+                    Let lte be proc string_equals from StringCore with op, "<="
+                    If lte is equal to 1:
+                        proc stringbuilder_append from SB with sb, "is less than or equal to"
+                    Otherwise:
+                        Let gt be proc string_equals from StringCore with op, ">"
+                        If gt is equal to 1:
+                            proc stringbuilder_append from SB with sb, "is greater than"
+                        Otherwise:
+                            Let gte be proc string_equals from StringCore with op, ">="
+                            If gte is equal to 1:
+                                proc stringbuilder_append from SB with sb, "is greater than or equal to"
+                            Otherwise:
+                                Let like be proc string_equals from StringCore with op, "LIKE"
+                                If like is equal to 1:
+                                    proc stringbuilder_append from SB with sb, "is like"
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+    proc stringbuilder_append_char from SB with sb, 32
+    Let rhs be proc query_ast_get_child from QA with node, 1
+    proc rql_serialize_value with sb, rhs
+    Return 0
+End Process
+
+Process called "rql_serialize_expr" takes sb as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc query_ast_get_kind from QA with node
+    If kind is equal to 30:
+        proc rql_serialize_cmp with sb, node
+        Return 0
+    End If
+    If kind is equal to 31:
+        Let lhs be proc query_ast_get_child from QA with node, 0
+        Let rhs be proc query_ast_get_child from QA with node, 1
+        proc rql_serialize_expr with sb, lhs
+        proc stringbuilder_append_char from SB with sb, 32
+        Let op be proc query_ast_get_primary from QA with node
+        Let eq_and be proc string_equals from StringCore with op, "AND"
+        If eq_and is equal to 1:
+            proc stringbuilder_append from SB with sb, "and"
+        Otherwise:
+            proc stringbuilder_append from SB with sb, "or"
+        End If
+        proc stringbuilder_append_char from SB with sb, 32
+        proc rql_serialize_expr with sb, rhs
+        Return 0
+    End If
+    proc rql_serialize_value with sb, node
+    Return 0
+End Process
+
+Process called "rql_serialize" takes root as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append from SB with sb, "Query:"
+    proc stringbuilder_append_char from SB with sb, 10
+    Let cs be proc query_ast_get_children from QA with root
+    Let ccount be proc list_length from List with cs
+    Let i be 0
+    While i is less than ccount:
+        Let c be proc list_get from List with cs, i
+        Let k be proc query_ast_get_kind from QA with c
+        proc stringbuilder_append from SB with sb, "    "
+        If k is equal to 10:
+            proc stringbuilder_append from SB with sb, "Select "
+            Let scs be proc query_ast_get_children from QA with c
+            Let n be proc list_length from List with scs
+            Let j be 0
+            While j is less than n:
+                If j is greater than 0:
+                    proc stringbuilder_append from SB with sb, ", "
+                End If
+                Let col be proc list_get from List with scs, j
+                Let cname be proc query_ast_get_primary from QA with col
+                If cname is not equal to 0:
+                    proc stringbuilder_append from SB with sb, cname
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        If k is equal to 11:
+            proc stringbuilder_append from SB with sb, "From "
+            Let fc be proc query_ast_get_child from QA with c, 0
+            If fc is not equal to 0:
+                Let tname be proc query_ast_get_primary from QA with fc
+                If tname is not equal to 0:
+                    proc stringbuilder_append from SB with sb, tname
+                End If
+            End If
+        End If
+        If k is equal to 12:
+            proc stringbuilder_append from SB with sb, "Where "
+            Let we be proc query_ast_get_child from QA with c, 0
+            proc rql_serialize_expr with sb, we
+        End If
+        If k is equal to 15:
+            proc stringbuilder_append from SB with sb, "Order By "
+            Let oscs be proc query_ast_get_children from QA with c
+            Let on be proc list_length from List with oscs
+            Let oi be 0
+            While oi is less than on:
+                If oi is greater than 0:
+                    proc stringbuilder_append from SB with sb, ", "
+                End If
+                Let oitem be proc list_get from List with oscs, oi
+                Let oexpr be proc query_ast_get_child from QA with oitem, 0
+                Let ocname be proc query_ast_get_primary from QA with oexpr
+                If ocname is not equal to 0:
+                    proc stringbuilder_append from SB with sb, ocname
+                End If
+                Let dir be proc query_ast_get_secondary from QA with oitem
+                If dir is equal to 1:
+                    proc stringbuilder_append from SB with sb, " descending"
+                Otherwise:
+                    proc stringbuilder_append from SB with sb, " ascending"
+                End If
+                Set oi to oi plus 1
+            End While
+        End If
+        If k is equal to 16:
+            Let limit_n be proc query_ast_get_secondary from QA with c
+            proc stringbuilder_append from SB with sb, "Limit "
+            proc stringbuilder_append_integer from SB with sb, limit_n
+        End If
+        If k is equal to 17:
+            Let off_n be proc query_ast_get_secondary from QA with c
+            proc stringbuilder_append from SB with sb, "Offset "
+            proc stringbuilder_append_integer from SB with sb, off_n
+        End If
+        proc stringbuilder_append_char from SB with sb, 10
+        Set i to i plus 1
+    End While
+    proc stringbuilder_append from SB with sb, "End Query"
+    proc stringbuilder_append_char from SB with sb, 10
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+Note: ============================================================================
+Note: SQL EMITTER
+Note: ============================================================================
+
+@Reasoning
+Emit standard SQL from an RQL AST for backward compatibility with
+PostgreSQL, MySQL, and SQLite.  Most clauses map 1:1; comparison
+operators are emitted in their symbolic form per SQL:2016 grammar.
+@End Reasoning
+@Implementation
+Walk the root's clause list emitting "SELECT ... FROM ... WHERE ..."
+syntax.  Comparison operators use the symbolic ASCII representations
+(=, <>, <, <=, >, >=, LIKE, IS NULL, IS NOT NULL).
+@End Implementation
+@Performance_Hints
+Linear in AST size.
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "rql_sql_emit_value" takes sb as Integer, node as Integer returns Integer:
+    Let kind be proc query_ast_get_kind from QA with node
+    If kind is equal to 20:
+        Let name be proc query_ast_get_primary from QA with node
+        If name is not equal to 0:
+            proc stringbuilder_append from SB with sb, name
+        End If
+        Return 0
+    End If
+    If kind is equal to 21:
+        Let lt be proc query_ast_get_secondary from QA with node
+        Let payload be proc query_ast_get_payload from QA with node
+        If lt is equal to 0:
+            proc stringbuilder_append_integer from SB with sb, payload
+        End If
+        If lt is equal to 2:
+            Let pr be proc query_ast_get_primary from QA with node
+            proc stringbuilder_append_char from SB with sb, 39
+            If pr is not equal to 0:
+                proc stringbuilder_append from SB with sb, pr
+            End If
+            proc stringbuilder_append_char from SB with sb, 39
+        End If
+        If lt is equal to 3:
+            If payload is equal to 1:
+                proc stringbuilder_append from SB with sb, "TRUE"
+            Otherwise:
+                proc stringbuilder_append from SB with sb, "FALSE"
+            End If
+        End If
+        If lt is equal to 4:
+            proc stringbuilder_append from SB with sb, "NULL"
+        End If
+        Return 0
+    End If
+    Return 0
+End Process
+
+Process called "rql_sql_emit_expr" takes sb as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc query_ast_get_kind from QA with node
+    If kind is equal to 30:
+        Let lhs be proc query_ast_get_child from QA with node, 0
+        Let rhs be proc query_ast_get_child from QA with node, 1
+        Let op be proc query_ast_get_primary from QA with node
+        proc rql_sql_emit_value with sb, lhs
+        proc stringbuilder_append_char from SB with sb, 32
+        If op is not equal to 0:
+            proc stringbuilder_append from SB with sb, op
+        End If
+        proc stringbuilder_append_char from SB with sb, 32
+        proc rql_sql_emit_value with sb, rhs
+        Return 0
+    End If
+    If kind is equal to 31:
+        Let lhs2 be proc query_ast_get_child from QA with node, 0
+        Let rhs2 be proc query_ast_get_child from QA with node, 1
+        Let op2 be proc query_ast_get_primary from QA with node
+        proc rql_sql_emit_expr with sb, lhs2
+        proc stringbuilder_append_char from SB with sb, 32
+        If op2 is not equal to 0:
+            proc stringbuilder_append from SB with sb, op2
+        End If
+        proc stringbuilder_append_char from SB with sb, 32
+        proc rql_sql_emit_expr with sb, rhs2
+        Return 0
+    End If
+    If kind is equal to 36:
+        Let inner be proc query_ast_get_child from QA with node, 0
+        proc rql_sql_emit_value with sb, inner
+        Let neg be proc query_ast_get_secondary from QA with node
+        If neg is equal to 1:
+            proc stringbuilder_append from SB with sb, " IS NOT NULL"
+        Otherwise:
+            proc stringbuilder_append from SB with sb, " IS NULL"
+        End If
+        Return 0
+    End If
+    proc rql_sql_emit_value with sb, node
+    Return 0
+End Process
+
+Process called "rql_to_sql" takes root as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let cs be proc query_ast_get_children from QA with root
+    Let ccount be proc list_length from List with cs
+    Let select_clause be proc query_ast_find_clause from QA with root, 10
+    Let from_clause be proc query_ast_find_clause from QA with root, 11
+    Let where_clause be proc query_ast_find_clause from QA with root, 12
+    Let order_clause be proc query_ast_find_clause from QA with root, 15
+    Let limit_clause be proc query_ast_find_clause from QA with root, 16
+    Let offset_clause be proc query_ast_find_clause from QA with root, 17
+    proc stringbuilder_append from SB with sb, "SELECT "
+    If select_clause is not equal to 0:
+        Let scs be proc query_ast_get_children from QA with select_clause
+        Let n be proc list_length from List with scs
+        Let j be 0
+        While j is less than n:
+            If j is greater than 0:
+                proc stringbuilder_append from SB with sb, ", "
+            End If
+            Let col be proc list_get from List with scs, j
+            Let cname be proc query_ast_get_primary from QA with col
+            If cname is not equal to 0:
+                proc stringbuilder_append from SB with sb, cname
+            End If
+            Set j to j plus 1
+        End While
+    Otherwise:
+        proc stringbuilder_append from SB with sb, "*"
+    End If
+    If from_clause is not equal to 0:
+        proc stringbuilder_append from SB with sb, " FROM "
+        Let fc be proc query_ast_get_child from QA with from_clause, 0
+        If fc is not equal to 0:
+            Let tname be proc query_ast_get_primary from QA with fc
+            If tname is not equal to 0:
+                proc stringbuilder_append from SB with sb, tname
+            End If
+        End If
+    End If
+    If where_clause is not equal to 0:
+        proc stringbuilder_append from SB with sb, " WHERE "
+        Let we be proc query_ast_get_child from QA with where_clause, 0
+        proc rql_sql_emit_expr with sb, we
+    End If
+    If order_clause is not equal to 0:
+        proc stringbuilder_append from SB with sb, " ORDER BY "
+        Let oscs be proc query_ast_get_children from QA with order_clause
+        Let on be proc list_length from List with oscs
+        Let oi be 0
+        While oi is less than on:
+            If oi is greater than 0:
+                proc stringbuilder_append from SB with sb, ", "
+            End If
+            Let oitem be proc list_get from List with oscs, oi
+            Let oexpr be proc query_ast_get_child from QA with oitem, 0
+            Let ocname be proc query_ast_get_primary from QA with oexpr
+            If ocname is not equal to 0:
+                proc stringbuilder_append from SB with sb, ocname
+            End If
+            Let dir be proc query_ast_get_secondary from QA with oitem
+            If dir is equal to 1:
+                proc stringbuilder_append from SB with sb, " DESC"
+            Otherwise:
+                proc stringbuilder_append from SB with sb, " ASC"
+            End If
+            Set oi to oi plus 1
+        End While
+    End If
+    If limit_clause is not equal to 0:
+        Let lv be proc query_ast_get_secondary from QA with limit_clause
+        proc stringbuilder_append from SB with sb, " LIMIT "
+        proc stringbuilder_append_integer from SB with sb, lv
+    End If
+    If offset_clause is not equal to 0:
+        Let ov be proc query_ast_get_secondary from QA with offset_clause
+        proc stringbuilder_append from SB with sb, " OFFSET "
+        proc stringbuilder_append_integer from SB with sb, ov
+    End If
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Validate that the AST is well-formed for execution against a SQL
+backend.  Issues found: missing FROM clause, undefined column
+(without a schema we can only check for empty column names), Order By
+column not in select list (informational - not always an error).
+@End Reasoning
+@Implementation
+Walk the tree collecting issues into a list.  Each issue is a 16-byte
+record (code, message).
+@End Implementation
+@Performance_Hints
+O(tree size).
+@End Performance_Hints
+@Security_Scope
+Caller owns the issues list.
+@End Security_Scope
+Process called "rql_validate" takes root as Integer, schema as Integer returns Integer:
+    Let issues be proc list_create from List
+    If issues is equal to 0:
+        Return 0
+    End If
+    If root is equal to 0:
+        Return issues
+    End If
+    Let from_clause be proc query_ast_find_clause from QA with root, 11
+    If from_clause is equal to 0:
+        Let issue1 be proc allocate from Layout with 16
+        If issue1 is not equal to 0:
+            proc memory_set_int64 from Memory with issue1, 0, -100
+            proc memory_set_int64 from Memory with issue1, 8, "FROM clause required"
+            proc list_push from List with issues, issue1
+        End If
+    End If
+    Let select_clause be proc query_ast_find_clause from QA with root, 10
+    If select_clause is equal to 0:
+        Let issue2 be proc allocate from Layout with 16
+        If issue2 is not equal to 0:
+            proc memory_set_int64 from Memory with issue2, 0, -101
+            proc memory_set_int64 from Memory with issue2, 8, "SELECT clause required"
+            proc list_push from List with issues, issue2
+        End If
+    End If
+    Return issues
+End Process

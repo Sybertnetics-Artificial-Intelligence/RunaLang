@@ -1,0 +1,1179 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+PASSPHRASE - Argon2id-based passphrase hashing and verification
+==============================================================================
+
+Production passphrase storage uses Argon2id (RFC 9106) as the underlying KDF
+with the OWASP 2023 recommended baseline parameters:
+  - m_cost = 65536 KiB (64 MiB)
+  - t_cost = 3
+  - parallelism = 1
+  - output_len = 32 bytes (Argon2id hash)
+  - salt_len = 16 bytes (cryptographically random)
+
+The encoded hash string follows the standard Argon2id format used by the
+reference implementation:
+
+  $argon2id$v=19$m=65536,t=3,p=1$<salt-b64>$<hash-b64>
+
+Where:
+  - 'argon2id' is the variant identifier
+  - 'v=19' is the Argon2 version (0x13 = 19 decimal, current per RFC 9106)
+  - 'm=N' is the memory cost in KiB
+  - 't=N' is the time cost (passes)
+  - 'p=N' is the parallelism
+  - <salt-b64> and <hash-b64> are the salt and hash bytes in base64
+    (standard alphabet, no padding per the reference implementation
+    convention).
+
+Verification is constant-time on the final hash comparison so that an
+attacker cannot detect partial matches through timing.
+
+References:
+- RFC 9106: Argon2 password hash.
+- OWASP Password Storage Cheat Sheet 2023.
+- libargon2 reference encoding format.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "compiler/frontend/primitives/crypto_identity/key_derivation.runa" as Kdf
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+Import "compiler/frontend/import_system/crypto/entropy.runa" as Entropy
+
+Note: ============================================================================
+Note: SECTION 1: Default parameter constants
+Note: ============================================================================
+
+Let PASSPHRASE_DEFAULT_M_COST be 65536
+Let PASSPHRASE_DEFAULT_T_COST be 3
+Let PASSPHRASE_DEFAULT_P_COST be 1
+Let PASSPHRASE_DEFAULT_HASH_LEN be 32
+Let PASSPHRASE_DEFAULT_SALT_LEN be 16
+Let PASSPHRASE_VERSION be 19
+
+Note: ============================================================================
+Note: SECTION 2: generate_salt - draw N random bytes from OS entropy
+Note: ============================================================================
+
+@Reasoning
+Generate a cryptographically random salt of the requested byte length
+using the OS entropy source via entropy_random_bytes. The salt does not
+need to be secret, but it MUST be unpredictable so that pre-computed
+rainbow tables are infeasible.
+
+Returns a pointer to an arena-allocated buffer of byte_count bytes, or
+0 on entropy failure.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena and byte_count.
+  2. Allocate buffer.
+  3. Fill via entropy_random_bytes.
+  4. On failure, secure_zero the partial buffer and return 0.
+@End Implementation
+
+@Performance_Hints
+One entropy read; sub-millisecond on modern hosts (Linux getrandom(2)).
+@End Performance_Hints
+
+@Security_Scope
+Salt is non-secret but must be cryptographically random; entropy.runa
+provides the OS-grade DRBG.
+@End Security_Scope
+Process called "generate_salt" takes arena as Integer, byte_count as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If byte_count is less than 1:
+        Return 0
+    End If
+    Let buf be Arena.arena_allocate(arena, byte_count)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let rc be Entropy.entropy_random_bytes(arena, buf, byte_count)
+    If rc is equal to 0:
+        Secure.secure_zero(buf, byte_count)
+        Return 0
+    End If
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: passphrase_hash - compute encoded Argon2id hash
+Note: ============================================================================
+
+@Reasoning
+Hash a passphrase and return the encoded $argon2id$ string. The params
+struct is passed inline via discrete integer parameters; for v0.0.8.5
+the params are: m_cost_kib, t_cost, parallelism, hash_len, salt_len.
+A salt is generated fresh from OS entropy.
+
+The returned string is null-terminated ASCII.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate parameters against reasonable bounds.
+  2. Generate fresh salt.
+  3. Run argon2id_derive to compute the hash bytes.
+  4. Format the salt and hash as base64 (no padding per libargon2).
+  5. Concatenate: $argon2id$v=19$m=M,t=T,p=P$<salt-b64>$<hash-b64>\0.
+@End Implementation
+
+@Performance_Hints
+Dominated by argon2id_derive. With m=65536 KiB, t=3: ~0.5-1 second on
+modern hardware.
+@End Performance_Hints
+
+@Security_Scope
+The password is consumed but never logged. The output encoded string is
+safe to store in plaintext (it's a one-way hash).
+@End Security_Scope
+Process called "passphrase_hash" takes arena as Integer, password as Integer, password_len as Integer, m_cost_kib as Integer, t_cost as Integer, parallelism as Integer, hash_len as Integer, salt_len as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If password is equal to 0:
+        If password_len is not equal to 0:
+            Return 0
+        End If
+    End If
+    If m_cost_kib is less than 8:
+        Return 0
+    End If
+    If t_cost is less than 1:
+        Return 0
+    End If
+    If parallelism is less than 1:
+        Return 0
+    End If
+    If hash_len is less than 4:
+        Return 0
+    End If
+    If salt_len is less than 8:
+        Return 0
+    End If
+
+    Let salt_buf be generate_salt(arena, salt_len)
+    If salt_buf is equal to 0:
+        Return 0
+    End If
+
+    Let hash_buf be Arena.arena_allocate(arena, hash_len)
+    If hash_buf is equal to 0:
+        Return 0
+    End If
+
+    Let rc be Kdf.argon2id_derive(arena, password, password_len, salt_buf, salt_len, t_cost, m_cost_kib, parallelism, hash_len, hash_buf)
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Note: Build the encoded string.
+    Let encoded be passphrase_encode_string(arena, m_cost_kib, t_cost, parallelism, salt_buf, salt_len, hash_buf, hash_len)
+    Return encoded
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: passphrase_encode_string - format the $argon2id$... string
+Note: ============================================================================
+
+@Reasoning
+Build the standard Argon2id encoded string. The format is:
+  $argon2id$v=19$m=M,t=T,p=P$<salt-b64>$<hash-b64>
+
+Base64 here is the "RFC 4648 standard with no padding" alphabet (the
+reference libargon2 omits the '=' padding characters).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Compute the base64 lengths: ceil(N * 4 / 3) without padding.
+  2. Pre-compute the decimal-string lengths of M, T, P.
+  3. Allocate the output buffer with the exact total length plus 1 null.
+  4. Write each segment in order.
+@End Implementation
+
+@Performance_Hints
+O(salt_len + hash_len). Each byte produces a small number of output chars.
+@End Performance_Hints
+
+@Security_Scope
+Non-secret encoded output.
+@End Security_Scope
+Process called "passphrase_encode_string" takes arena as Integer, m_cost as Integer, t_cost as Integer, p_cost as Integer, salt_buf as Integer, salt_len as Integer, hash_buf as Integer, hash_len as Integer returns Integer:
+    Let m_str_len be passphrase_decimal_length(m_cost)
+    Let t_str_len be passphrase_decimal_length(t_cost)
+    Let p_str_len be passphrase_decimal_length(p_cost)
+    Let salt_b64_len be passphrase_b64_nopad_length(salt_len)
+    Let hash_b64_len be passphrase_b64_nopad_length(hash_len)
+
+    Note: "$argon2id$v=19$m=" = 17 chars; ",t=" = 3; ",p=" = 3; "$" twice = 2.
+    Let prefix_len be 17 plus m_str_len plus 3 plus t_str_len plus 3 plus p_str_len plus 1 plus salt_b64_len plus 1 plus hash_b64_len
+    Let total_len be prefix_len plus 1
+    Let out_buf be Arena.arena_allocate(arena, total_len)
+    If out_buf is equal to 0:
+        Return 0
+    End If
+
+    Let off be 0
+    Note: "$argon2id$"
+    Memory.memory_set_byte(out_buf, off, 36)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 97)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 114)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 103)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 111)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 110)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 50)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 105)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 100)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 36)
+    Set off to off plus 1
+
+    Note: "v=19$"
+    Memory.memory_set_byte(out_buf, off, 118)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 61)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 49)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 57)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 36)
+    Set off to off plus 1
+
+    Note: "m="
+    Memory.memory_set_byte(out_buf, off, 109)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 61)
+    Set off to off plus 1
+    Set off to passphrase_write_decimal(out_buf, off, m_cost)
+    Note: ",t="
+    Memory.memory_set_byte(out_buf, off, 44)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 116)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 61)
+    Set off to off plus 1
+    Set off to passphrase_write_decimal(out_buf, off, t_cost)
+    Note: ",p="
+    Memory.memory_set_byte(out_buf, off, 44)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 112)
+    Set off to off plus 1
+    Memory.memory_set_byte(out_buf, off, 61)
+    Set off to off plus 1
+    Set off to passphrase_write_decimal(out_buf, off, p_cost)
+
+    Note: "$" + salt_b64.
+    Memory.memory_set_byte(out_buf, off, 36)
+    Set off to off plus 1
+    Set off to passphrase_write_b64_nopad(out_buf, off, salt_buf, salt_len)
+
+    Note: "$" + hash_b64.
+    Memory.memory_set_byte(out_buf, off, 36)
+    Set off to off plus 1
+    Set off to passphrase_write_b64_nopad(out_buf, off, hash_buf, hash_len)
+
+    Note: Null terminator.
+    Memory.memory_set_byte(out_buf, off, 0)
+
+    Return out_buf
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: passphrase_decimal_length - count digits
+Note: ============================================================================
+
+@Reasoning
+Compute the number of decimal digits required to represent a non-negative
+integer.
+@End Reasoning
+
+@Implementation
+Iterative divide-by-10.
+@End Implementation
+
+@Performance_Hints
+O(log10 n).
+@End Performance_Hints
+
+@Security_Scope
+Public.
+@End Security_Scope
+Process called "passphrase_decimal_length" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 1
+    End If
+    Let count be 0
+    Let v be n
+    While v is greater than 0:
+        Set v to v divided by 10
+        Set count to count plus 1
+    End While
+    Return count
+End Process
+
+@Reasoning
+Write n in decimal at buffer offset; returns the new offset.
+@End Reasoning
+
+@Implementation
+Compute digits in a small reversed buffer, then write forward.
+@End Implementation
+
+@Performance_Hints
+O(log10 n).
+@End Performance_Hints
+
+@Security_Scope
+Public.
+@End Security_Scope
+Process called "passphrase_write_decimal" takes buf as Integer, offset as Integer, n as Integer returns Integer:
+    If n is equal to 0:
+        Memory.memory_set_byte(buf, offset, 48)
+        Return offset plus 1
+    End If
+    Note: For Runa primitives we cannot allocate without an arena, so we
+    Note: use a small stack-style approach: compute digits into a local
+    Note: chain via twenty lets capable of up to 20 digits (2^63 fits).
+    Let d0 be 0
+    Let d1 be 0
+    Let d2 be 0
+    Let d3 be 0
+    Let d4 be 0
+    Let d5 be 0
+    Let d6 be 0
+    Let d7 be 0
+    Let d8 be 0
+    Let d9 be 0
+    Let d10 be 0
+    Let d11 be 0
+    Let d12 be 0
+    Let d13 be 0
+    Let d14 be 0
+    Let d15 be 0
+    Let d16 be 0
+    Let d17 be 0
+    Let d18 be 0
+    Let d19 be 0
+
+    Let v be n
+    Let dcount be 0
+    Note: Repeat divmod into d[0..dcount-1] (least significant first).
+    While v is greater than 0:
+        Let dig be v modulo by 10
+        If dcount is equal to 0:
+            Set d0 to dig
+        End If
+        If dcount is equal to 1:
+            Set d1 to dig
+        End If
+        If dcount is equal to 2:
+            Set d2 to dig
+        End If
+        If dcount is equal to 3:
+            Set d3 to dig
+        End If
+        If dcount is equal to 4:
+            Set d4 to dig
+        End If
+        If dcount is equal to 5:
+            Set d5 to dig
+        End If
+        If dcount is equal to 6:
+            Set d6 to dig
+        End If
+        If dcount is equal to 7:
+            Set d7 to dig
+        End If
+        If dcount is equal to 8:
+            Set d8 to dig
+        End If
+        If dcount is equal to 9:
+            Set d9 to dig
+        End If
+        If dcount is equal to 10:
+            Set d10 to dig
+        End If
+        If dcount is equal to 11:
+            Set d11 to dig
+        End If
+        If dcount is equal to 12:
+            Set d12 to dig
+        End If
+        If dcount is equal to 13:
+            Set d13 to dig
+        End If
+        If dcount is equal to 14:
+            Set d14 to dig
+        End If
+        If dcount is equal to 15:
+            Set d15 to dig
+        End If
+        If dcount is equal to 16:
+            Set d16 to dig
+        End If
+        If dcount is equal to 17:
+            Set d17 to dig
+        End If
+        If dcount is equal to 18:
+            Set d18 to dig
+        End If
+        If dcount is equal to 19:
+            Set d19 to dig
+        End If
+        Set dcount to dcount plus 1
+        Set v to v divided by 10
+    End While
+
+    Note: Write digits in reverse order (most significant first).
+    Let cur_off be offset
+    Let pos be dcount minus 1
+    While pos is greater than (0 minus 1):
+        Let val be 0
+        If pos is equal to 0:
+            Set val to d0
+        End If
+        If pos is equal to 1:
+            Set val to d1
+        End If
+        If pos is equal to 2:
+            Set val to d2
+        End If
+        If pos is equal to 3:
+            Set val to d3
+        End If
+        If pos is equal to 4:
+            Set val to d4
+        End If
+        If pos is equal to 5:
+            Set val to d5
+        End If
+        If pos is equal to 6:
+            Set val to d6
+        End If
+        If pos is equal to 7:
+            Set val to d7
+        End If
+        If pos is equal to 8:
+            Set val to d8
+        End If
+        If pos is equal to 9:
+            Set val to d9
+        End If
+        If pos is equal to 10:
+            Set val to d10
+        End If
+        If pos is equal to 11:
+            Set val to d11
+        End If
+        If pos is equal to 12:
+            Set val to d12
+        End If
+        If pos is equal to 13:
+            Set val to d13
+        End If
+        If pos is equal to 14:
+            Set val to d14
+        End If
+        If pos is equal to 15:
+            Set val to d15
+        End If
+        If pos is equal to 16:
+            Set val to d16
+        End If
+        If pos is equal to 17:
+            Set val to d17
+        End If
+        If pos is equal to 18:
+            Set val to d18
+        End If
+        If pos is equal to 19:
+            Set val to d19
+        End If
+        Memory.memory_set_byte(buf, cur_off, val plus 48)
+        Set cur_off to cur_off plus 1
+        Set pos to pos minus 1
+    End While
+    Return cur_off
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: base64 (no-padding) helpers
+Note: ============================================================================
+
+@Reasoning
+Compute the number of output chars for base64 without padding:
+  out_len = ceil(in_bytes * 4 / 3) = floor((in_bytes * 4 + 2) / 3)
+@End Reasoning
+
+@Implementation
+Arithmetic.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Public.
+@End Security_Scope
+Process called "passphrase_b64_nopad_length" takes in_bytes as Integer returns Integer:
+    Let bits be in_bytes multiplied by 8
+    Let chars be bits plus 5
+    Set chars to chars divided by 6
+    Return chars
+End Process
+
+@Reasoning
+Return the base64 character for a 0..63 index using the standard
+RFC 4648 alphabet (A-Z, a-z, 0-9, +, /).
+@End Reasoning
+
+@Implementation
+Branching on the index range.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Public.
+@End Security_Scope
+Process called "passphrase_b64_char" takes idx as Integer returns Integer:
+    If idx is less than 26:
+        Return 65 plus idx
+    End If
+    If idx is less than 52:
+        Return 97 plus (idx minus 26)
+    End If
+    If idx is less than 62:
+        Return 48 plus (idx minus 52)
+    End If
+    If idx is equal to 62:
+        Return 43
+    End If
+    Return 47
+End Process
+
+@Reasoning
+Write base64 (no padding) of in_buf[in_len] starting at out_buf[out_offset].
+Returns the new offset.
+
+Standard 3-bytes->4-chars encoding with the final partial group emitting
+only as many chars as needed (2 for a 1-byte remainder, 3 for a 2-byte
+remainder), with NO '=' padding.
+@End Reasoning
+
+@Implementation
+Walk in_buf in 3-byte groups. For each group, extract four 6-bit indices
+and write the corresponding chars. Handle the tail group.
+@End Implementation
+
+@Performance_Hints
+O(in_len).
+@End Performance_Hints
+
+@Security_Scope
+Public output.
+@End Security_Scope
+Process called "passphrase_write_b64_nopad" takes out_buf as Integer, out_offset as Integer, in_buf as Integer, in_len as Integer returns Integer:
+    Let i be 0
+    Let off be out_offset
+    Let full_groups be in_len divided by 3
+    Let tail_bytes be in_len modulo by 3
+    Let group_idx be 0
+    While group_idx is less than full_groups:
+        Let b0 be Memory.memory_get_byte(in_buf, i)
+        Let b1 be Memory.memory_get_byte(in_buf, i plus 1)
+        Let b2 be Memory.memory_get_byte(in_buf, i plus 2)
+        Let n0 be b0 divided by 4
+        Let n1 be ((b0 modulo by 4) multiplied by 16) plus (b1 divided by 16)
+        Let n2 be ((b1 modulo by 16) multiplied by 4) plus (b2 divided by 64)
+        Let n3 be b2 modulo by 64
+        Memory.memory_set_byte(out_buf, off, passphrase_b64_char(n0))
+        Memory.memory_set_byte(out_buf, off plus 1, passphrase_b64_char(n1))
+        Memory.memory_set_byte(out_buf, off plus 2, passphrase_b64_char(n2))
+        Memory.memory_set_byte(out_buf, off plus 3, passphrase_b64_char(n3))
+        Set off to off plus 4
+        Set i to i plus 3
+        Set group_idx to group_idx plus 1
+    End While
+    If tail_bytes is equal to 1:
+        Let b0t be Memory.memory_get_byte(in_buf, i)
+        Let n0t be b0t divided by 4
+        Let n1t be (b0t modulo by 4) multiplied by 16
+        Memory.memory_set_byte(out_buf, off, passphrase_b64_char(n0t))
+        Memory.memory_set_byte(out_buf, off plus 1, passphrase_b64_char(n1t))
+        Set off to off plus 2
+    End If
+    If tail_bytes is equal to 2:
+        Let b0u be Memory.memory_get_byte(in_buf, i)
+        Let b1u be Memory.memory_get_byte(in_buf, i plus 1)
+        Let n0u be b0u divided by 4
+        Let n1u be ((b0u modulo by 4) multiplied by 16) plus (b1u divided by 16)
+        Let n2u be (b1u modulo by 16) multiplied by 4
+        Memory.memory_set_byte(out_buf, off, passphrase_b64_char(n0u))
+        Memory.memory_set_byte(out_buf, off plus 1, passphrase_b64_char(n1u))
+        Memory.memory_set_byte(out_buf, off plus 2, passphrase_b64_char(n2u))
+        Set off to off plus 3
+    End If
+    Return off
+End Process
+
+Note: ============================================================================
+Note: SECTION 7: passphrase_verify - constant-time check
+Note: ============================================================================
+
+@Reasoning
+Verify a candidate passphrase against an encoded $argon2id$ string.
+Parses the encoded params, re-derives the hash with the same params and
+salt, then constant-time compares the resulting hash bytes.
+
+Returns 1 on match, 0 on mismatch (or any parse error).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Parse the encoded string into (m, t, p, salt_bytes, hash_bytes).
+  2. Allocate output buffer of hash_bytes_len.
+  3. Run argon2id_derive with the parsed params on the candidate.
+  4. Constant-time compare with the parsed hash bytes.
+@End Implementation
+
+@Performance_Hints
+Dominated by argon2id_derive.
+@End Performance_Hints
+
+@Security_Scope
+The final byte comparison is constant-time so a partial-prefix-match
+attacker cannot learn anything via timing.
+@End Security_Scope
+Process called "passphrase_verify" takes arena as Integer, password as Integer, password_len as Integer, encoded as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If encoded is equal to 0:
+        Return 0
+    End If
+    If password is equal to 0:
+        If password_len is not equal to 0:
+            Return 0
+        End If
+    End If
+
+    Let m_out be Arena.arena_allocate(arena, 8)
+    If m_out is equal to 0:
+        Return 0
+    End If
+    Let t_out be Arena.arena_allocate(arena, 8)
+    If t_out is equal to 0:
+        Return 0
+    End If
+    Let p_out be Arena.arena_allocate(arena, 8)
+    If p_out is equal to 0:
+        Return 0
+    End If
+    Let salt_ptr_out be Arena.arena_allocate(arena, 8)
+    If salt_ptr_out is equal to 0:
+        Return 0
+    End If
+    Let salt_len_out be Arena.arena_allocate(arena, 8)
+    If salt_len_out is equal to 0:
+        Return 0
+    End If
+    Let hash_ptr_out be Arena.arena_allocate(arena, 8)
+    If hash_ptr_out is equal to 0:
+        Return 0
+    End If
+    Let hash_len_out be Arena.arena_allocate(arena, 8)
+    If hash_len_out is equal to 0:
+        Return 0
+    End If
+
+    Let rc be passphrase_parse_encoded(arena, encoded, m_out, t_out, p_out, salt_ptr_out, salt_len_out, hash_ptr_out, hash_len_out)
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Let m_cost be Memory.memory_get_int64(m_out, 0)
+    Let t_cost be Memory.memory_get_int64(t_out, 0)
+    Let p_cost be Memory.memory_get_int64(p_out, 0)
+    Let salt_buf be Memory.memory_get_int64(salt_ptr_out, 0)
+    Let salt_len be Memory.memory_get_int64(salt_len_out, 0)
+    Let stored_hash be Memory.memory_get_int64(hash_ptr_out, 0)
+    Let stored_hash_len be Memory.memory_get_int64(hash_len_out, 0)
+
+    Let candidate_hash be Arena.arena_allocate(arena, stored_hash_len)
+    If candidate_hash is equal to 0:
+        Return 0
+    End If
+    Let derive_rc be Kdf.argon2id_derive(arena, password, password_len, salt_buf, salt_len, t_cost, m_cost, p_cost, stored_hash_len, candidate_hash)
+    If derive_rc is equal to 0:
+        Return 0
+    End If
+
+    Return Secure.constant_time_compare(candidate_hash, stored_hash, stored_hash_len)
+End Process
+
+Note: ============================================================================
+Note: SECTION 8: passphrase_needs_rehash - parameter migration check
+Note: ============================================================================
+
+@Reasoning
+Returns 1 if the encoded hash's parameters differ from the current
+recommended parameters (current_m_cost, current_t_cost, current_p_cost).
+This lets applications transparently upgrade stored hashes when CPU and
+memory budgets allow stronger params.
+
+Returns 0 if the encoded params already match the current recommendations.
+Returns 0 on parse failure (treated as "do not rehash"; the verify path
+will reject).
+@End Reasoning
+
+@Implementation
+Parse the encoded string for m, t, p; compare with the provided
+current_* parameters.
+@End Implementation
+
+@Performance_Hints
+O(encoded_length). Single parser pass.
+@End Performance_Hints
+
+@Security_Scope
+Public params; non-secret.
+@End Security_Scope
+Process called "passphrase_needs_rehash" takes arena as Integer, encoded as Integer, current_m_cost as Integer, current_t_cost as Integer, current_p_cost as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If encoded is equal to 0:
+        Return 0
+    End If
+
+    Let m_out be Arena.arena_allocate(arena, 8)
+    If m_out is equal to 0:
+        Return 0
+    End If
+    Let t_out be Arena.arena_allocate(arena, 8)
+    If t_out is equal to 0:
+        Return 0
+    End If
+    Let p_out be Arena.arena_allocate(arena, 8)
+    If p_out is equal to 0:
+        Return 0
+    End If
+    Let salt_ptr_out be Arena.arena_allocate(arena, 8)
+    If salt_ptr_out is equal to 0:
+        Return 0
+    End If
+    Let salt_len_out be Arena.arena_allocate(arena, 8)
+    If salt_len_out is equal to 0:
+        Return 0
+    End If
+    Let hash_ptr_out be Arena.arena_allocate(arena, 8)
+    If hash_ptr_out is equal to 0:
+        Return 0
+    End If
+    Let hash_len_out be Arena.arena_allocate(arena, 8)
+    If hash_len_out is equal to 0:
+        Return 0
+    End If
+
+    Let rc be passphrase_parse_encoded(arena, encoded, m_out, t_out, p_out, salt_ptr_out, salt_len_out, hash_ptr_out, hash_len_out)
+    If rc is equal to 0:
+        Return 0
+    End If
+    Let m_cost be Memory.memory_get_int64(m_out, 0)
+    Let t_cost be Memory.memory_get_int64(t_out, 0)
+    Let p_cost be Memory.memory_get_int64(p_out, 0)
+    If m_cost is not equal to current_m_cost:
+        Return 1
+    End If
+    If t_cost is not equal to current_t_cost:
+        Return 1
+    End If
+    If p_cost is not equal to current_p_cost:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 9: passphrase_parse_encoded - parser for the $argon2id$ format
+Note: ============================================================================
+
+@Reasoning
+Parse an Argon2id encoded string into its components. Expected format:
+  $argon2id$v=19$m=M,t=T,p=P$<salt-b64>$<hash-b64>\0
+
+Stores results into the caller-provided output qword pointers (so the
+caller can read them without allocating return tuples). Returns 1 on
+success, 0 on any parse error.
+@End Reasoning
+
+@Implementation
+State-machine-like parser:
+  1. Match literal "$argon2id$v=19$m=".
+  2. Read decimal integer for m.
+  3. Match ",t=".
+  4. Read decimal for t.
+  5. Match ",p=".
+  6. Read decimal for p.
+  7. Match "$".
+  8. Read base64-no-pad chars up to the next "$" into the salt buffer.
+  9. Match "$".
+  10. Read base64-no-pad chars to end-of-string into the hash buffer.
+@End Implementation
+
+@Performance_Hints
+O(encoded_length). Single pass.
+@End Performance_Hints
+
+@Security_Scope
+Untrusted input; bounded reads.
+@End Security_Scope
+Process called "passphrase_parse_encoded" takes arena as Integer, encoded as Integer, m_out as Integer, t_out as Integer, p_out as Integer, salt_ptr_out as Integer, salt_len_out as Integer, hash_ptr_out as Integer, hash_len_out as Integer returns Integer:
+    Note: Check literal prefix "$argon2id$v=19$m=".
+    Let prefix_match be passphrase_check_literal(encoded, 0, "$argon2id$v=19$m=", 17)
+    If prefix_match is equal to 0:
+        Return 0
+    End If
+    Let off be 17
+
+    Note: Read decimal m.
+    Let m_val_buf be Arena.arena_allocate(arena, 8)
+    If m_val_buf is equal to 0:
+        Return 0
+    End If
+    Let off_next be passphrase_read_decimal(encoded, off, m_val_buf)
+    If off_next is equal to off:
+        Return 0
+    End If
+    Memory.memory_set_int64(m_out, 0, Memory.memory_get_int64(m_val_buf, 0))
+    Set off to off_next
+
+    Note: Match ",t=".
+    If passphrase_check_literal(encoded, off, ",t=", 3) is equal to 0:
+        Return 0
+    End If
+    Set off to off plus 3
+
+    Let t_val_buf be Arena.arena_allocate(arena, 8)
+    If t_val_buf is equal to 0:
+        Return 0
+    End If
+    Let off_next2 be passphrase_read_decimal(encoded, off, t_val_buf)
+    If off_next2 is equal to off:
+        Return 0
+    End If
+    Memory.memory_set_int64(t_out, 0, Memory.memory_get_int64(t_val_buf, 0))
+    Set off to off_next2
+
+    If passphrase_check_literal(encoded, off, ",p=", 3) is equal to 0:
+        Return 0
+    End If
+    Set off to off plus 3
+
+    Let p_val_buf be Arena.arena_allocate(arena, 8)
+    If p_val_buf is equal to 0:
+        Return 0
+    End If
+    Let off_next3 be passphrase_read_decimal(encoded, off, p_val_buf)
+    If off_next3 is equal to off:
+        Return 0
+    End If
+    Memory.memory_set_int64(p_out, 0, Memory.memory_get_int64(p_val_buf, 0))
+    Set off to off_next3
+
+    Note: Match "$".
+    If Memory.memory_get_byte(encoded, off) is not equal to 36:
+        Return 0
+    End If
+    Set off to off plus 1
+
+    Note: Scan to next "$" for salt segment.
+    Let salt_start be off
+    While Memory.memory_get_byte(encoded, off) is not equal to 36:
+        If Memory.memory_get_byte(encoded, off) is equal to 0:
+            Return 0
+        End If
+        Set off to off plus 1
+    End While
+    Let salt_b64_len be off minus salt_start
+    Let salt_buf be Arena.arena_allocate(arena, salt_b64_len)
+    If salt_buf is equal to 0:
+        Return 0
+    End If
+    Let salt_byte_count_buf be Arena.arena_allocate(arena, 8)
+    If salt_byte_count_buf is equal to 0:
+        Return 0
+    End If
+    Let salt_decoded_len be passphrase_decode_b64_nopad(encoded, salt_start, salt_b64_len, salt_buf)
+    If salt_decoded_len is equal to 0 - 1:
+        Return 0
+    End If
+    Memory.memory_set_int64(salt_ptr_out, 0, salt_buf)
+    Memory.memory_set_int64(salt_len_out, 0, salt_decoded_len)
+
+    Note: Match the second "$".
+    If Memory.memory_get_byte(encoded, off) is not equal to 36:
+        Return 0
+    End If
+    Set off to off plus 1
+
+    Note: Scan to NUL for hash segment.
+    Let hash_start be off
+    While Memory.memory_get_byte(encoded, off) is not equal to 0:
+        Set off to off plus 1
+    End While
+    Let hash_b64_len be off minus hash_start
+    Let hash_buf be Arena.arena_allocate(arena, hash_b64_len)
+    If hash_buf is equal to 0:
+        Return 0
+    End If
+    Let hash_decoded_len be passphrase_decode_b64_nopad(encoded, hash_start, hash_b64_len, hash_buf)
+    If hash_decoded_len is equal to 0 - 1:
+        Return 0
+    End If
+    Memory.memory_set_int64(hash_ptr_out, 0, hash_buf)
+    Memory.memory_set_int64(hash_len_out, 0, hash_decoded_len)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 10: passphrase_check_literal - exact-match comparator
+Note: ============================================================================
+
+@Reasoning
+Check whether buffer[at..at+length] matches the given C string literal.
+Returns 1 on match, 0 otherwise.
+@End Reasoning
+
+@Implementation
+Byte-by-byte compare.
+@End Implementation
+
+@Performance_Hints
+O(length).
+@End Performance_Hints
+
+@Security_Scope
+Public input parsing.
+@End Security_Scope
+Process called "passphrase_check_literal" takes buffer as Integer, at as Integer, literal as String, length as Integer returns Integer:
+    Let i be 0
+    While i is less than length:
+        Let bb be Memory.memory_get_byte(buffer, at plus i)
+        Let lb be Memory.memory_get_byte(literal, i)
+        If bb is not equal to lb:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 11: passphrase_read_decimal - parse decimal integer
+Note: ============================================================================
+
+@Reasoning
+Read a decimal integer starting at buffer[at]. Returns the offset
+immediately after the last digit. Stores the parsed value at val_out[0].
+Returns at unchanged if no digits were read.
+@End Reasoning
+
+@Implementation
+Loop while the current byte is in [48..57] (ASCII '0'..'9'), accumulate
+value as value*10 + digit.
+@End Implementation
+
+@Performance_Hints
+O(digit_count).
+@End Performance_Hints
+
+@Security_Scope
+Public parsing.
+@End Security_Scope
+Process called "passphrase_read_decimal" takes buffer as Integer, at as Integer, val_out as Integer returns Integer:
+    Let value be 0
+    Let off be at
+    Let ch be Memory.memory_get_byte(buffer, off)
+    While ch is greater than 47:
+        If ch is greater than 57:
+            Memory.memory_set_int64(val_out, 0, value)
+            Return off
+        End If
+        Set value to (value multiplied by 10) plus (ch minus 48)
+        Set off to off plus 1
+        Set ch to Memory.memory_get_byte(buffer, off)
+    End While
+    Memory.memory_set_int64(val_out, 0, value)
+    Return off
+End Process
+
+Note: ============================================================================
+Note: SECTION 12: passphrase_decode_b64_nopad - decode base64 without padding
+Note: ============================================================================
+
+@Reasoning
+Decode base64-no-padding from buffer[at..at+length] into out_buf. Returns
+the number of decoded bytes, or 0xFFFFFFFFFFFFFFFF on invalid input.
+@End Reasoning
+
+@Implementation
+For each 4-char group, decode to 3 bytes. The final group may be 2 or 3
+chars producing 1 or 2 trailing bytes.
+@End Implementation
+
+@Performance_Hints
+O(length).
+@End Performance_Hints
+
+@Security_Scope
+Untrusted input; invalid chars return error.
+@End Security_Scope
+Process called "passphrase_decode_b64_nopad" takes buffer as Integer, at as Integer, length as Integer, out_buf as Integer returns Integer:
+    Let i be 0
+    Let out_off be 0
+    Let full_groups be length divided by 4
+    Let tail be length modulo by 4
+    Let gi be 0
+    While gi is less than full_groups:
+        Let c0 be Memory.memory_get_byte(buffer, at plus i)
+        Let c1 be Memory.memory_get_byte(buffer, at plus i plus 1)
+        Let c2 be Memory.memory_get_byte(buffer, at plus i plus 2)
+        Let c3 be Memory.memory_get_byte(buffer, at plus i plus 3)
+        Let v0 be passphrase_b64_value(c0)
+        Let v1 be passphrase_b64_value(c1)
+        Let v2 be passphrase_b64_value(c2)
+        Let v3 be passphrase_b64_value(c3)
+        If v0 is less than 0:
+            Return 0 minus 1
+        End If
+        If v1 is less than 0:
+            Return 0 minus 1
+        End If
+        If v2 is less than 0:
+            Return 0 minus 1
+        End If
+        If v3 is less than 0:
+            Return 0 minus 1
+        End If
+        Memory.memory_set_byte(out_buf, out_off, (v0 multiplied by 4) plus (v1 divided by 16))
+        Memory.memory_set_byte(out_buf, out_off plus 1, ((v1 modulo by 16) multiplied by 16) plus (v2 divided by 4))
+        Memory.memory_set_byte(out_buf, out_off plus 2, ((v2 modulo by 4) multiplied by 64) plus v3)
+        Set out_off to out_off plus 3
+        Set i to i plus 4
+        Set gi to gi plus 1
+    End While
+    If tail is equal to 2:
+        Let cx be Memory.memory_get_byte(buffer, at plus i)
+        Let cy be Memory.memory_get_byte(buffer, at plus i plus 1)
+        Let vx be passphrase_b64_value(cx)
+        Let vy be passphrase_b64_value(cy)
+        If vx is less than 0:
+            Return 0 minus 1
+        End If
+        If vy is less than 0:
+            Return 0 minus 1
+        End If
+        Memory.memory_set_byte(out_buf, out_off, (vx multiplied by 4) plus (vy divided by 16))
+        Set out_off to out_off plus 1
+    End If
+    If tail is equal to 3:
+        Let cu be Memory.memory_get_byte(buffer, at plus i)
+        Let cv be Memory.memory_get_byte(buffer, at plus i plus 1)
+        Let cw be Memory.memory_get_byte(buffer, at plus i plus 2)
+        Let vu be passphrase_b64_value(cu)
+        Let vv be passphrase_b64_value(cv)
+        Let vw be passphrase_b64_value(cw)
+        If vu is less than 0:
+            Return 0 minus 1
+        End If
+        If vv is less than 0:
+            Return 0 minus 1
+        End If
+        If vw is less than 0:
+            Return 0 minus 1
+        End If
+        Memory.memory_set_byte(out_buf, out_off, (vu multiplied by 4) plus (vv divided by 16))
+        Memory.memory_set_byte(out_buf, out_off plus 1, ((vv modulo by 16) multiplied by 16) plus (vw divided by 4))
+        Set out_off to out_off plus 2
+    End If
+    Return out_off
+End Process
+
+@Reasoning
+Convert a base64 character (RFC 4648 standard alphabet) to its 0..63
+index, or -1 if not a valid base64 char.
+@End Reasoning
+
+@Implementation
+Range tests on the ASCII value.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Untrusted input.
+@End Security_Scope
+Process called "passphrase_b64_value" takes c as Integer returns Integer:
+    If c is greater than 64:
+        If c is less than 91:
+            Return c minus 65
+        End If
+    End If
+    If c is greater than 96:
+        If c is less than 123:
+            Return (c minus 97) plus 26
+        End If
+    End If
+    If c is greater than 47:
+        If c is less than 58:
+            Return (c minus 48) plus 52
+        End If
+    End If
+    If c is equal to 43:
+        Return 62
+    End If
+    If c is equal to 47:
+        Return 63
+    End If
+    Return 0 minus 1
+End Process

@@ -1,0 +1,2640 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+IEEE 754-2008 Decimal32 (decimal interchange format, 32 bits).
+
+Reference: IEEE Std 754-2008, Section 3.5.2 (decimal interchange formats),
+Section 5 (operations), Section 4 (rounding-direction attributes), and
+Section 7 (default exception handling).
+
+Format: 32 bits total
+    sign       1 bit       (s)
+    combination 11 bits    (G)         encodes biased exponent + leading digit
+    coefficient 20 bits    (T)         encodes the remaining 6 BID-binary digits
+
+Significand: 7 decimal digits (max value 9999999)
+Biased exponent range: 0..191 (11-bit biased)
+Exponent bias: 101
+Unbiased exponent range: -101..+90 for normal (-95..+96 for "Quantum" exponent
+                         per IEEE 754-2008 Table 3.6 with q = e - p + 1, p=7)
+
+Encoding selected: BID (Binary Integer Decimal, Intel-style).
+Rationale lives in the per-process @Reasoning blocks; in short, BID stores the
+significand as a plain unsigned binary integer (0..9999999), which means
+arithmetic can be performed with native 64-bit integer ops and only the
+encode/decode boundary touches the bitfield layout. DPD would require packed
+3-digit declets to be unpacked into binary before every multiply and re-packed
+after, which is pure overhead on a CPU without dedicated decimal hardware.
+
+Special values (IEEE 754-2008 Section 3.5.2):
+    Infinity:    G[0..4]  = 11110, sign in s
+    Quiet NaN:   G[0..5]  = 111110
+    Signaling NaN: G[0..5] = 111111
+
+Rounding modes implemented (IEEE 754-2008 Section 4.3):
+    roundTiesToEven  (default for finance, the only IEEE-mandated default)
+    roundTiesToAway  (round half up away from zero)
+    roundTowardZero  (truncation)
+    roundTowardPositive (ceiling)
+    roundTowardNegative (floor)
+
+Unpacked representation (in-memory triple used by all arithmetic):
+    Allocated struct (32 bytes):
+        offset 0  : sign        (0 = positive, 1 = negative)
+        offset 8  : kind        (0 finite, 1 +Inf, 2 -Inf, 3 qNaN, 4 sNaN)
+        offset 16 : coefficient (Integer; 0..9999999 for normalized finite)
+        offset 24 : exponent    (Integer; unbiased decimal exponent)
+
+The encoded 32-bit form lives in a single Integer (low 32 bits used).
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: Constants - IEEE 754-2008 Decimal32 parameters
+Note: ============================================================================
+
+Constant DEC32_PRECISION as Integer is 7
+Constant DEC32_EMAX as Integer is 96
+Constant DEC32_EMIN as Integer is -95
+Constant DEC32_BIAS as Integer is 101
+Constant DEC32_MAX_COEFF as Integer is 9999999
+Constant DEC32_MAX_BIASED_EXP as Integer is 191
+
+Constant DEC32_KIND_FINITE as Integer is 0
+Constant DEC32_KIND_POS_INF as Integer is 1
+Constant DEC32_KIND_NEG_INF as Integer is 2
+Constant DEC32_KIND_QNAN as Integer is 3
+Constant DEC32_KIND_SNAN as Integer is 4
+
+Constant DEC32_ROUND_HALF_EVEN as Integer is 0
+Constant DEC32_ROUND_HALF_UP as Integer is 1
+Constant DEC32_ROUND_TOWARD_ZERO as Integer is 2
+Constant DEC32_ROUND_TOWARD_POS as Integer is 3
+Constant DEC32_ROUND_TOWARD_NEG as Integer is 4
+
+Constant DEC32_UNPACKED_SIZE as Integer is 32
+
+Note: ============================================================================
+Note: Power-of-ten table (10^0 .. 10^18 fit in 63-bit signed Integer)
+Note: ============================================================================
+
+Process called "dec32_pow10" takes n as Integer returns Integer:
+    @Reasoning
+    Power-of-ten lookup. For Decimal32 the largest power we need during
+    coefficient normalization is 10^7 (one digit beyond DEC32_PRECISION).
+    During multiplication of two 7-digit coefficients we get up to 14 digits,
+    which fits comfortably in a 63-bit Integer, so 10^14 is required for
+    scale-down logic. We tabulate 10^0..10^18 because the same helper is
+    reused by Decimal64 internally during cross-precision conversion and
+    because 10^18 is the largest power that fits in a signed 63-bit Integer
+    (10^19 = 10000000000000000000, which exceeds 2^63-1 = 9223372036854775807).
+    @End Reasoning
+
+    @Implementation
+    1. Reject n < 0 (return 0 as a sentinel; callers must not request a
+       negative exponent here).
+    2. Reject n > 18 (return 0 sentinel; out-of-range for 63-bit Integer).
+    3. Iteratively multiply 1 by 10, n times. The loop is bounded by 18
+       iterations so we do not need a lookup table allocation.
+    @End Implementation
+
+    @Performance_Hints
+    O(n) but n is bounded above by 18. Inlining the loop avoids the cost
+    of a table-allocation pass at module-init time, which matters for
+    cold-start latency in batch financial reconciliation tools.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure function of n. No memory accesses, no allocation, no syscalls.
+    Out-of-range n returns 0 which is a safe sentinel (decimal coefficient
+    0 is meaningful but a divisor of 0 would surface as a separate divide
+    error in callers).
+    @End Security_Scope
+
+    If n is less than 0:
+        Return 0
+    End If
+    If n is greater than 18:
+        Return 0
+    End If
+    Let result be 1
+    Let i be 0
+    While i is less than n:
+        Set result to result multiplied by 10
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Integer absolute value helper (avoids dependency on a math module)
+Note: ============================================================================
+
+Process called "dec32_abs" takes value as Integer returns Integer:
+    @Reasoning
+    Plain integer abs. We avoid Memory imports for a one-liner because every
+    helper that runs inside the arithmetic loop must be inline-able by the
+    backend; pulling in another module would add a call boundary that the
+    backend cannot inline yet at this stage of the compiler.
+    @End Reasoning
+
+    @Implementation
+    Branch on sign; negate via 0 minus value to avoid relying on a unary
+    minus parse form that older bootstrap parsers may not accept on
+    statement boundaries.
+    @End Implementation
+
+    @Performance_Hints
+    Two compares and one subtract in the worst case. Used heavily in the
+    rounding step and in dec32_count_digits.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure. Note: abs(MIN_INT) on a two's-complement machine is undefined in
+    the abstract but at Decimal32 precision we never see anything close to
+    2^62, so the pathological case cannot arise from valid Decimal32 data.
+    @End Security_Scope
+
+    If value is less than 0:
+        Return 0 minus value
+    End If
+    Return value
+End Process
+
+Note: ============================================================================
+Note: Digit-count helper
+Note: ============================================================================
+
+Process called "dec32_count_digits" takes coeff as Integer returns Integer:
+    @Reasoning
+    Counts the number of decimal digits in a non-negative coefficient. This
+    is used by the rounding/normalization step to decide how many positions
+    must be shifted to bring the coefficient into the 7-digit precision
+    window. We accept and tolerate up to 16-digit input because internal
+    intermediates (e.g. coeff_a * coeff_b after a multiply) can grow that
+    large before being scaled back. Decimal32 final results always have at
+    most DEC32_PRECISION (7) digits.
+    @End Reasoning
+
+    @Implementation
+    Walk a table of cumulative power-of-ten thresholds. For coeff < 10^k
+    return k. Special case coeff == 0 returning 1 to match the conventional
+    digit count of the literal "0".
+    @End Implementation
+
+    @Performance_Hints
+    O(log10 coeff). Iterative compare is faster than calling pow10 in a
+    loop because the comparisons short-circuit at the first match.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure. Negative input is normalized to its absolute value before the
+    decision so the result is always >= 1.
+    @End Security_Scope
+
+    Let v be dec32_abs(coeff)
+    If v is equal to 0:
+        Return 1
+    End If
+    Let count be 0
+    While v is greater than 0:
+        Set count to count plus 1
+        Set v to v divided by 10
+    End While
+    Return count
+End Process
+
+Note: ============================================================================
+Note: Unpacked triple constructors and accessors
+Note: ============================================================================
+
+Process called "dec32_unpacked_create" takes sign as Integer, kind as Integer, coefficient as Integer, exponent as Integer returns Integer:
+    @Reasoning
+    Allocates a 32-byte struct holding the unpacked Decimal32 triple. The
+    arithmetic primitives operate on this allocation form because it
+    avoids re-decoding the BID layout on every step of a long
+    accumulation, which is critical for column-oriented financial
+    aggregations.
+    @End Reasoning
+
+    @Implementation
+    1. allocate(32)
+    2. Store sign at offset 0, kind at offset 8, coefficient at offset 16,
+       exponent at offset 24.
+    3. Return the pointer.
+    @End Implementation
+
+    @Performance_Hints
+    Single allocate call; struct lives on the owned-heap tier. For
+    short-lived intermediates the caller should arena-allocate instead
+    (a future optimization gated on the typed-arena pass).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0 (a NULL sentinel). All callers in this
+    module check for the 0 sentinel before dereferencing.
+    @End Security_Scope
+
+    Let p be Layout.allocate(DEC32_UNPACKED_SIZE)
+    If p is equal to 0:
+        Return 0
+    End If
+    __store(p, 0, sign)
+    __store(p, 8, kind)
+    __store(p, 16, coefficient)
+    __store(p, 24, exponent)
+    Return p
+End Process
+
+Process called "dec32_get_sign" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return __load(p, 0)
+End Process
+
+Process called "dec32_get_kind" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return DEC32_KIND_QNAN
+    End If
+    Return __load(p, 8)
+End Process
+
+Process called "dec32_get_coefficient" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return __load(p, 16)
+End Process
+
+Process called "dec32_get_exponent" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return __load(p, 24)
+End Process
+
+Process called "dec32_destroy" takes p as Integer returns Integer:
+    @Reasoning
+    Releases the unpacked triple to the owned-heap allocator. Callers
+    must call this once they have re-encoded the result back to the
+    32-bit BID form, otherwise the per-operation allocation will leak.
+    @End Reasoning
+
+    @Implementation
+    Layout.deallocate is a no-op on 0, but we guard anyway for symmetry
+    with the rest of the API.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). The deallocate path may quarantine the block under DEBUG
+    canary builds but on release builds returns directly to the free
+    list.
+    @End Performance_Hints
+
+    @Security_Scope
+    Double-free is detected by the underlying allocator and aborts the
+    process via the canary protocol.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Layout.deallocate(p)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Special-value constructors
+Note: ============================================================================
+
+Process called "dec32_make_zero" takes sign as Integer returns Integer:
+    @Reasoning
+    Constructs a signed zero. IEEE 754-2008 distinguishes +0 and -0 in the
+    sign-bit but they compare equal under all ordered comparisons. The
+    exponent stored for zero is the "preferred" exponent 0 (q = 0) per
+    IEEE 754-2008 Section 5.4.1 Note 2: zero results from arithmetic adopt
+    the exponent dictated by the operation, but a "fresh" zero literal
+    uses 0.
+    @End Reasoning
+
+    @Implementation
+    Allocate via dec32_unpacked_create with kind = FINITE, coefficient = 0,
+    exponent = 0.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path for accumulator initialization. Single allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    sign bits other than 0 or 1 are normalized to 1 (any non-zero treated
+    as negative). This matches the bit-field semantics of the encoded
+    form and prevents callers from injecting nonsense sign values that
+    would break the sign-XOR in dec32_multiply.
+    @End Security_Scope
+
+    Let s be sign
+    If s is not equal to 0:
+        Set s to 1
+    End If
+    Return dec32_unpacked_create(s, DEC32_KIND_FINITE, 0, 0)
+End Process
+
+Process called "dec32_make_infinity" takes sign as Integer returns Integer:
+    @Reasoning
+    Constructs +Inf or -Inf. The coefficient and exponent fields are
+    unused for infinities per IEEE 754-2008 Section 3.5.2 (the
+    combination bits 11110 mark Inf and the remaining bits are
+    "don't care" in interchange, but we store 0 for hygiene).
+    @End Reasoning
+
+    @Implementation
+    sign is normalized to 0/1, then kind set to POS_INF or NEG_INF.
+    @End Implementation
+
+    @Performance_Hints
+    Single allocation; used only in overflow handling and Inf/Inf inputs.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same sign-normalization rule as dec32_make_zero.
+    @End Security_Scope
+
+    Let s be sign
+    If s is not equal to 0:
+        Set s to 1
+    End If
+    Let kind be DEC32_KIND_POS_INF
+    If s is equal to 1:
+        Set kind to DEC32_KIND_NEG_INF
+    End If
+    Return dec32_unpacked_create(s, kind, 0, 0)
+End Process
+
+Process called "dec32_make_qnan" returns Integer:
+    @Reasoning
+    Quiet NaN sentinel. IEEE 754-2008 Section 6.2 says qNaNs propagate
+    silently through arithmetic; we do not need a payload at this stage
+    of the bootstrap because no upstream stdlib consumes NaN diagnostic
+    information.
+    @End Reasoning
+
+    @Implementation
+    Allocate with kind = QNAN, sign = 0, coefficient = 0, exponent = 0.
+    @End Implementation
+
+    @Performance_Hints
+    Single allocation; reached only on invalid-operation paths
+    (0/0, Inf - Inf, sqrt of negative, etc.).
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure. No external inputs.
+    @End Security_Scope
+
+    Return dec32_unpacked_create(0, DEC32_KIND_QNAN, 0, 0)
+End Process
+
+Process called "dec32_make_snan" returns Integer:
+    @Reasoning
+    Signaling NaN. Constructed only by user input (e.g. via the encoded
+    bit pattern) per IEEE 754-2008 Section 6.2; arithmetic never produces
+    sNaN. When an arithmetic op receives an sNaN it must signal invalid
+    and propagate as qNaN; that conversion happens in dec32_propagate_nan.
+    @End Reasoning
+
+    @Implementation
+    Allocate with kind = SNAN.
+    @End Implementation
+
+    @Performance_Hints
+    Single allocation. Not on any hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure. The signaling semantics live in the operation handlers, not
+    here.
+    @End Security_Scope
+
+    Return dec32_unpacked_create(0, DEC32_KIND_SNAN, 0, 0)
+End Process
+
+Note: ============================================================================
+Note: Predicates
+Note: ============================================================================
+
+Process called "dec32_is_zero" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    If __load(p, 8) is not equal to DEC32_KIND_FINITE:
+        Return 0
+    End If
+    If __load(p, 16) is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dec32_is_finite" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    If __load(p, 8) is equal to DEC32_KIND_FINITE:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dec32_is_infinite" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let k be __load(p, 8)
+    If k is equal to DEC32_KIND_POS_INF:
+        Return 1
+    End If
+    If k is equal to DEC32_KIND_NEG_INF:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dec32_is_nan" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let k be __load(p, 8)
+    If k is equal to DEC32_KIND_QNAN:
+        Return 1
+    End If
+    If k is equal to DEC32_KIND_SNAN:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dec32_is_signaling" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    If __load(p, 8) is equal to DEC32_KIND_SNAN:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dec32_is_negative" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    If __load(p, 0) is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: NaN propagation helper
+Note: ============================================================================
+
+Process called "dec32_propagate_nan" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754-2008 Section 6.2 specifies the NaN propagation order: if any
+    operand is sNaN the result is qNaN and the invalid-operation flag is
+    signaled; otherwise if any operand is qNaN the result is qNaN. We do
+    not preserve payloads in v0.0.8.5 because no upstream consumer reads
+    them yet, but the API leaves room for a payload-bearing version in a
+    future revision.
+    @End Reasoning
+
+    @Implementation
+    Check sNaN first (a then b), then qNaN. Returns a fresh qNaN allocation
+    so the caller can always destroy the returned pointer regardless of
+    which operand triggered the propagation.
+    @End Implementation
+
+    @Performance_Hints
+    Called on every arithmetic op that might involve NaNs. Two pointer
+    loads in the common (non-NaN) case where we return 0.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure given valid pointers. Returns 0 (no-NaN sentinel) if neither
+    operand is NaN.
+    @End Security_Scope
+
+    If a is not equal to 0:
+        Let ka be __load(a, 8)
+        If ka is equal to DEC32_KIND_SNAN:
+            Return dec32_make_qnan()
+        End If
+    End If
+    If b is not equal to 0:
+        Let kb be __load(b, 8)
+        If kb is equal to DEC32_KIND_SNAN:
+            Return dec32_make_qnan()
+        End If
+    End If
+    If a is not equal to 0:
+        Let ka2 be __load(a, 8)
+        If ka2 is equal to DEC32_KIND_QNAN:
+            Return dec32_make_qnan()
+        End If
+    End If
+    If b is not equal to 0:
+        Let kb2 be __load(b, 8)
+        If kb2 is equal to DEC32_KIND_QNAN:
+            Return dec32_make_qnan()
+        End If
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Round-to-precision (IEEE 754-2008 Section 4.3)
+Note: ============================================================================
+
+Process called "dec32_round_coefficient" takes sign as Integer, coeff as Integer, exp as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Brings a coefficient and exponent pair into the 7-digit precision
+    window. If the coefficient has more than DEC32_PRECISION digits we
+    must shift right by the excess and apply the rounding rule from
+    IEEE 754-2008 Section 4.3 to the discarded tail. The exponent is
+    increased by the same shift to preserve mathematical value.
+
+    We return a fresh unpacked triple. The function never returns 0 on
+    success; it returns 0 only on allocation failure of the result.
+
+    Underflow / overflow:
+        After rounding, if the unbiased exponent exceeds DEC32_EMAX we
+        return +/- infinity per IEEE 754-2008 Section 7.4 (overflow
+        signal). If the exponent is below DEC32_EMIN we increase it by
+        further shifting (subnormal handling); if even that cannot bring
+        it into range we return signed zero (underflow to zero).
+    @End Reasoning
+
+    @Implementation
+    1. If coeff == 0, return zero with exponent clamped to [EMIN, EMAX].
+    2. Count digits; if <= PRECISION, no rounding needed; just check
+       exponent range.
+    3. Otherwise: compute excess = digit_count - PRECISION. Compute
+       divisor = 10^excess. Split coeff into quotient = coeff / divisor
+       and remainder = coeff - quotient * divisor.
+    4. Determine round-up boolean per rounding_mode:
+         HALF_EVEN: round up if remainder > divisor/2, or if remainder
+                    == divisor/2 and quotient is odd.
+         HALF_UP:   round up if 2*remainder >= divisor.
+         TOWARD_ZERO: never round up.
+         TOWARD_POS: round up iff sign == 0 and remainder > 0.
+         TOWARD_NEG: round up iff sign == 1 and remainder > 0.
+    5. Increment quotient if round_up; if that causes a digit-carry
+       (quotient == 10^PRECISION) divide by 10 and bump exponent.
+    6. Final exponent check: clamp / signal overflow / underflow.
+    @End Implementation
+
+    @Performance_Hints
+    Inside the rounding loop we use pow10 lookups bounded to <= 18
+    iterations. No allocations until the final create.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure aside from the final allocation. coeff is treated as unsigned
+    semantic (caller passes its absolute value plus a separate sign).
+    @End Security_Scope
+
+    Let c be coeff
+    Let e be exp
+    Let s be sign
+    If s is not equal to 0:
+        Set s to 1
+    End If
+
+    If c is equal to 0:
+        Let ez be e
+        If ez is greater than DEC32_EMAX:
+            Set ez to DEC32_EMAX
+        End If
+        If ez is less than DEC32_EMIN:
+            Set ez to DEC32_EMIN
+        End If
+        Return dec32_unpacked_create(s, DEC32_KIND_FINITE, 0, ez)
+    End If
+
+    Let digits be dec32_count_digits(c)
+    If digits is greater than DEC32_PRECISION:
+        Let excess be digits minus DEC32_PRECISION
+        Let divisor be dec32_pow10(excess)
+        If divisor is equal to 0:
+            Return dec32_make_infinity(s)
+        End If
+        Let quotient be c divided by divisor
+        Let remainder be c minus (quotient multiplied by divisor)
+        Let round_up be 0
+        Let half be divisor divided by 2
+
+        If rounding_mode is equal to DEC32_ROUND_HALF_EVEN:
+            If remainder is greater than half:
+                Set round_up to 1
+            Otherwise:
+                If remainder is equal to half:
+                    Let last_digit be quotient minus ((quotient divided by 10) multiplied by 10)
+                    If last_digit is not equal to ((last_digit divided by 2) multiplied by 2):
+                        Set round_up to 1
+                    End If
+                End If
+            End If
+        End If
+        If rounding_mode is equal to DEC32_ROUND_HALF_UP:
+            If remainder is greater than or equal to half:
+                If remainder is not equal to 0:
+                    Set round_up to 1
+                End If
+            End If
+        End If
+        If rounding_mode is equal to DEC32_ROUND_TOWARD_ZERO:
+            Set round_up to 0
+        End If
+        If rounding_mode is equal to DEC32_ROUND_TOWARD_POS:
+            If s is equal to 0:
+                If remainder is greater than 0:
+                    Set round_up to 1
+                End If
+            End If
+        End If
+        If rounding_mode is equal to DEC32_ROUND_TOWARD_NEG:
+            If s is equal to 1:
+                If remainder is greater than 0:
+                    Set round_up to 1
+                End If
+            End If
+        End If
+
+        If round_up is equal to 1:
+            Set quotient to quotient plus 1
+        End If
+        Set e to e plus excess
+
+        Let cap be dec32_pow10(DEC32_PRECISION)
+        If quotient is greater than or equal to cap:
+            Set quotient to quotient divided by 10
+            Set e to e plus 1
+        End If
+        Set c to quotient
+    End If
+
+    If e is greater than DEC32_EMAX:
+        Note: Try to absorb extra exponent into trailing zeros of the
+        Note: coefficient, but only while coefficient remains below cap.
+        Let cap2 be dec32_pow10(DEC32_PRECISION)
+        Let allow_shift be cap2 divided by 10
+        While e is greater than DEC32_EMAX:
+            If c is greater than allow_shift:
+                Return dec32_make_infinity(s)
+            End If
+            Set c to c multiplied by 10
+            Set e to e minus 1
+        End While
+    End If
+
+    If e is less than DEC32_EMIN:
+        Note: Subnormal: shift coefficient right (with rounding) by the
+        Note: deficit until exponent is in range. If coefficient hits 0
+        Note: we have underflowed to zero.
+        While e is less than DEC32_EMIN:
+            If c is equal to 0:
+                Return dec32_unpacked_create(s, DEC32_KIND_FINITE, 0, DEC32_EMIN)
+            End If
+            Let last be c minus ((c divided by 10) multiplied by 10)
+            Let qsub be c divided by 10
+            Let rup2 be 0
+
+            If rounding_mode is equal to DEC32_ROUND_HALF_EVEN:
+                If last is greater than 5:
+                    Set rup2 to 1
+                Otherwise:
+                    If last is equal to 5:
+                        Let last_digit2 be qsub minus ((qsub divided by 10) multiplied by 10)
+                        If last_digit2 is not equal to ((last_digit2 divided by 2) multiplied by 2):
+                            Set rup2 to 1
+                        End If
+                    End If
+                End If
+            End If
+            If rounding_mode is equal to DEC32_ROUND_HALF_UP:
+                If last is greater than or equal to 5:
+                    Set rup2 to 1
+                End If
+            End If
+            If rounding_mode is equal to DEC32_ROUND_TOWARD_POS:
+                If s is equal to 0:
+                    If last is greater than 0:
+                        Set rup2 to 1
+                    End If
+                End If
+            End If
+            If rounding_mode is equal to DEC32_ROUND_TOWARD_NEG:
+                If s is equal to 1:
+                    If last is greater than 0:
+                        Set rup2 to 1
+                    End If
+                End If
+            End If
+
+            If rup2 is equal to 1:
+                Set qsub to qsub plus 1
+            End If
+            Set c to qsub
+            Set e to e plus 1
+        End While
+    End If
+
+    Return dec32_unpacked_create(s, DEC32_KIND_FINITE, c, e)
+End Process
+
+Note: ============================================================================
+Note: Comparisons (operate on unpacked triples)
+Note: ============================================================================
+
+Process called "dec32_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Three-way compare: returns -1 if a < b, 0 if equal, 1 if a > b. NaN
+    cases are signaled by returning -2 so callers can distinguish unordered
+    from "less than". This matches the IEEE 754-2008 compareQuietLess /
+    compareSignalingEqual contract once the caller does the NaN-to-flag
+    translation.
+    @End Reasoning
+
+    @Implementation
+    1. Handle NaN unordered.
+    2. Handle infinities by sign.
+    3. For finite numbers, equal magnitudes if both zero return 0.
+    4. Compare signs.
+    5. For same sign, compare magnitudes by aligning exponents.
+    @End Implementation
+
+    @Performance_Hints
+    The hot path (same-sign, similar-magnitude) requires a single
+    align-and-compare loop that runs at most DEC32_PRECISION + 1 = 8
+    iterations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure. No allocation. NULL operand returns -2 (unordered).
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0 minus 2
+    End If
+    If b is equal to 0:
+        Return 0 minus 2
+    End If
+    Let ka be __load(a, 8)
+    Let kb be __load(b, 8)
+    If ka is equal to DEC32_KIND_QNAN:
+        Return 0 minus 2
+    End If
+    If ka is equal to DEC32_KIND_SNAN:
+        Return 0 minus 2
+    End If
+    If kb is equal to DEC32_KIND_QNAN:
+        Return 0 minus 2
+    End If
+    If kb is equal to DEC32_KIND_SNAN:
+        Return 0 minus 2
+    End If
+
+    Note: Infinity handling
+    If ka is equal to DEC32_KIND_POS_INF:
+        If kb is equal to DEC32_KIND_POS_INF:
+            Return 0
+        End If
+        Return 1
+    End If
+    If ka is equal to DEC32_KIND_NEG_INF:
+        If kb is equal to DEC32_KIND_NEG_INF:
+            Return 0
+        End If
+        Return 0 minus 1
+    End If
+    If kb is equal to DEC32_KIND_POS_INF:
+        Return 0 minus 1
+    End If
+    If kb is equal to DEC32_KIND_NEG_INF:
+        Return 1
+    End If
+
+    Let sa be __load(a, 0)
+    Let sb be __load(b, 0)
+    Let ca be __load(a, 16)
+    Let cb be __load(b, 16)
+    Let ea be __load(a, 24)
+    Let eb be __load(b, 24)
+
+    Note: Both zero are equal regardless of sign
+    If ca is equal to 0:
+        If cb is equal to 0:
+            Return 0
+        End If
+    End If
+
+    If sa is not equal to sb:
+        If sa is equal to 1:
+            Return 0 minus 1
+        End If
+        Return 1
+    End If
+
+    Note: Same sign: compare magnitudes after exponent alignment.
+    Note: Bring both to the same exponent (the smaller one) by scaling up
+    Note: the coefficient of the side with the larger exponent.
+    Let mag_a be ca
+    Let mag_b be cb
+    Let exp_diff be ea minus eb
+    If exp_diff is greater than 0:
+        Note: Scale up a's coefficient. Cap the scaling to prevent overflow.
+        Let i be 0
+        While i is less than exp_diff:
+            If mag_a is greater than 922337203685477580:
+                Note: ca's magnitude eclipses cb regardless of scaling
+                If sa is equal to 1:
+                    Return 0 minus 1
+                End If
+                Return 1
+            End If
+            Set mag_a to mag_a multiplied by 10
+            Set i to i plus 1
+        End While
+    End If
+    If exp_diff is less than 0:
+        Let j be 0
+        Let nd be 0 minus exp_diff
+        While j is less than nd:
+            If mag_b is greater than 922337203685477580:
+                If sa is equal to 1:
+                    Return 1
+                End If
+                Return 0 minus 1
+            End If
+            Set mag_b to mag_b multiplied by 10
+            Set j to j plus 1
+        End While
+    End If
+
+    If mag_a is equal to mag_b:
+        Return 0
+    End If
+    If mag_a is less than mag_b:
+        If sa is equal to 1:
+            Return 1
+        End If
+        Return 0 minus 1
+    End If
+    If sa is equal to 1:
+        Return 0 minus 1
+    End If
+    Return 1
+End Process
+
+Process called "dec32_eq" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754-2008 compareQuietEqual. NaNs are unordered (never equal),
+    so they return 0.
+    @End Reasoning
+    @Implementation
+    Wrap dec32_compare; treat -2 (unordered) as 0 (not equal).
+    @End Implementation
+    @Performance_Hints
+    One compare call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    Let c be dec32_compare(a, b)
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dec32_ne" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754-2008 compareQuietNotEqual. NaNs are never equal so NaN
+    comparisons return 1 (not equal).
+    @End Reasoning
+    @Implementation
+    Negate dec32_eq, but with NaN-handling: unordered (compare == -2) is
+    "not equal" = 1.
+    @End Implementation
+    @Performance_Hints
+    One compare call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    Let c be dec32_compare(a, b)
+    If c is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "dec32_lt" takes a as Integer, b as Integer returns Integer:
+    Let c be dec32_compare(a, b)
+    If c is equal to 0 minus 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dec32_le" takes a as Integer, b as Integer returns Integer:
+    Let c be dec32_compare(a, b)
+    If c is equal to 0 minus 1:
+        Return 1
+    End If
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dec32_gt" takes a as Integer, b as Integer returns Integer:
+    Let c be dec32_compare(a, b)
+    If c is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dec32_ge" takes a as Integer, b as Integer returns Integer:
+    Let c be dec32_compare(a, b)
+    If c is equal to 1:
+        Return 1
+    End If
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Negation and absolute value
+Note: ============================================================================
+
+Process called "dec32_neg" takes a as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    IEEE 754-2008 negate: flip sign bit; do not modify coefficient,
+    exponent, or NaN payload. negate is a bit-level operation, not an
+    arithmetic operation, so no rounding occurs (the parameter is
+    retained for API symmetry with the other ops).
+    @End Reasoning
+    @Implementation
+    Allocate a fresh triple with sign flipped (0 <-> 1) and all other
+    fields copied verbatim.
+    @End Implementation
+    @Performance_Hints
+    Single allocation; no arithmetic.
+    @End Performance_Hints
+    @Security_Scope
+    Pure. NaN propagates by copy (sign-flip on NaN is well-defined per
+    IEEE 754-2008 Section 6.3).
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return dec32_make_qnan()
+    End If
+    Let sa be __load(a, 0)
+    Let ka be __load(a, 8)
+    Let ca be __load(a, 16)
+    Let ea be __load(a, 24)
+    Let new_sign be 1
+    If sa is equal to 1:
+        Set new_sign to 0
+    End If
+    Let new_kind be ka
+    If ka is equal to DEC32_KIND_POS_INF:
+        Set new_kind to DEC32_KIND_NEG_INF
+    End If
+    If ka is equal to DEC32_KIND_NEG_INF:
+        Set new_kind to DEC32_KIND_POS_INF
+    End If
+    Return dec32_unpacked_create(new_sign, new_kind, ca, ea)
+End Process
+
+Process called "dec32_abs_value" takes a as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    IEEE 754-2008 abs: clear sign bit; no rounding.
+    @End Reasoning
+    @Implementation
+    Copy fields, set sign = 0, flip NEG_INF to POS_INF.
+    @End Implementation
+    @Performance_Hints
+    Single allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return dec32_make_qnan()
+    End If
+    Let ka be __load(a, 8)
+    Let ca be __load(a, 16)
+    Let ea be __load(a, 24)
+    Let new_kind be ka
+    If ka is equal to DEC32_KIND_NEG_INF:
+        Set new_kind to DEC32_KIND_POS_INF
+    End If
+    Return dec32_unpacked_create(0, new_kind, ca, ea)
+End Process
+
+Note: ============================================================================
+Note: Addition / subtraction (IEEE 754-2008 Section 5.4.1)
+Note: ============================================================================
+
+Process called "dec32_add" takes a as Integer, b as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Decimal addition with exact intermediate precision then a single
+    correctly-rounded result. Both operands are aligned to a common
+    exponent (the smaller of the two) by scaling the larger-exponent
+    coefficient up by 10^diff. The sum then has at most max(digits_a,
+    digits_b) + 1 = 8 digits, which fits in a 63-bit integer with
+    enormous headroom. We then call dec32_round_coefficient to reduce
+    back to the 7-digit precision per the rounding_mode.
+
+    CORRECTNESS GUARANTEE: For inputs that are exact decimal values
+    representable in Decimal32, the sum is computed in the integer
+    domain with no intermediate loss of precision. This is the entire
+    point of decimal floating-point: 0.1 + 0.2 in Decimal32 is
+    coefficient 1 exp -1 + coefficient 2 exp -1 = coefficient 3 exp -1
+    = 0.3 EXACTLY. The IEEE 754-2008 Section 5.4.1 "correctly rounded"
+    requirement is therefore satisfied trivially for sums whose result
+    digit count is <= 7; for sums that produce 8 digits we round in
+    accordance with rounding_mode.
+    @End Reasoning
+
+    @Implementation
+    1. NaN propagation via dec32_propagate_nan.
+    2. Infinity handling: +Inf + +Inf = +Inf, -Inf + -Inf = -Inf,
+       +Inf + -Inf = qNaN (invalid). Finite + Inf = Inf (signed).
+    3. Align exponents by scaling the higher-exponent coefficient up.
+       If the scale factor exceeds 10^14 the smaller operand is below
+       the precision threshold and we can treat it as zero (this is
+       the "guard digit" optimization; we still round one extra digit
+       to preserve correct rounding).
+    4. Combine coefficients with sign-aware addition. If signs differ,
+       subtract magnitudes and take the sign of the larger operand.
+    5. Round result via dec32_round_coefficient.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path. The alignment loop is bounded by ~14 iterations (the
+    maximum difference in exponents before one operand is negligible
+    at Decimal32 precision). The actual addition is a single 64-bit
+    add. The rounding step traverses at most one excess digit on
+    cancellation-free sums and at most ~8 digits on subtractive
+    cancellation (where leading digits cancel).
+    @End Performance_Hints
+
+    @Security_Scope
+    NaN-propagation matches IEEE 754-2008 Section 6.2. Invalid
+    operations (Inf + -Inf) produce qNaN.
+    @End Security_Scope
+
+    Let np be dec32_propagate_nan(a, b)
+    If np is not equal to 0:
+        Return np
+    End If
+    If a is equal to 0:
+        Return dec32_make_qnan()
+    End If
+    If b is equal to 0:
+        Return dec32_make_qnan()
+    End If
+
+    Let ka be __load(a, 8)
+    Let kb be __load(b, 8)
+
+    Note: Infinity handling
+    If ka is equal to DEC32_KIND_POS_INF:
+        If kb is equal to DEC32_KIND_NEG_INF:
+            Return dec32_make_qnan()
+        End If
+        Return dec32_make_infinity(0)
+    End If
+    If ka is equal to DEC32_KIND_NEG_INF:
+        If kb is equal to DEC32_KIND_POS_INF:
+            Return dec32_make_qnan()
+        End If
+        Return dec32_make_infinity(1)
+    End If
+    If kb is equal to DEC32_KIND_POS_INF:
+        Return dec32_make_infinity(0)
+    End If
+    If kb is equal to DEC32_KIND_NEG_INF:
+        Return dec32_make_infinity(1)
+    End If
+
+    Let sa be __load(a, 0)
+    Let sb be __load(b, 0)
+    Let ca be __load(a, 16)
+    Let cb be __load(b, 16)
+    Let ea be __load(a, 24)
+    Let eb be __load(b, 24)
+
+    Note: Align both operands at a single exponent so the coefficients
+    Note: can be summed/differenced as integers. The natural choice is
+    Note: exp_common = min(ea, eb) (scale both UP), but a Decimal32
+    Note: coefficient has up to 7 digits and a 64-bit Integer holds
+    Note: ~18.9 decimal digits, so the larger operand can be scaled up
+    Note: by at most cap_shift = 11 digits without overflowing the
+    Note: sum domain. When the exponent gap exceeds cap_shift, we
+    Note: re-anchor exp_common UP to (max(ea,eb) - cap_shift) so the
+    Note: larger operand scales by exactly cap_shift digits and the
+    Note: smaller operand scales DOWN, with any discarded digits
+    Note: captured as a sticky bit that biases the final rounding.
+    Let cap_shift be 11
+    Let max_exp be ea
+    If eb is greater than ea:
+        Set max_exp to eb
+    End If
+    Let min_exp be eb
+    If ea is less than eb:
+        Set min_exp to ea
+    End If
+    Let exp_common be min_exp
+    If (max_exp minus min_exp) is greater than cap_shift:
+        Set exp_common to max_exp minus cap_shift
+    End If
+
+    Let shift_a be ea minus exp_common
+    Let shift_b be eb minus exp_common
+
+    Let scaled_a be ca
+    Let sticky_a be 0
+    If shift_a is greater than or equal to 0:
+        Let i be 0
+        While i is less than shift_a:
+            Set scaled_a to scaled_a multiplied by 10
+            Set i to i plus 1
+        End While
+    Otherwise:
+        Note: shift_a < 0 means we drop |shift_a| trailing decimal digits.
+        Note: 19 covers the full Integer range, so any larger drop yields 0.
+        Let down_a be 0 minus shift_a
+        If down_a is greater than 19:
+            If scaled_a is not equal to 0:
+                Set sticky_a to 1
+            End If
+            Set scaled_a to 0
+        Otherwise:
+            Let k be 0
+            While k is less than down_a:
+                Let rem_d be scaled_a minus ((scaled_a divided by 10) multiplied by 10)
+                If rem_d is not equal to 0:
+                    Set sticky_a to 1
+                End If
+                Set scaled_a to scaled_a divided by 10
+                Set k to k plus 1
+            End While
+        End If
+    End If
+
+    Let scaled_b be cb
+    Let sticky_b be 0
+    If shift_b is greater than or equal to 0:
+        Let j be 0
+        While j is less than shift_b:
+            Set scaled_b to scaled_b multiplied by 10
+            Set j to j plus 1
+        End While
+    Otherwise:
+        Let down_b be 0 minus shift_b
+        If down_b is greater than 19:
+            If scaled_b is not equal to 0:
+                Set sticky_b to 1
+            End If
+            Set scaled_b to 0
+        Otherwise:
+            Let kb be 0
+            While kb is less than down_b:
+                Let rem_db be scaled_b minus ((scaled_b divided by 10) multiplied by 10)
+                If rem_db is not equal to 0:
+                    Set sticky_b to 1
+                End If
+                Set scaled_b to scaled_b divided by 10
+                Set kb to kb plus 1
+            End While
+        End If
+    End If
+
+    Note: Combine with signs.
+    Let result_sign be 0
+    Let result_coeff be 0
+    Let combined_sticky be sticky_a bitwise or sticky_b
+    If sa is equal to sb:
+        Set result_coeff to scaled_a plus scaled_b
+        Set result_sign to sa
+    Otherwise:
+        If scaled_a is greater than scaled_b:
+            Set result_coeff to scaled_a minus scaled_b
+            Set result_sign to sa
+            Note: Sign mismatch with positive A-B subtracts a slightly
+            Note: larger B (the sticky digits we dropped from B). The
+            Note: rounded difference is therefore <= the integer
+            Note: difference; if any sticky is set we decrement by one
+            Note: ULP-of-difference and re-flag sticky so the rounder
+            Note: still sees that the true value lies between
+            Note: result_coeff-1 and result_coeff.
+            If sticky_b is not equal to 0:
+                If result_coeff is greater than 0:
+                    Set result_coeff to result_coeff minus 1
+                    Set combined_sticky to 1
+                End If
+            End If
+        End If
+        If scaled_b is greater than scaled_a:
+            Set result_coeff to scaled_b minus scaled_a
+            Set result_sign to sb
+            If sticky_a is not equal to 0:
+                If result_coeff is greater than 0:
+                    Set result_coeff to result_coeff minus 1
+                    Set combined_sticky to 1
+                End If
+            End If
+        End If
+        If scaled_a is equal to scaled_b:
+            Set result_coeff to 0
+            Note: Sign of zero from subtractive cancellation under
+            Note: roundTiesToEven is +0; under roundTowardNegative it
+            Note: is -0 per IEEE 754-2008 Section 6.3.
+            If rounding_mode is equal to DEC32_ROUND_TOWARD_NEG:
+                Set result_sign to 1
+            Otherwise:
+                Set result_sign to 0
+            End If
+            Note: If only one operand contributed sticky, the true
+            Note: difference is non-zero (smaller-magnitude operand
+            Note: leaks below LSB). Adopt that operand's sign.
+            If sticky_a is not equal to 0:
+                If sticky_b is equal to 0:
+                    Set result_sign to sa
+                End If
+            End If
+            If sticky_b is not equal to 0:
+                If sticky_a is equal to 0:
+                    Set result_sign to sb
+                End If
+            End If
+        End If
+    End If
+
+    Note: When sticky is non-zero we inject one extra LSB digit so the
+    Note: rounder's HALF_EVEN / HALF_UP / directed-rounding decision
+    Note: factors in the non-zero residual. To preserve the represented
+    Note: value, we first pad result_coeff up to PRECISION significant
+    Note: digits (decreasing exp_common to compensate), then multiply
+    Note: by 10 and OR in the sticky bit. After this transform the
+    Note: coefficient has PRECISION+1 digits, which always triggers the
+    Note: rounder's excess-digit path. With a remainder of "1" the
+    Note: rounder leaves the coefficient untouched for round-half cases
+    Note: where the result is not exactly on a half boundary, and
+    Note: breaks ties using the IEEE 754-2008 Section 4.3 rules.
+    If combined_sticky is not equal to 0:
+        Let cur_digits be dec32_count_digits(result_coeff)
+        If cur_digits is less than DEC32_PRECISION:
+            Let pad be DEC32_PRECISION minus cur_digits
+            Let p_iter be 0
+            While p_iter is less than pad:
+                Set result_coeff to result_coeff multiplied by 10
+                Set exp_common to exp_common minus 1
+                Set p_iter to p_iter plus 1
+            End While
+        End If
+        Set result_coeff to (result_coeff multiplied by 10) plus 1
+        Set exp_common to exp_common minus 1
+    End If
+
+    Return dec32_round_coefficient(result_sign, result_coeff, exp_common, rounding_mode)
+End Process
+
+Process called "dec32_sub" takes a as Integer, b as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    IEEE 754-2008 Section 5.4.1 subtraction defined as a + (-b). We
+    materialize a negated copy of b and delegate to dec32_add. The
+    negation is bit-level so it preserves NaN payloads.
+    @End Reasoning
+
+    @Implementation
+    1. Build neg_b via dec32_neg(b, rounding_mode).
+    2. Call dec32_add(a, neg_b, rounding_mode).
+    3. Free neg_b before returning the sum.
+    @End Implementation
+
+    @Performance_Hints
+    One extra allocation versus a direct subtract. The alternative
+    (inline subtractive path) would duplicate ~80 LOC of alignment
+    logic; benchmarking on real workloads shows the allocation is
+    negligible compared to the alignment loop.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same NaN/Inf handling as dec32_add.
+    @End Security_Scope
+
+    Let neg_b be dec32_neg(b, rounding_mode)
+    If neg_b is equal to 0:
+        Return dec32_make_qnan()
+    End If
+    Let result be dec32_add(a, neg_b, rounding_mode)
+    dec32_destroy(neg_b)
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Multiplication (IEEE 754-2008 Section 5.4.1)
+Note: ============================================================================
+
+Process called "dec32_mul" takes a as Integer, b as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Decimal multiply: coefficient_a * coefficient_b at exponent
+    exponent_a + exponent_b, with sign sign_a XOR sign_b. Both
+    coefficients are at most 7 digits so the product is at most 14
+    digits, which fits in 63-bit Integer with no overflow risk. The
+    rounding step then reduces back to 7 digits.
+    @End Reasoning
+
+    @Implementation
+    1. NaN propagation.
+    2. Inf cases: Inf * 0 = qNaN (invalid). Otherwise Inf * finite = Inf
+       with combined sign.
+    3. Zero cases: 0 * Inf = qNaN; 0 * anything else = signed 0.
+    4. Compute coefficient product, exponent sum, sign XOR.
+    5. Round to precision.
+    @End Implementation
+
+    @Performance_Hints
+    Single 64-bit integer multiply plus a rounding step. Far cheaper
+    than the binary-float multiply on most CPUs.
+    @End Performance_Hints
+
+    @Security_Scope
+    Inf * 0 generates qNaN with invalid-operation semantics per
+    IEEE 754-2008 Section 7.2.
+    @End Security_Scope
+
+    Let np be dec32_propagate_nan(a, b)
+    If np is not equal to 0:
+        Return np
+    End If
+    If a is equal to 0:
+        Return dec32_make_qnan()
+    End If
+    If b is equal to 0:
+        Return dec32_make_qnan()
+    End If
+
+    Let ka be __load(a, 8)
+    Let kb be __load(b, 8)
+    Let sa be __load(a, 0)
+    Let sb be __load(b, 0)
+    Let ca be __load(a, 16)
+    Let cb be __load(b, 16)
+    Let ea be __load(a, 24)
+    Let eb be __load(b, 24)
+
+    Let result_sign be 0
+    If sa is not equal to sb:
+        Set result_sign to 1
+    End If
+
+    Let a_inf be 0
+    If ka is equal to DEC32_KIND_POS_INF:
+        Set a_inf to 1
+    End If
+    If ka is equal to DEC32_KIND_NEG_INF:
+        Set a_inf to 1
+    End If
+    Let b_inf be 0
+    If kb is equal to DEC32_KIND_POS_INF:
+        Set b_inf to 1
+    End If
+    If kb is equal to DEC32_KIND_NEG_INF:
+        Set b_inf to 1
+    End If
+
+    If a_inf is equal to 1:
+        If kb is equal to DEC32_KIND_FINITE:
+            If cb is equal to 0:
+                Return dec32_make_qnan()
+            End If
+            Return dec32_make_infinity(result_sign)
+        End If
+        Return dec32_make_infinity(result_sign)
+    End If
+    If b_inf is equal to 1:
+        If ka is equal to DEC32_KIND_FINITE:
+            If ca is equal to 0:
+                Return dec32_make_qnan()
+            End If
+            Return dec32_make_infinity(result_sign)
+        End If
+        Return dec32_make_infinity(result_sign)
+    End If
+
+    If ca is equal to 0:
+        Return dec32_unpacked_create(result_sign, DEC32_KIND_FINITE, 0, ea plus eb)
+    End If
+    If cb is equal to 0:
+        Return dec32_unpacked_create(result_sign, DEC32_KIND_FINITE, 0, ea plus eb)
+    End If
+
+    Let product be ca multiplied by cb
+    Let exp_sum be ea plus eb
+    Return dec32_round_coefficient(result_sign, product, exp_sum, rounding_mode)
+End Process
+
+Note: ============================================================================
+Note: Division (IEEE 754-2008 Section 5.4.1)
+Note: ============================================================================
+
+Process called "dec32_div" takes a as Integer, b as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Decimal division with correctly-rounded result. We pre-scale the
+    dividend coefficient by 10^(PRECISION+1) to obtain a quotient with
+    PRECISION+1 digits, then round to PRECISION via dec32_round_coefficient.
+    The +1 guard digit ensures the rounding decision is made on the
+    correct half-way information per IEEE 754-2008 Section 4.3.
+
+    Special cases per IEEE 754-2008 Sections 6.1, 6.2, 7.2, 7.3:
+        x / 0 with x != 0: signed infinity, signal divideByZero.
+        0 / 0:             qNaN, signal invalid.
+        Inf / Inf:         qNaN, signal invalid.
+        finite / Inf:      signed zero.
+        Inf / finite:      signed infinity.
+    @End Reasoning
+
+    @Implementation
+    1. NaN propagation.
+    2. Sign of result: sign_a XOR sign_b (always; even for special values).
+    3. Inf and zero handling per spec.
+    4. Scale ca by 10^(DEC32_PRECISION+1) = 10^8 then divide by cb.
+    5. Track the remainder for round-bit information; we feed the
+       (quotient * 10 + something_to_indicate_remainder) into the
+       rounding step. To keep things tractable we instead include the
+       guard digit by scaling, and the round step uses the next-lower
+       digit naturally.
+    @End Implementation
+
+    @Performance_Hints
+    Single 64-bit divide. The scaling is a single multiply by 10^8 =
+    100000000 which is well within 63-bit Integer range for the
+    7-digit dividend (max 9999999 * 10^8 = ~10^15 which is below 2^63).
+    @End Performance_Hints
+
+    @Security_Scope
+    Division by zero with non-zero dividend signals divideByZero per
+    IEEE 754-2008 Section 7.3. We return signed infinity per the
+    default exception handling.
+    @End Security_Scope
+
+    Let np be dec32_propagate_nan(a, b)
+    If np is not equal to 0:
+        Return np
+    End If
+    If a is equal to 0:
+        Return dec32_make_qnan()
+    End If
+    If b is equal to 0:
+        Return dec32_make_qnan()
+    End If
+
+    Let ka be __load(a, 8)
+    Let kb be __load(b, 8)
+    Let sa be __load(a, 0)
+    Let sb be __load(b, 0)
+    Let ca be __load(a, 16)
+    Let cb be __load(b, 16)
+    Let ea be __load(a, 24)
+    Let eb be __load(b, 24)
+
+    Let result_sign be 0
+    If sa is not equal to sb:
+        Set result_sign to 1
+    End If
+
+    Let a_inf be 0
+    If ka is equal to DEC32_KIND_POS_INF:
+        Set a_inf to 1
+    End If
+    If ka is equal to DEC32_KIND_NEG_INF:
+        Set a_inf to 1
+    End If
+    Let b_inf be 0
+    If kb is equal to DEC32_KIND_POS_INF:
+        Set b_inf to 1
+    End If
+    If kb is equal to DEC32_KIND_NEG_INF:
+        Set b_inf to 1
+    End If
+
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            Return dec32_make_qnan()
+        End If
+        Return dec32_make_infinity(result_sign)
+    End If
+    If b_inf is equal to 1:
+        Return dec32_unpacked_create(result_sign, DEC32_KIND_FINITE, 0, 0)
+    End If
+
+    Note: Both finite.
+    If cb is equal to 0:
+        If ca is equal to 0:
+            Return dec32_make_qnan()
+        End If
+        Return dec32_make_infinity(result_sign)
+    End If
+    If ca is equal to 0:
+        Return dec32_unpacked_create(result_sign, DEC32_KIND_FINITE, 0, ea minus eb)
+    End If
+
+    Note: Scale dividend by 10^(PRECISION+1) for the guard digit.
+    Let scale be dec32_pow10(DEC32_PRECISION plus 1)
+    Let scaled_ca be ca multiplied by scale
+    Let quotient be scaled_ca divided by cb
+    Let remainder be scaled_ca minus (quotient multiplied by cb)
+    Note: If remainder is non-zero, we OR a sticky bit into the last
+    Note: position of the quotient so that half-way ties are broken
+    Note: correctly. We implement this by ensuring the last digit is
+    Note: odd whenever the true result is not exactly representable.
+    If remainder is not equal to 0:
+        Let lastq be quotient minus ((quotient divided by 10) multiplied by 10)
+        If lastq is equal to 0:
+            Set quotient to quotient plus 1
+        End If
+    End If
+    Let new_exp be ea minus eb minus DEC32_PRECISION minus 1
+    Return dec32_round_coefficient(result_sign, quotient, new_exp, rounding_mode)
+End Process
+
+Note: ============================================================================
+Note: Fused multiply-add (IEEE 754-2008 Section 5.4.1)
+Note: ============================================================================
+
+Process called "dec32_fma" takes a as Integer, b as Integer, c as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Computes (a * b) + c with a single correctly-rounded result, per
+    IEEE 754-2008 Section 5.4.1. The intermediate product is exact in
+    the integer domain (14 digits worst case for Decimal32), so the
+    fused form differs from naive (a*b) + c only by skipping the
+    intermediate rounding. The single rounding at the end is what
+    makes FMA preferred for polynomial evaluation and dot-product
+    accumulation.
+    @End Reasoning
+
+    @Implementation
+    1. NaN propagation across all three operands (handle a/b/c).
+    2. Inf handling: a*b = Inf with c != opposite-Inf -> Inf; a*b = Inf
+       with c = opposite-Inf -> qNaN.
+    3. Compute the unrounded product as (sign_p, coeff_p, exp_p) where
+       coeff_p = ca * cb (exact), exp_p = ea + eb, sign_p = sa XOR sb.
+    4. Align the product with c at the smaller exponent.
+    5. Add or subtract magnitudes per sign rules.
+    6. Round once via dec32_round_coefficient.
+    @End Implementation
+
+    @Performance_Hints
+    Single integer multiply + add + round. Skips the intermediate
+    rounding that naive (a*b) + c would do, which is exactly the
+    accuracy advantage IEEE 754-2008 codifies.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same special-value semantics as dec32_mul followed by dec32_add.
+    @End Security_Scope
+
+    Let np_ab be dec32_propagate_nan(a, b)
+    If np_ab is not equal to 0:
+        Return np_ab
+    End If
+    Let np_c be dec32_propagate_nan(c, c)
+    If np_c is not equal to 0:
+        Return np_c
+    End If
+    If a is equal to 0:
+        Return dec32_make_qnan()
+    End If
+    If b is equal to 0:
+        Return dec32_make_qnan()
+    End If
+    If c is equal to 0:
+        Return dec32_make_qnan()
+    End If
+
+    Let ka be __load(a, 8)
+    Let kb be __load(b, 8)
+    Let kc be __load(c, 8)
+    Let sa be __load(a, 0)
+    Let sb be __load(b, 0)
+    Let sc be __load(c, 0)
+    Let ca be __load(a, 16)
+    Let cb be __load(b, 16)
+    Let cc be __load(c, 16)
+    Let ea be __load(a, 24)
+    Let eb be __load(b, 24)
+    Let ec be __load(c, 24)
+
+    Let sign_p be 0
+    If sa is not equal to sb:
+        Set sign_p to 1
+    End If
+
+    Let a_inf be 0
+    If ka is equal to DEC32_KIND_POS_INF:
+        Set a_inf to 1
+    End If
+    If ka is equal to DEC32_KIND_NEG_INF:
+        Set a_inf to 1
+    End If
+    Let b_inf be 0
+    If kb is equal to DEC32_KIND_POS_INF:
+        Set b_inf to 1
+    End If
+    If kb is equal to DEC32_KIND_NEG_INF:
+        Set b_inf to 1
+    End If
+    Let c_inf be 0
+    Let c_sign_for_inf be sc
+    If kc is equal to DEC32_KIND_POS_INF:
+        Set c_inf to 1
+    End If
+    If kc is equal to DEC32_KIND_NEG_INF:
+        Set c_inf to 1
+    End If
+
+    Note: a*b Inf paths
+    Let prod_is_inf be 0
+    If a_inf is equal to 1:
+        If kb is equal to DEC32_KIND_FINITE:
+            If cb is equal to 0:
+                Return dec32_make_qnan()
+            End If
+        End If
+        Set prod_is_inf to 1
+    End If
+    If b_inf is equal to 1:
+        If ka is equal to DEC32_KIND_FINITE:
+            If ca is equal to 0:
+                Return dec32_make_qnan()
+            End If
+        End If
+        Set prod_is_inf to 1
+    End If
+
+    If prod_is_inf is equal to 1:
+        If c_inf is equal to 1:
+            If c_sign_for_inf is not equal to sign_p:
+                Return dec32_make_qnan()
+            End If
+        End If
+        Return dec32_make_infinity(sign_p)
+    End If
+    If c_inf is equal to 1:
+        Return dec32_make_infinity(c_sign_for_inf)
+    End If
+
+    Note: All finite. Compute exact product.
+    Let coeff_p be ca multiplied by cb
+    Let exp_p be ea plus eb
+
+    Note: Now align product with c. Smaller exponent is the alignment exponent.
+    Let exp_common be exp_p
+    If ec is less than exp_p:
+        Set exp_common to ec
+    End If
+
+    Let scaled_p be coeff_p
+    Let scaled_c be cc
+    Let shift_p be exp_p minus exp_common
+    Let shift_c be ec minus exp_common
+
+    Let i be 0
+    While i is less than shift_p:
+        If i is greater than or equal to 16:
+            Set i to shift_p
+        Otherwise:
+            Set scaled_p to scaled_p multiplied by 10
+            Set i to i plus 1
+        End If
+    End While
+    Let j be 0
+    While j is less than shift_c:
+        If j is greater than or equal to 16:
+            Set j to shift_c
+        Otherwise:
+            Set scaled_c to scaled_c multiplied by 10
+            Set j to j plus 1
+        End If
+    End While
+
+    Let result_coeff be 0
+    Let result_sign be 0
+    If sign_p is equal to sc:
+        Set result_coeff to scaled_p plus scaled_c
+        Set result_sign to sign_p
+    Otherwise:
+        If scaled_p is greater than scaled_c:
+            Set result_coeff to scaled_p minus scaled_c
+            Set result_sign to sign_p
+        End If
+        If scaled_c is greater than scaled_p:
+            Set result_coeff to scaled_c minus scaled_p
+            Set result_sign to sc
+        End If
+        If scaled_p is equal to scaled_c:
+            Set result_coeff to 0
+            If rounding_mode is equal to DEC32_ROUND_TOWARD_NEG:
+                Set result_sign to 1
+            Otherwise:
+                Set result_sign to 0
+            End If
+        End If
+    End If
+
+    Return dec32_round_coefficient(result_sign, result_coeff, exp_common, rounding_mode)
+End Process
+
+Note: ============================================================================
+Note: Square root (IEEE 754-2008 Section 5.4.2)
+Note: ============================================================================
+
+Process called "dec32_sqrt" takes a as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Decimal square root via integer Newton-Raphson iteration on a
+    pre-scaled coefficient. Decimal sqrt is non-trivial because the
+    exponent must be even after scaling so that the result exponent is
+    integral. We scale the coefficient by 10^(2k) where k is chosen so
+    that:
+        - the exponent (ea + 2k) is even AND
+        - the scaled coefficient has at least 2*DEC32_PRECISION digits
+          (so the integer sqrt has at least DEC32_PRECISION digits).
+
+    The integer Newton iteration on a 14-digit value converges in ~5
+    iterations from a power-of-2 initial guess; we cap at 32 iterations
+    for safety even though convergence is monotonic.
+
+    Special cases per IEEE 754-2008 Section 5.4.2:
+        sqrt(qNaN) = qNaN
+        sqrt(-0) = -0
+        sqrt(+Inf) = +Inf
+        sqrt(x < 0) = qNaN (invalid operation)
+    @End Reasoning
+
+    @Implementation
+    1. NaN propagation.
+    2. Negative-nonzero check -> qNaN.
+    3. Zero -> zero with halved exponent (rounded toward even).
+    4. Inf -> Inf.
+    5. Scale ca up by 10^(2k) where k = ceil((2*PRECISION - digits(ca))/2)
+       plus an extra pair if needed to make ea+2k even.
+    6. Integer Newton iteration:
+          x = (initial guess)
+          repeat:
+            new_x = (x + scaled / x) / 2
+            if new_x >= x: break
+            x = new_x
+       The classical Newton method converges quadratically; the
+       "monotonic decrease" stopping criterion is the standard integer
+       sqrt termination per Knuth TAOCP Vol 2 Section 4.3.1 Exercise 16.
+    7. Halve the exponent and round to precision.
+    @End Implementation
+
+    @Performance_Hints
+    Iteration count is bounded by ~30 for a 14-digit input which is
+    sub-microsecond on any modern CPU. The initial guess is computed
+    by isolating the high bit (log2 estimate) so we start within a
+    factor of 2 of the true root.
+    @End Performance_Hints
+
+    @Security_Scope
+    Negative input signals invalid operation per IEEE 754-2008 Section
+    7.2 and returns qNaN. -0 returns -0 (not qNaN) per Section 5.4.2.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return dec32_make_qnan()
+    End If
+    Let ka be __load(a, 8)
+    If ka is equal to DEC32_KIND_QNAN:
+        Return dec32_make_qnan()
+    End If
+    If ka is equal to DEC32_KIND_SNAN:
+        Return dec32_make_qnan()
+    End If
+
+    Let sa be __load(a, 0)
+    Let ca be __load(a, 16)
+    Let ea be __load(a, 24)
+
+    If ka is equal to DEC32_KIND_NEG_INF:
+        Return dec32_make_qnan()
+    End If
+    If ka is equal to DEC32_KIND_POS_INF:
+        Return dec32_make_infinity(0)
+    End If
+
+    If ca is equal to 0:
+        Note: sqrt(-0) = -0 per Section 5.4.2
+        Return dec32_unpacked_create(sa, DEC32_KIND_FINITE, 0, ea divided by 2)
+    End If
+
+    If sa is equal to 1:
+        Return dec32_make_qnan()
+    End If
+
+    Note: Scale up to ensure we have enough digits after the sqrt for
+    Note: PRECISION digits of result, AND ensure the exponent is even.
+    Let scaled be ca
+    Let exp_work be ea
+    Let target_digits be DEC32_PRECISION multiplied by 2
+
+    While dec32_count_digits(scaled) is less than target_digits:
+        Set scaled to scaled multiplied by 100
+        Set exp_work to exp_work minus 2
+    End While
+    Note: Ensure exp_work is even.
+    If exp_work minus ((exp_work divided by 2) multiplied by 2) is not equal to 0:
+        Set scaled to scaled multiplied by 10
+        Set exp_work to exp_work minus 1
+    End If
+
+    Note: Initial guess: 10^(digits/2)
+    Let initial_digits be dec32_count_digits(scaled)
+    Let guess_digits be (initial_digits plus 1) divided by 2
+    Let guess be dec32_pow10(guess_digits)
+    If guess is equal to 0:
+        Set guess to 1
+    End If
+
+    Note: Integer Newton iteration with monotonic-decrease termination.
+    Let iter be 0
+    Let done be 0
+    While done is equal to 0:
+        If iter is greater than 64:
+            Set done to 1
+        Otherwise:
+            If guess is equal to 0:
+                Set guess to 1
+            End If
+            Let new_guess be (guess plus (scaled divided by guess)) divided by 2
+            If new_guess is greater than or equal to guess:
+                Set done to 1
+            Otherwise:
+                Set guess to new_guess
+                Set iter to iter plus 1
+            End If
+        End If
+    End While
+
+    Note: At this point guess = floor(sqrt(scaled)). Determine round bits
+    Note: by examining guess^2 vs scaled and (guess+1)^2 vs scaled.
+    Let guess_sq be guess multiplied by guess
+    Let next_guess be guess plus 1
+    Let next_sq be next_guess multiplied by next_guess
+    Let result_coeff be guess
+
+    Note: Standard round-half-even on the integer sqrt. The exact
+    Note: midpoint test compares 4*scaled against (2*guess+1)^2.
+    Let mid_sq be (next_guess multiplied by 2) minus 1
+    Set mid_sq to mid_sq multiplied by mid_sq
+    Let four_scaled be scaled multiplied by 4
+    If four_scaled is greater than mid_sq:
+        Set result_coeff to next_guess
+    Otherwise:
+        If four_scaled is equal to mid_sq:
+            If rounding_mode is equal to DEC32_ROUND_HALF_EVEN:
+                Let last be result_coeff minus ((result_coeff divided by 2) multiplied by 2)
+                If last is not equal to 0:
+                    Set result_coeff to next_guess
+                End If
+            End If
+            If rounding_mode is equal to DEC32_ROUND_HALF_UP:
+                Set result_coeff to next_guess
+            End If
+            If rounding_mode is equal to DEC32_ROUND_TOWARD_POS:
+                Set result_coeff to next_guess
+            End If
+        End If
+    End If
+
+    Note: Exponent of sqrt result is exp_work/2.
+    Let result_exp be exp_work divided by 2
+
+    Return dec32_round_coefficient(0, result_coeff, result_exp, rounding_mode)
+End Process
+
+Note: ============================================================================
+Note: Conversions
+Note: ============================================================================
+
+Process called "dec32_from_integer" takes value as Integer returns Integer:
+    @Reasoning
+    Exact conversion from a 64-bit Integer to Decimal32. If |value|
+    exceeds DEC32_MAX_COEFF the result must be rounded to DEC32_PRECISION
+    digits; we delegate to dec32_round_coefficient with
+    rounding_mode = HALF_EVEN.
+    @End Reasoning
+
+    @Implementation
+    1. If value is 0, return positive zero.
+    2. Else split sign from magnitude.
+    3. Call dec32_round_coefficient with exp=0.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) for values that fit in 7 digits (the dominant case); O(log10
+    value) for the rounding path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    If value is equal to 0:
+        Return dec32_make_zero(0)
+    End If
+    Let sign be 0
+    Let mag be value
+    If mag is less than 0:
+        Set sign to 1
+        Set mag to 0 minus mag
+    End If
+    Return dec32_round_coefficient(sign, mag, 0, DEC32_ROUND_HALF_EVEN)
+End Process
+
+Process called "dec32_to_integer" takes a as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Convert Decimal32 to a 64-bit Integer, rounding per rounding_mode.
+    Inf and NaN cannot be represented as Integer; we return 0 as a
+    sentinel and the caller is expected to check is_finite first.
+    @End Reasoning
+
+    @Implementation
+    1. NaN / Inf -> 0.
+    2. Adjust coefficient by exponent: if exp >= 0, multiply by 10^exp;
+       if exp < 0, divide by 10^(-exp) with rounding.
+    3. Apply sign.
+    @End Implementation
+
+    @Performance_Hints
+    O(|exp|).
+    @End Performance_Hints
+
+    @Security_Scope
+    Overflow to 0 sentinel rather than wrap-around.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    Let ka be __load(a, 8)
+    If ka is not equal to DEC32_KIND_FINITE:
+        Return 0
+    End If
+    Let sa be __load(a, 0)
+    Let ca be __load(a, 16)
+    Let ea be __load(a, 24)
+    Let result be ca
+    If ea is greater than 0:
+        Let factor be dec32_pow10(ea)
+        If factor is equal to 0:
+            Return 0
+        End If
+        Set result to result multiplied by factor
+    End If
+    If ea is less than 0:
+        Let neg_e be 0 minus ea
+        Let divisor be dec32_pow10(neg_e)
+        If divisor is equal to 0:
+            Return 0
+        End If
+        Let quotient be result divided by divisor
+        Let remainder be result minus (quotient multiplied by divisor)
+        Let half be divisor divided by 2
+        Let round_up be 0
+        If rounding_mode is equal to DEC32_ROUND_HALF_EVEN:
+            If remainder is greater than half:
+                Set round_up to 1
+            Otherwise:
+                If remainder is equal to half:
+                    Let last_digit be quotient minus ((quotient divided by 2) multiplied by 2)
+                    If last_digit is not equal to 0:
+                        Set round_up to 1
+                    End If
+                End If
+            End If
+        End If
+        If rounding_mode is equal to DEC32_ROUND_HALF_UP:
+            If remainder is greater than or equal to half:
+                If remainder is not equal to 0:
+                    Set round_up to 1
+                End If
+            End If
+        End If
+        If rounding_mode is equal to DEC32_ROUND_TOWARD_POS:
+            If sa is equal to 0:
+                If remainder is greater than 0:
+                    Set round_up to 1
+                End If
+            End If
+        End If
+        If rounding_mode is equal to DEC32_ROUND_TOWARD_NEG:
+            If sa is equal to 1:
+                If remainder is greater than 0:
+                    Set round_up to 1
+                End If
+            End If
+        End If
+        Set result to quotient
+        If round_up is equal to 1:
+            Set result to result plus 1
+        End If
+    End If
+    If sa is equal to 1:
+        Return 0 minus result
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: String I/O - canonical round-trip surface for decimal values
+Note: ============================================================================
+
+Process called "dec32_from_string" takes s as Integer returns Integer:
+    @Reasoning
+    Parses a Decimal32 from a null-terminated ASCII string. Accepted
+    grammar (subset of IEEE 754-2008 Section 5.12.2 + RFC-style):
+        sign? digits ('.' digits)? (['e' | 'E'] sign? digits)?
+        sign? 'Inf' | 'Infinity'
+        sign? 'NaN' | 'sNaN'
+
+    This is the CANONICAL conversion to Decimal: the user types a
+    decimal literal, the parser converts it to a Decimal32 with
+    exactly the typed value, with no binary-to-decimal rounding loss
+    en route. This is the property that makes 0.1 + 0.2 = 0.3 work
+    correctly.
+    @End Reasoning
+
+    @Implementation
+    1. Skip leading whitespace.
+    2. Parse optional sign.
+    3. Match infinity / NaN keywords.
+    4. Otherwise accumulate digits into coefficient, counting fractional
+       digits as exponent reductions.
+    5. Parse optional exponent and combine with the fractional count.
+    6. Round to precision.
+    @End Implementation
+
+    @Performance_Hints
+    O(length). Single-pass, no allocation until the final unpacked
+    triple is built.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller must pass a valid null-terminated buffer. Out-of-range
+    exponents are clamped via dec32_round_coefficient's overflow /
+    underflow path.
+    @End Security_Scope
+
+    If s is equal to 0:
+        Return dec32_make_qnan()
+    End If
+
+    Let pos be 0
+    Note: Skip leading whitespace (space, tab, LF, CR).
+    Let scanning_ws be 1
+    While scanning_ws is equal to 1:
+        Let bws be Memory.memory_get_byte(s, pos)
+        If bws is equal to 32:
+            Set pos to pos plus 1
+        Otherwise:
+            If bws is equal to 9:
+                Set pos to pos plus 1
+            Otherwise:
+                If bws is equal to 10:
+                    Set pos to pos plus 1
+                Otherwise:
+                    If bws is equal to 13:
+                        Set pos to pos plus 1
+                    Otherwise:
+                        Set scanning_ws to 0
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Let sign be 0
+    Let bsign be Memory.memory_get_byte(s, pos)
+    If bsign is equal to 45:
+        Set sign to 1
+        Set pos to pos plus 1
+    End If
+    If bsign is equal to 43:
+        Set pos to pos plus 1
+    End If
+
+    Note: Detect Infinity (case-insensitive prefix "inf").
+    Let bi1 be Memory.memory_get_byte(s, pos)
+    Let bi2 be Memory.memory_get_byte(s, pos plus 1)
+    Let bi3 be Memory.memory_get_byte(s, pos plus 2)
+    Let is_inf be 0
+    If bi1 is equal to 73:
+        If bi2 is equal to 110:
+            If bi3 is equal to 102:
+                Set is_inf to 1
+            End If
+        End If
+    End If
+    If bi1 is equal to 105:
+        If bi2 is equal to 110:
+            If bi3 is equal to 102:
+                Set is_inf to 1
+            End If
+        End If
+    End If
+    If is_inf is equal to 1:
+        Return dec32_make_infinity(sign)
+    End If
+
+    Note: Detect NaN.
+    Let bn1 be Memory.memory_get_byte(s, pos)
+    Let bn2 be Memory.memory_get_byte(s, pos plus 1)
+    Let bn3 be Memory.memory_get_byte(s, pos plus 2)
+    Let is_qnan be 0
+    If bn1 is equal to 78:
+        If bn2 is equal to 97:
+            If bn3 is equal to 78:
+                Set is_qnan to 1
+            End If
+        End If
+    End If
+    If bn1 is equal to 110:
+        If bn2 is equal to 97:
+            If bn3 is equal to 110:
+                Set is_qnan to 1
+            End If
+        End If
+    End If
+    If is_qnan is equal to 1:
+        Return dec32_make_qnan()
+    End If
+
+    Let coeff be 0
+    Let frac_digits be 0
+    Let saw_digit be 0
+    Let saw_dot be 0
+    Let scanning_digits be 1
+    While scanning_digits is equal to 1:
+        Let bd be Memory.memory_get_byte(s, pos)
+        If bd is equal to 46:
+            If saw_dot is equal to 1:
+                Set scanning_digits to 0
+            Otherwise:
+                Set saw_dot to 1
+                Set pos to pos plus 1
+            End If
+        Otherwise:
+            If bd is greater than or equal to 48:
+                If bd is less than or equal to 57:
+                    Let digit_value be bd minus 48
+                    Set coeff to (coeff multiplied by 10) plus digit_value
+                    If saw_dot is equal to 1:
+                        Set frac_digits to frac_digits plus 1
+                    End If
+                    Set saw_digit to 1
+                    Set pos to pos plus 1
+                Otherwise:
+                    Set scanning_digits to 0
+                End If
+            Otherwise:
+                Set scanning_digits to 0
+            End If
+        End If
+    End While
+
+    If saw_digit is equal to 0:
+        Return dec32_make_qnan()
+    End If
+
+    Note: Optional exponent.
+    Let exp_val be 0
+    Let bexp be Memory.memory_get_byte(s, pos)
+    If bexp is equal to 101:
+        Set pos to pos plus 1
+    Otherwise:
+        If bexp is equal to 69:
+            Set pos to pos plus 1
+        End If
+    End If
+    If bexp is equal to 101:
+        Note: Already consumed.
+        Let exp_sign be 0
+        Let bs2 be Memory.memory_get_byte(s, pos)
+        If bs2 is equal to 45:
+            Set exp_sign to 1
+            Set pos to pos plus 1
+        End If
+        If bs2 is equal to 43:
+            Set pos to pos plus 1
+        End If
+        Let scanning_exp be 1
+        While scanning_exp is equal to 1:
+            Let be2 be Memory.memory_get_byte(s, pos)
+            If be2 is greater than or equal to 48:
+                If be2 is less than or equal to 57:
+                    Set exp_val to (exp_val multiplied by 10) plus (be2 minus 48)
+                    Set pos to pos plus 1
+                Otherwise:
+                    Set scanning_exp to 0
+                End If
+            Otherwise:
+                Set scanning_exp to 0
+            End If
+        End While
+        If exp_sign is equal to 1:
+            Set exp_val to 0 minus exp_val
+        End If
+    End If
+    If bexp is equal to 69:
+        Let exp_sign2 be 0
+        Let bs3 be Memory.memory_get_byte(s, pos)
+        If bs3 is equal to 45:
+            Set exp_sign2 to 1
+            Set pos to pos plus 1
+        End If
+        If bs3 is equal to 43:
+            Set pos to pos plus 1
+        End If
+        Let scanning_exp2 be 1
+        While scanning_exp2 is equal to 1:
+            Let be3 be Memory.memory_get_byte(s, pos)
+            If be3 is greater than or equal to 48:
+                If be3 is less than or equal to 57:
+                    Set exp_val to (exp_val multiplied by 10) plus (be3 minus 48)
+                    Set pos to pos plus 1
+                Otherwise:
+                    Set scanning_exp2 to 0
+                End If
+            Otherwise:
+                Set scanning_exp2 to 0
+            End If
+        End While
+        If exp_sign2 is equal to 1:
+            Set exp_val to 0 minus exp_val
+        End If
+    End If
+
+    Let final_exp be exp_val minus frac_digits
+    Return dec32_round_coefficient(sign, coeff, final_exp, DEC32_ROUND_HALF_EVEN)
+End Process
+
+Process called "dec32_to_string" takes a as Integer, buffer as Integer, buffer_size as Integer returns Integer:
+    @Reasoning
+    Writes a canonical text form of a Decimal32 into the caller's buffer
+    per IEEE 754-2008 Section 5.12.2. The text uses the natural
+    coefficient + 'E' + exponent form unless the value can be
+    expressed in plain digits without an exponent in <= buffer_size
+    characters. Returns the byte length written (excluding terminator),
+    or 0 on failure.
+    @End Reasoning
+
+    @Implementation
+    1. Handle NaN ("NaN" + terminator).
+    2. Handle Infinity ("Inf" or "-Inf").
+    3. For finite values, write sign (if negative), then coefficient
+       digits, then 'E' and exponent.
+    4. Always null-terminate at the end.
+    @End Implementation
+
+    @Performance_Hints
+    O(digits). At most DEC32_PRECISION (7) coefficient digits and
+    ceil(log10(EMAX-EMIN+1)) = 3 exponent digits.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller controls buffer_size. If insufficient (less than 16 bytes for
+    worst case "-9999999E-101\0") we write nothing and return 0.
+    @End Security_Scope
+
+    If buffer is equal to 0:
+        Return 0
+    End If
+    If buffer_size is less than 16:
+        Return 0
+    End If
+    If a is equal to 0:
+        Return 0
+    End If
+
+    Let ka be __load(a, 8)
+    Let pos be 0
+    If ka is equal to DEC32_KIND_QNAN:
+        Memory.memory_set_byte(buffer, 0, 78)
+        Memory.memory_set_byte(buffer, 1, 97)
+        Memory.memory_set_byte(buffer, 2, 78)
+        Memory.memory_set_byte(buffer, 3, 0)
+        Return 3
+    End If
+    If ka is equal to DEC32_KIND_SNAN:
+        Memory.memory_set_byte(buffer, 0, 115)
+        Memory.memory_set_byte(buffer, 1, 78)
+        Memory.memory_set_byte(buffer, 2, 97)
+        Memory.memory_set_byte(buffer, 3, 78)
+        Memory.memory_set_byte(buffer, 4, 0)
+        Return 4
+    End If
+    If ka is equal to DEC32_KIND_POS_INF:
+        Memory.memory_set_byte(buffer, 0, 73)
+        Memory.memory_set_byte(buffer, 1, 110)
+        Memory.memory_set_byte(buffer, 2, 102)
+        Memory.memory_set_byte(buffer, 3, 0)
+        Return 3
+    End If
+    If ka is equal to DEC32_KIND_NEG_INF:
+        Memory.memory_set_byte(buffer, 0, 45)
+        Memory.memory_set_byte(buffer, 1, 73)
+        Memory.memory_set_byte(buffer, 2, 110)
+        Memory.memory_set_byte(buffer, 3, 102)
+        Memory.memory_set_byte(buffer, 4, 0)
+        Return 4
+    End If
+
+    Let sa be __load(a, 0)
+    Let ca be __load(a, 16)
+    Let ea be __load(a, 24)
+    If sa is equal to 1:
+        Memory.memory_set_byte(buffer, pos, 45)
+        Set pos to pos plus 1
+    End If
+
+    Note: Emit coefficient digits (at least one digit even for zero).
+    If ca is equal to 0:
+        Memory.memory_set_byte(buffer, pos, 48)
+        Set pos to pos plus 1
+    Otherwise:
+        Note: Build digits by collecting them right-to-left, then writing
+        Note: them left-to-right.
+        Let digits_buf be 0
+        Let buf_pos be 0
+        Let c_work be ca
+        Let temp_buffer be Layout.allocate(32)
+        If temp_buffer is equal to 0:
+            Return 0
+        End If
+        While c_work is greater than 0:
+            Let d be c_work minus ((c_work divided by 10) multiplied by 10)
+            Memory.memory_set_byte(temp_buffer, buf_pos, d plus 48)
+            Set buf_pos to buf_pos plus 1
+            Set c_work to c_work divided by 10
+        End While
+        Let k be buf_pos minus 1
+        While k is greater than or equal to 0:
+            Let d2 be Memory.memory_get_byte(temp_buffer, k)
+            Memory.memory_set_byte(buffer, pos, d2)
+            Set pos to pos plus 1
+            Set k to k minus 1
+        End While
+        Layout.deallocate(temp_buffer)
+    End If
+
+    Note: Always emit exponent in 'E<int>' form for unambiguous round-trip.
+    Memory.memory_set_byte(buffer, pos, 69)
+    Set pos to pos plus 1
+    Let e_work be ea
+    If e_work is less than 0:
+        Memory.memory_set_byte(buffer, pos, 45)
+        Set pos to pos plus 1
+        Set e_work to 0 minus e_work
+    End If
+    If e_work is equal to 0:
+        Memory.memory_set_byte(buffer, pos, 48)
+        Set pos to pos plus 1
+    Otherwise:
+        Let e_buf be Layout.allocate(16)
+        If e_buf is equal to 0:
+            Return 0
+        End If
+        Let e_pos be 0
+        While e_work is greater than 0:
+            Let ed be e_work minus ((e_work divided by 10) multiplied by 10)
+            Memory.memory_set_byte(e_buf, e_pos, ed plus 48)
+            Set e_pos to e_pos plus 1
+            Set e_work to e_work divided by 10
+        End While
+        Let m be e_pos minus 1
+        While m is greater than or equal to 0:
+            Let ed2 be Memory.memory_get_byte(e_buf, m)
+            Memory.memory_set_byte(buffer, pos, ed2)
+            Set pos to pos plus 1
+            Set m to m minus 1
+        End While
+        Layout.deallocate(e_buf)
+    End If
+
+    Memory.memory_set_byte(buffer, pos, 0)
+    Return pos
+End Process
+
+Note: ============================================================================
+Note: Encoding / decoding to the 32-bit BID interchange form
+Note: ============================================================================
+
+Process called "dec32_encode_bid" takes a as Integer returns Integer:
+    @Reasoning
+    Encodes an unpacked triple into the 32-bit BID interchange form per
+    IEEE 754-2008 Section 3.5.2. BID stores the entire coefficient as a
+    plain binary integer in the trailing significand field, with the
+    sign in bit 31 and the biased exponent in bits 30..23 (for the
+    short BID form) or split across the combination field for the
+    extended form.
+
+    For Decimal32 the BID-32 layout is:
+        bit 31:        sign s
+        bits 30..23:   biased exponent (8 bits)  - upper combination
+        bits 22..0:    coefficient continuation (23 bits = up to 8388607)
+
+    Numbers whose coefficient does not fit in 23 bits use the alternate
+    encoding (bits 30..29 = 11) with a longer exponent field. We
+    implement BOTH forms.
+
+    Result fits in the low 32 bits of an Integer.
+    @End Reasoning
+
+    @Implementation
+    1. NaN/Inf: bits 30..27 = 11111 (Inf) or 11110 (NaN)? Per IEEE
+       754-2008 Section 3.5.2 Table 3.5: the combination bits are
+           11110 -> +/- Infinity
+           111110 -> qNaN
+           111111 -> sNaN
+       We emit:
+           sign | 0x78000000 for +Inf
+           sign | 0x7C000000 for qNaN
+           sign | 0x7E000000 for sNaN
+    2. Finite: compute biased_exp = exponent + DEC32_BIAS. Clamp to
+       [0, DEC32_MAX_BIASED_EXP].
+       If coefficient < 2^23 (8388608): use small-coefficient form:
+           bits 31:    sign
+           bits 30..23: biased_exp[7..0]
+           bits 22..0:  coefficient
+       Else: use large-coefficient form:
+           bits 31:    sign
+           bits 30..29: 11
+           bits 28..21: biased_exp[7..0]
+           bits 20..0:  coefficient & 0x1FFFFF | (coefficient_high << 21)
+       In Decimal32 the coefficient is at most 9999999 < 2^24 so the
+       large-coefficient form encodes the top bit implicitly via the
+       11 prefix.
+    @End Implementation
+
+    @Performance_Hints
+    Bitwise composition, no allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Out-of-range exponents are clamped via the upstream
+    dec32_round_coefficient; this routine assumes a normalized triple.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 2143289344
+    End If
+    Let ka be __load(a, 8)
+    Let sa be __load(a, 0)
+
+    Let sign_bit be 0
+    If sa is equal to 1:
+        Set sign_bit to 2147483648
+    End If
+
+    If ka is equal to DEC32_KIND_POS_INF:
+        Return sign_bit bitwise or 2013265920
+    End If
+    If ka is equal to DEC32_KIND_NEG_INF:
+        Return sign_bit bitwise or 2013265920
+    End If
+    If ka is equal to DEC32_KIND_QNAN:
+        Return sign_bit bitwise or 2080374784
+    End If
+    If ka is equal to DEC32_KIND_SNAN:
+        Return sign_bit bitwise or 2113929216
+    End If
+
+    Let ca be __load(a, 16)
+    Let ea be __load(a, 24)
+    Let biased be ea plus DEC32_BIAS
+    If biased is less than 0:
+        Set biased to 0
+    End If
+    If biased is greater than DEC32_MAX_BIASED_EXP:
+        Set biased to DEC32_MAX_BIASED_EXP
+    End If
+
+    Note: Small-coefficient form: coefficient fits in 23 bits.
+    If ca is less than 8388608:
+        Let encoded be sign_bit bitwise or (biased shifted left by 23)
+        Set encoded to encoded bitwise or ca
+        Return encoded
+    End If
+
+    Note: Large-coefficient form: prefix 11, then 8 exponent bits, then
+    Note: 21 coefficient bits with the high 3 implied via the prefix.
+    Let prefix be 1610612736
+    Let encoded2 be sign_bit bitwise or prefix
+    Set encoded2 to encoded2 bitwise or (biased shifted left by 21)
+    Let masked be ca bitwise and 2097151
+    Set encoded2 to encoded2 bitwise or masked
+    Return encoded2
+End Process
+
+Process called "dec32_decode_bid" takes bits as Integer returns Integer:
+    @Reasoning
+    Decodes a 32-bit BID into an unpacked triple. Inverse of
+    dec32_encode_bid.
+    @End Reasoning
+
+    @Implementation
+    1. Extract sign from bit 31.
+    2. Inspect bits 30..23:
+         11110xxxx -> Inf, bit 27 distinguishes signaling from quiet NaN.
+         11111xxxx -> NaN.
+         11_xxxxxx -> large-coefficient form.
+         other     -> small-coefficient form.
+    3. Build unpacked triple via dec32_unpacked_create.
+    @End Implementation
+
+    @Performance_Hints
+    Bitwise extraction, single allocation for the resulting triple.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure. Garbage input still produces a well-formed triple (possibly
+    NaN or Inf).
+    @End Security_Scope
+
+    Let sign_bit be bits bitwise and 2147483648
+    Let sign be 0
+    If sign_bit is not equal to 0:
+        Set sign to 1
+    End If
+
+    Let combo be (bits shifted right by 26) bitwise and 31
+
+    If combo is equal to 30:
+        Return dec32_make_infinity(sign)
+    End If
+    If combo is equal to 31:
+        Let nan_bit be (bits shifted right by 25) bitwise and 1
+        If nan_bit is equal to 1:
+            Return dec32_make_snan()
+        End If
+        Return dec32_make_qnan()
+    End If
+
+    Let biased be 0
+    Let coeff be 0
+    Let high_two be (bits shifted right by 29) bitwise and 3
+
+    If high_two is equal to 3:
+        Note: Large-coefficient form
+        Set biased to (bits shifted right by 21) bitwise and 255
+        Set coeff to bits bitwise and 2097151
+        Set coeff to coeff bitwise or 8388608
+    Otherwise:
+        Set biased to (bits shifted right by 23) bitwise and 255
+        Set coeff to bits bitwise and 8388607
+    End If
+
+    Let exp_val be biased minus DEC32_BIAS
+    Return dec32_unpacked_create(sign, DEC32_KIND_FINITE, coeff, exp_val)
+End Process

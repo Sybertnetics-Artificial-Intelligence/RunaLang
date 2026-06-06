@@ -1,0 +1,1639 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+==============================================================================
+Duration - Signed 128-bit Nanosecond Time Interval
+==============================================================================
+
+A Duration represents an interval between two points in time, expressed as
+a signed 128-bit nanosecond count. The 128-bit range covers approximately
++/- 5.4e30 years - twenty orders of magnitude past the age of the universe
+- so any arithmetic that does not deliberately attempt to overflow stays
+trivially in range. Long-horizon use cases (geological, astronomical,
+deep-space mission timelines) all fit.
+
+Storage layout: 16-byte heap blob
+  offset 0 :  lo  - lower 64 bits, treated as unsigned
+  offset 8 :  hi  - upper 64 bits, treated as signed (two's complement)
+
+Sign convention: positive Durations point forward in time, negative
+Durations point backward. Negation, absolute value, and comparison all
+operate on the full 128-bit two's complement representation.
+
+Conversion table (exact):
+  1 second       = 1_000_000_000 ns
+  1 minute       = 60          seconds
+  1 hour         = 60          minutes
+  1 day          = 24          hours
+  1 week         = 7           days
+  1 Julian year  = 365.25      days (only for casual use; civil years
+                                     should be computed via date.runa)
+
+References:
+  - ISO 8601-1:2019 §5.5 (duration representation: PnYnMnDTnHnMnS)
+  - RFC 3339 §5.6 (date-time / duration ABNF)
+  - IEEE 1003.1-2017 (POSIX) §A.4.16 (clock_t / nanoseconds)
+  - C++20 <chrono> duration<Rep, Period>
+  - NIST SP 811:2008 §B.6 (year definitions: Julian 365.25 d vs Gregorian
+                          365.2425 d vs tropical 365.24219 d)
+==============================================================================
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+
+Note: ============================================================================
+Note: Layout constants
+Note: ============================================================================
+
+Constant DURATION_SIZE_BYTES as Integer is 16
+Constant DURATION_LO_OFFSET as Integer is 0
+Constant DURATION_HI_OFFSET as Integer is 8
+
+Note: ============================================================================
+Note: Conversion ratios (ns base)
+Note: ============================================================================
+
+Constant DUR_NS_PER_US as Integer is 1000
+Constant DUR_NS_PER_MS as Integer is 1000000
+Constant DUR_NS_PER_S as Integer is 1000000000
+Constant DUR_NS_PER_MIN as Integer is 60000000000
+Constant DUR_NS_PER_HOUR as Integer is 3600000000000
+Constant DUR_NS_PER_DAY as Integer is 86400000000000
+Constant DUR_NS_PER_WEEK as Integer is 604800000000000
+
+Note: Julian year = 365.25 days exactly. 365.25 * 86_400 * 1e9 = 31_557_600_000_000_000 ns.
+Constant DUR_NS_PER_JULIAN_YEAR as Integer is 31557600000000000
+
+Note: Bit masks for sign handling
+Constant DUR_HIGH_BIT_MASK as Integer is 0x8000000000000000
+Constant DUR_LIMB_MASK as Integer is 0xFFFFFFFFFFFFFFFF
+Constant DUR_LOW32_MASK as Integer is 0xFFFFFFFF
+Constant DUR_BITS_PER_LIMB as Integer is 64
+Constant DUR_HIGH32_SHIFT as Integer is 32
+
+Note: Error sentinels
+Constant DURATION_OK as Integer is 0
+Constant DURATION_ERR_NULL as Integer is -1
+Constant DURATION_ERR_DIVIDE_BY_ZERO as Integer is -2
+Constant DURATION_ERR_PARSE as Integer is -3
+
+Note: ASCII digit constants
+Constant DUR_ASCII_ZERO as Integer is 48
+Constant DUR_ASCII_NINE as Integer is 57
+Constant DUR_ASCII_MINUS as Integer is 45
+Constant DUR_ASCII_PLUS as Integer is 43
+Constant DUR_ASCII_P_UPPER as Integer is 80
+Constant DUR_ASCII_T_UPPER as Integer is 84
+Constant DUR_ASCII_H_UPPER as Integer is 72
+Constant DUR_ASCII_M_UPPER as Integer is 77
+Constant DUR_ASCII_S_UPPER as Integer is 83
+Constant DUR_ASCII_D_UPPER as Integer is 68
+Constant DUR_ASCII_W_UPPER as Integer is 87
+Constant DUR_ASCII_Y_UPPER as Integer is 89
+Constant DUR_ASCII_SPACE as Integer is 32
+
+Note: ============================================================================
+Note: Allocation / setters
+Note: ============================================================================
+
+Process called "duration_allocate" returns Integer:
+    @Reasoning
+    Reserves a fresh 16-byte Duration on the owned heap. Used by every
+    constructor below and by callers that need a zero-initialised
+    Duration to use as an accumulator.
+    @End Reasoning
+    @Implementation
+    Calls the Layout tier-3 allocator, returns the raw pointer. The
+    initial bit pattern is whatever the allocator delivers (debug
+    builds canary-fill, release builds leave undefined contents) so
+    callers MUST follow with a set_* call before reading.
+    @End Implementation
+    @Performance_Hints
+    Single tier-3 allocation. For ephemeral Durations consider stack
+    storage or arena allocation via Layout's arena tier.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer returned to caller; caller is responsible for matching
+    duration_free.
+    @End Security_Scope
+    Return proc allocate from Layout with DURATION_SIZE_BYTES
+End Process
+
+Process called "duration_free" takes d as Integer returns Integer:
+    @Reasoning
+    Releases a Duration buffer. Mirror of duration_allocate.
+    @End Reasoning
+    @Implementation
+    Forwards to Layout.deallocate. Null pointer is a no-op.
+    @End Implementation
+    @Performance_Hints
+    One tier-3 free.
+    @End Performance_Hints
+    @Security_Scope
+    Double-free protection is provided by Layout's canary protocol.
+    @End Security_Scope
+    If d is equal to 0:
+        Return DURATION_OK
+    End If
+    Let dummy be proc deallocate from Layout with d
+    Return DURATION_OK
+End Process
+
+Process called "duration_set_zero" takes d as Integer returns Integer:
+    @Reasoning
+    Initialises a Duration to zero ns. Useful as a zero-valued
+    accumulator and to clear a buffer before reuse.
+    @End Reasoning
+    @Implementation
+    Writes 0 to both 64-bit limbs.
+    @End Implementation
+    @Performance_Hints
+    Two store instructions.
+    @End Performance_Hints
+    @Security_Scope
+    Pure write to caller-owned memory.
+    @End Security_Scope
+    If d is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    Let dummy_lo be proc memory_set_int64 from MemoryCore with d, DURATION_LO_OFFSET, 0
+    Let dummy_hi be proc memory_set_int64 from MemoryCore with d, DURATION_HI_OFFSET, 0
+    Return DURATION_OK
+End Process
+
+Process called "duration_set_from_i64" takes d as Integer, ns as Integer returns Integer:
+    @Reasoning
+    Stores a signed 64-bit nanosecond count into a Duration. The high
+    limb is sign-extended so the two-limb representation matches the
+    one-limb value bit-for-bit when interpreted as signed 128-bit.
+    @End Reasoning
+    @Implementation
+    Writes ns to the low limb, then writes the arithmetic shift of ns
+    by 63 bits to the high limb. The right shift propagates the sign
+    bit across all 64 bits of the high limb.
+    @End Implementation
+    @Performance_Hints
+    Two stores, one shift. ~3 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Pure write to caller-owned memory.
+    @End Security_Scope
+    If d is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    Let dummy_lo be proc memory_set_int64 from MemoryCore with d, DURATION_LO_OFFSET, ns
+    Let sign_ext be ns shifted right by 63
+    Let dummy_hi be proc memory_set_int64 from MemoryCore with d, DURATION_HI_OFFSET, sign_ext
+    Return DURATION_OK
+End Process
+
+Process called "duration_get_lo" takes d as Integer returns Integer:
+    @Reasoning
+    Reads the low 64-bit limb of a Duration. Used by tests and by the
+    arithmetic helpers below.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    One memory load.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If d is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with d, DURATION_LO_OFFSET
+End Process
+
+Process called "duration_get_hi" takes d as Integer returns Integer:
+    @Reasoning
+    Reads the high 64-bit limb of a Duration.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    One memory load.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If d is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with d, DURATION_HI_OFFSET
+End Process
+
+Process called "duration_copy" takes src as Integer, dst as Integer returns Integer:
+    @Reasoning
+    Duplicates a Duration into another buffer. Used to preserve an
+    operand before destructive arithmetic.
+    @End Reasoning
+    @Implementation
+    Two 64-bit loads followed by two stores.
+    @End Implementation
+    @Performance_Hints
+    Four memory ops, no allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Read/write of caller-owned memory.
+    @End Security_Scope
+    If src is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If dst is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    Let lo be proc memory_get_int64 from MemoryCore with src, DURATION_LO_OFFSET
+    Let hi be proc memory_get_int64 from MemoryCore with src, DURATION_HI_OFFSET
+    Let dummy_lo be proc memory_set_int64 from MemoryCore with dst, DURATION_LO_OFFSET, lo
+    Let dummy_hi be proc memory_set_int64 from MemoryCore with dst, DURATION_HI_OFFSET, hi
+    Return DURATION_OK
+End Process
+
+Note: ============================================================================
+Note: Internal: 128-bit signed arithmetic on (hi, lo) limb pairs
+Note: ============================================================================
+
+Process called "_dur_carry_from_add" takes a as Integer, b as Integer, sum_lo as Integer returns Integer:
+    @Reasoning
+    Computes the carry-out bit for the low-limb addition lo_a + lo_b.
+    Used by duration_add to propagate carry into the high limb. Uses
+    the classic "if both high bits set, or one is set and the sum's
+    high bit is clear, then carry" formula that is signedness-agnostic.
+    @End Reasoning
+    @Implementation
+    carry = ((a & b) | ((a | b) & ~sum)) >> 63 & 1.
+    @End Implementation
+    @Performance_Hints
+    Five bitwise ops + one shift. Branchless.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    Let and_ab be a bitwise and b
+    Let or_ab be a bitwise or b
+    Let not_sum be bitwise not sum_lo
+    Let term2 be or_ab bitwise and not_sum
+    Let combined be and_ab bitwise or term2
+    Let carry_bit be combined shifted right by 63
+    Return carry_bit bitwise and 1
+End Process
+
+Process called "_dur_borrow_from_sub" takes a as Integer, b as Integer, diff_lo as Integer returns Integer:
+    @Reasoning
+    Companion to _dur_carry_from_add. Computes the borrow-out bit for
+    a - b at the low limb. Used by duration_sub to subtract one from
+    the high limb when the low subtraction underflows.
+    @End Reasoning
+    @Implementation
+    borrow = ((~a & b) | ((~a | b) & diff)) >> 63 & 1.
+    @End Implementation
+    @Performance_Hints
+    Six bitwise ops + one shift. Branchless.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    Let not_a be bitwise not a
+    Let term1 be not_a bitwise and b
+    Let or_term be not_a bitwise or b
+    Let term2 be or_term bitwise and diff_lo
+    Let combined be term1 bitwise or term2
+    Let borrow_bit be combined shifted right by 63
+    Return borrow_bit bitwise and 1
+End Process
+
+Note: ============================================================================
+Note: Construction by unit (each function allocates a fresh Duration)
+Note: ============================================================================
+
+Process called "duration_from_nanoseconds" takes ns as Integer returns Integer:
+    @Reasoning
+    Primary constructor. Builds a Duration from a signed nanosecond
+    count. All other duration_from_* constructors multiply through
+    DUR_NS_PER_* into this one.
+    @End Reasoning
+    @Implementation
+    Allocates, then writes the value with sign-extension of the high
+    limb. Returns the new pointer (zero on allocation failure).
+    @End Implementation
+    @Performance_Hints
+    One allocation, two stores.
+    @End Performance_Hints
+    @Security_Scope
+    Returned pointer must be released with duration_free.
+    @End Security_Scope
+    Let d be proc allocate from Layout with DURATION_SIZE_BYTES
+    If d is equal to 0:
+        Return 0
+    End If
+    Let dummy be duration_set_from_i64(d, ns)
+    Return d
+End Process
+
+Process called "duration_from_microseconds" takes us as Integer returns Integer:
+    @Reasoning
+    Constructs a Duration from microseconds. Multiplies by 1_000 to
+    reach nanoseconds, then defers to duration_from_nanoseconds.
+    @End Reasoning
+    @Implementation
+    For us in the signed 64-bit range divided by 1000 (which is
+    9.2e15 us, ~290_000 years), the product fits inside a 64-bit
+    integer. Beyond that range the caller should construct directly
+    via duration_from_seconds + duration_from_nanoseconds.
+    @End Implementation
+    @Performance_Hints
+    One multiply + delegated allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let ns be us multiplied by DUR_NS_PER_US
+    Return duration_from_nanoseconds(ns)
+End Process
+
+Process called "duration_from_milliseconds" takes ms as Integer returns Integer:
+    @Reasoning
+    Constructs a Duration from milliseconds.
+    @End Reasoning
+    @Implementation
+    Multiplies by 1_000_000 to reach nanoseconds; sign extends through
+    duration_set_from_i64.
+    @End Implementation
+    @Performance_Hints
+    One multiply + allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let ns be ms multiplied by DUR_NS_PER_MS
+    Return duration_from_nanoseconds(ns)
+End Process
+
+Process called "duration_from_seconds" takes s as Integer returns Integer:
+    @Reasoning
+    Constructs a Duration from seconds.
+    @End Reasoning
+    @Implementation
+    Multiplies by 1_000_000_000 to reach nanoseconds.
+    @End Implementation
+    @Performance_Hints
+    One multiply + allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let ns be s multiplied by DUR_NS_PER_S
+    Return duration_from_nanoseconds(ns)
+End Process
+
+Process called "duration_from_minutes" takes m as Integer returns Integer:
+    @Reasoning
+    Constructs a Duration from minutes.
+    @End Reasoning
+    @Implementation
+    Multiplies by 60_000_000_000 (DUR_NS_PER_MIN).
+    @End Implementation
+    @Performance_Hints
+    One multiply + allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let ns be m multiplied by DUR_NS_PER_MIN
+    Return duration_from_nanoseconds(ns)
+End Process
+
+Process called "duration_from_hours" takes h as Integer returns Integer:
+    @Reasoning
+    Constructs a Duration from hours.
+    @End Reasoning
+    @Implementation
+    Multiplies by 3_600_000_000_000 (DUR_NS_PER_HOUR).
+    @End Implementation
+    @Performance_Hints
+    One multiply + allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let ns be h multiplied by DUR_NS_PER_HOUR
+    Return duration_from_nanoseconds(ns)
+End Process
+
+Process called "duration_from_days" takes days as Integer returns Integer:
+    @Reasoning
+    Constructs a Duration from civil days (exact 86_400-second days,
+    no DST or leap-second smearing). For wall-clock day arithmetic
+    that respects DST and leap-second insertion, use
+    datetime_add_days from datetime.runa.
+    @End Reasoning
+    @Implementation
+    Multiplies by DUR_NS_PER_DAY.
+    @End Implementation
+    @Performance_Hints
+    One multiply + allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let ns be days multiplied by DUR_NS_PER_DAY
+    Return duration_from_nanoseconds(ns)
+End Process
+
+Process called "duration_from_weeks" takes weeks as Integer returns Integer:
+    @Reasoning
+    Constructs a Duration from weeks.
+    @End Reasoning
+    @Implementation
+    Multiplies by DUR_NS_PER_WEEK.
+    @End Implementation
+    @Performance_Hints
+    One multiply + allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let ns be weeks multiplied by DUR_NS_PER_WEEK
+    Return duration_from_nanoseconds(ns)
+End Process
+
+Process called "duration_from_years_julian" takes years as Integer returns Integer:
+    @Reasoning
+    Constructs a Duration from Julian years (365.25 days exactly).
+    This is the right "year" for back-of-envelope astronomy work
+    (light-year arithmetic, orbital periods) and explicitly NOT the
+    right choice for civil-calendar arithmetic, where year length
+    varies 365 / 366 days under the Gregorian rules. For civil years,
+    use date_add_years from date.runa.
+    @End Reasoning
+    @Implementation
+    Multiplies by DUR_NS_PER_JULIAN_YEAR = 31_557_600_000_000_000 ns.
+    @End Implementation
+    @Performance_Hints
+    One multiply + allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let ns be years multiplied by DUR_NS_PER_JULIAN_YEAR
+    Return duration_from_nanoseconds(ns)
+End Process
+
+Note: ============================================================================
+Note: Conversion: Duration -> single integer (truncating)
+Note: ============================================================================
+
+Process called "duration_to_nanoseconds" takes d as Integer returns Integer:
+    @Reasoning
+    Extracts the nanosecond count, truncating to 64-bit signed. For
+    Durations whose magnitude fits inside a signed 64-bit nanosecond
+    counter (~ +/- 292 years) the result is exact. Larger magnitudes
+    silently truncate to the low limb; callers operating outside that
+    range must consult the (hi, lo) pair directly.
+    @End Reasoning
+    @Implementation
+    Returns the low limb. The high limb is ignored.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If d is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with d, DURATION_LO_OFFSET
+End Process
+
+Process called "duration_to_microseconds" takes d as Integer returns Integer:
+    @Reasoning
+    Truncating conversion to microseconds.
+    @End Reasoning
+    @Implementation
+    Integer-divide the low-limb nanosecond count by 1_000. Truncates
+    toward zero in the sign-of-dividend direction (matching Runa
+    Integer division).
+    @End Implementation
+    @Performance_Hints
+    One load + one divide.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let ns be duration_to_nanoseconds(d)
+    Return ns divided by DUR_NS_PER_US
+End Process
+
+Process called "duration_to_milliseconds" takes d as Integer returns Integer:
+    @Reasoning
+    Truncating conversion to milliseconds.
+    @End Reasoning
+    @Implementation
+    Integer-divides ns by 1_000_000.
+    @End Implementation
+    @Performance_Hints
+    One load + one divide.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let ns be duration_to_nanoseconds(d)
+    Return ns divided by DUR_NS_PER_MS
+End Process
+
+Process called "duration_to_seconds" takes d as Integer returns Integer:
+    @Reasoning
+    Truncating conversion to seconds.
+    @End Reasoning
+    @Implementation
+    Integer-divides ns by 1_000_000_000.
+    @End Implementation
+    @Performance_Hints
+    One load + one divide.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let ns be duration_to_nanoseconds(d)
+    Return ns divided by DUR_NS_PER_S
+End Process
+
+Process called "duration_to_minutes" takes d as Integer returns Integer:
+    @Reasoning
+    Truncating conversion to minutes.
+    @End Reasoning
+    @Implementation
+    Integer-divides ns by DUR_NS_PER_MIN.
+    @End Implementation
+    @Performance_Hints
+    One load + one divide.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let ns be duration_to_nanoseconds(d)
+    Return ns divided by DUR_NS_PER_MIN
+End Process
+
+Process called "duration_to_hours" takes d as Integer returns Integer:
+    @Reasoning
+    Truncating conversion to hours.
+    @End Reasoning
+    @Implementation
+    Integer-divides ns by DUR_NS_PER_HOUR.
+    @End Implementation
+    @Performance_Hints
+    One load + one divide.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let ns be duration_to_nanoseconds(d)
+    Return ns divided by DUR_NS_PER_HOUR
+End Process
+
+Process called "duration_to_days" takes d as Integer returns Integer:
+    @Reasoning
+    Truncating conversion to civil days (86_400 s).
+    @End Reasoning
+    @Implementation
+    Integer-divides ns by DUR_NS_PER_DAY.
+    @End Implementation
+    @Performance_Hints
+    One load + one divide.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let ns be duration_to_nanoseconds(d)
+    Return ns divided by DUR_NS_PER_DAY
+End Process
+
+Note: ============================================================================
+Note: Arithmetic (destructive: result buffer supplied by caller)
+Note: ============================================================================
+
+Process called "duration_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+    128-bit two's-complement addition. result = a + b. Wraps on
+    overflow per the standard two's-complement contract, matching
+    every other limb-based primitive in the numeric package.
+    @End Reasoning
+    @Implementation
+    Add low limbs, compute the carry bit via _dur_carry_from_add, add
+    high limbs + carry. Stores both halves into the result buffer.
+    @End Implementation
+    @Performance_Hints
+    Two adds + carry computation. ~6 cycles on x86-64.
+    @End Performance_Hints
+    @Security_Scope
+    Read of a and b, write of result; all caller-owned.
+    @End Security_Scope
+    If a is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    Let a_lo be proc memory_get_int64 from MemoryCore with a, DURATION_LO_OFFSET
+    Let a_hi be proc memory_get_int64 from MemoryCore with a, DURATION_HI_OFFSET
+    Let b_lo be proc memory_get_int64 from MemoryCore with b, DURATION_LO_OFFSET
+    Let b_hi be proc memory_get_int64 from MemoryCore with b, DURATION_HI_OFFSET
+    Let sum_lo be a_lo plus b_lo
+    Let carry be _dur_carry_from_add(a_lo, b_lo, sum_lo)
+    Let sum_hi_partial be a_hi plus b_hi
+    Let sum_hi be sum_hi_partial plus carry
+    Let dummy_lo be proc memory_set_int64 from MemoryCore with result, DURATION_LO_OFFSET, sum_lo
+    Let dummy_hi be proc memory_set_int64 from MemoryCore with result, DURATION_HI_OFFSET, sum_hi
+    Return DURATION_OK
+End Process
+
+Process called "duration_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+    128-bit subtraction. result = a - b. Wraps on underflow.
+    @End Reasoning
+    @Implementation
+    Subtract low limbs, compute borrow via _dur_borrow_from_sub, then
+    subtract high limbs and the borrow.
+    @End Implementation
+    @Performance_Hints
+    Two subs + borrow computation.
+    @End Performance_Hints
+    @Security_Scope
+    Read of a and b, write of result; all caller-owned.
+    @End Security_Scope
+    If a is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    Let a_lo be proc memory_get_int64 from MemoryCore with a, DURATION_LO_OFFSET
+    Let a_hi be proc memory_get_int64 from MemoryCore with a, DURATION_HI_OFFSET
+    Let b_lo be proc memory_get_int64 from MemoryCore with b, DURATION_LO_OFFSET
+    Let b_hi be proc memory_get_int64 from MemoryCore with b, DURATION_HI_OFFSET
+    Let diff_lo be a_lo minus b_lo
+    Let borrow be _dur_borrow_from_sub(a_lo, b_lo, diff_lo)
+    Let diff_hi_partial be a_hi minus b_hi
+    Let diff_hi be diff_hi_partial minus borrow
+    Let dummy_lo be proc memory_set_int64 from MemoryCore with result, DURATION_LO_OFFSET, diff_lo
+    Let dummy_hi be proc memory_set_int64 from MemoryCore with result, DURATION_HI_OFFSET, diff_hi
+    Return DURATION_OK
+End Process
+
+Process called "duration_negate" takes a as Integer, result as Integer returns Integer:
+    @Reasoning
+    Two's-complement negation: result = -a. negate(0) = 0,
+    negate(INT128_MIN) = INT128_MIN (the standard wrapping convention).
+    @End Reasoning
+    @Implementation
+    Bitwise NOT both limbs, then add 1 with carry handling.
+    @End Implementation
+    @Performance_Hints
+    Two NOTs + add-with-carry. ~5 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Read of a, write of result; both caller-owned.
+    @End Security_Scope
+    If a is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    Let a_lo be proc memory_get_int64 from MemoryCore with a, DURATION_LO_OFFSET
+    Let a_hi be proc memory_get_int64 from MemoryCore with a, DURATION_HI_OFFSET
+    Let inv_lo be bitwise not a_lo
+    Let inv_hi be bitwise not a_hi
+    Let new_lo be inv_lo plus 1
+    Let carry be _dur_carry_from_add(inv_lo, 1, new_lo)
+    Let new_hi be inv_hi plus carry
+    Let dummy_lo be proc memory_set_int64 from MemoryCore with result, DURATION_LO_OFFSET, new_lo
+    Let dummy_hi be proc memory_set_int64 from MemoryCore with result, DURATION_HI_OFFSET, new_hi
+    Return DURATION_OK
+End Process
+
+Process called "duration_abs" takes a as Integer, result as Integer returns Integer:
+    @Reasoning
+    Absolute value. abs(-d) = d, abs(+d) = d. abs(INT128_MIN) wraps to
+    INT128_MIN per the two's-complement contract; no signed integer
+    type can represent the positive counterpart.
+    @End Reasoning
+    @Implementation
+    Tests the sign bit of the high limb. If clear, copies a to
+    result. If set, defers to duration_negate.
+    @End Implementation
+    @Performance_Hints
+    One sign-bit test + either a copy or a negate.
+    @End Performance_Hints
+    @Security_Scope
+    Read of a, write of result.
+    @End Security_Scope
+    If a is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    Let a_hi be proc memory_get_int64 from MemoryCore with a, DURATION_HI_OFFSET
+    If a_hi is less than 0:
+        Return duration_negate(a, result)
+    End If
+    Return duration_copy(a, result)
+End Process
+
+Process called "duration_multiply_by_integer" takes a as Integer, factor as Integer, result as Integer returns Integer:
+    @Reasoning
+    Scalar multiplication: result = a * factor where factor is a
+    signed 64-bit integer. Used for "this many of that duration"
+    arithmetic (e.g. seven 30-second slots).
+    @End Reasoning
+    @Implementation
+    Splits a into four 32-bit unsigned chunks (a_lo_low,
+    a_lo_high, a_hi_low, a_hi_high), and factor into its sign-bit
+    and 64-bit magnitude. Performs a 128 x 64 schoolbook multiply
+    using the 64x64->128 split via 32x32->64 partials, then
+    applies the sign at the end. Wraps modulo 2^128, matching the
+    semantics of int256_mul.
+    @End Implementation
+    @Performance_Hints
+    Eight 32-bit multiplies + adds. ~25 cycles on x86-64. Faster
+    paths exist if factor is a power of two (caller can shift
+    directly).
+    @End Performance_Hints
+    @Security_Scope
+    Read of a, write of result.
+    @End Security_Scope
+    If a is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+
+    Note: Capture sign of factor and work with magnitude.
+    Let factor_neg be 0
+    Let mag_factor be factor
+    If factor is less than 0:
+        Set factor_neg to 1
+        Set mag_factor to 0 minus factor
+    End If
+
+    Note: Capture sign of a and work with magnitude of a.
+    Let a_lo be proc memory_get_int64 from MemoryCore with a, DURATION_LO_OFFSET
+    Let a_hi be proc memory_get_int64 from MemoryCore with a, DURATION_HI_OFFSET
+    Let a_neg be 0
+    Let mag_lo be a_lo
+    Let mag_hi be a_hi
+    If a_hi is less than 0:
+        Set a_neg to 1
+        Note: Two's-complement magnitude of a: invert and add 1.
+        Let inv_lo be bitwise not a_lo
+        Let inv_hi be bitwise not a_hi
+        Let mlo_partial be inv_lo plus 1
+        Let neg_carry be _dur_carry_from_add(inv_lo, 1, mlo_partial)
+        Set mag_lo to mlo_partial
+        Set mag_hi to inv_hi plus neg_carry
+    End If
+
+    Note: 32-bit chunks of mag_lo and mag_hi (unsigned).
+    Let mag_lo_lo32 be mag_lo bitwise and DUR_LOW32_MASK
+    Let mag_lo_hi32 be (mag_lo shifted right by DUR_HIGH32_SHIFT) bitwise and DUR_LOW32_MASK
+    Let mag_hi_lo32 be mag_hi bitwise and DUR_LOW32_MASK
+    Let mag_hi_hi32 be (mag_hi shifted right by DUR_HIGH32_SHIFT) bitwise and DUR_LOW32_MASK
+
+    Let f_lo32 be mag_factor bitwise and DUR_LOW32_MASK
+    Let f_hi32 be (mag_factor shifted right by DUR_HIGH32_SHIFT) bitwise and DUR_LOW32_MASK
+
+    Note: Schoolbook 128 x 64 -> 192 bit product; we keep the low 128 bits.
+    Note: p0 contributes to bits [0..63], p1+p2 to [32..95], p3+p4+p5 to [64..127].
+    Let p0 be mag_lo_lo32 multiplied by f_lo32
+    Let p1 be mag_lo_lo32 multiplied by f_hi32
+    Let p2 be mag_lo_hi32 multiplied by f_lo32
+    Let p3 be mag_lo_hi32 multiplied by f_hi32
+    Let p4 be mag_hi_lo32 multiplied by f_lo32
+    Let p5 be mag_hi_lo32 multiplied by f_hi32
+    Let p6 be mag_hi_hi32 multiplied by f_lo32
+
+    Note: Build the low limb of the magnitude product.
+    Let p0_lo32 be p0 bitwise and DUR_LOW32_MASK
+    Let p0_hi32 be (p0 shifted right by DUR_HIGH32_SHIFT) bitwise and DUR_LOW32_MASK
+    Let mid_sum be (p1 plus p2) plus p0_hi32
+    Let mid_sum_lo32 be mid_sum bitwise and DUR_LOW32_MASK
+    Let mid_sum_carry be mid_sum shifted right by DUR_HIGH32_SHIFT
+    Let prod_lo be (mid_sum_lo32 shifted left by DUR_HIGH32_SHIFT) bitwise or p0_lo32
+
+    Note: High limb of the magnitude product: p3 + p4 + p5*2^32 + p6*2^32 + carry.
+    Let prod_hi_partial be (p3 plus p4) plus mid_sum_carry
+    Let p5_shifted be p5 shifted left by DUR_HIGH32_SHIFT
+    Let p6_shifted be p6 shifted left by DUR_HIGH32_SHIFT
+    Let prod_hi be (prod_hi_partial plus p5_shifted) plus p6_shifted
+
+    Note: Apply final sign. Result is negative iff exactly one operand was negative.
+    Let final_neg be a_neg bitwise xor factor_neg
+    If final_neg is equal to 1:
+        Let inv_prod_lo be bitwise not prod_lo
+        Let inv_prod_hi be bitwise not prod_hi
+        Let neg_lo be inv_prod_lo plus 1
+        Let neg_carry2 be _dur_carry_from_add(inv_prod_lo, 1, neg_lo)
+        Let neg_hi be inv_prod_hi plus neg_carry2
+        Let dummy_lo be proc memory_set_int64 from MemoryCore with result, DURATION_LO_OFFSET, neg_lo
+        Let dummy_hi be proc memory_set_int64 from MemoryCore with result, DURATION_HI_OFFSET, neg_hi
+        Return DURATION_OK
+    End If
+
+    Let dummy_lo2 be proc memory_set_int64 from MemoryCore with result, DURATION_LO_OFFSET, prod_lo
+    Let dummy_hi2 be proc memory_set_int64 from MemoryCore with result, DURATION_HI_OFFSET, prod_hi
+    Return DURATION_OK
+End Process
+
+Process called "duration_divide_by_integer" takes a as Integer, divisor as Integer, result as Integer returns Integer:
+    @Reasoning
+    Scalar division: result = a / divisor where divisor is a non-zero
+    signed 64-bit integer. Used for averages, splitting an interval
+    into N equal parts, etc. Division by zero returns
+    DURATION_ERR_DIVIDE_BY_ZERO and leaves result unmodified.
+    @End Reasoning
+    @Implementation
+    For magnitudes that fit in 64 bits (the common case: any Duration
+    bounded by +/- 292 years), this collapses to a 64-bit divide. For
+    truly 128-bit Durations a long-division loop walks bit-by-bit from
+    the MSB; the loop runs at most 128 iterations, bounded and finite.
+    Sign is computed as the XOR of operand signs, with the magnitude
+    division done in unsigned 128-bit arithmetic.
+    @End Implementation
+    @Performance_Hints
+    Fast path (high limb is 0 or all-ones with sign-match): one 64-bit
+    DIV. Slow path: 128-iteration long division, ~400-600 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Read of a, write of result. Division by zero is detected and
+    surfaced as an error sentinel; never traps.
+    @End Security_Scope
+    If a is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If divisor is equal to 0:
+        Return DURATION_ERR_DIVIDE_BY_ZERO
+    End If
+
+    Note: Compute magnitudes and combined sign.
+    Let a_lo be proc memory_get_int64 from MemoryCore with a, DURATION_LO_OFFSET
+    Let a_hi be proc memory_get_int64 from MemoryCore with a, DURATION_HI_OFFSET
+    Let a_neg be 0
+    Let mag_lo be a_lo
+    Let mag_hi be a_hi
+    If a_hi is less than 0:
+        Set a_neg to 1
+        Let inv_lo be bitwise not a_lo
+        Let inv_hi be bitwise not a_hi
+        Let mlo_partial be inv_lo plus 1
+        Let neg_carry be _dur_carry_from_add(inv_lo, 1, mlo_partial)
+        Set mag_lo to mlo_partial
+        Set mag_hi to inv_hi plus neg_carry
+    End If
+
+    Let divisor_neg be 0
+    Let mag_div be divisor
+    If divisor is less than 0:
+        Set divisor_neg to 1
+        Set mag_div to 0 minus divisor
+    End If
+
+    Let q_lo be 0
+    Let q_hi be 0
+
+    Note: Fast path: high limb of magnitude is zero -> 64-bit division.
+    If mag_hi is equal to 0:
+        Set q_lo to mag_lo divided by mag_div
+        Set q_hi to 0
+    Otherwise:
+        Note: Long division: shift remainder left bit-by-bit, accumulate quotient.
+        Let rem be 0
+        Let bit_index be 127
+        While bit_index is greater than or equal to 0:
+            Note: rem = (rem << 1) | bit(mag, bit_index)
+            Set rem to rem shifted left by 1
+            Let target_bit be 0
+            If bit_index is greater than or equal to 64:
+                Let pos be bit_index minus 64
+                Set target_bit to (mag_hi shifted right by pos) bitwise and 1
+            Otherwise:
+                Set target_bit to (mag_lo shifted right by bit_index) bitwise and 1
+            End If
+            Set rem to rem bitwise or target_bit
+            Note: Compare rem (unsigned 64-bit) to mag_div (unsigned 64-bit).
+            Note: We do a signed-aware unsigned compare via two halves.
+            Let take be 0
+            If rem is greater than or equal to mag_div:
+                Set take to 1
+            End If
+            Note: Handle the case where rem has its top bit set (unsigned > signed cmp).
+            If rem is less than 0:
+                If mag_div is greater than or equal to 0:
+                    Set take to 1
+                Otherwise:
+                    If rem is greater than or equal to mag_div:
+                        Set take to 1
+                    Otherwise:
+                        Set take to 0
+                    End If
+                End If
+            End If
+            If take is equal to 1:
+                Set rem to rem minus mag_div
+                Note: Set quotient bit at bit_index.
+                If bit_index is greater than or equal to 64:
+                    Let pos2 be bit_index minus 64
+                    Let bit_mask be 1 shifted left by pos2
+                    Set q_hi to q_hi bitwise or bit_mask
+                Otherwise:
+                    Let bit_mask2 be 1 shifted left by bit_index
+                    Set q_lo to q_lo bitwise or bit_mask2
+                End If
+            End If
+            Set bit_index to bit_index minus 1
+        End While
+    End If
+
+    Note: Apply sign.
+    Let final_neg2 be a_neg bitwise xor divisor_neg
+    If final_neg2 is equal to 1:
+        Let inv_qlo be bitwise not q_lo
+        Let inv_qhi be bitwise not q_hi
+        Let new_qlo be inv_qlo plus 1
+        Let neg_carry3 be _dur_carry_from_add(inv_qlo, 1, new_qlo)
+        Let new_qhi be inv_qhi plus neg_carry3
+        Let dummy_lo be proc memory_set_int64 from MemoryCore with result, DURATION_LO_OFFSET, new_qlo
+        Let dummy_hi be proc memory_set_int64 from MemoryCore with result, DURATION_HI_OFFSET, new_qhi
+        Return DURATION_OK
+    End If
+
+    Let dummy_lo2 be proc memory_set_int64 from MemoryCore with result, DURATION_LO_OFFSET, q_lo
+    Let dummy_hi2 be proc memory_set_int64 from MemoryCore with result, DURATION_HI_OFFSET, q_hi
+    Return DURATION_OK
+End Process
+
+Note: ============================================================================
+Note: Comparison: 128-bit two's-complement
+Note: ============================================================================
+
+Process called "duration_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Three-way comparison. Returns -1 if a < b, 0 if equal, +1 if a > b.
+    Signed comparison on the high limb, unsigned comparison on the low
+    limb if high limbs match.
+    @End Reasoning
+    @Implementation
+    Compares high limbs as signed; if equal, compares low limbs as
+    unsigned. The unsigned compare on the low limb uses the
+    sign-bit-aware trick: if exactly one operand has its top bit set,
+    that one is unsigned-greater than the other.
+    @End Implementation
+    @Performance_Hints
+    Two compares + bit-tests in the worst case. ~3-4 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let a_hi be proc memory_get_int64 from MemoryCore with a, DURATION_HI_OFFSET
+    Let b_hi be proc memory_get_int64 from MemoryCore with b, DURATION_HI_OFFSET
+    If a_hi is less than b_hi:
+        Return -1
+    End If
+    If a_hi is greater than b_hi:
+        Return 1
+    End If
+    Let a_lo be proc memory_get_int64 from MemoryCore with a, DURATION_LO_OFFSET
+    Let b_lo be proc memory_get_int64 from MemoryCore with b, DURATION_LO_OFFSET
+    Note: Unsigned compare on a_lo / b_lo.
+    Let a_top be a_lo bitwise and DUR_HIGH_BIT_MASK
+    Let b_top be b_lo bitwise and DUR_HIGH_BIT_MASK
+    If a_top is not equal to b_top:
+        If a_top is equal to 0:
+            Note: a_lo has 0 in MSB, b_lo has 1 -> b is unsigned-greater.
+            Return -1
+        End If
+        Return 1
+    End If
+    Note: Same MSB -> signed compare matches unsigned compare.
+    If a_lo is less than b_lo:
+        Return -1
+    End If
+    If a_lo is greater than b_lo:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "duration_equals" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Equality predicate.
+    @End Reasoning
+    @Implementation
+    Compares both limbs for bitwise equality.
+    @End Implementation
+    @Performance_Hints
+    Two loads + two compares per operand.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If duration_compare(a, b) is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "duration_not_equals" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Inequality predicate.
+    @End Reasoning
+    @Implementation
+    Negation of duration_equals.
+    @End Implementation
+    @Performance_Hints
+    Same as duration_equals.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If duration_equals(a, b) is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "duration_less_than" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Strict less-than predicate.
+    @End Reasoning
+    @Implementation
+    Returns 1 iff duration_compare returns -1.
+    @End Implementation
+    @Performance_Hints
+    Single compare.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If duration_compare(a, b) is equal to -1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "duration_less_than_or_equal" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Less-than-or-equal predicate.
+    @End Reasoning
+    @Implementation
+    Returns 1 iff duration_compare returns -1 or 0.
+    @End Implementation
+    @Performance_Hints
+    Single compare.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let cmp_result be duration_compare(a, b)
+    If cmp_result is less than or equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "duration_greater_than" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Strict greater-than predicate.
+    @End Reasoning
+    @Implementation
+    Returns 1 iff duration_compare returns +1.
+    @End Implementation
+    @Performance_Hints
+    Single compare.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If duration_compare(a, b) is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "duration_greater_than_or_equal" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Greater-than-or-equal predicate.
+    @End Reasoning
+    @Implementation
+    Returns 1 iff duration_compare is 0 or +1.
+    @End Implementation
+    @Performance_Hints
+    Single compare.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let cmp_result be duration_compare(a, b)
+    If cmp_result is greater than or equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "duration_is_zero" takes d as Integer returns Integer:
+    @Reasoning
+    True when both limbs are zero.
+    @End Reasoning
+    @Implementation
+    Two loads + two equality checks.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If d is equal to 0:
+        Return 0
+    End If
+    Let lo be proc memory_get_int64 from MemoryCore with d, DURATION_LO_OFFSET
+    If lo is not equal to 0:
+        Return 0
+    End If
+    Let hi be proc memory_get_int64 from MemoryCore with d, DURATION_HI_OFFSET
+    If hi is not equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "duration_is_negative" takes d as Integer returns Integer:
+    @Reasoning
+    True when the duration is strictly less than zero (sign bit of the
+    high limb is set).
+    @End Reasoning
+    @Implementation
+    Tests the high-limb sign bit.
+    @End Implementation
+    @Performance_Hints
+    One load + one bit test.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If d is equal to 0:
+        Return 0
+    End If
+    Let hi be proc memory_get_int64 from MemoryCore with d, DURATION_HI_OFFSET
+    If hi is less than 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "duration_is_positive" takes d as Integer returns Integer:
+    @Reasoning
+    True when the duration is strictly greater than zero.
+    @End Reasoning
+    @Implementation
+    Combines duration_is_zero and duration_is_negative.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If d is equal to 0:
+        Return 0
+    End If
+    If duration_is_zero(d) is equal to 1:
+        Return 0
+    End If
+    If duration_is_negative(d) is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Internal: integer-to-decimal-string helpers (positive only)
+Note: ============================================================================
+
+Process called "_dur_write_uint_decimal" takes buf as Integer, offset as Integer, value as Integer returns Integer:
+    @Reasoning
+    Writes a non-negative integer as decimal ASCII into buf starting
+    at offset, returning the number of bytes written. Used by the
+    human-readable and ISO 8601 formatters below.
+    @End Reasoning
+    @Implementation
+    Generates digits least-significant first into a scratch area on
+    the stack-style local variable buffer (using a fixed 20-byte
+    capacity, sufficient for any 64-bit unsigned value), then
+    reverses them into the output buffer.
+    @End Implementation
+    @Performance_Hints
+    O(log10(value)) work. For typical durations this is under 20
+    digits.
+    @End Performance_Hints
+    @Security_Scope
+    Caller is responsible for sizing buf. The function writes at most
+    20 bytes per call.
+    @End Security_Scope
+    If value is equal to 0:
+        Let d_set be proc memory_set_int8 from MemoryCore with buf, offset, DUR_ASCII_ZERO
+        Return 1
+    End If
+    Let scratch be proc allocate from Layout with 32
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let n be 0
+    Let v be value
+    While v is greater than 0:
+        Let digit be v modulo by 10
+        Let ascii_d be digit plus DUR_ASCII_ZERO
+        Let dummy be proc memory_set_int8 from MemoryCore with scratch, n, ascii_d
+        Set n to n plus 1
+        Set v to v divided by 10
+    End While
+    Note: Reverse into output.
+    Let i be 0
+    While i is less than n:
+        Let src_index be (n minus 1) minus i
+        Let c be proc memory_get_int8 from MemoryCore with scratch, src_index
+        Let dst_offset be offset plus i
+        Let dummy2 be proc memory_set_int8 from MemoryCore with buf, dst_offset, c
+        Set i to i plus 1
+    End While
+    Let dummy3 be proc deallocate from Layout with scratch
+    Return n
+End Process
+
+Note: ============================================================================
+Note: ISO 8601 formatting
+Note: ============================================================================
+
+Process called "duration_to_iso_8601" takes d as Integer, out_buf as Integer, out_capacity as Integer returns Integer:
+    @Reasoning
+    Formats a Duration as ISO 8601 §5.5.4 duration form. Examples:
+      PT1H30M           - 1 hour, 30 minutes
+      PT45.500S         - 45.5 seconds
+      -PT5M             - negative 5 minutes (sign prefix per §5.5.4.2)
+      P0D               - zero duration
+    Because ISO 8601 weeks (P1W) are mutually exclusive with H/M/S
+    designators, the formatter normalises to days + hours + minutes +
+    seconds rather than emitting weeks.
+    @End Reasoning
+    @Implementation
+    Operates on the absolute value of the duration, splits into days
+    / hours / minutes / seconds / nanoseconds using the
+    DUR_NS_PER_* ratios, then emits "P", "T" (if any time-of-day
+    components are non-zero), and each non-zero unit with its
+    designator. Fractional seconds are emitted to a fixed nine
+    digits when nanoseconds are non-zero, with trailing zeros
+    trimmed. Zero duration emits "PT0S" (RFC 3339 / Java Duration
+    convention).
+    @End Implementation
+    @Performance_Hints
+    O(number of digits in the output). No allocations besides the
+    digit-formatter scratch buffer.
+    @End Performance_Hints
+    @Security_Scope
+    Bounded writes into out_buf up to out_capacity. Returns the
+    number of bytes written excluding any null terminator; the
+    caller must guarantee capacity >= 32 to fit any realistic ISO
+    duration string.
+    @End Security_Scope
+    If out_buf is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If out_capacity is less than 5:
+        Return DURATION_ERR_NULL
+    End If
+
+    Note: Detect sign by checking high limb of d.
+    Let total_ns be 0
+    Let is_negative be 0
+    If d is not equal to 0:
+        Let d_hi be proc memory_get_int64 from MemoryCore with d, DURATION_HI_OFFSET
+        Let d_lo be proc memory_get_int64 from MemoryCore with d, DURATION_LO_OFFSET
+        If d_hi is less than 0:
+            Set is_negative to 1
+            Note: Magnitude = -d in 64-bit; assumes |d| fits in 64 bits for ISO output.
+            Set total_ns to 0 minus d_lo
+        Otherwise:
+            Set total_ns to d_lo
+        End If
+    End If
+
+    Let cursor be 0
+    If is_negative is equal to 1:
+        Let dummy_minus be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_MINUS
+        Set cursor to cursor plus 1
+    End If
+    Let dummy_p be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_P_UPPER
+    Set cursor to cursor plus 1
+
+    Note: Zero case.
+    If total_ns is equal to 0:
+        Let dummy_t be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_T_UPPER
+        Set cursor to cursor plus 1
+        Let dummy_0 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_ZERO
+        Set cursor to cursor plus 1
+        Let dummy_s be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_S_UPPER
+        Set cursor to cursor plus 1
+        Return cursor
+    End If
+
+    Let days be total_ns divided by DUR_NS_PER_DAY
+    Let rem_after_days be total_ns modulo by DUR_NS_PER_DAY
+    Let hours be rem_after_days divided by DUR_NS_PER_HOUR
+    Let rem_after_hours be rem_after_days modulo by DUR_NS_PER_HOUR
+    Let mins be rem_after_hours divided by DUR_NS_PER_MIN
+    Let rem_after_mins be rem_after_hours modulo by DUR_NS_PER_MIN
+    Let secs be rem_after_mins divided by DUR_NS_PER_S
+    Let ns_remainder be rem_after_mins modulo by DUR_NS_PER_S
+
+    Note: Date portion: "<days>D".
+    If days is greater than 0:
+        Let dlen be _dur_write_uint_decimal(out_buf, cursor, days)
+        Set cursor to cursor plus dlen
+        Let dummy_d be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_D_UPPER
+        Set cursor to cursor plus 1
+    End If
+
+    Note: Need a T section if any time-of-day component is non-zero.
+    Let time_present be 0
+    If hours is greater than 0:
+        Set time_present to 1
+    End If
+    If mins is greater than 0:
+        Set time_present to 1
+    End If
+    If secs is greater than 0:
+        Set time_present to 1
+    End If
+    If ns_remainder is greater than 0:
+        Set time_present to 1
+    End If
+
+    If time_present is equal to 1:
+        Let dummy_t2 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_T_UPPER
+        Set cursor to cursor plus 1
+        If hours is greater than 0:
+            Let hlen be _dur_write_uint_decimal(out_buf, cursor, hours)
+            Set cursor to cursor plus hlen
+            Let dummy_h be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_H_UPPER
+            Set cursor to cursor plus 1
+        End If
+        If mins is greater than 0:
+            Let mlen be _dur_write_uint_decimal(out_buf, cursor, mins)
+            Set cursor to cursor plus mlen
+            Let dummy_m be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_M_UPPER
+            Set cursor to cursor plus 1
+        End If
+        Let any_secs be 0
+        If secs is greater than 0:
+            Set any_secs to 1
+        End If
+        If ns_remainder is greater than 0:
+            Set any_secs to 1
+        End If
+        If any_secs is equal to 1:
+            Let slen be _dur_write_uint_decimal(out_buf, cursor, secs)
+            Set cursor to cursor plus slen
+            If ns_remainder is greater than 0:
+                Let dummy_dot be proc memory_set_int8 from MemoryCore with out_buf, cursor, 46
+                Set cursor to cursor plus 1
+                Note: Emit nine digits then trim trailing zeros.
+                Let digits_buf be proc allocate from Layout with 16
+                If digits_buf is equal to 0:
+                    Return DURATION_ERR_NULL
+                End If
+                Note: zero-pad to 9 digits
+                Let v be ns_remainder
+                Let i9 be 8
+                While i9 is greater than or equal to 0:
+                    Let digit_v be v modulo by 10
+                    Let ascii_d be digit_v plus DUR_ASCII_ZERO
+                    Let dummy_pd be proc memory_set_int8 from MemoryCore with digits_buf, i9, ascii_d
+                    Set v to v divided by 10
+                    Set i9 to i9 minus 1
+                End While
+                Note: Find last non-zero index.
+                Let last be 8
+                While last is greater than 0:
+                    Let c_last be proc memory_get_int8 from MemoryCore with digits_buf, last
+                    If c_last is equal to DUR_ASCII_ZERO:
+                        Set last to last minus 1
+                    Otherwise:
+                        Set last to 0 minus 1
+                    End If
+                End While
+                Note: 'last' is now either -1 (loop broke because non-zero) so we
+                Note: need to recompute trim_count by scanning forward.
+                Let trim_count be 0
+                Let scan be 8
+                While scan is greater than 0:
+                    Let c_scan be proc memory_get_int8 from MemoryCore with digits_buf, scan
+                    If c_scan is equal to DUR_ASCII_ZERO:
+                        Set trim_count to trim_count plus 1
+                        Set scan to scan minus 1
+                    Otherwise:
+                        Set scan to 0 minus 1
+                    End If
+                End While
+                Let emit_len be 9 minus trim_count
+                Let k be 0
+                While k is less than emit_len:
+                    Let c be proc memory_get_int8 from MemoryCore with digits_buf, k
+                    Let dst_off be cursor plus k
+                    Let dummy_wc be proc memory_set_int8 from MemoryCore with out_buf, dst_off, c
+                    Set k to k plus 1
+                End While
+                Set cursor to cursor plus emit_len
+                Let dummy_freed be proc deallocate from Layout with digits_buf
+            End If
+            Let dummy_s2 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_S_UPPER
+            Set cursor to cursor plus 1
+        End If
+    End If
+
+    Return cursor
+End Process
+
+Note: ============================================================================
+Note: Human-readable formatting (e.g. "1h 23m 45s")
+Note: ============================================================================
+
+Process called "duration_to_human_string" takes d as Integer, out_buf as Integer, out_capacity as Integer returns Integer:
+    @Reasoning
+    Emits a human-friendly duration string using compact unit suffixes
+    (d/h/m/s/ms/us/ns). Components with zero magnitude are omitted.
+    Negative durations are prefixed with "-". Example outputs:
+      "0s"
+      "1h 23m 45s"
+      "-2d 5h"
+      "150ms"
+    @End Reasoning
+    @Implementation
+    Splits the magnitude into day / hour / minute / second / millisecond
+    / microsecond / nanosecond components and emits each non-zero
+    component separated by a single ASCII space. The smallest
+    sub-second unit chosen is the largest one that captures the
+    sub-second remainder exactly.
+    @End Implementation
+    @Performance_Hints
+    Linear in the number of components emitted, bounded by a small
+    constant. No allocations beyond the digit formatter scratch.
+    @End Performance_Hints
+    @Security_Scope
+    Bounded writes into out_buf up to out_capacity. Caller should
+    provide capacity >= 64 for any realistic input.
+    @End Security_Scope
+    If out_buf is equal to 0:
+        Return DURATION_ERR_NULL
+    End If
+    If out_capacity is less than 3:
+        Return DURATION_ERR_NULL
+    End If
+
+    Let total_ns be 0
+    Let is_negative be 0
+    If d is not equal to 0:
+        Let d_hi be proc memory_get_int64 from MemoryCore with d, DURATION_HI_OFFSET
+        Let d_lo be proc memory_get_int64 from MemoryCore with d, DURATION_LO_OFFSET
+        If d_hi is less than 0:
+            Set is_negative to 1
+            Set total_ns to 0 minus d_lo
+        Otherwise:
+            Set total_ns to d_lo
+        End If
+    End If
+
+    Let cursor be 0
+    If is_negative is equal to 1:
+        Let dummy_minus be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_MINUS
+        Set cursor to cursor plus 1
+    End If
+
+    If total_ns is equal to 0:
+        Let dummy_0 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_ZERO
+        Set cursor to cursor plus 1
+        Let dummy_s_low be proc memory_set_int8 from MemoryCore with out_buf, cursor, 115
+        Set cursor to cursor plus 1
+        Return cursor
+    End If
+
+    Let days be total_ns divided by DUR_NS_PER_DAY
+    Let rem1 be total_ns modulo by DUR_NS_PER_DAY
+    Let hours be rem1 divided by DUR_NS_PER_HOUR
+    Let rem2 be rem1 modulo by DUR_NS_PER_HOUR
+    Let mins be rem2 divided by DUR_NS_PER_MIN
+    Let rem3 be rem2 modulo by DUR_NS_PER_MIN
+    Let secs be rem3 divided by DUR_NS_PER_S
+    Let sub_ns be rem3 modulo by DUR_NS_PER_S
+
+    Let any_written be 0
+
+    If days is greater than 0:
+        Let dlen be _dur_write_uint_decimal(out_buf, cursor, days)
+        Set cursor to cursor plus dlen
+        Let dummy_d_low be proc memory_set_int8 from MemoryCore with out_buf, cursor, 100
+        Set cursor to cursor plus 1
+        Set any_written to 1
+    End If
+    If hours is greater than 0:
+        If any_written is equal to 1:
+            Let dummy_sp be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_SPACE
+            Set cursor to cursor plus 1
+        End If
+        Let hlen be _dur_write_uint_decimal(out_buf, cursor, hours)
+        Set cursor to cursor plus hlen
+        Let dummy_h_low be proc memory_set_int8 from MemoryCore with out_buf, cursor, 104
+        Set cursor to cursor plus 1
+        Set any_written to 1
+    End If
+    If mins is greater than 0:
+        If any_written is equal to 1:
+            Let dummy_sp2 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_SPACE
+            Set cursor to cursor plus 1
+        End If
+        Let mlen be _dur_write_uint_decimal(out_buf, cursor, mins)
+        Set cursor to cursor plus mlen
+        Let dummy_m_low be proc memory_set_int8 from MemoryCore with out_buf, cursor, 109
+        Set cursor to cursor plus 1
+        Set any_written to 1
+    End If
+    If secs is greater than 0:
+        If any_written is equal to 1:
+            Let dummy_sp3 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_SPACE
+            Set cursor to cursor plus 1
+        End If
+        Let slen be _dur_write_uint_decimal(out_buf, cursor, secs)
+        Set cursor to cursor plus slen
+        Let dummy_s_low2 be proc memory_set_int8 from MemoryCore with out_buf, cursor, 115
+        Set cursor to cursor plus 1
+        Set any_written to 1
+    End If
+    If sub_ns is greater than 0:
+        Note: Choose the largest exact unit for the sub-second remainder.
+        Let unit_label_first be 0
+        Let unit_label_second be 0
+        Let value_out be 0
+        If (sub_ns modulo by DUR_NS_PER_MS) is equal to 0:
+            Set value_out to sub_ns divided by DUR_NS_PER_MS
+            Set unit_label_first to 109
+            Set unit_label_second to 115
+        Otherwise:
+            If (sub_ns modulo by DUR_NS_PER_US) is equal to 0:
+                Set value_out to sub_ns divided by DUR_NS_PER_US
+                Set unit_label_first to 117
+                Set unit_label_second to 115
+            Otherwise:
+                Set value_out to sub_ns
+                Set unit_label_first to 110
+                Set unit_label_second to 115
+            End If
+        End If
+        If any_written is equal to 1:
+            Let dummy_sp4 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DUR_ASCII_SPACE
+            Set cursor to cursor plus 1
+        End If
+        Let vlen be _dur_write_uint_decimal(out_buf, cursor, value_out)
+        Set cursor to cursor plus vlen
+        Let dummy_u1 be proc memory_set_int8 from MemoryCore with out_buf, cursor, unit_label_first
+        Set cursor to cursor plus 1
+        Let dummy_u2 be proc memory_set_int8 from MemoryCore with out_buf, cursor, unit_label_second
+        Set cursor to cursor plus 1
+    End If
+
+    Return cursor
+End Process

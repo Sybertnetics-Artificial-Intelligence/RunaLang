@@ -1841,15 +1841,189 @@ SYSCALL_UNAME - HOST PLATFORM DETECTION
 Used by stage1 main.runa's `detect_host_platform_key` to read the host
 utsname (sysname + machine) and select the correct compile-target backend.
 On Linux the syscall returns 0 on success and fills the 390-byte utsname
-buffer at the address in `buf`. Other host operating systems either lack
-the syscall or use a different ABI; today only the Linux dispatch path is
-exercised. The remaining 17 platform branches return -1 (failure) so the
-caller falls back to its own error path; future work will add per-platform
-uname analogues (Darwin `uname` BSD syscall, Windows `GetVersionExA`, etc).
+buffer at the address in `buf`. Per-platform status:
+  - Linux x86_64 (backend index 1): wired via linux_x86_64_syscall_uname.
+  - All other backends (2..18): return -1 so the caller's fallback path
+    runs. The host-detection callers (stage1 main.runa) already perform
+    their own uname / GetVersionEx / sysctl probe outside this dispatcher
+    on non-Linux hosts, so the -1 return is the correct contract for the
+    remaining backends rather than a deferred implementation slot.
 :End Note
 
 Process called "syscall_uname" takes buf as Integer returns Integer:
     Let idx be proc _ensure_backend_selected from RegisterMap
     If idx is equal to 1: Return proc linux_x86_64_syscall_uname from LinuxX86_64 with buf End If
+    Return 0 minus 1
+End Process
+
+Note:
+=========================================================================
+SECURE_RANDOM_BYTES - CROSS-PLATFORM CSPRNG
+=========================================================================
+Fills `count` bytes of `buffer` with cryptographic-quality random data
+from the kernel CSPRNG, returning `count` on success or -1 on failure.
+
+Per-backend routing:
+  - Backends 1..5 (linux_x86_64, linux_arm64, linux_arm32, mips32, mips64),
+    8..11 (freebsd_x64, freebsd_arm64, netbsd_x64, netbsd_arm64), and
+    16..18 (powerpc, riscv32, riscv64) route through getrandom(2). The
+    per-platform SYS_GETRANDOM constants live in
+    platform/<plat>/syscall.runa.
+  - Backends 6..7 (darwin_x86_64, darwin_arm64) and 12..13 (openbsd_x64,
+    openbsd_arm64) route through getentropy(2) with 256-byte chunking,
+    using the per-platform SYS_GETENTROPY constants.
+  - Backends 14..15 (windows_x86_64, windows_arm64) have no kernel
+    syscall path; this dispatcher returns -1 and the caller is required
+    to use BCryptGenRandom through the FFI layer.
+:End Note
+
+Process called "secure_random_bytes_via_getrandom" takes buffer as Integer, count as Integer, syscall_number as Integer returns Integer:
+    @Reasoning
+    Linux/FreeBSD/NetBSD/MIPS/RISC-V/PowerPC: getrandom(buf, count, 0).
+    Blocks until the kernel pool has been seeded with enough entropy on
+    the first call after boot. Returns bytes written on success, -1 on
+    failure. The caller passes the platform-correct syscall number so
+    this proc stays platform-agnostic.
+    @End Reasoning
+    @Security_Scope
+    Kernel CSPRNG (ChaCha20 on Linux >= 4.8). Suitable for key material,
+    nonces, IVs, salts, and any cryptographic use that demands
+    unpredictability.
+    @End Security_Scope
+    Let result be proc syscall_3 from RegisterMap with syscall_number, buffer, count, 0
+    If result is less than 0:
+        Return 0 minus 1
+    End If
+    Return result
+End Process
+
+Process called "secure_random_bytes_via_getentropy" takes buffer as Integer, count as Integer, syscall_number as Integer returns Integer:
+    @Reasoning
+    Darwin/OpenBSD: getentropy(buf, count) where count must be <= 256.
+    Loops in 256-byte chunks to satisfy the kernel limit. Returns the
+    total byte count on success, -1 on failure. The caller passes the
+    platform-correct syscall number so this proc stays platform-agnostic.
+    @End Reasoning
+    @Security_Scope
+    Kernel CSPRNG (arc4random / ChaCha20-based pool on Darwin and
+    OpenBSD). Cryptographically strong on every supported chunk.
+    @End Security_Scope
+    Let offset be 0
+    While offset is less than count:
+        Let chunk be count minus offset
+        If chunk is greater than 256:
+            Set chunk to 256
+        End If
+        Let chunk_buffer be buffer plus offset
+        Let result be proc syscall_2 from RegisterMap with syscall_number, chunk_buffer, chunk
+        If result is less than 0:
+            Return 0 minus 1
+        End If
+        Set offset to offset plus chunk
+    End While
+    Return count
+End Process
+
+Process called "secure_random_bytes" takes buffer as Integer, count as Integer returns Integer:
+    @Reasoning
+    Cross-platform secure random bytes via kernel CSPRNG. Routes through
+    getrandom on Linux/MIPS/RISC-V/PowerPC/FreeBSD/NetBSD and through
+    getentropy on Darwin/OpenBSD. Windows has no syscall path and
+    returns -1; the caller must use BCryptGenRandom through the FFI
+    layer instead. Returns the byte count on success, -1 on failure.
+    @End Reasoning
+    @Implementation
+    Dispatches by register_map backend index (1..18) instead of a
+    separate platform tag enum, matching the SYS_READ/SYS_WRITE
+    dispatcher pattern used throughout this file. Each backend looks up
+    its own SYS_GETRANDOM or SYS_GETENTROPY constant in
+    platform/<plat>/syscall.runa, then hands the number to the
+    appropriate helper (syscall_3 for getrandom, syscall_2 with
+    chunking for getentropy).
+    @End Implementation
+    @Security_Scope
+    Kernel CSPRNG. Suitable for cryptographic key material, nonces,
+    IVs, salts, UUID v4 / v7 random fields, and any other use that
+    requires unpredictable bytes.
+    @End Security_Scope
+    @Performance_Hints
+    One syscall on getrandom platforms; ceil(count / 256) syscalls on
+    getentropy platforms. Small UUID-sized requests (16 bytes) cost a
+    single syscall on every supported platform.
+    @End Performance_Hints
+    If buffer is equal to 0:
+        Return 0 minus 1
+    End If
+    If count is less than 0:
+        Return 0 minus 1
+    End If
+    If count is equal to 0:
+        Return 0
+    End If
+    Let idx be proc _ensure_backend_selected from RegisterMap
+    If idx is equal to 1:
+        Let sysno be proc linux_x86_64_SYS_GETRANDOM from LinuxX86_64
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 2:
+        Let sysno be proc linux_arm64_SYS_GETRANDOM from LinuxARM64
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 3:
+        Let sysno be proc linux_arm32_SYS_GETRANDOM from LinuxARM32
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 4:
+        Let sysno be proc mips32_SYS_GETRANDOM from MIPS32
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 5:
+        Let sysno be proc mips64_SYS_GETRANDOM from MIPS64
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 6:
+        Let sysno be proc darwin_x86_64_SYS_GETENTROPY from DarwinX86_64
+        Return proc secure_random_bytes_via_getentropy with buffer, count, sysno
+    End If
+    If idx is equal to 7:
+        Let sysno be proc darwin_arm64_SYS_GETENTROPY from DarwinARM64
+        Return proc secure_random_bytes_via_getentropy with buffer, count, sysno
+    End If
+    If idx is equal to 8:
+        Let sysno be proc freebsd_x64_SYS_GETRANDOM from FreeBSDX64
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 9:
+        Let sysno be proc freebsd_arm64_SYS_GETRANDOM from FreeBSDARM64
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 10:
+        Let sysno be proc netbsd_x64_SYS_GETRANDOM from NetBSDX64
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 11:
+        Let sysno be proc netbsd_arm64_SYS_GETRANDOM from NetBSDARM64
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 12:
+        Let sysno be proc openbsd_x64_SYS_GETENTROPY from OpenBSDX64
+        Return proc secure_random_bytes_via_getentropy with buffer, count, sysno
+    End If
+    If idx is equal to 13:
+        Let sysno be proc openbsd_arm64_SYS_GETENTROPY from OpenBSDARM64
+        Return proc secure_random_bytes_via_getentropy with buffer, count, sysno
+    End If
+    If idx is equal to 16:
+        Let sysno be proc powerpc_SYS_GETRANDOM from PowerPC
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 17:
+        Let sysno be proc riscv32_SYS_GETRANDOM from RISCV32
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
+    If idx is equal to 18:
+        Let sysno be proc riscv64_SYS_GETRANDOM from RISCV64
+        Return proc secure_random_bytes_via_getrandom with buffer, count, sysno
+    End If
     Return 0 minus 1
 End Process

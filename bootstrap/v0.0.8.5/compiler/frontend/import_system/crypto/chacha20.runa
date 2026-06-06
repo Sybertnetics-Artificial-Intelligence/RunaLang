@@ -1,0 +1,564 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+CHACHA20 - Stream cipher per RFC 8439
+==============================================================================
+
+ChaCha20 is a 256-bit-key 96-bit-nonce stream cipher designed by Daniel J.
+Bernstein and standardized in RFC 8439 as the recommended cipher for TLS 1.3
+when AES hardware acceleration is unavailable.
+
+Construction:
+  State (RFC 8439 section 2.3):
+    [const0  const1  const2  const3 ]   "expand 32-byte k"
+    [key0    key1    key2    key3   ]
+    [key4    key5    key6    key7   ]
+    [counter nonce0  nonce1  nonce2 ]
+
+  20-round permutation = 10 double-rounds, each consisting of:
+    Column round: QR(0,4,8,12), QR(1,5,9,13), QR(2,6,10,14), QR(3,7,11,15)
+    Diagonal round: QR(0,5,10,15), QR(1,6,11,12), QR(2,7,8,13), QR(3,4,9,14)
+
+  QR(a,b,c,d):
+    a += b; d ^= a; d <<<= 16
+    c += d; b ^= c; b <<<= 12
+    a += b; d ^= a; d <<<= 8
+    c += d; b ^= c; b <<<= 7
+
+After 20 rounds, the output state is added back to the original state
+(modulo 2^32 per word) to produce a 64-byte keystream block.
+
+Encryption is keystream XOR plaintext. Decryption is the same operation
+(involutive).
+
+Side-channel posture:
+- No secret-dependent branches: every operation is integer arithmetic on
+  fixed-size state words.
+- No secret-dependent memory accesses: state indices are loop-counter
+  driven, not key-derived.
+- Constant-time by construction at the algorithm level.
+
+Out-of-scope side channels:
+- CPU microarchitectural timing differences in 32-bit integer add and rotate
+  (uniform on every CPU we target).
+- Power-analysis attacks (require physical access; out of scope for software
+  countermeasures).
+
+References:
+- RFC 8439, "ChaCha20 and Poly1305 for IETF Protocols", Y. Nir, A. Langley.
+- D. J. Bernstein, "ChaCha, a variant of Salsa20", 2008.
+- FSE 2008 paper.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+
+Constant CHACHA20_KEY_SIZE as Integer is 32
+Constant CHACHA20_NONCE_SIZE as Integer is 12
+Constant CHACHA20_BLOCK_SIZE as Integer is 64
+Constant CHACHA20_STATE_WORDS as Integer is 16
+Constant U32_MASK as Integer is 4294967295
+Constant CHACHA20_CONST_0 as Integer is 1634760805
+Constant CHACHA20_CONST_1 as Integer is 857760878
+Constant CHACHA20_CONST_2 as Integer is 2036477234
+Constant CHACHA20_CONST_3 as Integer is 1797285236
+
+Note: ============================================================================
+Note: 32-bit arithmetic helpers (purely arithmetic, constant-time)
+Note: ============================================================================
+
+Process called "chacha20_u32_add" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Modular 32-bit addition: (a + b) mod 2^32. Runa Integer is 64-bit signed
+    so plain addition does not overflow into the 33rd bit; we mask the
+    result to 32 bits to discard any sign-extension or carry.
+    @End Reasoning
+
+    @Implementation
+    Adds the two integers, then masks with U32_MASK (= 2^32 - 1) to drop
+    any bits 32+. Both inputs must already be in [0, 2^32). Result is in
+    [0, 2^32).
+    @End Implementation
+
+    @Performance_Hints
+    Single integer add + single bitwise_and. Sub-nanosecond on any modern
+    CPU; no memory access.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time (pure arithmetic).
+    @End Security_Scope
+
+    Let sum_value be a plus b
+    Return sum_value bitwise_and U32_MASK
+End Process
+
+Process called "chacha20_rotl32" takes value as Integer, n as Integer returns Integer:
+    @Reasoning
+    Left-rotate a 32-bit word by n positions. The ChaCha20 quarter-round
+    uses rotations by 16, 12, 8, and 7. Implemented as
+    ((value << n) | (value >> (32 - n))) masked to 32 bits.
+    @End Reasoning
+
+    @Implementation
+    Multiplies value by 2^n to perform the left shift, then divides the
+    32-bit value by 2^(32-n) to perform the right shift, ORs the two
+    halves, and masks to 32 bits. Equivalent to a hardware ROL on x86.
+    @End Implementation
+
+    @Performance_Hints
+    Two integer multiplies-by-power-of-2, one divide-by-power-of-2, one
+    OR, one mask. Sub-nanosecond. A future Runa codegen pass can lower
+    this to a single ROL instruction once the pattern is detected.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: timing depends only on n (public, loop-invariant), not
+    on value.
+    @End Security_Scope
+
+    Let v32 be value bitwise_and U32_MASK
+    Let n_mod be n modulo by 32
+    If n_mod is equal to 0:
+        Return v32
+    End If
+
+    Let shift_left be 1
+    Let il be 0
+    While il is less than n_mod:
+        Set shift_left to shift_left multiplied by 2
+        Set il to il plus 1
+    End While
+    Let shift_right be 1
+    Let ir be 0
+    Let right_count be 32 minus n_mod
+    While ir is less than right_count:
+        Set shift_right to shift_right multiplied by 2
+        Set ir to ir plus 1
+    End While
+
+    Let left_part be v32 multiplied by shift_left
+    Set left_part to left_part bitwise_and U32_MASK
+    Let right_part be v32 divided by shift_right
+    Let combined be left_part bitwise_or right_part
+    Return combined bitwise_and U32_MASK
+End Process
+
+Note: ============================================================================
+Note: ChaCha20 quarter round
+Note: ============================================================================
+
+Process called "chacha20_quarter_round" takes state as Integer, ia as Integer, ib as Integer, ic as Integer, id as Integer returns Integer:
+    @Reasoning
+    Performs the ChaCha20 quarter-round on four state words at indices
+    ia, ib, ic, id. Each state word is stored as an 8-byte qword at
+    offset index*8 in state to keep 32-bit values in 64-bit slots
+    (saves us from having to handle 32-bit-only arithmetic at the load).
+    @End Reasoning
+
+    @Implementation
+    Per RFC 8439 section 2.1:
+      a += b; d ^= a; d <<<= 16
+      c += d; b ^= c; b <<<= 12
+      a += b; d ^= a; d <<<= 8
+      c += d; b ^= c; b <<<= 7
+
+    All adds are modulo 2^32 (we mask after each add). XOR is naturally
+    32-bit-clean given that both operands are already < 2^32. The rotate
+    output is already masked by chacha20_rotl32.
+    @End Implementation
+
+    @Performance_Hints
+    Eight 32-bit adds, four 32-bit XORs, four rotations. The hot loop
+    of ChaCha20 (8 column quarter-rounds + 8 diagonal quarter-rounds
+    per double-round, times 10 double-rounds) is the dominant cost.
+    A future SIMD lowering can pack four state lanes into a single
+    128-bit register and execute QR in ~4 cycles per double-round.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: no secret-dependent branches or memory accesses.
+    @End Security_Scope
+
+    Let off_a be ia multiplied by 8
+    Let off_b be ib multiplied by 8
+    Let off_c be ic multiplied by 8
+    Let off_d be id multiplied by 8
+
+    Let a_val be proc memory_get_qword from Memory with state, off_a
+    Let b_val be proc memory_get_qword from Memory with state, off_b
+    Let c_val be proc memory_get_qword from Memory with state, off_c
+    Let d_val be proc memory_get_qword from Memory with state, off_d
+
+    Set a_val to proc chacha20_u32_add with a_val, b_val
+    Let xor1 be d_val bitwise_xor a_val
+    Set d_val to proc chacha20_rotl32 with xor1, 16
+
+    Set c_val to proc chacha20_u32_add with c_val, d_val
+    Let xor2 be b_val bitwise_xor c_val
+    Set b_val to proc chacha20_rotl32 with xor2, 12
+
+    Set a_val to proc chacha20_u32_add with a_val, b_val
+    Let xor3 be d_val bitwise_xor a_val
+    Set d_val to proc chacha20_rotl32 with xor3, 8
+
+    Set c_val to proc chacha20_u32_add with c_val, d_val
+    Let xor4 be b_val bitwise_xor c_val
+    Set b_val to proc chacha20_rotl32 with xor4, 7
+
+    proc memory_set_qword from Memory with state, off_a, a_val
+    proc memory_set_qword from Memory with state, off_b, b_val
+    proc memory_set_qword from Memory with state, off_c, c_val
+    proc memory_set_qword from Memory with state, off_d, d_val
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ChaCha20 block function (single 64-byte keystream block)
+Note: ============================================================================
+
+Process called "chacha20_block" takes arena as Integer, key as Integer, nonce as Integer, counter as Integer, out_block as Integer returns Integer:
+    @Reasoning
+    Produces one 64-byte keystream block for the given key, nonce, and
+    counter per RFC 8439 section 2.3. The block is the byte-serialization
+    (little-endian) of (initial_state + chacha20_permute(initial_state)).
+    @End Reasoning
+
+    @Implementation
+    1. Build initial state:
+         words 0..3:   constant "expand 32-byte k" (RFC 8439 fixed).
+         words 4..11:  key as 8 little-endian u32.
+         word 12:      counter (caller-controlled, typically starts at 1
+                       for the encryption block and 0 for the Poly1305
+                       one-time-key derivation).
+         words 13..15: nonce as 3 little-endian u32.
+    2. Copy state to working state.
+    3. Run 10 double-rounds (column then diagonal quarter-rounds).
+    4. Add working state back into initial state (mod 2^32 per word).
+    5. Serialize 16 u32 in little-endian into out_block (64 bytes).
+    @End Implementation
+
+    @Performance_Hints
+    10 double-rounds = 160 quarter-round invocations per block. Each QR is
+    a handful of integer ops; total per-block cost is on the order of a
+    few microseconds on a modern CPU at 2-3 GHz under software-only
+    arithmetic. A SIMD lowering brings this to nanoseconds per block.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against: any timing or cache side-channel arising from
+    secret-dependent control flow (there is none) or secret-dependent
+    memory access (there is none - all state accesses are at loop-counter
+    indices).
+
+    Out of scope: power analysis (requires hardware countermeasures),
+    fault injection (requires platform-level mitigations).
+
+    References:
+    - RFC 8439 section 2.3 (block function pseudocode).
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If nonce is equal to 0:
+        Return 0
+    End If
+    If out_block is equal to 0:
+        Return 0
+    End If
+
+    Let state_size be CHACHA20_STATE_WORDS multiplied by 8
+    Let initial be proc arena_allocate from Arena with arena, state_size
+    If initial is equal to 0:
+        Return 0
+    End If
+    Let working be proc arena_allocate from Arena with arena, state_size
+    If working is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_qword from Memory with initial, 0, CHACHA20_CONST_0
+    proc memory_set_qword from Memory with initial, 8, CHACHA20_CONST_1
+    proc memory_set_qword from Memory with initial, 16, CHACHA20_CONST_2
+    proc memory_set_qword from Memory with initial, 24, CHACHA20_CONST_3
+
+    Let ki be 0
+    While ki is less than 8:
+        Let kb0 be proc memory_get_byte from Memory with key, ki multiplied by 4
+        Let kb1 be proc memory_get_byte from Memory with key, ki multiplied by 4 plus 1
+        Let kb2 be proc memory_get_byte from Memory with key, ki multiplied by 4 plus 2
+        Let kb3 be proc memory_get_byte from Memory with key, ki multiplied by 4 plus 3
+        Let kword be kb0 plus kb1 multiplied by 256
+        Set kword to kword plus kb2 multiplied by 65536
+        Set kword to kword plus kb3 multiplied by 16777216
+        proc memory_set_qword from Memory with initial, (ki plus 4) multiplied by 8, kword
+        Set ki to ki plus 1
+    End While
+
+    Let counter_masked be counter bitwise_and U32_MASK
+    proc memory_set_qword from Memory with initial, 96, counter_masked
+
+    Let ni be 0
+    While ni is less than 3:
+        Let nb0 be proc memory_get_byte from Memory with nonce, ni multiplied by 4
+        Let nb1 be proc memory_get_byte from Memory with nonce, ni multiplied by 4 plus 1
+        Let nb2 be proc memory_get_byte from Memory with nonce, ni multiplied by 4 plus 2
+        Let nb3 be proc memory_get_byte from Memory with nonce, ni multiplied by 4 plus 3
+        Let nword be nb0 plus nb1 multiplied by 256
+        Set nword to nword plus nb2 multiplied by 65536
+        Set nword to nword plus nb3 multiplied by 16777216
+        proc memory_set_qword from Memory with initial, (ni plus 13) multiplied by 8, nword
+        Set ni to ni plus 1
+    End While
+
+    Let ci be 0
+    While ci is less than CHACHA20_STATE_WORDS:
+        Let v be proc memory_get_qword from Memory with initial, ci multiplied by 8
+        proc memory_set_qword from Memory with working, ci multiplied by 8, v
+        Set ci to ci plus 1
+    End While
+
+    Let round_idx be 0
+    While round_idx is less than 10:
+        proc chacha20_quarter_round with working, 0, 4, 8, 12
+        proc chacha20_quarter_round with working, 1, 5, 9, 13
+        proc chacha20_quarter_round with working, 2, 6, 10, 14
+        proc chacha20_quarter_round with working, 3, 7, 11, 15
+        proc chacha20_quarter_round with working, 0, 5, 10, 15
+        proc chacha20_quarter_round with working, 1, 6, 11, 12
+        proc chacha20_quarter_round with working, 2, 7, 8, 13
+        proc chacha20_quarter_round with working, 3, 4, 9, 14
+        Set round_idx to round_idx plus 1
+    End While
+
+    Let oi be 0
+    While oi is less than CHACHA20_STATE_WORDS:
+        Let w_val be proc memory_get_qword from Memory with working, oi multiplied by 8
+        Let i_val be proc memory_get_qword from Memory with initial, oi multiplied by 8
+        Let summed be proc chacha20_u32_add with w_val, i_val
+        Note: serialize little-endian into out_block at offset oi*4
+        Let base_off be oi multiplied by 4
+        Let s0 be summed bitwise_and 255
+        Let s1 be summed divided by 256
+        Set s1 to s1 bitwise_and 255
+        Let s2 be summed divided by 65536
+        Set s2 to s2 bitwise_and 255
+        Let s3 be summed divided by 16777216
+        Set s3 to s3 bitwise_and 255
+        proc memory_set_byte from Memory with out_block, base_off, s0
+        proc memory_set_byte from Memory with out_block, base_off plus 1, s1
+        proc memory_set_byte from Memory with out_block, base_off plus 2, s2
+        proc memory_set_byte from Memory with out_block, base_off plus 3, s3
+        Set oi to oi plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ChaCha20 keystream (arbitrary length)
+Note: ============================================================================
+
+Process called "chacha20_keystream" takes arena as Integer, key as Integer, nonce as Integer, counter as Integer, length as Integer, out_buffer as Integer returns Integer:
+    @Reasoning
+    Generates `length` bytes of keystream starting at the given counter.
+    Concatenates ceil(length/64) successive 64-byte blocks, incrementing
+    the counter for each block, and truncates the final block to the
+    exact length requested.
+    @End Reasoning
+
+    @Implementation
+    1. Validate inputs.
+    2. Allocate one 64-byte scratch block.
+    3. For each block index b = 0, 1, ...:
+         a. Generate block at counter + b into scratch.
+         b. Copy min(length - b*64, 64) bytes into out_buffer + b*64.
+    4. Stop when b*64 >= length.
+    @End Implementation
+
+    @Performance_Hints
+    O(length) work. Per-block cost is the chacha20_block cost. For
+    streaming use cases the keystream blocks can be precomputed and
+    XORed lazily, but for the call-once interface used by RFC 8439
+    AEAD this single-pass loop is the natural shape.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: keystream generation has no secret-dependent control
+    flow. The keystream itself is the public output; its bytes leaving
+    this proc are by definition observable, so there is no timing
+    channel beyond the size of the request (also public).
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If nonce is equal to 0:
+        Return 0
+    End If
+    If out_buffer is equal to 0:
+        If length is greater than 0:
+            Return 0
+        End If
+    End If
+    If length is less than 0:
+        Return 0
+    End If
+    If length is equal to 0:
+        Return 1
+    End If
+
+    Let block_scratch be proc arena_allocate from Arena with arena, CHACHA20_BLOCK_SIZE
+    If block_scratch is equal to 0:
+        Return 0
+    End If
+
+    Let produced be 0
+    Let block_index be 0
+    While produced is less than length:
+        Let block_counter be counter plus block_index
+        Let block_counter_masked be block_counter bitwise_and U32_MASK
+        Let bk_rc be proc chacha20_block with arena, key, nonce, block_counter_masked, block_scratch
+        If bk_rc is equal to 0:
+            Return 0
+        End If
+
+        Let remaining be length minus produced
+        Let to_copy be remaining
+        If to_copy is greater than CHACHA20_BLOCK_SIZE:
+            Set to_copy to CHACHA20_BLOCK_SIZE
+        End If
+
+        Let ci be 0
+        While ci is less than to_copy:
+            Let ks_byte be proc memory_get_byte from Memory with block_scratch, ci
+            proc memory_set_byte from Memory with out_buffer, produced plus ci, ks_byte
+            Set ci to ci plus 1
+        End While
+
+        Set produced to produced plus to_copy
+        Set block_index to block_index plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ChaCha20 encryption (XOR plaintext with keystream)
+Note: ============================================================================
+
+Process called "chacha20_encrypt" takes arena as Integer, key as Integer, nonce as Integer, counter as Integer, plaintext as Integer, length as Integer, out_ciphertext as Integer returns Integer:
+    @Reasoning
+    Encrypts plaintext under (key, nonce, counter) by XOR with the
+    ChaCha20 keystream. The same operation decrypts (XOR is involutive).
+    Operates block-by-block to avoid allocating a length-sized keystream
+    buffer when plaintext is large.
+    @End Reasoning
+
+    @Implementation
+    1. Validate inputs (key/nonce non-null, length non-negative).
+    2. Allocate one 64-byte scratch block.
+    3. For each block:
+         a. Generate keystream block at counter + b.
+         b. XOR with min(length - b*64, 64) bytes of plaintext into
+            the corresponding slice of out_ciphertext.
+    @End Implementation
+
+    @Performance_Hints
+    Same per-byte cost as chacha20_keystream plus one XOR per byte.
+    No allocation of a length-sized keystream buffer; the scratch block
+    is reused across iterations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time per byte. Plaintext and ciphertext are walked
+    sequentially with no secret-dependent indexing. The output is
+    public (ciphertext is by definition observable on the wire).
+
+    NEVER reuse a (key, nonce) pair across distinct plaintexts. ChaCha20
+    is a stream cipher: nonce reuse leaks plaintext XOR plaintext to any
+    attacker who sees both ciphertexts. RFC 8439 mandates that the nonce
+    be unique per encryption under a given key; the caller MUST enforce
+    this.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If nonce is equal to 0:
+        Return 0
+    End If
+    If length is less than 0:
+        Return 0
+    End If
+    If length is equal to 0:
+        Return 1
+    End If
+    If plaintext is equal to 0:
+        Return 0
+    End If
+    If out_ciphertext is equal to 0:
+        Return 0
+    End If
+
+    Let block_scratch be proc arena_allocate from Arena with arena, CHACHA20_BLOCK_SIZE
+    If block_scratch is equal to 0:
+        Return 0
+    End If
+
+    Let processed be 0
+    Let block_index be 0
+    While processed is less than length:
+        Let block_counter be counter plus block_index
+        Let block_counter_masked be block_counter bitwise_and U32_MASK
+        Let bk_rc be proc chacha20_block with arena, key, nonce, block_counter_masked, block_scratch
+        If bk_rc is equal to 0:
+            Return 0
+        End If
+
+        Let remaining be length minus processed
+        Let to_xor be remaining
+        If to_xor is greater than CHACHA20_BLOCK_SIZE:
+            Set to_xor to CHACHA20_BLOCK_SIZE
+        End If
+
+        Let ci be 0
+        While ci is less than to_xor:
+            Let ks_byte be proc memory_get_byte from Memory with block_scratch, ci
+            Let pt_byte be proc memory_get_byte from Memory with plaintext, processed plus ci
+            Let ct_byte be ks_byte bitwise_xor pt_byte
+            proc memory_set_byte from Memory with out_ciphertext, processed plus ci, ct_byte
+            Set ci to ci plus 1
+        End While
+
+        Set processed to processed plus to_xor
+        Set block_index to block_index plus 1
+    End While
+
+    Return 1
+End Process

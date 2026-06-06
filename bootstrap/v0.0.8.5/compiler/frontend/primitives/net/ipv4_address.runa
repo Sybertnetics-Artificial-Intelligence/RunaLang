@@ -1,0 +1,1103 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+IPV4 ADDRESS - 32-bit IPv4 Address Primitive (Tier 1)
+
+Implements the IPv4Address value type per RFC 791 (Internet Protocol) and the
+IPv4Range CIDR aggregate per RFC 4632 (Classless Inter-Domain Routing).
+Addresses are represented as a non-negative 32-bit unsigned integer stored in
+host-order semantics inside a 64-bit Runa Integer. The full 0..4294967295
+range is representable without sign issues because Runa Integers are 64-bit.
+
+Classification predicates implement the official IANA Special-Purpose Address
+Registry (RFC 6890), covering:
+  - Loopback        127.0.0.0/8        RFC 1122
+  - Private         10.0.0.0/8         RFC 1918
+                    172.16.0.0/12      RFC 1918
+                    192.168.0.0/16     RFC 1918
+  - Link-local      169.254.0.0/16     RFC 3927
+  - Multicast       224.0.0.0/4        RFC 5771
+  - Broadcast       255.255.255.255    RFC 919
+  - Documentation   192.0.2.0/24       RFC 5737
+                    198.51.100.0/24    RFC 5737
+                    203.0.113.0/24     RFC 5737
+
+CIDR ranges store base address and prefix length and expose containment,
+network address, broadcast address, and host-count queries per RFC 4632.
+
+Representation:
+  - IPv4Address: 32-bit unsigned integer, octet a is most-significant byte.
+                 Octet ordering matches dotted-quad "a.b.c.d" reading order.
+  - IPv4Range:   16-byte record { base_addr:u32, prefix_len:u32, _pad:u64 }.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let IPV4_BYTES be 4
+Let IPV4_BITS be 32
+Let IPV4_MAX_VALUE be 4294967295
+Let IPV4_RANGE_SIZE be 16
+Let IPV4_OCTET_MAX be 255
+
+Note: ============================================================================
+Note: CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Compose a 32-bit IPv4 address from four octets in dotted-quad ordering. RFC 791
+specifies dotted-quad notation as the canonical human-readable form, with the
+leftmost octet occupying the most-significant byte of the resulting integer.
+Each octet must satisfy 0 <= octet <= 255. Invalid octets cause the call to
+return -1 so callers can distinguish error from the legitimate value 0.0.0.0.
+@End Reasoning
+
+@Implementation
+Validate each octet against 0..255 inclusive. Pack with shifts:
+  result = (a << 24) | (b << 16) | (c << 8) | d
+Returns the 32-bit address value, or -1 if any octet is out of range.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). Four range checks plus three shifts and three ors.
+No allocation. Branch-predictor-friendly: validation pattern is uniform.
+@End Performance_Hints
+
+@Security_Scope
+Octet range validation prevents accidental wrap-around from negative inputs
+or values exceeding the byte width. Callers must treat -1 as the error
+sentinel; 0 is a valid address (0.0.0.0, the unspecified address).
+@End Security_Scope
+Process called "ipv4_from_octets" takes a as Integer, b as Integer, c as Integer, d as Integer returns Integer:
+    If a is less than 0:
+        Return -1
+    End If
+    If a is greater than IPV4_OCTET_MAX:
+        Return -1
+    End If
+    If b is less than 0:
+        Return -1
+    End If
+    If b is greater than IPV4_OCTET_MAX:
+        Return -1
+    End If
+    If c is less than 0:
+        Return -1
+    End If
+    If c is greater than IPV4_OCTET_MAX:
+        Return -1
+    End If
+    If d is less than 0:
+        Return -1
+    End If
+    If d is greater than IPV4_OCTET_MAX:
+        Return -1
+    End If
+    Let part_a be a multiplied by 16777216
+    Let part_b be b multiplied by 65536
+    Let part_c be c multiplied by 256
+    Let result be part_a plus part_b
+    Set result to result plus part_c
+    Set result to result plus d
+    Return result
+End Process
+
+@Reasoning
+Wrap a raw 32-bit value as an IPv4 address. Validates the value falls within
+0..2^32 - 1 so callers cannot accidentally promote a signed wrap-around or
+larger 64-bit value into the address space. Returns -1 on out-of-range input.
+@End Reasoning
+
+@Implementation
+Direct identity if the input is in range; otherwise the -1 error sentinel.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). Two comparisons. No allocation.
+@End Performance_Hints
+
+@Security_Scope
+Prevents silent truncation. Out-of-range inputs must be rejected because they
+would otherwise alias into valid host or network addresses.
+@End Security_Scope
+Process called "ipv4_from_u32" takes value as Integer returns Integer:
+    If value is less than 0:
+        Return -1
+    End If
+    If value is greater than IPV4_MAX_VALUE:
+        Return -1
+    End If
+    Return value
+End Process
+
+@Reasoning
+Parse a dotted-quad string per RFC 791. Accepts canonical "a.b.c.d" with each
+octet a decimal integer in 0..255. Leading zeros are accepted but not
+required; trailing whitespace and surrounding characters are rejected so
+the parse stays strict. Returns -1 on any malformed input.
+@End Reasoning
+
+@Implementation
+Walk byte-by-byte through the string accumulating decimal digits into the
+current octet. On '.' the current octet is committed and the next one begun.
+At end-of-string the final octet is committed, followed by an octet-count
+check (exactly 4). Each octet is validated against 0..255 inline. A leading
+'-' or non-digit non-dot character aborts the parse.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) where n is string length, n <= 15 in practice. Space: O(1).
+Single forward pass, no backtracking. No allocation other than reading the
+input string in place.
+@End Performance_Hints
+
+@Security_Scope
+Strict validation prevents address-spoofing tricks such as embedded shell
+syntax, octal escapes, or hex-encoded values that some lax parsers accept.
+Empty string, multi-dot, missing-octet, and overflow patterns all return -1.
+@End Security_Scope
+Process called "ipv4_from_string" takes str as Integer returns Integer:
+    If str is equal to 0:
+        Return -1
+    End If
+    Let length be proc string_length from StringCore with str
+    If length is equal to 0:
+        Return -1
+    End If
+    If length is greater than 15:
+        Return -1
+    End If
+
+    Let octets be proc allocate from Layout with 32
+    If octets is equal to 0:
+        Return -1
+    End If
+    proc memory_set_int64 from Memory with octets, 0, 0
+    proc memory_set_int64 from Memory with octets, 8, 0
+    proc memory_set_int64 from Memory with octets, 16, 0
+    proc memory_set_int64 from Memory with octets, 24, 0
+
+    Let octet_index be 0
+    Let current_value be 0
+    Let digits_in_octet be 0
+    Let i be 0
+    Let parse_failed be 0
+
+    While i is less than length:
+        If parse_failed is equal to 1:
+            Set i to length
+        Otherwise:
+            Let ch be proc memory_get_byte from Memory with str, i
+            If ch is equal to 46:
+                Note: dot separator
+                If digits_in_octet is equal to 0:
+                    Set parse_failed to 1
+                Otherwise:
+                    If octet_index is greater than 2:
+                        Set parse_failed to 1
+                    Otherwise:
+                        proc memory_set_int64 from Memory with octets, octet_index multiplied by 8, current_value
+                        Set octet_index to octet_index plus 1
+                        Set current_value to 0
+                        Set digits_in_octet to 0
+                    End If
+                End If
+            Otherwise:
+                Let is_dig be proc is_digit from Char with ch
+                If is_dig is equal to 0:
+                    Set parse_failed to 1
+                Otherwise:
+                    Let digit be ch minus 48
+                    Set current_value to current_value multiplied by 10
+                    Set current_value to current_value plus digit
+                    Set digits_in_octet to digits_in_octet plus 1
+                    If current_value is greater than IPV4_OCTET_MAX:
+                        Set parse_failed to 1
+                    End If
+                    If digits_in_octet is greater than 3:
+                        Set parse_failed to 1
+                    End If
+                End If
+            End If
+            Set i to i plus 1
+        End If
+    End While
+
+    If parse_failed is equal to 1:
+        proc deallocate from Layout with octets
+        Return -1
+    End If
+
+    If digits_in_octet is equal to 0:
+        proc deallocate from Layout with octets
+        Return -1
+    End If
+    If octet_index is not equal to 3:
+        proc deallocate from Layout with octets
+        Return -1
+    End If
+    proc memory_set_int64 from Memory with octets, 24, current_value
+
+    Let a be proc memory_get_int64 from Memory with octets, 0
+    Let b be proc memory_get_int64 from Memory with octets, 8
+    Let c be proc memory_get_int64 from Memory with octets, 16
+    Let d be proc memory_get_int64 from Memory with octets, 24
+    proc deallocate from Layout with octets
+    Return proc ipv4_from_octets with a, b, c, d
+End Process
+
+Note: ============================================================================
+Note: FORMATTING
+Note: ============================================================================
+
+@Reasoning
+Render an IPv4 address as the canonical dotted-quad string per RFC 791.
+Result is a freshly-allocated null-terminated string the caller owns. Each
+octet is extracted via division and modulus rather than bit shifts because
+the 64-bit Runa integer storing the address has no native u32 shift, and
+arithmetic operators are universally well-defined on this representation.
+@End Reasoning
+
+@Implementation
+Decompose using powers of 256:
+  a = (addr / 2^24) & 0xFF
+  b = (addr / 2^16) & 0xFF
+  c = (addr / 2^8)  & 0xFF
+  d = addr & 0xFF
+Format each octet as decimal via integer_to_string and concatenate with
+dot separators using a StringBuilder for amortized O(n) construction.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) - upper bound is "255.255.255.255" = 15 chars. Space: O(1)
+proportional to output. Single allocation for final string plus
+StringBuilder scratch buffer.
+@End Performance_Hints
+
+@Security_Scope
+No untrusted input is parsed; this is output only. Result is always
+well-formed dotted-quad text. Returns 0 on allocation failure.
+@End Security_Scope
+Process called "ipv4_to_string" takes addr as Integer returns Integer:
+    If addr is less than 0:
+        Return 0
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return 0
+    End If
+    Let a be addr divided by 16777216
+    Let remaining_a be addr modulo by 16777216
+    Let b be remaining_a divided by 65536
+    Let remaining_b be remaining_a modulo by 65536
+    Let c be remaining_b divided by 256
+    Let d be remaining_b modulo by 256
+
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append_integer from SB with sb, a
+    proc stringbuilder_append_char from SB with sb, 46
+    proc stringbuilder_append_integer from SB with sb, b
+    proc stringbuilder_append_char from SB with sb, 46
+    proc stringbuilder_append_integer from SB with sb, c
+    proc stringbuilder_append_char from SB with sb, 46
+    proc stringbuilder_append_integer from SB with sb, d
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process
+
+@Reasoning
+Extract a specific octet (0..3) by index. Octet 0 is the most-significant
+byte ("a" in "a.b.c.d"). Used by classification routines and CIDR math to
+avoid reshifting the same address repeatedly.
+@End Reasoning
+
+@Implementation
+Divide-and-modulo decomposition with bounds check on the index.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). One division and one modulo at most.
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on out-of-range index so callers can distinguish error from a
+legitimate 0 octet.
+@End Security_Scope
+Process called "ipv4_get_octet" takes addr as Integer, index as Integer returns Integer:
+    If addr is less than 0:
+        Return -1
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return -1
+    End If
+    If index is equal to 0:
+        Return addr divided by 16777216
+    End If
+    If index is equal to 1:
+        Let r be addr modulo by 16777216
+        Return r divided by 65536
+    End If
+    If index is equal to 2:
+        Let r be addr modulo by 65536
+        Return r divided by 256
+    End If
+    If index is equal to 3:
+        Return addr modulo by 256
+    End If
+    Return -1
+End Process
+
+@Reasoning
+Return the 32-bit unsigned value backing the address. Provided as a named
+accessor for clarity at call sites where the integer-representation
+distinction matters (raw bit operations vs address semantics).
+@End Reasoning
+
+@Implementation
+Identity function with bounds validation.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input handled; just validates the in-band sentinel.
+@End Security_Scope
+Process called "ipv4_to_u32" takes addr as Integer returns Integer:
+    If addr is less than 0:
+        Return -1
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return -1
+    End If
+    Return addr
+End Process
+
+Note: ============================================================================
+Note: CLASSIFICATION (RFC 6890 SPECIAL-PURPOSE REGISTRY)
+Note: ============================================================================
+
+@Reasoning
+Detect the loopback range 127.0.0.0/8 per RFC 1122 Section 3.2.1.3.
+Any address in this block is treated as referring to the local host and
+must never be forwarded across a router.
+@End Reasoning
+
+@Implementation
+Most-significant octet equals 127.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). One division and one comparison.
+@End Performance_Hints
+
+@Security_Scope
+Loopback addresses appearing on a wire interface indicate either a
+mis-configuration or an active spoofing attempt; callers may use this
+predicate to reject such packets.
+@End Security_Scope
+Process called "ipv4_is_loopback" takes addr as Integer returns Integer:
+    If addr is less than 0:
+        Return 0
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return 0
+    End If
+    Let a be addr divided by 16777216
+    If a is equal to 127:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Detect RFC 1918 private address ranges:
+  10.0.0.0/8
+  172.16.0.0/12
+  192.168.0.0/16
+These ranges are reserved for private internets and must not appear on the
+public Internet.
+@End Reasoning
+
+@Implementation
+Octet-by-octet test:
+  a == 10
+  a == 172 and 16 <= b <= 31
+  a == 192 and b == 168
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). Three branches max.
+@End Performance_Hints
+
+@Security_Scope
+Used by firewalls and NAT engines to recognize traffic that must not
+egress to the public Internet without translation.
+@End Security_Scope
+Process called "ipv4_is_private" takes addr as Integer returns Integer:
+    If addr is less than 0:
+        Return 0
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return 0
+    End If
+    Let a be addr divided by 16777216
+    If a is equal to 10:
+        Return 1
+    End If
+    Let remaining_a be addr modulo by 16777216
+    Let b be remaining_a divided by 65536
+    If a is equal to 172:
+        If b is greater than or equal to 16:
+            If b is less than or equal to 31:
+                Return 1
+            End If
+        End If
+    End If
+    If a is equal to 192:
+        If b is equal to 168:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Detect link-local range 169.254.0.0/16 per RFC 3927. These addresses are
+auto-configured when DHCP fails and are not routable beyond the local link.
+@End Reasoning
+
+@Implementation
+First octet 169 and second octet 254.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Routers must not forward link-local addresses; firewalls may drop them.
+@End Security_Scope
+Process called "ipv4_is_link_local" takes addr as Integer returns Integer:
+    If addr is less than 0:
+        Return 0
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return 0
+    End If
+    Let a be addr divided by 16777216
+    If a is not equal to 169:
+        Return 0
+    End If
+    Let remaining_a be addr modulo by 16777216
+    Let b be remaining_a divided by 65536
+    If b is equal to 254:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Detect multicast range 224.0.0.0/4 per RFC 5771. Multicast addresses are
+delivered to a group of receivers rather than a single host.
+@End Reasoning
+
+@Implementation
+First octet in the range 224..239 inclusive.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Receivers and routers use this predicate to dispatch multicast handling.
+@End Security_Scope
+Process called "ipv4_is_multicast" takes addr as Integer returns Integer:
+    If addr is less than 0:
+        Return 0
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return 0
+    End If
+    Let a be addr divided by 16777216
+    If a is less than 224:
+        Return 0
+    End If
+    If a is greater than 239:
+        Return 0
+    End If
+    Return 1
+End Process
+
+@Reasoning
+Detect the limited broadcast address 255.255.255.255 per RFC 919. A packet
+sent to this address is delivered to every host on the directly attached
+link.
+@End Reasoning
+
+@Implementation
+Exact equality with IPV4_MAX_VALUE.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). Single comparison.
+@End Performance_Hints
+
+@Security_Scope
+Routers must not forward limited broadcast across links.
+@End Security_Scope
+Process called "ipv4_is_broadcast" takes addr as Integer returns Integer:
+    If addr is equal to IPV4_MAX_VALUE:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Detect documentation prefixes per RFC 5737:
+  192.0.2.0/24    (TEST-NET-1)
+  198.51.100.0/24 (TEST-NET-2)
+  203.0.113.0/24  (TEST-NET-3)
+Used in examples and never routed on the public Internet.
+@End Reasoning
+
+@Implementation
+Three independent /24 tests on the (a, b, c) triple.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Reject documentation traffic on production interfaces.
+@End Security_Scope
+Process called "ipv4_is_documentation" takes addr as Integer returns Integer:
+    If addr is less than 0:
+        Return 0
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return 0
+    End If
+    Let a be addr divided by 16777216
+    Let remaining_a be addr modulo by 16777216
+    Let b be remaining_a divided by 65536
+    Let remaining_b be remaining_a modulo by 65536
+    Let c be remaining_b divided by 256
+    If a is equal to 192:
+        If b is equal to 0:
+            If c is equal to 2:
+                Return 1
+            End If
+        End If
+    End If
+    If a is equal to 198:
+        If b is equal to 51:
+            If c is equal to 100:
+                Return 1
+            End If
+        End If
+    End If
+    If a is equal to 203:
+        If b is equal to 0:
+            If c is equal to 113:
+                Return 1
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Detect addresses that fall into reserved or special-use space and therefore
+should not appear as ordinary unicast traffic. Aggregates the predicates
+above plus the "this network" 0.0.0.0/8 (RFC 1122) and the reserved 240/4
+block (RFC 1112).
+@End Reasoning
+
+@Implementation
+Logical OR across the constituent classifiers; short-circuits on first hit.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). Up to six predicate evaluations.
+@End Performance_Hints
+
+@Security_Scope
+Useful for ingress filtering: drop any traffic in reserved space.
+@End Security_Scope
+Process called "ipv4_is_reserved" takes addr as Integer returns Integer:
+    If addr is less than 0:
+        Return 0
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return 0
+    End If
+    Let a be addr divided by 16777216
+    If a is equal to 0:
+        Return 1
+    End If
+    If a is greater than or equal to 240:
+        Return 1
+    End If
+    Let lb be proc ipv4_is_loopback with addr
+    If lb is equal to 1:
+        Return 1
+    End If
+    Let lk be proc ipv4_is_link_local with addr
+    If lk is equal to 1:
+        Return 1
+    End If
+    Let dc be proc ipv4_is_documentation with addr
+    If dc is equal to 1:
+        Return 1
+    End If
+    Let mc be proc ipv4_is_multicast with addr
+    If mc is equal to 1:
+        Return 1
+    End If
+    Let bc be proc ipv4_is_broadcast with addr
+    If bc is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: ARITHMETIC
+Note: ============================================================================
+
+@Reasoning
+Return the next address in numeric order, wrapping 255.255.255.255 to
+0.0.0.0 to preserve a total successor function over the 32-bit space.
+Wrap behavior matches RFC 6890 enumeration semantics used by route
+generators and host scanners.
+@End Reasoning
+
+@Implementation
+addr plus 1, modulo 2^32.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input; pure arithmetic.
+@End Security_Scope
+Process called "ipv4_next" takes addr as Integer returns Integer:
+    If addr is less than 0:
+        Return -1
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return -1
+    End If
+    If addr is equal to IPV4_MAX_VALUE:
+        Return 0
+    End If
+    Return addr plus 1
+End Process
+
+@Reasoning
+Three-way comparator returning -1, 0, or 1 for less-than, equal, or
+greater-than respectively. Used by sorted-table consumers (route tables,
+ACLs) to maintain canonical ordering.
+@End Reasoning
+
+@Implementation
+Two-branch decision tree.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "ipv4_compare" takes a as Integer, b as Integer returns Integer:
+    If a is less than b:
+        Return -1
+    End If
+    If a is greater than b:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Closed-interval membership test on a numeric range. Distinct from CIDR
+containment; this is a raw "is x in [low, high]" check used by ACL
+processors and address-pool selectors.
+@End Reasoning
+
+@Implementation
+Low <= addr <= high.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "ipv4_in_range" takes addr as Integer, low as Integer, high as Integer returns Integer:
+    If addr is less than low:
+        Return 0
+    End If
+    If addr is greater than high:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CIDR RANGE - IPv4Range
+Note: ============================================================================
+
+Note: IPv4Range layout (16 bytes):
+Note:   offset 0:  base_addr (8 bytes - host-order u32)
+Note:   offset 8:  prefix_len (8 bytes - 0..32)
+
+@Reasoning
+Create an IPv4Range from an explicit base address and prefix length per
+RFC 4632. The base address is canonicalized by masking off host bits so
+two semantically-equivalent CIDR strings produce identical records.
+@End Reasoning
+
+@Implementation
+Validate prefix_len 0..32. Compute network mask = 2^32 - 2^(32-prefix_len)
+and apply with arithmetic modular subtraction. Allocate 16 bytes and store
+the canonical base address followed by the prefix length.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1) - 16 bytes per range.
+@End Performance_Hints
+
+@Security_Scope
+Canonicalization prevents two parsers from disagreeing about whether
+"10.0.0.5/8" and "10.0.0.0/8" denote the same network.
+@End Security_Scope
+Process called "ipv4_range_create" takes base_addr as Integer, prefix_len as Integer returns Integer:
+    If base_addr is less than 0:
+        Return 0
+    End If
+    If base_addr is greater than IPV4_MAX_VALUE:
+        Return 0
+    End If
+    If prefix_len is less than 0:
+        Return 0
+    End If
+    If prefix_len is greater than IPV4_BITS:
+        Return 0
+    End If
+    Let host_bits be IPV4_BITS minus prefix_len
+    Let host_count be 1
+    Let k be 0
+    While k is less than host_bits:
+        Set host_count to host_count multiplied by 2
+        Set k to k plus 1
+    End While
+    Let mask be IPV4_MAX_VALUE plus 1
+    Set mask to mask minus host_count
+    Let canonical_base be base_addr divided by host_count
+    Set canonical_base to canonical_base multiplied by host_count
+    Let range be proc allocate from Layout with IPV4_RANGE_SIZE
+    If range is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with range, 0, canonical_base
+    proc memory_set_int64 from Memory with range, 8, prefix_len
+    Return range
+End Process
+
+@Reasoning
+Free a CIDR range record. Provided as a paired destructor so the caller
+isn't required to know the internal layout.
+@End Reasoning
+
+@Implementation
+Deallocate via the layout allocator.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not touch the pointer after destroy.
+@End Security_Scope
+Process called "ipv4_range_destroy" takes range as Integer returns Integer:
+    If range is equal to 0:
+        Return 0
+    End If
+    proc deallocate from Layout with range
+    Return 1
+End Process
+
+@Reasoning
+Parse a CIDR string of the form "a.b.c.d/n" per RFC 4632 section 3.1.
+Both the address and the prefix length must be present and well-formed.
+The address is canonicalized to the network address as part of construction.
+@End Reasoning
+
+@Implementation
+Locate the '/' character. Split into address text and prefix text. Parse
+the address via ipv4_from_string. Parse the prefix as decimal 0..32.
+Hand off to ipv4_range_create for canonicalization.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over input. Space: O(1) plus 16 bytes for the resulting range.
+@End Performance_Hints
+
+@Security_Scope
+Rejects missing slash, missing prefix, non-decimal prefix, and out-of-range
+prefix. Returns 0 on any malformed input so the caller never receives a
+partially-initialized range.
+@End Security_Scope
+Process called "ipv4_range_from_cidr_string" takes str as Integer returns Integer:
+    If str is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with str
+    If length is less than 3:
+        Return 0
+    End If
+    Let slash_pos be -1
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with str, i
+        If ch is equal to 47:
+            Set slash_pos to i
+            Set i to length
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+    If slash_pos is less than 1:
+        Return 0
+    End If
+    If slash_pos is greater than or equal to length minus 1:
+        Return 0
+    End If
+
+    Let addr_str be proc string_substring from StringPrim with str, 0, slash_pos
+    If addr_str is equal to 0:
+        Return 0
+    End If
+    Let prefix_start be slash_pos plus 1
+    Let prefix_len_chars be length minus prefix_start
+    Let prefix_str be proc string_substring from StringPrim with str, prefix_start, prefix_len_chars
+    If prefix_str is equal to 0:
+        proc deallocate from Layout with addr_str
+        Return 0
+    End If
+
+    Let addr_value be proc ipv4_from_string with addr_str
+    proc deallocate from Layout with addr_str
+    If addr_value is less than 0:
+        proc deallocate from Layout with prefix_str
+        Return 0
+    End If
+
+    Let prefix_value be 0
+    Let j be 0
+    Let prefix_chars be proc string_length from StringCore with prefix_str
+    If prefix_chars is equal to 0:
+        proc deallocate from Layout with prefix_str
+        Return 0
+    End If
+    If prefix_chars is greater than 2:
+        proc deallocate from Layout with prefix_str
+        Return 0
+    End If
+    Let prefix_failed be 0
+    While j is less than prefix_chars:
+        Let pc be proc memory_get_byte from Memory with prefix_str, j
+        Let is_d be proc is_digit from Char with pc
+        If is_d is equal to 0:
+            Set prefix_failed to 1
+            Set j to prefix_chars
+        Otherwise:
+            Set prefix_value to prefix_value multiplied by 10
+            Set prefix_value to prefix_value plus (pc minus 48)
+            Set j to j plus 1
+        End If
+    End While
+    proc deallocate from Layout with prefix_str
+    If prefix_failed is equal to 1:
+        Return 0
+    End If
+    If prefix_value is greater than IPV4_BITS:
+        Return 0
+    End If
+    Return proc ipv4_range_create with addr_value, prefix_value
+End Process
+
+@Reasoning
+Return the network (lowest) address of a CIDR range. By construction this
+is the stored base_addr because ipv4_range_create canonicalizes input.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "ipv4_range_network_address" takes range as Integer returns Integer:
+    If range is equal to 0:
+        Return -1
+    End If
+    Return proc memory_get_int64 from Memory with range, 0
+End Process
+
+@Reasoning
+Return the broadcast (highest) address of a CIDR range = base | (2^h - 1)
+where h is the host-bit count, per RFC 919 generalized to subnetting in
+RFC 950. For /32 ranges the broadcast equals the network address.
+@End Reasoning
+
+@Implementation
+host_bits = 32 - prefix_len
+host_count = 2^host_bits
+broadcast = base + host_count - 1
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "ipv4_range_broadcast_address" takes range as Integer returns Integer:
+    If range is equal to 0:
+        Return -1
+    End If
+    Let base be proc memory_get_int64 from Memory with range, 0
+    Let prefix_len be proc memory_get_int64 from Memory with range, 8
+    Let host_bits be IPV4_BITS minus prefix_len
+    Let host_count be 1
+    Let k be 0
+    While k is less than host_bits:
+        Set host_count to host_count multiplied by 2
+        Set k to k plus 1
+    End While
+    Let result be base plus host_count
+    Set result to result minus 1
+    Return result
+End Process
+
+@Reasoning
+Return the total host count (including network and broadcast addresses) of
+a CIDR range = 2^(32 - prefix_len).
+@End Reasoning
+
+@Implementation
+Repeated multiplication by 2 over the host-bit count.
+@End Implementation
+
+@Performance_Hints
+Time: O(32) worst case. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "ipv4_range_host_count" takes range as Integer returns Integer:
+    If range is equal to 0:
+        Return 0
+    End If
+    Let prefix_len be proc memory_get_int64 from Memory with range, 8
+    Let host_bits be IPV4_BITS minus prefix_len
+    Let host_count be 1
+    Let k be 0
+    While k is less than host_bits:
+        Set host_count to host_count multiplied by 2
+        Set k to k plus 1
+    End While
+    Return host_count
+End Process
+
+@Reasoning
+Test whether an address is contained in a CIDR range. RFC 4632 defines
+containment as the address falling within [network, broadcast] inclusive.
+@End Reasoning
+
+@Implementation
+Network = base. Broadcast = base + 2^host_bits - 1. Range test.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). Two comparisons plus host-bit calculation.
+@End Performance_Hints
+
+@Security_Scope
+Used by ACL evaluators - must reject negative or > 2^32 addresses to avoid
+false-positive matches via wrap-around.
+@End Security_Scope
+Process called "ipv4_range_contains_address" takes range as Integer, addr as Integer returns Integer:
+    If range is equal to 0:
+        Return 0
+    End If
+    If addr is less than 0:
+        Return 0
+    End If
+    If addr is greater than IPV4_MAX_VALUE:
+        Return 0
+    End If
+    Let base be proc memory_get_int64 from Memory with range, 0
+    Let prefix_len be proc memory_get_int64 from Memory with range, 8
+    Let host_bits be IPV4_BITS minus prefix_len
+    Let host_count be 1
+    Let k be 0
+    While k is less than host_bits:
+        Set host_count to host_count multiplied by 2
+        Set k to k plus 1
+    End While
+    Let broadcast be base plus host_count
+    Set broadcast to broadcast minus 1
+    If addr is less than base:
+        Return 0
+    End If
+    If addr is greater than broadcast:
+        Return 0
+    End If
+    Return 1
+End Process

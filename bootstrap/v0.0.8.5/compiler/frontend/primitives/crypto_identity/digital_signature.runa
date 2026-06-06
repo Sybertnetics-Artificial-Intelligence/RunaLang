@@ -1,0 +1,497 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+DIGITAL_SIGNATURE - High-level sign / verify with batch and detached variants
+==============================================================================
+
+This module is the high-level API that production code should call to sign or
+verify messages. It dispatches by the algorithm tag carried with the keypair
+or signature, enforcing the HC#11 mandate (algorithm-tag is authoritative;
+never select dispatch by byte length or string).
+
+Capabilities:
+  - sign(message, keypair) -> Signature
+  - verify(message, signature, public_key) -> 1 (valid) / 0 (invalid)
+  - sign_detached -> raw signature bytes (no algorithm tag carried)
+  - verify_detached -> takes a separate algorithm tag argument
+  - sign_batch / verify_batch -> arrays of messages and signatures
+
+The detached forms exist for wire formats that carry the algorithm out-of-band
+(e.g., JWT headers, X.509 signatureAlgorithm field). The attached forms are
+the safer default because the tag travels with the signature.
+
+References:
+- HC#11 TASC: crypto-agility mandate.
+- RFC 8032 sections 5.1.6, 5.1.7: Ed25519 sign/verify.
+- RFC 8032 sections 5.2.6, 5.2.7: Ed448 sign/verify.
+- FIPS 186-5: ECDSA sign/verify.
+- RFC 8017 sections 8.1, 9.1: RSASSA-PSS / RSASSA-PKCS1v15.
+- FIPS 204 sections 6.1, 6.2: ML-DSA sign/verify.
+- FIPS 205 sections 6.4, 6.5: SLH-DSA sign/verify.
+- FALCON round-3 spec: FALCON sign/verify.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "compiler/frontend/primitives/crypto_identity/public_key.runa" as PK
+Import "compiler/frontend/primitives/crypto_identity/private_key.runa" as SK
+Import "compiler/frontend/primitives/crypto_identity/key_pair.runa" as KP
+Import "compiler/frontend/primitives/crypto_identity/signature.runa" as Sig
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+
+Note: ============================================================================
+Note: SECTION 1: sign - attached form using algorithm tag from keypair
+Note: ============================================================================
+
+@Reasoning
+Compute a digital signature over `message` using the keypair's algorithm.
+Returns a Signature object carrying the algorithm tag and signature bytes.
+
+The high-level wrapper delegates to signature.runa's signature_sign which
+already implements per-algorithm dispatch. This wrapper exists to:
+  - Provide the natural-API surface (sign over a KeyPair, not a PrivateKey).
+  - Enforce non-null and wiped-key checks at the outer boundary so the
+    inner dispatch can assume valid input.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena, message, keypair.
+  2. Extract the PrivateKey from the keypair.
+  3. Verify the private key is not wiped.
+  4. Call signature.runa's signature_sign.
+@End Implementation
+
+@Performance_Hints
+O(sign) per algorithm. Ed25519 ~50us; ECDSA-P256 ~200us; RSA-2048 ~5ms.
+@End Performance_Hints
+
+@Security_Scope
+The PrivateKey bytes are consumed but never logged or copied outside
+the signature_sign internal arena scope. The returned Signature carries
+the algorithm tag.
+@End Security_Scope
+Process called "sign" takes arena as Integer, message as Integer, message_length as Integer, keypair as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If message is equal to 0:
+        If message_length is not equal to 0:
+            Return 0
+        End If
+    End If
+    If keypair is equal to 0:
+        Return 0
+    End If
+    Let sk be KP.keypair_private(keypair)
+    If sk is equal to 0:
+        Return 0
+    End If
+    Let wiped be SK.private_key_is_wiped(sk)
+    If wiped is equal to 1:
+        Return 0
+    End If
+    Return Sig.signature_sign(arena, sk, message, message_length)
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: verify - attached form using algorithm tag from signature
+Note: ============================================================================
+
+@Reasoning
+Verify a Signature against a public_key + message. Returns 1 on valid,
+0 on invalid (including cross-algorithm mismatches, tampered messages,
+malformed inputs).
+
+The dispatch is by the Signature's algorithm tag, with a hard check that
+it matches the PublicKey's algorithm tag. signature.runa's
+signature_verify already implements this check; we call into it.
+@End Reasoning
+
+@Implementation
+Validate inputs then delegate to signature_verify.
+@End Implementation
+
+@Performance_Hints
+O(verify) per algorithm. Verify is typically slower than sign for
+RSA (ratio ~2x) and similar for Ed25519/ECDSA.
+@End Performance_Hints
+
+@Security_Scope
+Cross-algorithm sig/pk mismatches return 0 without invoking the
+underlying verify (catches confused-deputy attacks). Malformed signature
+or public-key buffers return 0.
+@End Security_Scope
+Process called "verify" takes arena as Integer, message as Integer, message_length as Integer, signature as Integer, public_key as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If signature is equal to 0:
+        Return 0
+    End If
+    If public_key is equal to 0:
+        Return 0
+    End If
+    If message is equal to 0:
+        If message_length is not equal to 0:
+            Return 0
+        End If
+    End If
+    Return Sig.signature_verify(arena, public_key, message, message_length, signature)
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: sign_detached - raw signature bytes only
+Note: ============================================================================
+
+@Reasoning
+Compute the raw signature bytes (no algorithm tag carried). The caller
+is responsible for tracking the algorithm out-of-band. This is the form
+used by wire protocols that carry the algorithm in a header field (JWT,
+X.509 signatureAlgorithm).
+
+The output is a pointer to bytes in the arena. The caller can read the
+length via signature_byte_length on a temporary Signature wrap, or by
+knowing the algorithm's published size.
+
+Returns 0 on error.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Call sign to get a Signature.
+  2. Allocate a buffer of signature_byte_length in the arena.
+  3. Copy the signature bytes into the buffer.
+  4. Return the buffer pointer with a 4-byte length prefix at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(sign + copy). One extra memcpy compared to sign.
+@End Performance_Hints
+
+@Security_Scope
+The raw bytes do not include the algorithm tag; cross-algorithm
+confusion is now the caller's responsibility. The attached form (sign)
+is the safer default.
+@End Security_Scope
+Process called "sign_detached" takes arena as Integer, message as Integer, message_length as Integer, keypair as Integer returns Integer:
+    Let sig be sign(arena, message, message_length, keypair)
+    If sig is equal to 0:
+        Return 0
+    End If
+    Let sig_bytes be Sig.signature_bytes(sig)
+    Let sig_len be Sig.signature_byte_length(sig)
+    If sig_bytes is equal to 0:
+        Return 0
+    End If
+    Let buf be Arena.arena_allocate(arena, 4 plus sig_len)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int32(buf, 0, sig_len)
+    Memory.memory_copy(buf plus 4, sig_bytes, sig_len)
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: verify_detached - raw bytes + explicit algorithm tag
+Note: ============================================================================
+
+@Reasoning
+Verify raw signature bytes against a public key, with the algorithm tag
+supplied separately. Wraps the bytes as a Signature so signature_verify
+can dispatch.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena, sig_bytes, public_key, algorithm.
+  2. Wrap sig_bytes as a Signature via signature_create.
+  3. Call signature_verify.
+@End Implementation
+
+@Performance_Hints
+O(verify + wrap).
+@End Performance_Hints
+
+@Security_Scope
+The algorithm tag is supplied by the caller; if it doesn't match the
+public-key's tag, signature_verify rejects without calling the underlying
+verify.
+@End Security_Scope
+Process called "verify_detached" takes arena as Integer, message as Integer, message_length as Integer, sig_bytes as Integer, sig_length as Integer, public_key as Integer, algorithm as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If sig_bytes is equal to 0:
+        Return 0
+    End If
+    If public_key is equal to 0:
+        Return 0
+    End If
+    Let sig be Sig.signature_create(arena, algorithm, sig_bytes, sig_length)
+    If sig is equal to 0:
+        Return 0
+    End If
+    Return Sig.signature_verify(arena, public_key, message, message_length, sig)
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: sign_batch - sign multiple messages with one keypair
+Note: ============================================================================
+
+@Reasoning
+Sign N messages with the same keypair. Returns an array of N Signature
+pointers stored in the arena. The N input messages are specified as
+parallel arrays: messages_ptrs (N pointers) and messages_lens (N i32
+lengths packed back-to-back as 4-byte BE integers).
+
+Returns 0 on any sub-failure. Partial success is not exposed; the caller
+should split the call into smaller batches if partial completion matters.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena and N > 0.
+  2. Allocate an output buffer of (N + 1) qwords: slot 0 holds N as
+     int64; slots 1..N hold Signature pointers.
+  3. For each i in 0..N-1, read messages_ptrs[i] and messages_lens[i],
+     call sign, store the result.
+  4. If any sign returned 0, return 0 (caller's arena will be reset).
+@End Implementation
+
+@Performance_Hints
+O(N * sign). No batching optimization at this tier; per-call cost equals
+the sum of individual sign calls. A future batch-verify proc can use
+the algorithm-specific aggregation paths (e.g., Ed25519 batch verify).
+@End Performance_Hints
+
+@Security_Scope
+The same private key is exposed to N sign calls. The aggregate timing
+side-channel is the union of N individual sign side-channels (which the
+underlying algorithm code is responsible for being constant-time on
+secret-dependent paths).
+@End Security_Scope
+Process called "sign_batch" takes arena as Integer, count as Integer, messages_ptrs as Integer, messages_lens as Integer, keypair as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If count is less than 1:
+        Return 0
+    End If
+    If messages_ptrs is equal to 0:
+        Return 0
+    End If
+    If messages_lens is equal to 0:
+        Return 0
+    End If
+    If keypair is equal to 0:
+        Return 0
+    End If
+    Let out_buf be Arena.arena_allocate(arena, 8 plus (count multiplied by 8))
+    If out_buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(out_buf, 0, count)
+    Let i be 0
+    While i is less than count:
+        Let msg_ptr be Memory.memory_get_qword(messages_ptrs, i multiplied by 8)
+        Let msg_len be Memory.memory_get_int32(messages_lens, i multiplied by 4)
+        Let sig be sign(arena, msg_ptr, msg_len, keypair)
+        If sig is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_int64(out_buf, 8 plus (i multiplied by 8), sig)
+        Set i to i plus 1
+    End While
+    Return out_buf
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: verify_batch - verify (message, signature, pk) triples
+Note: ============================================================================
+
+@Reasoning
+Verify N (message, signature, public_key) triples and return an array of
+N results (1 = valid, 0 = invalid). The output is structured the same
+way as sign_batch's output: 8-byte count followed by count*8 result slots.
+
+Inputs are parallel arrays:
+  - messages_ptrs[N]: pointers to messages
+  - messages_lens[N]: int32 lengths
+  - signatures_ptrs[N]: Signature pointers
+  - public_keys_ptrs[N]: PublicKey pointers
+@End Reasoning
+
+@Implementation
+Linear scan calling verify on each triple. Stores 1/0 results in the
+output buffer.
+@End Implementation
+
+@Performance_Hints
+O(N * verify). No batch-verify optimization at this tier; Ed25519 batch
+verify and ECDSA simultaneous-multi-scalar-multiplication are future
+work.
+@End Performance_Hints
+
+@Security_Scope
+Each result is computed in the underlying algorithm's verify, which is
+constant-time on secret-dependent paths.
+@End Security_Scope
+Process called "verify_batch" takes arena as Integer, count as Integer, messages_ptrs as Integer, messages_lens as Integer, signatures_ptrs as Integer, public_keys_ptrs as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If count is less than 1:
+        Return 0
+    End If
+    If messages_ptrs is equal to 0:
+        Return 0
+    End If
+    If messages_lens is equal to 0:
+        Return 0
+    End If
+    If signatures_ptrs is equal to 0:
+        Return 0
+    End If
+    If public_keys_ptrs is equal to 0:
+        Return 0
+    End If
+    Let out_buf be Arena.arena_allocate(arena, 8 plus (count multiplied by 8))
+    If out_buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(out_buf, 0, count)
+    Let i be 0
+    While i is less than count:
+        Let msg_ptr be Memory.memory_get_qword(messages_ptrs, i multiplied by 8)
+        Let msg_len be Memory.memory_get_int32(messages_lens, i multiplied by 4)
+        Let sig be Memory.memory_get_qword(signatures_ptrs, i multiplied by 8)
+        Let pk be Memory.memory_get_qword(public_keys_ptrs, i multiplied by 8)
+        Let rc be verify(arena, msg_ptr, msg_len, sig, pk)
+        Memory.memory_set_int64(out_buf, 8 plus (i multiplied by 8), rc)
+        Set i to i plus 1
+    End While
+    Return out_buf
+End Process
+
+Note: ============================================================================
+Note: SECTION 7: Accessors for batch results
+Note: ============================================================================
+
+@Reasoning
+Read the count from a batch result buffer.
+@End Reasoning
+
+@Implementation
+First int64 of the buffer.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret count.
+@End Security_Scope
+Process called "batch_result_count" takes batch_result as Integer returns Integer:
+    If batch_result is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int64(batch_result, 0)
+End Process
+
+@Reasoning
+Read the i-th element of a batch result buffer.
+@End Reasoning
+
+@Implementation
+Bounds-check against count, then read the int64 at offset 8 + i*8.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Out-of-range index returns 0.
+@End Security_Scope
+Process called "batch_result_at" takes batch_result as Integer, index as Integer returns Integer:
+    If batch_result is equal to 0:
+        Return 0
+    End If
+    If index is less than 0:
+        Return 0
+    End If
+    Let n be batch_result_count(batch_result)
+    If index is greater than (n minus 1):
+        Return 0
+    End If
+    Return Memory.memory_get_int64(batch_result, 8 plus (index multiplied by 8))
+End Process
+
+Note: ============================================================================
+Note: SECTION 8: detached_signature_length - report bytes-of-detached
+Note: ============================================================================
+
+@Reasoning
+For a detached signature buffer produced by sign_detached, read the
+4-byte BE length prefix and return the number of signature bytes.
+@End Reasoning
+
+@Implementation
+Read int32 at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret length.
+@End Security_Scope
+Process called "detached_signature_length" takes detached as Integer returns Integer:
+    If detached is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int32(detached, 0)
+End Process
+
+@Reasoning
+For a detached signature buffer, return a pointer to the raw signature
+bytes (offset 4 from the buffer start).
+@End Reasoning
+
+@Implementation
+Pointer arithmetic.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Signature bytes are public; the caller may transmit them in the clear.
+@End Security_Scope
+Process called "detached_signature_bytes" takes detached as Integer returns Integer:
+    If detached is equal to 0:
+        Return 0
+    End If
+    Return detached plus 4
+End Process

@@ -1,0 +1,635 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+LRU CACHE - Least-Recently-Used Cache Tier 0 Primitive
+
+This file implements an O(1) get/put LRU (Least Recently Used) cache
+backed by:
+  - An open-addressed hashmap keyed by user Integer keys whose stored
+    value is a pointer to the cache node that owns the entry.
+  - A doubly-linked list of nodes maintaining MRU-to-LRU ordering.
+    The list head holds the most-recently-used node; the list tail
+    holds the least-recently-used node (the eviction candidate).
+
+Each operation that touches a key promotes the corresponding node to
+the head of the linked list. Eviction simply removes the tail node and
+deletes its hashmap entry.
+
+LRU node layout (40 bytes):
+  offset 0:  user key             (8 bytes)
+  offset 8:  user value           (8 bytes)
+  offset 16: prev node pointer    (8 bytes) - closer to head
+  offset 24: next node pointer    (8 bytes) - closer to tail
+  offset 32: in_use flag          (8 bytes) - 1 live, 0 freed
+
+LRU header (40 bytes):
+  offset 0:  hashmap pointer       (8 bytes)
+  offset 8:  head node pointer     (8 bytes) - MRU
+  offset 16: tail node pointer     (8 bytes) - LRU
+  offset 24: size                  (8 bytes)
+  offset 32: capacity              (8 bytes) - max number of resident entries
+
+Capacity is an upper bound. When a put would exceed it, the tail node
+is evicted before the new entry is inserted.
+
+This module deliberately maintains its own intrusive doubly-linked
+list rather than using collections/linked_list.runa because the node
+must hold the key as well as the value so the hashmap entry can be
+removed during eviction without an extra reverse lookup table.
+
+Returns sentinel constants make ambiguous "value is zero" and "key not
+found" cases distinguishable: lru_get returns 0 if the key is absent.
+Callers should use lru_contains first if they need to distinguish a
+stored zero value from a miss.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/collections/hashmap.runa" as HashMap
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let LRU_HEADER_SIZE be 40
+Let LRU_NODE_SIZE be 40
+Let LRU_DEFAULT_CAPACITY be 64
+
+Note: ============================================================================
+Note: INTERNAL HELPERS - NODE ALLOCATION / LINKING
+Note: ============================================================================
+
+@Reasoning
+Allocate and initialize a new LRU node. The node starts unlinked
+(prev = next = 0) and marked in_use.
+@End Reasoning
+
+@Implementation
+1) allocate 40 bytes.
+2) Set key, value, prev = 0, next = 0, in_use = 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "lru_node_create" takes key as Integer, value as Integer returns Integer:
+    Let node be proc allocate from Layout with LRU_NODE_SIZE
+    If node is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with node, 0, key
+    proc memory_set_int64 from Memory with node, 8, value
+    proc memory_set_int64 from Memory with node, 16, 0
+    proc memory_set_int64 from Memory with node, 24, 0
+    proc memory_set_int64 from Memory with node, 32, 1
+    Return node
+End Process
+
+@Reasoning
+Unlink a node from the list. Updates the neighbouring nodes'
+pointers AND the list's head/tail if the unlinked node was at the end.
+@End Reasoning
+
+@Implementation
+1) Read prev and next of node.
+2) If prev != 0, set prev.next = next; else cache.head = next.
+3) If next != 0, set next.prev = prev; else cache.tail = prev.
+4) Clear node.prev and node.next to 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper; caller guarantees node is currently linked.
+@End Security_Scope
+Process called "lru_unlink" takes cache as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let prev_node be proc memory_get_int64 from Memory with node, 16
+    Let next_node be proc memory_get_int64 from Memory with node, 24
+    If prev_node is not equal to 0:
+        proc memory_set_int64 from Memory with prev_node, 24, next_node
+    Otherwise:
+        proc memory_set_int64 from Memory with cache, 8, next_node
+    End If
+    If next_node is not equal to 0:
+        proc memory_set_int64 from Memory with next_node, 16, prev_node
+    Otherwise:
+        proc memory_set_int64 from Memory with cache, 16, prev_node
+    End If
+    proc memory_set_int64 from Memory with node, 16, 0
+    proc memory_set_int64 from Memory with node, 24, 0
+    Return 1
+End Process
+
+@Reasoning
+Insert node at the head (MRU position). Node must be unlinked.
+@End Reasoning
+
+@Implementation
+1) Read current head.
+2) Set node.prev = 0, node.next = old_head.
+3) If old_head != 0, set old_head.prev = node.
+4) Set cache.head = node.
+5) If cache.tail == 0, set cache.tail = node.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper; caller guarantees node is unlinked.
+@End Security_Scope
+Process called "lru_link_to_head" takes cache as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let old_head be proc memory_get_int64 from Memory with cache, 8
+    proc memory_set_int64 from Memory with node, 16, 0
+    proc memory_set_int64 from Memory with node, 24, old_head
+    If old_head is not equal to 0:
+        proc memory_set_int64 from Memory with old_head, 16, node
+    End If
+    proc memory_set_int64 from Memory with cache, 8, node
+    Let tail be proc memory_get_int64 from Memory with cache, 16
+    If tail is equal to 0:
+        proc memory_set_int64 from Memory with cache, 16, node
+    End If
+    Return 1
+End Process
+
+@Reasoning
+Promote a node to the MRU position. If it is already the head no work
+is performed.
+@End Reasoning
+
+@Implementation
+1) If node is already head, return.
+2) Otherwise unlink and link to head.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "lru_promote" takes cache as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let head be proc memory_get_int64 from Memory with cache, 8
+    If head is equal to node:
+        Return 1
+    End If
+    proc lru_unlink with cache, node
+    proc lru_link_to_head with cache, node
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Allocate a new LRU cache with the requested capacity.
+@End Reasoning
+
+@Implementation
+1) Clamp capacity to at least 1 to avoid degenerate zero-capacity caches.
+2) Allocate header (40 bytes).
+3) Create hashmap.
+4) Initialize head = 0, tail = 0, size = 0, capacity = clamped.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) at the boundary; hashmap creation is its own cost.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure (header or hashmap).
+@End Security_Scope
+Process called "lru_create" takes capacity as Integer returns Integer:
+    Let final_capacity be capacity
+    If final_capacity is less than 1:
+        Set final_capacity to LRU_DEFAULT_CAPACITY
+    End If
+    Let cache be proc allocate from Layout with LRU_HEADER_SIZE
+    If cache is equal to 0:
+        Return 0
+    End If
+    Let hm be proc hashmap_create from HashMap
+    If hm is equal to 0:
+        proc deallocate from Layout with cache
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with cache, 0, hm
+    proc memory_set_int64 from Memory with cache, 8, 0
+    proc memory_set_int64 from Memory with cache, 16, 0
+    proc memory_set_int64 from Memory with cache, 24, 0
+    proc memory_set_int64 from Memory with cache, 32, final_capacity
+    Return cache
+End Process
+
+@Reasoning
+Tear down the cache. Walks the doubly-linked list freeing each node,
+destroys the hashmap, then frees the header.
+@End Reasoning
+
+@Implementation
+1) Walk list from head, free each node, advance to next.
+2) hashmap_destroy on the hashmap.
+3) Free header.
+@End Implementation
+
+@Performance_Hints
+Time: O(size + hashmap capacity).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned; do not double-free.
+@End Security_Scope
+Process called "lru_destroy" takes cache as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Let cur be proc memory_get_int64 from Memory with cache, 8
+    While cur is not equal to 0:
+        Let next_node be proc memory_get_int64 from Memory with cur, 24
+        proc deallocate from Layout with cur
+        Set cur to next_node
+    End While
+    Let hm be proc memory_get_int64 from Memory with cache, 0
+    If hm is not equal to 0:
+        proc hashmap_destroy from HashMap with hm
+    End If
+    proc deallocate from Layout with cache
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: STATE QUERIES
+Note: ============================================================================
+
+@Reasoning
+Resident entry count.
+@End Reasoning
+
+@Implementation
+Returns size field at offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "lru_size" takes cache as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with cache, 24
+End Process
+
+@Reasoning
+Configured eviction threshold.
+@End Reasoning
+
+@Implementation
+Returns capacity field at offset 32.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "lru_capacity" takes cache as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with cache, 32
+End Process
+
+@Reasoning
+Containment predicate.
+@End Reasoning
+
+@Implementation
+Delegates to hashmap_contains. Does NOT promote the entry.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Read-only; never modifies recency order.
+@End Security_Scope
+Process called "lru_contains" takes cache as Integer, key as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Let hm be proc memory_get_int64 from Memory with cache, 0
+    Return proc hashmap_contains from HashMap with hm, key
+End Process
+
+Note: ============================================================================
+Note: GET / PUT
+Note: ============================================================================
+
+@Reasoning
+Look up a key. On hit, promote the entry to MRU and return its value.
+On miss, return 0.
+@End Reasoning
+
+@Implementation
+1) hashmap_contains -> if not present, return 0.
+2) hashmap_get -> node pointer.
+3) Read value from node.
+4) Promote node to MRU.
+5) Return value.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Mutates recency order even though the cache content is otherwise
+unchanged. Callers cannot distinguish miss from a stored zero value
+via lru_get alone; use lru_contains to distinguish.
+@End Security_Scope
+Process called "lru_get" takes cache as Integer, key as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Let hm be proc memory_get_int64 from Memory with cache, 0
+    Let present be proc hashmap_contains from HashMap with hm, key
+    If present is equal to 0:
+        Return 0
+    End If
+    Let node be proc hashmap_get from HashMap with hm, key
+    If node is equal to 0:
+        Return 0
+    End If
+    Let value be proc memory_get_int64 from Memory with node, 8
+    proc lru_promote with cache, node
+    Return value
+End Process
+
+@Reasoning
+Peek a key's value without promoting it to MRU. Used for diagnostic
+and instrumentation paths.
+@End Reasoning
+
+@Implementation
+Same as lru_get but skips the promote step.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Read-only on recency order.
+@End Security_Scope
+Process called "lru_peek" takes cache as Integer, key as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Let hm be proc memory_get_int64 from Memory with cache, 0
+    Let present be proc hashmap_contains from HashMap with hm, key
+    If present is equal to 0:
+        Return 0
+    End If
+    Let node be proc hashmap_get from HashMap with hm, key
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, 8
+End Process
+
+@Reasoning
+Insert or update a key-value pair. On insert, may evict the LRU entry
+if the cache is at capacity.
+@End Reasoning
+
+@Implementation
+1) If hashmap_contains key:
+     a) Read existing node, update value, promote node, return 1.
+2) Otherwise (insert path):
+     a) If size == capacity, evict the tail node and remove its key
+        from the hashmap.
+     b) Allocate a new node.
+     c) Link it to the head.
+     d) hashmap_set(key -> node).
+     e) Increment size.
+3) Return 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) amortized.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "lru_put" takes cache as Integer, key as Integer, value as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Let hm be proc memory_get_int64 from Memory with cache, 0
+    Let present be proc hashmap_contains from HashMap with hm, key
+    If present is equal to 1:
+        Let existing be proc hashmap_get from HashMap with hm, key
+        If existing is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with existing, 8, value
+        proc lru_promote with cache, existing
+        Return 1
+    End If
+    Let size be proc memory_get_int64 from Memory with cache, 24
+    Let capacity be proc memory_get_int64 from Memory with cache, 32
+    If size is greater than or equal to capacity:
+        Let tail be proc memory_get_int64 from Memory with cache, 16
+        If tail is not equal to 0:
+            Let evicted_key be proc memory_get_int64 from Memory with tail, 0
+            proc lru_unlink with cache, tail
+            proc memory_set_int64 from Memory with tail, 32, 0
+            proc deallocate from Layout with tail
+            proc hashmap_remove from HashMap with hm, evicted_key
+            proc memory_set_int64 from Memory with cache, 24, size minus 1
+            Set size to size minus 1
+        End If
+    End If
+    Let node be proc lru_node_create with key, value
+    If node is equal to 0:
+        Return 0
+    End If
+    proc lru_link_to_head with cache, node
+    proc hashmap_set from HashMap with hm, key, node
+    proc memory_set_int64 from Memory with cache, 24, size plus 1
+    Return 1
+End Process
+
+@Reasoning
+Remove a key. Returns 1 on hit, 0 on miss.
+@End Reasoning
+
+@Implementation
+1) hashmap_contains check.
+2) hashmap_get node, unlink, free.
+3) hashmap_remove. Decrement size.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Caller-managed.
+@End Security_Scope
+Process called "lru_remove" takes cache as Integer, key as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Let hm be proc memory_get_int64 from Memory with cache, 0
+    Let present be proc hashmap_contains from HashMap with hm, key
+    If present is equal to 0:
+        Return 0
+    End If
+    Let node be proc hashmap_get from HashMap with hm, key
+    If node is equal to 0:
+        Return 0
+    End If
+    proc lru_unlink with cache, node
+    proc memory_set_int64 from Memory with node, 32, 0
+    proc deallocate from Layout with node
+    proc hashmap_remove from HashMap with hm, key
+    Let size be proc memory_get_int64 from Memory with cache, 24
+    proc memory_set_int64 from Memory with cache, 24, size minus 1
+    Return 1
+End Process
+
+@Reasoning
+Empty the cache by walking the list, freeing nodes, and clearing the
+hashmap by remove-each. The hashmap object itself is preserved so the
+cache can be re-used without reallocating the bucket array.
+@End Reasoning
+
+@Implementation
+1) Walk list head-to-tail, freeing each node and removing its key
+   from the hashmap.
+2) Set head = tail = 0, size = 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(size).
+@End Performance_Hints
+
+@Security_Scope
+After clear, the cache is empty but ready to accept new entries.
+@End Security_Scope
+Process called "lru_clear" takes cache as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Let hm be proc memory_get_int64 from Memory with cache, 0
+    Let cur be proc memory_get_int64 from Memory with cache, 8
+    While cur is not equal to 0:
+        Let next_node be proc memory_get_int64 from Memory with cur, 24
+        Let cur_key be proc memory_get_int64 from Memory with cur, 0
+        proc hashmap_remove from HashMap with hm, cur_key
+        proc deallocate from Layout with cur
+        Set cur to next_node
+    End While
+    proc memory_set_int64 from Memory with cache, 8, 0
+    proc memory_set_int64 from Memory with cache, 16, 0
+    proc memory_set_int64 from Memory with cache, 24, 0
+    Return 1
+End Process
+
+@Reasoning
+Read the current MRU key (the most recently accessed key). Returns
+the key, or 0 if the cache is empty. Callers should check lru_size
+first if 0 is a valid key.
+@End Reasoning
+
+@Implementation
+1) Empty check.
+2) Read head.key.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "lru_mru_key" takes cache as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Let head be proc memory_get_int64 from Memory with cache, 8
+    If head is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with head, 0
+End Process
+
+@Reasoning
+Read the current LRU key (eviction candidate). Returns 0 on empty.
+@End Reasoning
+
+@Implementation
+1) Empty check.
+2) Read tail.key.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "lru_lru_key" takes cache as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Let tail be proc memory_get_int64 from Memory with cache, 16
+    If tail is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with tail, 0
+End Process

@@ -1,0 +1,547 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+TRIE - Prefix Tree Tier 0 Primitive
+
+This file implements a 256-ary trie keyed by byte strings (Strings are
+null-terminated byte sequences in the bootstrap runtime). Each node
+holds a value slot and a 256-entry children array (one per possible
+byte). The trie supports prefix-based search and is the substrate for
+autocomplete, IP routing prefix dispatch, and dictionary lookups.
+
+Node structure (8 + 8 + 8 + 256 * 8 = 2072 bytes):
+  offset 0:    has_value flag (8 bytes)
+  offset 8:    value (8 bytes; only meaningful when has_value == 1)
+  offset 16:   child_count (8 bytes; bookkeeping for fast empty check)
+  offset 24+:  children array (256 * 8 = 2048 bytes)
+
+Trie header (16 bytes):
+  offset 0: root pointer
+  offset 8: entry_count (8 bytes; total number of terminated keys)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let TRIE_ALPHABET_SIZE be 256
+Let TRIE_NODE_SIZE be 2072
+Let TRIE_HEADER_SIZE be 16
+Let TRIE_CHILDREN_OFFSET be 24
+
+Note: ============================================================================
+Note: NODE HELPERS
+Note: ============================================================================
+
+@Reasoning
+Address of the child slot for byte 'b' in a node.
+@End Reasoning
+
+@Implementation
+addr = node + 24 + b * 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated byte (0..255).
+@End Security_Scope
+Process called "trie_child_addr" takes node as Integer, b as Integer returns Integer:
+    Return node plus (TRIE_CHILDREN_OFFSET plus (b multiplied by 8))
+End Process
+
+@Reasoning
+Allocate a new trie node. Layout.allocate zero-fills so all child slots
+are null, has_value = 0, child_count = 0.
+@End Reasoning
+
+@Implementation
+2072-byte allocation; zero-init by allocator.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: 2072 bytes per node.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "trie_node_create" returns Integer:
+    Let node be proc allocate from Layout with TRIE_NODE_SIZE
+    If node is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with node, 0, 0
+    proc memory_set_int64 from Memory with node, 8, 0
+    proc memory_set_int64 from Memory with node, 16, 0
+    Note: Children are zero-initialized by the allocator.
+    Return node
+End Process
+
+Note: ============================================================================
+Note: TREE CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Create an empty trie with a single root node.
+@End Reasoning
+
+@Implementation
+Allocate header, allocate root, link, entry_count = 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "trie_create" returns Integer:
+    Let trie be proc allocate from Layout with TRIE_HEADER_SIZE
+    If trie is equal to 0:
+        Return 0
+    End If
+    Let root be proc trie_node_create
+    If root is equal to 0:
+        proc deallocate from Layout with trie
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with trie, 0, root
+    proc memory_set_int64 from Memory with trie, 8, 0
+    Return trie
+End Process
+
+@Reasoning
+Free every node iteratively using a stack of node pointers.
+@End Reasoning
+
+@Implementation
+Maintain a dynamic stack buffer of pointers. Pop each node, push every
+non-null child, free the popped node. Postorder is implicit because
+children are pushed before the parent is freed but freeing only
+happens after we've pushed all children.
+
+Implementation detail: nodes with no children are freed first because
+they're at the top of the stack when popped without further pushes.
+@End Implementation
+
+@Performance_Hints
+Time: O(N) in node count. Space: O(N) in the worst case (the stack can
+contain many siblings simultaneously).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "trie_destroy" takes trie as Integer returns Integer:
+    If trie is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with trie, 0
+    Let cap be 64
+    Let buf_bytes be cap multiplied by 8
+    Let buf be proc allocate from Layout with buf_bytes
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let sp be 0
+    If root is not equal to 0:
+        proc memory_set_int64 from Memory with buf, 0, root
+        Set sp to 1
+    End If
+    While sp is greater than 0:
+        Set sp to sp minus 1
+        Let off be sp multiplied by 8
+        Let node be proc memory_get_int64 from Memory with buf, off
+        Let i be 0
+        While i is less than TRIE_ALPHABET_SIZE:
+            Let c_addr be proc trie_child_addr with node, i
+            Let child be proc memory_get_int64 from Memory with c_addr, 0
+            If child is not equal to 0:
+                Let need be sp plus 1
+                If need is greater than cap:
+                    Let new_cap be cap multiplied by 2
+                    Let new_bytes be new_cap multiplied by 8
+                    Let new_buf be proc allocate from Layout with new_bytes
+                    If new_buf is equal to 0:
+                        proc deallocate from Layout with buf
+                        Return 0
+                    End If
+                    Let copy_bytes be cap multiplied by 8
+                    proc memory_copy from Memory with new_buf, buf, copy_bytes
+                    proc deallocate from Layout with buf
+                    Set buf to new_buf
+                    Set cap to new_cap
+                End If
+                Let s_off be sp multiplied by 8
+                proc memory_set_int64 from Memory with buf, s_off, child
+                Set sp to sp plus 1
+            End If
+            Set i to i plus 1
+        End While
+        proc deallocate from Layout with node
+    End While
+    proc deallocate from Layout with buf
+    proc deallocate from Layout with trie
+    Return 1
+End Process
+
+@Reasoning
+Number of complete-key entries in the trie.
+@End Reasoning
+
+@Implementation
+Read entry_count at offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "trie_size" takes trie as Integer returns Integer:
+    If trie is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with trie, 8
+End Process
+
+Note: ============================================================================
+Note: STRING LENGTH HELPER (null-terminated)
+Note: ============================================================================
+
+@Reasoning
+Local string-length helper to avoid bringing in the text module for
+this single use. Walks until a null byte.
+@End Reasoning
+
+@Implementation
+Loop until *(ptr + i) == 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Caller must supply a null-terminated string.
+@End Security_Scope
+Process called "trie_strlen" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While 1 is equal to 1:
+        Let byte be proc memory_get_byte from Memory with s, i
+        If byte is equal to 0:
+            Return i
+        End If
+        Set i to i plus 1
+    End While
+    Return i
+End Process
+
+Note: ============================================================================
+Note: INSERT / LOOKUP / DELETE
+Note: ============================================================================
+
+@Reasoning
+Insert key (null-terminated String) with associated value. If the key
+already exists, overwrite the value rather than incrementing the count.
+@End Reasoning
+
+@Implementation
+1) Walk down from root, byte by byte. At each byte, if the child slot
+   is empty, allocate a fresh node and link it. Bump child_count of
+   the parent when a new slot is filled.
+2) After consuming all bytes, mark the terminal node has_value = 1
+   and set value. If it was newly marked, increment entry_count.
+@End Implementation
+
+@Performance_Hints
+Time: O(k) where k is key length. Space: O(k) in the worst case (each
+byte may allocate one new node).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "trie_insert" takes trie as Integer, key as Integer, value as Integer returns Integer:
+    If trie is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    Let cur be proc memory_get_int64 from Memory with trie, 0
+    Let i be 0
+    Let klen be proc trie_strlen with key
+    While i is less than klen:
+        Let byte be proc memory_get_byte from Memory with key, i
+        Let c_addr be proc trie_child_addr with cur, byte
+        Let child be proc memory_get_int64 from Memory with c_addr, 0
+        If child is equal to 0:
+            Set child to proc trie_node_create
+            If child is equal to 0:
+                Return 0
+            End If
+            proc memory_set_int64 from Memory with c_addr, 0, child
+            Let cc be proc memory_get_int64 from Memory with cur, 16
+            proc memory_set_int64 from Memory with cur, 16, cc plus 1
+        End If
+        Set cur to child
+        Set i to i plus 1
+    End While
+    Let had be proc memory_get_int64 from Memory with cur, 0
+    proc memory_set_int64 from Memory with cur, 0, 1
+    proc memory_set_int64 from Memory with cur, 8, value
+    If had is equal to 0:
+        Let ec be proc memory_get_int64 from Memory with trie, 8
+        proc memory_set_int64 from Memory with trie, 8, ec plus 1
+    End If
+    Return 1
+End Process
+
+@Reasoning
+Lookup value for key. Returns value if present, 0 if absent.
+@End Reasoning
+
+@Implementation
+Walk down child[byte] for each byte; if a child is null partway, return
+0. After consuming all bytes, return value if has_value == 1, else 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(k).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "trie_lookup" takes trie as Integer, key as Integer returns Integer:
+    If trie is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    Let cur be proc memory_get_int64 from Memory with trie, 0
+    Let i be 0
+    Let klen be proc trie_strlen with key
+    While i is less than klen:
+        Let byte be proc memory_get_byte from Memory with key, i
+        Let c_addr be proc trie_child_addr with cur, byte
+        Let child be proc memory_get_int64 from Memory with c_addr, 0
+        If child is equal to 0:
+            Return 0
+        End If
+        Set cur to child
+        Set i to i plus 1
+    End While
+    Let has_value be proc memory_get_int64 from Memory with cur, 0
+    If has_value is equal to 1:
+        Return proc memory_get_int64 from Memory with cur, 8
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Contains predicate (distinguishes "present with value 0" from "absent").
+@End Reasoning
+
+@Implementation
+Same descent as lookup but returns 1 on has_value match.
+@End Implementation
+
+@Performance_Hints
+Time: O(k).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "trie_contains" takes trie as Integer, key as Integer returns Integer:
+    If trie is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    Let cur be proc memory_get_int64 from Memory with trie, 0
+    Let i be 0
+    Let klen be proc trie_strlen with key
+    While i is less than klen:
+        Let byte be proc memory_get_byte from Memory with key, i
+        Let c_addr be proc trie_child_addr with cur, byte
+        Let child be proc memory_get_int64 from Memory with c_addr, 0
+        If child is equal to 0:
+            Return 0
+        End If
+        Set cur to child
+        Set i to i plus 1
+    End While
+    Let has_value be proc memory_get_int64 from Memory with cur, 0
+    Return has_value
+End Process
+
+@Reasoning
+Find the node at which a given prefix ends; returns 0 if any byte of
+the prefix is missing. Used as the entry point for prefix enumeration.
+@End Reasoning
+
+@Implementation
+Walk down child[byte] for each prefix byte.
+@End Implementation
+
+@Performance_Hints
+Time: O(k).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "trie_prefix_node" takes trie as Integer, prefix as Integer returns Integer:
+    If trie is equal to 0:
+        Return 0
+    End If
+    If prefix is equal to 0:
+        Return 0
+    End If
+    Let cur be proc memory_get_int64 from Memory with trie, 0
+    Let i be 0
+    Let plen be proc trie_strlen with prefix
+    While i is less than plen:
+        Let byte be proc memory_get_byte from Memory with prefix, i
+        Let c_addr be proc trie_child_addr with cur, byte
+        Let child be proc memory_get_int64 from Memory with c_addr, 0
+        If child is equal to 0:
+            Return 0
+        End If
+        Set cur to child
+        Set i to i plus 1
+    End While
+    Return cur
+End Process
+
+@Reasoning
+Count entries with the given prefix. Walks the subtree rooted at the
+prefix node and counts has_value == 1 along the way.
+@End Reasoning
+
+@Implementation
+1) Find subtree root via trie_prefix_node.
+2) Walk the subtree iteratively using a node stack.
+3) Each node contributes 1 to the count if has_value == 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(M) where M is the number of nodes in the prefix subtree.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "trie_prefix_count" takes trie as Integer, prefix as Integer returns Integer:
+    Let sub_root be proc trie_prefix_node with trie, prefix
+    If sub_root is equal to 0:
+        Return 0
+    End If
+    Let cap be 64
+    Let buf_bytes be cap multiplied by 8
+    Let buf be proc allocate from Layout with buf_bytes
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let sp be 0
+    proc memory_set_int64 from Memory with buf, 0, sub_root
+    Set sp to 1
+    Let count be 0
+    While sp is greater than 0:
+        Set sp to sp minus 1
+        Let off be sp multiplied by 8
+        Let node be proc memory_get_int64 from Memory with buf, off
+        Let has_value be proc memory_get_int64 from Memory with node, 0
+        If has_value is equal to 1:
+            Set count to count plus 1
+        End If
+        Let i be 0
+        While i is less than TRIE_ALPHABET_SIZE:
+            Let c_addr be proc trie_child_addr with node, i
+            Let child be proc memory_get_int64 from Memory with c_addr, 0
+            If child is not equal to 0:
+                Let need be sp plus 1
+                If need is greater than cap:
+                    Let new_cap be cap multiplied by 2
+                    Let new_bytes be new_cap multiplied by 8
+                    Let new_buf be proc allocate from Layout with new_bytes
+                    If new_buf is equal to 0:
+                        proc deallocate from Layout with buf
+                        Return count
+                    End If
+                    Let copy_bytes be cap multiplied by 8
+                    proc memory_copy from Memory with new_buf, buf, copy_bytes
+                    proc deallocate from Layout with buf
+                    Set buf to new_buf
+                    Set cap to new_cap
+                End If
+                Let s_off be sp multiplied by 8
+                proc memory_set_int64 from Memory with buf, s_off, child
+                Set sp to sp plus 1
+            End If
+            Set i to i plus 1
+        End While
+    End While
+    proc deallocate from Layout with buf
+    Return count
+End Process
+
+@Reasoning
+Convenience: does any entry with this prefix exist?
+@End Reasoning
+
+@Implementation
+Calls trie_prefix_node; returns 1 if non-null and the subtree contains
+at least one has_value node. Uses prefix_count > 0 for the second
+condition because the prefix node itself might not be terminal.
+@End Implementation
+
+@Performance_Hints
+Time: O(k + M).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "trie_has_prefix" takes trie as Integer, prefix as Integer returns Integer:
+    Let n be proc trie_prefix_node with trie, prefix
+    If n is equal to 0:
+        Return 0
+    End If
+    Let c be proc trie_prefix_count with trie, prefix
+    If c is greater than 0:
+        Return 1
+    End If
+    Return 0
+End Process

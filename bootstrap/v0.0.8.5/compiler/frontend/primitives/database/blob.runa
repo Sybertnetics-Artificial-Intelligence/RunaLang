@@ -1,0 +1,363 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+BLOB - Large Binary Object with lazy-load support.
+
+A Blob represents binary data that may be too large to keep in memory.
+It supports two backing modes:
+  MODE_INLINE: data is held in a heap buffer
+  MODE_FILE:   data lives in a file; reads pull chunks on demand
+
+Blob layout (48 bytes):
+  offset 0:  mode        (8 bytes) (1 = inline, 2 = file)
+  offset 8:  size_bytes  (8 bytes) - logical total size
+  offset 16: data_ptr    (8 bytes) - heap pointer when MODE_INLINE; null when FILE
+  offset 24: file_handle (8 bytes) - integer file descriptor when MODE_FILE
+  offset 32: file_path   (8 bytes) - path string (for diagnostics); null when INLINE
+  offset 40: capacity    (8 bytes) - allocated capacity for INLINE mode
+
+Dependencies:
+- memory/layout.runa
+- core/memory_core.runa
+- platform/syscall layer (for file I/O - delegated via existing IO modules)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+
+Constant BLOB_OFF_MODE as Integer is 0
+Constant BLOB_OFF_SIZE as Integer is 8
+Constant BLOB_OFF_DATA as Integer is 16
+Constant BLOB_OFF_FILE_HANDLE as Integer is 24
+Constant BLOB_OFF_FILE_PATH as Integer is 32
+Constant BLOB_OFF_CAPACITY as Integer is 40
+Constant BLOB_STRUCT_SIZE as Integer is 48
+
+Constant BLOB_MODE_INLINE as Integer is 1
+Constant BLOB_MODE_FILE as Integer is 2
+
+Constant BLOB_OK as Integer is 1
+Constant BLOB_ERR_INVALID as Integer is 0
+Constant BLOB_ERR_IO as Integer is -1
+Constant BLOB_ERR_OUT_OF_RANGE as Integer is -2
+
+@Reasoning
+Create an inline blob from raw bytes. Copies the bytes into a heap buffer.
+@End Reasoning
+
+@Implementation
+Allocate the blob record + a data buffer of size_bytes, memcopy the bytes
+in.
+@End Implementation
+
+@Performance_Hints
+O(size_bytes) for the memcpy.
+@End Performance_Hints
+
+@Security_Scope
+Caller's source buffer is read-only from the blob's perspective; lifetime
+is independent after construction.
+@End Security_Scope
+
+Process called "blob_create_from_bytes" takes src_ptr as Integer, size_bytes as Integer returns Integer:
+    If size_bytes is less than 0:
+        Return 0
+    End If
+    Let b be proc allocate from Memory with BLOB_STRUCT_SIZE
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let buf be 0
+    If size_bytes is greater than 0:
+        Set buf to proc allocate from Memory with size_bytes
+        If buf is equal to 0:
+            proc deallocate from Memory with b
+            Return 0
+        End If
+        If src_ptr is not equal to 0:
+            proc memory_copy from Mem with buf, src_ptr, size_bytes
+        Otherwise:
+            proc memory_zero from Mem with buf, size_bytes
+        End If
+    End If
+
+    proc memory_set_int64 from Mem with b, BLOB_OFF_MODE, BLOB_MODE_INLINE
+    proc memory_set_int64 from Mem with b, BLOB_OFF_SIZE, size_bytes
+    proc memory_set_int64 from Mem with b, BLOB_OFF_DATA, buf
+    proc memory_set_int64 from Mem with b, BLOB_OFF_FILE_HANDLE, 0
+    proc memory_set_int64 from Mem with b, BLOB_OFF_FILE_PATH, 0
+    proc memory_set_int64 from Mem with b, BLOB_OFF_CAPACITY, size_bytes
+    Return b
+End Process
+
+@Reasoning
+Create a file-backed blob. The file is opened (read-only) and held by the
+blob; chunk reads pull from the file on demand without loading the whole
+file into memory.
+@End Reasoning
+
+@Implementation
+Open the file via the platform syscall layer. Stat (or seek+lseek) for
+size. Store the file handle and path pointer.
+@End Implementation
+
+@Performance_Hints
+Construction is one open + one lseek. Subsequent reads pay per-chunk
+syscall costs.
+@End Performance_Hints
+
+@Security_Scope
+path_ptr must be a valid null-terminated UTF-8 path. The blob holds the
+file open until destroyed.
+@End Security_Scope
+
+Process called "blob_create_from_file" takes path_ptr as Integer returns Integer:
+    If path_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Open file read-only via syscall layer. We use the generic
+    Note: platform_syscall_open if available; here we delegate via the
+    Note: existing syscall layer's named primitive `syscall_open_readonly`.
+    Let fd be proc syscall_open_readonly_safe with path_ptr
+    If fd is less than 0:
+        Return 0
+    End If
+
+    Note: Determine file size via lseek to end
+    Let size be proc syscall_lseek_end_safe with fd
+    If size is less than 0:
+        proc syscall_close_safe with fd
+        Return 0
+    End If
+
+    Let b be proc allocate from Memory with BLOB_STRUCT_SIZE
+    If b is equal to 0:
+        proc syscall_close_safe with fd
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with b, BLOB_OFF_MODE, BLOB_MODE_FILE
+    proc memory_set_int64 from Mem with b, BLOB_OFF_SIZE, size
+    proc memory_set_int64 from Mem with b, BLOB_OFF_DATA, 0
+    proc memory_set_int64 from Mem with b, BLOB_OFF_FILE_HANDLE, fd
+    proc memory_set_int64 from Mem with b, BLOB_OFF_FILE_PATH, path_ptr
+    proc memory_set_int64 from Mem with b, BLOB_OFF_CAPACITY, 0
+    Return b
+End Process
+
+Note: ============================================================================
+Note: Syscall safety wrappers
+Note: ============================================================================
+
+@Reasoning
+The platform syscall layer exposes raw open/read/write/close/lseek by
+name; we wrap them with consistent error mapping so the blob API does not
+leak platform error codes.
+@End Reasoning
+
+@Implementation
+Delegate to the existing syscall layer. The names below match the
+public surface of compiler/frontend/primitives/assembly/syscall.runa
+(see syscall_open / syscall_read / syscall_close / syscall_lseek).
+@End Implementation
+
+@Performance_Hints
+One platform call per wrapper.
+@End Performance_Hints
+
+@Security_Scope
+Errors are surfaced as negative return codes. No retries.
+@End Security_Scope
+
+Process called "syscall_open_readonly_safe" takes path_ptr as Integer returns Integer:
+    Note: O_RDONLY = 0 on Linux; the cross-platform constant is exposed
+    Note: through the syscall layer via `syscall_open_flags_readonly`.
+    Let flags be 0
+    Let mode be 0
+    Return proc syscall_open from Syscall with path_ptr, flags, mode
+End Process
+
+Process called "syscall_close_safe" takes fd as Integer returns Integer:
+    Return proc syscall_close from Syscall with fd
+End Process
+
+Process called "syscall_lseek_end_safe" takes fd as Integer returns Integer:
+    Note: SEEK_END = 2
+    Return proc syscall_lseek from Syscall with fd, 0, 2
+End Process
+
+Process called "syscall_lseek_set_safe" takes fd as Integer, offset as Integer returns Integer:
+    Note: SEEK_SET = 0
+    Return proc syscall_lseek from Syscall with fd, offset, 0
+End Process
+
+Process called "syscall_read_safe" takes fd as Integer, buf as Integer, count as Integer returns Integer:
+    Return proc syscall_read from Syscall with fd, buf, count
+End Process
+
+Note: ============================================================================
+Note: Read API
+Note: ============================================================================
+
+@Reasoning
+Read a chunk of bytes from the blob into a caller-provided buffer.
+@End Reasoning
+
+@Implementation
+INLINE: memcopy from data_ptr+offset. FILE: lseek+read into buf.
+@End Implementation
+
+@Performance_Hints
+INLINE is single memcpy. FILE incurs lseek + read syscalls.
+@End Performance_Hints
+
+@Security_Scope
+offset and length must be within [0, size_bytes]. buf must be writable.
+@End Security_Scope
+
+Process called "blob_read_chunk" takes b as Integer, offset as Integer, length as Integer, out_buf as Integer returns Integer:
+    If b is equal to 0:
+        Return BLOB_ERR_INVALID
+    End If
+    If out_buf is equal to 0:
+        Return BLOB_ERR_INVALID
+    End If
+    If length is less than 0:
+        Return BLOB_ERR_INVALID
+    End If
+    If offset is less than 0:
+        Return BLOB_ERR_INVALID
+    End If
+    Let size be proc memory_get_int64 from Mem with b, BLOB_OFF_SIZE
+    If offset is greater than size:
+        Return BLOB_ERR_OUT_OF_RANGE
+    End If
+    Let actual_len be length
+    If (offset plus actual_len) is greater than size:
+        Set actual_len to size minus offset
+    End If
+    If actual_len is equal to 0:
+        Return 0
+    End If
+
+    Let mode be proc memory_get_int64 from Mem with b, BLOB_OFF_MODE
+    If mode is equal to BLOB_MODE_INLINE:
+        Let data_ptr be proc memory_get_int64 from Mem with b, BLOB_OFF_DATA
+        proc memory_copy from Mem with out_buf, (data_ptr plus offset), actual_len
+        Return actual_len
+    End If
+    If mode is equal to BLOB_MODE_FILE:
+        Let fd be proc memory_get_int64 from Mem with b, BLOB_OFF_FILE_HANDLE
+        Let seek_rc be proc syscall_lseek_set_safe with fd, offset
+        If seek_rc is less than 0:
+            Return BLOB_ERR_IO
+        End If
+        Let n be proc syscall_read_safe with fd, out_buf, actual_len
+        If n is less than 0:
+            Return BLOB_ERR_IO
+        End If
+        Return n
+    End If
+    Return BLOB_ERR_INVALID
+End Process
+
+Process called "blob_size" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with b, BLOB_OFF_SIZE
+End Process
+
+Process called "blob_mode" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with b, BLOB_OFF_MODE
+End Process
+
+@Reasoning
+Materialize a file-backed blob fully into memory. Useful when full random
+access is required and the file fits in memory.
+@End Reasoning
+
+@Implementation
+Allocate a buffer of size, read into it from offset 0, then mutate the
+blob to INLINE mode and close the file handle.
+@End Implementation
+
+@Performance_Hints
+One alloc + one sequential read.
+@End Performance_Hints
+
+@Security_Scope
+Use only for files that fit comfortably in memory.
+@End Security_Scope
+
+Process called "blob_materialize" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return BLOB_ERR_INVALID
+    End If
+    Let mode be proc memory_get_int64 from Mem with b, BLOB_OFF_MODE
+    If mode is not equal to BLOB_MODE_FILE:
+        Return BLOB_OK
+    End If
+    Let size be proc memory_get_int64 from Mem with b, BLOB_OFF_SIZE
+    If size is equal to 0:
+        proc memory_set_int64 from Mem with b, BLOB_OFF_MODE, BLOB_MODE_INLINE
+        proc memory_set_int64 from Mem with b, BLOB_OFF_DATA, 0
+        proc memory_set_int64 from Mem with b, BLOB_OFF_CAPACITY, 0
+        Let fd0 be proc memory_get_int64 from Mem with b, BLOB_OFF_FILE_HANDLE
+        proc syscall_close_safe with fd0
+        proc memory_set_int64 from Mem with b, BLOB_OFF_FILE_HANDLE, 0
+        Return BLOB_OK
+    End If
+    Let buf be proc allocate from Memory with size
+    If buf is equal to 0:
+        Return BLOB_ERR_INVALID
+    End If
+    Let fd be proc memory_get_int64 from Mem with b, BLOB_OFF_FILE_HANDLE
+    Let seek_rc be proc syscall_lseek_set_safe with fd, 0
+    If seek_rc is less than 0:
+        proc deallocate from Memory with buf
+        Return BLOB_ERR_IO
+    End If
+    Let n be proc syscall_read_safe with fd, buf, size
+    If n is less than 0:
+        proc deallocate from Memory with buf
+        Return BLOB_ERR_IO
+    End If
+
+    proc memory_set_int64 from Mem with b, BLOB_OFF_DATA, buf
+    proc memory_set_int64 from Mem with b, BLOB_OFF_MODE, BLOB_MODE_INLINE
+    proc memory_set_int64 from Mem with b, BLOB_OFF_CAPACITY, size
+    proc syscall_close_safe with fd
+    proc memory_set_int64 from Mem with b, BLOB_OFF_FILE_HANDLE, 0
+    Return BLOB_OK
+End Process
+
+Process called "blob_destroy" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return BLOB_ERR_INVALID
+    End If
+    Let mode be proc memory_get_int64 from Mem with b, BLOB_OFF_MODE
+    If mode is equal to BLOB_MODE_INLINE:
+        Let data_ptr be proc memory_get_int64 from Mem with b, BLOB_OFF_DATA
+        If data_ptr is not equal to 0:
+            proc deallocate from Memory with data_ptr
+        End If
+    Otherwise:
+        If mode is equal to BLOB_MODE_FILE:
+            Let fd be proc memory_get_int64 from Mem with b, BLOB_OFF_FILE_HANDLE
+            If fd is not equal to 0:
+                proc syscall_close_safe with fd
+            End If
+        End If
+    End If
+    proc deallocate from Memory with b
+    Return BLOB_OK
+End Process

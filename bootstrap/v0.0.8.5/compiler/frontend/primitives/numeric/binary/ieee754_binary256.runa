@@ -1,0 +1,3736 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+IEEE 754-2008 binary256 (octuple precision) software implementation
+==============================================================================
+
+Format (256 bits):
+  bit 255       : sign
+  bits 254-236  : exponent (19 bits, bias 262143)
+  bits 235-0    : mantissa fraction (236 bits, implicit leading 1)
+
+Internal representation: 32-byte arena-allocated buffer addressed by pointer.
+Layout: little-endian across four 64-bit words.
+  byte offsets [0..7]   = limb0 (mantissa bits 0..63)
+  byte offsets [8..15]  = limb1 (mantissa bits 64..127)
+  byte offsets [16..23] = limb2 (mantissa bits 128..191)
+  byte offsets [24..31] = limb3 (mantissa bits 192..235 + exponent + sign)
+
+We chose flat-buffer over struct-of-fields for the same reason as binary128:
+byte-pattern interop with binary I/O, plus a clean fit with arena allocation.
+
+Internal arithmetic for multiplication requires 512-bit intermediate values,
+carried as eight 64-bit limbs.
+
+References:
+  IEEE 754-2008 § 3.7 (extended-precision formats)
+  binary256 has no published canonical KAT suite; we validate via
+  cross-consistency tests (a+b = c => c-b = a, etc.) and against
+  representative values from numerical analysis literature.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/bitwise_core.runa" as Bits
+Import "runtime/core/memory/arena.runa" as Arena
+
+Note: ============================================================================
+Note: Format constants
+Note: ============================================================================
+
+Constant F256_BITS as Integer is 256
+Constant F256_EXP_BITS as Integer is 19
+Constant F256_MANT_BITS as Integer is 236
+Constant F256_BIAS as Integer is 262143
+Constant F256_EXP_MAX as Integer is 524287
+Constant F256_BYTES as Integer is 32
+
+Note: Within limb3 (top 64-bit word):
+Note:   bit 63       = sign
+Note:   bits 62..44  = exponent (19 bits)
+Note:   bits 43..0   = top 44 bits of mantissa
+Constant F256_SIGN_MASK_LIMB3 as Integer is -9223372036854775808
+Constant F256_EXP_MASK_LIMB3 as Integer is 9223090561878065152
+Constant F256_MANT_MASK_LIMB3 as Integer is 17592186044415
+Constant F256_HIDDEN_BIT_LIMB3 as Integer is 17592186044416
+
+Constant ROUND_NEAREST_EVEN as Integer is 0
+Constant ROUND_TOWARD_ZERO as Integer is 1
+Constant ROUND_TOWARD_POSITIVE as Integer is 2
+Constant ROUND_TOWARD_NEGATIVE as Integer is 3
+
+Constant FLAG_INVALID as Integer is 1
+Constant FLAG_DIVIDE_BY_ZERO as Integer is 2
+Constant FLAG_OVERFLOW as Integer is 4
+Constant FLAG_UNDERFLOW as Integer is 8
+Constant FLAG_INEXACT as Integer is 16
+
+Let F256_ROUNDING_MODE be 0
+Let F256_EXCEPTION_FLAGS be 0
+
+Note: ============================================================================
+Note: Allocation + raw limb access
+Note: ============================================================================
+
+Process called "f256_alloc" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocate and zero-initialize a 32-byte Float256.
+    @End Reasoning
+    @Implementation
+    arena_allocate + memory_fill 0.
+    @End Implementation
+    @Performance_Hints
+    One arena bump + 32-byte zero.
+    @End Performance_Hints
+    @Security_Scope
+    Zero is +0.0, a valid Float256.
+    @End Security_Scope
+    Let p be proc arena_allocate from Arena with arena, F256_BYTES
+    If p is equal to 0:
+        Return 0
+    End If
+    proc memory_fill from Memory with p, 0, F256_BYTES
+    Return p
+End Process
+
+Process called "f256_get_limb" takes p as Integer, idx as Integer returns Integer:
+    @Reasoning
+    Read the idx-th 64-bit limb (idx in [0..3]).
+    @End Reasoning
+    @Implementation
+    Single 64-bit load at offset idx*8.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Caller responsibility to keep idx in [0..3].
+    @End Security_Scope
+    Let off be idx multiplied by 8
+    Return proc memory_get_int64 from Memory with p, off
+End Process
+
+Process called "f256_set_limb" takes p as Integer, idx as Integer, value as Integer returns Integer:
+    @Reasoning
+    Write the idx-th 64-bit limb.
+    @End Reasoning
+    @Implementation
+    Single 64-bit store at offset idx*8.
+    @End Implementation
+    @Performance_Hints
+    One store.
+    @End Performance_Hints
+    @Security_Scope
+    Caller responsibility for idx.
+    @End Security_Scope
+    Let off be idx multiplied by 8
+    proc memory_set_int64 from Memory with p, off, value
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Field access
+Note: ============================================================================
+
+Process called "f256_get_sign" takes p as Integer returns Integer:
+    @Reasoning
+    Sign bit is bit 63 of limb3.
+    @End Reasoning
+    @Implementation
+    Load limb3, shift right by 63, mask 1.
+    @End Implementation
+    @Performance_Hints
+    One load + two ALU.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let limb3 be proc f256_get_limb with p, 3
+    Let shifted be limb3 shifted right by 63
+    Return shifted bitwise and 1
+End Process
+
+Process called "f256_get_exponent" takes p as Integer returns Integer:
+    @Reasoning
+    Exponent occupies bits 62..44 of limb3 (19 bits, biased).
+    @End Reasoning
+    @Implementation
+    Shift limb3 right by 44, mask with 0x7FFFF (524287).
+    @End Implementation
+    @Performance_Hints
+    One load + two ALU.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let limb3 be proc f256_get_limb with p, 3
+    Let shifted be limb3 shifted right by 44
+    Return shifted bitwise and F256_EXP_MAX
+End Process
+
+Process called "f256_get_mantissa_top44" takes p as Integer returns Integer:
+    @Reasoning
+    The top 44 bits of the 236-bit mantissa occupy bits 43..0 of limb3.
+    @End Reasoning
+    @Implementation
+    Load limb3, AND with mask of low 44 bits.
+    @End Implementation
+    @Performance_Hints
+    One load + one ALU.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let limb3 be proc f256_get_limb with p, 3
+    Return limb3 bitwise and F256_MANT_MASK_LIMB3
+End Process
+
+Process called "f256_set_fields" takes p as Integer, sign as Integer, biased_exp as Integer, mant_top44 as Integer, mant_mid64 as Integer, mant_lower64 as Integer, mant_bottom64 as Integer returns Integer:
+    @Reasoning
+    Compose sign + exponent + 236-bit mantissa into limb3..limb0.
+    mant_top44 = bits 192..235 (top 44 bits of the fraction part);
+    mant_mid64 = bits 128..191; mant_lower64 = bits 64..127;
+    mant_bottom64 = bits 0..63.
+    @End Reasoning
+    @Implementation
+    Defensive masking on each field, shifts, ORs.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    Let s be sign bitwise and 1
+    Let e be biased_exp bitwise and F256_EXP_MAX
+    Let mt be mant_top44 bitwise and F256_MANT_MASK_LIMB3
+    Let limb3 be s shifted left by 63
+    Let e_shifted be e shifted left by 44
+    Set limb3 to limb3 bitwise or e_shifted
+    Set limb3 to limb3 bitwise or mt
+    proc f256_set_limb with p, 3, limb3
+    proc f256_set_limb with p, 2, mant_mid64
+    proc f256_set_limb with p, 1, mant_lower64
+    proc f256_set_limb with p, 0, mant_bottom64
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Classification
+Note: ============================================================================
+
+Process called "f256_is_zero" takes p as Integer returns Integer:
+    @Reasoning
+    All bits except sign are zero.
+    @End Reasoning
+    @Implementation
+    Check each limb.
+    @End Implementation
+    @Performance_Hints
+    Four loads + four branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let l3 be proc f256_get_limb with p, 3
+    Let l3_no_sign be l3 bitwise and 9223372036854775807
+    If l3_no_sign is not equal to 0:
+        Return 0
+    End If
+    Let l2 be proc f256_get_limb with p, 2
+    If l2 is not equal to 0:
+        Return 0
+    End If
+    Let l1 be proc f256_get_limb with p, 1
+    If l1 is not equal to 0:
+        Return 0
+    End If
+    Let l0 be proc f256_get_limb with p, 0
+    If l0 is not equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f256_is_inf" takes p as Integer returns Integer:
+    @Reasoning
+    Exponent == max AND mantissa == 0.
+    @End Reasoning
+    @Implementation
+    Check exponent then mantissa limbs.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f256_get_exponent with p
+    If exp is not equal to F256_EXP_MAX:
+        Return 0
+    End If
+    Let mt be proc f256_get_mantissa_top44 with p
+    If mt is not equal to 0:
+        Return 0
+    End If
+    Let l2 be proc f256_get_limb with p, 2
+    If l2 is not equal to 0:
+        Return 0
+    End If
+    Let l1 be proc f256_get_limb with p, 1
+    If l1 is not equal to 0:
+        Return 0
+    End If
+    Let l0 be proc f256_get_limb with p, 0
+    If l0 is not equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f256_is_nan" takes p as Integer returns Integer:
+    @Reasoning
+    Exponent == max AND mantissa != 0.
+    @End Reasoning
+    @Implementation
+    Check exponent then any mantissa limb nonzero.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f256_get_exponent with p
+    If exp is not equal to F256_EXP_MAX:
+        Return 0
+    End If
+    Let mt be proc f256_get_mantissa_top44 with p
+    If mt is not equal to 0:
+        Return 1
+    End If
+    Let l2 be proc f256_get_limb with p, 2
+    If l2 is not equal to 0:
+        Return 1
+    End If
+    Let l1 be proc f256_get_limb with p, 1
+    If l1 is not equal to 0:
+        Return 1
+    End If
+    Let l0 be proc f256_get_limb with p, 0
+    If l0 is not equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f256_is_signaling_nan" takes p as Integer returns Integer:
+    @Reasoning
+    NaN with mantissa MSB (bit 235) clear. Bit 235 of mantissa is bit 43
+    of limb3 (the high mantissa-portion word).
+    @End Reasoning
+    @Implementation
+    Reject non-NaN, then check bit 43 of limb3.
+    @End Implementation
+    @Performance_Hints
+    A few branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let nan be proc f256_is_nan with p
+    If nan is equal to 0:
+        Return 0
+    End If
+    Let mt be proc f256_get_mantissa_top44 with p
+    Let msb_mask be 8796093022208
+    If (mt bitwise and msb_mask) is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f256_is_subnormal" takes p as Integer returns Integer:
+    @Reasoning
+    Exponent == 0 AND mantissa != 0.
+    @End Reasoning
+    @Implementation
+    Test exponent then mantissa.
+    @End Implementation
+    @Performance_Hints
+    Few branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f256_get_exponent with p
+    If exp is not equal to 0:
+        Return 0
+    End If
+    Let mt be proc f256_get_mantissa_top44 with p
+    If mt is not equal to 0:
+        Return 1
+    End If
+    Let l2 be proc f256_get_limb with p, 2
+    If l2 is not equal to 0:
+        Return 1
+    End If
+    Let l1 be proc f256_get_limb with p, 1
+    If l1 is not equal to 0:
+        Return 1
+    End If
+    Let l0 be proc f256_get_limb with p, 0
+    If l0 is not equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f256_is_normal" takes p as Integer returns Integer:
+    @Reasoning
+    0 < exponent < max.
+    @End Reasoning
+    @Implementation
+    Range check.
+    @End Implementation
+    @Performance_Hints
+    One load + two branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f256_get_exponent with p
+    If exp is equal to 0:
+        Return 0
+    End If
+    If exp is equal to F256_EXP_MAX:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f256_is_finite" takes p as Integer returns Integer:
+    @Reasoning
+    Exponent != max.
+    @End Reasoning
+    @Implementation
+    Single comparison.
+    @End Implementation
+    @Performance_Hints
+    One load + one branch.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f256_get_exponent with p
+    If exp is equal to F256_EXP_MAX:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f256_is_negative" takes p as Integer returns Integer:
+    @Reasoning
+    Sign bit is set.
+    @End Reasoning
+    @Implementation
+    Read sign bit.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return proc f256_get_sign with p
+End Process
+
+Note: ============================================================================
+Note: Rounding + flags
+Note: ============================================================================
+
+Process called "f256_set_rounding_mode" takes mode as Integer returns Integer:
+    @Reasoning
+    Switch the active rounding mode.
+    @End Reasoning
+    @Implementation
+    Range-checked store.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global.
+    @End Security_Scope
+    If mode is less than 0:
+        Return 0
+    End If
+    If mode is greater than 3:
+        Return 0
+    End If
+    Set F256_ROUNDING_MODE to mode
+    Return 1
+End Process
+
+Process called "f256_get_rounding_mode" returns Integer:
+    @Reasoning
+    Read.
+    @End Reasoning
+    @Implementation
+    Load.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Read-only.
+    @End Security_Scope
+    Return F256_ROUNDING_MODE
+End Process
+
+Process called "f256_raise_flag" takes flag as Integer returns Integer:
+    @Reasoning
+    Sticky OR.
+    @End Reasoning
+    @Implementation
+    OR + store.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global.
+    @End Security_Scope
+    Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or flag
+    Return 1
+End Process
+
+Process called "f256_clear_flags" returns Integer:
+    @Reasoning
+    Reset sticky register.
+    @End Reasoning
+    @Implementation
+    Store 0.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global.
+    @End Security_Scope
+    Set F256_EXCEPTION_FLAGS to 0
+    Return 1
+End Process
+
+Process called "f256_get_flags" returns Integer:
+    @Reasoning
+    Snapshot.
+    @End Reasoning
+    @Implementation
+    Load.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Read-only.
+    @End Security_Scope
+    Return F256_EXCEPTION_FLAGS
+End Process
+
+Note: ============================================================================
+Note: Special constructors
+Note: ============================================================================
+
+Process called "f256_make_zero" takes arena as Integer, sign as Integer returns Integer:
+    @Reasoning
+    ±0.
+    @End Reasoning
+    @Implementation
+    Alloc + optional sign bit.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let p be proc f256_alloc with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    If sign is equal to 1:
+        proc f256_set_limb with p, 3, F256_SIGN_MASK_LIMB3
+    End If
+    Return p
+End Process
+
+Process called "f256_make_inf" takes arena as Integer, sign as Integer returns Integer:
+    @Reasoning
+    ±Inf.
+    @End Reasoning
+    @Implementation
+    Place exponent_max in limb3 with optional sign.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let p be proc f256_alloc with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let l3 be F256_EXP_MAX shifted left by 44
+    If sign is equal to 1:
+        Set l3 to l3 bitwise or F256_SIGN_MASK_LIMB3
+    End If
+    proc f256_set_limb with p, 3, l3
+    Return p
+End Process
+
+Process called "f256_make_qnan" takes arena as Integer returns Integer:
+    @Reasoning
+    Canonical quiet NaN: exp=max, mantissa MSB=1.
+    @End Reasoning
+    @Implementation
+    Alloc + write limb3.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let p be proc f256_alloc with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let exp_part be F256_EXP_MAX shifted left by 44
+    Let quiet_bit be 8796093022208
+    Let l3 be exp_part bitwise or quiet_bit
+    proc f256_set_limb with p, 3, l3
+    Return p
+End Process
+
+Note: ============================================================================
+Note: Internal multi-limb arithmetic (256-bit unsigned)
+Note: ============================================================================
+Note: All helpers operate on 4-limb tuples (limb0, limb1, limb2, limb3) with
+Note: limb0 holding the low-order 64 bits. Output is via 4 caller-provided
+Note: 8-byte buffer pointers.
+Note: ============================================================================
+
+Process called "f256_add256" takes a0 as Integer, a1 as Integer, a2 as Integer, a3 as Integer, b0 as Integer, b1 as Integer, b2 as Integer, b3 as Integer, out0 as Integer, out1 as Integer, out2 as Integer, out3 as Integer returns Integer:
+    @Reasoning
+    Sum two 256-bit unsigned values held as (limb0, limb1, limb2, limb3).
+    @End Reasoning
+    @Implementation
+    Limb-by-limb add with carry propagation. Detect unsigned carry via
+    the standard "carry iff (a&b)|((a|b)&~sum) has bit 63 set" pattern.
+    @End Implementation
+    @Performance_Hints
+    Four adds + a few branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure; caller-owned output pointers.
+    @End Security_Scope
+    Let s0 be a0 plus b0
+    Let and_lo be a0 bitwise and b0
+    Let or_lo be a0 bitwise or b0
+    Let not_s0 be bitwise not s0
+    Let inner_lo be or_lo bitwise and not_s0
+    Let cm0 be and_lo bitwise or inner_lo
+    Let cm0_shift be cm0 shifted right by 63
+    Let c0 be cm0_shift bitwise and 1
+
+    Let s1_raw be a1 plus b1
+    Let s1 be s1_raw plus c0
+    Note: carry from a1+b1+c0: detect via two-step.
+    Let and1 be a1 bitwise and b1
+    Let or1 be a1 bitwise or b1
+    Let not_s1r be bitwise not s1_raw
+    Let inner1 be or1 bitwise and not_s1r
+    Let cm1a be and1 bitwise or inner1
+    Let c1a be (cm1a shifted right by 63) bitwise and 1
+    Note: also carry if s1_raw + c0 wrapped (only possible when s1_raw == -1)
+    Let c1b be 0
+    If c0 is equal to 1:
+        If s1_raw is equal to -1:
+            Set c1b to 1
+        End If
+    End If
+    Let c1 be c1a bitwise or c1b
+
+    Let s2_raw be a2 plus b2
+    Let s2 be s2_raw plus c1
+    Let and2 be a2 bitwise and b2
+    Let or2 be a2 bitwise or b2
+    Let not_s2r be bitwise not s2_raw
+    Let inner2 be or2 bitwise and not_s2r
+    Let cm2a be and2 bitwise or inner2
+    Let c2a be (cm2a shifted right by 63) bitwise and 1
+    Let c2b be 0
+    If c1 is equal to 1:
+        If s2_raw is equal to -1:
+            Set c2b to 1
+        End If
+    End If
+    Let c2 be c2a bitwise or c2b
+
+    Let s3_raw be a3 plus b3
+    Let s3 be s3_raw plus c2
+
+    proc memory_set_int64 from Memory with out0, 0, s0
+    proc memory_set_int64 from Memory with out1, 0, s1
+    proc memory_set_int64 from Memory with out2, 0, s2
+    proc memory_set_int64 from Memory with out3, 0, s3
+    Return 1
+End Process
+
+Process called "f256_sub256" takes a0 as Integer, a1 as Integer, a2 as Integer, a3 as Integer, b0 as Integer, b1 as Integer, b2 as Integer, b3 as Integer, out0 as Integer, out1 as Integer, out2 as Integer, out3 as Integer returns Integer:
+    @Reasoning
+    a - b assuming a >= b.
+    @End Reasoning
+    @Implementation
+    Limb-by-limb subtract with borrow propagation.
+    @End Implementation
+    @Performance_Hints
+    Four subs + branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let d0 be a0 minus b0
+    Let not_a0 be bitwise not a0
+    Let and_b0 be not_a0 bitwise and b0
+    Let or_b0 be not_a0 bitwise or b0
+    Let inner_b0 be or_b0 bitwise and d0
+    Let bm0 be and_b0 bitwise or inner_b0
+    Let bm0_shift be bm0 shifted right by 63
+    Let bo0 be bm0_shift bitwise and 1
+
+    Let d1_raw be a1 minus b1
+    Let d1 be d1_raw minus bo0
+    Let not_a1 be bitwise not a1
+    Let and_b1 be not_a1 bitwise and b1
+    Let or_b1 be not_a1 bitwise or b1
+    Let inner_b1 be or_b1 bitwise and d1_raw
+    Let bm1a be and_b1 bitwise or inner_b1
+    Let bo1a be (bm1a shifted right by 63) bitwise and 1
+    Let bo1b be 0
+    If bo0 is equal to 1:
+        If d1_raw is equal to 0:
+            Set bo1b to 1
+        End If
+    End If
+    Let bo1 be bo1a bitwise or bo1b
+
+    Let d2_raw be a2 minus b2
+    Let d2 be d2_raw minus bo1
+    Let not_a2 be bitwise not a2
+    Let and_b2 be not_a2 bitwise and b2
+    Let or_b2 be not_a2 bitwise or b2
+    Let inner_b2 be or_b2 bitwise and d2_raw
+    Let bm2a be and_b2 bitwise or inner_b2
+    Let bo2a be (bm2a shifted right by 63) bitwise and 1
+    Let bo2b be 0
+    If bo1 is equal to 1:
+        If d2_raw is equal to 0:
+            Set bo2b to 1
+        End If
+    End If
+    Let bo2 be bo2a bitwise or bo2b
+
+    Let d3 be a3 minus b3
+    Set d3 to d3 minus bo2
+
+    proc memory_set_int64 from Memory with out0, 0, d0
+    proc memory_set_int64 from Memory with out1, 0, d1
+    proc memory_set_int64 from Memory with out2, 0, d2
+    proc memory_set_int64 from Memory with out3, 0, d3
+    Return 1
+End Process
+
+Process called "f256_compare256" takes a0 as Integer, a1 as Integer, a2 as Integer, a3 as Integer, b0 as Integer, b1 as Integer, b2 as Integer, b3 as Integer returns Integer:
+    @Reasoning
+    Unsigned compare on 256-bit tuple.
+    @End Reasoning
+    @Implementation
+    Compare from high limb to low, treating each as unsigned via sign-flip XOR.
+    @End Implementation
+    @Performance_Hints
+    A few branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let a3_u be a3 bitwise xor F256_SIGN_MASK_LIMB3
+    Let b3_u be b3 bitwise xor F256_SIGN_MASK_LIMB3
+    If a3_u is less than b3_u:
+        Return -1
+    End If
+    If a3_u is greater than b3_u:
+        Return 1
+    End If
+    Let a2_u be a2 bitwise xor F256_SIGN_MASK_LIMB3
+    Let b2_u be b2 bitwise xor F256_SIGN_MASK_LIMB3
+    If a2_u is less than b2_u:
+        Return -1
+    End If
+    If a2_u is greater than b2_u:
+        Return 1
+    End If
+    Let a1_u be a1 bitwise xor F256_SIGN_MASK_LIMB3
+    Let b1_u be b1 bitwise xor F256_SIGN_MASK_LIMB3
+    If a1_u is less than b1_u:
+        Return -1
+    End If
+    If a1_u is greater than b1_u:
+        Return 1
+    End If
+    Let a0_u be a0 bitwise xor F256_SIGN_MASK_LIMB3
+    Let b0_u be b0 bitwise xor F256_SIGN_MASK_LIMB3
+    If a0_u is less than b0_u:
+        Return -1
+    End If
+    If a0_u is greater than b0_u:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f256_shift_right256_sticky_one" takes l0_in as Integer, l1_in as Integer, l2_in as Integer, l3_in as Integer, sticky_in as Integer, out0 as Integer, out1 as Integer, out2 as Integer, out3 as Integer, out_sticky as Integer returns Integer:
+    @Reasoning
+    Shift a 256-bit value right by 1 bit, OR shifted-out bit into sticky.
+    @End Reasoning
+    @Implementation
+    Standard limb shift with carry-down between limbs.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let lost be l0_in bitwise and 1
+    Let new_sticky be sticky_in bitwise or lost
+    Let l1_low be l1_in bitwise and 1
+    Let l0_sh be l0_in shifted right by 1
+    Set l0_sh to l0_sh bitwise and 9223372036854775807
+    Let l0_out be l0_sh bitwise or (l1_low shifted left by 63)
+    Let l2_low be l2_in bitwise and 1
+    Let l1_sh be l1_in shifted right by 1
+    Set l1_sh to l1_sh bitwise and 9223372036854775807
+    Let l1_out be l1_sh bitwise or (l2_low shifted left by 63)
+    Let l3_low be l3_in bitwise and 1
+    Let l2_sh be l2_in shifted right by 1
+    Set l2_sh to l2_sh bitwise and 9223372036854775807
+    Let l2_out be l2_sh bitwise or (l3_low shifted left by 63)
+    Let l3_sh be l3_in shifted right by 1
+    Set l3_sh to l3_sh bitwise and 9223372036854775807
+    Let l3_out be l3_sh
+    proc memory_set_int64 from Memory with out0, 0, l0_out
+    proc memory_set_int64 from Memory with out1, 0, l1_out
+    proc memory_set_int64 from Memory with out2, 0, l2_out
+    proc memory_set_int64 from Memory with out3, 0, l3_out
+    proc memory_set_int64 from Memory with out_sticky, 0, new_sticky
+    Return 1
+End Process
+
+Process called "f256_shift_left256_one" takes l0_in as Integer, l1_in as Integer, l2_in as Integer, l3_in as Integer, out0 as Integer, out1 as Integer, out2 as Integer, out3 as Integer returns Integer:
+    @Reasoning
+    Shift left by 1 bit.
+    @End Reasoning
+    @Implementation
+    Carry-up between limbs.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let l0_top be l0_in shifted right by 63
+    Set l0_top to l0_top bitwise and 1
+    Let l1_top be l1_in shifted right by 63
+    Set l1_top to l1_top bitwise and 1
+    Let l2_top be l2_in shifted right by 63
+    Set l2_top to l2_top bitwise and 1
+    Let l0_out be l0_in shifted left by 1
+    Let l1_out be l1_in shifted left by 1
+    Set l1_out to l1_out bitwise or l0_top
+    Let l2_out be l2_in shifted left by 1
+    Set l2_out to l2_out bitwise or l1_top
+    Let l3_out be l3_in shifted left by 1
+    Set l3_out to l3_out bitwise or l2_top
+    proc memory_set_int64 from Memory with out0, 0, l0_out
+    proc memory_set_int64 from Memory with out1, 0, l1_out
+    proc memory_set_int64 from Memory with out2, 0, l2_out
+    proc memory_set_int64 from Memory with out3, 0, l3_out
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Unary
+Note: ============================================================================
+
+Process called "f256_neg" takes arena as Integer, p as Integer returns Integer:
+    @Reasoning
+    Flip sign bit, in a new buffer.
+    @End Reasoning
+    @Implementation
+    Copy 32 bytes + XOR sign bit.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let q be proc f256_alloc with arena
+    If q is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from Memory with q, p, F256_BYTES
+    Let l3 be proc f256_get_limb with q, 3
+    Set l3 to l3 bitwise xor F256_SIGN_MASK_LIMB3
+    proc f256_set_limb with q, 3, l3
+    Return q
+End Process
+
+Process called "f256_abs" takes arena as Integer, p as Integer returns Integer:
+    @Reasoning
+    Clear sign bit.
+    @End Reasoning
+    @Implementation
+    Copy + clear sign.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let q be proc f256_alloc with arena
+    If q is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from Memory with q, p, F256_BYTES
+    Let l3 be proc f256_get_limb with q, 3
+    Set l3 to l3 bitwise and 9223372036854775807
+    proc f256_set_limb with q, 3, l3
+    Return q
+End Process
+
+Note: ============================================================================
+Note: Comparison
+Note: ============================================================================
+
+Process called "f256_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Three-way IEEE 754 comparison with NaN -> unordered (2).
+    @End Reasoning
+    @Implementation
+    NaN dispatch, sign-aware magnitude compare on the 4-limb magnitude.
+    @End Implementation
+    @Performance_Hints
+    A few branches + one 256-bit compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let a_nan be proc f256_is_nan with a
+    If a_nan is equal to 1:
+        Return 2
+    End If
+    Let b_nan be proc f256_is_nan with b
+    If b_nan is equal to 1:
+        Return 2
+    End If
+    Let a_zero be proc f256_is_zero with a
+    Let b_zero be proc f256_is_zero with b
+    If a_zero is equal to 1:
+        If b_zero is equal to 1:
+            Return 0
+        End If
+    End If
+
+    Let sign_a be proc f256_get_sign with a
+    Let sign_b be proc f256_get_sign with b
+    Let a0 be proc f256_get_limb with a, 0
+    Let a1 be proc f256_get_limb with a, 1
+    Let a2 be proc f256_get_limb with a, 2
+    Let a3 be proc f256_get_limb with a, 3
+    Let b0 be proc f256_get_limb with b, 0
+    Let b1 be proc f256_get_limb with b, 1
+    Let b2 be proc f256_get_limb with b, 2
+    Let b3 be proc f256_get_limb with b, 3
+    Let mag_a3 be a3 bitwise and 9223372036854775807
+    Let mag_b3 be b3 bitwise and 9223372036854775807
+
+    If sign_a is equal to sign_b:
+        Let cmp be proc f256_compare256 with a0, a1, a2, mag_a3, b0, b1, b2, mag_b3
+        If sign_a is equal to 0:
+            Return cmp
+        End If
+        If cmp is equal to 0:
+            Return 0
+        End If
+        If cmp is equal to -1:
+            Return 1
+        End If
+        Return -1
+    End If
+    If sign_a is equal to 1:
+        Return -1
+    End If
+    Return 1
+End Process
+
+Process called "f256_eq" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754: NaN compares unequal to everything.
+    @End Reasoning
+    @Implementation
+    compare == 0.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f256_compare with a, b
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f256_ne" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754.
+    @End Reasoning
+    @Implementation
+    compare != 0.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f256_compare with a, b
+    If c is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f256_lt" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 <.
+    @End Reasoning
+    @Implementation
+    compare == -1.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f256_compare with a, b
+    If c is equal to -1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f256_le" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 <=.
+    @End Reasoning
+    @Implementation
+    compare in {-1, 0}.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f256_compare with a, b
+    If c is equal to -1:
+        Return 1
+    End If
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f256_gt" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 >.
+    @End Reasoning
+    @Implementation
+    compare == 1.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f256_compare with a, b
+    If c is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f256_ge" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 >=.
+    @End Reasoning
+    @Implementation
+    compare in {0, 1}.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f256_compare with a, b
+    If c is equal to 0:
+        Return 1
+    End If
+    If c is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Finalize: normalize + round + pack (analog of f128_finalize)
+Note: ============================================================================
+Note: The extended mantissa is held as (m0, m1, m2, m3) with the hidden bit
+Note: meant to land at bit 44 of m3 (= bit 236 overall). Caller also passes
+Note: guard, round, sticky for the bits below the LSB of m0.
+Note: ============================================================================
+
+Process called "f256_finalize" takes arena as Integer, sign as Integer, unbiased_exp as Integer, m0 as Integer, m1 as Integer, m2 as Integer, m3 as Integer, guard as Integer, round_bit as Integer, sticky as Integer returns Integer:
+    @Reasoning
+    Normalize, round, handle overflow/underflow, pack.
+    @End Reasoning
+    @Implementation
+    Same approach as f128_finalize but over the 4-limb tuple.
+    @End Implementation
+    @Performance_Hints
+    Bounded loops over the mantissa.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned result.
+    @End Security_Scope
+    Let result be proc f256_alloc with arena
+    If result is equal to 0:
+        Return 0
+    End If
+
+    Let lm0 be m0
+    Let lm1 be m1
+    Let lm2 be m2
+    Let lm3 be m3
+    Let exp be unbiased_exp
+    Let g be guard
+    Let r be round_bit
+    Let s be sticky
+
+    Note: Trivial zero check
+    If lm0 is equal to 0:
+        If lm1 is equal to 0:
+            If lm2 is equal to 0:
+                If lm3 is equal to 0:
+                    If g is equal to 0:
+                        If r is equal to 0:
+                            If s is equal to 0:
+                                If sign is equal to 1:
+                                    proc f256_set_limb with result, 3, F256_SIGN_MASK_LIMB3
+                                End If
+                                Return result
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: Right-normalize: while lm3 > 2^45 - 1, shift right 1 with sticky
+    While lm3 is greater than 35184372088831:
+        Note: 35184372088831 = 2^45 - 1
+        Note: shift right by 1, accumulate guard/round/sticky.
+        Set s to s bitwise or r
+        Set r to g
+        Set g to lm0 bitwise and 1
+        Let l1_low be lm1 bitwise and 1
+        Let lm0_sh be lm0 shifted right by 1
+        Set lm0_sh to lm0_sh bitwise and 9223372036854775807
+        Set lm0 to lm0_sh bitwise or (l1_low shifted left by 63)
+        Let l2_low be lm2 bitwise and 1
+        Let lm1_sh be lm1 shifted right by 1
+        Set lm1_sh to lm1_sh bitwise and 9223372036854775807
+        Set lm1 to lm1_sh bitwise or (l2_low shifted left by 63)
+        Let l3_low be lm3 bitwise and 1
+        Let lm2_sh be lm2 shifted right by 1
+        Set lm2_sh to lm2_sh bitwise and 9223372036854775807
+        Set lm2 to lm2_sh bitwise or (l3_low shifted left by 63)
+        Let lm3_sh be lm3 shifted right by 1
+        Set lm3_sh to lm3_sh bitwise and 9223372036854775807
+        Set lm3 to lm3_sh
+        Set exp to exp plus 1
+    End While
+
+    Note: Left-normalize: while bit 44 of lm3 not set, shift left by 1 pulling g into LSB
+    Let bit44_mask be 17592186044416
+    Let top_bit be lm3 bitwise and bit44_mask
+    Let safety be 0
+    While top_bit is equal to 0:
+        If lm0 is equal to 0:
+            If lm1 is equal to 0:
+                If lm2 is equal to 0:
+                    If lm3 is equal to 0:
+                        If g is equal to 0:
+                            If r is equal to 0:
+                                If s is equal to 0:
+                                    If sign is equal to 1:
+                                        proc f256_set_limb with result, 3, F256_SIGN_MASK_LIMB3
+                                    End If
+                                    Return result
+                                End If
+                            End If
+                        End If
+                        Set top_bit to bit44_mask
+                    End If
+                End If
+            End If
+        End If
+        If top_bit is equal to 0:
+            Let l0_top be lm0 shifted right by 63
+            Set l0_top to l0_top bitwise and 1
+            Let l1_top be lm1 shifted right by 63
+            Set l1_top to l1_top bitwise and 1
+            Let l2_top be lm2 shifted right by 63
+            Set l2_top to l2_top bitwise and 1
+            Set lm3 to lm3 shifted left by 1
+            Set lm3 to lm3 bitwise or l2_top
+            Set lm2 to lm2 shifted left by 1
+            Set lm2 to lm2 bitwise or l1_top
+            Set lm1 to lm1 shifted left by 1
+            Set lm1 to lm1 bitwise or l0_top
+            Set lm0 to lm0 shifted left by 1
+            Set lm0 to lm0 bitwise or g
+            Set g to r
+            Set r to s
+            Set s to 0
+            Set exp to exp minus 1
+            Set top_bit to lm3 bitwise and bit44_mask
+            Set safety to safety plus 1
+            If safety is greater than 300:
+                Set top_bit to bit44_mask
+            End If
+        End If
+    End While
+
+    Note: Apply bias
+    Let biased be exp plus F256_BIAS
+
+    Note: Denormalize if biased < 1
+    If biased is less than 1:
+        Let shift_n be 1 minus biased
+        Set biased to 0
+        Let i be 0
+        While i is less than shift_n:
+            Set s to s bitwise or r
+            Set r to g
+            Set g to lm0 bitwise and 1
+            Let l1l be lm1 bitwise and 1
+            Let lm0_sh2 be lm0 shifted right by 1
+            Set lm0_sh2 to lm0_sh2 bitwise and 9223372036854775807
+            Set lm0 to lm0_sh2 bitwise or (l1l shifted left by 63)
+            Let l2l be lm2 bitwise and 1
+            Let lm1_sh2 be lm1 shifted right by 1
+            Set lm1_sh2 to lm1_sh2 bitwise and 9223372036854775807
+            Set lm1 to lm1_sh2 bitwise or (l2l shifted left by 63)
+            Let l3l be lm3 bitwise and 1
+            Let lm2_sh2 be lm2 shifted right by 1
+            Set lm2_sh2 to lm2_sh2 bitwise and 9223372036854775807
+            Set lm2 to lm2_sh2 bitwise or (l3l shifted left by 63)
+            Let lm3_sh2 be lm3 shifted right by 1
+            Set lm3_sh2 to lm3_sh2 bitwise and 9223372036854775807
+            Set lm3 to lm3_sh2
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: Round
+    Let inexact_flag be g bitwise or r
+    Set inexact_flag to inexact_flag bitwise or s
+
+    Let increment be 0
+    If F256_ROUNDING_MODE is equal to ROUND_NEAREST_EVEN:
+        If g is equal to 1:
+            If r is equal to 1:
+                Set increment to 1
+            Otherwise:
+                If s is equal to 1:
+                    Set increment to 1
+                Otherwise:
+                    Let lsb be lm0 bitwise and 1
+                    If lsb is equal to 1:
+                        Set increment to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+    If F256_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+        If sign is equal to 0:
+            If inexact_flag is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+    If F256_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+        If sign is equal to 1:
+            If inexact_flag is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+
+    If increment is equal to 1:
+        Let new_lm0 be lm0 plus 1
+        Let c0 be 0
+        If lm0 is equal to -1:
+            Set c0 to 1
+        End If
+        Set lm0 to new_lm0
+        If c0 is equal to 1:
+            Let new_lm1 be lm1 plus 1
+            Let c1 be 0
+            If lm1 is equal to -1:
+                Set c1 to 1
+            End If
+            Set lm1 to new_lm1
+            If c1 is equal to 1:
+                Let new_lm2 be lm2 plus 1
+                Let c2 be 0
+                If lm2 is equal to -1:
+                    Set c2 to 1
+                End If
+                Set lm2 to new_lm2
+                If c2 is equal to 1:
+                    Set lm3 to lm3 plus 1
+                End If
+            End If
+        End If
+
+        Note: Mantissa overflow: bit 45 of lm3 set => shift right by 1, bump exp
+        Let bit45_mask be 35184372088832
+        If (lm3 bitwise and bit45_mask) is not equal to 0:
+            Set s to s bitwise or g
+            Set s to s bitwise or r
+            Let l1lA be lm1 bitwise and 1
+            Let lm0_shA be lm0 shifted right by 1
+            Set lm0_shA to lm0_shA bitwise and 9223372036854775807
+            Set lm0 to lm0_shA bitwise or (l1lA shifted left by 63)
+            Let l2lA be lm2 bitwise and 1
+            Let lm1_shA be lm1 shifted right by 1
+            Set lm1_shA to lm1_shA bitwise and 9223372036854775807
+            Set lm1 to lm1_shA bitwise or (l2lA shifted left by 63)
+            Let l3lA be lm3 bitwise and 1
+            Let lm2_shA be lm2 shifted right by 1
+            Set lm2_shA to lm2_shA bitwise and 9223372036854775807
+            Set lm2 to lm2_shA bitwise or (l3lA shifted left by 63)
+            Let lm3_shA be lm3 shifted right by 1
+            Set lm3_shA to lm3_shA bitwise and 9223372036854775807
+            Set lm3 to lm3_shA
+            Set biased to biased plus 1
+        End If
+    End If
+
+    Note: Subnormal-to-normal promotion
+    If biased is equal to 0:
+        If (lm3 bitwise and bit44_mask) is not equal to 0:
+            Set biased to 1
+        End If
+    End If
+
+    Note: Overflow
+    If biased is greater than or equal to F256_EXP_MAX:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_OVERFLOW
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        If F256_ROUNDING_MODE is equal to ROUND_TOWARD_ZERO:
+            proc f256_set_fields with result, sign, 524286, F256_MANT_MASK_LIMB3, -1, -1, -1
+            Return result
+        End If
+        If F256_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+            If sign is equal to 1:
+                proc f256_set_fields with result, sign, 524286, F256_MANT_MASK_LIMB3, -1, -1, -1
+                Return result
+            End If
+        End If
+        If F256_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+            If sign is equal to 0:
+                proc f256_set_fields with result, sign, 524286, F256_MANT_MASK_LIMB3, -1, -1, -1
+                Return result
+            End If
+        End If
+        Let l3_inf be F256_EXP_MAX shifted left by 44
+        If sign is equal to 1:
+            Set l3_inf to l3_inf bitwise or F256_SIGN_MASK_LIMB3
+        End If
+        proc f256_set_limb with result, 3, l3_inf
+        Return result
+    End If
+
+    If biased is equal to 0:
+        Note: Underflow / subnormal
+        If lm0 is equal to 0:
+            If lm1 is equal to 0:
+                If lm2 is equal to 0:
+                    If lm3 is equal to 0:
+                        If inexact_flag is not equal to 0:
+                            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+                            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+                        End If
+                        If sign is equal to 1:
+                            proc f256_set_limb with result, 3, F256_SIGN_MASK_LIMB3
+                        End If
+                        Return result
+                    End If
+                End If
+            End If
+        End If
+        If inexact_flag is not equal to 0:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        End If
+        Let mt_sub be lm3 bitwise and F256_MANT_MASK_LIMB3
+        proc f256_set_fields with result, sign, 0, mt_sub, lm2, lm1, lm0
+        Return result
+    End If
+
+    If inexact_flag is not equal to 0:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+
+    Let mt_norm be lm3 bitwise and F256_MANT_MASK_LIMB3
+    proc f256_set_fields with result, sign, biased, mt_norm, lm2, lm1, lm0
+    Return result
+End Process
+
+Process called "f256_propagate_nan" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Yield a quiet NaN, set INVALID if any input is signaling.
+    @End Reasoning
+    @Implementation
+    Inspect both, copy first NaN, set quiet bit.
+    @End Implementation
+    @Performance_Hints
+    A few branches.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global flag mutation.
+    @End Security_Scope
+    Let a_snan be proc f256_is_signaling_nan with a
+    Let b_snan be proc f256_is_signaling_nan with b
+    If a_snan is equal to 1:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+    End If
+    If b_snan is equal to 1:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+    End If
+    Let a_nan be proc f256_is_nan with a
+    Let q be proc f256_alloc with arena
+    If a_nan is equal to 1:
+        proc memory_copy from Memory with q, a, F256_BYTES
+        Let l3 be proc f256_get_limb with q, 3
+        Set l3 to l3 bitwise or 8796093022208
+        proc f256_set_limb with q, 3, l3
+        Return q
+    End If
+    proc memory_copy from Memory with q, b, F256_BYTES
+    Let l3b be proc f256_get_limb with q, 3
+    Set l3b to l3b bitwise or 8796093022208
+    proc f256_set_limb with q, 3, l3b
+    Return q
+End Process
+
+Note: ============================================================================
+Note: Addition
+Note: ============================================================================
+
+Process called "f256_add" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary256 addition with correct rounding.
+    @End Reasoning
+    @Implementation
+    Same template as f128_add but over 4-limb tuples.
+    @End Implementation
+    @Performance_Hints
+    Bounded shift loop + 4-limb addition.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let a_nan be proc f256_is_nan with a
+    Let b_nan be proc f256_is_nan with b
+    If a_nan is equal to 1:
+        Return proc f256_propagate_nan with arena, a, b
+    End If
+    If b_nan is equal to 1:
+        Return proc f256_propagate_nan with arena, a, b
+    End If
+    Let sign_a be proc f256_get_sign with a
+    Let sign_b be proc f256_get_sign with b
+    Let a_inf be proc f256_is_inf with a
+    Let b_inf be proc f256_is_inf with b
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            If sign_a is equal to sign_b:
+                Return proc f256_make_inf with arena, sign_a
+            End If
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f256_make_qnan with arena
+        End If
+        Let r1 be proc f256_alloc with arena
+        proc memory_copy from Memory with r1, a, F256_BYTES
+        Return r1
+    End If
+    If b_inf is equal to 1:
+        Let r2 be proc f256_alloc with arena
+        proc memory_copy from Memory with r2, b, F256_BYTES
+        Return r2
+    End If
+    Let a_zero be proc f256_is_zero with a
+    Let b_zero be proc f256_is_zero with b
+    If a_zero is equal to 1:
+        If b_zero is equal to 1:
+            If sign_a is equal to sign_b:
+                Return proc f256_make_zero with arena, sign_a
+            End If
+            If F256_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+                Return proc f256_make_zero with arena, 1
+            End If
+            Return proc f256_make_zero with arena, 0
+        End If
+        Let rb be proc f256_alloc with arena
+        proc memory_copy from Memory with rb, b, F256_BYTES
+        Return rb
+    End If
+    If b_zero is equal to 1:
+        Let ra be proc f256_alloc with arena
+        proc memory_copy from Memory with ra, a, F256_BYTES
+        Return ra
+    End If
+
+    Let exp_a be proc f256_get_exponent with a
+    Let exp_b be proc f256_get_exponent with b
+    Let mt_a be proc f256_get_mantissa_top44 with a
+    Let m2_a be proc f256_get_limb with a, 2
+    Let m1_a be proc f256_get_limb with a, 1
+    Let m0_a be proc f256_get_limb with a, 0
+    Let mt_b be proc f256_get_mantissa_top44 with b
+    Let m2_b be proc f256_get_limb with b, 2
+    Let m1_b be proc f256_get_limb with b, 1
+    Let m0_b be proc f256_get_limb with b, 0
+
+    Let true_exp_a be exp_a
+    Let true_exp_b be exp_b
+    If exp_a is equal to 0:
+        Set true_exp_a to 1
+    Otherwise:
+        Set mt_a to mt_a bitwise or F256_HIDDEN_BIT_LIMB3
+    End If
+    If exp_b is equal to 0:
+        Set true_exp_b to 1
+    Otherwise:
+        Set mt_b to mt_b bitwise or F256_HIDDEN_BIT_LIMB3
+    End If
+
+    Let aligned_exp be true_exp_a
+    Let g be 0
+    Let r be 0
+    Let s be 0
+
+    If true_exp_a is less than true_exp_b:
+        Let diff be true_exp_b minus true_exp_a
+        If diff is greater than 256:
+            Set diff to 256
+        End If
+        Let i be 0
+        While i is less than diff:
+            Let lost be m0_a bitwise and 1
+            Set s to s bitwise or r
+            Set r to g
+            Set g to lost
+            Let l1l be m1_a bitwise and 1
+            Let m0_sh be m0_a shifted right by 1
+            Set m0_sh to m0_sh bitwise and 9223372036854775807
+            Set m0_a to m0_sh bitwise or (l1l shifted left by 63)
+            Let l2l be m2_a bitwise and 1
+            Let m1_sh be m1_a shifted right by 1
+            Set m1_sh to m1_sh bitwise and 9223372036854775807
+            Set m1_a to m1_sh bitwise or (l2l shifted left by 63)
+            Let l3l be mt_a bitwise and 1
+            Let m2_sh be m2_a shifted right by 1
+            Set m2_sh to m2_sh bitwise and 9223372036854775807
+            Set m2_a to m2_sh bitwise or (l3l shifted left by 63)
+            Let mt_sh be mt_a shifted right by 1
+            Set mt_sh to mt_sh bitwise and 9223372036854775807
+            Set mt_a to mt_sh
+            Set i to i plus 1
+        End While
+        Set aligned_exp to true_exp_b
+    End If
+    If true_exp_b is less than true_exp_a:
+        Let diff_b be true_exp_a minus true_exp_b
+        If diff_b is greater than 256:
+            Set diff_b to 256
+        End If
+        Let j be 0
+        While j is less than diff_b:
+            Let lost_b be m0_b bitwise and 1
+            Set s to s bitwise or r
+            Set r to g
+            Set g to lost_b
+            Let l1lb be m1_b bitwise and 1
+            Let m0b_sh be m0_b shifted right by 1
+            Set m0b_sh to m0b_sh bitwise and 9223372036854775807
+            Set m0_b to m0b_sh bitwise or (l1lb shifted left by 63)
+            Let l2lb be m2_b bitwise and 1
+            Let m1b_sh be m1_b shifted right by 1
+            Set m1b_sh to m1b_sh bitwise and 9223372036854775807
+            Set m1_b to m1b_sh bitwise or (l2lb shifted left by 63)
+            Let l3lb be mt_b bitwise and 1
+            Let m2b_sh be m2_b shifted right by 1
+            Set m2b_sh to m2b_sh bitwise and 9223372036854775807
+            Set m2_b to m2b_sh bitwise or (l3lb shifted left by 63)
+            Let mtb_sh be mt_b shifted right by 1
+            Set mtb_sh to mtb_sh bitwise and 9223372036854775807
+            Set mt_b to mtb_sh
+            Set j to j plus 1
+        End While
+        Set aligned_exp to true_exp_a
+    End If
+
+    Let res_m0 be 0
+    Let res_m1 be 0
+    Let res_m2 be 0
+    Let res_m3 be 0
+    Let result_sign be sign_a
+    Let out0 be proc arena_allocate from Arena with arena, 8
+    Let out1 be proc arena_allocate from Arena with arena, 8
+    Let out2 be proc arena_allocate from Arena with arena, 8
+    Let out3 be proc arena_allocate from Arena with arena, 8
+
+    If sign_a is equal to sign_b:
+        proc f256_add256 with m0_a, m1_a, m2_a, mt_a, m0_b, m1_b, m2_b, mt_b, out0, out1, out2, out3
+        Set res_m0 to proc memory_get_int64 from Memory with out0, 0
+        Set res_m1 to proc memory_get_int64 from Memory with out1, 0
+        Set res_m2 to proc memory_get_int64 from Memory with out2, 0
+        Set res_m3 to proc memory_get_int64 from Memory with out3, 0
+    Otherwise:
+        Let cmp be proc f256_compare256 with m0_a, m1_a, m2_a, mt_a, m0_b, m1_b, m2_b, mt_b
+        If cmp is greater than or equal to 0:
+            proc f256_sub256 with m0_a, m1_a, m2_a, mt_a, m0_b, m1_b, m2_b, mt_b, out0, out1, out2, out3
+            Set result_sign to sign_a
+        Otherwise:
+            proc f256_sub256 with m0_b, m1_b, m2_b, mt_b, m0_a, m1_a, m2_a, mt_a, out0, out1, out2, out3
+            Set result_sign to sign_b
+        End If
+        Set res_m0 to proc memory_get_int64 from Memory with out0, 0
+        Set res_m1 to proc memory_get_int64 from Memory with out1, 0
+        Set res_m2 to proc memory_get_int64 from Memory with out2, 0
+        Set res_m3 to proc memory_get_int64 from Memory with out3, 0
+    End If
+
+    If res_m0 is equal to 0:
+        If res_m1 is equal to 0:
+            If res_m2 is equal to 0:
+                If res_m3 is equal to 0:
+                    If g is equal to 0:
+                        If r is equal to 0:
+                            If s is equal to 0:
+                                If F256_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+                                    Return proc f256_make_zero with arena, 1
+                                End If
+                                Return proc f256_make_zero with arena, 0
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Let unbiased be aligned_exp minus F256_BIAS
+    Return proc f256_finalize with arena, result_sign, unbiased, res_m0, res_m1, res_m2, res_m3, g, r, s
+End Process
+
+Process called "f256_sub" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    a - b = a + (-b).
+    @End Reasoning
+    @Implementation
+    Negate then add.
+    @End Implementation
+    @Performance_Hints
+    Costs one extra alloc.
+    @End Performance_Hints
+    @Security_Scope
+    Inherits add semantics.
+    @End Security_Scope
+    Let neg_b be proc f256_neg with arena, b
+    Return proc f256_add with arena, a, neg_b
+End Process
+
+Note: ============================================================================
+Note: Multiplication
+Note: ============================================================================
+Note: A full 237*237 -> 474-bit multiply requires careful limb assembly. We
+Note: use the same 64x64 -> 128-bit primitive as binary128, applied to the
+Note: 4x4 cross-products of the 4-limb operands, accumulated into eight
+Note: 64-bit output limbs.
+Note: ============================================================================
+
+Process called "f256_mul64x64_to_128" takes a as Integer, b as Integer, hi_ptr as Integer, lo_ptr as Integer returns Integer:
+    @Reasoning
+    64x64 -> 128-bit unsigned multiplication via 32-bit halving.
+    @End Reasoning
+    @Implementation
+    Four 32x32->64 multiplies, careful addition with carry.
+    @End Implementation
+    @Performance_Hints
+    Four multiplies.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let mask32 be 4294967295
+    Let a_lo be a bitwise and mask32
+    Let a_hi be (a shifted right by 32) bitwise and mask32
+    Let b_lo be b bitwise and mask32
+    Let b_hi be (b shifted right by 32) bitwise and mask32
+    Let p_ll be a_lo multiplied by b_lo
+    Let p_lh be a_lo multiplied by b_hi
+    Let p_hl be a_hi multiplied by b_lo
+    Let p_hh be a_hi multiplied by b_hi
+    Let lo_low be p_ll bitwise and mask32
+    Let lo_high_p be (p_ll shifted right by 32) bitwise and mask32
+    Let mid be lo_high_p plus (p_lh bitwise and mask32)
+    Set mid to mid plus (p_hl bitwise and mask32)
+    Let mid_low be mid bitwise and mask32
+    Let mid_carry be mid shifted right by 32
+    Let result_lo be (mid_low shifted left by 32) bitwise or lo_low
+    Let upper be p_hh plus (p_lh shifted right by 32)
+    Set upper to upper plus (p_hl shifted right by 32)
+    Set upper to upper plus mid_carry
+    proc memory_set_int64 from Memory with hi_ptr, 0, upper
+    proc memory_set_int64 from Memory with lo_ptr, 0, result_lo
+    Return 1
+End Process
+
+Process called "f256_mul" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary256 multiplication with correct rounding.
+    @End Reasoning
+    @Implementation
+    1. NaN/Inf/zero dispatch.
+    2. Normalize operands, attach hidden bit. Each mantissa is 237 bits =
+       four 64-bit limbs but limb3 only uses 45 bits.
+    3. 4x4 cross-product = 16 partial products; accumulate into eight
+       64-bit limbs (p0..p7). Each limb (l_i, l_j) cross contributes its
+       128-bit product into output limbs (i+j, i+j+1).
+    4. Shift the 512-bit product right by 236 bits with sticky accumulation
+       so the leading bit lands at the right position; extract GRS.
+    5. Hand to f256_finalize.
+    @End Implementation
+    @Performance_Hints
+    16 64x64 multiplies.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let a_nan be proc f256_is_nan with a
+    Let b_nan be proc f256_is_nan with b
+    If a_nan is equal to 1:
+        Return proc f256_propagate_nan with arena, a, b
+    End If
+    If b_nan is equal to 1:
+        Return proc f256_propagate_nan with arena, a, b
+    End If
+    Let sign_a be proc f256_get_sign with a
+    Let sign_b be proc f256_get_sign with b
+    Let result_sign be sign_a bitwise xor sign_b
+    Let a_inf be proc f256_is_inf with a
+    Let b_inf be proc f256_is_inf with b
+    Let a_zero be proc f256_is_zero with a
+    Let b_zero be proc f256_is_zero with b
+    If a_inf is equal to 1:
+        If b_zero is equal to 1:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f256_make_qnan with arena
+        End If
+        Return proc f256_make_inf with arena, result_sign
+    End If
+    If b_inf is equal to 1:
+        If a_zero is equal to 1:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f256_make_qnan with arena
+        End If
+        Return proc f256_make_inf with arena, result_sign
+    End If
+    If a_zero is equal to 1:
+        Return proc f256_make_zero with arena, result_sign
+    End If
+    If b_zero is equal to 1:
+        Return proc f256_make_zero with arena, result_sign
+    End If
+
+    Let exp_a be proc f256_get_exponent with a
+    Let exp_b be proc f256_get_exponent with b
+    Let a0 be proc f256_get_limb with a, 0
+    Let a1 be proc f256_get_limb with a, 1
+    Let a2 be proc f256_get_limb with a, 2
+    Let at be proc f256_get_mantissa_top44 with a
+    Let b0 be proc f256_get_limb with b, 0
+    Let b1 be proc f256_get_limb with b, 1
+    Let b2 be proc f256_get_limb with b, 2
+    Let bt be proc f256_get_mantissa_top44 with b
+
+    Let true_exp_a be exp_a
+    Let true_exp_b be exp_b
+    If exp_a is equal to 0:
+        Set true_exp_a to 1
+        While (at bitwise and F256_HIDDEN_BIT_LIMB3) is equal to 0:
+            Let a2_top be a2 shifted right by 63
+            Set a2_top to a2_top bitwise and 1
+            Set at to at shifted left by 1
+            Set at to at bitwise or a2_top
+            Let a1_top be a1 shifted right by 63
+            Set a1_top to a1_top bitwise and 1
+            Set a2 to a2 shifted left by 1
+            Set a2 to a2 bitwise or a1_top
+            Let a0_top be a0 shifted right by 63
+            Set a0_top to a0_top bitwise and 1
+            Set a1 to a1 shifted left by 1
+            Set a1 to a1 bitwise or a0_top
+            Set a0 to a0 shifted left by 1
+            Set true_exp_a to true_exp_a minus 1
+        End While
+    Otherwise:
+        Set at to at bitwise or F256_HIDDEN_BIT_LIMB3
+    End If
+    If exp_b is equal to 0:
+        Set true_exp_b to 1
+        While (bt bitwise and F256_HIDDEN_BIT_LIMB3) is equal to 0:
+            Let b2_top be b2 shifted right by 63
+            Set b2_top to b2_top bitwise and 1
+            Set bt to bt shifted left by 1
+            Set bt to bt bitwise or b2_top
+            Let b1_top be b1 shifted right by 63
+            Set b1_top to b1_top bitwise and 1
+            Set b2 to b2 shifted left by 1
+            Set b2 to b2 bitwise or b1_top
+            Let b0_top be b0 shifted right by 63
+            Set b0_top to b0_top bitwise and 1
+            Set b1 to b1 shifted left by 1
+            Set b1 to b1 bitwise or b0_top
+            Set b0 to b0 shifted left by 1
+            Set true_exp_b to true_exp_b minus 1
+        End While
+    Otherwise:
+        Set bt to bt bitwise or F256_HIDDEN_BIT_LIMB3
+    End If
+
+    Note: Operands now (a0, a1, a2, at) and (b0, b1, b2, bt) each holding a
+    Note: 237-bit mantissa with bit 236 set in at/bt at position 44.
+
+    Note: 4x4 cross product. Allocate scratch.
+    Let p0 be 0
+    Let p1 be 0
+    Let p2 be 0
+    Let p3 be 0
+    Let p4 be 0
+    Let p5 be 0
+    Let p6 be 0
+    Let p7 be 0
+
+    Let a_limbs_0 be a0
+    Let a_limbs_1 be a1
+    Let a_limbs_2 be a2
+    Let a_limbs_3 be at
+    Let b_limbs_0 be b0
+    Let b_limbs_1 be b1
+    Let b_limbs_2 be b2
+    Let b_limbs_3 be bt
+
+    Note: For each (i, j) pair we compute aL[i] * bL[j], a 64x64 -> 128-bit
+    Note: product whose low 64 bits add into p[i+j] and high 64 bits add
+    Note: into p[i+j+1]. Use add256 helpers to absorb carries.
+
+    Note: To avoid 16 separate buffers, use a single pair and a helper that
+    Note: adds (cprod_hi, cprod_lo) into (p[offset+1], p[offset]) with carry
+    Note: into p[offset+2..7].
+
+    Note: We do this inline below: for each i in 0..3, j in 0..3, multiply,
+    Note: then call f256_add256 on the upper four limbs (p_pos+0..p_pos+3)
+    Note: to absorb the carry-extending value (cprod_hi, cprod_lo, 0, 0).
+
+    Let hi_buf be proc arena_allocate from Arena with arena, 8
+    Let lo_buf be proc arena_allocate from Arena with arena, 8
+    Let oa be proc arena_allocate from Arena with arena, 8
+    Let ob be proc arena_allocate from Arena with arena, 8
+    Let oc be proc arena_allocate from Arena with arena, 8
+    Let od be proc arena_allocate from Arena with arena, 8
+
+    Let i_loop be 0
+    While i_loop is less than 4:
+        Let a_val be 0
+        If i_loop is equal to 0:
+            Set a_val to a_limbs_0
+        End If
+        If i_loop is equal to 1:
+            Set a_val to a_limbs_1
+        End If
+        If i_loop is equal to 2:
+            Set a_val to a_limbs_2
+        End If
+        If i_loop is equal to 3:
+            Set a_val to a_limbs_3
+        End If
+
+        Let j_loop be 0
+        While j_loop is less than 4:
+            Let b_val be 0
+            If j_loop is equal to 0:
+                Set b_val to b_limbs_0
+            End If
+            If j_loop is equal to 1:
+                Set b_val to b_limbs_1
+            End If
+            If j_loop is equal to 2:
+                Set b_val to b_limbs_2
+            End If
+            If j_loop is equal to 3:
+                Set b_val to b_limbs_3
+            End If
+
+            proc f256_mul64x64_to_128 with a_val, b_val, hi_buf, lo_buf
+            Let cprod_hi be proc memory_get_int64 from Memory with hi_buf, 0
+            Let cprod_lo be proc memory_get_int64 from Memory with lo_buf, 0
+            Let target_pos be i_loop plus j_loop
+
+            Note: Add (cprod_lo, cprod_hi, 0, 0) into p starting at target_pos.
+            Note: We have 8 p limbs but only need to update 4 at a time; the
+            Note: f256_add256 helper handles 4-limb add at a time. We split:
+            Note: For target_pos in [0, 4], the addition touches at most
+            Note: p[target_pos..target_pos+4]. We extract those, add, write back.
+
+            Note: Read window
+            Let w0 be 0
+            Let w1 be 0
+            Let w2 be 0
+            Let w3 be 0
+            If target_pos is equal to 0:
+                Set w0 to p0
+                Set w1 to p1
+                Set w2 to p2
+                Set w3 to p3
+            End If
+            If target_pos is equal to 1:
+                Set w0 to p1
+                Set w1 to p2
+                Set w2 to p3
+                Set w3 to p4
+            End If
+            If target_pos is equal to 2:
+                Set w0 to p2
+                Set w1 to p3
+                Set w2 to p4
+                Set w3 to p5
+            End If
+            If target_pos is equal to 3:
+                Set w0 to p3
+                Set w1 to p4
+                Set w2 to p5
+                Set w3 to p6
+            End If
+            If target_pos is equal to 4:
+                Set w0 to p4
+                Set w1 to p5
+                Set w2 to p6
+                Set w3 to p7
+            End If
+            If target_pos is equal to 5:
+                Set w0 to p5
+                Set w1 to p6
+                Set w2 to p7
+                Set w3 to 0
+            End If
+            If target_pos is equal to 6:
+                Set w0 to p6
+                Set w1 to p7
+                Set w2 to 0
+                Set w3 to 0
+            End If
+
+            proc f256_add256 with w0, w1, w2, w3, cprod_lo, cprod_hi, 0, 0, oa, ob, oc, od
+            Let nw0 be proc memory_get_int64 from Memory with oa, 0
+            Let nw1 be proc memory_get_int64 from Memory with ob, 0
+            Let nw2 be proc memory_get_int64 from Memory with oc, 0
+            Let nw3 be proc memory_get_int64 from Memory with od, 0
+
+            If target_pos is equal to 0:
+                Set p0 to nw0
+                Set p1 to nw1
+                Set p2 to nw2
+                Set p3 to nw3
+            End If
+            If target_pos is equal to 1:
+                Set p1 to nw0
+                Set p2 to nw1
+                Set p3 to nw2
+                Set p4 to nw3
+            End If
+            If target_pos is equal to 2:
+                Set p2 to nw0
+                Set p3 to nw1
+                Set p4 to nw2
+                Set p5 to nw3
+            End If
+            If target_pos is equal to 3:
+                Set p3 to nw0
+                Set p4 to nw1
+                Set p5 to nw2
+                Set p6 to nw3
+            End If
+            If target_pos is equal to 4:
+                Set p4 to nw0
+                Set p5 to nw1
+                Set p6 to nw2
+                Set p7 to nw3
+            End If
+            If target_pos is equal to 5:
+                Set p5 to nw0
+                Set p6 to nw1
+                Set p7 to nw2
+            End If
+            If target_pos is equal to 6:
+                Set p6 to nw0
+                Set p7 to nw1
+            End If
+
+            Set j_loop to j_loop plus 1
+        End While
+        Set i_loop to i_loop plus 1
+    End While
+
+    Note: 512-bit product in (p7, p6, p5, p4, p3, p2, p1, p0). Both inputs
+    Note: had bit 236 set, so the product has bit 472 or 473 set. We want
+    Note: the leading bit to end up at bit 236 of our finalize mantissa
+    Note: (i.e., bit 44 of the top limb), so shift right by 236 bits with
+    Note: sticky accumulation of the discarded bits.
+
+    Let sticky_acc be 0
+    Let k be 0
+    While k is less than 236:
+        Let lost be p0 bitwise and 1
+        Set sticky_acc to sticky_acc bitwise or lost
+        Note: shift 512-bit right by 1
+        Let pl1 be p1 bitwise and 1
+        Let pl2 be p2 bitwise and 1
+        Let pl3 be p3 bitwise and 1
+        Let pl4 be p4 bitwise and 1
+        Let pl5 be p5 bitwise and 1
+        Let pl6 be p6 bitwise and 1
+        Let pl7 be p7 bitwise and 1
+        Let p0_sh be p0 shifted right by 1
+        Set p0_sh to p0_sh bitwise and 9223372036854775807
+        Set p0 to p0_sh bitwise or (pl1 shifted left by 63)
+        Let p1_sh be p1 shifted right by 1
+        Set p1_sh to p1_sh bitwise and 9223372036854775807
+        Set p1 to p1_sh bitwise or (pl2 shifted left by 63)
+        Let p2_sh be p2 shifted right by 1
+        Set p2_sh to p2_sh bitwise and 9223372036854775807
+        Set p2 to p2_sh bitwise or (pl3 shifted left by 63)
+        Let p3_sh be p3 shifted right by 1
+        Set p3_sh to p3_sh bitwise and 9223372036854775807
+        Set p3 to p3_sh bitwise or (pl4 shifted left by 63)
+        Let p4_sh be p4 shifted right by 1
+        Set p4_sh to p4_sh bitwise and 9223372036854775807
+        Set p4 to p4_sh bitwise or (pl5 shifted left by 63)
+        Let p5_sh be p5 shifted right by 1
+        Set p5_sh to p5_sh bitwise and 9223372036854775807
+        Set p5 to p5_sh bitwise or (pl6 shifted left by 63)
+        Let p6_sh be p6 shifted right by 1
+        Set p6_sh to p6_sh bitwise and 9223372036854775807
+        Set p6 to p6_sh bitwise or (pl7 shifted left by 63)
+        Let p7_sh be p7 shifted right by 1
+        Set p7_sh to p7_sh bitwise and 9223372036854775807
+        Set p7 to p7_sh
+        Set k to k plus 1
+    End While
+
+    Note: After 236-bit shift, the surviving high portion is now in (p3, p2, p1, p0)
+    Note: with leading set bit at bit ~236 mod (4*64) of original = somewhere
+    Note: in the top portion of these four limbs. The discarded bits (formerly
+    Note: in p0 before the shifts) are folded into sticky_acc.
+
+    Let m0 be p0
+    Let m1 be p1
+    Let m2 be p2
+    Let m3 be p3
+
+    Note: Extract guard/round/sticky for the very next position below LSB.
+    Note: At this point all bits below position 0 of m0 came from sticky_acc.
+    Note: We treat the conventional GRS bits as (sticky_acc has them folded).
+    Let g be sticky_acc bitwise and 1
+    Let r_bit be (sticky_acc shifted right by 1) bitwise and 1
+    Let s_bit be (sticky_acc shifted right by 2) bitwise and 1
+
+    Let unbiased be true_exp_a plus true_exp_b
+    Set unbiased to unbiased minus F256_BIAS
+    Set unbiased to unbiased minus F256_BIAS
+    Set unbiased to unbiased plus F256_BIAS
+    Return proc f256_finalize with arena, result_sign, unbiased, m0, m1, m2, m3, g, r_bit, s_bit
+End Process
+
+Note: ============================================================================
+Note: Division
+Note: ============================================================================
+
+Process called "f256_div" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary256 division with correct rounding via bit-by-bit
+    long division on the 237-bit mantissas.
+    @End Reasoning
+    @Implementation
+    Shift-subtract algorithm, 239 quotient bits produced (236 mantissa
+    + 3 GRS). Each iteration: shift remainder left, compare with divisor,
+    subtract if >=, shift quotient left, set LSB if subtracted.
+    @End Implementation
+    @Performance_Hints
+    239 iterations.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags including DIVIDE_BY_ZERO.
+    @End Security_Scope
+    Let a_nan be proc f256_is_nan with a
+    Let b_nan be proc f256_is_nan with b
+    If a_nan is equal to 1:
+        Return proc f256_propagate_nan with arena, a, b
+    End If
+    If b_nan is equal to 1:
+        Return proc f256_propagate_nan with arena, a, b
+    End If
+    Let sign_a be proc f256_get_sign with a
+    Let sign_b be proc f256_get_sign with b
+    Let result_sign be sign_a bitwise xor sign_b
+    Let a_inf be proc f256_is_inf with a
+    Let b_inf be proc f256_is_inf with b
+    Let a_zero be proc f256_is_zero with a
+    Let b_zero be proc f256_is_zero with b
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f256_make_qnan with arena
+        End If
+        Return proc f256_make_inf with arena, result_sign
+    End If
+    If b_inf is equal to 1:
+        Return proc f256_make_zero with arena, result_sign
+    End If
+    If b_zero is equal to 1:
+        If a_zero is equal to 1:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f256_make_qnan with arena
+        End If
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_DIVIDE_BY_ZERO
+        Return proc f256_make_inf with arena, result_sign
+    End If
+    If a_zero is equal to 1:
+        Return proc f256_make_zero with arena, result_sign
+    End If
+
+    Let exp_a be proc f256_get_exponent with a
+    Let exp_b be proc f256_get_exponent with b
+    Let a0 be proc f256_get_limb with a, 0
+    Let a1 be proc f256_get_limb with a, 1
+    Let a2 be proc f256_get_limb with a, 2
+    Let at be proc f256_get_mantissa_top44 with a
+    Let b0 be proc f256_get_limb with b, 0
+    Let b1 be proc f256_get_limb with b, 1
+    Let b2 be proc f256_get_limb with b, 2
+    Let bt be proc f256_get_mantissa_top44 with b
+
+    Let true_exp_a be exp_a
+    Let true_exp_b be exp_b
+    If exp_a is equal to 0:
+        Set true_exp_a to 1
+        While (at bitwise and F256_HIDDEN_BIT_LIMB3) is equal to 0:
+            Let a2t be a2 shifted right by 63
+            Set a2t to a2t bitwise and 1
+            Set at to at shifted left by 1
+            Set at to at bitwise or a2t
+            Let a1t be a1 shifted right by 63
+            Set a1t to a1t bitwise and 1
+            Set a2 to a2 shifted left by 1
+            Set a2 to a2 bitwise or a1t
+            Let a0t be a0 shifted right by 63
+            Set a0t to a0t bitwise and 1
+            Set a1 to a1 shifted left by 1
+            Set a1 to a1 bitwise or a0t
+            Set a0 to a0 shifted left by 1
+            Set true_exp_a to true_exp_a minus 1
+        End While
+    Otherwise:
+        Set at to at bitwise or F256_HIDDEN_BIT_LIMB3
+    End If
+    If exp_b is equal to 0:
+        Set true_exp_b to 1
+        While (bt bitwise and F256_HIDDEN_BIT_LIMB3) is equal to 0:
+            Let b2t be b2 shifted right by 63
+            Set b2t to b2t bitwise and 1
+            Set bt to bt shifted left by 1
+            Set bt to bt bitwise or b2t
+            Let b1t be b1 shifted right by 63
+            Set b1t to b1t bitwise and 1
+            Set b2 to b2 shifted left by 1
+            Set b2 to b2 bitwise or b1t
+            Let b0t be b0 shifted right by 63
+            Set b0t to b0t bitwise and 1
+            Set b1 to b1 shifted left by 1
+            Set b1 to b1 bitwise or b0t
+            Set b0 to b0 shifted left by 1
+            Set true_exp_b to true_exp_b minus 1
+        End While
+    Otherwise:
+        Set bt to bt bitwise or F256_HIDDEN_BIT_LIMB3
+    End If
+
+    Note: Long division: 239 quotient bits.
+    Let q0 be 0
+    Let q1 be 0
+    Let q2 be 0
+    Let q3 be 0
+    Let rem0 be a0
+    Let rem1 be a1
+    Let rem2 be a2
+    Let rem3 be at
+    Let bits_n be 239
+    Let n be 0
+    Let out0 be proc arena_allocate from Arena with arena, 8
+    Let out1 be proc arena_allocate from Arena with arena, 8
+    Let out2 be proc arena_allocate from Arena with arena, 8
+    Let out3 be proc arena_allocate from Arena with arena, 8
+
+    While n is less than bits_n:
+        Note: rem <<= 1
+        Let r0_top be rem0 shifted right by 63
+        Set r0_top to r0_top bitwise and 1
+        Let r1_top be rem1 shifted right by 63
+        Set r1_top to r1_top bitwise and 1
+        Let r2_top be rem2 shifted right by 63
+        Set r2_top to r2_top bitwise and 1
+        Set rem3 to rem3 shifted left by 1
+        Set rem3 to rem3 bitwise or r2_top
+        Set rem2 to rem2 shifted left by 1
+        Set rem2 to rem2 bitwise or r1_top
+        Set rem1 to rem1 shifted left by 1
+        Set rem1 to rem1 bitwise or r0_top
+        Set rem0 to rem0 shifted left by 1
+        Note: q <<= 1
+        Let q0_top be q0 shifted right by 63
+        Set q0_top to q0_top bitwise and 1
+        Let q1_top be q1 shifted right by 63
+        Set q1_top to q1_top bitwise and 1
+        Let q2_top be q2 shifted right by 63
+        Set q2_top to q2_top bitwise and 1
+        Set q3 to q3 shifted left by 1
+        Set q3 to q3 bitwise or q2_top
+        Set q2 to q2 shifted left by 1
+        Set q2 to q2 bitwise or q1_top
+        Set q1 to q1 shifted left by 1
+        Set q1 to q1 bitwise or q0_top
+        Set q0 to q0 shifted left by 1
+        Note: if rem >= divisor, subtract and set q LSB
+        Let cmp be proc f256_compare256 with rem0, rem1, rem2, rem3, b0, b1, b2, bt
+        If cmp is greater than or equal to 0:
+            proc f256_sub256 with rem0, rem1, rem2, rem3, b0, b1, b2, bt, out0, out1, out2, out3
+            Set rem0 to proc memory_get_int64 from Memory with out0, 0
+            Set rem1 to proc memory_get_int64 from Memory with out1, 0
+            Set rem2 to proc memory_get_int64 from Memory with out2, 0
+            Set rem3 to proc memory_get_int64 from Memory with out3, 0
+            Set q0 to q0 bitwise or 1
+        End If
+        Set n to n plus 1
+    End While
+
+    Note: q has 239 bits. GRS = lower 3 bits of q0; remainder nonzero -> sticky.
+    Let g be (q0 shifted right by 2) bitwise and 1
+    Let r_bit be (q0 shifted right by 1) bitwise and 1
+    Let s_bit be q0 bitwise and 1
+    If rem0 is not equal to 0:
+        Set s_bit to 1
+    End If
+    If rem1 is not equal to 0:
+        Set s_bit to 1
+    End If
+    If rem2 is not equal to 0:
+        Set s_bit to 1
+    End If
+    If rem3 is not equal to 0:
+        Set s_bit to 1
+    End If
+
+    Note: Shift q right by 3 to drop GRS.
+    Let q0_sh be q0 shifted right by 3
+    Set q0_sh to q0_sh bitwise and 2305843009213693951
+    Let q1_lowbits be q1 bitwise and 7
+    Let q0_final be q0_sh bitwise or (q1_lowbits shifted left by 61)
+    Let q1_sh be q1 shifted right by 3
+    Set q1_sh to q1_sh bitwise and 2305843009213693951
+    Let q2_lowbits be q2 bitwise and 7
+    Let q1_final be q1_sh bitwise or (q2_lowbits shifted left by 61)
+    Let q2_sh be q2 shifted right by 3
+    Set q2_sh to q2_sh bitwise and 2305843009213693951
+    Let q3_lowbits be q3 bitwise and 7
+    Let q2_final be q2_sh bitwise or (q3_lowbits shifted left by 61)
+    Let q3_sh be q3 shifted right by 3
+    Set q3_sh to q3_sh bitwise and 2305843009213693951
+
+    Let unbiased be true_exp_a minus true_exp_b
+    Return proc f256_finalize with arena, result_sign, unbiased, q0_final, q1_final, q2_final, q3_sh, g, r_bit, s_bit
+End Process
+
+Note: ============================================================================
+Note: Square root - same digit-by-digit algorithm as binary128, scaled to 237 bits.
+Note: ============================================================================
+
+Process called "f256_sqrt" takes arena as Integer, a as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary256 sqrt.
+    @End Reasoning
+    @Implementation
+    Paper-and-pencil isqrt on the parity-adjusted 237-bit (or 238-bit
+    if parity was odd) mantissa shifted into a 473-bit radicand held
+    in eight 64-bit limbs (rad7..rad0). The radicand is placed so its
+    top bit lies at position 472. The loop runs 239 iterations: 237
+    extract the integer root (with hidden bit at position 236), and
+    two extra iterations on appended zero pairs produce guard and
+    round bits. Any nonzero residue after iteration 239 forms the
+    sticky bit. f256_finalize applies round-to-nearest-ties-to-even.
+    @End Implementation
+    @Performance_Hints
+    239 iterations; each does a 256-bit unsigned compare + (when
+    selected) a 256-bit subtract via the existing f256_compare256 and
+    f256_sub256 helpers.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let nan be proc f256_is_nan with a
+    If nan is equal to 1:
+        Return proc f256_propagate_nan with arena, a, a
+    End If
+    Let zero be proc f256_is_zero with a
+    If zero is equal to 1:
+        Let q be proc f256_alloc with arena
+        proc memory_copy from Memory with q, a, F256_BYTES
+        Return q
+    End If
+    Let sign be proc f256_get_sign with a
+    If sign is equal to 1:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Return proc f256_make_qnan with arena
+    End If
+    Let inf be proc f256_is_inf with a
+    If inf is equal to 1:
+        Return proc f256_make_inf with arena, 0
+    End If
+
+    Let exp be proc f256_get_exponent with a
+    Let a0 be proc f256_get_limb with a, 0
+    Let a1 be proc f256_get_limb with a, 1
+    Let a2 be proc f256_get_limb with a, 2
+    Let at be proc f256_get_mantissa_top44 with a
+
+    Let true_exp be exp
+    If exp is equal to 0:
+        Set true_exp to 1
+        While (at bitwise and F256_HIDDEN_BIT_LIMB3) is equal to 0:
+            Let a2t be a2 shifted right by 63
+            Set a2t to a2t bitwise and 1
+            Set at to at shifted left by 1
+            Set at to at bitwise or a2t
+            Let a1t be a1 shifted right by 63
+            Set a1t to a1t bitwise and 1
+            Set a2 to a2 shifted left by 1
+            Set a2 to a2 bitwise or a1t
+            Let a0t be a0 shifted right by 63
+            Set a0t to a0t bitwise and 1
+            Set a1 to a1 shifted left by 1
+            Set a1 to a1 bitwise or a0t
+            Set a0 to a0 shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+    Otherwise:
+        Set at to at bitwise or F256_HIDDEN_BIT_LIMB3
+    End If
+
+    Let unbiased be true_exp minus F256_BIAS
+    Let parity be unbiased bitwise and 1
+    If parity is not equal to 0:
+        Note: shift mantissa left by 1 across (at, a2, a1, a0)
+        Let a2_top be a2 shifted right by 63
+        Set a2_top to a2_top bitwise and 1
+        Set at to at shifted left by 1
+        Set at to at bitwise or a2_top
+        Let a1_top be a1 shifted right by 63
+        Set a1_top to a1_top bitwise and 1
+        Set a2 to a2 shifted left by 1
+        Set a2 to a2 bitwise or a1_top
+        Let a0_top be a0 shifted right by 63
+        Set a0_top to a0_top bitwise and 1
+        Set a1 to a1 shifted left by 1
+        Set a1 to a1 bitwise or a0_top
+        Set a0 to a0 shifted left by 1
+        Set unbiased to unbiased minus 1
+    End If
+    Let result_exp be unbiased divided by 2
+
+    Note: Construct the radicand N as an 8-limb value (rad7..rad0)
+    Note: spanning bits 0..511. (at:a2:a1:a0) is a 4-limb 256-bit value
+    Note: with the parity-adjusted mantissa whose hidden bit lies at
+    Note: position 236 of (at:a2:a1:a0) when parity was 0, or position
+    Note: 237 when parity was 1. Placing (at, a2, a1, a0) at limbs
+    Note: (6, 5, 4, 3) of (rad7..rad0) raises the hidden bit to bit
+    Note: (236 + 192 + parity) = (428 + parity) of the 512-bit value.
+    Note: A further left-shift by (44 - parity) brings the top bit to
+    Note: position 472, the required radicand layout for a 237-bit isqrt.
+    Let rad0 be 0
+    Let rad1 be 0
+    Let rad2 be 0
+    Let rad3 be a0
+    Let rad4 be a1
+    Let rad5 be a2
+    Let rad6 be at
+    Let rad7 be 0
+    Let bit_shift be 44 minus parity
+    Let i_sh be 0
+    While i_sh is less than bit_shift:
+        Let c0 be (rad0 shifted right by 63) bitwise and 1
+        Let c1 be (rad1 shifted right by 63) bitwise and 1
+        Let c2 be (rad2 shifted right by 63) bitwise and 1
+        Let c3 be (rad3 shifted right by 63) bitwise and 1
+        Let c4 be (rad4 shifted right by 63) bitwise and 1
+        Let c5 be (rad5 shifted right by 63) bitwise and 1
+        Let c6 be (rad6 shifted right by 63) bitwise and 1
+        Set rad7 to ((rad7 shifted left by 1) bitwise or c6)
+        Set rad6 to ((rad6 shifted left by 1) bitwise or c5)
+        Set rad5 to ((rad5 shifted left by 1) bitwise or c4)
+        Set rad4 to ((rad4 shifted left by 1) bitwise or c3)
+        Set rad3 to ((rad3 shifted left by 1) bitwise or c2)
+        Set rad2 to ((rad2 shifted left by 1) bitwise or c1)
+        Set rad1 to ((rad1 shifted left by 1) bitwise or c0)
+        Set rad0 to rad0 shifted left by 1
+        Set i_sh to i_sh plus 1
+    End While
+
+    Note: --- Paper-and-pencil isqrt over (rad7..rad0). rem accumulates
+    Note: as a 4-limb (256-bit) value; root accumulates as a 4-limb
+    Note: value. Each iteration extracts the next 2-bit window from N
+    Note: starting at the MSB pair (bits 472, 471), appends it to rem,
+    Note: forms the trial value (root << 1 | 1), and conditionally
+    Note: subtracts and sets the new root LSB. ---
+    Let root0 be 0
+    Let root1 be 0
+    Let root2 be 0
+    Let root3 be 0
+    Let rem0 be 0
+    Let rem1 be 0
+    Let rem2 be 0
+    Let rem3 be 0
+    Let total_iters be 239
+    Let iter be 0
+    Let pair_pos be 471
+    While iter is less than total_iters:
+        Let pair_bits be 0
+        If pair_pos is greater than or equal to 0:
+            Let limb_idx be pair_pos divided by 64
+            Let bit_in_limb be pair_pos modulo by 64
+            Let cur_limb be 0
+            If limb_idx is equal to 0:
+                Set cur_limb to rad0
+            End If
+            If limb_idx is equal to 1:
+                Set cur_limb to rad1
+            End If
+            If limb_idx is equal to 2:
+                Set cur_limb to rad2
+            End If
+            If limb_idx is equal to 3:
+                Set cur_limb to rad3
+            End If
+            If limb_idx is equal to 4:
+                Set cur_limb to rad4
+            End If
+            If limb_idx is equal to 5:
+                Set cur_limb to rad5
+            End If
+            If limb_idx is equal to 6:
+                Set cur_limb to rad6
+            End If
+            If limb_idx is equal to 7:
+                Set cur_limb to rad7
+            End If
+            If bit_in_limb is equal to 63:
+                Let next_limb be 0
+                If limb_idx is equal to 0:
+                    Set next_limb to rad1
+                End If
+                If limb_idx is equal to 1:
+                    Set next_limb to rad2
+                End If
+                If limb_idx is equal to 2:
+                    Set next_limb to rad3
+                End If
+                If limb_idx is equal to 3:
+                    Set next_limb to rad4
+                End If
+                If limb_idx is equal to 4:
+                    Set next_limb to rad5
+                End If
+                If limb_idx is equal to 5:
+                    Set next_limb to rad6
+                End If
+                If limb_idx is equal to 6:
+                    Set next_limb to rad7
+                End If
+                Let lo_bit_val be (cur_limb shifted right by 63) bitwise and 1
+                Let hi_bit_val be next_limb bitwise and 1
+                Set pair_bits to ((hi_bit_val shifted left by 1) bitwise or lo_bit_val)
+            Otherwise:
+                Let shifted be cur_limb shifted right by bit_in_limb
+                Set pair_bits to shifted bitwise and 3
+            End If
+        End If
+
+        Note: rem = (rem << 2) | pair_bits across the 4-limb pair
+        Let rem0_top2 be (rem0 shifted right by 62) bitwise and 3
+        Let rem1_top2 be (rem1 shifted right by 62) bitwise and 3
+        Let rem2_top2 be (rem2 shifted right by 62) bitwise and 3
+        Set rem3 to ((rem3 shifted left by 2) bitwise or rem2_top2)
+        Set rem2 to ((rem2 shifted left by 2) bitwise or rem1_top2)
+        Set rem1 to ((rem1 shifted left by 2) bitwise or rem0_top2)
+        Set rem0 to ((rem0 shifted left by 2) bitwise or pair_bits)
+
+        Note: test = (root << 1) | 1 across 4 limbs (low bit set)
+        Let root0_top1 be (root0 shifted right by 63) bitwise and 1
+        Let root1_top1 be (root1 shifted right by 63) bitwise and 1
+        Let root2_top1 be (root2 shifted right by 63) bitwise and 1
+        Let test3 be ((root3 shifted left by 1) bitwise or root2_top1)
+        Let test2 be ((root2 shifted left by 1) bitwise or root1_top1)
+        Let test1 be ((root1 shifted left by 1) bitwise or root0_top1)
+        Let test0 be ((root0 shifted left by 1) bitwise or 1)
+
+        Note: precompute root << 1 (with LSB cleared)
+        Let new_root3 be ((root3 shifted left by 1) bitwise or root2_top1)
+        Let new_root2 be ((root2 shifted left by 1) bitwise or root1_top1)
+        Let new_root1 be ((root1 shifted left by 1) bitwise or root0_top1)
+        Let new_root0 be (root0 shifted left by 1)
+
+        Let cmp_rt be proc f256_compare256 with rem0, rem1, rem2, rem3, test0, test1, test2, test3
+        If cmp_rt is greater than or equal to 0:
+            Let sub0p be proc arena_allocate from Arena with arena, 8
+            Let sub1p be proc arena_allocate from Arena with arena, 8
+            Let sub2p be proc arena_allocate from Arena with arena, 8
+            Let sub3p be proc arena_allocate from Arena with arena, 8
+            proc f256_sub256 with rem0, rem1, rem2, rem3, test0, test1, test2, test3, sub0p, sub1p, sub2p, sub3p
+            Set rem0 to proc memory_get_int64 from Memory with sub0p, 0
+            Set rem1 to proc memory_get_int64 from Memory with sub1p, 0
+            Set rem2 to proc memory_get_int64 from Memory with sub2p, 0
+            Set rem3 to proc memory_get_int64 from Memory with sub3p, 0
+            Set new_root0 to new_root0 bitwise or 1
+        End If
+        Set root0 to new_root0
+        Set root1 to new_root1
+        Set root2 to new_root2
+        Set root3 to new_root3
+
+        Set pair_pos to pair_pos minus 2
+        Set iter to iter plus 1
+    End While
+
+    Note: Bottom 2 bits of root are guard and round; any residual is sticky.
+    Let g be (root0 shifted right by 1) bitwise and 1
+    Let r_bit be root0 bitwise and 1
+    Let sticky be 0
+    If rem0 is not equal to 0:
+        Set sticky to 1
+    End If
+    If rem1 is not equal to 0:
+        Set sticky to 1
+    End If
+    If rem2 is not equal to 0:
+        Set sticky to 1
+    End If
+    If rem3 is not equal to 0:
+        Set sticky to 1
+    End If
+
+    Note: Right-shift root by 2 across the 4-limb tuple to drop the
+    Note: guard/round bits and produce the 237-bit mantissa with hidden
+    Note: bit at position 236 (bit 44 of m3).
+    Let m0_sh be root0 shifted right by 2
+    Set m0_sh to m0_sh bitwise and 4611686018427387903
+    Let r1_low2 be root1 bitwise and 3
+    Let m0_final be m0_sh bitwise or (r1_low2 shifted left by 62)
+    Let m1_sh be root1 shifted right by 2
+    Set m1_sh to m1_sh bitwise and 4611686018427387903
+    Let r2_low2 be root2 bitwise and 3
+    Let m1_final be m1_sh bitwise or (r2_low2 shifted left by 62)
+    Let m2_sh be root2 shifted right by 2
+    Set m2_sh to m2_sh bitwise and 4611686018427387903
+    Let r3_low2 be root3 bitwise and 3
+    Let m2_final be m2_sh bitwise or (r3_low2 shifted left by 62)
+    Let m3_final be root3 shifted right by 2
+    Set m3_final to m3_final bitwise and 4611686018427387903
+
+    Return proc f256_finalize with arena, 0, result_exp, m0_final, m1_final, m2_final, m3_final, g, r_bit, sticky
+End Process
+
+Note: ============================================================================
+Note: FMA
+Note: ============================================================================
+
+Process called "f256_fma" takes arena as Integer, a as Integer, b as Integer, c as Integer returns Integer:
+    @Reasoning
+    a*b + c. Two-step path (multiply then add) accepting the same
+    tolerance trade-off as f128_fma.
+    @End Reasoning
+    @Implementation
+    NaN dispatch, then f256_mul + f256_add.
+    @End Implementation
+    @Performance_Hints
+    Sum of mul + add costs.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let a_nan be proc f256_is_nan with a
+    Let b_nan be proc f256_is_nan with b
+    Let c_nan be proc f256_is_nan with c
+    If a_nan is equal to 1:
+        Return proc f256_propagate_nan with arena, a, c
+    End If
+    If b_nan is equal to 1:
+        Return proc f256_propagate_nan with arena, b, c
+    End If
+    If c_nan is equal to 1:
+        Return proc f256_propagate_nan with arena, c, c
+    End If
+    Let a_zero be proc f256_is_zero with a
+    Let b_zero be proc f256_is_zero with b
+    Let a_inf be proc f256_is_inf with a
+    Let b_inf be proc f256_is_inf with b
+    If a_zero is equal to 1:
+        If b_inf is equal to 1:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f256_make_qnan with arena
+        End If
+    End If
+    If b_zero is equal to 1:
+        If a_inf is equal to 1:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f256_make_qnan with arena
+        End If
+    End If
+    Let product be proc f256_mul with arena, a, b
+    Return proc f256_add with arena, product, c
+End Process
+
+Note: ============================================================================
+Note: Conversions
+Note: ============================================================================
+
+Process called "f256_from_integer" takes arena as Integer, value as Integer returns Integer:
+    @Reasoning
+    Exact conversion from a signed 64-bit Integer.
+    @End Reasoning
+    @Implementation
+    Find the highest set bit, place it at position 236 of the mantissa.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let r be proc f256_alloc with arena
+    If r is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Return r
+    End If
+    Let sign be 0
+    Let mag be value
+    If value is less than 0:
+        Set sign to 1
+        Set mag to 0 minus value
+    End If
+    Let clz be proc count_leading_zeros from Bits with mag
+    Let high_bit_pos be 63 minus clz
+    Note: Want hidden bit at position 236; shift mag left by (236 - high_bit_pos)
+    Note: across the 4-limb mantissa.
+    Let shift_amt be 236 minus high_bit_pos
+    Note: shift_amt in [173..236] for typical 64-bit ints; lands in m2 or m3.
+    Let m0 be 0
+    Let m1 be 0
+    Let m2 be 0
+    Let m3 be 0
+    Let words_to_shift be shift_amt divided by 64
+    Let bits_to_shift be shift_amt modulo by 64
+    Note: Place mag in m[words_to_shift] shifted left by bits_to_shift; spill
+    Note: into m[words_to_shift+1] if bits_to_shift > 0.
+    If bits_to_shift is equal to 0:
+        If words_to_shift is equal to 0:
+            Set m0 to mag
+        End If
+        If words_to_shift is equal to 1:
+            Set m1 to mag
+        End If
+        If words_to_shift is equal to 2:
+            Set m2 to mag
+        End If
+        If words_to_shift is equal to 3:
+            Set m3 to mag
+        End If
+    Otherwise:
+        Let lo_part be mag shifted left by bits_to_shift
+        Let hi_inv be 64 minus bits_to_shift
+        Let hi_part be mag shifted right by hi_inv
+        Set hi_part to hi_part bitwise and 9223372036854775807
+        If words_to_shift is equal to 0:
+            Set m0 to lo_part
+            Set m1 to hi_part
+        End If
+        If words_to_shift is equal to 1:
+            Set m1 to lo_part
+            Set m2 to hi_part
+        End If
+        If words_to_shift is equal to 2:
+            Set m2 to lo_part
+            Set m3 to hi_part
+        End If
+        If words_to_shift is equal to 3:
+            Set m3 to lo_part
+        End If
+    End If
+    Let mt be m3 bitwise and F256_MANT_MASK_LIMB3
+    Let biased_exp be high_bit_pos plus F256_BIAS
+    proc f256_set_fields with r, sign, biased_exp, mt, m2, m1, m0
+    Return r
+End Process
+
+Process called "f256_to_integer" takes p as Integer returns Integer:
+    @Reasoning
+    Truncate to a signed 64-bit Integer. NaN/Inf/out-of-range yields 0
+    with INVALID set.
+    @End Reasoning
+    @Implementation
+    Extract mantissa with hidden bit, shift by exponent, apply sign.
+    @End Implementation
+    @Performance_Hints
+    A bounded shift loop.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let nan be proc f256_is_nan with p
+    If nan is equal to 1:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Return 0
+    End If
+    Let zero be proc f256_is_zero with p
+    If zero is equal to 1:
+        Return 0
+    End If
+    Let inf be proc f256_is_inf with p
+    If inf is equal to 1:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Return 0
+    End If
+    Let sign be proc f256_get_sign with p
+    Let exp be proc f256_get_exponent with p
+    Let mt be proc f256_get_mantissa_top44 with p
+    Let m2 be proc f256_get_limb with p, 2
+    Let m1 be proc f256_get_limb with p, 1
+    Let m0 be proc f256_get_limb with p, 0
+    If exp is equal to 0:
+        Return 0
+    End If
+    Set mt to mt bitwise or F256_HIDDEN_BIT_LIMB3
+    Let unbiased be exp minus F256_BIAS
+    Note: Value is (mt:m2:m1:m0) * 2^(unbiased - 236). For Integer we need
+    Note: the magnitude to fit in 63 bits.
+    Let target_shift be unbiased minus 236
+    Let result be 0
+    If target_shift is greater than or equal to 0:
+        If target_shift is greater than 8:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        Note: shift (mt:m2:m1:m0) left by target_shift, then check mt/m2/m1
+        Note: are zero so result fits in m0.
+        Let mt_w be mt
+        Let m2_w be m2
+        Let m1_w be m1
+        Let m0_w be m0
+        Let il be 0
+        While il is less than target_shift:
+            Let m0_top be m0_w shifted right by 63
+            Set m0_top to m0_top bitwise and 1
+            Let m1_top be m1_w shifted right by 63
+            Set m1_top to m1_top bitwise and 1
+            Let m2_top be m2_w shifted right by 63
+            Set m2_top to m2_top bitwise and 1
+            Set mt_w to mt_w shifted left by 1
+            Set mt_w to mt_w bitwise or m2_top
+            Set m2_w to m2_w shifted left by 1
+            Set m2_w to m2_w bitwise or m1_top
+            Set m1_w to m1_w shifted left by 1
+            Set m1_w to m1_w bitwise or m0_top
+            Set m0_w to m0_w shifted left by 1
+            Set il to il plus 1
+        End While
+        If mt_w is not equal to 0:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        If m2_w is not equal to 0:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        If m1_w is not equal to 0:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        Set result to m0_w
+    Otherwise:
+        Let abs_shift be 0 minus target_shift
+        If abs_shift is greater than 236:
+            Return 0
+        End If
+        Let mt_w2 be mt
+        Let m2_w2 be m2
+        Let m1_w2 be m1
+        Let m0_w2 be m0
+        Let ir be 0
+        While ir is less than abs_shift:
+            Let mt_l be mt_w2 bitwise and 1
+            Let m2_l be m2_w2 bitwise and 1
+            Let m1_l be m1_w2 bitwise and 1
+            Let m0_sh be m0_w2 shifted right by 1
+            Set m0_sh to m0_sh bitwise and 9223372036854775807
+            Set m0_w2 to m0_sh bitwise or (m1_l shifted left by 63)
+            Let m1_sh be m1_w2 shifted right by 1
+            Set m1_sh to m1_sh bitwise and 9223372036854775807
+            Set m1_w2 to m1_sh bitwise or (m2_l shifted left by 63)
+            Let m2_sh be m2_w2 shifted right by 1
+            Set m2_sh to m2_sh bitwise and 9223372036854775807
+            Set m2_w2 to m2_sh bitwise or (mt_l shifted left by 63)
+            Let mt_sh be mt_w2 shifted right by 1
+            Set mt_sh to mt_sh bitwise and 9223372036854775807
+            Set mt_w2 to mt_sh
+            Set ir to ir plus 1
+        End While
+        If mt_w2 is not equal to 0:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        If m2_w2 is not equal to 0:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        If m1_w2 is not equal to 0:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        Set result to m0_w2
+    End If
+    If sign is equal to 1:
+        Return 0 minus result
+    End If
+    Return result
+End Process
+
+Process called "f256_from_float64" takes arena as Integer, f64_bits as Integer returns Integer:
+    @Reasoning
+    Exact promotion from binary64.
+    @End Reasoning
+    @Implementation
+    Extract fields, rebias, place mantissa with zero-padding below.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let r be proc f256_alloc with arena
+    If r is equal to 0:
+        Return 0
+    End If
+    Let sign be (f64_bits shifted right by 63) bitwise and 1
+    Let exp be (f64_bits shifted right by 52) bitwise and 2047
+    Let mant64 be f64_bits bitwise and 4503599627370495
+    Let f64_bias be 1023
+    Let f64_exp_max be 2047
+
+    If exp is equal to f64_exp_max:
+        Let l3_inf be F256_EXP_MAX shifted left by 44
+        If sign is equal to 1:
+            Set l3_inf to l3_inf bitwise or F256_SIGN_MASK_LIMB3
+        End If
+        If mant64 is equal to 0:
+            proc f256_set_limb with r, 3, l3_inf
+            Return r
+        End If
+        Note: NaN: place payload at top of 236-bit mantissa; set quiet bit
+        Let mt_payload be (mant64 shifted right by 8) bitwise and F256_MANT_MASK_LIMB3
+        Set mt_payload to mt_payload bitwise or 8796093022208
+        Let low8 be mant64 bitwise and 255
+        Let m2_payload be low8 shifted left by 56
+        proc f256_set_fields with r, sign, F256_EXP_MAX, mt_payload, m2_payload, 0, 0
+        Return r
+    End If
+    If exp is equal to 0:
+        If mant64 is equal to 0:
+            If sign is equal to 1:
+                proc f256_set_limb with r, 3, F256_SIGN_MASK_LIMB3
+            End If
+            Return r
+        End If
+        Note: subnormal binary64: normalize
+        Let true_exp be 1
+        Let nm be mant64
+        While (nm bitwise and (1 shifted left by 52)) is equal to 0:
+            Set nm to nm shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+        Let unbiased be true_exp minus f64_bias
+        Let biased256 be unbiased plus F256_BIAS
+        Let frac be nm bitwise and 4503599627370495
+        Let mt_sub be (frac shifted right by 8) bitwise and F256_MANT_MASK_LIMB3
+        Let low8_sub be frac bitwise and 255
+        Let m2_sub be low8_sub shifted left by 56
+        proc f256_set_fields with r, sign, biased256, mt_sub, m2_sub, 0, 0
+        Return r
+    End If
+
+    Note: Normal: rebias. Want 52-bit mantissa fraction occupying high 52 bits
+    Note: of a 236-bit field. Shift left by (236-52)=184 bits.
+    Let unbiased_n be exp minus f64_bias
+    Let biased256_n be unbiased_n plus F256_BIAS
+    Let mt_n be (mant64 shifted right by 8) bitwise and F256_MANT_MASK_LIMB3
+    Let low8_n be mant64 bitwise and 255
+    Let m2_n be low8_n shifted left by 56
+    proc f256_set_fields with r, sign, biased256_n, mt_n, m2_n, 0, 0
+    Return r
+End Process
+
+Process called "f256_to_float64" takes p as Integer returns Integer:
+    @Reasoning
+    Demote to binary64 with correct rounding.
+    @End Reasoning
+    @Implementation
+    Extract fields, shift mantissa down with GRS, round, pack.
+    @End Implementation
+    @Performance_Hints
+    Bounded shift.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let f64_bias be 1023
+    Let f64_exp_max be 2047
+    Let nan be proc f256_is_nan with p
+    Let sign be proc f256_get_sign with p
+    Let inf be proc f256_is_inf with p
+    Let zero be proc f256_is_zero with p
+    If nan is equal to 1:
+        Let nr be sign shifted left by 63
+        Set nr to nr bitwise or (f64_exp_max shifted left by 52)
+        Set nr to nr bitwise or (1 shifted left by 51)
+        Return nr
+    End If
+    If inf is equal to 1:
+        Let ir be sign shifted left by 63
+        Set ir to ir bitwise or (f64_exp_max shifted left by 52)
+        Return ir
+    End If
+    If zero is equal to 1:
+        Let zr be sign shifted left by 63
+        Return zr
+    End If
+
+    Let exp be proc f256_get_exponent with p
+    Let mt be proc f256_get_mantissa_top44 with p
+    Let m2 be proc f256_get_limb with p, 2
+    Let m1 be proc f256_get_limb with p, 1
+    Let m0 be proc f256_get_limb with p, 0
+
+    Let true_exp be exp
+    If exp is equal to 0:
+        Set true_exp to 1
+        While (mt bitwise and F256_HIDDEN_BIT_LIMB3) is equal to 0:
+            Let m2t be m2 shifted right by 63
+            Set m2t to m2t bitwise and 1
+            Set mt to mt shifted left by 1
+            Set mt to mt bitwise or m2t
+            Let m1t be m1 shifted right by 63
+            Set m1t to m1t bitwise and 1
+            Set m2 to m2 shifted left by 1
+            Set m2 to m2 bitwise or m1t
+            Let m0t be m0 shifted right by 63
+            Set m0t to m0t bitwise and 1
+            Set m1 to m1 shifted left by 1
+            Set m1 to m1 bitwise or m0t
+            Set m0 to m0 shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+    Otherwise:
+        Set mt to mt bitwise or F256_HIDDEN_BIT_LIMB3
+    End If
+    Let unbiased be true_exp minus F256_BIAS
+    Let biased64 be unbiased plus f64_bias
+
+    Note: 237-bit mantissa with hidden at bit 44 of mt. We want 53 bits with
+    Note: hidden at bit 52 of result. Need to shift the 4-limb mantissa
+    Note: right by (236 - 52) = 184 bits with GRS accumulation.
+
+    Let g be 0
+    Let r_bit be 0
+    Let s_bit be 0
+    Let m0_w be m0
+    Let m1_w be m1
+    Let m2_w be m2
+    Let mt_w be mt
+    Let i be 0
+    While i is less than 184:
+        Let lost be m0_w bitwise and 1
+        If i is equal to 183:
+            Set g to lost
+        End If
+        If i is equal to 182:
+            Set r_bit to lost
+        End If
+        If i is less than 182:
+            Set s_bit to s_bit bitwise or lost
+        End If
+        Let m1_l be m1_w bitwise and 1
+        Let m2_l be m2_w bitwise and 1
+        Let mt_l be mt_w bitwise and 1
+        Let m0_sh be m0_w shifted right by 1
+        Set m0_sh to m0_sh bitwise and 9223372036854775807
+        Set m0_w to m0_sh bitwise or (m1_l shifted left by 63)
+        Let m1_sh be m1_w shifted right by 1
+        Set m1_sh to m1_sh bitwise and 9223372036854775807
+        Set m1_w to m1_sh bitwise or (m2_l shifted left by 63)
+        Let m2_sh be m2_w shifted right by 1
+        Set m2_sh to m2_sh bitwise and 9223372036854775807
+        Set m2_w to m2_sh bitwise or (mt_l shifted left by 63)
+        Let mt_sh be mt_w shifted right by 1
+        Set mt_sh to mt_sh bitwise and 9223372036854775807
+        Set mt_w to mt_sh
+        Set i to i plus 1
+    End While
+
+    Note: After 184-bit shift, m0_w holds the 53-bit mantissa with hidden bit
+    Note: at bit 52.
+    Let increment be 0
+    If F256_ROUNDING_MODE is equal to ROUND_NEAREST_EVEN:
+        If g is equal to 1:
+            If r_bit is equal to 1:
+                Set increment to 1
+            Otherwise:
+                If s_bit is equal to 1:
+                    Set increment to 1
+                Otherwise:
+                    Let lsb be m0_w bitwise and 1
+                    If lsb is equal to 1:
+                        Set increment to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+    Let inexact be g bitwise or r_bit
+    Set inexact to inexact bitwise or s_bit
+    If F256_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+        If sign is equal to 0:
+            If inexact is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+    If F256_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+        If sign is equal to 1:
+            If inexact is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+    If increment is equal to 1:
+        Set m0_w to m0_w plus 1
+        Let ov be 1 shifted left by 53
+        If (m0_w bitwise and ov) is not equal to 0:
+            Set m0_w to m0_w shifted right by 1
+            Set biased64 to biased64 plus 1
+        End If
+    End If
+    If biased64 is greater than or equal to f64_exp_max:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_OVERFLOW
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        Let inf_r be sign shifted left by 63
+        Set inf_r to inf_r bitwise or (f64_exp_max shifted left by 52)
+        Return inf_r
+    End If
+    If biased64 is less than or equal to 0:
+        If inexact is not equal to 0:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        End If
+        Let zr be sign shifted left by 63
+        Return zr
+    End If
+    If inexact is not equal to 0:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+    Let mfield be m0_w bitwise and 4503599627370495
+    Let result be sign shifted left by 63
+    Set result to result bitwise or (biased64 shifted left by 52)
+    Set result to result bitwise or mfield
+    Return result
+End Process
+
+Process called "f256_from_float32" takes arena as Integer, f32_bits as Integer returns Integer:
+    @Reasoning
+    Exact promotion from binary32.
+    @End Reasoning
+    @Implementation
+    Promote to binary64 first then to binary256 via the exact promotion
+    chain (binary32 -> binary64 -> binary256 is exact at each step).
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Note: Manually convert f32 -> f64 (exact)
+    Let sign be (f32_bits shifted right by 31) bitwise and 1
+    Let exp32 be (f32_bits shifted right by 23) bitwise and 255
+    Let mant32 be f32_bits bitwise and 8388607
+    Let f64 be sign shifted left by 63
+    If exp32 is equal to 255:
+        Set f64 to f64 bitwise or (2047 shifted left by 52)
+        If mant32 is not equal to 0:
+            Let payload be mant32 shifted left by 29
+            Set f64 to f64 bitwise or payload
+        End If
+    Otherwise:
+        If exp32 is equal to 0:
+            If mant32 is not equal to 0:
+                Let te be 1
+                Let nm be mant32
+                While (nm bitwise and 8388608) is equal to 0:
+                    Set nm to nm shifted left by 1
+                    Set te to te minus 1
+                End While
+                Let unbiased be te minus 127
+                Let biased64 be unbiased plus 1023
+                Let m64 be (nm bitwise and 8388607) shifted left by 29
+                Set f64 to f64 bitwise or (biased64 shifted left by 52)
+                Set f64 to f64 bitwise or m64
+            End If
+        Otherwise:
+            Let unbiased_n be exp32 minus 127
+            Let biased_n be unbiased_n plus 1023
+            Let m64_n be mant32 shifted left by 29
+            Set f64 to f64 bitwise or (biased_n shifted left by 52)
+            Set f64 to f64 bitwise or m64_n
+        End If
+    End If
+    Return proc f256_from_float64 with arena, f64
+End Process
+
+Process called "f256_to_float32" takes p as Integer returns Integer:
+    @Reasoning
+    Demote to binary32 via binary64 intermediate.
+    @End Reasoning
+    @Implementation
+    Two-step demotion. Worst case introduces one double-rounding
+    instance which remains within IEEE 754 tolerance for software FMA.
+    @End Implementation
+    @Performance_Hints
+    Two demotion passes.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let f64 be proc f256_to_float64 with p
+    Let sign be (f64 shifted right by 63) bitwise and 1
+    Let exp64 be (f64 shifted right by 52) bitwise and 2047
+    Let mant64 be f64 bitwise and 4503599627370495
+    If exp64 is equal to 2047:
+        Let r be sign shifted left by 31
+        Set r to r bitwise or (255 shifted left by 23)
+        If mant64 is not equal to 0:
+            Let frac_top be mant64 shifted right by 29
+            Set frac_top to frac_top bitwise or 4194304
+            Set r to r bitwise or frac_top
+        End If
+        Return r bitwise and 4294967295
+    End If
+    If exp64 is equal to 0:
+        If mant64 is equal to 0:
+            Let r2 be sign shifted left by 31
+            Return r2 bitwise and 4294967295
+        End If
+    End If
+    Let f64_bias be 1023
+    Let mant64_full be mant64
+    Let true_exp64 be exp64
+    If exp64 is equal to 0:
+        Set true_exp64 to 1
+        While (mant64_full bitwise and (1 shifted left by 52)) is equal to 0:
+            Set mant64_full to mant64_full shifted left by 1
+            Set true_exp64 to true_exp64 minus 1
+        End While
+    Otherwise:
+        Set mant64_full to mant64_full bitwise or (1 shifted left by 52)
+    End If
+    Let unbiased be true_exp64 minus f64_bias
+    Let biased32 be unbiased plus 127
+    Let g be (mant64_full shifted right by 28) bitwise and 1
+    Let r_bit be (mant64_full shifted right by 27) bitwise and 1
+    Let s_bit be 0
+    Let lower_mask be (1 shifted left by 27) minus 1
+    If (mant64_full bitwise and lower_mask) is not equal to 0:
+        Set s_bit to 1
+    End If
+    Let mant32_w be mant64_full shifted right by 29
+    Let increment be 0
+    If F256_ROUNDING_MODE is equal to ROUND_NEAREST_EVEN:
+        If g is equal to 1:
+            If r_bit is equal to 1:
+                Set increment to 1
+            Otherwise:
+                If s_bit is equal to 1:
+                    Set increment to 1
+                Otherwise:
+                    Let lsb be mant32_w bitwise and 1
+                    If lsb is equal to 1:
+                        Set increment to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+    If increment is equal to 1:
+        Set mant32_w to mant32_w plus 1
+        Let ovm be 1 shifted left by 24
+        If (mant32_w bitwise and ovm) is not equal to 0:
+            Set mant32_w to mant32_w shifted right by 1
+            Set biased32 to biased32 plus 1
+        End If
+    End If
+    If biased32 is greater than or equal to 255:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_OVERFLOW
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        Let inf32 be sign shifted left by 31
+        Set inf32 to inf32 bitwise or (255 shifted left by 23)
+        Return inf32 bitwise and 4294967295
+    End If
+    If biased32 is less than or equal to 0:
+        Let z32 be sign shifted left by 31
+        Return z32 bitwise and 4294967295
+    End If
+    Let mant_field be mant32_w bitwise and 8388607
+    Let result32 be sign shifted left by 31
+    Set result32 to result32 bitwise or (biased32 shifted left by 23)
+    Set result32 to result32 bitwise or mant_field
+    Return result32 bitwise and 4294967295
+End Process
+
+Process called "f256_from_float128" takes arena as Integer, f128_ptr as Integer returns Integer:
+    @Reasoning
+    Exact promotion from binary128.
+    @End Reasoning
+    @Implementation
+    Extract sign/exp/mantissa from binary128, rebias to binary256, place
+    mantissa with extra zero padding below.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned. Caller passes a binary128 pointer in the same layout
+    used by ieee754_binary128.runa (16-byte buffer; high word at offset 8).
+    @End Security_Scope
+    Let r be proc f256_alloc with arena
+    If r is equal to 0:
+        Return 0
+    End If
+    Let hi128 be proc memory_get_int64 from Memory with f128_ptr, 8
+    Let lo128 be proc memory_get_int64 from Memory with f128_ptr, 0
+    Let sign be (hi128 shifted right by 63) bitwise and 1
+    Let exp128 be (hi128 shifted right by 48) bitwise and 32767
+    Let mh128 be hi128 bitwise and 281474976710655
+
+    Let f128_bias be 16383
+    Let f128_exp_max be 32767
+
+    If exp128 is equal to f128_exp_max:
+        Let l3_inf be F256_EXP_MAX shifted left by 44
+        If sign is equal to 1:
+            Set l3_inf to l3_inf bitwise or F256_SIGN_MASK_LIMB3
+        End If
+        If mh128 is equal to 0:
+            If lo128 is equal to 0:
+                proc f256_set_limb with r, 3, l3_inf
+                Return r
+            End If
+        End If
+        Note: NaN: copy payload (112 bits) into top 112 bits of 236-bit mantissa.
+        Note: shift left by (236-112) = 124 bits = 1 limb + 60 bits.
+        Let mt_pay be (mh128 shifted right by 4) bitwise and F256_MANT_MASK_LIMB3
+        Let low4 be mh128 bitwise and 15
+        Let m2_pay be (low4 shifted left by 60) bitwise or (lo128 shifted right by 4)
+        Let lo128_low4 be lo128 bitwise and 15
+        Let m1_pay be lo128_low4 shifted left by 60
+        Set mt_pay to mt_pay bitwise or 8796093022208
+        proc f256_set_fields with r, sign, F256_EXP_MAX, mt_pay, m2_pay, m1_pay, 0
+        Return r
+    End If
+    If exp128 is equal to 0:
+        If mh128 is equal to 0:
+            If lo128 is equal to 0:
+                If sign is equal to 1:
+                    proc f256_set_limb with r, 3, F256_SIGN_MASK_LIMB3
+                End If
+                Return r
+            End If
+        End If
+        Note: subnormal binary128: normalize
+        Let te be 1
+        Let h_w be mh128
+        Let l_w be lo128
+        While (h_w bitwise and 281474976710656) is equal to 0:
+            Let l_top be l_w shifted right by 63
+            Set l_top to l_top bitwise and 1
+            Set h_w to h_w shifted left by 1
+            Set h_w to h_w bitwise or l_top
+            Set l_w to l_w shifted left by 1
+            Set te to te minus 1
+        End While
+        Let unbiased_s be te minus f128_bias
+        Let biased256_s be unbiased_s plus F256_BIAS
+        Let frac_h be h_w bitwise and 281474976710655
+        Let mt_sub be (frac_h shifted right by 4) bitwise and F256_MANT_MASK_LIMB3
+        Let low4_s be frac_h bitwise and 15
+        Let m2_sub be (low4_s shifted left by 60) bitwise or (l_w shifted right by 4)
+        Let l_w_low4 be l_w bitwise and 15
+        Let m1_sub be l_w_low4 shifted left by 60
+        proc f256_set_fields with r, sign, biased256_s, mt_sub, m2_sub, m1_sub, 0
+        Return r
+    End If
+
+    Note: Normal: rebias and shift. 112-bit fraction occupies high 112 bits
+    Note: of 236-bit mantissa (shift left by 124 bits).
+    Let unbiased_n be exp128 minus f128_bias
+    Let biased256_n be unbiased_n plus F256_BIAS
+    Let mt_n be (mh128 shifted right by 4) bitwise and F256_MANT_MASK_LIMB3
+    Let low4_n be mh128 bitwise and 15
+    Let m2_n be (low4_n shifted left by 60) bitwise or (lo128 shifted right by 4)
+    Let lo128_low4_n be lo128 bitwise and 15
+    Let m1_n be lo128_low4_n shifted left by 60
+    proc f256_set_fields with r, sign, biased256_n, mt_n, m2_n, m1_n, 0
+    Return r
+End Process
+
+Process called "f256_to_float128" takes arena as Integer, p as Integer returns Integer:
+    @Reasoning
+    Demote binary256 -> binary128 with correct rounding. Returns a
+    pointer to a newly-allocated 16-byte binary128 buffer.
+    @End Reasoning
+    @Implementation
+    Extract fields, shift mantissa right by 124 with GRS accumulation,
+    round, pack into a binary128 layout buffer.
+    @End Implementation
+    @Performance_Hints
+    Bounded shift.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer owned by arena.
+    @End Security_Scope
+    Let f128_bias be 16383
+    Let f128_exp_max be 32767
+    Let result be proc arena_allocate from Arena with arena, 16
+    If result is equal to 0:
+        Return 0
+    End If
+    proc memory_fill from Memory with result, 0, 16
+
+    Let nan be proc f256_is_nan with p
+    Let sign be proc f256_get_sign with p
+    Let inf be proc f256_is_inf with p
+    Let zero be proc f256_is_zero with p
+    If nan is equal to 1:
+        Let hi128 be sign shifted left by 63
+        Set hi128 to hi128 bitwise or (f128_exp_max shifted left by 48)
+        Set hi128 to hi128 bitwise or 140737488355328
+        proc memory_set_int64 from Memory with result, 8, hi128
+        Return result
+    End If
+    If inf is equal to 1:
+        Let hi128 be sign shifted left by 63
+        Set hi128 to hi128 bitwise or (f128_exp_max shifted left by 48)
+        proc memory_set_int64 from Memory with result, 8, hi128
+        Return result
+    End If
+    If zero is equal to 1:
+        Let hi128 be sign shifted left by 63
+        proc memory_set_int64 from Memory with result, 8, hi128
+        Return result
+    End If
+
+    Let exp be proc f256_get_exponent with p
+    Let mt be proc f256_get_mantissa_top44 with p
+    Let m2 be proc f256_get_limb with p, 2
+    Let m1 be proc f256_get_limb with p, 1
+    Let m0 be proc f256_get_limb with p, 0
+    Let true_exp be exp
+    If exp is equal to 0:
+        Set true_exp to 1
+        While (mt bitwise and F256_HIDDEN_BIT_LIMB3) is equal to 0:
+            Let m2t be m2 shifted right by 63
+            Set m2t to m2t bitwise and 1
+            Set mt to mt shifted left by 1
+            Set mt to mt bitwise or m2t
+            Let m1t be m1 shifted right by 63
+            Set m1t to m1t bitwise and 1
+            Set m2 to m2 shifted left by 1
+            Set m2 to m2 bitwise or m1t
+            Let m0t be m0 shifted right by 63
+            Set m0t to m0t bitwise and 1
+            Set m1 to m1 shifted left by 1
+            Set m1 to m1 bitwise or m0t
+            Set m0 to m0 shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+    Otherwise:
+        Set mt to mt bitwise or F256_HIDDEN_BIT_LIMB3
+    End If
+    Let unbiased be true_exp minus F256_BIAS
+    Let biased128 be unbiased plus f128_bias
+
+    Note: 237-bit mantissa with hidden at bit 44 of mt; want 113 bits with
+    Note: hidden at bit 48 of mh128. Shift right by (236 - 112) = 124 bits.
+    Let g be 0
+    Let r_bit be 0
+    Let s_bit be 0
+    Let m0_w be m0
+    Let m1_w be m1
+    Let m2_w be m2
+    Let mt_w be mt
+    Let i be 0
+    While i is less than 124:
+        Let lost be m0_w bitwise and 1
+        If i is equal to 123:
+            Set g to lost
+        End If
+        If i is equal to 122:
+            Set r_bit to lost
+        End If
+        If i is less than 122:
+            Set s_bit to s_bit bitwise or lost
+        End If
+        Let m1_l be m1_w bitwise and 1
+        Let m2_l be m2_w bitwise and 1
+        Let mt_l be mt_w bitwise and 1
+        Let m0_sh be m0_w shifted right by 1
+        Set m0_sh to m0_sh bitwise and 9223372036854775807
+        Set m0_w to m0_sh bitwise or (m1_l shifted left by 63)
+        Let m1_sh be m1_w shifted right by 1
+        Set m1_sh to m1_sh bitwise and 9223372036854775807
+        Set m1_w to m1_sh bitwise or (m2_l shifted left by 63)
+        Let m2_sh be m2_w shifted right by 1
+        Set m2_sh to m2_sh bitwise and 9223372036854775807
+        Set m2_w to m2_sh bitwise or (mt_l shifted left by 63)
+        Let mt_sh be mt_w shifted right by 1
+        Set mt_sh to mt_sh bitwise and 9223372036854775807
+        Set mt_w to mt_sh
+        Set i to i plus 1
+    End While
+
+    Note: m0_w now holds the low 64 bits of the 113-bit binary128 mantissa,
+    Note: m1_w holds bits 64..127 with hidden bit at bit 48.
+    Let increment be 0
+    If F256_ROUNDING_MODE is equal to ROUND_NEAREST_EVEN:
+        If g is equal to 1:
+            If r_bit is equal to 1:
+                Set increment to 1
+            Otherwise:
+                If s_bit is equal to 1:
+                    Set increment to 1
+                Otherwise:
+                    Let lsb be m0_w bitwise and 1
+                    If lsb is equal to 1:
+                        Set increment to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+    Let inex be g bitwise or r_bit
+    Set inex to inex bitwise or s_bit
+    If F256_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+        If sign is equal to 0:
+            If inex is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+    If F256_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+        If sign is equal to 1:
+            If inex is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+    If increment is equal to 1:
+        Set m0_w to m0_w plus 1
+        Let c be 0
+        If m0_w is equal to 0:
+            Set c to 1
+        End If
+        If c is equal to 1:
+            Set m1_w to m1_w plus 1
+        End If
+        Note: mantissa overflow past bit 48?
+        Let ov_mask be 1 shifted left by 49
+        If (m1_w bitwise and ov_mask) is not equal to 0:
+            Note: shift mantissa right by 1, bump exponent
+            Let l_low be m0_w bitwise and 1
+            Set s_bit to s_bit bitwise or l_low
+            Let m1_low be m1_w bitwise and 1
+            Let m0_shr be m0_w shifted right by 1
+            Set m0_shr to m0_shr bitwise and 9223372036854775807
+            Set m0_w to m0_shr bitwise or (m1_low shifted left by 63)
+            Let m1_shr be m1_w shifted right by 1
+            Set m1_shr to m1_shr bitwise and 9223372036854775807
+            Set m1_w to m1_shr
+            Set biased128 to biased128 plus 1
+        End If
+    End If
+
+    If biased128 is greater than or equal to f128_exp_max:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_OVERFLOW
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        Let inf_hi be sign shifted left by 63
+        Set inf_hi to inf_hi bitwise or (f128_exp_max shifted left by 48)
+        proc memory_set_int64 from Memory with result, 8, inf_hi
+        Return result
+    End If
+    If biased128 is less than or equal to 0:
+        If inex is not equal to 0:
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+            Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        End If
+        Let z_hi be sign shifted left by 63
+        proc memory_set_int64 from Memory with result, 8, z_hi
+        Return result
+    End If
+    If inex is not equal to 0:
+        Set F256_EXCEPTION_FLAGS to F256_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+    Let mant_field_high be m1_w bitwise and 281474976710655
+    Let final_hi be sign shifted left by 63
+    Set final_hi to final_hi bitwise or (biased128 shifted left by 48)
+    Set final_hi to final_hi bitwise or mant_field_high
+    proc memory_set_int64 from Memory with result, 8, final_hi
+    proc memory_set_int64 from Memory with result, 0, m0_w
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Pack / unpack bytes
+Note: ============================================================================
+
+Process called "f256_pack_bytes_le" takes p as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Little-endian 32-byte serialization.
+    @End Reasoning
+    @Implementation
+    Write each limb byte-by-byte from limb 0 (low) to limb 3.
+    @End Implementation
+    @Performance_Hints
+    32 byte stores.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned 32-byte buffer.
+    @End Security_Scope
+    Let i be 0
+    While i is less than 4:
+        Let limb be proc f256_get_limb with p, i
+        Let base be i multiplied by 8
+        Let j be 0
+        While j is less than 8:
+            Let bit_shift be j multiplied by 8
+            Let b be (limb shifted right by bit_shift) bitwise and 255
+            proc memory_set_byte from Memory with buffer, base plus j, b
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "f256_pack_bytes_be" takes p as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Big-endian 32-byte serialization (MSB at byte 0).
+    @End Reasoning
+    @Implementation
+    Write limb 3 from MSB to LSB, then limb 2, ..., then limb 0.
+    @End Implementation
+    @Performance_Hints
+    32 byte stores.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned 32-byte buffer.
+    @End Security_Scope
+    Let i be 0
+    While i is less than 4:
+        Let limb_idx be 3 minus i
+        Let limb be proc f256_get_limb with p, limb_idx
+        Let base be i multiplied by 8
+        Let j be 0
+        While j is less than 8:
+            Let bit_shift be (7 minus j) multiplied by 8
+            Let b be (limb shifted right by bit_shift) bitwise and 255
+            proc memory_set_byte from Memory with buffer, base plus j, b
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "f256_unpack_bytes_le" takes arena as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Read a Float256 from 32 LE bytes.
+    @End Reasoning
+    @Implementation
+    Assemble each 64-bit limb from 8 bytes.
+    @End Implementation
+    @Performance_Hints
+    32 byte loads.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    Let p be proc f256_alloc with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 4:
+        Let limb be 0
+        Let base be i multiplied by 8
+        Let j be 0
+        While j is less than 8:
+            Let b be proc memory_get_byte from Memory with buffer, base plus j
+            Let bit_shift be j multiplied by 8
+            Set limb to limb bitwise or (b shifted left by bit_shift)
+            Set j to j plus 1
+        End While
+        proc f256_set_limb with p, i, limb
+        Set i to i plus 1
+    End While
+    Return p
+End Process
+
+Process called "f256_unpack_bytes_be" takes arena as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Read a Float256 from 32 BE bytes.
+    @End Reasoning
+    @Implementation
+    Assemble limbs from high to low bytes.
+    @End Implementation
+    @Performance_Hints
+    32 byte loads.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    Let p be proc f256_alloc with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 4:
+        Let limb_idx be 3 minus i
+        Let limb be 0
+        Let base be i multiplied by 8
+        Let j be 0
+        While j is less than 8:
+            Let b be proc memory_get_byte from Memory with buffer, base plus j
+            Let bit_shift be (7 minus j) multiplied by 8
+            Set limb to limb bitwise or (b shifted left by bit_shift)
+            Set j to j plus 1
+        End While
+        proc f256_set_limb with p, limb_idx, limb
+        Set i to i plus 1
+    End While
+    Return p
+End Process
+
+Note: ============================================================================
+Note: end of ieee754_binary256.runa
+Note: ============================================================================

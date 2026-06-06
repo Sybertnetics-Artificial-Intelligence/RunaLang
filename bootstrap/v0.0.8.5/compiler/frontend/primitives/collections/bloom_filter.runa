@@ -1,0 +1,569 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+BLOOM FILTER - Probabilistic Membership Test Tier 0 Primitive
+
+This file implements a classic Bloom filter: a bit array of m bits
+plus k hash functions. Insert sets k bit positions; contains tests k
+bit positions. False positives are possible (an item never inserted
+might still report present) but false negatives are impossible.
+
+Sizing formulas (given capacity n and target false-positive rate p):
+  m = -(n * ln p) / (ln 2)^2 = ceil(-1.4427 * n * log2 p)
+  k = (m / n) * ln 2 = ceil(0.6931 * m / n)
+
+Two hash functions are derived from a base FNV-1a-64 hash via
+"double hashing": h_i(x) = h1(x) + i * h2(x). This gives k effective
+hashes from only two computed hashes per operation.
+
+Filter structure (40 bytes):
+  offset 0:  bits (pointer to bit array, byte-addressed)
+  offset 8:  m (number of bits)
+  offset 16: k (number of hash functions)
+  offset 24: capacity (target capacity n)
+  offset 32: insert_count (number of insertions so far)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let BLOOM_HEADER_SIZE be 40
+Let BLOOM_FNV_OFFSET_BASIS be 14695981039346656037
+Let BLOOM_FNV_PRIME be 1099511628211
+
+Note: ============================================================================
+Note: HASH FUNCTIONS
+Note: ============================================================================
+
+@Reasoning
+FNV-1a 64-bit hash over a null-terminated byte string. Used as h1.
+@End Reasoning
+
+@Implementation
+Walk bytes: hash = (hash xor byte) * prime. Returns the absolute value
+to keep it positive for modular reduction by m.
+@End Implementation
+
+@Performance_Hints
+Time: O(L) where L is key byte length.
+@End Performance_Hints
+
+@Security_Scope
+FNV-1a is not cryptographic - adequate for a Bloom filter's needs.
+@End Security_Scope
+Process called "bloom_hash1" takes key as Integer returns Integer:
+    If key is equal to 0:
+        Return 0
+    End If
+    Let h be BLOOM_FNV_OFFSET_BASIS
+    Let i be 0
+    While 1 is equal to 1:
+        Let byte be proc memory_get_byte from Memory with key, i
+        If byte is equal to 0:
+            If h is less than 0:
+                Return 0 minus h
+            End If
+            Return h
+        End If
+        Set h to h bitwise xor byte
+        Set h to h multiplied by BLOOM_FNV_PRIME
+        Set i to i plus 1
+    End While
+    Return h
+End Process
+
+@Reasoning
+Secondary hash, used as h2 in the double-hashing scheme. We use a
+variant of FNV with a different seed to give a sufficiently independent
+hash so that h1 + i*h2 spreads uniformly.
+@End Reasoning
+
+@Implementation
+Same FNV-1a structure but with a different starting seed and prime
+swap. The dual-hash technique (Kirsch and Mitzenmacher 2008) gives
+the same false-positive rate as k truly independent hashes.
+@End Implementation
+
+@Performance_Hints
+Time: O(L).
+@End Performance_Hints
+
+@Security_Scope
+Same as bloom_hash1.
+@End Security_Scope
+Process called "bloom_hash2" takes key as Integer returns Integer:
+    If key is equal to 0:
+        Return 0
+    End If
+    Let h be 5381
+    Let i be 0
+    While 1 is equal to 1:
+        Let byte be proc memory_get_byte from Memory with key, i
+        If byte is equal to 0:
+            If h is less than 0:
+                Return 0 minus h
+            End If
+            Return h
+        End If
+        Note: djb2 step: hash = hash * 33 + byte
+        Set h to (h multiplied by 33) plus byte
+        Set i to i plus 1
+    End While
+    Return h
+End Process
+
+Note: ============================================================================
+Note: SIZING HELPERS
+Note: ============================================================================
+
+@Reasoning
+Compute the bit array size m given capacity n and target FPR p.
+Closed-form: m = -n * ln(p) / (ln 2)^2 = n * (-log2(p)) * 1.4427.
+
+We accept p as a parts-per-million integer (e.g. 10000 for 1% FPR)
+to avoid floating-point in the bootstrap arithmetic.
+@End Reasoning
+
+@Implementation
+The integer formula uses a table of -log2(p) approximations for
+common p values, scaled to a fixed-point integer with 16 fractional
+bits. For p_ppm = 10000 (1%), -log2(0.01) = 6.6439; scaled value =
+6.6439 * 65536 = 435485.
+
+Rather than embed a full table, we use the identity:
+  m_approx = n * neg_log2_p_fp / 65536 * 1.4427_fp / 65536
+For the common case p = 0.01 (10000 ppm) we hardcode the multiplier
+to 9585 (which is 6.6439 * 1.4427, rounded), giving m = n * 9585 / 1000.
+
+To support arbitrary p we compute -log2(p) iteratively using shifts:
+  let r = 0; while p_ppm < 500000: p_ppm *= 2; r += 1; end
+Each shift doubles p, accumulating an integer log2 magnitude.
+@End Implementation
+
+@Performance_Hints
+Time: O(log(1/p)).
+@End Performance_Hints
+
+@Security_Scope
+Pure.
+@End Security_Scope
+Process called "bloom_optimal_bits" takes n as Integer, p_ppm as Integer returns Integer:
+    If n is less than or equal to 0:
+        Return 64
+    End If
+    If p_ppm is less than or equal to 0:
+        Set p_ppm to 10000
+    End If
+    Note: Compute integer ceil(-log2(p)) where p = p_ppm / 1000000.
+    Let target be 500000
+    Let log2_recip be 0
+    Let scaled be p_ppm
+    While scaled is less than target:
+        Set scaled to scaled multiplied by 2
+        Set log2_recip to log2_recip plus 1
+    End While
+    Note: m = n * log2_recip * 144 / 100 (approximation of n * log2(1/p) * ln2)
+    Let m be (n multiplied by log2_recip multiplied by 144) divided by 100
+    If m is less than 64:
+        Set m to 64
+    End If
+    Return m
+End Process
+
+@Reasoning
+Compute optimal hash count k = (m / n) * ln 2. ln 2 ~ 0.693.
+@End Reasoning
+
+@Implementation
+k = (m * 693) / (n * 1000); clamped to [1, 32].
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure.
+@End Security_Scope
+Process called "bloom_optimal_hashes" takes m as Integer, n as Integer returns Integer:
+    If n is less than or equal to 0:
+        Return 7
+    End If
+    Let k be (m multiplied by 693) divided by (n multiplied by 1000)
+    If k is less than 1:
+        Set k to 1
+    End If
+    If k is greater than 32:
+        Set k to 32
+    End If
+    Return k
+End Process
+
+Note: ============================================================================
+Note: FILTER CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Create a Bloom filter parameterized by capacity (expected element
+count) and target FPR in parts-per-million.
+@End Reasoning
+
+@Implementation
+1) Compute m and k from sizing helpers.
+2) Allocate header and bit array (ceil(m / 8) bytes).
+3) Initialize fields.
+@End Implementation
+
+@Performance_Hints
+Time: O(m / 8). Space: O(m / 8) bytes.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "bloom_create" takes capacity as Integer, fpr_ppm as Integer returns Integer:
+    Let m be proc bloom_optimal_bits with capacity, fpr_ppm
+    Let k be proc bloom_optimal_hashes with m, capacity
+    Let bits_bytes be (m plus 7) divided by 8
+    Let bf be proc allocate from Layout with BLOOM_HEADER_SIZE
+    If bf is equal to 0:
+        Return 0
+    End If
+    Let bits be proc allocate from Layout with bits_bytes
+    If bits is equal to 0:
+        proc deallocate from Layout with bf
+        Return 0
+    End If
+    Note: zero-init the bit array
+    Let zi be 0
+    While zi is less than bits_bytes:
+        proc memory_set_byte from Memory with bits, zi, 0
+        Set zi to zi plus 1
+    End While
+    proc memory_set_int64 from Memory with bf, 0, bits
+    proc memory_set_int64 from Memory with bf, 8, m
+    proc memory_set_int64 from Memory with bf, 16, k
+    proc memory_set_int64 from Memory with bf, 24, capacity
+    proc memory_set_int64 from Memory with bf, 32, 0
+    Return bf
+End Process
+
+@Reasoning
+Free filter and bit array.
+@End Reasoning
+
+@Implementation
+Deallocate bits then header.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "bloom_destroy" takes bf as Integer returns Integer:
+    If bf is equal to 0:
+        Return 0
+    End If
+    Let bits be proc memory_get_int64 from Memory with bf, 0
+    If bits is not equal to 0:
+        proc deallocate from Layout with bits
+    End If
+    proc deallocate from Layout with bf
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: BIT OPERATIONS
+Note: ============================================================================
+
+@Reasoning
+Set the bit at index 'bit_index' in the filter's bit array.
+@End Reasoning
+
+@Implementation
+byte_index = bit_index / 8; bit_mask = 1 << (bit_index mod 8).
+bits[byte_index] |= bit_mask.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated bit_index (must be < m).
+@End Security_Scope
+Process called "bloom_set_bit" takes bits as Integer, bit_index as Integer returns Integer:
+    Let byte_index be bit_index divided by 8
+    Let bit_off be bit_index modulo by 8
+    Let mask be 1 shifted left by bit_off
+    Let old be proc memory_get_byte from Memory with bits, byte_index
+    Let new_val be old bitwise or mask
+    proc memory_set_byte from Memory with bits, byte_index, new_val
+    Return 1
+End Process
+
+@Reasoning
+Test bit at index 'bit_index'.
+@End Reasoning
+
+@Implementation
+Read byte, mask out the bit, return 1 if non-zero.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated bit_index.
+@End Security_Scope
+Process called "bloom_get_bit" takes bits as Integer, bit_index as Integer returns Integer:
+    Let byte_index be bit_index divided by 8
+    Let bit_off be bit_index modulo by 8
+    Let mask be 1 shifted left by bit_off
+    Let b be proc memory_get_byte from Memory with bits, byte_index
+    Let v be b bitwise and mask
+    If v is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: INSERT / CONTAINS / COUNT-ESTIMATE
+Note: ============================================================================
+
+@Reasoning
+Insert a key. Computes k hash positions via h1 + i*h2 and sets each
+corresponding bit.
+@End Reasoning
+
+@Implementation
+1) Compute h1 and h2.
+2) For i in 0..k-1: pos = (h1 + i * h2) mod m. Set bit at pos.
+3) Increment insert_count.
+@End Implementation
+
+@Performance_Hints
+Time: O(L + k).
+@End Performance_Hints
+
+@Security_Scope
+Caller must supply null-terminated key bytes.
+@End Security_Scope
+Process called "bloom_insert" takes bf as Integer, key as Integer returns Integer:
+    If bf is equal to 0:
+        Return 0
+    End If
+    Let bits be proc memory_get_int64 from Memory with bf, 0
+    Let m be proc memory_get_int64 from Memory with bf, 8
+    Let k be proc memory_get_int64 from Memory with bf, 16
+    Let h1 be proc bloom_hash1 with key
+    Let h2 be proc bloom_hash2 with key
+    Let i be 0
+    While i is less than k:
+        Let pos be (h1 plus (i multiplied by h2)) modulo by m
+        If pos is less than 0:
+            Set pos to 0 minus pos
+        End If
+        proc bloom_set_bit with bits, pos
+        Set i to i plus 1
+    End While
+    Let n_inserted be proc memory_get_int64 from Memory with bf, 32
+    proc memory_set_int64 from Memory with bf, 32, n_inserted plus 1
+    Return 1
+End Process
+
+@Reasoning
+Probe membership. Returns 1 if all k bits are set (probably present),
+0 if any is clear (definitely absent).
+@End Reasoning
+
+@Implementation
+Compute the same k positions; if any bit is 0, return 0 early.
+@End Implementation
+
+@Performance_Hints
+Time: O(L + k).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "bloom_contains" takes bf as Integer, key as Integer returns Integer:
+    If bf is equal to 0:
+        Return 0
+    End If
+    Let bits be proc memory_get_int64 from Memory with bf, 0
+    Let m be proc memory_get_int64 from Memory with bf, 8
+    Let k be proc memory_get_int64 from Memory with bf, 16
+    Let h1 be proc bloom_hash1 with key
+    Let h2 be proc bloom_hash2 with key
+    Let i be 0
+    While i is less than k:
+        Let pos be (h1 plus (i multiplied by h2)) modulo by m
+        If pos is less than 0:
+            Set pos to 0 minus pos
+        End If
+        Let b be proc bloom_get_bit with bits, pos
+        If b is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Return the exact number of insert calls (NOT distinct elements; a key
+inserted twice counts twice). Used as an upper bound on the count of
+unique elements.
+@End Reasoning
+
+@Implementation
+Read insert_count at offset 32.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "bloom_insert_count" takes bf as Integer returns Integer:
+    If bf is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with bf, 32
+End Process
+
+@Reasoning
+Estimate the cardinality of distinct elements inserted using the
+Swamidass and Baldi 2007 formula:
+  n_est = -m / k * ln(1 - X / m)
+where X is the count of bits currently set. Implemented via integer
+approximation: count set bits, then apply n_est ~ -m/k * ln(1 - x_frac).
+For Bloom-typical occupancies of < 50%, we use the linear approximation
+ln(1 - q) ~ -q - q^2/2 - q^3/3.
+@End Reasoning
+
+@Implementation
+1) Count set bits across the array.
+2) Compute fraction full = set_count * 1000 / m (parts per thousand).
+3) Use Taylor series approximation for -ln(1 - q) where q = fraction.
+4) n_est ~ (m / k) * approx.
+@End Implementation
+
+@Performance_Hints
+Time: O(m / 8). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Approximation; the exact insert count is available via
+bloom_insert_count.
+@End Security_Scope
+Process called "bloom_estimate_count" takes bf as Integer returns Integer:
+    If bf is equal to 0:
+        Return 0
+    End If
+    Let bits be proc memory_get_int64 from Memory with bf, 0
+    Let m be proc memory_get_int64 from Memory with bf, 8
+    Let k be proc memory_get_int64 from Memory with bf, 16
+    Let bytes be (m plus 7) divided by 8
+    Let set_count be 0
+    Let bi be 0
+    While bi is less than bytes:
+        Let b be proc memory_get_byte from Memory with bits, bi
+        Let j be 0
+        While j is less than 8:
+            Let mask be 1 shifted left by j
+            Let v be b bitwise and mask
+            If v is not equal to 0:
+                Set set_count to set_count plus 1
+            End If
+            Set j to j plus 1
+        End While
+        Set bi to bi plus 1
+    End While
+    If set_count is equal to 0:
+        Return 0
+    End If
+    If set_count is greater than or equal to m:
+        Return proc memory_get_int64 from Memory with bf, 24
+    End If
+    Note: q_milli = set_count * 1000 / m (parts per thousand)
+    Let q_milli be (set_count multiplied by 1000) divided by m
+    Note: -ln(1-q) ~ q + q^2/2 + q^3/3, in thousandths.
+    Let q2 be (q_milli multiplied by q_milli) divided by 1000
+    Let q3 be (q2 multiplied by q_milli) divided by 1000
+    Let neg_ln be q_milli plus (q2 divided by 2) plus (q3 divided by 3)
+    Note: n_est = (m / k) * neg_ln / 1000
+    Let n_est be ((m divided by k) multiplied by neg_ln) divided by 1000
+    Return n_est
+End Process
+
+@Reasoning
+Number of bits in the filter.
+@End Reasoning
+
+@Implementation
+Returns m field.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "bloom_bit_count" takes bf as Integer returns Integer:
+    If bf is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with bf, 8
+End Process
+
+@Reasoning
+Number of hash functions used.
+@End Reasoning
+
+@Implementation
+Returns k field.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "bloom_hash_count" takes bf as Integer returns Integer:
+    If bf is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with bf, 16
+End Process

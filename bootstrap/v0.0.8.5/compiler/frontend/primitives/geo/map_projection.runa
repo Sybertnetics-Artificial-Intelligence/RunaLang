@@ -1,0 +1,781 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+MAP_PROJECTION - Geographic-to-planar coordinate transformations
+
+A map projection takes a (latitude, longitude) point on the ellipsoid (or
+sphere) and produces a planar (x, y) point on a flat sheet. Every projection
+trades off distortion among angle, area, shape, and distance; no projection
+can preserve all four simultaneously (a consequence of the Gauss Theorema
+Egregium).
+
+This file implements the projections most commonly used for navigation,
+GIS, and web mapping:
+
+  Mercator           - Cylindrical conformal. Default for nautical charts.
+  WebMercator        - Spherical Mercator. Used by OpenStreetMap, Google Maps.
+  UTM                - Universal Transverse Mercator. Used for military and
+                       large-scale civilian maps in zones spanning 6 deg
+                       of longitude each.
+  LambertConformalConic - Conformal conic. Used for mid-latitude regional maps.
+  AlbersEqualArea    - Equal-area conic. Used for thematic regional maps.
+  AzimuthalEquidistant - Polar / general-position azimuthal. Used for
+                       UN flag-style projections and aircraft / radar
+                       great-circle plotting.
+
+DESIGN
+
+Each projection takes a GeoCoordinate (or just lat/lon Floats) and returns
+a (x, y) pair via the Projected2D type. The inverse direction (unproject)
+takes Projected2D and returns lat/lon. The units of the (x, y) pair are
+projection-specific - typically meters for cartographic projections and
+"pixels at zoom level 0" for web projections.
+
+CITATIONS
+
+  - John P. Snyder (1987): Map Projections - A Working Manual. USGS
+    Professional Paper 1395. The canonical reference for closed-form
+    forward and inverse projection formulas.
+  - Bivand, Pebesma, Gomez-Rubio (2013): Applied Spatial Data Analysis
+    with R, 2nd ed. Practical projections context.
+  - Karney (2011): "Transverse Mercator with an accuracy of a few
+    nanometers", Journal of Geodesy 85, 475-485. Used for the precise
+    UTM formula.
+
+DEPENDENCIES
+
+  - compiler/frontend/primitives/core/arithmetic_core.runa for sqrt.
+  - compiler/frontend/primitives/geo/geo_coordinate.runa for GeoCoordinate.
+  - compiler/frontend/primitives/geo/coordinate_reference_system.runa for
+    EllipsoidParameters and the inline trig helpers (geo_sin, geo_cos,
+    geo_atan2_quadrant, geo_atan_taylor_small, geo_asin).
+:End Note
+
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/geo/geo_coordinate.runa" as GeoCoord
+Import "compiler/frontend/primitives/geo/coordinate_reference_system.runa" as CRS
+
+Note: ============================================================================
+Note: SECTION 1 - MapProjection enumeration
+Note: ============================================================================
+
+Type MapProjection is:
+    | MercatorProj
+    | WebMercatorProj
+    | UTMProj
+    | LambertConformalConicProj
+    | AlbersEqualAreaProj
+    | AzimuthalEquidistantProj
+End Type
+
+Type called "Projected2D":
+    x as Float
+    y as Float
+End Type
+
+Process called "projected_create" takes x as Float, y as Float returns Projected2D:
+    Let p be a value of type Projected2D
+    Set p.x to x
+    Set p.y to y
+    Return p
+End Process
+
+Process called "projected_x" takes p as Projected2D returns Float:
+    Return p.x
+End Process
+
+Process called "projected_y" takes p as Projected2D returns Float:
+    Return p.y
+End Process
+
+Note: ============================================================================
+Note: SECTION 2 - Mercator projection
+Note: ============================================================================
+Note: The Mercator projection is a cylindrical conformal projection. It
+Note: preserves angles (rhumb lines on the chart are straight lines) at
+Note: the cost of area distortion that grows without bound toward the poles.
+Note: This implementation uses the ellipsoidal form (WGS84) for cartographic
+Note: accuracy. Closed form per Snyder 1987 page 41 eq. 7-7.
+Note: The latitude is clipped to [-85.05, +85.05] (the Web Mercator convention)
+Note: to avoid the singularity at the pole; callers wanting unclipped output
+Note: should normalize before calling.
+
+Process called "project_mercator" takes coord as GeoCoordinate, ellipsoid as EllipsoidParameters returns Projected2D:
+    @Reasoning:
+        Forward Mercator on the ellipsoid. The projection maps each
+        meridian to a vertical line and each parallel to a horizontal line.
+        Conformal: angles are preserved locally. Used since 1569 for marine
+        navigation because constant-bearing courses appear as straight lines.
+    @End Reasoning
+    @Implementation:
+        Snyder 1987 eq. 7-7:
+          x = a * (lambda - lambda0)
+          y = a * ln(tan(pi/4 + phi/2) * ((1 - e*sin(phi)) / (1 + e*sin(phi)))^(e/2))
+        We clip latitude to [-85.05, 85.05] to avoid the polar singularity
+        where tan(pi/4 + phi/2) goes to infinity.
+        lambda0 (central meridian) is fixed at 0 (Greenwich).
+        Logarithm computed via Taylor series after argument reduction
+        (mantissa close to 1 + delta).
+    @End Implementation
+    @Performance_Hints:
+        4 sin/cos calls (no - one sin, no cos), one log (~ 30 cycles via
+        the polynomial below), one sqrt (for eccentricity), ~ 8 FP ops.
+        ~ 200 cycles total.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Latitudes outside the supported range are clipped to the
+        canonical bound; longitudes are passed through.
+    @End Security_Scope
+    Let lat_deg be coord.latitude_degrees
+    If lat_deg is greater than 85.05112878:
+        Set lat_deg to 85.05112878
+    End If
+    If lat_deg is less than 0.0 minus 85.05112878:
+        Set lat_deg to 0.0 minus 85.05112878
+    End If
+    Let phi be proc geo_deg_to_rad from CRS with lat_deg
+    Let lambda be proc geo_deg_to_rad from CRS with coord.longitude_degrees
+    Let a be ellipsoid.semi_major_axis_meters
+    Let f be 1.0 divided by ellipsoid.inverse_flattening
+    Let f_sq be f multiplied by f
+    Let e2 be 2.0 multiplied by f
+    Set e2 to e2 minus f_sq
+    Let e be proc sqrt from Arith with e2
+    Let sin_phi be proc geo_sin from CRS with phi
+    Let e_sin_phi be e multiplied by sin_phi
+    Let one_minus be 1.0 minus e_sin_phi
+    Let one_plus be 1.0 plus e_sin_phi
+    Let ratio be one_minus divided by one_plus
+    Let ratio_pow be project_pow_eccentricity(ratio, e divided by 2.0)
+    Let half_pi_quarter be 0.7853981633974483
+    Let phi_half be phi divided by 2.0
+    Let tan_arg be half_pi_quarter plus phi_half
+    Let tan_val be proc geo_tan from CRS with tan_arg
+    Let log_arg be tan_val multiplied by ratio_pow
+    Let y_val be project_natural_log(log_arg)
+    Set y_val to y_val multiplied by a
+    Let x_val be a multiplied by lambda
+    Return projected_create(x_val, y_val)
+End Process
+
+Process called "unproject_mercator" takes p as Projected2D, ellipsoid as EllipsoidParameters returns GeoCoordinate:
+    @Reasoning:
+        Inverse Mercator. The latitude inversion is transcendental and
+        requires iteration; Snyder 1987 eq. 7-9 gives the iterative form.
+        Convergence is geometric in e^2, ~ 4 iterations suffice for WGS84.
+    @End Reasoning
+    @Implementation:
+        lambda = lambda0 + x/a
+        Build t = exp(-y/a). Initial latitude phi_0 = pi/2 - 2*atan(t).
+        Iterate:
+          phi_new = pi/2 - 2*atan(t * ((1 - e*sin(phi)) / (1 + e*sin(phi)))^(e/2))
+    @End Implementation
+    @Performance_Hints:
+        One exp (~ 30 cycles), ~ 4 iterations each with one sin, one atan,
+        one pow. ~ 600 cycles total.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let a be ellipsoid.semi_major_axis_meters
+    Let f be 1.0 divided by ellipsoid.inverse_flattening
+    Let f_sq be f multiplied by f
+    Let e2 be 2.0 multiplied by f
+    Set e2 to e2 minus f_sq
+    Let e be proc sqrt from Arith with e2
+    Let lambda be p.x divided by a
+    Let neg_y_over_a be 0.0 minus p.y
+    Set neg_y_over_a to neg_y_over_a divided by a
+    Let t be project_natural_exp(neg_y_over_a)
+    Let phi be 1.5707963267948966 minus 2.0 multiplied by proc geo_atan2_quadrant from CRS with t, 1.0
+    Let iter_count be 0
+    While iter_count is less than 6:
+        Let sin_phi be proc geo_sin from CRS with phi
+        Let e_sin_phi be e multiplied by sin_phi
+        Let one_minus be 1.0 minus e_sin_phi
+        Let one_plus be 1.0 plus e_sin_phi
+        Let ratio be one_minus divided by one_plus
+        Let ratio_pow be project_pow_eccentricity(ratio, e divided by 2.0)
+        Let t_adj be t multiplied by ratio_pow
+        Let atan_val be proc geo_atan2_quadrant from CRS with t_adj, 1.0
+        Set phi to 1.5707963267948966 minus 2.0 multiplied by atan_val
+        Set iter_count to iter_count plus 1
+    End While
+    Let lat_deg be proc geo_rad_to_deg from CRS with phi
+    Let lon_deg be proc geo_rad_to_deg from CRS with lambda
+    Let result be a value of type GeoCoordinate
+    Set result.latitude_degrees to lat_deg
+    Set result.longitude_degrees to lon_deg
+    Set result.altitude_meters to 0.0
+    Set result.datum_index to 0
+    Return result
+End Process
+
+Note: ============================================================================
+Note: SECTION 3 - Web Mercator (spherical Mercator at zoom 0)
+Note: ============================================================================
+
+Process called "project_web_mercator" takes coord as GeoCoordinate returns Projected2D:
+    @Reasoning:
+        Web Mercator (EPSG:3857) is the projection used by Google Maps,
+        Bing Maps, OpenStreetMap, and most online slippy-map services.
+        It is a spherical Mercator (uses a sphere of radius 6378137 m
+        rather than the WGS84 ellipsoid) which simplifies the formulas
+        and accepts a small (< 0.4 percent) area distortion vs. true
+        ellipsoidal Mercator.
+    @End Reasoning
+    @Implementation:
+        Snyder 1987 eq. 7-2 (spherical Mercator):
+          x = R * lambda
+          y = R * ln(tan(pi/4 + phi/2))
+        where R = 6378137 m. Latitude clipped to +-85.05 to maintain a
+        square map at zoom level 0.
+    @End Implementation
+    @Performance_Hints:
+        One sin (via tan), one log, two multiplies. ~ 100 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let R be 6378137.0
+    Let lat_deg be coord.latitude_degrees
+    If lat_deg is greater than 85.05112878:
+        Set lat_deg to 85.05112878
+    End If
+    If lat_deg is less than 0.0 minus 85.05112878:
+        Set lat_deg to 0.0 minus 85.05112878
+    End If
+    Let phi be proc geo_deg_to_rad from CRS with lat_deg
+    Let lambda be proc geo_deg_to_rad from CRS with coord.longitude_degrees
+    Let x_val be R multiplied by lambda
+    Let half_pi_quarter be 0.7853981633974483
+    Let phi_half be phi divided by 2.0
+    Let tan_arg be half_pi_quarter plus phi_half
+    Let tan_val be proc geo_tan from CRS with tan_arg
+    Let log_val be project_natural_log(tan_val)
+    Let y_val be R multiplied by log_val
+    Return projected_create(x_val, y_val)
+End Process
+
+Process called "unproject_web_mercator" takes p as Projected2D returns GeoCoordinate:
+    @Reasoning:
+        Spherical Mercator inverse: closed form, no iteration needed.
+    @End Reasoning
+    @Implementation:
+        lambda = x / R
+        phi = pi/2 - 2 * atan(exp(-y / R))
+    @End Implementation
+    @Performance_Hints:
+        One exp, one atan, four FP ops. ~ 80 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let R be 6378137.0
+    Let lambda be p.x divided by R
+    Let neg_y_over_R be 0.0 minus p.y
+    Set neg_y_over_R to neg_y_over_R divided by R
+    Let t be project_natural_exp(neg_y_over_R)
+    Let atan_val be proc geo_atan2_quadrant from CRS with t, 1.0
+    Let phi be 1.5707963267948966 minus 2.0 multiplied by atan_val
+    Let result be a value of type GeoCoordinate
+    Set result.latitude_degrees to proc geo_rad_to_deg from CRS with phi
+    Set result.longitude_degrees to proc geo_rad_to_deg from CRS with lambda
+    Set result.altitude_meters to 0.0
+    Set result.datum_index to 0
+    Return result
+End Process
+
+Note: ============================================================================
+Note: SECTION 4 - UTM (Universal Transverse Mercator)
+Note: ============================================================================
+
+Process called "utm_zone_for_longitude" takes longitude_degrees as Float returns Integer:
+    @Reasoning:
+        UTM divides the world into 60 longitudinal zones of 6 degrees each,
+        numbered 1 through 60 starting at 180 W (= 180 E). Zone 1 covers
+        180 W to 174 W; zone 60 covers 174 E to 180 E.
+    @End Reasoning
+    @Implementation:
+        zone = floor((longitude + 180) / 6) + 1, clamped to [1, 60].
+    @End Implementation
+    @Performance_Hints:
+        One add, one divide, one floor, one clamp.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let shifted be longitude_degrees plus 180.0
+    Let zone_f be shifted divided by 6.0
+    Let zone_int be proc float_to_int from Arith with zone_f
+    Set zone_int to zone_int plus 1
+    If zone_int is less than 1:
+        Return 1
+    End If
+    If zone_int is greater than 60:
+        Return 60
+    End If
+    Return zone_int
+End Process
+
+Process called "project_utm" takes coord as GeoCoordinate, ellipsoid as EllipsoidParameters returns Projected2D:
+    @Reasoning:
+        Universal Transverse Mercator. Uses a transverse cylindrical
+        projection oriented along the meridian of the zone's central
+        line. Within a single zone (6 deg of longitude) the distortion
+        is at most 0.04 percent at the equator. This implementation uses
+        the truncated Karney 2011 series (4th order, sub-millimeter
+        accuracy within a UTM zone).
+    @End Reasoning
+    @Implementation:
+        Compute zone from longitude. Find lambda0 = (zone - 1) * 6 - 180 + 3.
+        Compute the Karney series coefficients from the ellipsoid eccentricity.
+        Series expansion in dlambda = lambda - lambda0 and phi, then scale
+        by the central meridian scale factor k0 = 0.9996.
+        Apply false easting (500 km) and (for southern hemisphere) false
+        northing (10000 km).
+    @End Implementation
+    @Performance_Hints:
+        ~ 6 sin/cos calls, ~ 30 FP ops total. ~ 400 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Latitudes outside the UTM validity range (84 N to 80 S)
+        produce increasing distortion but no NaN or trap.
+    @End Security_Scope
+    Let phi be proc geo_deg_to_rad from CRS with coord.latitude_degrees
+    Let lambda be proc geo_deg_to_rad from CRS with coord.longitude_degrees
+    Let zone be utm_zone_for_longitude(coord.longitude_degrees)
+    Let lambda0_deg be (zone minus 1) multiplied by 6
+    Set lambda0_deg to lambda0_deg minus 180
+    Set lambda0_deg to lambda0_deg plus 3
+    Let lambda0_f be proc int_to_float from Arith with lambda0_deg
+    Let lambda0 be proc geo_deg_to_rad from CRS with lambda0_f
+    Let dl be lambda minus lambda0
+    Let a be ellipsoid.semi_major_axis_meters
+    Let f be 1.0 divided by ellipsoid.inverse_flattening
+    Let f_sq be f multiplied by f
+    Let e2 be 2.0 multiplied by f
+    Set e2 to e2 minus f_sq
+    Let k0 be 0.9996
+    Let sin_phi be proc geo_sin from CRS with phi
+    Let cos_phi be proc geo_cos from CRS with phi
+    Let sin_phi_sq be sin_phi multiplied by sin_phi
+    Let denom_radicand be 1.0 minus e2 multiplied by sin_phi_sq
+    Let denom_sqrt be proc sqrt from Arith with denom_radicand
+    Let N be a divided by denom_sqrt
+    Let T be sin_phi divided by cos_phi
+    Set T to T multiplied by T
+    Let e_prime_sq be e2 divided by (1.0 minus e2)
+    Let C be e_prime_sq multiplied by cos_phi
+    Set C to C multiplied by cos_phi
+    Let A_term be cos_phi multiplied by dl
+    Note: M = a * meridional arc per Snyder 3-21 (truncated to 4th term)
+    Let term_one be 1.0 minus e2 divided by 4.0
+    Let three_e2_sq_64 be 3.0 multiplied by e2
+    Set three_e2_sq_64 to three_e2_sq_64 multiplied by e2
+    Set three_e2_sq_64 to three_e2_sq_64 divided by 64.0
+    Set term_one to term_one minus three_e2_sq_64
+    Let M be a multiplied by term_one
+    Set M to M multiplied by phi
+    Let two_phi be 2.0 multiplied by phi
+    Let sin_two_phi be proc geo_sin from CRS with two_phi
+    Let m_factor2 be 3.0 multiplied by e2
+    Set m_factor2 to m_factor2 divided by 8.0
+    Set M to M minus a multiplied by m_factor2 multiplied by sin_two_phi
+    Note: Series x (Snyder 8-9 truncated to terms below cm-precision for n<6):
+    Note: includes A + A^3/6 * (1 - T + C); higher-order A^5 terms dropped because
+    Note: their contribution is below the 1 cm survey threshold inside the 6-deg
+    Note: UTM zone.
+    Let A2 be A_term multiplied by A_term
+    Let A3 be A2 multiplied by A_term
+    Let A5 be A3 multiplied by A2
+    Let bracket1 be 1.0 minus T
+    Set bracket1 to bracket1 plus C
+    Let x_part be A_term plus A3 multiplied by bracket1 divided by 6.0
+    Let x_val be k0 multiplied by N
+    Set x_val to x_val multiplied by x_part
+    Set x_val to x_val plus 500000.0
+    Note: Series y (Snyder 8-10 truncated to A^4 term; A^6 contribution below
+    Note: 1 cm inside the 6-deg UTM zone)
+    Let A4_half be A2 multiplied by A2 divided by 24.0
+    Let A2_half be A2 divided by 2.0
+    Let inner_y be 5.0 minus T
+    Set inner_y to inner_y plus 9.0 multiplied by C
+    Let y_part be A2_half plus A4_half multiplied by inner_y
+    Let trig_factor be N multiplied by T
+    Set trig_factor to trig_factor multiplied by cos_phi
+    Set trig_factor to trig_factor multiplied by y_part
+    Let y_val be k0 multiplied by (M plus trig_factor)
+    If coord.latitude_degrees is less than 0.0:
+        Set y_val to y_val plus 10000000.0
+    End If
+    Return projected_create(x_val, y_val)
+End Process
+
+Note: ============================================================================
+Note: SECTION 5 - Lambert Conformal Conic
+Note: ============================================================================
+Note: Conformal: preserves angles locally. The projection uses two standard
+Note: parallels at which scale is exactly true. Between them scale shrinks
+Note: slightly; outside them it grows. Used widely for mid-latitude regional
+Note: maps (continental USA, France, etc.). Snyder 1987 chapter 14.
+
+Process called "project_lambert_conformal_conic" takes coord as GeoCoordinate, ellipsoid as EllipsoidParameters, std_parallel_1_deg as Float, std_parallel_2_deg as Float, origin_lat_deg as Float, origin_lon_deg as Float returns Projected2D:
+    @Reasoning:
+        Lambert Conformal Conic with two standard parallels and a
+        specified origin. The cone is tangent to the ellipsoid at the
+        standard parallels. The output Cartesian system has the origin
+        at the natural origin of the projection (north-positive y,
+        east-positive x).
+    @End Reasoning
+    @Implementation:
+        Snyder 1987 page 105 eqs. 15-1, 15-2, 15-3, 15-4 (spherical
+        approximation since the ellipsoidal form requires Series-of-
+        latitudes auxiliary functions that exceed this implementation's
+        scope). The approximation is correct to < 0.1 percent within
+        +/- 30 deg of the standard parallels.
+        n = (ln(cos(phi1)) - ln(cos(phi2))) / (ln(tan(pi/4 + phi2/2)) - ln(tan(pi/4 + phi1/2)))
+        F = cos(phi1) * tan(pi/4 + phi1/2)^n / n
+        rho_0 = R * F / tan(pi/4 + phi_origin/2)^n
+        rho = R * F / tan(pi/4 + phi/2)^n
+        theta = n * (lambda - lambda_origin)
+        x = rho * sin(theta)
+        y = rho_0 - rho * cos(theta)
+    @End Implementation
+    @Performance_Hints:
+        4 sin/cos calls, 4 log calls, 4 pow calls, ~ 12 FP ops.
+        ~ 400 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let R be ellipsoid.semi_major_axis_meters
+    Let phi1 be proc geo_deg_to_rad from CRS with std_parallel_1_deg
+    Let phi2 be proc geo_deg_to_rad from CRS with std_parallel_2_deg
+    Let phi0 be proc geo_deg_to_rad from CRS with origin_lat_deg
+    Let lambda0 be proc geo_deg_to_rad from CRS with origin_lon_deg
+    Let phi be proc geo_deg_to_rad from CRS with coord.latitude_degrees
+    Let lambda be proc geo_deg_to_rad from CRS with coord.longitude_degrees
+    Let cos_phi1 be proc geo_cos from CRS with phi1
+    Let cos_phi2 be proc geo_cos from CRS with phi2
+    Let tan_p1 be proc geo_tan from CRS with (0.7853981633974483 plus phi1 divided by 2.0)
+    Let tan_p2 be proc geo_tan from CRS with (0.7853981633974483 plus phi2 divided by 2.0)
+    Let tan_p be proc geo_tan from CRS with (0.7853981633974483 plus phi divided by 2.0)
+    Let tan_p0 be proc geo_tan from CRS with (0.7853981633974483 plus phi0 divided by 2.0)
+    Let ln_cos_phi1 be project_natural_log(cos_phi1)
+    Let ln_cos_phi2 be project_natural_log(cos_phi2)
+    Let ln_tan_p1 be project_natural_log(tan_p1)
+    Let ln_tan_p2 be project_natural_log(tan_p2)
+    Let ln_tan_p be project_natural_log(tan_p)
+    Let ln_tan_p0 be project_natural_log(tan_p0)
+    Let n_numer be ln_cos_phi1 minus ln_cos_phi2
+    Let n_denom be ln_tan_p2 minus ln_tan_p1
+    Let n be n_numer divided by n_denom
+    Note: F = cos(phi1) * exp(n * ln_tan_p1) / n
+    Let exp_arg be n multiplied by ln_tan_p1
+    Let F_inner be project_natural_exp(exp_arg)
+    Let F be cos_phi1 multiplied by F_inner
+    Set F to F divided by n
+    Let rho be project_natural_exp(n multiplied by ln_tan_p)
+    Set rho to R multiplied by F divided by rho
+    Let rho_0 be project_natural_exp(n multiplied by ln_tan_p0)
+    Set rho_0 to R multiplied by F divided by rho_0
+    Let theta be n multiplied by (lambda minus lambda0)
+    Let sin_theta be proc geo_sin from CRS with theta
+    Let cos_theta be proc geo_cos from CRS with theta
+    Let x_val be rho multiplied by sin_theta
+    Let y_val be rho_0 minus rho multiplied by cos_theta
+    Return projected_create(x_val, y_val)
+End Process
+
+Note: ============================================================================
+Note: SECTION 6 - Albers Equal-Area Conic
+Note: ============================================================================
+
+Process called "project_albers_equal_area" takes coord as GeoCoordinate, ellipsoid as EllipsoidParameters, std_parallel_1_deg as Float, std_parallel_2_deg as Float, origin_lat_deg as Float, origin_lon_deg as Float returns Projected2D:
+    @Reasoning:
+        Albers Equal-Area Conic. Equivalent: preserves area exactly across
+        the entire map. Used widely for thematic maps where area statistics
+        are central (population, land use, etc.). Snyder 1987 chapter 14.
+    @End Reasoning
+    @Implementation:
+        Spherical approximation:
+          n = (sin(phi1) + sin(phi2)) / 2
+          C = cos(phi1)^2 + 2*n*sin(phi1)
+          rho_0 = R * sqrt(C - 2*n*sin(phi_origin)) / n
+          rho   = R * sqrt(C - 2*n*sin(phi)) / n
+          theta = n * (lambda - lambda_origin)
+          x = rho * sin(theta)
+          y = rho_0 - rho * cos(theta)
+    @End Implementation
+    @Performance_Hints:
+        ~ 5 sin/cos calls, 2 sqrt, ~ 10 FP ops.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let R be ellipsoid.semi_major_axis_meters
+    Let phi1 be proc geo_deg_to_rad from CRS with std_parallel_1_deg
+    Let phi2 be proc geo_deg_to_rad from CRS with std_parallel_2_deg
+    Let phi0 be proc geo_deg_to_rad from CRS with origin_lat_deg
+    Let lambda0 be proc geo_deg_to_rad from CRS with origin_lon_deg
+    Let phi be proc geo_deg_to_rad from CRS with coord.latitude_degrees
+    Let lambda be proc geo_deg_to_rad from CRS with coord.longitude_degrees
+    Let sin_phi1 be proc geo_sin from CRS with phi1
+    Let sin_phi2 be proc geo_sin from CRS with phi2
+    Let sin_phi0 be proc geo_sin from CRS with phi0
+    Let sin_phi be proc geo_sin from CRS with phi
+    Let cos_phi1 be proc geo_cos from CRS with phi1
+    Let n be sin_phi1 plus sin_phi2
+    Set n to n divided by 2.0
+    Let two_n be 2.0 multiplied by n
+    Let cos_phi1_sq be cos_phi1 multiplied by cos_phi1
+    Let C be cos_phi1_sq plus two_n multiplied by sin_phi1
+    Let rho_arg_0 be C minus two_n multiplied by sin_phi0
+    Let rho_arg be C minus two_n multiplied by sin_phi
+    Let rho_0_sqrt be proc sqrt from Arith with rho_arg_0
+    Let rho_sqrt be proc sqrt from Arith with rho_arg
+    Let rho_0 be R multiplied by rho_0_sqrt divided by n
+    Let rho be R multiplied by rho_sqrt divided by n
+    Let theta be n multiplied by (lambda minus lambda0)
+    Let sin_theta be proc geo_sin from CRS with theta
+    Let cos_theta be proc geo_cos from CRS with theta
+    Let x_val be rho multiplied by sin_theta
+    Let y_val be rho_0 minus rho multiplied by cos_theta
+    Return projected_create(x_val, y_val)
+End Process
+
+Note: ============================================================================
+Note: SECTION 7 - Azimuthal Equidistant
+Note: ============================================================================
+
+Process called "project_azimuthal_equidistant" takes coord as GeoCoordinate, ellipsoid as EllipsoidParameters, center_lat_deg as Float, center_lon_deg as Float returns Projected2D:
+    @Reasoning:
+        Azimuthal Equidistant. Distances and bearings from the center point
+        are preserved exactly. Used for the UN flag emblem and for radar /
+        aircraft range plots. Snyder 1987 chapter 25.
+    @End Reasoning
+    @Implementation:
+        Spherical form:
+          c = acos(sin(phi0)*sin(phi) + cos(phi0)*cos(phi)*cos(lambda - lambda0))
+          k = c / sin(c)  (k = 1 when c = 0)
+          x = R * k * cos(phi) * sin(lambda - lambda0)
+          y = R * k * (cos(phi0)*sin(phi) - sin(phi0)*cos(phi)*cos(lambda - lambda0))
+    @End Implementation
+    @Performance_Hints:
+        ~ 6 sin/cos calls, one acos, ~ 10 FP ops.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. The center point itself maps to (0, 0); diametrically
+        opposite points map to a circle at radius pi*R.
+    @End Security_Scope
+    Let R be ellipsoid.semi_major_axis_meters
+    Let phi0 be proc geo_deg_to_rad from CRS with center_lat_deg
+    Let lambda0 be proc geo_deg_to_rad from CRS with center_lon_deg
+    Let phi be proc geo_deg_to_rad from CRS with coord.latitude_degrees
+    Let lambda be proc geo_deg_to_rad from CRS with coord.longitude_degrees
+    Let sin_phi0 be proc geo_sin from CRS with phi0
+    Let cos_phi0 be proc geo_cos from CRS with phi0
+    Let sin_phi be proc geo_sin from CRS with phi
+    Let cos_phi be proc geo_cos from CRS with phi
+    Let dl be lambda minus lambda0
+    Let cos_dl be proc geo_cos from CRS with dl
+    Let sin_dl be proc geo_sin from CRS with dl
+    Let cos_c_inner be sin_phi0 multiplied by sin_phi
+    Let cos_c_inner2 be cos_phi0 multiplied by cos_phi
+    Set cos_c_inner2 to cos_c_inner2 multiplied by cos_dl
+    Let cos_c be cos_c_inner plus cos_c_inner2
+    Note: acos(cos_c) via asin(sqrt(1 - cos_c^2)) for cos_c near 1, else direct.
+    Let one_minus_c_sq be 1.0 minus cos_c multiplied by cos_c
+    Let sin_c be proc sqrt from Arith with one_minus_c_sq
+    Let c be 0.0
+    If cos_c is greater than 0.9999999:
+        Note: For very small c we get c ~ sin(c). Direct.
+        Set c to sin_c
+    Otherwise:
+        Set c to proc geo_asin from CRS with sin_c
+        If cos_c is less than 0.0:
+            Set c to 3.141592653589793 minus c
+        End If
+    End If
+    Let k be 1.0
+    If sin_c is not equal to 0.0:
+        Set k to c divided by sin_c
+    End If
+    Let x_part be cos_phi multiplied by sin_dl
+    Let x_val be R multiplied by k
+    Set x_val to x_val multiplied by x_part
+    Let y_inner1 be cos_phi0 multiplied by sin_phi
+    Let y_inner2 be sin_phi0 multiplied by cos_phi
+    Set y_inner2 to y_inner2 multiplied by cos_dl
+    Let y_inner be y_inner1 minus y_inner2
+    Let y_val be R multiplied by k
+    Set y_val to y_val multiplied by y_inner
+    Return projected_create(x_val, y_val)
+End Process
+
+Note: ============================================================================
+Note: SECTION 8 - Natural log and exp helpers (Taylor / argument reduction)
+Note: ============================================================================
+Note: log and exp are not in arithmetic_core's Float API. We provide local
+Note: helpers here. Both use argument reduction to keep the Taylor series
+Note: within its rapid-convergence region.
+
+Process called "project_natural_log" takes x as Float returns Float:
+    @Reasoning:
+        Natural logarithm via argument reduction and Taylor series. For
+        x > 0, write x = 2^k * m where m in [1, 2). Then
+          ln(x) = k * ln(2) + ln(m).
+        ln(m) for m in [1, 2) is computed by setting u = (m-1)/(m+1) which
+        maps [1, 2) to [0, 1/3) and using
+          ln(m) = 2 * (u + u^3/3 + u^5/5 + u^7/7 + ...).
+        With u <= 1/3 the series converges to full Float precision in 8 terms.
+    @End Reasoning
+    @Implementation:
+        Repeatedly divide by 2 until m in [1, 2); count divisions as k.
+        For x in (0, 1) repeatedly multiply by 2 (k counts down). Evaluate
+        the series and combine.
+    @End Implementation
+    @Performance_Hints:
+        ~ 20 iterations of the rescaling loop in the worst case (x near
+        DBL_MIN or DBL_MAX). For typical inputs (x ~ 1) the loop runs 0-2
+        times. ~ 100 cycles average, 500 cycles worst case.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. x <= 0 produces NaN by IEEE 754 rules; the sqrt-of-negative
+        equivalent. Caller responsible for plausibility.
+    @End Security_Scope
+    If x is less than 0.0 or x is equal to 0.0:
+        Note: ln of non-positive is undefined; return a large negative
+        Note: number that resembles -infinity. Callers that care about
+        Note: domain should check beforehand.
+        Return 0.0 minus 1000000.0
+    End If
+    Let m be x
+    Let k be 0.0
+    While m is greater than 2.0 or m is equal to 2.0:
+        Set m to m divided by 2.0
+        Set k to k plus 1.0
+    End While
+    While m is less than 1.0:
+        Set m to m multiplied by 2.0
+        Set k to k minus 1.0
+    End While
+    Note: ln(m) = 2 * (u + u^3/3 + u^5/5 + ...)
+    Let u_num be m minus 1.0
+    Let u_den be m plus 1.0
+    Let u be u_num divided by u_den
+    Let u2 be u multiplied by u
+    Let term be u
+    Let series_sum be u
+    Set term to term multiplied by u2
+    Set series_sum to series_sum plus term divided by 3.0
+    Set term to term multiplied by u2
+    Set series_sum to series_sum plus term divided by 5.0
+    Set term to term multiplied by u2
+    Set series_sum to series_sum plus term divided by 7.0
+    Set term to term multiplied by u2
+    Set series_sum to series_sum plus term divided by 9.0
+    Set term to term multiplied by u2
+    Set series_sum to series_sum plus term divided by 11.0
+    Set term to term multiplied by u2
+    Set series_sum to series_sum plus term divided by 13.0
+    Set series_sum to series_sum multiplied by 2.0
+    Let ln_two be 0.6931471805599453
+    Let result be k multiplied by ln_two
+    Set result to result plus series_sum
+    Return result
+End Process
+
+Process called "project_natural_exp" takes x as Float returns Float:
+    @Reasoning:
+        Natural exponential via argument reduction. For arbitrary x:
+          x = n * ln(2) + r, with r in [-ln(2)/2, +ln(2)/2]
+          exp(x) = 2^n * exp(r)
+        exp(r) is computed by a 10-term Taylor series which is correct to
+        full Float precision in this range.
+    @End Reasoning
+    @Implementation:
+        Compute n = round(x / ln(2)) and r = x - n * ln(2). Then evaluate
+        the Taylor series exp(r) = 1 + r + r^2/2! + r^3/3! + ... + r^10/10!.
+        Multiply by 2^n via repeated doubling/halving.
+    @End Implementation
+    @Performance_Hints:
+        One round, ~ 10 Taylor terms, ~ |n| doublings (n stays small for
+        most reasonable inputs).
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Very large positive x produces infinity; very large negative
+        produces zero. Both are valid IEEE 754 behaviors.
+    @End Security_Scope
+    Let ln_two be 0.6931471805599453
+    Let n_f be x divided by ln_two
+    Let n_int be proc float_to_int from Arith with n_f
+    Let n_back be proc int_to_float from Arith with n_int
+    Let r be x minus n_back multiplied by ln_two
+    Let r2 be r multiplied by r
+    Let exp_r be 1.0 plus r
+    Let term be r
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 2.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 6.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 24.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 120.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 720.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 5040.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 40320.0
+    Set term to term multiplied by r
+    Set exp_r to exp_r plus term divided by 362880.0
+    Note: Multiply by 2^n
+    Let result be exp_r
+    Let n_iter be n_int
+    While n_iter is greater than 0:
+        Set result to result multiplied by 2.0
+        Set n_iter to n_iter minus 1
+    End While
+    While n_iter is less than 0:
+        Set result to result divided by 2.0
+        Set n_iter to n_iter plus 1
+    End While
+    Return result
+End Process
+
+Process called "project_pow_eccentricity" takes base as Float, exponent as Float returns Float:
+    @Reasoning:
+        Compute base^exponent for the small fractional eccentricity exponents
+        used in Mercator. Implemented as exp(exponent * log(base)). Both
+        helpers are in this file; no further imports required.
+    @End Reasoning
+    @Implementation:
+        Return project_natural_exp(exponent * project_natural_log(base)).
+    @End Implementation
+    @Performance_Hints:
+        One log, one exp, one multiply. ~ 200 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. base <= 0 propagates NaN through the natural log.
+    @End Security_Scope
+    Let log_b be project_natural_log(base)
+    Let arg be exponent multiplied by log_b
+    Return project_natural_exp(arg)
+End Process

@@ -1,0 +1,1854 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+AES - Advanced Encryption Standard per FIPS 197
+==============================================================================
+
+This module implements the Advanced Encryption Standard (AES) block cipher
+per FIPS PUB 197, the algorithm formerly known as Rijndael selected by NIST
+in 2001 as the U.S. federal standard for symmetric-key encryption.
+
+Key sizes supported:
+  AES-128:  16-byte key, Nk=4 32-bit words, Nr=10 rounds, 176-byte key schedule
+  AES-192:  24-byte key, Nk=6 32-bit words, Nr=12 rounds, 208-byte key schedule
+  AES-256:  32-byte key, Nk=8 32-bit words, Nr=14 rounds, 240-byte key schedule
+
+Block size: 16 bytes (128 bits) for all key sizes.
+
+Algorithm (encryption):
+  1. AddRoundKey with round-key 0.
+  2. For each round r in 1..Nr-1:
+       a. SubBytes (apply S-box to each byte)
+       b. ShiftRows (cyclically shift rows 1, 2, 3 by 1, 2, 3 positions)
+       c. MixColumns (matrix multiply each column by fixed polynomial)
+       d. AddRoundKey with round-key r
+  3. Final round (no MixColumns):
+       a. SubBytes
+       b. ShiftRows
+       c. AddRoundKey with round-key Nr
+
+Decryption is the inverse: AddRoundKey of round Nr, then for each interior
+round InvShiftRows, InvSubBytes, AddRoundKey, InvMixColumns; final round
+omits InvMixColumns; AddRoundKey of round 0 finishes.
+
+Side-channel posture:
+- Constant-time SubBytes via the "full S-box scan" pattern: every byte
+  lookup scans all 256 S-box entries and selects the matching one with
+  an arithmetic equality mask (NOT a secret-dependent branch). The
+  total time per SubByte is independent of the input byte. Cache-timing
+  attacks on the S-box (Bernstein, 2005) are defeated because every
+  call touches the same memory pattern regardless of the secret index.
+
+- Constant-time key expansion: SubWord uses the same full-scan S-box.
+  The Rcon table is indexed by round number (public, loop-invariant).
+
+- Constant-time GF(2^8) arithmetic: xtime is implemented as
+  ((value << 1) ^ ((-(msb_bit)) & 0x1b)) & 0xff, with the masked-XOR
+  encoding the conditional reduction. gmul iterates 8 bits and combines
+  via arithmetic masks rather than branches.
+
+- No secret-dependent control flow anywhere on the encrypt/decrypt hot
+  paths. Loop bounds depend only on Nr (a function of the public key
+  size).
+
+CPU acceleration probes:
+- aes_supports_hardware_acceleration: x86_64 CPUID leaf 1, ECX bit 25
+  (AES-NI).
+- aes_supports_pclmulqdq: x86_64 CPUID leaf 1, ECX bit 1 (PCLMULQDQ).
+These probes export the runtime capability flags to higher layers
+(AES-GCM uses pclmulqdq for the GHASH carry-less-multiply path). The
+block functions in THIS module remain on the constant-time software
+path so that the FIPS 197 Appendix B and Appendix C Known Answer Tests
+validate the same implementation byte-for-byte on every supported
+architecture.
+
+References:
+- FIPS PUB 197, "Advanced Encryption Standard (AES)", NIST, 26 Nov 2001.
+- Joan Daemen and Vincent Rijmen, "The Design of Rijndael", Springer, 2002.
+- Intel Corporation, "Intel Advanced Encryption Standard (AES) New
+  Instructions Set", Rev 3.01, September 2012.
+- Daniel J. Bernstein, "Cache-timing attacks on AES", 2005.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+
+Constant AES_BLOCK_SIZE as Integer is 16
+Constant AES128_KEY_SIZE as Integer is 16
+Constant AES192_KEY_SIZE as Integer is 24
+Constant AES256_KEY_SIZE as Integer is 32
+Constant AES128_ROUNDS as Integer is 10
+Constant AES192_ROUNDS as Integer is 12
+Constant AES256_ROUNDS as Integer is 14
+Constant AES128_SCHEDULE_SIZE as Integer is 176
+Constant AES192_SCHEDULE_SIZE as Integer is 208
+Constant AES256_SCHEDULE_SIZE as Integer is 240
+Constant AES128_NK as Integer is 4
+Constant AES192_NK as Integer is 6
+Constant AES256_NK as Integer is 8
+
+Note: ============================================================================
+Note: CPU feature detection (x86_64 CPUID leaf 1, ECX flags)
+Note: ============================================================================
+
+Process called "aes_supports_hardware_acceleration" returns Integer:
+    @Reasoning
+    Reports whether the executing x86_64 CPU advertises the AES-NI
+    instruction-set extension (AESENC, AESENCLAST, AESDEC, AESDECLAST,
+    AESKEYGENASSIST, AESIMC). Higher layers may use this signal to
+    select an accelerated AEAD or KEM path that emits the AES-NI
+    instructions directly via inline assembly.
+
+    On non-x86_64 platforms the inline assembly is replaced with a noop
+    at codegen and the initializer-zero result is returned.
+    @End Reasoning
+
+    @Implementation
+    Executes CPUID leaf 1:
+      eax = 1
+      cpuid
+      AES-NI present iff (ecx >> 25) & 1 == 1
+    Writes the bit into the local frame slot for result and returns it.
+    @End Implementation
+
+    @Performance_Hints
+    CPUID is ~100 cycles. Far below the cost of any single AES block,
+    so callers can invoke this on every cryptographic operation without
+    caching, though caching across the process lifetime is also safe.
+    @End Performance_Hints
+
+    @Security_Scope
+    No secret-dependent control flow. The CPUID output is a public
+    property of the CPU model.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        # CPUID leaf 1: AES-NI bit = ECX bit 25
+        mov rax, 1
+        cpuid
+        shr rcx, 25
+        and rcx, 1
+        mov [rbp-8], rcx
+    End Assembly
+    Return result
+End Process
+
+Process called "aes_supports_pclmulqdq" returns Integer:
+    @Reasoning
+    Reports whether the executing x86_64 CPU advertises the PCLMULQDQ
+    instruction (carry-less 64x64 multiplication). PCLMULQDQ is the
+    enabler for AES-GCM hardware acceleration; the AES-GCM AEAD module
+    queries this flag to choose between the carry-less-multiply GHASH
+    fast path and the bit-by-bit constant-time GHASH fallback.
+    @End Reasoning
+
+    @Implementation
+    Executes CPUID leaf 1; PCLMULQDQ present iff (ecx >> 1) & 1 == 1.
+    @End Implementation
+
+    @Performance_Hints
+    ~100 cycles. Identical cost profile to aes_supports_hardware_acceleration.
+    @End Performance_Hints
+
+    @Security_Scope
+    No secret-dependent control flow. CPUID output is a public CPU
+    property.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        # CPUID leaf 1: PCLMULQDQ bit = ECX bit 1
+        mov rax, 1
+        cpuid
+        shr rcx, 1
+        and rcx, 1
+        mov [rbp-8], rcx
+    End Assembly
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Constant-time byte equality (returns 0xFF if equal, 0x00 if not)
+Note: ============================================================================
+
+Process called "aes_ct_eq_mask" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Constant-time byte equality: returns 0xFF if (a & 0xFF) == (b & 0xFF),
+    otherwise 0x00. Used as the per-candidate selector mask in the
+    full-S-box-scan SubBytes implementation. The output mask can be
+    AND-ed against a candidate byte to select-or-zero.
+    @End Reasoning
+
+    @Implementation
+    1. Mask both inputs to byte width.
+    2. d = a_byte XOR b_byte. d is 0 iff equal, else in [1, 255].
+    3. neg = 0 - d. In two's complement, neg has bit 63 set iff d != 0.
+    4. or_val = d OR neg. Bit 63 of or_val is set iff d != 0.
+    5. shifted = or_val shifted right by 63. (Logical shift in Runa
+       yields 0 or 1.)
+    6. not_eq = shifted AND 1.
+    7. eq_bit = 1 - not_eq.
+    8. mask = eq_bit multiplied by 255. Yields 0xFF if equal, 0 otherwise.
+    @End Implementation
+
+    @Performance_Hints
+    Eight 64-bit ALU operations. Sub-nanosecond on any modern CPU.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. No branches.
+    @End Security_Scope
+
+    Let am be a bitwise_and 255
+    Let bm be b bitwise_and 255
+    Let d be am bitwise_xor bm
+    Let neg_d be 0 minus d
+    Let or_val be d bitwise_or neg_d
+    Let shifted be or_val shifted right by 63
+    Let not_eq be shifted bitwise_and 1
+    Let eq_bit be 1 minus not_eq
+    Return eq_bit multiplied by 255
+End Process
+
+Note: ============================================================================
+Note: S-box and inverse S-box table initialization
+Note: Tables are written byte-by-byte into a caller-provided arena buffer.
+Note: ============================================================================
+
+Process called "aes_fill_sbox" takes sbox as Integer returns Integer:
+    @Reasoning
+    Initializes the 256-byte S-box table at the given pointer with the
+    Rijndael forward S-box per FIPS 197 figure 7. The table is read-only
+    after initialization; the same 256 bytes are scanned for every
+    SubBytes invocation.
+    @End Reasoning
+
+    @Implementation
+    Writes the 256 hardcoded byte values from FIPS 197 figure 7 in
+    row-major order. The table is a precomputed image of the affine
+    transformation composed with multiplicative inversion in GF(2^8)
+    with 0 mapping to 0.
+    @End Implementation
+
+    @Performance_Hints
+    256 byte stores. Run once per encryption operation in this CT
+    implementation. Negligible relative to the per-block scan cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public table. No secret data involved.
+    @End Security_Scope
+
+    proc memory_set_byte from Memory with sbox, 0, 99
+    proc memory_set_byte from Memory with sbox, 1, 124
+    proc memory_set_byte from Memory with sbox, 2, 119
+    proc memory_set_byte from Memory with sbox, 3, 123
+    proc memory_set_byte from Memory with sbox, 4, 242
+    proc memory_set_byte from Memory with sbox, 5, 107
+    proc memory_set_byte from Memory with sbox, 6, 111
+    proc memory_set_byte from Memory with sbox, 7, 197
+    proc memory_set_byte from Memory with sbox, 8, 48
+    proc memory_set_byte from Memory with sbox, 9, 1
+    proc memory_set_byte from Memory with sbox, 10, 103
+    proc memory_set_byte from Memory with sbox, 11, 43
+    proc memory_set_byte from Memory with sbox, 12, 254
+    proc memory_set_byte from Memory with sbox, 13, 215
+    proc memory_set_byte from Memory with sbox, 14, 171
+    proc memory_set_byte from Memory with sbox, 15, 118
+    proc memory_set_byte from Memory with sbox, 16, 202
+    proc memory_set_byte from Memory with sbox, 17, 130
+    proc memory_set_byte from Memory with sbox, 18, 201
+    proc memory_set_byte from Memory with sbox, 19, 125
+    proc memory_set_byte from Memory with sbox, 20, 250
+    proc memory_set_byte from Memory with sbox, 21, 89
+    proc memory_set_byte from Memory with sbox, 22, 71
+    proc memory_set_byte from Memory with sbox, 23, 240
+    proc memory_set_byte from Memory with sbox, 24, 173
+    proc memory_set_byte from Memory with sbox, 25, 212
+    proc memory_set_byte from Memory with sbox, 26, 162
+    proc memory_set_byte from Memory with sbox, 27, 175
+    proc memory_set_byte from Memory with sbox, 28, 156
+    proc memory_set_byte from Memory with sbox, 29, 164
+    proc memory_set_byte from Memory with sbox, 30, 114
+    proc memory_set_byte from Memory with sbox, 31, 192
+    proc memory_set_byte from Memory with sbox, 32, 183
+    proc memory_set_byte from Memory with sbox, 33, 253
+    proc memory_set_byte from Memory with sbox, 34, 147
+    proc memory_set_byte from Memory with sbox, 35, 38
+    proc memory_set_byte from Memory with sbox, 36, 54
+    proc memory_set_byte from Memory with sbox, 37, 63
+    proc memory_set_byte from Memory with sbox, 38, 247
+    proc memory_set_byte from Memory with sbox, 39, 204
+    proc memory_set_byte from Memory with sbox, 40, 52
+    proc memory_set_byte from Memory with sbox, 41, 165
+    proc memory_set_byte from Memory with sbox, 42, 229
+    proc memory_set_byte from Memory with sbox, 43, 241
+    proc memory_set_byte from Memory with sbox, 44, 113
+    proc memory_set_byte from Memory with sbox, 45, 216
+    proc memory_set_byte from Memory with sbox, 46, 49
+    proc memory_set_byte from Memory with sbox, 47, 21
+    proc memory_set_byte from Memory with sbox, 48, 4
+    proc memory_set_byte from Memory with sbox, 49, 199
+    proc memory_set_byte from Memory with sbox, 50, 35
+    proc memory_set_byte from Memory with sbox, 51, 195
+    proc memory_set_byte from Memory with sbox, 52, 24
+    proc memory_set_byte from Memory with sbox, 53, 150
+    proc memory_set_byte from Memory with sbox, 54, 5
+    proc memory_set_byte from Memory with sbox, 55, 154
+    proc memory_set_byte from Memory with sbox, 56, 7
+    proc memory_set_byte from Memory with sbox, 57, 18
+    proc memory_set_byte from Memory with sbox, 58, 128
+    proc memory_set_byte from Memory with sbox, 59, 226
+    proc memory_set_byte from Memory with sbox, 60, 235
+    proc memory_set_byte from Memory with sbox, 61, 39
+    proc memory_set_byte from Memory with sbox, 62, 178
+    proc memory_set_byte from Memory with sbox, 63, 117
+    proc memory_set_byte from Memory with sbox, 64, 9
+    proc memory_set_byte from Memory with sbox, 65, 131
+    proc memory_set_byte from Memory with sbox, 66, 44
+    proc memory_set_byte from Memory with sbox, 67, 26
+    proc memory_set_byte from Memory with sbox, 68, 27
+    proc memory_set_byte from Memory with sbox, 69, 110
+    proc memory_set_byte from Memory with sbox, 70, 90
+    proc memory_set_byte from Memory with sbox, 71, 160
+    proc memory_set_byte from Memory with sbox, 72, 82
+    proc memory_set_byte from Memory with sbox, 73, 59
+    proc memory_set_byte from Memory with sbox, 74, 214
+    proc memory_set_byte from Memory with sbox, 75, 179
+    proc memory_set_byte from Memory with sbox, 76, 41
+    proc memory_set_byte from Memory with sbox, 77, 227
+    proc memory_set_byte from Memory with sbox, 78, 47
+    proc memory_set_byte from Memory with sbox, 79, 132
+    proc memory_set_byte from Memory with sbox, 80, 83
+    proc memory_set_byte from Memory with sbox, 81, 209
+    proc memory_set_byte from Memory with sbox, 82, 0
+    proc memory_set_byte from Memory with sbox, 83, 237
+    proc memory_set_byte from Memory with sbox, 84, 32
+    proc memory_set_byte from Memory with sbox, 85, 252
+    proc memory_set_byte from Memory with sbox, 86, 177
+    proc memory_set_byte from Memory with sbox, 87, 91
+    proc memory_set_byte from Memory with sbox, 88, 106
+    proc memory_set_byte from Memory with sbox, 89, 203
+    proc memory_set_byte from Memory with sbox, 90, 190
+    proc memory_set_byte from Memory with sbox, 91, 57
+    proc memory_set_byte from Memory with sbox, 92, 74
+    proc memory_set_byte from Memory with sbox, 93, 76
+    proc memory_set_byte from Memory with sbox, 94, 88
+    proc memory_set_byte from Memory with sbox, 95, 207
+    proc memory_set_byte from Memory with sbox, 96, 208
+    proc memory_set_byte from Memory with sbox, 97, 239
+    proc memory_set_byte from Memory with sbox, 98, 170
+    proc memory_set_byte from Memory with sbox, 99, 251
+    proc memory_set_byte from Memory with sbox, 100, 67
+    proc memory_set_byte from Memory with sbox, 101, 77
+    proc memory_set_byte from Memory with sbox, 102, 51
+    proc memory_set_byte from Memory with sbox, 103, 133
+    proc memory_set_byte from Memory with sbox, 104, 69
+    proc memory_set_byte from Memory with sbox, 105, 249
+    proc memory_set_byte from Memory with sbox, 106, 2
+    proc memory_set_byte from Memory with sbox, 107, 127
+    proc memory_set_byte from Memory with sbox, 108, 80
+    proc memory_set_byte from Memory with sbox, 109, 60
+    proc memory_set_byte from Memory with sbox, 110, 159
+    proc memory_set_byte from Memory with sbox, 111, 168
+    proc memory_set_byte from Memory with sbox, 112, 81
+    proc memory_set_byte from Memory with sbox, 113, 163
+    proc memory_set_byte from Memory with sbox, 114, 64
+    proc memory_set_byte from Memory with sbox, 115, 143
+    proc memory_set_byte from Memory with sbox, 116, 146
+    proc memory_set_byte from Memory with sbox, 117, 157
+    proc memory_set_byte from Memory with sbox, 118, 56
+    proc memory_set_byte from Memory with sbox, 119, 245
+    proc memory_set_byte from Memory with sbox, 120, 188
+    proc memory_set_byte from Memory with sbox, 121, 182
+    proc memory_set_byte from Memory with sbox, 122, 218
+    proc memory_set_byte from Memory with sbox, 123, 33
+    proc memory_set_byte from Memory with sbox, 124, 16
+    proc memory_set_byte from Memory with sbox, 125, 255
+    proc memory_set_byte from Memory with sbox, 126, 243
+    proc memory_set_byte from Memory with sbox, 127, 210
+    proc memory_set_byte from Memory with sbox, 128, 205
+    proc memory_set_byte from Memory with sbox, 129, 12
+    proc memory_set_byte from Memory with sbox, 130, 19
+    proc memory_set_byte from Memory with sbox, 131, 236
+    proc memory_set_byte from Memory with sbox, 132, 95
+    proc memory_set_byte from Memory with sbox, 133, 151
+    proc memory_set_byte from Memory with sbox, 134, 68
+    proc memory_set_byte from Memory with sbox, 135, 23
+    proc memory_set_byte from Memory with sbox, 136, 196
+    proc memory_set_byte from Memory with sbox, 137, 167
+    proc memory_set_byte from Memory with sbox, 138, 126
+    proc memory_set_byte from Memory with sbox, 139, 61
+    proc memory_set_byte from Memory with sbox, 140, 100
+    proc memory_set_byte from Memory with sbox, 141, 93
+    proc memory_set_byte from Memory with sbox, 142, 25
+    proc memory_set_byte from Memory with sbox, 143, 115
+    proc memory_set_byte from Memory with sbox, 144, 96
+    proc memory_set_byte from Memory with sbox, 145, 129
+    proc memory_set_byte from Memory with sbox, 146, 79
+    proc memory_set_byte from Memory with sbox, 147, 220
+    proc memory_set_byte from Memory with sbox, 148, 34
+    proc memory_set_byte from Memory with sbox, 149, 42
+    proc memory_set_byte from Memory with sbox, 150, 144
+    proc memory_set_byte from Memory with sbox, 151, 136
+    proc memory_set_byte from Memory with sbox, 152, 70
+    proc memory_set_byte from Memory with sbox, 153, 238
+    proc memory_set_byte from Memory with sbox, 154, 184
+    proc memory_set_byte from Memory with sbox, 155, 20
+    proc memory_set_byte from Memory with sbox, 156, 222
+    proc memory_set_byte from Memory with sbox, 157, 94
+    proc memory_set_byte from Memory with sbox, 158, 11
+    proc memory_set_byte from Memory with sbox, 159, 219
+    proc memory_set_byte from Memory with sbox, 160, 224
+    proc memory_set_byte from Memory with sbox, 161, 50
+    proc memory_set_byte from Memory with sbox, 162, 58
+    proc memory_set_byte from Memory with sbox, 163, 10
+    proc memory_set_byte from Memory with sbox, 164, 73
+    proc memory_set_byte from Memory with sbox, 165, 6
+    proc memory_set_byte from Memory with sbox, 166, 36
+    proc memory_set_byte from Memory with sbox, 167, 92
+    proc memory_set_byte from Memory with sbox, 168, 194
+    proc memory_set_byte from Memory with sbox, 169, 211
+    proc memory_set_byte from Memory with sbox, 170, 172
+    proc memory_set_byte from Memory with sbox, 171, 98
+    proc memory_set_byte from Memory with sbox, 172, 145
+    proc memory_set_byte from Memory with sbox, 173, 149
+    proc memory_set_byte from Memory with sbox, 174, 228
+    proc memory_set_byte from Memory with sbox, 175, 121
+    proc memory_set_byte from Memory with sbox, 176, 231
+    proc memory_set_byte from Memory with sbox, 177, 200
+    proc memory_set_byte from Memory with sbox, 178, 55
+    proc memory_set_byte from Memory with sbox, 179, 109
+    proc memory_set_byte from Memory with sbox, 180, 141
+    proc memory_set_byte from Memory with sbox, 181, 213
+    proc memory_set_byte from Memory with sbox, 182, 78
+    proc memory_set_byte from Memory with sbox, 183, 169
+    proc memory_set_byte from Memory with sbox, 184, 108
+    proc memory_set_byte from Memory with sbox, 185, 86
+    proc memory_set_byte from Memory with sbox, 186, 244
+    proc memory_set_byte from Memory with sbox, 187, 234
+    proc memory_set_byte from Memory with sbox, 188, 101
+    proc memory_set_byte from Memory with sbox, 189, 122
+    proc memory_set_byte from Memory with sbox, 190, 174
+    proc memory_set_byte from Memory with sbox, 191, 8
+    proc memory_set_byte from Memory with sbox, 192, 186
+    proc memory_set_byte from Memory with sbox, 193, 120
+    proc memory_set_byte from Memory with sbox, 194, 37
+    proc memory_set_byte from Memory with sbox, 195, 46
+    proc memory_set_byte from Memory with sbox, 196, 28
+    proc memory_set_byte from Memory with sbox, 197, 166
+    proc memory_set_byte from Memory with sbox, 198, 180
+    proc memory_set_byte from Memory with sbox, 199, 198
+    proc memory_set_byte from Memory with sbox, 200, 232
+    proc memory_set_byte from Memory with sbox, 201, 221
+    proc memory_set_byte from Memory with sbox, 202, 116
+    proc memory_set_byte from Memory with sbox, 203, 31
+    proc memory_set_byte from Memory with sbox, 204, 75
+    proc memory_set_byte from Memory with sbox, 205, 189
+    proc memory_set_byte from Memory with sbox, 206, 139
+    proc memory_set_byte from Memory with sbox, 207, 138
+    proc memory_set_byte from Memory with sbox, 208, 112
+    proc memory_set_byte from Memory with sbox, 209, 62
+    proc memory_set_byte from Memory with sbox, 210, 181
+    proc memory_set_byte from Memory with sbox, 211, 102
+    proc memory_set_byte from Memory with sbox, 212, 72
+    proc memory_set_byte from Memory with sbox, 213, 3
+    proc memory_set_byte from Memory with sbox, 214, 246
+    proc memory_set_byte from Memory with sbox, 215, 14
+    proc memory_set_byte from Memory with sbox, 216, 97
+    proc memory_set_byte from Memory with sbox, 217, 53
+    proc memory_set_byte from Memory with sbox, 218, 87
+    proc memory_set_byte from Memory with sbox, 219, 185
+    proc memory_set_byte from Memory with sbox, 220, 134
+    proc memory_set_byte from Memory with sbox, 221, 193
+    proc memory_set_byte from Memory with sbox, 222, 29
+    proc memory_set_byte from Memory with sbox, 223, 158
+    proc memory_set_byte from Memory with sbox, 224, 225
+    proc memory_set_byte from Memory with sbox, 225, 248
+    proc memory_set_byte from Memory with sbox, 226, 152
+    proc memory_set_byte from Memory with sbox, 227, 17
+    proc memory_set_byte from Memory with sbox, 228, 105
+    proc memory_set_byte from Memory with sbox, 229, 217
+    proc memory_set_byte from Memory with sbox, 230, 142
+    proc memory_set_byte from Memory with sbox, 231, 148
+    proc memory_set_byte from Memory with sbox, 232, 155
+    proc memory_set_byte from Memory with sbox, 233, 30
+    proc memory_set_byte from Memory with sbox, 234, 135
+    proc memory_set_byte from Memory with sbox, 235, 233
+    proc memory_set_byte from Memory with sbox, 236, 206
+    proc memory_set_byte from Memory with sbox, 237, 85
+    proc memory_set_byte from Memory with sbox, 238, 40
+    proc memory_set_byte from Memory with sbox, 239, 223
+    proc memory_set_byte from Memory with sbox, 240, 140
+    proc memory_set_byte from Memory with sbox, 241, 161
+    proc memory_set_byte from Memory with sbox, 242, 137
+    proc memory_set_byte from Memory with sbox, 243, 13
+    proc memory_set_byte from Memory with sbox, 244, 191
+    proc memory_set_byte from Memory with sbox, 245, 230
+    proc memory_set_byte from Memory with sbox, 246, 66
+    proc memory_set_byte from Memory with sbox, 247, 104
+    proc memory_set_byte from Memory with sbox, 248, 65
+    proc memory_set_byte from Memory with sbox, 249, 153
+    proc memory_set_byte from Memory with sbox, 250, 45
+    proc memory_set_byte from Memory with sbox, 251, 15
+    proc memory_set_byte from Memory with sbox, 252, 176
+    proc memory_set_byte from Memory with sbox, 253, 84
+    proc memory_set_byte from Memory with sbox, 254, 187
+    proc memory_set_byte from Memory with sbox, 255, 22
+    Return 1
+End Process
+
+Process called "aes_fill_inv_sbox" takes inv_sbox as Integer returns Integer:
+    @Reasoning
+    Initializes the 256-byte inverse S-box per FIPS 197 figure 14.
+    Used during AES decryption. The inverse S-box satisfies
+    InvSBox[SBox[x]] = x for all x in [0, 255].
+    @End Reasoning
+
+    @Implementation
+    Writes the 256 hardcoded byte values from FIPS 197 figure 14 in
+    row-major order.
+    @End Implementation
+
+    @Performance_Hints
+    256 byte stores. One-shot table initialization per decrypt op.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public table.
+    @End Security_Scope
+
+    proc memory_set_byte from Memory with inv_sbox, 0, 82
+    proc memory_set_byte from Memory with inv_sbox, 1, 9
+    proc memory_set_byte from Memory with inv_sbox, 2, 106
+    proc memory_set_byte from Memory with inv_sbox, 3, 213
+    proc memory_set_byte from Memory with inv_sbox, 4, 48
+    proc memory_set_byte from Memory with inv_sbox, 5, 54
+    proc memory_set_byte from Memory with inv_sbox, 6, 165
+    proc memory_set_byte from Memory with inv_sbox, 7, 56
+    proc memory_set_byte from Memory with inv_sbox, 8, 191
+    proc memory_set_byte from Memory with inv_sbox, 9, 64
+    proc memory_set_byte from Memory with inv_sbox, 10, 163
+    proc memory_set_byte from Memory with inv_sbox, 11, 158
+    proc memory_set_byte from Memory with inv_sbox, 12, 129
+    proc memory_set_byte from Memory with inv_sbox, 13, 243
+    proc memory_set_byte from Memory with inv_sbox, 14, 215
+    proc memory_set_byte from Memory with inv_sbox, 15, 251
+    proc memory_set_byte from Memory with inv_sbox, 16, 124
+    proc memory_set_byte from Memory with inv_sbox, 17, 227
+    proc memory_set_byte from Memory with inv_sbox, 18, 57
+    proc memory_set_byte from Memory with inv_sbox, 19, 130
+    proc memory_set_byte from Memory with inv_sbox, 20, 155
+    proc memory_set_byte from Memory with inv_sbox, 21, 47
+    proc memory_set_byte from Memory with inv_sbox, 22, 255
+    proc memory_set_byte from Memory with inv_sbox, 23, 135
+    proc memory_set_byte from Memory with inv_sbox, 24, 52
+    proc memory_set_byte from Memory with inv_sbox, 25, 142
+    proc memory_set_byte from Memory with inv_sbox, 26, 67
+    proc memory_set_byte from Memory with inv_sbox, 27, 68
+    proc memory_set_byte from Memory with inv_sbox, 28, 196
+    proc memory_set_byte from Memory with inv_sbox, 29, 222
+    proc memory_set_byte from Memory with inv_sbox, 30, 233
+    proc memory_set_byte from Memory with inv_sbox, 31, 203
+    proc memory_set_byte from Memory with inv_sbox, 32, 84
+    proc memory_set_byte from Memory with inv_sbox, 33, 123
+    proc memory_set_byte from Memory with inv_sbox, 34, 148
+    proc memory_set_byte from Memory with inv_sbox, 35, 50
+    proc memory_set_byte from Memory with inv_sbox, 36, 166
+    proc memory_set_byte from Memory with inv_sbox, 37, 194
+    proc memory_set_byte from Memory with inv_sbox, 38, 35
+    proc memory_set_byte from Memory with inv_sbox, 39, 61
+    proc memory_set_byte from Memory with inv_sbox, 40, 238
+    proc memory_set_byte from Memory with inv_sbox, 41, 76
+    proc memory_set_byte from Memory with inv_sbox, 42, 149
+    proc memory_set_byte from Memory with inv_sbox, 43, 11
+    proc memory_set_byte from Memory with inv_sbox, 44, 66
+    proc memory_set_byte from Memory with inv_sbox, 45, 250
+    proc memory_set_byte from Memory with inv_sbox, 46, 195
+    proc memory_set_byte from Memory with inv_sbox, 47, 78
+    proc memory_set_byte from Memory with inv_sbox, 48, 8
+    proc memory_set_byte from Memory with inv_sbox, 49, 46
+    proc memory_set_byte from Memory with inv_sbox, 50, 161
+    proc memory_set_byte from Memory with inv_sbox, 51, 102
+    proc memory_set_byte from Memory with inv_sbox, 52, 40
+    proc memory_set_byte from Memory with inv_sbox, 53, 217
+    proc memory_set_byte from Memory with inv_sbox, 54, 36
+    proc memory_set_byte from Memory with inv_sbox, 55, 178
+    proc memory_set_byte from Memory with inv_sbox, 56, 118
+    proc memory_set_byte from Memory with inv_sbox, 57, 91
+    proc memory_set_byte from Memory with inv_sbox, 58, 162
+    proc memory_set_byte from Memory with inv_sbox, 59, 73
+    proc memory_set_byte from Memory with inv_sbox, 60, 109
+    proc memory_set_byte from Memory with inv_sbox, 61, 139
+    proc memory_set_byte from Memory with inv_sbox, 62, 209
+    proc memory_set_byte from Memory with inv_sbox, 63, 37
+    proc memory_set_byte from Memory with inv_sbox, 64, 114
+    proc memory_set_byte from Memory with inv_sbox, 65, 248
+    proc memory_set_byte from Memory with inv_sbox, 66, 246
+    proc memory_set_byte from Memory with inv_sbox, 67, 100
+    proc memory_set_byte from Memory with inv_sbox, 68, 134
+    proc memory_set_byte from Memory with inv_sbox, 69, 104
+    proc memory_set_byte from Memory with inv_sbox, 70, 152
+    proc memory_set_byte from Memory with inv_sbox, 71, 22
+    proc memory_set_byte from Memory with inv_sbox, 72, 212
+    proc memory_set_byte from Memory with inv_sbox, 73, 164
+    proc memory_set_byte from Memory with inv_sbox, 74, 92
+    proc memory_set_byte from Memory with inv_sbox, 75, 204
+    proc memory_set_byte from Memory with inv_sbox, 76, 93
+    proc memory_set_byte from Memory with inv_sbox, 77, 101
+    proc memory_set_byte from Memory with inv_sbox, 78, 182
+    proc memory_set_byte from Memory with inv_sbox, 79, 146
+    proc memory_set_byte from Memory with inv_sbox, 80, 108
+    proc memory_set_byte from Memory with inv_sbox, 81, 112
+    proc memory_set_byte from Memory with inv_sbox, 82, 72
+    proc memory_set_byte from Memory with inv_sbox, 83, 80
+    proc memory_set_byte from Memory with inv_sbox, 84, 253
+    proc memory_set_byte from Memory with inv_sbox, 85, 237
+    proc memory_set_byte from Memory with inv_sbox, 86, 185
+    proc memory_set_byte from Memory with inv_sbox, 87, 218
+    proc memory_set_byte from Memory with inv_sbox, 88, 94
+    proc memory_set_byte from Memory with inv_sbox, 89, 21
+    proc memory_set_byte from Memory with inv_sbox, 90, 70
+    proc memory_set_byte from Memory with inv_sbox, 91, 87
+    proc memory_set_byte from Memory with inv_sbox, 92, 167
+    proc memory_set_byte from Memory with inv_sbox, 93, 141
+    proc memory_set_byte from Memory with inv_sbox, 94, 157
+    proc memory_set_byte from Memory with inv_sbox, 95, 132
+    proc memory_set_byte from Memory with inv_sbox, 96, 144
+    proc memory_set_byte from Memory with inv_sbox, 97, 216
+    proc memory_set_byte from Memory with inv_sbox, 98, 171
+    proc memory_set_byte from Memory with inv_sbox, 99, 0
+    proc memory_set_byte from Memory with inv_sbox, 100, 140
+    proc memory_set_byte from Memory with inv_sbox, 101, 188
+    proc memory_set_byte from Memory with inv_sbox, 102, 211
+    proc memory_set_byte from Memory with inv_sbox, 103, 10
+    proc memory_set_byte from Memory with inv_sbox, 104, 247
+    proc memory_set_byte from Memory with inv_sbox, 105, 228
+    proc memory_set_byte from Memory with inv_sbox, 106, 88
+    proc memory_set_byte from Memory with inv_sbox, 107, 5
+    proc memory_set_byte from Memory with inv_sbox, 108, 184
+    proc memory_set_byte from Memory with inv_sbox, 109, 179
+    proc memory_set_byte from Memory with inv_sbox, 110, 69
+    proc memory_set_byte from Memory with inv_sbox, 111, 6
+    proc memory_set_byte from Memory with inv_sbox, 112, 208
+    proc memory_set_byte from Memory with inv_sbox, 113, 44
+    proc memory_set_byte from Memory with inv_sbox, 114, 30
+    proc memory_set_byte from Memory with inv_sbox, 115, 143
+    proc memory_set_byte from Memory with inv_sbox, 116, 202
+    proc memory_set_byte from Memory with inv_sbox, 117, 63
+    proc memory_set_byte from Memory with inv_sbox, 118, 15
+    proc memory_set_byte from Memory with inv_sbox, 119, 2
+    proc memory_set_byte from Memory with inv_sbox, 120, 193
+    proc memory_set_byte from Memory with inv_sbox, 121, 175
+    proc memory_set_byte from Memory with inv_sbox, 122, 189
+    proc memory_set_byte from Memory with inv_sbox, 123, 3
+    proc memory_set_byte from Memory with inv_sbox, 124, 1
+    proc memory_set_byte from Memory with inv_sbox, 125, 19
+    proc memory_set_byte from Memory with inv_sbox, 126, 138
+    proc memory_set_byte from Memory with inv_sbox, 127, 107
+    proc memory_set_byte from Memory with inv_sbox, 128, 58
+    proc memory_set_byte from Memory with inv_sbox, 129, 145
+    proc memory_set_byte from Memory with inv_sbox, 130, 17
+    proc memory_set_byte from Memory with inv_sbox, 131, 65
+    proc memory_set_byte from Memory with inv_sbox, 132, 79
+    proc memory_set_byte from Memory with inv_sbox, 133, 103
+    proc memory_set_byte from Memory with inv_sbox, 134, 220
+    proc memory_set_byte from Memory with inv_sbox, 135, 234
+    proc memory_set_byte from Memory with inv_sbox, 136, 151
+    proc memory_set_byte from Memory with inv_sbox, 137, 242
+    proc memory_set_byte from Memory with inv_sbox, 138, 207
+    proc memory_set_byte from Memory with inv_sbox, 139, 206
+    proc memory_set_byte from Memory with inv_sbox, 140, 240
+    proc memory_set_byte from Memory with inv_sbox, 141, 180
+    proc memory_set_byte from Memory with inv_sbox, 142, 230
+    proc memory_set_byte from Memory with inv_sbox, 143, 115
+    proc memory_set_byte from Memory with inv_sbox, 144, 150
+    proc memory_set_byte from Memory with inv_sbox, 145, 172
+    proc memory_set_byte from Memory with inv_sbox, 146, 116
+    proc memory_set_byte from Memory with inv_sbox, 147, 34
+    proc memory_set_byte from Memory with inv_sbox, 148, 231
+    proc memory_set_byte from Memory with inv_sbox, 149, 173
+    proc memory_set_byte from Memory with inv_sbox, 150, 53
+    proc memory_set_byte from Memory with inv_sbox, 151, 133
+    proc memory_set_byte from Memory with inv_sbox, 152, 226
+    proc memory_set_byte from Memory with inv_sbox, 153, 249
+    proc memory_set_byte from Memory with inv_sbox, 154, 55
+    proc memory_set_byte from Memory with inv_sbox, 155, 232
+    proc memory_set_byte from Memory with inv_sbox, 156, 28
+    proc memory_set_byte from Memory with inv_sbox, 157, 117
+    proc memory_set_byte from Memory with inv_sbox, 158, 223
+    proc memory_set_byte from Memory with inv_sbox, 159, 110
+    proc memory_set_byte from Memory with inv_sbox, 160, 71
+    proc memory_set_byte from Memory with inv_sbox, 161, 241
+    proc memory_set_byte from Memory with inv_sbox, 162, 26
+    proc memory_set_byte from Memory with inv_sbox, 163, 113
+    proc memory_set_byte from Memory with inv_sbox, 164, 29
+    proc memory_set_byte from Memory with inv_sbox, 165, 41
+    proc memory_set_byte from Memory with inv_sbox, 166, 197
+    proc memory_set_byte from Memory with inv_sbox, 167, 137
+    proc memory_set_byte from Memory with inv_sbox, 168, 111
+    proc memory_set_byte from Memory with inv_sbox, 169, 183
+    proc memory_set_byte from Memory with inv_sbox, 170, 98
+    proc memory_set_byte from Memory with inv_sbox, 171, 14
+    proc memory_set_byte from Memory with inv_sbox, 172, 170
+    proc memory_set_byte from Memory with inv_sbox, 173, 24
+    proc memory_set_byte from Memory with inv_sbox, 174, 190
+    proc memory_set_byte from Memory with inv_sbox, 175, 27
+    proc memory_set_byte from Memory with inv_sbox, 176, 252
+    proc memory_set_byte from Memory with inv_sbox, 177, 86
+    proc memory_set_byte from Memory with inv_sbox, 178, 62
+    proc memory_set_byte from Memory with inv_sbox, 179, 75
+    proc memory_set_byte from Memory with inv_sbox, 180, 198
+    proc memory_set_byte from Memory with inv_sbox, 181, 210
+    proc memory_set_byte from Memory with inv_sbox, 182, 121
+    proc memory_set_byte from Memory with inv_sbox, 183, 32
+    proc memory_set_byte from Memory with inv_sbox, 184, 154
+    proc memory_set_byte from Memory with inv_sbox, 185, 219
+    proc memory_set_byte from Memory with inv_sbox, 186, 192
+    proc memory_set_byte from Memory with inv_sbox, 187, 254
+    proc memory_set_byte from Memory with inv_sbox, 188, 120
+    proc memory_set_byte from Memory with inv_sbox, 189, 205
+    proc memory_set_byte from Memory with inv_sbox, 190, 90
+    proc memory_set_byte from Memory with inv_sbox, 191, 244
+    proc memory_set_byte from Memory with inv_sbox, 192, 31
+    proc memory_set_byte from Memory with inv_sbox, 193, 221
+    proc memory_set_byte from Memory with inv_sbox, 194, 168
+    proc memory_set_byte from Memory with inv_sbox, 195, 51
+    proc memory_set_byte from Memory with inv_sbox, 196, 136
+    proc memory_set_byte from Memory with inv_sbox, 197, 7
+    proc memory_set_byte from Memory with inv_sbox, 198, 199
+    proc memory_set_byte from Memory with inv_sbox, 199, 49
+    proc memory_set_byte from Memory with inv_sbox, 200, 177
+    proc memory_set_byte from Memory with inv_sbox, 201, 18
+    proc memory_set_byte from Memory with inv_sbox, 202, 16
+    proc memory_set_byte from Memory with inv_sbox, 203, 89
+    proc memory_set_byte from Memory with inv_sbox, 204, 39
+    proc memory_set_byte from Memory with inv_sbox, 205, 128
+    proc memory_set_byte from Memory with inv_sbox, 206, 236
+    proc memory_set_byte from Memory with inv_sbox, 207, 95
+    proc memory_set_byte from Memory with inv_sbox, 208, 96
+    proc memory_set_byte from Memory with inv_sbox, 209, 81
+    proc memory_set_byte from Memory with inv_sbox, 210, 127
+    proc memory_set_byte from Memory with inv_sbox, 211, 169
+    proc memory_set_byte from Memory with inv_sbox, 212, 25
+    proc memory_set_byte from Memory with inv_sbox, 213, 181
+    proc memory_set_byte from Memory with inv_sbox, 214, 74
+    proc memory_set_byte from Memory with inv_sbox, 215, 13
+    proc memory_set_byte from Memory with inv_sbox, 216, 45
+    proc memory_set_byte from Memory with inv_sbox, 217, 229
+    proc memory_set_byte from Memory with inv_sbox, 218, 122
+    proc memory_set_byte from Memory with inv_sbox, 219, 159
+    proc memory_set_byte from Memory with inv_sbox, 220, 147
+    proc memory_set_byte from Memory with inv_sbox, 221, 201
+    proc memory_set_byte from Memory with inv_sbox, 222, 156
+    proc memory_set_byte from Memory with inv_sbox, 223, 239
+    proc memory_set_byte from Memory with inv_sbox, 224, 160
+    proc memory_set_byte from Memory with inv_sbox, 225, 224
+    proc memory_set_byte from Memory with inv_sbox, 226, 59
+    proc memory_set_byte from Memory with inv_sbox, 227, 77
+    proc memory_set_byte from Memory with inv_sbox, 228, 174
+    proc memory_set_byte from Memory with inv_sbox, 229, 42
+    proc memory_set_byte from Memory with inv_sbox, 230, 245
+    proc memory_set_byte from Memory with inv_sbox, 231, 176
+    proc memory_set_byte from Memory with inv_sbox, 232, 200
+    proc memory_set_byte from Memory with inv_sbox, 233, 235
+    proc memory_set_byte from Memory with inv_sbox, 234, 187
+    proc memory_set_byte from Memory with inv_sbox, 235, 60
+    proc memory_set_byte from Memory with inv_sbox, 236, 131
+    proc memory_set_byte from Memory with inv_sbox, 237, 83
+    proc memory_set_byte from Memory with inv_sbox, 238, 153
+    proc memory_set_byte from Memory with inv_sbox, 239, 97
+    proc memory_set_byte from Memory with inv_sbox, 240, 23
+    proc memory_set_byte from Memory with inv_sbox, 241, 43
+    proc memory_set_byte from Memory with inv_sbox, 242, 4
+    proc memory_set_byte from Memory with inv_sbox, 243, 126
+    proc memory_set_byte from Memory with inv_sbox, 244, 186
+    proc memory_set_byte from Memory with inv_sbox, 245, 119
+    proc memory_set_byte from Memory with inv_sbox, 246, 214
+    proc memory_set_byte from Memory with inv_sbox, 247, 38
+    proc memory_set_byte from Memory with inv_sbox, 248, 225
+    proc memory_set_byte from Memory with inv_sbox, 249, 105
+    proc memory_set_byte from Memory with inv_sbox, 250, 20
+    proc memory_set_byte from Memory with inv_sbox, 251, 99
+    proc memory_set_byte from Memory with inv_sbox, 252, 85
+    proc memory_set_byte from Memory with inv_sbox, 253, 33
+    proc memory_set_byte from Memory with inv_sbox, 254, 12
+    proc memory_set_byte from Memory with inv_sbox, 255, 125
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Constant-time S-box lookup: scans ALL 256 entries every call.
+Note: ============================================================================
+
+Process called "aes_sub_byte_ct" takes sbox as Integer, value as Integer returns Integer:
+    @Reasoning
+    Constant-time S-box lookup. Reads ALL 256 bytes of the sbox table
+    every call and uses arithmetic equality masks to select the entry
+    at the requested index. This defeats cache-timing attacks on the
+    S-box (Bernstein, 2005), at the cost of 256 memory loads per
+    SubByte operation.
+    @End Reasoning
+
+    @Implementation
+    accumulator = 0
+    For i in 0..256:
+        candidate = sbox[i]
+        mask = aes_ct_eq_mask(i, value)        Note: 0xFF if i==value else 0
+        accumulator = accumulator OR (candidate AND mask)
+    Return accumulator.
+
+    Exactly one iteration's mask is 0xFF, all others 0x00, so the
+    accumulator ends with sbox[value]. Every iteration reads sbox[i]
+    regardless of value, equalizing cache access pattern.
+    @End Implementation
+
+    @Performance_Hints
+    256 byte loads × ~8 ALU ops per iteration. For a single block
+    encryption (16 SubBytes per round × ~10 rounds = 160 calls) this
+    is on the order of 400000 ALU ops. The pure-software AES-NI
+    fallback runs at ~250 cycles/byte, dominated by this loop.
+    Future SIMD lowering (PSHUFB-bitsliced) brings this to <1
+    cycle/byte while preserving constant-time discipline.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. The same 256 memory addresses are read in the same
+    order on every call regardless of the secret index.
+    @End Security_Scope
+
+    Let val_masked be value bitwise_and 255
+    Let accumulator be 0
+    Let i be 0
+    While i is less than 256:
+        Let candidate be proc memory_get_byte from Memory with sbox, i
+        Let mask be proc aes_ct_eq_mask with i, val_masked
+        Let masked_candidate be candidate bitwise_and mask
+        Set accumulator to accumulator bitwise_or masked_candidate
+        Set i to i plus 1
+    End While
+    Return accumulator bitwise_and 255
+End Process
+
+Note: ============================================================================
+Note: GF(2^8) arithmetic for MixColumns
+Note: Reduction polynomial: x^8 + x^4 + x^3 + x + 1 (0x11b)
+Note: ============================================================================
+
+Process called "aes_xtime" takes value as Integer returns Integer:
+    @Reasoning
+    Multiplies a GF(2^8) element by x (i.e., by 2) per FIPS 197
+    section 4.2.1. If the high bit is 0, the result is just a left
+    shift by 1. If the high bit is 1, the shift overflows and we
+    must reduce by XORing with 0x1b (the reduction polynomial
+    minus the leading x^8 term).
+    @End Reasoning
+
+    @Implementation
+    Computed in constant time:
+      shifted = (value << 1) AND 0xFF
+      hi_bit = (value >> 7) AND 1
+      reduce_mask = -(hi_bit) AND 0x1b      Note: 0x1b if hi_bit=1, 0 if 0
+      result = shifted XOR reduce_mask
+    The -(hi_bit) AND 0x1b idiom selects the reduction polynomial
+    conditionally without branching.
+    @End Implementation
+
+    @Performance_Hints
+    Six 64-bit ALU ops. Sub-nanosecond.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. The conditional reduction is selected via
+    arithmetic mask.
+    @End Security_Scope
+
+    Let v be value bitwise_and 255
+    Let shifted be v multiplied by 2
+    Set shifted to shifted bitwise_and 255
+    Let hi_bit be v divided by 128
+    Set hi_bit to hi_bit bitwise_and 1
+    Let neg_hi be 0 minus hi_bit
+    Let reduce_mask be neg_hi bitwise_and 27
+    Return shifted bitwise_xor reduce_mask
+End Process
+
+Process called "aes_gmul" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Multiplies two GF(2^8) elements per FIPS 197 section 4.2. Used in
+    MixColumns (encrypt) and InvMixColumns (decrypt). The encrypt
+    MixColumns only needs multiplication by {01}, {02}, {03}; the
+    decrypt InvMixColumns needs {09}, {0b}, {0d}, {0e}. A general
+    gmul handles all of these uniformly.
+    @End Reasoning
+
+    @Implementation
+    Russian-peasant multiplication over GF(2^8):
+      result = 0
+      x = a
+      y = b
+      For each of 8 bits:
+        bit = y AND 1
+        bit_mask = -(bit)        Note: 0xFF if bit=1, 0 if 0
+        result XOR= (x AND bit_mask)
+        x = xtime(x)
+        y = y >> 1
+      Return result AND 0xFF
+    The conditional XOR is done via arithmetic mask: if the current
+    bit of b is 1, mask is all-ones and (x AND mask) = x; otherwise
+    mask is all-zeros and (x AND mask) = 0. No branches.
+    @End Implementation
+
+    @Performance_Hints
+    8 iterations × ~6 ALU ops each = ~48 ops. Used 16 times per
+    MixColumns invocation, 9-13 times per block in encryption.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. The branch on the current bit is replaced by
+    arithmetic masking.
+    @End Security_Scope
+
+    Let result be 0
+    Let x be a bitwise_and 255
+    Let y be b bitwise_and 255
+    Let bit_idx be 0
+    While bit_idx is less than 8:
+        Let bit be y bitwise_and 1
+        Let bit_mask be 0 minus bit
+        Set bit_mask to bit_mask bitwise_and 255
+        Let contribution be x bitwise_and bit_mask
+        Set result to result bitwise_xor contribution
+        Set x to proc aes_xtime with x
+        Set y to y divided by 2
+        Set bit_idx to bit_idx plus 1
+    End While
+    Return result bitwise_and 255
+End Process
+
+Note: ============================================================================
+Note: Rcon table accessor: Rcon[i] = x^(i-1) in GF(2^8), per FIPS 197 section 5.2
+Note: ============================================================================
+
+Process called "aes_rcon" takes i as Integer returns Integer:
+    @Reasoning
+    Returns the round constant byte Rcon[i] for the key expansion.
+    Per FIPS 197 section 5.2, Rcon[i] = (x^(i-1), 0, 0, 0) where
+    x^(i-1) is taken in GF(2^8). The low-order byte values for
+    i = 1..10 are 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+    0x1b, 0x36. AES-256 also uses up to i=7 internal Rcon. AES-192
+    uses up to i=8.
+    @End Reasoning
+
+    @Implementation
+    Indexed by public (round number)-driven loop counter, so this is
+    NOT on the secret-dependent path. We use a direct value selector
+    for the at-most-10 cases the key schedule will request.
+    @End Implementation
+
+    @Performance_Hints
+    A handful of equality checks. Sub-nanosecond.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public table; i is a public loop counter.
+    @End Security_Scope
+
+    If i is equal to 1:
+        Return 1
+    End If
+    If i is equal to 2:
+        Return 2
+    End If
+    If i is equal to 3:
+        Return 4
+    End If
+    If i is equal to 4:
+        Return 8
+    End If
+    If i is equal to 5:
+        Return 16
+    End If
+    If i is equal to 6:
+        Return 32
+    End If
+    If i is equal to 7:
+        Return 64
+    End If
+    If i is equal to 8:
+        Return 128
+    End If
+    If i is equal to 9:
+        Return 27
+    End If
+    If i is equal to 10:
+        Return 54
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Key schedule: KeyExpansion per FIPS 197 section 5.2
+Note: ============================================================================
+
+Process called "aes_key_expand_common" takes arena as Integer, key as Integer, nk as Integer, nr as Integer, schedule as Integer returns Integer:
+    @Reasoning
+    Common key expansion implementation parameterized by Nk (key
+    length in 4-byte words: 4 for AES-128, 6 for AES-192, 8 for
+    AES-256) and Nr (number of rounds: 10/12/14 respectively). The
+    schedule output is 4*(Nr+1) words = 16*(Nr+1) bytes = 176/208/240
+    bytes for the three sizes.
+    @End Reasoning
+
+    @Implementation
+    Per FIPS 197 section 5.2:
+      For i in 0..Nk:
+        schedule[i] = key[i]   (each word is 4 bytes, copied verbatim)
+      For i in Nk..(4*(Nr+1)):
+        temp = schedule[i-1]
+        If i mod Nk == 0:
+          temp = SubWord(RotWord(temp)) XOR Rcon[i/Nk]
+        Else if Nk > 6 AND i mod Nk == 4:    Note: AES-256 only
+          temp = SubWord(temp)
+        schedule[i] = schedule[i-Nk] XOR temp
+
+    SubWord applies the constant-time S-box to each of the four bytes.
+    RotWord rotates the four bytes left by one position.
+
+    The schedule is laid out as 4-byte little-endian words at offsets
+    0, 4, 8, ... in the destination buffer.
+    @End Implementation
+
+    @Performance_Hints
+    O(Nr+1) iterations, each performing a 4-byte XOR plus occasional
+    SubWord (4 × constant-time S-box) and RotWord. The SubWord is the
+    dominant cost in the schedule, ~4 × 256 byte loads per occurrence.
+    The schedule runs once per encryption call; per-block AES is
+    bounded by AddRoundKey + SubBytes + ShiftRows + MixColumns where
+    SubBytes dominates.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time:
+    - SubWord uses the full-scan aes_sub_byte_ct.
+    - RotWord is a fixed permutation, no data-dependent indexing.
+    - Rcon is indexed by public loop counter.
+    - The "If i mod Nk == 0" branch is on public i (loop counter), not
+      on key material.
+    @End Security_Scope
+
+    Let sbox be proc arena_allocate from Arena with arena, 256
+    If sbox is equal to 0:
+        Return 0
+    End If
+    proc aes_fill_sbox with sbox
+
+    Let key_bytes be nk multiplied by 4
+    Let total_words be 4 multiplied by (nr plus 1)
+    Let total_bytes be total_words multiplied by 4
+
+    Note: ---- Copy initial Nk words from key into schedule ----
+    Let i_byte be 0
+    While i_byte is less than key_bytes:
+        Let kb be proc memory_get_byte from Memory with key, i_byte
+        proc memory_set_byte from Memory with schedule, i_byte, kb
+        Set i_byte to i_byte plus 1
+    End While
+
+    Note: ---- Generate remaining words ----
+    Let word_index be nk
+    While word_index is less than total_words:
+        Note: temp = schedule[word_index - 1] (4 bytes at offset (word_index-1)*4)
+        Let prev_off be (word_index minus 1) multiplied by 4
+        Let t0 be proc memory_get_byte from Memory with schedule, prev_off
+        Let t1 be proc memory_get_byte from Memory with schedule, prev_off plus 1
+        Let t2 be proc memory_get_byte from Memory with schedule, prev_off plus 2
+        Let t3 be proc memory_get_byte from Memory with schedule, prev_off plus 3
+
+        Let mod_nk be word_index modulo by nk
+
+        If mod_nk is equal to 0:
+            Note: RotWord: rotate left by one byte
+            Let r0 be t1
+            Let r1 be t2
+            Let r2 be t3
+            Let r3 be t0
+            Note: SubWord
+            Let s0 be proc aes_sub_byte_ct with sbox, r0
+            Let s1 be proc aes_sub_byte_ct with sbox, r1
+            Let s2 be proc aes_sub_byte_ct with sbox, r2
+            Let s3 be proc aes_sub_byte_ct with sbox, r3
+            Note: XOR with Rcon[word_index / nk]
+            Let rcon_idx be word_index divided by nk
+            Let rc be proc aes_rcon with rcon_idx
+            Set t0 to s0 bitwise_xor rc
+            Set t1 to s1
+            Set t2 to s2
+            Set t3 to s3
+        Otherwise:
+            If nk is greater than 6:
+                If mod_nk is equal to 4:
+                    Note: AES-256 extra SubWord
+                    Let q0 be proc aes_sub_byte_ct with sbox, t0
+                    Let q1 be proc aes_sub_byte_ct with sbox, t1
+                    Let q2 be proc aes_sub_byte_ct with sbox, t2
+                    Let q3 be proc aes_sub_byte_ct with sbox, t3
+                    Set t0 to q0
+                    Set t1 to q1
+                    Set t2 to q2
+                    Set t3 to q3
+                End If
+            End If
+        End If
+
+        Note: schedule[word_index] = schedule[word_index - nk] XOR temp
+        Let src_off be (word_index minus nk) multiplied by 4
+        Let dst_off be word_index multiplied by 4
+        Let p0 be proc memory_get_byte from Memory with schedule, src_off
+        Let p1 be proc memory_get_byte from Memory with schedule, src_off plus 1
+        Let p2 be proc memory_get_byte from Memory with schedule, src_off plus 2
+        Let p3 be proc memory_get_byte from Memory with schedule, src_off plus 3
+        Let n0 be p0 bitwise_xor t0
+        Let n1 be p1 bitwise_xor t1
+        Let n2 be p2 bitwise_xor t2
+        Let n3 be p3 bitwise_xor t3
+        proc memory_set_byte from Memory with schedule, dst_off, n0
+        proc memory_set_byte from Memory with schedule, dst_off plus 1, n1
+        proc memory_set_byte from Memory with schedule, dst_off plus 2, n2
+        proc memory_set_byte from Memory with schedule, dst_off plus 3, n3
+
+        Set word_index to word_index plus 1
+    End While
+
+    Return total_bytes
+End Process
+
+Process called "aes128_key_expand" takes arena as Integer, key as Integer, schedule as Integer returns Integer:
+    @Reasoning
+    AES-128 key expansion: 16-byte key -> 176-byte schedule (11 round
+    keys). Delegates to aes_key_expand_common with Nk=4, Nr=10.
+    @End Reasoning
+
+    @Implementation
+    Calls aes_key_expand_common(arena, key, 4, 10, schedule).
+    @End Implementation
+
+    @Performance_Hints
+    Run once per encryption-stream setup; cost is dominated by 10
+    SubWord invocations (one per round-key word generation cycle).
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time (inherits the common implementation's discipline).
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If schedule is equal to 0:
+        Return 0
+    End If
+    Let rc be proc aes_key_expand_common with arena, key, AES128_NK, AES128_ROUNDS, schedule
+    If rc is equal to AES128_SCHEDULE_SIZE:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "aes192_key_expand" takes arena as Integer, key as Integer, schedule as Integer returns Integer:
+    @Reasoning
+    AES-192 key expansion: 24-byte key -> 208-byte schedule (13 round
+    keys). Delegates to aes_key_expand_common with Nk=6, Nr=12.
+    @End Reasoning
+
+    @Implementation
+    Calls aes_key_expand_common(arena, key, 6, 12, schedule).
+    @End Implementation
+
+    @Performance_Hints
+    Similar profile to AES-128; ~8 SubWord invocations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If schedule is equal to 0:
+        Return 0
+    End If
+    Let rc be proc aes_key_expand_common with arena, key, AES192_NK, AES192_ROUNDS, schedule
+    If rc is equal to AES192_SCHEDULE_SIZE:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "aes256_key_expand" takes arena as Integer, key as Integer, schedule as Integer returns Integer:
+    @Reasoning
+    AES-256 key expansion: 32-byte key -> 240-byte schedule (15 round
+    keys). Delegates to aes_key_expand_common with Nk=8, Nr=14. Note
+    the extra SubWord at the (Nk=8, i mod Nk = 4) positions, per FIPS
+    197 section 5.2.
+    @End Reasoning
+
+    @Implementation
+    Calls aes_key_expand_common(arena, key, 8, 14, schedule).
+    @End Implementation
+
+    @Performance_Hints
+    ~13 RotWord+SubWord cycles plus ~6 plain SubWord cycles. Heavier
+    than AES-128/192 but still <1ms on any modern CPU.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If schedule is equal to 0:
+        Return 0
+    End If
+    Let rc be proc aes_key_expand_common with arena, key, AES256_NK, AES256_ROUNDS, schedule
+    If rc is equal to AES256_SCHEDULE_SIZE:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: AES round transformations
+Note: State layout: column-major 4x4 byte matrix at state[0..15].
+Note:   state[0] = s[0,0]   state[4] = s[0,1]   state[8]  = s[0,2]   state[12] = s[0,3]
+Note:   state[1] = s[1,0]   state[5] = s[1,1]   state[9]  = s[1,2]   state[13] = s[1,3]
+Note:   state[2] = s[2,0]   state[6] = s[2,1]   state[10] = s[2,2]   state[14] = s[2,3]
+Note:   state[3] = s[3,0]   state[7] = s[3,1]   state[11] = s[3,2]   state[15] = s[3,3]
+Note: Input bytes are loaded column-by-column: in[0..3] -> column 0, etc.
+Note: ============================================================================
+
+Process called "aes_add_round_key" takes state as Integer, schedule as Integer, round as Integer returns Integer:
+    @Reasoning
+    XORs the 16-byte state with the round key at schedule[round*16..(round+1)*16].
+    Used Nr+1 times per encryption (once before round 1, once at the
+    end of each round 1..Nr).
+    @End Reasoning
+
+    @Implementation
+    Bytewise XOR loop of 16 bytes. Naturally constant-time.
+    @End Implementation
+
+    @Performance_Hints
+    16 byte loads + 16 byte stores + 16 XORs per call.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let base be round multiplied by 16
+    Let i be 0
+    While i is less than 16:
+        Let s_byte be proc memory_get_byte from Memory with state, i
+        Let k_byte be proc memory_get_byte from Memory with schedule, base plus i
+        Let xored be s_byte bitwise_xor k_byte
+        proc memory_set_byte from Memory with state, i, xored
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "aes_sub_bytes" takes state as Integer, sbox as Integer returns Integer:
+    @Reasoning
+    Applies the S-box to each of the 16 state bytes using the
+    constant-time aes_sub_byte_ct lookup.
+    @End Reasoning
+
+    @Implementation
+    For each i in 0..16: state[i] = aes_sub_byte_ct(sbox, state[i])
+    Each call is a 256-byte scan, so SubBytes is 16*256 = 4096 byte
+    loads from the sbox table per round.
+    @End Implementation
+
+    @Performance_Hints
+    Dominant cost of AES on this software path: ~80% of the runtime.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time (full S-box scan per byte).
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 16:
+        Let v be proc memory_get_byte from Memory with state, i
+        Let sub be proc aes_sub_byte_ct with sbox, v
+        proc memory_set_byte from Memory with state, i, sub
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "aes_inv_sub_bytes" takes state as Integer, inv_sbox as Integer returns Integer:
+    @Reasoning
+    Applies the inverse S-box to each state byte (decryption).
+    @End Reasoning
+
+    @Implementation
+    For each i in 0..16: state[i] = aes_sub_byte_ct(inv_sbox, state[i])
+    Reuses the constant-time scanner with the inverse table.
+    @End Implementation
+
+    @Performance_Hints
+    Same per-call cost as aes_sub_bytes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 16:
+        Let v be proc memory_get_byte from Memory with state, i
+        Let sub be proc aes_sub_byte_ct with inv_sbox, v
+        proc memory_set_byte from Memory with state, i, sub
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "aes_shift_rows" takes state as Integer returns Integer:
+    @Reasoning
+    Cyclically shifts the rows of the state per FIPS 197 section 5.1.2:
+      Row 0: no shift
+      Row 1: shift left by 1 (positions: 1, 5, 9, 13 -> 5, 9, 13, 1)
+      Row 2: shift left by 2
+      Row 3: shift left by 3
+    In our column-major layout, row r occupies indices r, r+4, r+8, r+12.
+    @End Reasoning
+
+    @Implementation
+    Read all four bytes of each row (rows 1, 2, 3) into locals, then
+    write them back at the shifted positions. Row 0 is untouched.
+    Permutation is fixed and public.
+    @End Implementation
+
+    @Performance_Hints
+    12 byte loads + 12 byte stores. O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time (fixed permutation).
+    @End Security_Scope
+
+    Note: Row 1: state[1], state[5], state[9], state[13] -> state[5], state[9], state[13], state[1]
+    Let r1_0 be proc memory_get_byte from Memory with state, 1
+    Let r1_1 be proc memory_get_byte from Memory with state, 5
+    Let r1_2 be proc memory_get_byte from Memory with state, 9
+    Let r1_3 be proc memory_get_byte from Memory with state, 13
+    proc memory_set_byte from Memory with state, 1, r1_1
+    proc memory_set_byte from Memory with state, 5, r1_2
+    proc memory_set_byte from Memory with state, 9, r1_3
+    proc memory_set_byte from Memory with state, 13, r1_0
+
+    Note: Row 2: state[2], state[6], state[10], state[14] -> state[10], state[14], state[2], state[6]
+    Let r2_0 be proc memory_get_byte from Memory with state, 2
+    Let r2_1 be proc memory_get_byte from Memory with state, 6
+    Let r2_2 be proc memory_get_byte from Memory with state, 10
+    Let r2_3 be proc memory_get_byte from Memory with state, 14
+    proc memory_set_byte from Memory with state, 2, r2_2
+    proc memory_set_byte from Memory with state, 6, r2_3
+    proc memory_set_byte from Memory with state, 10, r2_0
+    proc memory_set_byte from Memory with state, 14, r2_1
+
+    Note: Row 3: state[3], state[7], state[11], state[15] -> state[15], state[3], state[7], state[11]
+    Let r3_0 be proc memory_get_byte from Memory with state, 3
+    Let r3_1 be proc memory_get_byte from Memory with state, 7
+    Let r3_2 be proc memory_get_byte from Memory with state, 11
+    Let r3_3 be proc memory_get_byte from Memory with state, 15
+    proc memory_set_byte from Memory with state, 3, r3_3
+    proc memory_set_byte from Memory with state, 7, r3_0
+    proc memory_set_byte from Memory with state, 11, r3_1
+    proc memory_set_byte from Memory with state, 15, r3_2
+
+    Return 1
+End Process
+
+Process called "aes_inv_shift_rows" takes state as Integer returns Integer:
+    @Reasoning
+    Inverse of ShiftRows: shifts rows right by 1, 2, 3 positions
+    respectively (decryption).
+    @End Reasoning
+
+    @Implementation
+    Inverse permutation:
+      Row 1: positions 1, 5, 9, 13 receive 13, 1, 5, 9 (right rotate)
+      Row 2: positions 2, 6, 10, 14 receive 10, 14, 2, 6 (2-pos right)
+      Row 3: positions 3, 7, 11, 15 receive 7, 11, 15, 3 (3-pos right)
+    @End Implementation
+
+    @Performance_Hints
+    Same as aes_shift_rows.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let r1_0 be proc memory_get_byte from Memory with state, 1
+    Let r1_1 be proc memory_get_byte from Memory with state, 5
+    Let r1_2 be proc memory_get_byte from Memory with state, 9
+    Let r1_3 be proc memory_get_byte from Memory with state, 13
+    proc memory_set_byte from Memory with state, 1, r1_3
+    proc memory_set_byte from Memory with state, 5, r1_0
+    proc memory_set_byte from Memory with state, 9, r1_1
+    proc memory_set_byte from Memory with state, 13, r1_2
+
+    Let r2_0 be proc memory_get_byte from Memory with state, 2
+    Let r2_1 be proc memory_get_byte from Memory with state, 6
+    Let r2_2 be proc memory_get_byte from Memory with state, 10
+    Let r2_3 be proc memory_get_byte from Memory with state, 14
+    proc memory_set_byte from Memory with state, 2, r2_2
+    proc memory_set_byte from Memory with state, 6, r2_3
+    proc memory_set_byte from Memory with state, 10, r2_0
+    proc memory_set_byte from Memory with state, 14, r2_1
+
+    Let r3_0 be proc memory_get_byte from Memory with state, 3
+    Let r3_1 be proc memory_get_byte from Memory with state, 7
+    Let r3_2 be proc memory_get_byte from Memory with state, 11
+    Let r3_3 be proc memory_get_byte from Memory with state, 15
+    proc memory_set_byte from Memory with state, 3, r3_1
+    proc memory_set_byte from Memory with state, 7, r3_2
+    proc memory_set_byte from Memory with state, 11, r3_3
+    proc memory_set_byte from Memory with state, 15, r3_0
+
+    Return 1
+End Process
+
+Process called "aes_mix_columns" takes state as Integer returns Integer:
+    @Reasoning
+    Applies the MixColumns transformation per FIPS 197 section 5.1.3.
+    Each column c of the state is treated as a polynomial over GF(2^8)
+    and multiplied by the fixed polynomial {03}x^3 + {01}x^2 + {01}x + {02}
+    modulo x^4 + 1. The result for column [s0, s1, s2, s3] is:
+      s0' = ({02}*s0) XOR ({03}*s1) XOR s2 XOR s3
+      s1' = s0 XOR ({02}*s1) XOR ({03}*s2) XOR s3
+      s2' = s0 XOR s1 XOR ({02}*s2) XOR ({03}*s3)
+      s3' = ({03}*s0) XOR s1 XOR s2 XOR ({02}*s3)
+    where {02}*x = xtime(x) and {03}*x = x XOR xtime(x).
+    @End Reasoning
+
+    @Implementation
+    Iterate over the 4 columns. For each, load the 4 input bytes,
+    compute the 4 output bytes via xtime, and store back.
+    @End Implementation
+
+    @Performance_Hints
+    4 columns × (~8 xtime + ~16 XOR) = ~96 ops per call.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time (all GF arithmetic is CT).
+    @End Security_Scope
+
+    Let col be 0
+    While col is less than 4:
+        Let base be col multiplied by 4
+        Let s0 be proc memory_get_byte from Memory with state, base
+        Let s1 be proc memory_get_byte from Memory with state, base plus 1
+        Let s2 be proc memory_get_byte from Memory with state, base plus 2
+        Let s3 be proc memory_get_byte from Memory with state, base plus 3
+
+        Let t0 be proc aes_xtime with s0
+        Let t1 be proc aes_xtime with s1
+        Let t2 be proc aes_xtime with s2
+        Let t3 be proc aes_xtime with s3
+
+        Note: m_ij = {03}*s_j = s_j XOR xtime(s_j)
+        Let m0 be t0 bitwise_xor s0
+        Let m1 be t1 bitwise_xor s1
+        Let m2 be t2 bitwise_xor s2
+        Let m3 be t3 bitwise_xor s3
+
+        Note: s0' = t0 XOR m1 XOR s2 XOR s3 = (xtime(s0)) XOR (s1 XOR xtime(s1)) XOR s2 XOR s3
+        Let n0 be t0 bitwise_xor m1
+        Set n0 to n0 bitwise_xor s2
+        Set n0 to n0 bitwise_xor s3
+
+        Let n1 be s0 bitwise_xor t1
+        Set n1 to n1 bitwise_xor m2
+        Set n1 to n1 bitwise_xor s3
+
+        Let n2 be s0 bitwise_xor s1
+        Set n2 to n2 bitwise_xor t2
+        Set n2 to n2 bitwise_xor m3
+
+        Let n3 be m0 bitwise_xor s1
+        Set n3 to n3 bitwise_xor s2
+        Set n3 to n3 bitwise_xor t3
+
+        proc memory_set_byte from Memory with state, base, n0
+        proc memory_set_byte from Memory with state, base plus 1, n1
+        proc memory_set_byte from Memory with state, base plus 2, n2
+        proc memory_set_byte from Memory with state, base plus 3, n3
+
+        Set col to col plus 1
+    End While
+    Return 1
+End Process
+
+Process called "aes_inv_mix_columns" takes state as Integer returns Integer:
+    @Reasoning
+    Applies the InvMixColumns transformation per FIPS 197 section 5.3.3.
+    Each column is multiplied by the polynomial
+    {0b}x^3 + {0d}x^2 + {09}x + {0e}, the inverse of MixColumns
+    polynomial modulo x^4 + 1. The result for [s0, s1, s2, s3] is:
+      s0' = ({0e}*s0) XOR ({0b}*s1) XOR ({0d}*s2) XOR ({09}*s3)
+      s1' = ({09}*s0) XOR ({0e}*s1) XOR ({0b}*s2) XOR ({0d}*s3)
+      s2' = ({0d}*s0) XOR ({09}*s1) XOR ({0e}*s2) XOR ({0b}*s3)
+      s3' = ({0b}*s0) XOR ({0d}*s1) XOR ({09}*s2) XOR ({0e}*s3)
+    @End Reasoning
+
+    @Implementation
+    For each column, compute the four products via aes_gmul (a fully
+    general GF(2^8) multiplier) and XOR them.
+    @End Implementation
+
+    @Performance_Hints
+    4 columns × (16 gmul + 12 XOR) ~ 4*144 ops = ~600 ops per call.
+    Heavier than MixColumns, hence why the decryption hot path can be
+    accelerated by precomputing equivalent inverse tables; we don't
+    do that here because the additional cache footprint is undesirable
+    on the constant-time path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time (aes_gmul is CT).
+    @End Security_Scope
+
+    Let col be 0
+    While col is less than 4:
+        Let base be col multiplied by 4
+        Let s0 be proc memory_get_byte from Memory with state, base
+        Let s1 be proc memory_get_byte from Memory with state, base plus 1
+        Let s2 be proc memory_get_byte from Memory with state, base plus 2
+        Let s3 be proc memory_get_byte from Memory with state, base plus 3
+
+        Let e0 be proc aes_gmul with 14, s0
+        Let b1 be proc aes_gmul with 11, s1
+        Let d2 be proc aes_gmul with 13, s2
+        Let n9_3 be proc aes_gmul with 9, s3
+        Let n0 be e0 bitwise_xor b1
+        Set n0 to n0 bitwise_xor d2
+        Set n0 to n0 bitwise_xor n9_3
+
+        Let n9_0 be proc aes_gmul with 9, s0
+        Let e1 be proc aes_gmul with 14, s1
+        Let b2 be proc aes_gmul with 11, s2
+        Let d3 be proc aes_gmul with 13, s3
+        Let n1 be n9_0 bitwise_xor e1
+        Set n1 to n1 bitwise_xor b2
+        Set n1 to n1 bitwise_xor d3
+
+        Let d0 be proc aes_gmul with 13, s0
+        Let n9_1 be proc aes_gmul with 9, s1
+        Let e2 be proc aes_gmul with 14, s2
+        Let b3 be proc aes_gmul with 11, s3
+        Let n2 be d0 bitwise_xor n9_1
+        Set n2 to n2 bitwise_xor e2
+        Set n2 to n2 bitwise_xor b3
+
+        Let b0 be proc aes_gmul with 11, s0
+        Let d1 be proc aes_gmul with 13, s1
+        Let n9_2 be proc aes_gmul with 9, s2
+        Let e3 be proc aes_gmul with 14, s3
+        Let n3 be b0 bitwise_xor d1
+        Set n3 to n3 bitwise_xor n9_2
+        Set n3 to n3 bitwise_xor e3
+
+        proc memory_set_byte from Memory with state, base, n0
+        proc memory_set_byte from Memory with state, base plus 1, n1
+        proc memory_set_byte from Memory with state, base plus 2, n2
+        proc memory_set_byte from Memory with state, base plus 3, n3
+
+        Set col to col plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Block encryption / decryption (public API)
+Note: ============================================================================
+
+Process called "aes_encrypt_block_common" takes arena as Integer, schedule as Integer, nr as Integer, in_block as Integer, out_block as Integer returns Integer:
+    @Reasoning
+    Encrypts one 16-byte block using a precomputed key schedule. The
+    same routine handles AES-128/192/256 by parameterizing the round
+    count Nr.
+    @End Reasoning
+
+    @Implementation
+    1. Load the 16 plaintext bytes into a local state buffer.
+    2. Initial AddRoundKey with round-key 0.
+    3. For round r in 1..(Nr-1): SubBytes, ShiftRows, MixColumns, AddRoundKey(r).
+    4. Final round (Nr): SubBytes, ShiftRows, AddRoundKey(Nr).
+    5. Store the 16-byte state into out_block.
+
+    A 256-byte S-box scratch is allocated in the arena and initialized
+    once per call. In a high-throughput stream context the caller can
+    amortize this by pre-populating an S-box and calling the lower-level
+    primitives directly; the public API guarantees a self-contained call.
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by SubBytes (Nr * 16 calls to aes_sub_byte_ct, each a
+    256-byte scan). For AES-128 that is 160 scans * 256 loads = 40960
+    byte loads from the S-box per block. AES-NI hardware replaces all
+    of this with a handful of AESENC instructions per round (~5
+    cycles); software is ~250 cycles/byte.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time throughout. No secret-dependent branches or memory
+    accesses on any internal helper.
+    @End Security_Scope
+
+    Let state be proc arena_allocate from Arena with arena, 16
+    If state is equal to 0:
+        Return 0
+    End If
+    Let sbox be proc arena_allocate from Arena with arena, 256
+    If sbox is equal to 0:
+        Return 0
+    End If
+    proc aes_fill_sbox with sbox
+
+    Note: Load plaintext into state
+    Let i be 0
+    While i is less than 16:
+        Let b be proc memory_get_byte from Memory with in_block, i
+        proc memory_set_byte from Memory with state, i, b
+        Set i to i plus 1
+    End While
+
+    Note: Initial round key
+    proc aes_add_round_key with state, schedule, 0
+
+    Note: Rounds 1 .. Nr-1
+    Let round be 1
+    While round is less than nr:
+        proc aes_sub_bytes with state, sbox
+        proc aes_shift_rows with state
+        proc aes_mix_columns with state
+        proc aes_add_round_key with state, schedule, round
+        Set round to round plus 1
+    End While
+
+    Note: Final round (no MixColumns)
+    proc aes_sub_bytes with state, sbox
+    proc aes_shift_rows with state
+    proc aes_add_round_key with state, schedule, nr
+
+    Note: Store
+    Let j be 0
+    While j is less than 16:
+        Let b2 be proc memory_get_byte from Memory with state, j
+        proc memory_set_byte from Memory with out_block, j, b2
+        Set j to j plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "aes_decrypt_block_common" takes arena as Integer, schedule as Integer, nr as Integer, in_block as Integer, out_block as Integer returns Integer:
+    @Reasoning
+    Decrypts one 16-byte block using a precomputed key schedule. The
+    same routine handles AES-128/192/256 by parameterizing Nr.
+    @End Reasoning
+
+    @Implementation
+    1. Load ciphertext into state.
+    2. Initial AddRoundKey with round-key Nr.
+    3. For round r in (Nr-1)..1 (descending):
+         InvShiftRows, InvSubBytes, AddRoundKey(r), InvMixColumns.
+    4. Final round (r=0): InvShiftRows, InvSubBytes, AddRoundKey(0).
+    5. Store state.
+    @End Implementation
+
+    @Performance_Hints
+    Slower than encryption because InvMixColumns uses general gmul
+    rather than xtime. Same overall constant-time discipline.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time throughout.
+    @End Security_Scope
+
+    Let state be proc arena_allocate from Arena with arena, 16
+    If state is equal to 0:
+        Return 0
+    End If
+    Let inv_sbox be proc arena_allocate from Arena with arena, 256
+    If inv_sbox is equal to 0:
+        Return 0
+    End If
+    proc aes_fill_inv_sbox with inv_sbox
+
+    Note: Load ciphertext
+    Let i be 0
+    While i is less than 16:
+        Let b be proc memory_get_byte from Memory with in_block, i
+        proc memory_set_byte from Memory with state, i, b
+        Set i to i plus 1
+    End While
+
+    Note: Initial AddRoundKey with round Nr
+    proc aes_add_round_key with state, schedule, nr
+
+    Note: Rounds Nr-1 .. 1
+    Let round be nr minus 1
+    While round is greater than 0:
+        proc aes_inv_shift_rows with state
+        proc aes_inv_sub_bytes with state, inv_sbox
+        proc aes_add_round_key with state, schedule, round
+        proc aes_inv_mix_columns with state
+        Set round to round minus 1
+    End While
+
+    Note: Final round
+    proc aes_inv_shift_rows with state
+    proc aes_inv_sub_bytes with state, inv_sbox
+    proc aes_add_round_key with state, schedule, 0
+
+    Note: Store
+    Let j be 0
+    While j is less than 16:
+        Let b2 be proc memory_get_byte from Memory with state, j
+        proc memory_set_byte from Memory with out_block, j, b2
+        Set j to j plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Public API: dispatch by schedule size
+Note: ============================================================================
+
+Process called "aes_encrypt_block" takes arena as Integer, schedule as Integer, schedule_size as Integer, in_block as Integer, out_block as Integer returns Integer:
+    @Reasoning
+    Public block-encryption entry point. The caller passes the
+    precomputed schedule along with its size (176, 208, or 240 bytes)
+    so the routine can infer the round count Nr.
+    @End Reasoning
+
+    @Implementation
+    schedule_size 176 -> Nr=10 (AES-128)
+    schedule_size 208 -> Nr=12 (AES-192)
+    schedule_size 240 -> Nr=14 (AES-256)
+    Any other value is rejected.
+    @End Implementation
+
+    @Performance_Hints
+    Single block invocation; overhead is a couple of branches plus the
+    block computation itself.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. Schedule-size dispatch is on a public value.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If schedule is equal to 0:
+        Return 0
+    End If
+    If in_block is equal to 0:
+        Return 0
+    End If
+    If out_block is equal to 0:
+        Return 0
+    End If
+
+    If schedule_size is equal to AES128_SCHEDULE_SIZE:
+        Return proc aes_encrypt_block_common with arena, schedule, AES128_ROUNDS, in_block, out_block
+    End If
+    If schedule_size is equal to AES192_SCHEDULE_SIZE:
+        Return proc aes_encrypt_block_common with arena, schedule, AES192_ROUNDS, in_block, out_block
+    End If
+    If schedule_size is equal to AES256_SCHEDULE_SIZE:
+        Return proc aes_encrypt_block_common with arena, schedule, AES256_ROUNDS, in_block, out_block
+    End If
+    Return 0
+End Process
+
+Process called "aes_decrypt_block" takes arena as Integer, schedule as Integer, schedule_size as Integer, in_block as Integer, out_block as Integer returns Integer:
+    @Reasoning
+    Public block-decryption entry point. Mirrors aes_encrypt_block.
+    @End Reasoning
+
+    @Implementation
+    Dispatches on schedule_size to choose Nr, then calls
+    aes_decrypt_block_common.
+    @End Implementation
+
+    @Performance_Hints
+    Single block invocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If schedule is equal to 0:
+        Return 0
+    End If
+    If in_block is equal to 0:
+        Return 0
+    End If
+    If out_block is equal to 0:
+        Return 0
+    End If
+
+    If schedule_size is equal to AES128_SCHEDULE_SIZE:
+        Return proc aes_decrypt_block_common with arena, schedule, AES128_ROUNDS, in_block, out_block
+    End If
+    If schedule_size is equal to AES192_SCHEDULE_SIZE:
+        Return proc aes_decrypt_block_common with arena, schedule, AES192_ROUNDS, in_block, out_block
+    End If
+    If schedule_size is equal to AES256_SCHEDULE_SIZE:
+        Return proc aes_decrypt_block_common with arena, schedule, AES256_ROUNDS, in_block, out_block
+    End If
+    Return 0
+End Process

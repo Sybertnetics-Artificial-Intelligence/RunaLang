@@ -1,0 +1,454 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+X25519 - Diffie-Hellman on Curve25519 per RFC 7748
+==============================================================================
+
+Implements the X25519 elliptic-curve Diffie-Hellman primitive defined in
+RFC 7748 section 5. X25519 operates on the u-coordinate of the Montgomery
+curve
+
+    y^2 = x^3 + 486662 x^2 + x  (mod 2^255 - 19)
+
+The single-coordinate Montgomery ladder is the canonical constant-time
+implementation: at every step it maintains two projective points
+(x_2, z_2) and (x_3, z_3) and conditionally swaps them based on the
+current scalar bit. The CSWAP is implemented branchlessly via bit-masking
+so that no operation in the loop depends on the secret bit's value.
+
+Public API:
+- x25519_clamp(private_32):
+    Applies the RFC 7748 5 clamping bits to a 32-byte scalar:
+      private[0]  &= 248         (clear bottom 3 bits)
+      private[31] &= 127         (clear top bit)
+      private[31] |= 64          (set bit 254)
+    Returns 1 always.
+
+- x25519_scalarmult(private_32, peer_public_32, shared_secret_32):
+    Performs u3 = ladder(private, u2). Clamps the input private scalar
+    if not already clamped. Computes shared_secret = canonical_pack(u3).
+    Returns 1 on success, 0 on input failure.
+
+- x25519_keygen(arena, private_out_32, public_out_32):
+    Generates a random scalar via entropy_random_bytes, clamps it,
+    and computes the public key as ladder(private, 9). Returns 1
+    on success, 0 on entropy failure.
+
+Constant-time guarantee: every operation that touches the scalar bits
+runs in the same sequence regardless of bit values. The ladder uses
+fe25519_cswap (XOR-with-mask). Memory access patterns are bit-independent.
+
+References:
+- RFC 7748 sections 5, 6.1.
+- D.J. Bernstein, "Curve25519: new Diffie-Hellman speed records", PKC 2006.
+- libsodium crypto_scalarmult_curve25519_ref10.c.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/field25519.runa" as Fe
+Import "compiler/frontend/import_system/crypto/entropy.runa" as Entropy
+
+Constant X25519_KEY_BYTES as Integer is 32
+
+Note: ============================================================================
+Note: SECTION 1: Scalar clamping per RFC 7748 section 5
+Note: ============================================================================
+
+Process called "x25519_clamp" takes private_key as Integer returns Integer:
+    @Reasoning
+    Applies the RFC 7748 section 5 clamping bits to an X25519 scalar.
+    The three operations:
+      1. Clear the bottom 3 bits so the scalar is a multiple of 8 (the
+         cofactor). This guarantees the scalar mult result lies in the
+         prime-order subgroup regardless of input point order.
+      2. Clear the top bit (bit 255) so the scalar fits in 255 bits.
+      3. Set bit 254 so the high bit of the scalar is fixed and the
+         ladder always executes from the same starting bit position
+         (constant-time guarantee).
+
+    Reference: RFC 7748 5, "Curve25519 ... decodeScalar25519".
+    @End Reasoning
+
+    @Implementation
+    Three byte mask/or operations on bytes 0 and 31 of the 32-byte scalar.
+    @End Implementation
+
+    @Performance_Hints
+    Three reads + three writes. Constant cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Operates only on the scalar in caller storage. The clamping is
+    well-defined for any 32-byte input; no input validation is needed
+    because every byte pattern produces a valid clamped scalar.
+    @End Security_Scope
+
+    If private_key is equal to 0:
+        Return 0
+    End If
+
+    Let b0 be Memory.memory_get_byte(private_key, 0)
+    Let b0_clamped be b0 bitwise_and 248
+    Memory.memory_set_byte(private_key, 0, b0_clamped)
+
+    Let b31 be Memory.memory_get_byte(private_key, 31)
+    Let b31_top_cleared be b31 bitwise_and 127
+    Let b31_final be b31_top_cleared bitwise_or 64
+    Memory.memory_set_byte(private_key, 31, b31_final)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Montgomery ladder step
+Note: ============================================================================
+
+Process called "x25519_ladder_step" takes arena as Integer, x2 as Integer, z2 as Integer, x3 as Integer, z3 as Integer, x1 as Integer returns Integer:
+    @Reasoning
+    A single Montgomery ladder step computes:
+      DBL: (x2', z2') = 2*(x2, z2)
+      ADD: (x3', z3') = (x2, z2) + (x3, z3), with the differential
+           x1 = x2_orig - x3_orig fixed at x1 (the base x-coordinate).
+
+    The formulas are (Montgomery 1987):
+      A = x2 + z2
+      B = x2 - z2
+      C = x3 + z3
+      D = x3 - z3
+      DA = D * A
+      CB = C * B
+      x3' = (DA + CB)^2
+      z3' = x1 * (DA - CB)^2
+      AA = A^2
+      BB = B^2
+      x2' = AA * BB
+      E  = AA - BB
+      z2' = E * (BB + a24 * E)        where a24 = 121665 = (486662 - 2)/4
+
+    Constants: a24 is a small integer; multiplication by a24 is implemented
+    via fe25519_mul with a precomputed field element for 121665.
+
+    All intermediate values are arena-allocated field elements.
+    @End Reasoning
+
+    @Implementation
+    Allocates eight scratch field elements: A, B, C, D, DA, CB, AA, BB,
+    and a24_fe. Performs the additions / subtractions / multiplications /
+    squarings, then stores back into the caller's x2, z2, x3, z3 buffers.
+    @End Implementation
+
+    @Performance_Hints
+    The ladder step is the dominant cost of X25519: 5 multiplications +
+    4 squarings + 1 mul-by-small (a24) + 8 additions/subtractions per bit.
+    Across the 255 ladder iterations the total is ~1280 mul + ~1020 sqr
+    + ~255 small-mul + ~2040 add/sub.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: every field operation is constant-time, all scratch
+    buffers are allocated unconditionally, no branching.
+    @End Security_Scope
+
+    Let scratch_A be proc fe25519_alloc from Fe with arena
+    Let scratch_B be proc fe25519_alloc from Fe with arena
+    Let scratch_C be proc fe25519_alloc from Fe with arena
+    Let scratch_D be proc fe25519_alloc from Fe with arena
+    Let scratch_DA be proc fe25519_alloc from Fe with arena
+    Let scratch_CB be proc fe25519_alloc from Fe with arena
+    Let scratch_AA be proc fe25519_alloc from Fe with arena
+    Let scratch_BB be proc fe25519_alloc from Fe with arena
+    Let scratch_E be proc fe25519_alloc from Fe with arena
+    Let scratch_a24 be proc fe25519_alloc from Fe with arena
+    Let scratch_T be proc fe25519_alloc from Fe with arena
+    Let scratch_T2 be proc fe25519_alloc from Fe with arena
+
+    If scratch_A is equal to 0:
+        Return 0
+    End If
+    If scratch_T2 is equal to 0:
+        Return 0
+    End If
+
+    Note: a24 = 121665 as a field element (limb 0 holds the whole value
+    Note: since 121665 < 2^26).
+    proc fe25519_set_zero from Fe with scratch_a24
+    Memory.memory_set_qword(scratch_a24, 0, 121665)
+
+    Note: A = x2 + z2
+    proc fe25519_add from Fe with scratch_A, x2, z2
+    Note: B = x2 - z2
+    proc fe25519_sub from Fe with scratch_B, x2, z2
+    Note: C = x3 + z3
+    proc fe25519_add from Fe with scratch_C, x3, z3
+    Note: D = x3 - z3
+    proc fe25519_sub from Fe with scratch_D, x3, z3
+
+    Note: DA = D * A
+    proc fe25519_mul from Fe with scratch_DA, scratch_D, scratch_A
+    Note: CB = C * B
+    proc fe25519_mul from Fe with scratch_CB, scratch_C, scratch_B
+
+    Note: x3' = (DA + CB)^2
+    proc fe25519_add from Fe with scratch_T, scratch_DA, scratch_CB
+    proc fe25519_sqr from Fe with x3, scratch_T
+
+    Note: z3' = x1 * (DA - CB)^2
+    proc fe25519_sub from Fe with scratch_T, scratch_DA, scratch_CB
+    proc fe25519_sqr from Fe with scratch_T2, scratch_T
+    proc fe25519_mul from Fe with z3, scratch_T2, x1
+
+    Note: AA = A^2
+    proc fe25519_sqr from Fe with scratch_AA, scratch_A
+    Note: BB = B^2
+    proc fe25519_sqr from Fe with scratch_BB, scratch_B
+
+    Note: x2' = AA * BB
+    proc fe25519_mul from Fe with x2, scratch_AA, scratch_BB
+
+    Note: E = AA - BB
+    proc fe25519_sub from Fe with scratch_E, scratch_AA, scratch_BB
+
+    Note: z2' = E * (BB + a24 * E)
+    proc fe25519_mul from Fe with scratch_T, scratch_a24, scratch_E
+    proc fe25519_add from Fe with scratch_T2, scratch_BB, scratch_T
+    proc fe25519_mul from Fe with z2, scratch_E, scratch_T2
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Full ladder (255 iterations)
+Note: ============================================================================
+
+Process called "x25519_ladder" takes arena as Integer, scalar_32 as Integer, base_u_32 as Integer, out_u_32 as Integer returns Integer:
+    @Reasoning
+    Executes the Montgomery ladder from bit 254 down to bit 0 of the
+    scalar. At every step the two accumulator points are conditionally
+    swapped based on the current scalar bit, so that the same ladder
+    step formula applies regardless of bit value. After the loop, a
+    final swap is performed to align (x2, z2) with the result point.
+
+    Result: u_out = x2 / z2 (mod p), encoded as 32 bytes little-endian.
+    Inversion of z2 uses fe25519_inv (Fermat). Final pack uses
+    fe25519_pack which already applies fe25519_freeze for canonical form.
+    @End Reasoning
+
+    @Implementation
+    Eight field elements are arena-allocated: x1, x2, z2, x3, z3,
+    inv_z2, result. The ladder loop runs 255 iterations (bits 254..0).
+    @End Implementation
+
+    @Performance_Hints
+    Total cost: 255 * (5 mul + 4 sqr + 1 small-mul) ladder steps +
+    1 inversion (255 sqr + 11 mul). Per-call cost is dominated by the
+    ladder.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: the loop iterates a fixed 255 times. Every step
+    runs the same code regardless of scalar bit values. CSWAP is
+    branchless.
+    @End Security_Scope
+
+    Let x1 be proc fe25519_alloc from Fe with arena
+    Let x2 be proc fe25519_alloc from Fe with arena
+    Let z2 be proc fe25519_alloc from Fe with arena
+    Let x3 be proc fe25519_alloc from Fe with arena
+    Let z3 be proc fe25519_alloc from Fe with arena
+    Let inv_z2 be proc fe25519_alloc from Fe with arena
+    Let result_u be proc fe25519_alloc from Fe with arena
+
+    If x1 is equal to 0:
+        Return 0
+    End If
+    If result_u is equal to 0:
+        Return 0
+    End If
+
+    Note: Per RFC 7748 5, mask off the high bit of the base point u
+    Note: before decoding. We work on a local 32-byte copy to avoid
+    Note: mutating caller storage.
+    Let u_local be Arena.arena_allocate(arena, 32)
+    If u_local is equal to 0:
+        Return 0
+    End If
+    Let cp be 0
+    While cp is less than 32:
+        Let bv be Memory.memory_get_byte(base_u_32, cp)
+        Memory.memory_set_byte(u_local, cp, bv)
+        Set cp to cp plus 1
+    End While
+    Let last_u be Memory.memory_get_byte(u_local, 31)
+    Memory.memory_set_byte(u_local, 31, last_u bitwise_and 127)
+
+    proc fe25519_unpack from Fe with x1, u_local
+
+    Note: Initial: (x2, z2) = (1, 0), (x3, z3) = (x1, 1).
+    proc fe25519_set_one from Fe with x2
+    proc fe25519_set_zero from Fe with z2
+    proc fe25519_copy from Fe with x3, x1
+    proc fe25519_set_one from Fe with z3
+
+    Let swap be 0
+    Let bit_index be 254
+    While bit_index is greater than 0 minus 1:
+        Note: Extract bit b = (scalar[bit_index >> 3] >> (bit_index & 7)) & 1
+        Let byte_index be bit_index shifted right by 3
+        Let bit_in_byte be bit_index bitwise_and 7
+        Let byte_val be Memory.memory_get_byte(scalar_32, byte_index)
+        Let bit_val be (byte_val shifted right by bit_in_byte) bitwise_and 1
+
+        Note: swap_now = swap XOR bit
+        Let swap_now be swap bitwise_xor bit_val
+        proc fe25519_cswap from Fe with x2, x3, swap_now
+        proc fe25519_cswap from Fe with z2, z3, swap_now
+        Set swap to bit_val
+
+        proc x25519_ladder_step with arena, x2, z2, x3, z3, x1
+
+        Set bit_index to bit_index minus 1
+    End While
+
+    Note: Final swap to align result with x2/z2.
+    proc fe25519_cswap from Fe with x2, x3, swap
+    proc fe25519_cswap from Fe with z2, z3, swap
+
+    Note: result = x2 / z2
+    proc fe25519_inv from Fe with arena, inv_z2, z2
+    proc fe25519_mul from Fe with result_u, x2, inv_z2
+
+    Note: Pack to canonical 32-byte little-endian
+    proc fe25519_pack from Fe with result_u, out_u_32
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Public API
+Note: ============================================================================
+
+Process called "x25519_scalarmult" takes arena as Integer, private_key_32 as Integer, peer_public_32 as Integer, shared_secret_32 as Integer returns Integer:
+    @Reasoning
+    Performs X25519 scalar multiplication. Clones the private scalar so
+    we can clamp without modifying caller storage. Runs the Montgomery
+    ladder via x25519_ladder. Returns the shared secret.
+
+    Per RFC 7748 6.1 step "scalarMult", the function input is treated as
+    a clamped scalar even if the caller already clamped it; clamping is
+    idempotent so this is safe.
+    @End Reasoning
+
+    @Implementation
+    Arena-allocates a 32-byte buffer for the clamped scalar copy. Runs
+    x25519_clamp on the copy, then x25519_ladder.
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by the ladder + inversion. One full scalar mult is
+    roughly 1280 mul + 1020 sqr.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time end to end. The private scalar copy is arena-backed
+    and will be wiped when the arena resets.
+    @End Security_Scope
+
+    If private_key_32 is equal to 0:
+        Return 0
+    End If
+    If peer_public_32 is equal to 0:
+        Return 0
+    End If
+    If shared_secret_32 is equal to 0:
+        Return 0
+    End If
+
+    Let private_copy be Arena.arena_allocate(arena, 32)
+    If private_copy is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 32:
+        Let bv be Memory.memory_get_byte(private_key_32, i)
+        Memory.memory_set_byte(private_copy, i, bv)
+        Set i to i plus 1
+    End While
+    proc x25519_clamp with private_copy
+
+    Let ladder_rc be proc x25519_ladder with arena, private_copy, peer_public_32, shared_secret_32
+    Return ladder_rc
+End Process
+
+Process called "x25519_keygen" takes arena as Integer, private_key_out_32 as Integer, public_key_out_32 as Integer returns Integer:
+    @Reasoning
+    Generates an X25519 keypair. Draws 32 bytes of cryptographic entropy
+    from entropy_random_bytes, clamps the result into a valid X25519
+    scalar, and computes the public key by scalar-multiplying the
+    standard generator (u = 9) into the scalar.
+
+    Per RFC 7748 5, the base point u is the integer 9 encoded as
+    little-endian 32 bytes: 09 00 00 ... 00.
+    @End Reasoning
+
+    @Implementation
+    1. Fill private_key_out_32 with 32 random bytes via entropy module.
+    2. Apply x25519_clamp.
+    3. Build the base point buffer (32 bytes, first byte = 9).
+    4. Run x25519_scalarmult(private, base, public).
+    @End Implementation
+
+    @Performance_Hints
+    One full scalar mult cost. Entropy gathering is one-time and
+    typically dominated by the syscall to /dev/urandom (a few
+    microseconds).
+    @End Performance_Hints
+
+    @Security_Scope
+    The private key never leaves the caller's buffer. Entropy source
+    is the kernel CSPRNG. The clamping defends against small-subgroup
+    attacks (private is always a multiple of 8) and against scalars
+    above 2^254 (top bit cleared, bit 254 set so the ladder always
+    starts from the same point).
+    @End Security_Scope
+
+    If private_key_out_32 is equal to 0:
+        Return 0
+    End If
+    If public_key_out_32 is equal to 0:
+        Return 0
+    End If
+
+    Let rc_entropy be proc entropy_random_bytes from Entropy with arena, private_key_out_32, 32
+    If rc_entropy is equal to 0:
+        Return 0
+    End If
+    proc x25519_clamp with private_key_out_32
+
+    Note: Build base point u=9 as 32 bytes little-endian
+    Let base_u be Arena.arena_allocate(arena, 32)
+    If base_u is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(base_u, 0, 9)
+    Let bi be 1
+    While bi is less than 32:
+        Memory.memory_set_byte(base_u, bi, 0)
+        Set bi to bi plus 1
+    End While
+
+    Return proc x25519_scalarmult with arena, private_key_out_32, base_u, public_key_out_32
+End Process

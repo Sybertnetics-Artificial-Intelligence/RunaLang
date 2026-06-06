@@ -1,0 +1,716 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+LOCKFILE - Reproducible-Build Dependency Pin Manifest (Tier 1)
+
+Implements the lockfile substrate: a sorted, deterministic list of
+exactly-resolved dependency versions with checksums. A lockfile is the
+mechanism by which an arbitrary developer machine reproduces a
+byte-identical build of a package. Mirrors Cargo.lock / package-lock.json
+/ poetry.lock in role.
+
+Determinism guarantee: lockfile_serialize emits entries in lexicographic
+order by (name, version_string) so two correctly-implemented serializers
+produce identical output for the same input. This is the property
+package managers test against to verify a clean install matches the
+recorded lockfile.
+
+Layout (LockEntry, 64 bytes):
+  offset  0 : name         (8 bytes, String pointer)
+  offset  8 : version      (8 bytes, Version pointer)
+  offset 16 : source_kind  (8 bytes, see DEP_* constants from dependency_spec)
+  offset 24 : source_url   (8 bytes, String pointer)
+  offset 32 : checksum     (8 bytes, String pointer - SHA-256 or BLAKE3 hex)
+  offset 40 : dependencies (8 bytes, List<String> pointer - names of transitive deps)
+  offset 48 : checksum_alg (8 bytes, see ALG_* constants)
+  offset 56 : _reserved    (8 bytes - reserved for future fields)
+
+Layout (Lockfile, 32 bytes):
+  offset  0 : format_version (8 bytes)
+  offset  8 : root_manifest_name (8 bytes, String pointer)
+  offset 16 : root_manifest_version (8 bytes, Version pointer)
+  offset 24 : entries     (8 bytes, List<LockEntry> pointer)
+
+References:
+  - Cargo.lock format ........ https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
+  - SLSA reproducible builds . https://slsa.dev/spec/v1.0/levels
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/manifest/version_constraint.runa" as VC
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let LOCK_ENTRY_SIZE be 64
+Let LOCKFILE_SIZE be 32
+
+Let LOCKFILE_FORMAT_VERSION be 1
+
+Let ALG_SHA256 be 1
+Let ALG_BLAKE3 be 2
+Let ALG_SHA512 be 3
+
+Note: ============================================================================
+Note: LOCK ENTRY
+Note: ============================================================================
+
+@Reasoning
+Construct a single locked dependency entry. The version is an owned
+Version pointer (released via entry_destroy_deep). The dependencies list
+must already have been allocated by the caller.
+@End Reasoning
+
+@Implementation
+Allocate 64 bytes and populate every slot.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on any null mandatory input.
+@End Security_Scope
+Process called "lock_entry_create" takes name as Integer, version as Integer, source_kind as Integer, source_url as Integer, checksum as Integer, checksum_alg as Integer, dependencies as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If version is equal to 0:
+        Return 0
+    End If
+    If checksum is equal to 0:
+        Return 0
+    End If
+    If checksum_alg is less than ALG_SHA256:
+        Return 0
+    End If
+    If checksum_alg is greater than ALG_SHA512:
+        Return 0
+    End If
+    Let e be proc allocate from Layout with LOCK_ENTRY_SIZE
+    If e is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with e, 0, name
+    proc memory_set_int64 from Memory with e, 8, version
+    proc memory_set_int64 from Memory with e, 16, source_kind
+    proc memory_set_int64 from Memory with e, 24, source_url
+    proc memory_set_int64 from Memory with e, 32, checksum
+    proc memory_set_int64 from Memory with e, 40, dependencies
+    proc memory_set_int64 from Memory with e, 48, checksum_alg
+    proc memory_set_int64 from Memory with e, 56, 0
+    Return e
+End Process
+
+@Reasoning
+Free the entry record without disturbing subordinate strings, version,
+or transitive-dep list.
+@End Reasoning
+
+@Implementation
+Free the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access the pointer after destroy.
+@End Security_Scope
+Process called "lock_entry_destroy" takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    proc deallocate from Layout with e
+    Return 1
+End Process
+
+@Reasoning
+Free the entry and every owned subordinate.
+@End Reasoning
+
+@Implementation
+Conditionally release each non-null subordinate, then free the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(d) where d is the number of transitive deps. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Double-free protection is caller's responsibility.
+@End Security_Scope
+Process called "lock_entry_destroy_deep" takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Let name be proc memory_get_int64 from Memory with e, 0
+    If name is not equal to 0:
+        proc deallocate from Layout with name
+    End If
+    Let version be proc memory_get_int64 from Memory with e, 8
+    If version is not equal to 0:
+        proc version_destroy_deep from VC with version
+    End If
+    Let source_url be proc memory_get_int64 from Memory with e, 24
+    If source_url is not equal to 0:
+        proc deallocate from Layout with source_url
+    End If
+    Let checksum be proc memory_get_int64 from Memory with e, 32
+    If checksum is not equal to 0:
+        proc deallocate from Layout with checksum
+    End If
+    Let deps be proc memory_get_int64 from Memory with e, 40
+    If deps is not equal to 0:
+        Let dn be proc list_length from List with deps
+        Let i be 0
+        While i is less than dn:
+            Let s be proc list_get from List with deps, i
+            If s is not equal to 0:
+                proc deallocate from Layout with s
+            End If
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with deps
+    End If
+    proc deallocate from Layout with e
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ENTRY ACCESSORS
+Note: ============================================================================
+
+@Reasoning
+Expose the entry name.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null.
+@End Security_Scope
+Process called "lock_entry_name" takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with e, 0
+End Process
+
+@Reasoning
+Expose the locked version.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null.
+@End Security_Scope
+Process called "lock_entry_version" takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with e, 8
+End Process
+
+@Reasoning
+Expose the integrity hash. Callers verifying the hash must use a
+constant-time comparator from the crypto module.
+@End Reasoning
+
+@Implementation
+Load offset 32.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+The hash is the package manager's tamper-detection signal.
+@End Security_Scope
+Process called "lock_entry_checksum" takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with e, 32
+End Process
+
+@Reasoning
+Expose the hashing algorithm identifier.
+@End Reasoning
+
+@Implementation
+Load offset 48.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null.
+@End Security_Scope
+Process called "lock_entry_checksum_alg" takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with e, 48
+End Process
+
+Note: ============================================================================
+Note: LOCKFILE
+Note: ============================================================================
+
+@Reasoning
+Construct an empty lockfile rooted at the given package name and version.
+The entries list is allocated as empty; the caller adds entries via
+lockfile_add_entry.
+@End Reasoning
+
+@Implementation
+Allocate 32 bytes, populate root metadata, and create an empty entry
+list.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null mandatory inputs.
+@End Security_Scope
+Process called "lockfile_create" takes root_name as Integer, root_version as Integer returns Integer:
+    If root_name is equal to 0:
+        Return 0
+    End If
+    If root_version is equal to 0:
+        Return 0
+    End If
+    Let lf be proc allocate from Layout with LOCKFILE_SIZE
+    If lf is equal to 0:
+        Return 0
+    End If
+    Let entries be proc list_create from List
+    If entries is equal to 0:
+        proc deallocate from Layout with lf
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with lf, 0, LOCKFILE_FORMAT_VERSION
+    proc memory_set_int64 from Memory with lf, 8, root_name
+    proc memory_set_int64 from Memory with lf, 16, root_version
+    proc memory_set_int64 from Memory with lf, 24, entries
+    Return lf
+End Process
+
+@Reasoning
+Free the lockfile and its entries list header. Does not deep-free
+entries.
+@End Reasoning
+
+@Implementation
+Destroy the list, free the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) for the list cleanup. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access the pointer after destroy.
+@End Security_Scope
+Process called "lockfile_destroy" takes lf as Integer returns Integer:
+    If lf is equal to 0:
+        Return 0
+    End If
+    Let entries be proc memory_get_int64 from Memory with lf, 24
+    If entries is not equal to 0:
+        proc list_destroy from List with entries
+    End If
+    proc deallocate from Layout with lf
+    Return 1
+End Process
+
+@Reasoning
+Free the lockfile and deep-free every entry.
+@End Reasoning
+
+@Implementation
+Iterate entries calling lock_entry_destroy_deep, then call
+lockfile_destroy.
+@End Implementation
+
+@Performance_Hints
+Time: O(n * d) for n entries and average d transitive deps. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Double-free protection is caller's responsibility.
+@End Security_Scope
+Process called "lockfile_destroy_deep" takes lf as Integer returns Integer:
+    If lf is equal to 0:
+        Return 0
+    End If
+    Let entries be proc memory_get_int64 from Memory with lf, 24
+    If entries is not equal to 0:
+        Let n be proc list_length from List with entries
+        Let i be 0
+        While i is less than n:
+            Let e be proc list_get from List with entries, i
+            If e is not equal to 0:
+                proc lock_entry_destroy_deep with e
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    Return proc lockfile_destroy with lf
+End Process
+
+@Reasoning
+Append an entry to the lockfile.
+@End Reasoning
+
+@Implementation
+List push the entry pointer.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller is responsible for entry lifetime.
+@End Security_Scope
+Process called "lockfile_add_entry" takes lf as Integer, entry as Integer returns Integer:
+    If lf is equal to 0:
+        Return 0
+    End If
+    If entry is equal to 0:
+        Return 0
+    End If
+    Let entries be proc memory_get_int64 from Memory with lf, 24
+    If entries is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with entries, entry
+    Return 1
+End Process
+
+@Reasoning
+Expose the entries list.
+@End Reasoning
+
+@Implementation
+Load offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null.
+@End Security_Scope
+Process called "lockfile_entries" takes lf as Integer returns Integer:
+    If lf is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with lf, 24
+End Process
+
+@Reasoning
+Find an entry by package name. Linear scan.
+@End Reasoning
+
+@Implementation
+Iterate entries comparing names with string_equals.
+@End Implementation
+
+@Performance_Hints
+Time: O(n * |name|). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if no match.
+@End Security_Scope
+Process called "lockfile_find_entry" takes lf as Integer, name as Integer returns Integer:
+    If lf is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let entries be proc memory_get_int64 from Memory with lf, 24
+    If entries is equal to 0:
+        Return 0
+    End If
+    Let n be proc list_length from List with entries
+    Let i be 0
+    While i is less than n:
+        Let e be proc list_get from List with entries, i
+        If e is not equal to 0:
+            Let en be proc lock_entry_name with e
+            If en is not equal to 0:
+                Let eq be proc string_equals from StringCore with en, name
+                If eq is equal to 1:
+                    Return e
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SERIALIZATION (DETERMINISTIC)
+Note: ============================================================================
+
+@Reasoning
+Serialize the lockfile to a deterministic text format. The output is
+the Runa-native lockfile format: a header line, the root package line,
+and one entry block per locked dependency in name-then-version
+lexicographic order.
+
+Deterministic ordering is the load-bearing property: two callers
+serializing the same logical lockfile must produce byte-identical output
+so package managers can detect drift via simple hash comparison.
+
+Format:
+  # Runa lockfile - format version 1
+  # AUTO-GENERATED - DO NOT EDIT
+  root.name = "<name>"
+  root.version = "<version-string>"
+
+  [[entry]]
+  name = "<name>"
+  version = "<version-string>"
+  checksum_alg = "<sha256|blake3|sha512>"
+  checksum = "<hex>"
+
+The order is enforced by sorting entries by name then version. Entries
+with identical (name, version) collapse to a single record (deduped).
+@End Reasoning
+
+@Implementation
+Construct a stable sorted view of the entries by allocating a parallel
+index list, performing an insertion sort with byte-wise (name, version)
+comparison, then emitting via StringBuilder.
+@End Implementation
+
+@Performance_Hints
+Time: O(n^2) insertion sort over n entries; acceptable because n is
+typically in the dozens to hundreds and the sort runs once per
+serialize call. Space: O(n) for the index list plus the rendered text.
+@End Performance_Hints
+
+@Security_Scope
+The serialized output is intended for storage; no untrusted input is
+parsed here. The deterministic-output property is itself a security
+property because it lets reviewers spot tampering via diff.
+@End Security_Scope
+Process called "lockfile_serialize" takes lf as Integer returns Integer:
+    If lf is equal to 0:
+        Return 0
+    End If
+    Let entries be proc memory_get_int64 from Memory with lf, 24
+    Let root_name be proc memory_get_int64 from Memory with lf, 8
+    Let root_version be proc memory_get_int64 from Memory with lf, 16
+
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+
+    proc stringbuilder_append from SB with sb, "# Runa lockfile - format version "
+    proc stringbuilder_append_integer from SB with sb, LOCKFILE_FORMAT_VERSION
+    proc stringbuilder_append_char from SB with sb, 10
+    proc stringbuilder_append from SB with sb, "# AUTO-GENERATED - DO NOT EDIT"
+    proc stringbuilder_append_char from SB with sb, 10
+    proc stringbuilder_append from SB with sb, "root.name = \""
+    If root_name is not equal to 0:
+        proc stringbuilder_append from SB with sb, root_name
+    End If
+    proc stringbuilder_append_char from SB with sb, 34
+    proc stringbuilder_append_char from SB with sb, 10
+    proc stringbuilder_append from SB with sb, "root.version = \""
+    If root_version is not equal to 0:
+        Let rv_str be proc version_to_string from VC with root_version
+        If rv_str is not equal to 0:
+            proc stringbuilder_append from SB with sb, rv_str
+            proc deallocate from Layout with rv_str
+        End If
+    End If
+    proc stringbuilder_append_char from SB with sb, 34
+    proc stringbuilder_append_char from SB with sb, 10
+
+    Note: Build sorted index over entries.
+    If entries is not equal to 0:
+        Let n be proc list_length from List with entries
+        Let order be proc list_create from List
+        If order is equal to 0:
+            proc stringbuilder_destroy from SB with sb
+            Return 0
+        End If
+        Let i be 0
+        While i is less than n:
+            proc list_push from List with order, i
+            Set i to i plus 1
+        End While
+        Note: Insertion sort.
+        Let p be 1
+        While p is less than n:
+            Let cur be proc list_get from List with order, p
+            Let q be p minus 1
+            Let inserted be 0
+            While inserted is equal to 0:
+                If q is less than 0:
+                    Set inserted to 1
+                Otherwise:
+                    Let q_idx be proc list_get from List with order, q
+                    Let cmp be proc compare_entries with entries, cur, q_idx
+                    If cmp is less than 0:
+                        Let q_val be proc list_get from List with order, q
+                        proc list_set from List with order, q plus 1, q_val
+                        Set q to q minus 1
+                    Otherwise:
+                        Set inserted to 1
+                    End If
+                End If
+            End While
+            proc list_set from List with order, q plus 1, cur
+            Set p to p plus 1
+        End While
+
+        Let j be 0
+        While j is less than n:
+            Let idx be proc list_get from List with order, j
+            Let entry be proc list_get from List with entries, idx
+            If entry is not equal to 0:
+                proc stringbuilder_append_char from SB with sb, 10
+                proc stringbuilder_append from SB with sb, "[[entry]]"
+                proc stringbuilder_append_char from SB with sb, 10
+                Let en_name be proc lock_entry_name with entry
+                proc stringbuilder_append from SB with sb, "name = \""
+                If en_name is not equal to 0:
+                    proc stringbuilder_append from SB with sb, en_name
+                End If
+                proc stringbuilder_append_char from SB with sb, 34
+                proc stringbuilder_append_char from SB with sb, 10
+
+                Let en_ver be proc lock_entry_version with entry
+                proc stringbuilder_append from SB with sb, "version = \""
+                If en_ver is not equal to 0:
+                    Let ev_str be proc version_to_string from VC with en_ver
+                    If ev_str is not equal to 0:
+                        proc stringbuilder_append from SB with sb, ev_str
+                        proc deallocate from Layout with ev_str
+                    End If
+                End If
+                proc stringbuilder_append_char from SB with sb, 34
+                proc stringbuilder_append_char from SB with sb, 10
+
+                Let alg_id be proc lock_entry_checksum_alg with entry
+                proc stringbuilder_append from SB with sb, "checksum_alg = \""
+                If alg_id is equal to ALG_SHA256:
+                    proc stringbuilder_append from SB with sb, "sha256"
+                End If
+                If alg_id is equal to ALG_BLAKE3:
+                    proc stringbuilder_append from SB with sb, "blake3"
+                End If
+                If alg_id is equal to ALG_SHA512:
+                    proc stringbuilder_append from SB with sb, "sha512"
+                End If
+                proc stringbuilder_append_char from SB with sb, 34
+                proc stringbuilder_append_char from SB with sb, 10
+
+                Let cs be proc lock_entry_checksum with entry
+                proc stringbuilder_append from SB with sb, "checksum = \""
+                If cs is not equal to 0:
+                    proc stringbuilder_append from SB with sb, cs
+                End If
+                proc stringbuilder_append_char from SB with sb, 34
+                proc stringbuilder_append_char from SB with sb, 10
+            End If
+            Set j to j plus 1
+        End While
+        proc list_destroy from List with order
+    End If
+
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process
+
+@Reasoning
+Helper: total order on entries by (name, version). Used by the sort in
+lockfile_serialize.
+@End Reasoning
+
+@Implementation
+Compare names byte-wise via string_compare; on tie, compare versions
+via version_compare.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name| + |version|) per call. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "compare_entries" takes entries as Integer, ai as Integer, bi as Integer returns Integer:
+    Let a be proc list_get from List with entries, ai
+    Let b be proc list_get from List with entries, bi
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 0
+        End If
+        Return -1
+    End If
+    If b is equal to 0:
+        Return 1
+    End If
+    Let an be proc lock_entry_name with a
+    Let bn be proc lock_entry_name with b
+    Let nc be proc string_compare from StringCore with an, bn
+    If nc is not equal to 0:
+        Return nc
+    End If
+    Let av be proc lock_entry_version with a
+    Let bv be proc lock_entry_version with b
+    Return proc version_compare from VC with av, bv
+End Process

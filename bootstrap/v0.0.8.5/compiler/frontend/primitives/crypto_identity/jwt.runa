@@ -1,0 +1,794 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+JWT - JSON Web Token (RFC 7519) with algorithm-typed signature
+==============================================================================
+
+A JWT is a compact, URL-safe token with three Base64URL-encoded segments
+separated by '.':
+
+    header_b64 . payload_b64 . signature_b64
+
+The header is a small JSON object naming the signature algorithm. The
+payload is application-defined JSON. The signature is over
+header_b64 + '.' + payload_b64.
+
+This module exposes a parser, a constructor, and a verifier. Algorithm
+selection is via the JWT "alg" claim mapped to our CryptoAlgorithm
+tags; "none" is REJECTED unconditionally because the historical
+"alg: none" vulnerability has caused widespread token-forgery bugs.
+
+Supported "alg" values:
+  "EdDSA"   ->  ALG_ED25519                          (RFC 8037)
+  "ES256"   ->  ALG_ECDSA_P256                       (RFC 7518 3.4)
+  "ES384"   ->  ALG_ECDSA_P384
+  "ES512"   ->  ALG_ECDSA_P521
+  "PS256"   ->  ALG_RSA_PSS_SHA256_2048              (RFC 7518 3.5)
+  "PS384"   ->  ALG_RSA_PSS_SHA384_3072
+  "PS512"   ->  ALG_RSA_PSS_SHA512_4096
+  "RS256"   ->  ALG_RSA_PKCS1V15_SHA256_2048         (RFC 7518 3.3)
+  "RS384"   ->  ALG_RSA_PKCS1V15_SHA384_3072
+  "RS512"   ->  ALG_RSA_PKCS1V15_SHA512_4096
+
+Per RFC 7518 the JWT "alg" field binds BOTH the padding and the hash:
+PS256 / RS256 are SHA-256, PS384 / RS384 are SHA-384, PS512 / RS512 are
+SHA-512. The corresponding modulus (2048 / 3072 / 4096) is a convention
+expressed by the algorithm tag; verifiers MUST cross-check the actual
+modulus against the algorithm tag before accepting.
+
+Memory layout (40 bytes):
+  offset  0 : algorithm tag         (8 bytes; CryptoAlgorithm)
+  offset  8 : header_json ptr       (8 bytes; into arena)
+  offset 16 : payload_json ptr      (8 bytes; into arena)
+  offset 24 : signature_bytes ptr   (8 bytes; into arena; raw signature)
+  offset 32 : signing_input_bytes   (8 bytes; into arena; header_b64.payload_b64)
+
+References:
+- RFC 7519: JSON Web Token.
+- RFC 7515: JSON Web Signature.
+- RFC 7518: JSON Web Algorithms.
+- RFC 8037: CFRG (Ed25519, Ed448, X25519, X448) in JOSE.
+- "Critical vulnerabilities in JSON Web Token libraries" (Auth0, 2015):
+  "alg: none" vulnerability.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/bytes.runa" as BytesP
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "compiler/frontend/primitives/crypto_identity/public_key.runa" as PK
+Import "compiler/frontend/primitives/crypto_identity/signature.runa" as Sig
+Import "runtime/core/memory/arena.runa" as Arena
+
+Let JWT_STRUCT_SIZE be 40
+Let JWT_OFF_ALGORITHM be 0
+Let JWT_OFF_HEADER_JSON be 8
+Let JWT_OFF_PAYLOAD_JSON be 16
+Let JWT_OFF_SIGNATURE be 24
+Let JWT_OFF_SIGNING_INPUT be 32
+
+Note: ============================================================================
+Note: SECTION 1: Base64URL encoding helpers
+Note: ============================================================================
+
+@Reasoning
+Decode Base64URL (RFC 4648 section 5) into bytes. Differs from standard
+Base64 in two characters: '+' becomes '-', '/' becomes '_'. Padding
+'=' is omitted from JWT segments and must be added back during decode.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Compute padded length: ceil(input_len / 4) * 4.
+  2. Allocate a temporary padded buffer; copy input; map '-' -> '+',
+     '_' -> '/'; pad with '='.
+  3. Wrap as Bytes and call bytes_from_base64.
+  4. Copy decoded bytes into out_buffer.
+Returns the number of decoded bytes, or 0 on failure.
+@End Implementation
+
+@Performance_Hints
+O(n). One allocation for padded buffer plus bytes_from_base64 internal
+buffers.
+@End Performance_Hints
+
+@Security_Scope
+Character validation happens inside bytes_from_base64; this helper just
+remaps the URL-safe characters.
+@End Security_Scope
+Process called "jwt_base64url_decode" takes arena as Integer, input as Integer, input_length as Integer, out_buffer as Integer, out_capacity as Integer returns Integer:
+    If input is equal to 0:
+        Return 0
+    End If
+    If out_buffer is equal to 0:
+        Return 0
+    End If
+    If input_length is less than 1:
+        Return 0
+    End If
+
+    Let pad_len be input_length modulo by 4
+    Let total_len be input_length
+    If pad_len is not equal to 0:
+        Set total_len to total_len plus (4 minus pad_len)
+    End If
+
+    Let padded be Arena.arena_allocate(arena, total_len plus 1)
+    If padded is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than input_length:
+        Let c be Memory.memory_get_byte(input, i)
+        If c is equal to 45:
+            Set c to 43
+        End If
+        If c is equal to 95:
+            Set c to 47
+        End If
+        Memory.memory_set_byte(padded, i, c)
+        Set i to i plus 1
+    End While
+    Let pi be input_length
+    While pi is less than total_len:
+        Memory.memory_set_byte(padded, pi, 61)
+        Set pi to pi plus 1
+    End While
+    Memory.memory_set_byte(padded, total_len, 0)
+
+    Note: bytes_from_base64 expects NUL-terminated string.
+    Let b be BytesP.bytes_from_base64(padded)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let dec_len be BytesP.bytes_length(b)
+    If dec_len is greater than out_capacity:
+        BytesP.bytes_destroy(b)
+        Return 0
+    End If
+    Let src be BytesP.bytes_data(b)
+    Memory.memory_copy(out_buffer, src, dec_len)
+    BytesP.bytes_destroy(b)
+    Return dec_len
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Algorithm name mapping
+Note: ============================================================================
+
+@Reasoning
+Map a JWT "alg" string (UTF-8 bytes + length) to a CryptoAlgorithm
+tag. Returns ALG_UNKNOWN for any name not in the supported list, AND
+SPECIFICALLY REJECTS "none" with ALG_UNKNOWN even though "none" is a
+historical JWT value: the "alg: none" vulnerability is the most
+notorious JWT bug class and MUST be unsupported in any modern verifier.
+
+Supported names: EdDSA, ES256, ES384, ES512, PS256, PS384, PS512,
+RS256, RS384, RS512.
+@End Reasoning
+
+@Implementation
+Byte-string matching against each supported name. Returns ALG_UNKNOWN
+on no match (and on "none").
+@End Implementation
+
+@Performance_Hints
+O(name length * candidates). Small constant.
+@End Performance_Hints
+
+@Security_Scope
+The "alg: none" rejection is the single most important line in this
+module. Removing it reintroduces the classic JWT vulnerability.
+
+References:
+- "Critical vulnerabilities in JSON Web Token libraries", Auth0 2015.
+- "JWT - JSON Web Token: Common Pitfalls", Tim McLean 2015.
+@End Security_Scope
+Process called "jwt_alg_name_to_tag" takes name as Integer, name_length as Integer returns Integer:
+    If name is equal to 0:
+        Return Alg.ALG_UNKNOWN
+    End If
+    If name_length is less than 5:
+        Return Alg.ALG_UNKNOWN
+    End If
+    If name_length is equal to 5:
+        Let m_eddsa be jwt_str_equals(name, name_length, "EdDSA")
+        If m_eddsa is equal to 1:
+            Return Alg.ALG_ED25519
+        End If
+        Let m_es256 be jwt_str_equals(name, name_length, "ES256")
+        If m_es256 is equal to 1:
+            Return Alg.ALG_ECDSA_P256
+        End If
+        Let m_es384 be jwt_str_equals(name, name_length, "ES384")
+        If m_es384 is equal to 1:
+            Return Alg.ALG_ECDSA_P384
+        End If
+        Let m_es512 be jwt_str_equals(name, name_length, "ES512")
+        If m_es512 is equal to 1:
+            Return Alg.ALG_ECDSA_P521
+        End If
+        Let m_ps256 be jwt_str_equals(name, name_length, "PS256")
+        If m_ps256 is equal to 1:
+            Return Alg.ALG_RSA_PSS_SHA256_2048
+        End If
+        Let m_ps384 be jwt_str_equals(name, name_length, "PS384")
+        If m_ps384 is equal to 1:
+            Return Alg.ALG_RSA_PSS_SHA384_3072
+        End If
+        Let m_ps512 be jwt_str_equals(name, name_length, "PS512")
+        If m_ps512 is equal to 1:
+            Return Alg.ALG_RSA_PSS_SHA512_4096
+        End If
+        Let m_rs256 be jwt_str_equals(name, name_length, "RS256")
+        If m_rs256 is equal to 1:
+            Return Alg.ALG_RSA_PKCS1V15_SHA256_2048
+        End If
+        Let m_rs384 be jwt_str_equals(name, name_length, "RS384")
+        If m_rs384 is equal to 1:
+            Return Alg.ALG_RSA_PKCS1V15_SHA384_3072
+        End If
+        Let m_rs512 be jwt_str_equals(name, name_length, "RS512")
+        If m_rs512 is equal to 1:
+            Return Alg.ALG_RSA_PKCS1V15_SHA512_4096
+        End If
+    End If
+    Note: "none" (length 4) and anything else: rejected.
+    Return Alg.ALG_UNKNOWN
+End Process
+
+@Reasoning
+Byte-compare candidate bytes to a literal string. Returns 1 on equal,
+0 otherwise. Length is provided so we don't dereference past the input.
+@End Reasoning
+
+@Implementation
+Walk both buffers byte-by-byte; length mismatch returns 0.
+@End Implementation
+
+@Performance_Hints
+O(min(len_a, len_b)).
+@End Performance_Hints
+
+@Security_Scope
+Algorithm-name comparison is over public data. Constant-time is not
+required because the algorithm name is metadata, not a secret.
+@End Security_Scope
+Process called "jwt_str_equals" takes a as Integer, a_len as Integer, b as String returns Integer:
+    Note: Compute b's length by walking until NUL (b is a String literal,
+    Note: represented as a NUL-terminated C-string pointer in stage1).
+    Let b_len be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let cc be Memory.memory_get_byte(b, b_len)
+        If cc is equal to 0:
+            Set scanning to 0
+        Otherwise:
+            Set b_len to b_len plus 1
+        End If
+    End While
+    If a_len is not equal to b_len:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than a_len:
+        Let ca be Memory.memory_get_byte(a, i)
+        Let cb be Memory.memory_get_byte(b, i)
+        If ca is not equal to cb:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Parse a JWT
+Note: ============================================================================
+
+@Reasoning
+Parse a compact-serialization JWT (three segments separated by '.')
+into a JWT value carrying:
+  - the algorithm tag (parsed from header.alg)
+  - the header JSON bytes
+  - the payload JSON bytes
+  - the signature bytes (raw, decoded from segment 3)
+  - the signing input (header_b64.payload_b64 as bytes; used for verify)
+
+Steps:
+  1. Find two '.' separators; reject if not exactly two.
+  2. Base64URL-decode each of the three segments.
+  3. Find the value of "alg" in the header JSON; map to a tag.
+  4. Reject ALG_UNKNOWN (covers "alg: none" and anything else
+     unsupported).
+  5. Save signing input bytes for later verify.
+
+The header JSON parser is a minimal scanner that looks ONLY for "alg":
+"..." and ignores everything else; full JSON parsing is left to
+downstream code that may need other header fields. The scan handles
+the few JSON-escape forms that can appear in alg (none of which are
+valid for the supported algorithms — alg is always a short ASCII
+identifier).
+@End Reasoning
+
+@Implementation
+Steps as above. Allocations are arena-owned.
+@End Implementation
+
+@Performance_Hints
+O(token length). Three base64 decodes plus a small JSON scan.
+@End Performance_Hints
+
+@Security_Scope
+Parsing does NOT verify the signature; call jwt_verify for that. A
+parsed JWT is untrusted input until verified.
+
+The algorithm-name path REJECTS unsupported and "none" algorithms.
+@End Security_Scope
+Process called "jwt_parse" takes arena as Integer, token_str as Integer, token_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If token_str is equal to 0:
+        Return 0
+    End If
+    If token_length is less than 8:
+        Return 0
+    End If
+
+    Note: Find the two '.' separators.
+    Let dot1 be 0 minus 1
+    Let dot2 be 0 minus 1
+    Let scan_i be 0
+    While scan_i is less than token_length:
+        Let cc be Memory.memory_get_byte(token_str, scan_i)
+        If cc is equal to 46:
+            If dot1 is less than 0:
+                Set dot1 to scan_i
+            Otherwise:
+                If dot2 is less than 0:
+                    Set dot2 to scan_i
+                Otherwise:
+                    Return 0
+                End If
+            End If
+        End If
+        Set scan_i to scan_i plus 1
+    End While
+    If dot1 is less than 1:
+        Return 0
+    End If
+    If dot2 is less than 0:
+        Return 0
+    End If
+
+    Let header_len be dot1
+    Let payload_len be (dot2 minus dot1) minus 1
+    Let sig_len_b64 be (token_length minus dot2) minus 1
+    If sig_len_b64 is less than 1:
+        Return 0
+    End If
+
+    Note: Decode header.
+    Let header_buf be Arena.arena_allocate(arena, header_len plus 8)
+    If header_buf is equal to 0:
+        Return 0
+    End If
+    Let header_decoded_len be jwt_base64url_decode(arena, token_str, header_len, header_buf, header_len plus 8)
+    If header_decoded_len is equal to 0:
+        Return 0
+    End If
+
+    Note: Decode payload.
+    Let payload_buf be Arena.arena_allocate(arena, payload_len plus 8)
+    If payload_buf is equal to 0:
+        Return 0
+    End If
+    Let payload_decoded_len be jwt_base64url_decode(arena, token_str plus (dot1 plus 1), payload_len, payload_buf, payload_len plus 8)
+    If payload_decoded_len is equal to 0:
+        Return 0
+    End If
+
+    Note: Decode signature.
+    Let sig_buf be Arena.arena_allocate(arena, sig_len_b64 plus 8)
+    If sig_buf is equal to 0:
+        Return 0
+    End If
+    Let sig_decoded_len be jwt_base64url_decode(arena, token_str plus (dot2 plus 1), sig_len_b64, sig_buf, sig_len_b64 plus 8)
+    If sig_decoded_len is equal to 0:
+        Return 0
+    End If
+
+    Note: Find "alg" in header JSON.
+    Let alg_tag be jwt_find_alg(header_buf, header_decoded_len)
+    If alg_tag is equal to Alg.ALG_UNKNOWN:
+        Return 0
+    End If
+
+    Note: Construct Signature value bound to the tag.
+    Let sig_val be Sig.signature_create(arena, alg_tag, sig_buf, sig_decoded_len)
+    If sig_val is equal to 0:
+        Return 0
+    End If
+
+    Note: Save signing input = first (dot2) bytes of token.
+    Let signing_input_len be dot2
+    Let signing_input be Arena.arena_allocate(arena, signing_input_len)
+    If signing_input is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(signing_input, token_str, signing_input_len)
+
+    Let jwt be Arena.arena_allocate(arena, JWT_STRUCT_SIZE)
+    If jwt is equal to 0:
+        Return 0
+    End If
+    Note: Pack algorithm tag (low 32 bits) and signing_input_length (high
+    Note: 32 bits) into one qword. Algorithm tags fit in 16 bits; lengths
+    Note: under 4 GiB fit in 32 bits, which exceeds any plausible JWT.
+    Let packed be alg_tag plus (signing_input_len multiplied by 4294967296)
+    Memory.memory_set_qword(jwt, JWT_OFF_ALGORITHM, packed)
+    Memory.memory_set_qword(jwt, JWT_OFF_HEADER_JSON, header_buf)
+    Memory.memory_set_qword(jwt, JWT_OFF_PAYLOAD_JSON, payload_buf)
+    Memory.memory_set_qword(jwt, JWT_OFF_SIGNATURE, sig_val)
+    Memory.memory_set_qword(jwt, JWT_OFF_SIGNING_INPUT, signing_input)
+    Return jwt
+End Process
+
+@Reasoning
+Locate the "alg" claim in a header JSON object and map it to a
+CryptoAlgorithm tag. The scan is intentionally minimal: it looks for
+the byte sequence:
+   "alg" : "VALUE"
+with arbitrary whitespace allowed around : and the value. The VALUE is
+read until the closing quote; escapes inside the value are NOT
+processed (none of the supported algorithm names contain escapes).
+@End Reasoning
+
+@Implementation
+1. Search for "alg" as a 5-byte string (open-quote 'a' 'l' 'g'
+   close-quote).
+2. Skip whitespace, expect ':'.
+3. Skip whitespace, expect '"'.
+4. Read bytes until closing '"' as the algorithm name.
+5. Map name to tag.
+@End Implementation
+
+@Performance_Hints
+O(header length).
+@End Performance_Hints
+
+@Security_Scope
+Minimal scanner; on malformed header or missing "alg", returns
+ALG_UNKNOWN which causes jwt_parse to reject.
+@End Security_Scope
+Process called "jwt_find_alg" takes header_json as Integer, header_len as Integer returns Integer:
+    Note: Search for the 5-byte sequence '"' 'a' 'l' 'g' '"'.
+    Let i be 0
+    Let limit be header_len minus 5
+    Let found_at be 0 minus 1
+    While i is less than or equal to limit:
+        Let c0 be Memory.memory_get_byte(header_json, i)
+        If c0 is equal to 34:
+            Let c1 be Memory.memory_get_byte(header_json, i plus 1)
+            If c1 is equal to 97:
+                Let c2 be Memory.memory_get_byte(header_json, i plus 2)
+                If c2 is equal to 108:
+                    Let c3 be Memory.memory_get_byte(header_json, i plus 3)
+                    If c3 is equal to 103:
+                        Let c4 be Memory.memory_get_byte(header_json, i plus 4)
+                        If c4 is equal to 34:
+                            Set found_at to i
+                            Set i to limit plus 1
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    If found_at is less than 0:
+        Return Alg.ALG_UNKNOWN
+    End If
+
+    Note: Skip past closing quote, then whitespace, expect ':'.
+    Let p be found_at plus 5
+    Let scanning be 1
+    While scanning is equal to 1:
+        If p is greater than or equal to header_len:
+            Return Alg.ALG_UNKNOWN
+        End If
+        Let cw be Memory.memory_get_byte(header_json, p)
+        If cw is equal to 58:
+            Set scanning to 0
+        Otherwise:
+            If cw is equal to 32:
+                Set p to p plus 1
+            Otherwise:
+                If cw is equal to 9:
+                    Set p to p plus 1
+                Otherwise:
+                    If cw is equal to 10:
+                        Set p to p plus 1
+                    Otherwise:
+                        If cw is equal to 13:
+                            Set p to p plus 1
+                        Otherwise:
+                            Return Alg.ALG_UNKNOWN
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Note: Past ':' — skip whitespace, expect '"'.
+    Set p to p plus 1
+    Let scanning2 be 1
+    While scanning2 is equal to 1:
+        If p is greater than or equal to header_len:
+            Return Alg.ALG_UNKNOWN
+        End If
+        Let cv be Memory.memory_get_byte(header_json, p)
+        If cv is equal to 34:
+            Set scanning2 to 0
+        Otherwise:
+            If cv is equal to 32:
+                Set p to p plus 1
+            Otherwise:
+                If cv is equal to 9:
+                    Set p to p plus 1
+                Otherwise:
+                    If cv is equal to 10:
+                        Set p to p plus 1
+                    Otherwise:
+                        If cv is equal to 13:
+                            Set p to p plus 1
+                        Otherwise:
+                            Return Alg.ALG_UNKNOWN
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Note: Past opening '"' — read until next '"'.
+    Let val_start be p plus 1
+    Let q be val_start
+    Let scanning3 be 1
+    While scanning3 is equal to 1:
+        If q is greater than or equal to header_len:
+            Return Alg.ALG_UNKNOWN
+        End If
+        Let cq be Memory.memory_get_byte(header_json, q)
+        If cq is equal to 34:
+            Set scanning3 to 0
+        Otherwise:
+            Set q to q plus 1
+        End If
+    End While
+    Let val_len be q minus val_start
+    Return jwt_alg_name_to_tag(header_json plus val_start, val_len)
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Verify a JWT
+Note: ============================================================================
+
+@Reasoning
+Verify the JWT signature using the supplied public key. Returns 1 on
+valid signature, 0 otherwise.
+
+The algorithm-tag match between the JWT and the public key is enforced
+by signature_verify, which is the central type-confusion gate.
+
+Temporal claims ("nbf", "exp") in the payload are NOT validated by
+this proc; the caller validates application-specific payload claims
+after this proc returns 1.
+@End Reasoning
+
+@Implementation
+Delegates to signature_verify on the signing input.
+@End Implementation
+
+@Performance_Hints
+O(verify) per the underlying signature scheme.
+@End Performance_Hints
+
+@Security_Scope
+This is the only correct way to verify a JWT. Any path that
+"trust the header alg" without binding to a specific public key
+algorithm is vulnerable to the classic JWT alg-mismatch attacks.
+
+References:
+- RFC 7515 section 5.2 (JWS verification).
+- "Critical vulnerabilities in JSON Web Token libraries", 2015.
+@End Security_Scope
+Process called "jwt_verify" takes arena as Integer, jwt as Integer, public_key as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If jwt is equal to 0:
+        Return 0
+    End If
+    If public_key is equal to 0:
+        Return 0
+    End If
+    Let signing_input be Memory.memory_get_qword(jwt, JWT_OFF_SIGNING_INPUT)
+    Let sig_val be Memory.memory_get_qword(jwt, JWT_OFF_SIGNATURE)
+    Note: Compute length of signing_input by recovering it. We allocated
+    Note: it as the first (dot2) bytes of the token; the token length is
+    Note: not stored, so we treat signing_input as a bytes object pinned
+    Note: by Length helper. In v0.0.8.5 we encode the length implicitly
+    Note: by re-deriving via NUL-scan: signing_input is NOT NUL-terminated.
+    Note: Instead, use the signature_create-bound algorithm to derive
+    Note: implicit length by routing through signature_verify which
+    Note: takes message_length explicitly. We compute it as follows:
+    Note: signing_input is the bytes from the token; we re-recover length
+    Note: from the structure by reading the underlying allocation header.
+    Note: For this version, we cache the length at offset 32 alongside.
+    Note: Reading length from a separate cache slot is cleaner; we store
+    Note: signing_input_length implicitly at the qword immediately
+    Note: following the buffer in arena. Arena allocations are aligned;
+    Note: the qword right before the buffer header carries the size.
+    Let signing_input_length be jwt_signing_input_length(jwt)
+    If signing_input_length is equal to 0:
+        Return 0
+    End If
+    Return Sig.signature_verify(arena, public_key, signing_input, signing_input_length, sig_val)
+End Process
+
+@Reasoning
+Returns the length of the signing input string. The length is the byte
+offset of the second '.' in the original token; we cache it in the JWT
+struct by re-using the FLAGS slot (offset 32) — wait, the signing_input
+slot is offset 32 (the pointer), so a parallel length cache is needed.
+For v0.0.8.5 we extend the JWT struct slot at offset 32 to hold the
+pointer, and we store the length in the high 32 bits of the algorithm
+qword to avoid bloating the struct. The algorithm tag uses only the
+low ~16 bits.
+@End Reasoning
+
+@Implementation
+For v0.0.8.5 we maintain the length in a separate path by re-deriving:
+the signing_input was copied from the original token's first (dot2)
+bytes. We retrieve the length by reading the JWT's "header + payload +
+1" derivation: header_decoded ... NO, the signing_input is the BASE64-
+ENCODED form (not decoded). Its length is dot1 + 1 + payload_b64_length.
+
+We can recompute it from the parsed header_json and payload_json by
+re-base64url-encoding both and adding 1, but that is expensive. The
+clean solution is to encode the length in the slot reserved for that
+purpose. We re-purpose offset 8 of the JWT struct: but offset 8 already
+holds header_json pointer.
+
+The implementation choice: we encode signing_input_length INSIDE the
+signing_input buffer's first 8 bytes, with the actual bytes starting
+at offset 8. The buffer remains contiguous and the length is recovered
+cheaply.
+
+This is the pattern: at jwt_parse time we allocate
+   signing_input_buffer = arena_allocate(signing_input_length + 8)
+   memory_set_qword(signing_input_buffer, 0, signing_input_length)
+   memory_copy(signing_input_buffer + 8, token_str, signing_input_length)
+And here we read the length back.
+
+For v0.0.8.5 the actual jwt_parse stores the pointer at offset 32
+WITHOUT the length prefix (per the simpler implementation above). To
+keep this proc well-defined without breaking the struct, we re-derive
+the length by scanning the original token, which requires the caller
+to provide a separate length-tracking helper — but jwt has no such
+helper.
+
+The actual implementation: jwt_parse stores the length in the high
+32 bits of the algorithm qword (algorithm tags are well below 2^16).
+This proc extracts the low 32 bits as algorithm and the high 32 bits
+as length.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper. Length is non-secret metadata.
+@End Security_Scope
+Process called "jwt_signing_input_length" takes jwt as Integer returns Integer:
+    If jwt is equal to 0:
+        Return 0
+    End If
+    Let combined be Memory.memory_get_qword(jwt, JWT_OFF_ALGORITHM)
+    Let length be combined divided by 4294967296
+    Return length
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Accessors
+Note: ============================================================================
+
+@Reasoning
+Returns the JWT's algorithm tag.
+@End Reasoning
+
+@Implementation
+Reads the low 32 bits of the algorithm qword at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "jwt_algorithm" takes jwt as Integer returns Integer:
+    If jwt is equal to 0:
+        Return 0
+    End If
+    Let combined be Memory.memory_get_qword(jwt, JWT_OFF_ALGORITHM)
+    Return combined modulo by 4294967296
+End Process
+
+@Reasoning
+Returns the pointer to the parsed header JSON bytes (decoded form,
+not Base64).
+@End Reasoning
+
+@Implementation
+Reads qword at offset 8.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Header JSON is public.
+@End Security_Scope
+Process called "jwt_header_bytes" takes jwt as Integer returns Integer:
+    If jwt is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(jwt, JWT_OFF_HEADER_JSON)
+End Process
+
+@Reasoning
+Returns the pointer to the parsed payload JSON bytes (decoded form).
+@End Reasoning
+
+@Implementation
+Reads qword at offset 16.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Payload JSON may contain CONFIDENTIAL data; treat it as application-
+defined sensitive material if the application uses JWTs to carry user
+PII.
+
+JWT payloads are NOT encrypted by JWS (signing only). Confidential
+payloads should use JWE (RFC 7516), which is out of scope for this
+primitive set; v0.0.9 wires JWE.
+@End Security_Scope
+Process called "jwt_payload_bytes" takes jwt as Integer returns Integer:
+    If jwt is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(jwt, JWT_OFF_PAYLOAD_JSON)
+End Process

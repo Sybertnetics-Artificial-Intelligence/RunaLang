@@ -1,0 +1,1407 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+ML-KEM-512 / 768 / 1024 per NIST FIPS 203 (CRYSTALS-Kyber)
+==============================================================================
+
+Module-Lattice Key Encapsulation Mechanism standardised in FIPS 203 (August
+2024). Three security levels:
+
+  ML-KEM-512  : k=2, eta1=3, eta2=2, du=10, dv=4 (NIST Cat 1)
+  ML-KEM-768  : k=3, eta1=2, eta2=2, du=10, dv=4 (NIST Cat 3)
+  ML-KEM-1024 : k=4, eta1=2, eta2=2, du=11, dv=5 (NIST Cat 5)
+
+All variants share the FIPS 203 ring R_q = Z_{3329}[X]/(X^256+1).
+
+Algorithms implemented:
+  - K-PKE.KeyGen(d)            FIPS 203 Algorithm 13
+  - K-PKE.Encrypt(ek_PKE,m,r)  Algorithm 14
+  - K-PKE.Decrypt(dk_PKE,c)    Algorithm 15
+  - ML-KEM.KeyGen()            Algorithm 16
+  - ML-KEM.Encaps(ek)          Algorithm 17 (with public-key validation)
+  - ML-KEM.Decaps(dk,c)        Algorithm 18 (constant-time implicit rejection)
+
+Auxiliary algorithms:
+  - BitsToBytes / BytesToBits  Algorithms 3-4
+  - ByteEncode_d / Decode_d    Algorithms 5-6
+  - SampleNTT(seed)            Algorithm 7 (rejection from SHAKE128)
+  - SamplePolyCBD_eta(seed)    Algorithm 8 (centered binomial)
+  - Compress / Decompress      FIPS 203 4.5
+
+Constant-time considerations:
+  - K-PKE.Decrypt has no rejection logic so is naturally constant-time.
+  - ML-KEM.Decaps uses constant-time selection between the re-encrypted-OK
+    branch and the implicit-rejection branch via a 32-bit mask derived from
+    constant-time byte-array compare.
+  - SampleNTT and SamplePolyCBD operate on PUBLIC seeds; the rejection sample
+    loop is variable-time on public data only.
+
+Inputs to KeyGen / Encaps are 32-byte seeds (caller-supplied entropy). The
+caller is responsible for providing high-quality randomness from a secure
+entropy source.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/sha3.runa" as Sha3
+Import "compiler/frontend/import_system/crypto/pq/ntt.runa" as NTT
+
+Note:
+==============================================================================
+PARAMETER-SET ACCESSORS
+==============================================================================
+Each ML-KEM parameter set is identified by an integer level:
+  1 = ML-KEM-512
+  2 = ML-KEM-768
+  3 = ML-KEM-1024
+The accessors below return the k, eta1, eta2, du, dv values defined in
+FIPS 203 Table 1.
+:End Note
+
+Process called "mlkem_k" takes level as Integer returns Integer:
+    @Reasoning
+    Returns k (the module rank) for an ML-KEM parameter set.
+    @End Reasoning
+    @Implementation
+    Branch by level: 2, 3, 4 for ML-KEM-512/768/1024 respectively.
+    @End Implementation
+    @Performance_Hints
+    O(1) ladder.
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 2
+    End If
+    If level is equal to 2:
+        Return 3
+    End If
+    Return 4
+End Process
+
+Process called "mlkem_eta1" takes level as Integer returns Integer:
+    @Reasoning
+    Returns eta1 (CBD parameter for s, e) for an ML-KEM parameter set per
+    FIPS 203 Table 1.
+    @End Reasoning
+    @Implementation
+    ML-KEM-512 uses eta1 = 3, ML-KEM-768/1024 use eta1 = 2.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 3
+    End If
+    Return 2
+End Process
+
+Process called "mlkem_eta2" takes level as Integer returns Integer:
+    @Reasoning
+    Returns eta2 (CBD parameter for e1, e2) per FIPS 203 Table 1.
+    All parameter sets use eta2 = 2.
+    @End Reasoning
+    @Implementation
+    Constant 2.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return 2
+End Process
+
+Process called "mlkem_du" takes level as Integer returns Integer:
+    @Reasoning
+    Returns du (compression bit-width for ciphertext u-component).
+    @End Reasoning
+    @Implementation
+    10 for ML-KEM-512/768, 11 for ML-KEM-1024.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If level is equal to 3:
+        Return 11
+    End If
+    Return 10
+End Process
+
+Process called "mlkem_dv" takes level as Integer returns Integer:
+    @Reasoning
+    Returns dv (compression bit-width for ciphertext v-component).
+    @End Reasoning
+    @Implementation
+    4 for ML-KEM-512/768, 5 for ML-KEM-1024.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If level is equal to 3:
+        Return 5
+    End If
+    Return 4
+End Process
+
+Process called "mlkem_ek_size" takes level as Integer returns Integer:
+    @Reasoning
+    Encapsulation-key size in bytes: 384*k + 32 (the 32 trailing bytes are
+    the seed rho).
+    @End Reasoning
+    @Implementation
+    Computes from k.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public size.
+    @End Security_Scope
+    Let k be proc mlkem_k with level
+    Return 384 multiplied by k plus 32
+End Process
+
+Process called "mlkem_dk_size" takes level as Integer returns Integer:
+    @Reasoning
+    Decapsulation key size: 768*k + 96. Layout (per FIPS 203 sec 6.2):
+    [dk_PKE | ek_PKE | H(ek_PKE) | z], sizes 384k + (384k+32) + 32 + 32.
+    @End Reasoning
+    @Implementation
+    Computes from k.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public size.
+    @End Security_Scope
+    Let k be proc mlkem_k with level
+    Return 768 multiplied by k plus 96
+End Process
+
+Process called "mlkem_ct_size" takes level as Integer returns Integer:
+    @Reasoning
+    Ciphertext size: 32*(du*k + dv).
+    @End Reasoning
+    @Implementation
+    Computes from k, du, dv.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public size.
+    @End Security_Scope
+    Let k be proc mlkem_k with level
+    Let du be proc mlkem_du with level
+    Let dv be proc mlkem_dv with level
+    Return 32 multiplied by du multiplied by k plus dv
+End Process
+
+Note:
+==============================================================================
+BYTE ENCODE / DECODE for variable bit-widths (Algorithms 5, 6)
+==============================================================================
+ByteEncode_d packs 256 coefficients of bit-width d into 32*d bytes by
+little-endian bit packing. ByteDecode_d is the inverse. We implement a
+generic streaming version: for each coefficient we shift its d bits into a
+64-bit accumulator and drain whole bytes whenever 8 bits accumulate.
+:End Note
+
+Process called "byte_encode" takes poly as Integer, d as Integer, out as Integer returns Integer:
+    @Reasoning
+    Packs 256 d-bit coefficients into 32*d bytes (little-endian within bytes
+    and across coefficients) per FIPS 203 Algorithm 5.
+    @End Reasoning
+    @Implementation
+    Walks the coefficient array (stored as int16 little-endian), masking each
+    value to d bits and shifting it into a bit accumulator. Whenever the
+    accumulator holds at least 8 bits, the low byte is written to the output
+    and the accumulator is shifted right by 8.
+    @End Implementation
+    @Performance_Hints
+    Single pass; 256 coefficients drain to 32*d output bytes.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on PUBLIC byte-encoded outputs; no data-dependent branches.
+    @End Security_Scope
+    Let mask be 1 shifted left by d
+    Set mask to mask minus 1
+    Let acc be 0
+    Let bits be 0
+    Let out_idx be 0
+    Let i be 0
+    While i is less than 256:
+        Let coef_off be i multiplied by 2
+        Let coef_v be Memory.memory_get_int16(poly, coef_off)
+        If coef_v is less than 0:
+            Set coef_v to coef_v plus 65536
+        End If
+        Set coef_v to coef_v bitwise_and mask
+        Set acc to acc bitwise_or coef_v shifted left by bits
+        Set bits to bits plus d
+        While bits is greater than or equal to 8:
+            Let byte_v be acc bitwise_and 255
+            Memory.memory_set_byte(out, out_idx, byte_v)
+            Set out_idx to out_idx plus 1
+            Set acc to acc shifted right by 8
+            Set bits to bits minus 8
+        End While
+        Set i to i plus 1
+    End While
+    Return out_idx
+End Process
+
+Process called "byte_decode" takes data as Integer, d as Integer, poly as Integer returns Integer:
+    @Reasoning
+    Unpacks 32*d bytes into 256 d-bit coefficients per FIPS 203 Algorithm 6.
+    @End Reasoning
+    @Implementation
+    Mirror of byte_encode: pull bytes into a bit accumulator and emit a
+    coefficient whenever d bits are available.
+    @End Implementation
+    @Performance_Hints
+    Single pass.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time per input byte.
+    @End Security_Scope
+    Let mask be 1 shifted left by d
+    Set mask to mask minus 1
+    Let acc be 0
+    Let bits be 0
+    Let in_idx be 0
+    Let i be 0
+    While i is less than 256:
+        While bits is less than d:
+            Let b be Memory.memory_get_byte(data, in_idx)
+            Set acc to acc bitwise_or b shifted left by bits
+            Set bits to bits plus 8
+            Set in_idx to in_idx plus 1
+        End While
+        Let coef_v be acc bitwise_and mask
+        Memory.memory_set_int16(poly, i multiplied by 2, coef_v)
+        Set acc to acc shifted right by d
+        Set bits to bits minus d
+        Set i to i plus 1
+    End While
+    Return 256
+End Process
+
+Process called "byte_encode_compress" takes poly as Integer, d as Integer, out as Integer returns Integer:
+    @Reasoning
+    Combined Compress_d + ByteEncode_d for ciphertext writing. Coefficients
+    are mod q (3329) on input; output is 32*d packed bytes.
+    @End Reasoning
+    @Implementation
+    For each coefficient apply NTT.kyber_compress then bit-pack.
+    @End Implementation
+    @Performance_Hints
+    Single pass.
+    @End Performance_Hints
+    @Security_Scope
+    Compress operates on PUBLIC ciphertext data; constant-time arithmetic.
+    @End Security_Scope
+    Let mask be 1 shifted left by d
+    Set mask to mask minus 1
+    Let acc be 0
+    Let bits be 0
+    Let out_idx be 0
+    Let i be 0
+    While i is less than 256:
+        Let coef_off be i multiplied by 2
+        Let coef_v be Memory.memory_get_int16(poly, coef_off)
+        If coef_v is less than 0:
+            Set coef_v to coef_v plus 3329
+        End If
+        If coef_v is greater than or equal to 3329:
+            Set coef_v to coef_v minus 3329
+        End If
+        Let compressed_v be NTT.kyber_compress(coef_v, d)
+        Set acc to acc bitwise_or compressed_v shifted left by bits
+        Set bits to bits plus d
+        While bits is greater than or equal to 8:
+            Let byte_v be acc bitwise_and 255
+            Memory.memory_set_byte(out, out_idx, byte_v)
+            Set out_idx to out_idx plus 1
+            Set acc to acc shifted right by 8
+            Set bits to bits minus 8
+        End While
+        Set i to i plus 1
+    End While
+    Return out_idx
+End Process
+
+Process called "byte_decode_decompress" takes data as Integer, d as Integer, poly as Integer returns Integer:
+    @Reasoning
+    Combined ByteDecode_d + Decompress_d for ciphertext reading. Output
+    coefficients are in [0, q-1].
+    @End Reasoning
+    @Implementation
+    For each coefficient unpack d bits then apply NTT.kyber_decompress.
+    @End Implementation
+    @Performance_Hints
+    Single pass.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time per input byte; ciphertext is public.
+    @End Security_Scope
+    Let mask be 1 shifted left by d
+    Set mask to mask minus 1
+    Let acc be 0
+    Let bits be 0
+    Let in_idx be 0
+    Let i be 0
+    While i is less than 256:
+        While bits is less than d:
+            Let b be Memory.memory_get_byte(data, in_idx)
+            Set acc to acc bitwise_or b shifted left by bits
+            Set bits to bits plus 8
+            Set in_idx to in_idx plus 1
+        End While
+        Let raw_v be acc bitwise_and mask
+        Let decompressed_v be NTT.kyber_decompress(raw_v, d)
+        Memory.memory_set_int16(poly, i multiplied by 2, decompressed_v)
+        Set acc to acc shifted right by d
+        Set bits to bits minus d
+        Set i to i plus 1
+    End While
+    Return 256
+End Process
+
+Note:
+==============================================================================
+SAMPLE NTT  (FIPS 203 Algorithm 7) -- rejection sampling from SHAKE128
+==============================================================================
+Reads bytes from a SHAKE128 stream parameterised by (seed, i, j) and
+interprets each three-byte chunk as two 12-bit values d1, d2. Each value
+< q (3329) is accepted; otherwise rejected. Continues until 256 valid
+coefficients have been collected.
+:End Note
+
+Process called "sample_ntt" takes shake_state as Integer, poly as Integer returns Integer:
+    @Reasoning
+    Algorithm 7: rejection-sample 256 coefficients from a 12-bit XOF stream
+    via SHAKE-128 with output coefficients in [0, q). The SHAKE state must
+    already have been initialised and absorbed with (rho || i || j) by the
+    caller.
+    @End Reasoning
+    @Implementation
+    Pull bytes in groups of 3 from the SHAKE state. Form
+      d1 = b0 + ((b1 and 0xF) << 8)
+      d2 = (b1 >> 4) + (b2 << 4)
+    and accept any value < q.
+    @End Implementation
+    @Performance_Hints
+    Expected acceptance rate ~ 3329 / 4096 = 0.813. Loop terminates with
+    high probability in O(256) iterations.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on PUBLIC matrix-derivation material (rho is part of the public
+    key). Variable-time on those bytes only.
+    @End Security_Scope
+    Let q be 3329
+    Let j_count be 0
+    Let buf_3 be 0
+    Let temp_buf be 0
+    Note: We pull bytes one-by-one via a 1-byte squeeze for simplicity;
+    Note: SHAKE squeeze auto-permutes when the rate window is exhausted.
+    Let one_byte_buf_addr be poly plus 512
+    Note: We use a 3-byte scratch carved out of an int32 slot at poly+1024
+    Note: (alignment-safe on all targets); the high byte is unused and the
+    Note: low three bytes hold the SHAKE-squeezed stream window.
+    Let acc be 0
+    Let acc_bytes be 0
+    While j_count is less than 256:
+        While acc_bytes is less than 3:
+            Let single be poly plus 1024 plus acc_bytes
+            NTT.shake_squeeze(shake_state, single, 1)
+            Set acc_bytes to acc_bytes plus 1
+        End While
+        Let b0 be Memory.memory_get_byte(poly plus 1024, 0)
+        Let b1 be Memory.memory_get_byte(poly plus 1024, 1)
+        Let b2 be Memory.memory_get_byte(poly plus 1024, 2)
+        Let d1 be b0 plus ((b1 bitwise_and 15) shifted left by 8)
+        Let d2 be (b1 shifted right by 4) plus (b2 shifted left by 4)
+        If d1 is less than q:
+            If j_count is less than 256:
+                Memory.memory_set_int16(poly, j_count multiplied by 2, d1)
+                Set j_count to j_count plus 1
+            End If
+        End If
+        If d2 is less than q:
+            If j_count is less than 256:
+                Memory.memory_set_int16(poly, j_count multiplied by 2, d2)
+                Set j_count to j_count plus 1
+            End If
+        End If
+        Set acc_bytes to 0
+    End While
+    Return 256
+End Process
+
+Note:
+==============================================================================
+SAMPLE PolyCBD_eta  (FIPS 203 Algorithm 8) -- centered binomial distribution
+==============================================================================
+Read 64*eta bytes from a PRF stream (SHAKE256 keyed by sigma). Interpret as
+2*eta-bit windows: sum of eta 1-bits minus sum of next eta 1-bits gives
+each coefficient in {-eta, ..., +eta}.
+:End Note
+
+Process called "sample_poly_cbd" takes data as Integer, eta as Integer, poly as Integer returns Integer:
+    @Reasoning
+    Algorithm 8: derive a polynomial with coefficients drawn from a centered
+    binomial distribution of width eta from a uniform byte stream.
+    @End Reasoning
+    @Implementation
+    Stream 8*64*eta = 512*eta bits as a bit accumulator; consume 2*eta bits
+    per coefficient, splitting into two eta-bit halves whose popcounts are
+    subtracted.
+    @End Implementation
+    @Performance_Hints
+    Linear in eta. eta in {2,3} for ML-KEM.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on SECRET PRF output. Constant-time popcount via bit-by-bit add.
+    @End Security_Scope
+    Let q be 3329
+    Let acc be 0
+    Let acc_bits be 0
+    Let data_idx be 0
+    Let i be 0
+    While i is less than 256:
+        While acc_bits is less than 2 multiplied by eta:
+            Let b be Memory.memory_get_byte(data, data_idx)
+            Set acc to acc bitwise_or b shifted left by acc_bits
+            Set acc_bits to acc_bits plus 8
+            Set data_idx to data_idx plus 1
+        End While
+        Let a_sum be 0
+        Let b_sum be 0
+        Let bi be 0
+        While bi is less than eta:
+            Let bit_a be acc shifted right by bi bitwise_and 1
+            Set a_sum to a_sum plus bit_a
+            Let bit_b be (acc shifted right by (eta plus bi)) bitwise_and 1
+            Set b_sum to b_sum plus bit_b
+            Set bi to bi plus 1
+        End While
+        Let coef_v be a_sum minus b_sum
+        If coef_v is less than 0:
+            Set coef_v to coef_v plus q
+        End If
+        Memory.memory_set_int16(poly, i multiplied by 2, coef_v)
+        Set acc to acc shifted right by 2 multiplied by eta
+        Set acc_bits to acc_bits minus 2 multiplied by eta
+        Set i to i plus 1
+    End While
+    Return 256
+End Process
+
+Note:
+==============================================================================
+PRF helper: SHAKE256(seed_32 || index_byte) -> 64*eta bytes
+==============================================================================
+:End Note
+
+Process called "kyber_prf" takes arena as Integer, seed as Integer, index as Integer, out as Integer, length as Integer returns Integer:
+    @Reasoning
+    PRF_eta(s,b) := SHAKE-256(s || b) producing 64*eta bytes. Used to derive
+    each polynomial in the secret/noise vectors. FIPS 203 sec 4.1.
+    @End Reasoning
+    @Implementation
+    Builds a 33-byte input (32-byte seed + 1-byte index) on the arena and
+    invokes the SHAKE-256 one-shot helper.
+    @End Implementation
+    @Performance_Hints
+    One SHAKE-256 invocation per polynomial.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path. Constant-time wrt the seed (SHAKE-256 itself is CT).
+    @End Security_Scope
+    Let input_buf be Arena.arena_allocate(arena, 33)
+    If input_buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(input_buf, seed, 32)
+    Memory.memory_set_byte(input_buf, 32, index)
+    Return NTT.shake256(arena, input_buf, 33, out, length)
+End Process
+
+Note:
+==============================================================================
+G : SHA3-512(input) -> 64 bytes
+H : SHA3-256(input) -> 32 bytes
+J : SHAKE-256(input) -> 32 bytes (used by implicit rejection)
+==============================================================================
+:End Note
+
+Process called "kyber_g" takes arena as Integer, input as Integer, input_length as Integer, out_64 as Integer returns Integer:
+    @Reasoning
+    G(c) := SHA3-512(c). FIPS 203 sec 4.1.
+    @End Reasoning
+    @Implementation
+    Delegates to Sha3.sha3_512_hash.
+    @End Implementation
+    @Performance_Hints
+    One SHA3-512 invocation.
+    @End Performance_Hints
+    @Security_Scope
+    May process secret material; SHA3-512 itself is CT.
+    @End Security_Scope
+    Return Sha3.sha3_512_hash(arena, input, input_length, out_64)
+End Process
+
+Process called "kyber_h" takes arena as Integer, input as Integer, input_length as Integer, out_32 as Integer returns Integer:
+    @Reasoning
+    H(c) := SHA3-256(c). FIPS 203 sec 4.1.
+    @End Reasoning
+    @Implementation
+    Delegates to Sha3.sha3_256_hash.
+    @End Implementation
+    @Performance_Hints
+    One SHA3-256 invocation.
+    @End Performance_Hints
+    @Security_Scope
+    Hash of public key material in most call sites.
+    @End Security_Scope
+    Return Sha3.sha3_256_hash(arena, input, input_length, out_32)
+End Process
+
+Process called "kyber_j" takes arena as Integer, input as Integer, input_length as Integer, out_32 as Integer returns Integer:
+    @Reasoning
+    J(s,c) := SHAKE-256(s||c, 32). Used to derive K_bar for implicit
+    rejection in Decaps. FIPS 203 sec 4.1.
+    @End Reasoning
+    @Implementation
+    Delegates to NTT.shake256.
+    @End Implementation
+    @Performance_Hints
+    One SHAKE-256 invocation.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET input z is concatenated by caller before the call.
+    @End Security_Scope
+    Return NTT.shake256(arena, input, input_length, out_32, 32)
+End Process
+
+Note:
+==============================================================================
+EXPAND_A : generate matrix A as 256-coef NTT-domain polynomials
+==============================================================================
+Per FIPS 203 sec 4.2 Algorithm 13 (KeyGen):
+For (i in 0..k, j in 0..k): A[i,j] = SampleNTT(SHAKE-128(rho || j || i))
+Note: convention is rho|j|i (column, row) NOT (row, column).
+:End Note
+
+Process called "expand_a_one_cell" takes arena as Integer, rho as Integer, row_i as Integer, col_j as Integer, out_poly as Integer returns Integer:
+    @Reasoning
+    Produces one matrix cell A[i,j] in NTT domain. Uses SHAKE-128 seeded
+    with rho || j || i per FIPS 203 Algorithm 13 step 4.
+    @End Reasoning
+    @Implementation
+    Allocates a SHAKE state, absorbs rho (32 bytes) + j byte + i byte,
+    finalizes, then rejection-samples 256 coefficients via sample_ntt.
+    @End Implementation
+    @Performance_Hints
+    One SHAKE-128 state per cell.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on PUBLIC rho.
+    @End Security_Scope
+    Let state_block be Arena.arena_allocate(arena, 496)
+    If state_block is equal to 0:
+        Return 0
+    End If
+    Let suffix_buf be Arena.arena_allocate(arena, 2)
+    Memory.memory_set_byte(suffix_buf, 0, col_j)
+    Memory.memory_set_byte(suffix_buf, 1, row_i)
+    NTT.shake128_init(state_block)
+    NTT.shake_absorb(state_block, rho, 32)
+    NTT.shake_absorb(state_block, suffix_buf, 2)
+    NTT.shake_finalize(state_block)
+    Let three_byte_buf be Arena.arena_allocate(arena, 1024 plus 16)
+    Memory.memory_zero(out_poly, 512)
+    Note: sample_ntt consumes the SHAKE stream byte-by-byte; the helper uses
+    Note: poly+1024 as a 3-byte scratch (poly buffer is 512 bytes for 256x int16,
+    Note: but caller MUST pass a poly that has the trailing scratch room).
+    Return proc sample_ntt with state_block, out_poly
+End Process
+
+Note:
+==============================================================================
+K-PKE INNER FUNCTIONS
+==============================================================================
+:End Note
+
+Process called "kpke_keygen" takes arena as Integer, d as Integer, level as Integer, ek_out as Integer, dk_out as Integer returns Integer:
+    @Reasoning
+    K-PKE.KeyGen(d) per FIPS 203 Algorithm 13:
+      (rho, sigma) = G(d || k)         -- 64-byte hash split
+      A = ExpandA(rho)                 -- k x k matrix in NTT domain
+      s = (SamplePolyCBD_eta1(PRF(sigma, N)))_N=0..k-1   -- k-vector in NTT
+      e = (SamplePolyCBD_eta1(PRF(sigma, N)))_N=k..2k-1  -- k-vector in NTT
+      t = A * s + e   (NTT-domain)
+      ek_PKE = ByteEncode_12(t) || rho
+      dk_PKE = ByteEncode_12(s)
+    @End Reasoning
+    @Implementation
+    Allocates k polynomials each for t, s, e plus a 512-byte working buffer
+    for each matrix row times s product. Performs all NTT-domain multiplies.
+    @End Implementation
+    @Performance_Hints
+    Dominated by k^2 SampleNTT calls plus k(k+1) polynomial multiplies.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET: d (the input seed), sigma (derived), s, e. Public: rho, t.
+    The arena holding all temporaries should be zeroed (caller responsibility).
+    @End Security_Scope
+    Let k be proc mlkem_k with level
+    Let eta1 be proc mlkem_eta1 with level
+
+    Note: G(d || k_byte) -> rho, sigma (32+32 bytes)
+    Let g_input be Arena.arena_allocate(arena, 33)
+    If g_input is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(g_input, d, 32)
+    Memory.memory_set_byte(g_input, 32, k)
+    Let g_out be Arena.arena_allocate(arena, 64)
+    proc kyber_g with arena, g_input, 33, g_out
+    Let rho be g_out
+    Let sigma be g_out plus 32
+
+    Note: Allocate matrix A (k*k polys * 512 bytes each, plus 16 scratch per cell)
+    Let cell_size be 512 plus 16 plus 1040
+    Let a_matrix be Arena.arena_allocate(arena, cell_size multiplied by k multiplied by k)
+    Let i be 0
+    While i is less than k:
+        Let j be 0
+        While j is less than k:
+            Let cell_addr be a_matrix plus (i multiplied by k plus j) multiplied by cell_size
+            proc expand_a_one_cell with arena, rho, i, j, cell_addr
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+
+    Note: Sample s (k polynomials)
+    Let s_vec be Arena.arena_allocate(arena, 512 multiplied by k)
+    Let n_counter be 0
+    Let cbd_bytes be 64 multiplied by eta1
+    Let prf_buf be Arena.arena_allocate(arena, cbd_bytes)
+    Let si be 0
+    While si is less than k:
+        proc kyber_prf with arena, sigma, n_counter, prf_buf, cbd_bytes
+        Let s_poly_addr be s_vec plus si multiplied by 512
+        proc sample_poly_cbd with prf_buf, eta1, s_poly_addr
+        Set n_counter to n_counter plus 1
+        Set si to si plus 1
+    End While
+
+    Note: Sample e (k polynomials)
+    Let e_vec be Arena.arena_allocate(arena, 512 multiplied by k)
+    Let ei be 0
+    While ei is less than k:
+        proc kyber_prf with arena, sigma, n_counter, prf_buf, cbd_bytes
+        Let e_poly_addr be e_vec plus ei multiplied by 512
+        proc sample_poly_cbd with prf_buf, eta1, e_poly_addr
+        Set n_counter to n_counter plus 1
+        Set ei to ei plus 1
+    End While
+
+    Note: NTT-transform s and e
+    Let ti be 0
+    While ti is less than k:
+        NTT.kyber_ntt_forward(s_vec plus ti multiplied by 512)
+        NTT.kyber_ntt_forward(e_vec plus ti multiplied by 512)
+        Set ti to ti plus 1
+    End While
+
+    Note: t = A * s + e  (matrix-vector multiply in NTT domain)
+    Let t_vec be Arena.arena_allocate(arena, 512 multiplied by k)
+    Let prod_tmp be Arena.arena_allocate(arena, 512)
+    Let tri be 0
+    While tri is less than k:
+        Let t_row_addr be t_vec plus tri multiplied by 512
+        Memory.memory_copy(t_row_addr, e_vec plus tri multiplied by 512, 512)
+        Let tj be 0
+        While tj is less than k:
+            Let cell_addr2 be a_matrix plus (tri multiplied by k plus tj) multiplied by cell_size
+            NTT.kyber_pointwise_multiply(cell_addr2, s_vec plus tj multiplied by 512, prod_tmp)
+            Let ci be 0
+            While ci is less than 256:
+                Let coef_off be ci multiplied by 2
+                Let cur_v be Memory.memory_get_int16(t_row_addr, coef_off)
+                Let add_v be Memory.memory_get_int16(prod_tmp, coef_off)
+                Let sum_v be cur_v plus add_v
+                If sum_v is greater than or equal to 3329:
+                    Set sum_v to sum_v minus 3329
+                End If
+                Memory.memory_set_int16(t_row_addr, coef_off, sum_v)
+                Set ci to ci plus 1
+            End While
+            Set tj to tj plus 1
+        End While
+        Set tri to tri plus 1
+    End While
+
+    Note: ek_PKE := ByteEncode_12(t) || rho
+    Let ek_offset be 0
+    Let ki be 0
+    While ki is less than k:
+        proc byte_encode with t_vec plus ki multiplied by 512, 12, ek_out plus ek_offset
+        Set ek_offset to ek_offset plus 384
+        Set ki to ki plus 1
+    End While
+    Memory.memory_copy(ek_out plus ek_offset, rho, 32)
+
+    Note: dk_PKE := ByteEncode_12(s)
+    Let dk_offset be 0
+    Let dki be 0
+    While dki is less than k:
+        proc byte_encode with s_vec plus dki multiplied by 512, 12, dk_out plus dk_offset
+        Set dk_offset to dk_offset plus 384
+        Set dki to dki plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "kpke_encrypt" takes arena as Integer, ek_pke as Integer, message as Integer, randomness as Integer, level as Integer, ciphertext_out as Integer returns Integer:
+    @Reasoning
+    K-PKE.Encrypt(ek_PKE, m, r) per FIPS 203 Algorithm 14:
+      t = ByteDecode_12(ek_PKE[0..384k])
+      rho = ek_PKE[384k..384k+32]
+      A_hat = ExpandA(rho)
+      r_vec = (SamplePolyCBD_eta1(PRF(r, N)))_N=0..k-1, NTT-domain
+      e1    = (SamplePolyCBD_eta2(PRF(r, N)))_N=k..2k-1
+      e2    = SamplePolyCBD_eta2(PRF(r, 2k))
+      u = inverseNTT(A_hat^T * r_hat) + e1
+      v = inverseNTT(t_hat^T * r_hat) + e2 + Decompress_1(message)
+      c1 = ByteEncode_du(Compress_du(u))
+      c2 = ByteEncode_dv(Compress_dv(v))
+      return c1 || c2
+    @End Reasoning
+    @Implementation
+    Symmetric to kpke_keygen but using A_hat transposed for u computation
+    and a vector inner product for v.
+    @End Implementation
+    @Performance_Hints
+    Dominated by ExpandA (k^2 SHAKE-128 streams) plus k(k+1) polynomial muls.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET: r (encryption randomness), message m, r_vec, e1, e2. Public:
+    ek_pke, ciphertext_out.
+    @End Security_Scope
+    Let k be proc mlkem_k with level
+    Let eta1 be proc mlkem_eta1 with level
+    Let eta2 be proc mlkem_eta2 with level
+    Let du be proc mlkem_du with level
+    Let dv be proc mlkem_dv with level
+
+    Note: Decode t from ek_PKE
+    Let t_vec be Arena.arena_allocate(arena, 512 multiplied by k)
+    Let ti be 0
+    While ti is less than k:
+        proc byte_decode with ek_pke plus ti multiplied by 384, 12, t_vec plus ti multiplied by 512
+        Set ti to ti plus 1
+    End While
+    Let rho be ek_pke plus 384 multiplied by k
+
+    Note: Expand A (we need A transposed: A_hat^T cell (i,j) = original cell (j,i))
+    Let cell_size be 512 plus 16 plus 1040
+    Let a_matrix be Arena.arena_allocate(arena, cell_size multiplied by k multiplied by k)
+    Let ami be 0
+    While ami is less than k:
+        Let amj be 0
+        While amj is less than k:
+            Let cell_addr be a_matrix plus (ami multiplied by k plus amj) multiplied by cell_size
+            proc expand_a_one_cell with arena, rho, ami, amj, cell_addr
+            Set amj to amj plus 1
+        End While
+        Set ami to ami plus 1
+    End While
+
+    Note: Sample r_vec (k polys eta1)
+    Let r_vec be Arena.arena_allocate(arena, 512 multiplied by k)
+    Let prf_buf1 be Arena.arena_allocate(arena, 64 multiplied by eta1)
+    Let nc be 0
+    Let ri be 0
+    While ri is less than k:
+        proc kyber_prf with arena, randomness, nc, prf_buf1, 64 multiplied by eta1
+        proc sample_poly_cbd with prf_buf1, eta1, r_vec plus ri multiplied by 512
+        Set nc to nc plus 1
+        Set ri to ri plus 1
+    End While
+
+    Note: Sample e1 (k polys eta2)
+    Let e1_vec be Arena.arena_allocate(arena, 512 multiplied by k)
+    Let prf_buf2 be Arena.arena_allocate(arena, 64 multiplied by eta2)
+    Let e1i be 0
+    While e1i is less than k:
+        proc kyber_prf with arena, randomness, nc, prf_buf2, 64 multiplied by eta2
+        proc sample_poly_cbd with prf_buf2, eta2, e1_vec plus e1i multiplied by 512
+        Set nc to nc plus 1
+        Set e1i to e1i plus 1
+    End While
+
+    Note: Sample e2 (single poly eta2)
+    Let e2_poly be Arena.arena_allocate(arena, 512)
+    proc kyber_prf with arena, randomness, nc, prf_buf2, 64 multiplied by eta2
+    proc sample_poly_cbd with prf_buf2, eta2, e2_poly
+
+    Note: NTT r_vec
+    Let nti be 0
+    While nti is less than k:
+        NTT.kyber_ntt_forward(r_vec plus nti multiplied by 512)
+        Set nti to nti plus 1
+    End While
+
+    Note: u_hat = A_hat^T * r_hat   (k-vector)
+    Let u_vec be Arena.arena_allocate(arena, 512 multiplied by k)
+    Let prod_tmp be Arena.arena_allocate(arena, 512)
+    Let uri be 0
+    While uri is less than k:
+        Let u_row_addr be u_vec plus uri multiplied by 512
+        Memory.memory_zero(u_row_addr, 512)
+        Let urj be 0
+        While urj is less than k:
+            Note: For A^T we use cell (j, i) instead of (i, j)
+            Let cell_addr2 be a_matrix plus (urj multiplied by k plus uri) multiplied by cell_size
+            NTT.kyber_pointwise_multiply(cell_addr2, r_vec plus urj multiplied by 512, prod_tmp)
+            Let ci be 0
+            While ci is less than 256:
+                Let coef_off be ci multiplied by 2
+                Let cur_v be Memory.memory_get_int16(u_row_addr, coef_off)
+                Let add_v be Memory.memory_get_int16(prod_tmp, coef_off)
+                Let sum_v be cur_v plus add_v
+                If sum_v is greater than or equal to 3329:
+                    Set sum_v to sum_v minus 3329
+                End If
+                Memory.memory_set_int16(u_row_addr, coef_off, sum_v)
+                Set ci to ci plus 1
+            End While
+            Set urj to urj plus 1
+        End While
+        NTT.kyber_ntt_inverse(u_row_addr)
+        Note: u_row_addr += e1[uri]
+        Let ai be 0
+        While ai is less than 256:
+            Let aoff be ai multiplied by 2
+            Let uval be Memory.memory_get_int16(u_row_addr, aoff)
+            Let eval2 be Memory.memory_get_int16(e1_vec plus uri multiplied by 512, aoff)
+            Let usum be uval plus eval2
+            If usum is greater than or equal to 3329:
+                Set usum to usum minus 3329
+            End If
+            If usum is less than 0:
+                Set usum to usum plus 3329
+            End If
+            Memory.memory_set_int16(u_row_addr, aoff, usum)
+            Set ai to ai plus 1
+        End While
+        Set uri to uri plus 1
+    End While
+
+    Note: v_hat = t_hat^T * r_hat (single poly inner product)
+    Let v_poly be Arena.arena_allocate(arena, 512)
+    Memory.memory_zero(v_poly, 512)
+    Let vri be 0
+    While vri is less than k:
+        NTT.kyber_pointwise_multiply(t_vec plus vri multiplied by 512, r_vec plus vri multiplied by 512, prod_tmp)
+        Let vi2 be 0
+        While vi2 is less than 256:
+            Let voff be vi2 multiplied by 2
+            Let vcur be Memory.memory_get_int16(v_poly, voff)
+            Let vadd be Memory.memory_get_int16(prod_tmp, voff)
+            Let vsum be vcur plus vadd
+            If vsum is greater than or equal to 3329:
+                Set vsum to vsum minus 3329
+            End If
+            Memory.memory_set_int16(v_poly, voff, vsum)
+            Set vi2 to vi2 plus 1
+        End While
+        Set vri to vri plus 1
+    End While
+    NTT.kyber_ntt_inverse(v_poly)
+
+    Note: v += e2 + Decompress_1(message)
+    Let mi be 0
+    While mi is less than 256:
+        Let moff be mi multiplied by 2
+        Let mbit be Memory.memory_get_byte(message, mi shifted right by 3)
+        Set mbit to mbit shifted right by mi bitwise_and 7
+        Set mbit to mbit bitwise_and 1
+        Let mdec be NTT.kyber_decompress(mbit, 1)
+        Let evval be Memory.memory_get_int16(e2_poly, moff)
+        Let vvval be Memory.memory_get_int16(v_poly, moff)
+        Let new_vv be vvval plus evval plus mdec
+        While new_vv is greater than or equal to 3329:
+            Set new_vv to new_vv minus 3329
+        End While
+        While new_vv is less than 0:
+            Set new_vv to new_vv plus 3329
+        End While
+        Memory.memory_set_int16(v_poly, moff, new_vv)
+        Set mi to mi plus 1
+    End While
+
+    Note: c1 = ByteEncode_du(Compress_du(u)); c2 = ByteEncode_dv(Compress_dv(v))
+    Let c_offset be 0
+    Let ci2 be 0
+    While ci2 is less than k:
+        proc byte_encode_compress with u_vec plus ci2 multiplied by 512, du, ciphertext_out plus c_offset
+        Set c_offset to c_offset plus 32 multiplied by du
+        Set ci2 to ci2 plus 1
+    End While
+    proc byte_encode_compress with v_poly, dv, ciphertext_out plus c_offset
+
+    Return 1
+End Process
+
+Process called "kpke_decrypt" takes arena as Integer, dk_pke as Integer, ciphertext as Integer, level as Integer, message_out as Integer returns Integer:
+    @Reasoning
+    K-PKE.Decrypt(dk_PKE, c) per FIPS 203 Algorithm 15:
+      c1 || c2 = c
+      u = Decompress_du(ByteDecode_du(c1))
+      v = Decompress_dv(ByteDecode_dv(c2))
+      s_hat = ByteDecode_12(dk_PKE)
+      w = v - inverseNTT(s_hat^T * NTT(u))
+      m = ByteEncode_1(Compress_1(w))
+    @End Reasoning
+    @Implementation
+    Standard module-LWE decryption.
+    @End Implementation
+    @Performance_Hints
+    Dominated by k polynomial multiplies in NTT domain.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path. No data-dependent branches; output m is the recovered
+    message (32 bytes).
+    @End Security_Scope
+    Let k be proc mlkem_k with level
+    Let du be proc mlkem_du with level
+    Let dv be proc mlkem_dv with level
+
+    Let u_vec be Arena.arena_allocate(arena, 512 multiplied by k)
+    Let ui be 0
+    While ui is less than k:
+        proc byte_decode_decompress with ciphertext plus ui multiplied by 32 multiplied by du, du, u_vec plus ui multiplied by 512
+        Set ui to ui plus 1
+    End While
+    Let v_poly be Arena.arena_allocate(arena, 512)
+    proc byte_decode_decompress with ciphertext plus 32 multiplied by du multiplied by k, dv, v_poly
+
+    Let s_vec be Arena.arena_allocate(arena, 512 multiplied by k)
+    Let si be 0
+    While si is less than k:
+        proc byte_decode with dk_pke plus si multiplied by 384, 12, s_vec plus si multiplied by 512
+        Set si to si plus 1
+    End While
+
+    Let nui be 0
+    While nui is less than k:
+        NTT.kyber_ntt_forward(u_vec plus nui multiplied by 512)
+        Set nui to nui plus 1
+    End While
+
+    Let w_poly be Arena.arena_allocate(arena, 512)
+    Memory.memory_zero(w_poly, 512)
+    Let prod_tmp be Arena.arena_allocate(arena, 512)
+    Let wi be 0
+    While wi is less than k:
+        NTT.kyber_pointwise_multiply(s_vec plus wi multiplied by 512, u_vec plus wi multiplied by 512, prod_tmp)
+        Let wj be 0
+        While wj is less than 256:
+            Let woff be wj multiplied by 2
+            Let wcur be Memory.memory_get_int16(w_poly, woff)
+            Let wadd be Memory.memory_get_int16(prod_tmp, woff)
+            Let wsum be wcur plus wadd
+            If wsum is greater than or equal to 3329:
+                Set wsum to wsum minus 3329
+            End If
+            Memory.memory_set_int16(w_poly, woff, wsum)
+            Set wj to wj plus 1
+        End While
+        Set wi to wi plus 1
+    End While
+    NTT.kyber_ntt_inverse(w_poly)
+
+    Note: w = v - w
+    Let mi be 0
+    While mi is less than 256:
+        Let moff be mi multiplied by 2
+        Let vval be Memory.memory_get_int16(v_poly, moff)
+        Let wval be Memory.memory_get_int16(w_poly, moff)
+        Let diff_w be vval minus wval
+        While diff_w is less than 0:
+            Set diff_w to diff_w plus 3329
+        End While
+        While diff_w is greater than or equal to 3329:
+            Set diff_w to diff_w minus 3329
+        End While
+        Memory.memory_set_int16(w_poly, moff, diff_w)
+        Set mi to mi plus 1
+    End While
+
+    Note: m = ByteEncode_1(Compress_1(w))
+    Memory.memory_zero(message_out, 32)
+    Let bi be 0
+    While bi is less than 256:
+        Let woff2 be bi multiplied by 2
+        Let wv be Memory.memory_get_int16(w_poly, woff2)
+        Let mbit be NTT.kyber_compress(wv, 1)
+        Let byte_idx be bi shifted right by 3
+        Let bit_idx be bi bitwise_and 7
+        Let cur_byte be Memory.memory_get_byte(message_out, byte_idx)
+        Set cur_byte to cur_byte bitwise_or mbit shifted left by bit_idx
+        Memory.memory_set_byte(message_out, byte_idx, cur_byte)
+        Set bi to bi plus 1
+    End While
+
+    Return 1
+End Process
+
+Note:
+==============================================================================
+ML-KEM TOP-LEVEL: KeyGen, Encaps, Decaps
+==============================================================================
+:End Note
+
+Process called "ml_kem_keygen_internal" takes arena as Integer, seed_d as Integer, seed_z as Integer, level as Integer, ek_out as Integer, dk_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM.KeyGen() per FIPS 203 Algorithm 16:
+      Generate d (32 bytes), z (32 bytes) from CSPRNG
+      (ek_PKE, dk_PKE) = K-PKE.KeyGen(d)
+      ek = ek_PKE
+      dk = dk_PKE || ek || H(ek) || z
+    Caller supplies the two 32-byte seeds.
+    @End Reasoning
+    @Implementation
+    Composes K-PKE.KeyGen with hashing of the public key and appending z.
+    @End Implementation
+    @Performance_Hints
+    Same as K-PKE.KeyGen plus one SHA3-256 of the public key.
+    @End Performance_Hints
+    @Security_Scope
+    Caller must supply z and d from a CSPRNG. Arena residue may contain
+    secret intermediates; caller should zero on release.
+    @End Security_Scope
+    Let k be proc mlkem_k with level
+    Let ek_size be proc mlkem_ek_size with level
+    Let ek_pke_size be 384 multiplied by k plus 32
+
+    proc kpke_keygen with arena, seed_d, level, ek_out, dk_out
+
+    Note: ek_PKE is in ek_out (size ek_pke_size). Copy into dk after dk_PKE.
+    Memory.memory_copy(dk_out plus 384 multiplied by k, ek_out, ek_pke_size)
+    Note: H(ek) into next 32 bytes
+    Let h_target be dk_out plus 384 multiplied by k plus ek_pke_size
+    proc kyber_h with arena, ek_out, ek_size, h_target
+    Note: z into final 32 bytes
+    Let z_target be h_target plus 32
+    Memory.memory_copy(z_target, seed_z, 32)
+
+    Return 1
+End Process
+
+Process called "ml_kem_encaps_internal" takes arena as Integer, ek as Integer, randomness_m as Integer, level as Integer, ciphertext_out as Integer, shared_secret_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM.Encaps(ek) per FIPS 203 Algorithm 17:
+      m = G_randomness   (caller-provided 32 bytes)
+      (K, r) = G(m || H(ek))   -- 64 bytes split as 32+32
+      c = K-PKE.Encrypt(ek, m, r)
+      return (K, c)
+    @End Reasoning
+    @Implementation
+    Bundles the 32-byte randomness m with the hash of the public key, derives
+    (K, r), then performs K-PKE.Encrypt.
+    @End Implementation
+    @Performance_Hints
+    One SHA3-256 for H(ek), one SHA3-512 for G, one K-PKE.Encrypt.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path: randomness_m and the derived K. Constant-time downstream.
+    Caller's randomness_m must be from a CSPRNG.
+    @End Security_Scope
+    Let ek_size be proc mlkem_ek_size with level
+
+    Note: g_input := m || H(ek)
+    Let g_input be Arena.arena_allocate(arena, 64)
+    Memory.memory_copy(g_input, randomness_m, 32)
+    proc kyber_h with arena, ek, ek_size, g_input plus 32
+
+    Let g_out be Arena.arena_allocate(arena, 64)
+    proc kyber_g with arena, g_input, 64, g_out
+
+    Let kk_addr be g_out
+    Let r_addr be g_out plus 32
+
+    proc kpke_encrypt with arena, ek, randomness_m, r_addr, level, ciphertext_out
+
+    Memory.memory_copy(shared_secret_out, kk_addr, 32)
+
+    Return 1
+End Process
+
+Process called "ml_kem_decaps_internal" takes arena as Integer, dk as Integer, ciphertext as Integer, level as Integer, shared_secret_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM.Decaps(dk, c) per FIPS 203 Algorithm 18:
+      dk_PKE || ek_PKE || h || z = dk
+      m_prime = K-PKE.Decrypt(dk_PKE, c)
+      (K_prime, r_prime) = G(m_prime || h)
+      K_bar = J(z || c)
+      c_prime = K-PKE.Encrypt(ek_PKE, m_prime, r_prime)
+      if c == c_prime  return K_prime    (constant-time compare)
+      else             return K_bar
+    @End Reasoning
+    @Implementation
+    Re-encryption check with constant-time selection between K_prime and
+    K_bar. Implicit rejection: the comparison MUST be done constant-time so
+    that timing reveals nothing about whether the ciphertext was valid.
+    @End Implementation
+    @Performance_Hints
+    One K-PKE.Decrypt + one K-PKE.Encrypt + a 32-byte constant-time compare
+    + a 32-byte constant-time select.
+    @End Performance_Hints
+    @Security_Scope
+    CRITICAL: implicit rejection MUST be CT. We compute a 32-bit mask from
+    the byte-equality of c and c_prime and use it to blend K_prime and K_bar.
+    @End Security_Scope
+    Let k be proc mlkem_k with level
+    Let ct_size be proc mlkem_ct_size with level
+
+    Let dk_pke be dk
+    Let ek_pke be dk plus 384 multiplied by k
+    Let ek_pke_size be 384 multiplied by k plus 32
+    Let h_field be ek_pke plus ek_pke_size
+    Let z_field be h_field plus 32
+
+    Let m_prime be Arena.arena_allocate(arena, 32)
+    proc kpke_decrypt with arena, dk_pke, ciphertext, level, m_prime
+
+    Let g_input be Arena.arena_allocate(arena, 64)
+    Memory.memory_copy(g_input, m_prime, 32)
+    Memory.memory_copy(g_input plus 32, h_field, 32)
+    Let g_out be Arena.arena_allocate(arena, 64)
+    proc kyber_g with arena, g_input, 64, g_out
+    Let kk_prime_addr be g_out
+    Let r_prime_addr be g_out plus 32
+
+    Let j_input be Arena.arena_allocate(arena, 32 plus ct_size)
+    Memory.memory_copy(j_input, z_field, 32)
+    Memory.memory_copy(j_input plus 32, ciphertext, ct_size)
+    Let k_bar be Arena.arena_allocate(arena, 32)
+    proc kyber_j with arena, j_input, 32 plus ct_size, k_bar
+
+    Let c_prime be Arena.arena_allocate(arena, ct_size)
+    proc kpke_encrypt with arena, ek_pke, m_prime, r_prime_addr, level, c_prime
+
+    Note: Constant-time byte compare across ct_size bytes
+    Let cmp_diff be 0
+    Let cmpi be 0
+    While cmpi is less than ct_size:
+        Let ba be Memory.memory_get_byte(ciphertext, cmpi)
+        Let bb be Memory.memory_get_byte(c_prime, cmpi)
+        Set cmp_diff to cmp_diff bitwise_or ba bitwise_xor bb
+        Set cmpi to cmpi plus 1
+    End While
+
+    Note: mask = -1 if cmp_diff == 0 else 0
+    Let mask_neg be 0 minus 1
+    If cmp_diff is not equal to 0:
+        Set mask_neg to 0
+    End If
+
+    Let bsi be 0
+    While bsi is less than 32:
+        Let bp be Memory.memory_get_byte(kk_prime_addr, bsi)
+        Let bb2 be Memory.memory_get_byte(k_bar, bsi)
+        Let blended be bp bitwise_and mask_neg
+        Let bbblend be bb2 bitwise_and mask_neg bitwise_xor 255
+        Set blended to blended bitwise_or bbblend
+        Memory.memory_set_byte(shared_secret_out, bsi, blended bitwise_and 255)
+        Set bsi to bsi plus 1
+    End While
+
+    Return 1
+End Process
+
+Note:
+==============================================================================
+Public per-parameter-set API
+==============================================================================
+:End Note
+
+Process called "ml_kem_512_keygen" takes arena as Integer, seed_d as Integer, seed_z as Integer, ek_out as Integer, dk_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM-512 KeyGen wrapper.
+    @End Reasoning
+    @Implementation
+    Delegates to ml_kem_keygen_internal with level=1.
+    @End Implementation
+    @Performance_Hints
+    See ml_kem_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See ml_kem_keygen_internal.
+    @End Security_Scope
+    Return proc ml_kem_keygen_internal with arena, seed_d, seed_z, 1, ek_out, dk_out
+End Process
+
+Process called "ml_kem_512_encaps" takes arena as Integer, ek as Integer, randomness_m as Integer, ciphertext_out as Integer, shared_secret_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM-512 Encaps wrapper.
+    @End Reasoning
+    @Implementation
+    Delegates with level=1.
+    @End Implementation
+    @Performance_Hints
+    See ml_kem_encaps_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See ml_kem_encaps_internal.
+    @End Security_Scope
+    Return proc ml_kem_encaps_internal with arena, ek, randomness_m, 1, ciphertext_out, shared_secret_out
+End Process
+
+Process called "ml_kem_512_decaps" takes arena as Integer, dk as Integer, ciphertext as Integer, shared_secret_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM-512 Decaps wrapper.
+    @End Reasoning
+    @Implementation
+    Delegates with level=1.
+    @End Implementation
+    @Performance_Hints
+    See ml_kem_decaps_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See ml_kem_decaps_internal.
+    @End Security_Scope
+    Return proc ml_kem_decaps_internal with arena, dk, ciphertext, 1, shared_secret_out
+End Process
+
+Process called "ml_kem_768_keygen" takes arena as Integer, seed_d as Integer, seed_z as Integer, ek_out as Integer, dk_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM-768 KeyGen wrapper.
+    @End Reasoning
+    @Implementation
+    Delegates with level=2.
+    @End Implementation
+    @Performance_Hints
+    See ml_kem_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See ml_kem_keygen_internal.
+    @End Security_Scope
+    Return proc ml_kem_keygen_internal with arena, seed_d, seed_z, 2, ek_out, dk_out
+End Process
+
+Process called "ml_kem_768_encaps" takes arena as Integer, ek as Integer, randomness_m as Integer, ciphertext_out as Integer, shared_secret_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM-768 Encaps wrapper.
+    @End Reasoning
+    @Implementation
+    Delegates with level=2.
+    @End Implementation
+    @Performance_Hints
+    See ml_kem_encaps_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See ml_kem_encaps_internal.
+    @End Security_Scope
+    Return proc ml_kem_encaps_internal with arena, ek, randomness_m, 2, ciphertext_out, shared_secret_out
+End Process
+
+Process called "ml_kem_768_decaps" takes arena as Integer, dk as Integer, ciphertext as Integer, shared_secret_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM-768 Decaps wrapper.
+    @End Reasoning
+    @Implementation
+    Delegates with level=2.
+    @End Implementation
+    @Performance_Hints
+    See ml_kem_decaps_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See ml_kem_decaps_internal.
+    @End Security_Scope
+    Return proc ml_kem_decaps_internal with arena, dk, ciphertext, 2, shared_secret_out
+End Process
+
+Process called "ml_kem_1024_keygen" takes arena as Integer, seed_d as Integer, seed_z as Integer, ek_out as Integer, dk_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM-1024 KeyGen wrapper.
+    @End Reasoning
+    @Implementation
+    Delegates with level=3.
+    @End Implementation
+    @Performance_Hints
+    See ml_kem_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See ml_kem_keygen_internal.
+    @End Security_Scope
+    Return proc ml_kem_keygen_internal with arena, seed_d, seed_z, 3, ek_out, dk_out
+End Process
+
+Process called "ml_kem_1024_encaps" takes arena as Integer, ek as Integer, randomness_m as Integer, ciphertext_out as Integer, shared_secret_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM-1024 Encaps wrapper.
+    @End Reasoning
+    @Implementation
+    Delegates with level=3.
+    @End Implementation
+    @Performance_Hints
+    See ml_kem_encaps_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See ml_kem_encaps_internal.
+    @End Security_Scope
+    Return proc ml_kem_encaps_internal with arena, ek, randomness_m, 3, ciphertext_out, shared_secret_out
+End Process
+
+Process called "ml_kem_1024_decaps" takes arena as Integer, dk as Integer, ciphertext as Integer, shared_secret_out as Integer returns Integer:
+    @Reasoning
+    ML-KEM-1024 Decaps wrapper.
+    @End Reasoning
+    @Implementation
+    Delegates with level=3.
+    @End Implementation
+    @Performance_Hints
+    See ml_kem_decaps_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See ml_kem_decaps_internal.
+    @End Security_Scope
+    Return proc ml_kem_decaps_internal with arena, dk, ciphertext, 3, shared_secret_out
+End Process

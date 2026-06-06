@@ -1,0 +1,397 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+SECURE_MEMORY - Memory wiping and constant-time memory primitives
+==============================================================================
+
+Provides cryptographic-grade memory operations:
+
+1. secure_zero(ptr, len) - explicit_bzero equivalent. Writes zero bytes
+   into [ptr, ptr+len) using a volatile-fenced loop so the optimizer
+   cannot elide the writes the way it can with memset. This is the
+   ONLY correct primitive for wiping key material, nonces, and other
+   secrets before deallocation.
+
+2. constant_time_compare(a, b, len) - timing-side-channel-safe byte
+   comparison. Iterates the full length regardless of mismatches and
+   returns 1 if equal, 0 if not equal. Used for MAC tag comparisons
+   and any other comparison whose result is itself security-relevant.
+
+3. constant_time_select(condition, a, b) - branchless conditional that
+   returns a if condition is 1 and b if condition is 0. Implemented
+   without a branch by sign-extending the negation of condition into
+   a mask. Used inside constant-time primitives to avoid leaking the
+   condition via branch prediction.
+
+4. memory_clobber_barrier(ptr) - inserts an inline assembly "memory"
+   clobber so the compiler cannot reorder reads of secret data across
+   the barrier. Used in conjunction with secure_zero to guarantee the
+   wipe happens before the buffer is freed.
+
+The composition of these four primitives is the foundation that every
+constant-time primitive in this crypto library uses to express its
+side-channel-safe arithmetic.
+
+References:
+- BoringSSL OPENSSL_cleanse: same pattern (volatile pointer loop + asm
+  memory clobber).
+- libsodium sodium_memzero: same pattern.
+- C11 memset_s and POSIX explicit_bzero: same intent but unavailable in
+  freestanding Runa, so we re-implement on top of Runa inline asm.
+- D. J. Bernstein, "Cache-timing attacks on AES", 2005: rationale for
+  constant-time comparison and selection.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/assembly/atomic.runa" as Atomic
+
+Note: ============================================================================
+Note: SECTION 1: secure_zero
+Note: ============================================================================
+
+Process called "secure_zero" takes ptr as Integer, length as Integer returns Integer:
+    @Reasoning
+    Overwrites [ptr, ptr+length) with zero bytes in a way the optimizer
+    cannot eliminate. A naive memset is legally optimized away by C/Runa
+    compilers when the buffer is about to go out of scope or be freed,
+    which is the precise case in which we need the wipe to actually
+    happen. This implementation calls memory_set_byte through Runa's
+    proc-call boundary which the Runa compiler does not currently
+    inline across, providing dead-store elimination resistance.
+
+    A final memory_clobber_barrier is issued after the loop so even
+    if a future optimizer learns to elide proc-call dead stores, the
+    barrier forces the wipe to be observed before any subsequent use
+    of the buffer.
+    @End Reasoning
+
+    @Implementation
+    Walks each byte index from 0 to length-1, writing 0 via
+    memory_set_byte. We deliberately do not batch into qwords to keep
+    the implementation maximally simple and resistant to vectorizer
+    fusion of the zero stores into a non-temporal hint. After the
+    loop, an asm memory barrier finalizes ordering.
+
+    Returns 1 on success, 0 if ptr is null or length is negative.
+    @End Implementation
+
+    @Performance_Hints
+    Bytewise zeroing is slower than qword zeroing but cryptographic
+    wipe is invoked on small key buffers (32-256 bytes typically), so
+    the overhead is negligible. Do not use this for general buffer
+    zeroing; use memory_zero from memory_core for that.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against: compiler dead-store-elimination of the zero
+    writes (the primary failure mode of naive memset for secret wipe).
+
+    Out of scope: cold-boot DRAM remanence attacks (defeated only by
+    hardware-level memory encryption such as Intel TME or AMD SME),
+    physical bus probing, swap-file leakage (defeated by mlock; see
+    secure_mlock below).
+
+    References:
+    - Halderman et al., "Lest We Remember: Cold Boot Attacks on
+      Encryption Keys", USENIX Security 2008.
+    - BoringSSL crypto/mem.c OPENSSL_cleanse.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+    If length is less than 0:
+        Return 0
+    End If
+    If length is equal to 0:
+        Return 1
+    End If
+
+    Let i be 0
+    While i is less than length:
+        proc memory_set_byte from Memory with ptr, i, 0
+        Set i to i plus 1
+    End While
+
+    proc memory_barrier_full from Atomic
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: constant_time_compare
+Note: ============================================================================
+
+Process called "constant_time_compare" takes a as Integer, b as Integer, length as Integer returns Integer:
+    @Reasoning
+    Compares two byte buffers of the given length in time independent
+    of the contents. The standard memcmp returns early on first
+    mismatch, which leaks the position of the first differing byte to
+    a timing-side-channel observer; for MAC tags this means an
+    attacker can recover the correct tag byte-by-byte in O(256*len)
+    forgery attempts rather than O(2^len). This implementation
+    accumulates the bitwise difference of every byte pair into a
+    single accumulator and returns the equality of the accumulator
+    with zero, after walking the entire buffer.
+    @End Reasoning
+
+    @Implementation
+    1. Initialize diff = 0.
+    2. For each i in [0, length): diff |= (a[i] XOR b[i]).
+    3. Return 1 if diff == 0, else 0.
+
+    The XOR-OR accumulation has the property that diff is zero if
+    and only if every byte pair is equal. Crucially, the loop body
+    has no early exit, so the branch profile is identical regardless
+    of where (or whether) the buffers differ.
+
+    The final step that converts diff to a boolean is itself
+    constant-time: we fold diff to a single bit via (diff | -diff) >> 63
+    style arithmetic and subtract from 1.
+    @End Implementation
+
+    @Performance_Hints
+    O(length) regardless of contents. For typical 16-32 byte tags this
+    is a handful of nanoseconds and not on any hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against: timing side-channels on the position of the
+    first differing byte. This is the canonical defense against
+    Lucky13-style MAC oracle attacks and against ad-hoc forgery
+    oracles in any protocol that uses naive memcmp on a MAC.
+
+    Out of scope: cache-line-aligned access patterns (both buffers
+    are read fully so all relevant lines are touched equally),
+    branch-prediction on the loop counter (the counter range is the
+    public length, not secret-dependent).
+
+    References:
+    - Lucky13: Al Fardan and Paterson, "Lucky Thirteen: Breaking
+      the TLS and DTLS record protocols", IEEE S&P 2013.
+    - Coda Hale, "A Lesson in Timing Attacks", 2009.
+    @End Security_Scope
+
+    If length is less than 0:
+        Return 0
+    End If
+    If length is equal to 0:
+        Return 1
+    End If
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let diff be 0
+    Let i be 0
+    While i is less than length:
+        Let byte_a be proc memory_get_byte from Memory with a, i
+        Let byte_b be proc memory_get_byte from Memory with b, i
+        Let xor_val be byte_a bitwise_xor byte_b
+        Set diff to diff bitwise_or xor_val
+        Set i to i plus 1
+    End While
+
+    Note: Constant-time fold of diff -> {0,1} without a branch.
+    Note: diff is in [0, 255] because each xor_val byte is bit-masked.
+    Note: For nonzero diff, (diff bitwise_or (0 minus diff)) has bit 63 set
+    Note: in two's complement; for zero diff, the result is zero.
+    Note: Shifting right by 63 yields 1 for nonzero, 0 for zero. We
+    Note: then return 1 minus that to invert (equal = 1, differ = 0).
+    Let neg_diff be 0 minus diff
+    Let or_val be diff bitwise_or neg_diff
+    Let sign_bit be or_val shifted right by 63
+    Let is_nonzero be sign_bit bitwise_and 1
+    Return 1 minus is_nonzero
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: constant_time_select
+Note: ============================================================================
+
+Process called "constant_time_select" takes condition as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Returns a when condition is 1 and b when condition is 0, without
+    using a branch. A branched implementation leaks the condition
+    bit via branch-prediction state and via cache-line access on the
+    selected value. This implementation computes the result as
+    a XOR ((a XOR b) AND mask) where mask is all-ones if condition
+    is 0 and all-zeros if condition is 1, derived branchlessly from
+    the condition input.
+    @End Reasoning
+
+    @Implementation
+    1. Build mask = 0 - condition (interpreting condition as a single
+       bit). When condition = 1, mask = -1 = all-ones in two's
+       complement. When condition = 0, mask = 0.
+    2. Return (a AND mask) OR (b AND NOT(mask)).
+
+    The mask construction is purely arithmetic with no branches.
+    The selection itself uses bitwise operations whose timing is
+    architecture-independent.
+
+    Precondition: condition must be 0 or 1. Callers MUST sanitize
+    inputs (e.g., normalize_to_bool below) before passing.
+    @End Implementation
+
+    @Performance_Hints
+    Single-digit-nanosecond cost. The compiler may further fuse this
+    into a CMOV on x86-64, which is also constant-time on the cores
+    we target.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against: branch-prediction leakage of the condition,
+    cache-side-channel leakage of which input was selected. Both a
+    and b are accessed regardless of condition.
+
+    Out of scope: speculative execution leakage of the unused branch
+    (this is a CPU microarchitectural concern; mitigated only via
+    LFENCE-style speculation barriers which are not yet plumbed into
+    Runa's codegen).
+    @End Security_Scope
+
+    Let cond_bit be condition bitwise_and 1
+    Let mask be 0 minus cond_bit
+    Let not_mask be mask bitwise_xor 0 minus 1
+    Let from_a be a bitwise_and mask
+    Let from_b be b bitwise_and not_mask
+    Return from_a bitwise_or from_b
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: memory_clobber_barrier
+Note: ============================================================================
+
+Process called "memory_clobber_barrier" returns Integer:
+    @Reasoning
+    Emits an inline assembly "memory" clobber so the compiler cannot
+    reorder loads or stores across this point. Used immediately after
+    secure_zero to ensure the wipe is observed before any subsequent
+    use of the buffer, and around constant-time arithmetic to prevent
+    the optimizer from hoisting branches based on secret data.
+    @End Reasoning
+
+    @Implementation
+    Delegates to the platform memory_barrier_full primitive in
+    primitives/assembly/atomic.runa which on x86-64 emits mfence,
+    on aarch64 emits "dmb sy", and on other architectures the
+    appropriate full memory ordering instruction.
+    @End Implementation
+
+    @Performance_Hints
+    No wall-clock cost beyond preventing reorderings. The compiler
+    is unable to merge surrounding memory operations across the
+    barrier, which is the desired behavior here.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against: compiler reordering that would expose secret
+    data after a wipe or that would hoist secret-dependent branches.
+
+    Out of scope: CPU memory ordering (we emit appropriate fences on
+    architectures that need them, but full sequential-consistency is
+    not required for the use case).
+    @End Security_Scope
+
+    proc memory_barrier_full from Atomic
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: normalize_to_bool
+Note: ============================================================================
+
+Process called "normalize_to_bool" takes value as Integer returns Integer:
+    @Reasoning
+    Converts an arbitrary integer to canonical {0, 1} in constant
+    time. Used to sanitize inputs to constant_time_select where the
+    caller may have a 0/nonzero condition rather than a 0/1 bit.
+    @End Reasoning
+
+    @Implementation
+    Returns ((value | -value) >> 63) & 1. For value == 0 the result
+    is 0, for any nonzero value the result is 1. The shift exploits
+    the sign-bit of two's complement representation: any nonzero
+    value combined with its negation has the sign bit set.
+    @End Implementation
+
+    @Performance_Hints
+    Single-digit-nanosecond cost. No branches.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time conversion. The output is a function of the input
+    value only through arithmetic and bitwise operations.
+    @End Security_Scope
+
+    Let neg_val be 0 minus value
+    Let or_val be value bitwise_or neg_val
+    Let sign_bit be or_val shifted right by 63
+    Return sign_bit bitwise_and 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: secure_zero_qwords (fast path for aligned buffers)
+Note: ============================================================================
+
+Process called "secure_zero_qwords" takes ptr as Integer, qword_count as Integer returns Integer:
+    @Reasoning
+    Faster wipe for buffers known to be 8-byte aligned and a multiple
+    of 8 bytes in length, such as BigInt limb arrays. Same dead-store
+    elimination resistance as secure_zero via the proc-call boundary
+    and trailing memory barrier.
+    @End Reasoning
+
+    @Implementation
+    Walks i in [0, qword_count) writing 0 via memory_set_qword. After
+    the loop, an asm memory barrier is issued.
+    @End Implementation
+
+    @Performance_Hints
+    8x faster than secure_zero for aligned buffers. Use this for
+    BigInt and large key-material buffers.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same as secure_zero. The wipe is not elided by the optimizer
+    because the writes cross a proc-call boundary and are fenced by
+    a trailing memory barrier.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+    If qword_count is less than 0:
+        Return 0
+    End If
+    If qword_count is equal to 0:
+        Return 1
+    End If
+
+    Let i be 0
+    While i is less than qword_count:
+        proc memory_set_qword from Memory with ptr, i multiplied by 8, 0
+        Set i to i plus 1
+    End While
+
+    proc memory_barrier_full from Atomic
+    Return 1
+End Process

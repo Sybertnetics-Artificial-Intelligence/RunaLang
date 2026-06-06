@@ -1,0 +1,223 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+BF #381 regression test: allocator hygiene. Stress-tests the owned-heap
+allocator at compiler/frontend/primitives/memory/layout.runa for:
+
+  1. Repeated allocate / deallocate cycles with varying sizes do not
+     corrupt heap metadata. A corrupted chunk header would manifest as
+     a glibc-style "munmap_chunk(): invalid pointer" warning at the
+     next deallocation OR at process exit.
+
+  2. Out-of-memory behavior: when the kernel rejects mmap (typically
+     because the address-space request is unreasonable), allocate
+     returns 0 cleanly without crashing or emitting diagnostic noise.
+
+  3. Pointer ownership boundary: deallocate is a no-op on pointers
+     outside the allocator's bounding box (slab registry + owned_addr
+     range), so passing a stack address, an argv-derived pointer, or
+     a foreign-library pointer is safe and returns 0.
+
+  4. Size-class fast path coverage: many allocations of small sizes
+     exercise the pool slab fast path; large allocations exercise the
+     mmap arm. Both must round-trip the size correctly so deallocate
+     returns memory to the right tier.
+
+The 1000-iteration stress loop is deterministic (uses a linear
+congruential generator seeded with a fixed value) so failures
+reproduce identically across runs.
+
+Exit code legend:
+    400 ALL PASS
+    401 First allocation returned 0 (allocator unavailable)
+    402 Repeated allocate/deallocate failed mid-stress
+    403 deallocate of NULL did not return 0
+    404 deallocate of an off-heap pointer triggered abort
+    405 Large-allocation OOM path did not return 0 cleanly
+    406 Pointer not 8-byte aligned (alignment requirement violated)
+    407 Allocation contents corrupted across deallocate/allocate cycle
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Heap
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Process called "main" returns Integer:
+    Note: ============================================================
+    Note: Case 1: basic allocate / deallocate round-trip with a
+    Note: small (cache-line-sized) buffer. Establishes that the
+    Note: allocator is alive and self-consistent.
+    Note: ============================================================
+    Let p1 be proc allocate from Heap with 64
+    If p1 is equal to 0:
+        Return 401
+    End If
+
+    Note: 8-byte alignment is a hard invariant: pool slabs hand out
+    Note: cells aligned to their size-class (>=8 for size 64), and
+    Note: brk/mmap arms round up to 16-byte alignment for SSE
+    Note: compatibility.
+    Let p1_low_bits be p1 modulo by 8
+    If p1_low_bits is not equal to 0:
+        Return 406
+    End If
+
+    Let _dealloc_r1 be proc deallocate from Heap with p1
+    Note: deallocate's return value is informational (1 == path taken,
+    Note: 0 == pointer ignored). We do not gate on its value here -
+    Note: what matters is that the call does not abort.
+
+    Note: ============================================================
+    Note: Case 2: deterministic stress loop, 1000 iterations across
+    Note: pool slab classes (8 to 256 bytes) and the mmap arm
+    Note: (>= 4096 bytes). The LCG below is the classic Numerical
+    Note: Recipes constants - period 2^32, uniform enough for stress
+    Note: rotation. Seeded with 0x9E3779B9 (the golden-ratio fractional
+    Note: bits) so the size sequence is reproducible.
+    Note: ============================================================
+    Let lcg_state be 2654435769  Note: 0x9E3779B9
+    Let lcg_a be 1664525
+    Let lcg_c be 1013904223
+    Let lcg_mod be 4294967296  Note: 2^32
+
+    Let i be 0
+    While i is less than 1000:
+        Note: Step the LCG. Modulo by 2^32 to keep within 32-bit
+        Note: range so the product does not overflow into the sign
+        Note: bit on the next iteration.
+        Set lcg_state to ((lcg_state multiplied by lcg_a) plus lcg_c) modulo by lcg_mod
+
+        Note: Map to a size class. Bucket 0..3 -> 16 bytes, 4..7 -> 64,
+        Note: 8..11 -> 256, 12..14 -> 1024, 15 -> 65536 (mmap arm).
+        Note: Distribution: 25% / 25% / 25% / 18.75% / 6.25% of small
+        Note: allocations + occasional large.
+        Let bucket be (lcg_state divided by 268435456) modulo by 16  Note: top nibble of 32-bit state
+        Let alloc_size be 16
+        If bucket is greater than or equal to 4:
+            Set alloc_size to 64
+        End If
+        If bucket is greater than or equal to 8:
+            Set alloc_size to 256
+        End If
+        If bucket is greater than or equal to 12:
+            Set alloc_size to 1024
+        End If
+        If bucket is equal to 15:
+            Set alloc_size to 65536
+        End If
+
+        Let stress_ptr be proc allocate from Heap with alloc_size
+        If stress_ptr is equal to 0:
+            Return 402
+        End If
+
+        Note: Touch the first and last bytes of the allocation to
+        Note: catch any latent bounds-check failure. The byte writes
+        Note: also serve as the canary roundtrip in Case 5 below.
+        Let _w1 be proc memory_set_byte from Memory with stress_ptr, 0, 170  Note: 0xAA
+        Let _w2 be proc memory_set_byte from Memory with stress_ptr, alloc_size minus 1, 187  Note: 0xBB
+
+        Let read_first be proc memory_get_byte from Memory with stress_ptr, 0
+        If read_first is not equal to 170:
+            Return 407
+        End If
+        Let read_last be proc memory_get_byte from Memory with stress_ptr, alloc_size minus 1
+        If read_last is not equal to 187:
+            Return 407
+        End If
+
+        Let _free be proc deallocate from Heap with stress_ptr
+
+        Set i to i plus 1
+    End While
+
+    Note: ============================================================
+    Note: Case 3: deallocate(0) MUST be a safe no-op. This is the
+    Note: documented NULL-guard contract and is relied upon by every
+    Note: caller in the codebase that does not pre-check.
+    Note: ============================================================
+    Let dealloc_null_r be proc deallocate from Heap with 0
+    If dealloc_null_r is not equal to 0:
+        Return 403
+    End If
+
+    Note: ============================================================
+    Note: Case 4: deallocate on a pointer OUTSIDE the allocator's
+    Note: bounding box must be a safe no-op. The owned_addr_min /
+    Note: owned_addr_max pre-filter (lines 3508-3513 of layout.runa)
+    Note: catches stack addresses, argv pointers, and any foreign
+    Note: pointer numerically below or above the brk/mmap region.
+    Note:
+    Note: We pass a small positive integer (8) which is guaranteed
+    Note: to be below any plausible mmap/brk region (the kernel
+    Note: reserves the entire first page 0..4095 as the NULL guard,
+    Note: and brk/mmap regions live far above that). The
+    Note: ptr < owned_addr_min check fires and returns 0 cleanly.
+    Note: ============================================================
+    Let dealloc_off_r be proc deallocate from Heap with 8
+    If dealloc_off_r is not equal to 0:
+        Return 404
+    End If
+
+    Note: ============================================================
+    Note: Case 5: large-allocation OOM path. We request a positive
+    Note: but unreasonably large allocation (1 TiB) which the kernel
+    Note: will reject. The allocator's mmap arm checks the syscall
+    Note: return value and returns 0 cleanly when mmap fails.
+    Note:
+    Note: A successful allocation here would mean the kernel actually
+    Note: reserved 1 TiB of address space - the test still passes in
+    Note: that case (we immediately free) but the OOM-handling code
+    Note: path went unexercised on this run.
+    Note: ============================================================
+    Let oom_size be 1099511627776  Note: 1 TiB
+    Let oom_ptr be proc allocate from Heap with oom_size
+    If oom_ptr is not equal to 0:
+        Let _oom_free be proc deallocate from Heap with oom_ptr
+        Note: Successful: kernel granted 1 TiB. Allocator returned
+        Note: a valid pointer; we freed it cleanly. No assertion
+        Note: failure - OOM path simply was not triggered.
+    End If
+    Note: If oom_ptr was 0, the allocator handled OOM correctly.
+    Note: Either path is a pass for this case.
+
+    Note: ============================================================
+    Note: Case 6: allocate-write-allocate-write pattern to catch
+    Note: free-list corruption. Two consecutive small allocations
+    Note: from the same size class typically come from adjacent
+    Note: free-list slots in the same pool slab. If a deallocate
+    Note: somehow corrupts the embedded next-pointer of the freed
+    Note: slot, the next allocate will hand out a garbage pointer.
+    Note: ============================================================
+    Let p_a be proc allocate from Heap with 64
+    If p_a is equal to 0:
+        Return 402
+    End If
+    Let _w_a be proc memory_set_byte from Memory with p_a, 0, 161  Note: 0xA1
+
+    Let p_b be proc allocate from Heap with 64
+    If p_b is equal to 0:
+        Return 402
+    End If
+    Let _w_b be proc memory_set_byte from Memory with p_b, 0, 162  Note: 0xA2
+
+    If p_a is equal to p_b:
+        Return 402  Note: same pointer returned for two live allocations - allocator broken
+    End If
+
+    Let r_a be proc memory_get_byte from Memory with p_a, 0
+    Let r_b be proc memory_get_byte from Memory with p_b, 0
+    If r_a is not equal to 161:
+        Return 407
+    End If
+    If r_b is not equal to 162:
+        Return 407
+    End If
+
+    Let _fa be proc deallocate from Heap with p_a
+    Let _fb be proc deallocate from Heap with p_b
+
+    Return 400
+End Process

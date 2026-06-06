@@ -1,0 +1,1117 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+QUERY_BUILDER - Type-safe SQL builder.
+
+A Builder accumulates clauses and emits a parameterised SQL string in
+the appropriate dialect (Postgres, MySQL, SQLite). The default
+placeholder syntax is "?", which Postgres callers can rewrite to "$1"
+"$2"... via the supplied placeholder strategy.
+
+Builder kinds:
+  SELECT  - SELECT cols FROM table [JOIN ...] [WHERE ...] [GROUP BY ...]
+            [HAVING ...] [ORDER BY ...] [LIMIT ...] [OFFSET ...]
+  INSERT  - INSERT INTO table (cols) VALUES (?, ?, ...)
+  UPDATE  - UPDATE table SET col = ?, ... [WHERE ...]
+  DELETE  - DELETE FROM table [WHERE ...]
+
+Builder layout (104 bytes):
+  offset 0:  kind                 (8 bytes) - BUILDER_KIND_*
+  offset 8:  dialect              (8 bytes) - DIALECT_*
+  offset 16: table_ptr            (8 bytes) - table name pointer
+  offset 24: table_len            (8 bytes)
+  offset 32: columns_head         (8 bytes) - linked list of strings
+  offset 40: predicates_head      (8 bytes) - linked list of predicate nodes
+  offset 48: joins_head           (8 bytes)
+  offset 56: group_by_head        (8 bytes)
+  offset 64: having_head          (8 bytes)
+  offset 72: order_by_head        (8 bytes)
+  offset 80: limit                (8 bytes) - -1 = unset
+  offset 88: offset               (8 bytes) - -1 = unset
+  offset 96: params_head          (8 bytes) - linked list of bound parameters
+
+String node (24 bytes):
+  offset 0:  text_ptr             (8 bytes)
+  offset 8:  text_len             (8 bytes)
+  offset 16: next                 (8 bytes)
+
+Predicate node (40 bytes):
+  offset 0:  text_ptr             (8 bytes)
+  offset 8:  text_len             (8 bytes)
+  offset 16: combinator           (8 bytes) - PRED_AND / PRED_OR
+  offset 24: param_count          (8 bytes) - placeholders inside text
+  offset 32: next                 (8 bytes)
+
+Join node (56 bytes):
+  offset 0:  join_kind            (8 bytes) - JOIN_*
+  offset 8:  table_ptr            (8 bytes)
+  offset 16: table_len            (8 bytes)
+  offset 24: on_clause_ptr        (8 bytes)
+  offset 32: on_clause_len        (8 bytes)
+  offset 40: param_count          (8 bytes)
+  offset 48: next                 (8 bytes)
+
+Parameter node (32 bytes):
+  offset 0: tag
+  offset 8: data
+  offset 16: text_ptr   (used only for string-bound params)
+  offset 24: next
+
+Dependencies:
+- memory/layout.runa
+- core/memory_core.runa
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant QB_OFF_KIND as Integer is 0
+Constant QB_OFF_DIALECT as Integer is 8
+Constant QB_OFF_TABLE as Integer is 16
+Constant QB_OFF_TABLE_LEN as Integer is 24
+Constant QB_OFF_COLUMNS as Integer is 32
+Constant QB_OFF_PREDS as Integer is 40
+Constant QB_OFF_JOINS as Integer is 48
+Constant QB_OFF_GROUP as Integer is 56
+Constant QB_OFF_HAVING as Integer is 64
+Constant QB_OFF_ORDER as Integer is 72
+Constant QB_OFF_LIMIT as Integer is 80
+Constant QB_OFF_OFFSET as Integer is 88
+Constant QB_OFF_PARAMS as Integer is 96
+Constant QB_STRUCT_SIZE as Integer is 104
+
+Constant STR_OFF_TEXT as Integer is 0
+Constant STR_OFF_LEN as Integer is 8
+Constant STR_OFF_NEXT as Integer is 16
+Constant STR_STRUCT_SIZE as Integer is 24
+
+Constant PRED_OFF_TEXT as Integer is 0
+Constant PRED_OFF_LEN as Integer is 8
+Constant PRED_OFF_COMB as Integer is 16
+Constant PRED_OFF_PARAMS as Integer is 24
+Constant PRED_OFF_NEXT as Integer is 32
+Constant PRED_STRUCT_SIZE as Integer is 40
+
+Constant JOIN_OFF_KIND as Integer is 0
+Constant JOIN_OFF_TABLE as Integer is 8
+Constant JOIN_OFF_TABLE_LEN as Integer is 16
+Constant JOIN_OFF_ON as Integer is 24
+Constant JOIN_OFF_ON_LEN as Integer is 32
+Constant JOIN_OFF_PARAMS as Integer is 40
+Constant JOIN_OFF_NEXT as Integer is 48
+Constant JOIN_STRUCT_SIZE as Integer is 56
+
+Constant PARAM_OFF_TAG as Integer is 0
+Constant PARAM_OFF_DATA as Integer is 8
+Constant PARAM_OFF_TEXT as Integer is 16
+Constant PARAM_OFF_NEXT as Integer is 24
+Constant PARAM_STRUCT_SIZE as Integer is 32
+
+Constant BUILDER_KIND_SELECT as Integer is 1
+Constant BUILDER_KIND_INSERT as Integer is 2
+Constant BUILDER_KIND_UPDATE as Integer is 3
+Constant BUILDER_KIND_DELETE as Integer is 4
+
+Constant DIALECT_POSTGRES as Integer is 1
+Constant DIALECT_MYSQL as Integer is 2
+Constant DIALECT_SQLITE as Integer is 3
+
+Constant JOIN_INNER as Integer is 0
+Constant JOIN_LEFT as Integer is 1
+Constant JOIN_RIGHT as Integer is 2
+Constant JOIN_FULL as Integer is 3
+
+Constant PRED_AND as Integer is 0
+Constant PRED_OR as Integer is 1
+
+Constant PARAM_TAG_NULL as Integer is 0
+Constant PARAM_TAG_INTEGER as Integer is 1
+Constant PARAM_TAG_FLOAT as Integer is 2
+Constant PARAM_TAG_STRING as Integer is 3
+Constant PARAM_TAG_BYTES as Integer is 4
+Constant PARAM_TAG_BOOLEAN as Integer is 5
+
+Constant QB_OK as Integer is 1
+Constant QB_ERR_INVALID as Integer is 0
+Constant QB_ERR_STATE as Integer is -1
+Constant QB_ERR_OOM as Integer is -2
+
+Note: ============================================================================
+Note: Builder lifecycle
+Note: ============================================================================
+
+@Reasoning
+Create a builder with a defined kind and dialect. Limit/offset start at
+-1 (unset). All linked lists start empty.
+@End Reasoning
+
+@Implementation
+Allocate 104 bytes, zero pointers, set kind / dialect / unset markers.
+@End Implementation
+
+@Performance_Hints
+One allocation.
+@End Performance_Hints
+
+@Security_Scope
+Heap-owned; caller must call builder_destroy.
+@End Security_Scope
+
+Process called "builder_new" takes kind as Integer, dialect as Integer returns Integer:
+    Let b be proc allocate from Memory with QB_STRUCT_SIZE
+    If b is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with b, QB_OFF_KIND, kind
+    proc memory_set_int64 from Mem with b, QB_OFF_DIALECT, dialect
+    proc memory_set_int64 from Mem with b, QB_OFF_TABLE, 0
+    proc memory_set_int64 from Mem with b, QB_OFF_TABLE_LEN, 0
+    proc memory_set_int64 from Mem with b, QB_OFF_COLUMNS, 0
+    proc memory_set_int64 from Mem with b, QB_OFF_PREDS, 0
+    proc memory_set_int64 from Mem with b, QB_OFF_JOINS, 0
+    proc memory_set_int64 from Mem with b, QB_OFF_GROUP, 0
+    proc memory_set_int64 from Mem with b, QB_OFF_HAVING, 0
+    proc memory_set_int64 from Mem with b, QB_OFF_ORDER, 0
+    proc memory_set_int64 from Mem with b, QB_OFF_LIMIT, -1
+    proc memory_set_int64 from Mem with b, QB_OFF_OFFSET, -1
+    proc memory_set_int64 from Mem with b, QB_OFF_PARAMS, 0
+    Return b
+End Process
+
+Process called "builder_free_string_list" takes head as Integer returns Integer:
+    Let cursor be head
+    While cursor is not equal to 0:
+        Let next_n be proc memory_get_int64 from Mem with cursor, STR_OFF_NEXT
+        proc deallocate from Memory with cursor
+        Set cursor to next_n
+    End While
+    Return QB_OK
+End Process
+
+Process called "builder_free_pred_list" takes head as Integer returns Integer:
+    Let cursor be head
+    While cursor is not equal to 0:
+        Let next_n be proc memory_get_int64 from Mem with cursor, PRED_OFF_NEXT
+        proc deallocate from Memory with cursor
+        Set cursor to next_n
+    End While
+    Return QB_OK
+End Process
+
+Process called "builder_free_join_list" takes head as Integer returns Integer:
+    Let cursor be head
+    While cursor is not equal to 0:
+        Let next_n be proc memory_get_int64 from Mem with cursor, JOIN_OFF_NEXT
+        proc deallocate from Memory with cursor
+        Set cursor to next_n
+    End While
+    Return QB_OK
+End Process
+
+Process called "builder_free_param_list" takes head as Integer returns Integer:
+    Let cursor be head
+    While cursor is not equal to 0:
+        Let next_n be proc memory_get_int64 from Mem with cursor, PARAM_OFF_NEXT
+        proc deallocate from Memory with cursor
+        Set cursor to next_n
+    End While
+    Return QB_OK
+End Process
+
+Process called "builder_destroy" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return QB_ERR_INVALID
+    End If
+    proc builder_free_string_list with proc memory_get_int64 from Mem with b, QB_OFF_COLUMNS
+    proc builder_free_pred_list with proc memory_get_int64 from Mem with b, QB_OFF_PREDS
+    proc builder_free_join_list with proc memory_get_int64 from Mem with b, QB_OFF_JOINS
+    proc builder_free_string_list with proc memory_get_int64 from Mem with b, QB_OFF_GROUP
+    proc builder_free_pred_list with proc memory_get_int64 from Mem with b, QB_OFF_HAVING
+    proc builder_free_string_list with proc memory_get_int64 from Mem with b, QB_OFF_ORDER
+    proc builder_free_param_list with proc memory_get_int64 from Mem with b, QB_OFF_PARAMS
+    proc deallocate from Memory with b
+    Return QB_OK
+End Process
+
+Process called "builder_kind" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with b, QB_OFF_KIND
+End Process
+
+Process called "builder_dialect" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with b, QB_OFF_DIALECT
+End Process
+
+Note: ============================================================================
+Note: Helpers for linked-list append
+Note: ============================================================================
+
+Process called "qb_append_string" takes head_offset_owner as Integer, head_offset as Integer, text as Integer, text_len as Integer returns Integer:
+    Let node be proc allocate from Memory with STR_STRUCT_SIZE
+    If node is equal to 0:
+        Return QB_ERR_OOM
+    End If
+    proc memory_set_int64 from Mem with node, STR_OFF_TEXT, text
+    proc memory_set_int64 from Mem with node, STR_OFF_LEN, text_len
+    proc memory_set_int64 from Mem with node, STR_OFF_NEXT, 0
+    Let head be proc memory_get_int64 from Mem with head_offset_owner, head_offset
+    If head is equal to 0:
+        proc memory_set_int64 from Mem with head_offset_owner, head_offset, node
+    Otherwise:
+        Let cursor be head
+        While 1 is equal to 1:
+            Let next_n be proc memory_get_int64 from Mem with cursor, STR_OFF_NEXT
+            If next_n is equal to 0:
+                proc memory_set_int64 from Mem with cursor, STR_OFF_NEXT, node
+                Return QB_OK
+            End If
+            Set cursor to next_n
+        End While
+    End If
+    Return QB_OK
+End Process
+
+Process called "qb_append_pred" takes b as Integer, text as Integer, text_len as Integer, combinator as Integer, param_count as Integer returns Integer:
+    Let node be proc allocate from Memory with PRED_STRUCT_SIZE
+    If node is equal to 0:
+        Return QB_ERR_OOM
+    End If
+    proc memory_set_int64 from Mem with node, PRED_OFF_TEXT, text
+    proc memory_set_int64 from Mem with node, PRED_OFF_LEN, text_len
+    proc memory_set_int64 from Mem with node, PRED_OFF_COMB, combinator
+    proc memory_set_int64 from Mem with node, PRED_OFF_PARAMS, param_count
+    proc memory_set_int64 from Mem with node, PRED_OFF_NEXT, 0
+    Let head be proc memory_get_int64 from Mem with b, QB_OFF_PREDS
+    If head is equal to 0:
+        proc memory_set_int64 from Mem with b, QB_OFF_PREDS, node
+    Otherwise:
+        Let cursor be head
+        While 1 is equal to 1:
+            Let next_n be proc memory_get_int64 from Mem with cursor, PRED_OFF_NEXT
+            If next_n is equal to 0:
+                proc memory_set_int64 from Mem with cursor, PRED_OFF_NEXT, node
+                Return QB_OK
+            End If
+            Set cursor to next_n
+        End While
+    End If
+    Return QB_OK
+End Process
+
+Process called "qb_append_param" takes b as Integer, tag as Integer, data as Integer, text_ptr as Integer returns Integer:
+    Let node be proc allocate from Memory with PARAM_STRUCT_SIZE
+    If node is equal to 0:
+        Return QB_ERR_OOM
+    End If
+    proc memory_set_int64 from Mem with node, PARAM_OFF_TAG, tag
+    proc memory_set_int64 from Mem with node, PARAM_OFF_DATA, data
+    proc memory_set_int64 from Mem with node, PARAM_OFF_TEXT, text_ptr
+    proc memory_set_int64 from Mem with node, PARAM_OFF_NEXT, 0
+    Let head be proc memory_get_int64 from Mem with b, QB_OFF_PARAMS
+    If head is equal to 0:
+        proc memory_set_int64 from Mem with b, QB_OFF_PARAMS, node
+    Otherwise:
+        Let cursor be head
+        While 1 is equal to 1:
+            Let next_n be proc memory_get_int64 from Mem with cursor, PARAM_OFF_NEXT
+            If next_n is equal to 0:
+                proc memory_set_int64 from Mem with cursor, PARAM_OFF_NEXT, node
+                Return QB_OK
+            End If
+            Set cursor to next_n
+        End While
+    End If
+    Return QB_OK
+End Process
+
+Process called "builder_param_count" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let cursor be proc memory_get_int64 from Mem with b, QB_OFF_PARAMS
+    Let n be 0
+    While cursor is not equal to 0:
+        Set n to n plus 1
+        Set cursor to proc memory_get_int64 from Mem with cursor, PARAM_OFF_NEXT
+    End While
+    Return n
+End Process
+
+Note: ============================================================================
+Note: Constructors
+Note: ============================================================================
+
+Process called "builder_select" takes dialect as Integer returns Integer:
+    Return proc builder_new with BUILDER_KIND_SELECT, dialect
+End Process
+
+Process called "builder_insert" takes dialect as Integer returns Integer:
+    Return proc builder_new with BUILDER_KIND_INSERT, dialect
+End Process
+
+Process called "builder_update" takes dialect as Integer returns Integer:
+    Return proc builder_new with BUILDER_KIND_UPDATE, dialect
+End Process
+
+Process called "builder_delete" takes dialect as Integer returns Integer:
+    Return proc builder_new with BUILDER_KIND_DELETE, dialect
+End Process
+
+Note: ============================================================================
+Note: Builder mutators
+Note: ============================================================================
+
+Process called "builder_from" takes b as Integer, table_ptr as Integer, table_len as Integer returns Integer:
+    If b is equal to 0:
+        Return QB_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with b, QB_OFF_TABLE, table_ptr
+    proc memory_set_int64 from Mem with b, QB_OFF_TABLE_LEN, table_len
+    Return QB_OK
+End Process
+
+Process called "builder_add_column" takes b as Integer, text as Integer, text_len as Integer returns Integer:
+    If b is equal to 0:
+        Return QB_ERR_INVALID
+    End If
+    Return proc qb_append_string with b, QB_OFF_COLUMNS, text, text_len
+End Process
+
+Process called "builder_where" takes b as Integer, predicate_text as Integer, predicate_len as Integer, param_count as Integer returns Integer:
+    If b is equal to 0:
+        Return QB_ERR_INVALID
+    End If
+    Let head be proc memory_get_int64 from Mem with b, QB_OFF_PREDS
+    Let combinator be PRED_AND
+    If head is equal to 0:
+        Set combinator to PRED_AND
+    End If
+    Return proc qb_append_pred with b, predicate_text, predicate_len, combinator, param_count
+End Process
+
+Process called "builder_and_where" takes b as Integer, predicate_text as Integer, predicate_len as Integer, param_count as Integer returns Integer:
+    Return proc qb_append_pred with b, predicate_text, predicate_len, PRED_AND, param_count
+End Process
+
+Process called "builder_or_where" takes b as Integer, predicate_text as Integer, predicate_len as Integer, param_count as Integer returns Integer:
+    Return proc qb_append_pred with b, predicate_text, predicate_len, PRED_OR, param_count
+End Process
+
+Process called "builder_join" takes b as Integer, kind as Integer, table_ptr as Integer, table_len as Integer, on_clause as Integer, on_len as Integer, param_count as Integer returns Integer:
+    If b is equal to 0:
+        Return QB_ERR_INVALID
+    End If
+    Let node be proc allocate from Memory with JOIN_STRUCT_SIZE
+    If node is equal to 0:
+        Return QB_ERR_OOM
+    End If
+    proc memory_set_int64 from Mem with node, JOIN_OFF_KIND, kind
+    proc memory_set_int64 from Mem with node, JOIN_OFF_TABLE, table_ptr
+    proc memory_set_int64 from Mem with node, JOIN_OFF_TABLE_LEN, table_len
+    proc memory_set_int64 from Mem with node, JOIN_OFF_ON, on_clause
+    proc memory_set_int64 from Mem with node, JOIN_OFF_ON_LEN, on_len
+    proc memory_set_int64 from Mem with node, JOIN_OFF_PARAMS, param_count
+    proc memory_set_int64 from Mem with node, JOIN_OFF_NEXT, 0
+    Let head be proc memory_get_int64 from Mem with b, QB_OFF_JOINS
+    If head is equal to 0:
+        proc memory_set_int64 from Mem with b, QB_OFF_JOINS, node
+    Otherwise:
+        Let cursor be head
+        While 1 is equal to 1:
+            Let next_n be proc memory_get_int64 from Mem with cursor, JOIN_OFF_NEXT
+            If next_n is equal to 0:
+                proc memory_set_int64 from Mem with cursor, JOIN_OFF_NEXT, node
+                Return QB_OK
+            End If
+            Set cursor to next_n
+        End While
+    End If
+    Return QB_OK
+End Process
+
+Process called "builder_group_by" takes b as Integer, text as Integer, text_len as Integer returns Integer:
+    If b is equal to 0:
+        Return QB_ERR_INVALID
+    End If
+    Return proc qb_append_string with b, QB_OFF_GROUP, text, text_len
+End Process
+
+Process called "builder_having" takes b as Integer, text as Integer, text_len as Integer, param_count as Integer returns Integer:
+    If b is equal to 0:
+        Return QB_ERR_INVALID
+    End If
+    Let node be proc allocate from Memory with PRED_STRUCT_SIZE
+    If node is equal to 0:
+        Return QB_ERR_OOM
+    End If
+    proc memory_set_int64 from Mem with node, PRED_OFF_TEXT, text
+    proc memory_set_int64 from Mem with node, PRED_OFF_LEN, text_len
+    proc memory_set_int64 from Mem with node, PRED_OFF_COMB, PRED_AND
+    proc memory_set_int64 from Mem with node, PRED_OFF_PARAMS, param_count
+    proc memory_set_int64 from Mem with node, PRED_OFF_NEXT, 0
+    Let head be proc memory_get_int64 from Mem with b, QB_OFF_HAVING
+    If head is equal to 0:
+        proc memory_set_int64 from Mem with b, QB_OFF_HAVING, node
+    Otherwise:
+        Let cursor be head
+        While 1 is equal to 1:
+            Let next_n be proc memory_get_int64 from Mem with cursor, PRED_OFF_NEXT
+            If next_n is equal to 0:
+                proc memory_set_int64 from Mem with cursor, PRED_OFF_NEXT, node
+                Return QB_OK
+            End If
+            Set cursor to next_n
+        End While
+    End If
+    Return QB_OK
+End Process
+
+Process called "builder_order_by" takes b as Integer, text as Integer, text_len as Integer returns Integer:
+    If b is equal to 0:
+        Return QB_ERR_INVALID
+    End If
+    Return proc qb_append_string with b, QB_OFF_ORDER, text, text_len
+End Process
+
+Process called "builder_limit" takes b as Integer, n as Integer returns Integer:
+    If b is equal to 0:
+        Return QB_ERR_INVALID
+    End If
+    If n is less than 0:
+        proc memory_set_int64 from Mem with b, QB_OFF_LIMIT, -1
+        Return QB_OK
+    End If
+    proc memory_set_int64 from Mem with b, QB_OFF_LIMIT, n
+    Return QB_OK
+End Process
+
+Process called "builder_offset" takes b as Integer, n as Integer returns Integer:
+    If b is equal to 0:
+        Return QB_ERR_INVALID
+    End If
+    If n is less than 0:
+        proc memory_set_int64 from Mem with b, QB_OFF_OFFSET, -1
+        Return QB_OK
+    End If
+    proc memory_set_int64 from Mem with b, QB_OFF_OFFSET, n
+    Return QB_OK
+End Process
+
+Process called "builder_bind_integer" takes b as Integer, value as Integer returns Integer:
+    Return proc qb_append_param with b, PARAM_TAG_INTEGER, value, 0
+End Process
+
+Process called "builder_bind_string" takes b as Integer, value_ptr as Integer, value_len as Integer returns Integer:
+    Return proc qb_append_param with b, PARAM_TAG_STRING, value_len, value_ptr
+End Process
+
+Process called "builder_bind_boolean" takes b as Integer, value as Integer returns Integer:
+    Return proc qb_append_param with b, PARAM_TAG_BOOLEAN, value, 0
+End Process
+
+Process called "builder_bind_null" takes b as Integer returns Integer:
+    Return proc qb_append_param with b, PARAM_TAG_NULL, 0, 0
+End Process
+
+Process called "builder_bind_float_bits" takes b as Integer, bits as Integer returns Integer:
+    Return proc qb_append_param with b, PARAM_TAG_FLOAT, bits, 0
+End Process
+
+Process called "builder_bind_bytes" takes b as Integer, value_ptr as Integer, value_len as Integer returns Integer:
+    Return proc qb_append_param with b, PARAM_TAG_BYTES, value_len, value_ptr
+End Process
+
+Note: ============================================================================
+Note: SQL emission
+Note: ============================================================================
+
+@Reasoning
+Emit a parameterised SQL string. The output buffer is heap-owned by
+the caller; its length is written to out_sql_len_holder.
+
+For Postgres dialect we rewrite '?' placeholders to "$1", "$2", ...
+The MySQL/SQLite dialects keep '?' as-is. The output is otherwise
+identical across dialects.
+
+To keep dependencies minimal we hand-assemble the SQL by appending to a
+growing byte buffer. Strings flowing in are byte-counted, not
+null-terminated.
+@End Reasoning
+
+@Implementation
+Walk the builder's clauses in canonical order and copy bytes into the
+output buffer. Dispatch '?' rewriting through builder_emit_placeholder.
+@End Implementation
+
+@Performance_Hints
+Single pass over each input string; total runtime is linear in the
+size of the emitted SQL.
+@End Performance_Hints
+
+@Security_Scope
+The caller is responsible for the lifetime of any pointers stored in
+the builder.
+@End Security_Scope
+
+Process called "qb_ensure_capacity" takes buffer_holder as Integer, capacity_holder as Integer, length as Integer, additional as Integer returns Integer:
+    Let buf be proc memory_get_int64 from Mem with buffer_holder, 0
+    Let cap be proc memory_get_int64 from Mem with capacity_holder, 0
+    Let required be length plus additional
+    If required is less than or equal to cap:
+        Return QB_OK
+    End If
+    Let new_cap be cap
+    If new_cap is less than 32:
+        Set new_cap to 32
+    End If
+    While new_cap is less than required:
+        Set new_cap to new_cap multiplied by 2
+    End While
+    Let new_buf be proc allocate from Memory with new_cap
+    If new_buf is equal to 0:
+        Return QB_ERR_OOM
+    End If
+    If buf is not equal to 0:
+        proc memory_copy from Mem with new_buf, buf, length
+        proc deallocate from Memory with buf
+    End If
+    proc memory_set_int64 from Mem with buffer_holder, 0, new_buf
+    proc memory_set_int64 from Mem with capacity_holder, 0, new_cap
+    Return QB_OK
+End Process
+
+Process called "qb_append_bytes" takes buffer_holder as Integer, capacity_holder as Integer, length_holder as Integer, src as Integer, src_len as Integer returns Integer:
+    If src_len is less than or equal to 0:
+        Return QB_OK
+    End If
+    Let length be proc memory_get_int64 from Mem with length_holder, 0
+    Let rc be proc qb_ensure_capacity with buffer_holder, capacity_holder, length, src_len
+    If rc is not equal to QB_OK:
+        Return rc
+    End If
+    Let buf be proc memory_get_int64 from Mem with buffer_holder, 0
+    Let dst be buf plus length
+    proc memory_copy from Mem with dst, src, src_len
+    proc memory_set_int64 from Mem with length_holder, 0, (length plus src_len)
+    Return QB_OK
+End Process
+
+Process called "qb_append_byte" takes buffer_holder as Integer, capacity_holder as Integer, length_holder as Integer, byte_value as Integer returns Integer:
+    Let length be proc memory_get_int64 from Mem with length_holder, 0
+    Let rc be proc qb_ensure_capacity with buffer_holder, capacity_holder, length, 1
+    If rc is not equal to QB_OK:
+        Return rc
+    End If
+    Let buf be proc memory_get_int64 from Mem with buffer_holder, 0
+    proc memory_set_byte from Mem with buf, length, byte_value
+    proc memory_set_int64 from Mem with length_holder, 0, (length plus 1)
+    Return QB_OK
+End Process
+
+Process called "qb_append_integer_decimal" takes buffer_holder as Integer, capacity_holder as Integer, length_holder as Integer, value as Integer returns Integer:
+    If value is equal to 0:
+        Return proc qb_append_byte with buffer_holder, capacity_holder, length_holder, 48
+    End If
+    Let n be value
+    Let is_neg be 0
+    If n is less than 0:
+        Set is_neg to 1
+        Set n to 0 minus n
+    End If
+    Let digits be proc allocate from Memory with 24
+    If digits is equal to 0:
+        Return QB_ERR_OOM
+    End If
+    Let count be 0
+    While n is greater than 0:
+        Let digit be n modulo by 10
+        proc memory_set_byte from Mem with digits, count, (48 plus digit)
+        Set count to count plus 1
+        Set n to n divided by 10
+    End While
+    If is_neg is equal to 1:
+        proc qb_append_byte with buffer_holder, capacity_holder, length_holder, 45
+    End If
+    While count is greater than 0:
+        Set count to count minus 1
+        Let b be proc memory_get_byte from Mem with digits, count
+        proc qb_append_byte with buffer_holder, capacity_holder, length_holder, b
+    End While
+    proc deallocate from Memory with digits
+    Return QB_OK
+End Process
+
+Process called "qb_emit_placeholder" takes buffer_holder as Integer, capacity_holder as Integer, length_holder as Integer, dialect as Integer, placeholder_index_holder as Integer returns Integer:
+    Let idx be proc memory_get_int64 from Mem with placeholder_index_holder, 0
+    Set idx to idx plus 1
+    proc memory_set_int64 from Mem with placeholder_index_holder, 0, idx
+    If dialect is equal to DIALECT_POSTGRES:
+        proc qb_append_byte with buffer_holder, capacity_holder, length_holder, 36
+        Return proc qb_append_integer_decimal with buffer_holder, capacity_holder, length_holder, idx
+    End If
+    Return proc qb_append_byte with buffer_holder, capacity_holder, length_holder, 63
+End Process
+
+Process called "qb_append_predicate_text" takes buffer_holder as Integer, capacity_holder as Integer, length_holder as Integer, dialect as Integer, placeholder_index_holder as Integer, text as Integer, text_len as Integer returns Integer:
+    Note: Append the raw predicate text to the rendered SQL buffer, replacing
+    Note: unquoted `?` markers with dialect-specific placeholders ($N for
+    Note: PostgreSQL, ? for MySQL/SQLite). String literals delimited by single
+    Note: quotes are passed through verbatim — a `?` inside `'..'` is part of
+    Note: the literal and must not be rewritten.
+
+    Note: SQL single-quote escaping rule: inside a string literal, a doubled
+    Note: single quote (`''`) is an escaped quote and the literal continues.
+    Note: We model this with a small state machine: outside a literal, a `'`
+    Note: enters literal mode; inside, a `'` either terminates the literal or,
+    Note: when followed immediately by another `'`, emits both bytes and
+    Note: remains in literal mode.
+    Let i be 0
+    Let in_string be 0
+    While i is less than text_len:
+        Let b be proc memory_get_byte from Mem with text, i
+        If in_string is equal to 1:
+            Note: Inside a string literal — copy verbatim, handle '' escape.
+            proc qb_append_byte with buffer_holder, capacity_holder, length_holder, b
+            If b is equal to 39:
+                Let next_i be i plus 1
+                If next_i is less than text_len:
+                    Let next_b be proc memory_get_byte from Mem with text, next_i
+                    If next_b is equal to 39:
+                        Note: Doubled quote — emit the second one and stay in_string.
+                        proc qb_append_byte with buffer_holder, capacity_holder, length_holder, next_b
+                        Set i to next_i
+                    Otherwise:
+                        Note: Single closing quote — leave literal mode.
+                        Set in_string to 0
+                    End If
+                Otherwise:
+                    Note: Closing quote at end of input — leave literal mode.
+                    Set in_string to 0
+                End If
+            End If
+        Otherwise:
+            If b is equal to 39:
+                Note: Opening quote — enter literal mode, emit the quote.
+                Set in_string to 1
+                proc qb_append_byte with buffer_holder, capacity_holder, length_holder, b
+            Otherwise:
+                If b is equal to 63:
+                    proc qb_emit_placeholder with buffer_holder, capacity_holder, length_holder, dialect, placeholder_index_holder
+                Otherwise:
+                    proc qb_append_byte with buffer_holder, capacity_holder, length_holder, b
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return QB_OK
+End Process
+
+Process called "qb_join_keyword" takes kind as Integer returns Integer:
+    If kind is equal to JOIN_LEFT:
+        Return 1
+    End If
+    If kind is equal to JOIN_RIGHT:
+        Return 2
+    End If
+    If kind is equal to JOIN_FULL:
+        Return 3
+    End If
+    Return 0
+End Process
+
+Process called "qb_append_join_keyword" takes buffer_holder as Integer, capacity_holder as Integer, length_holder as Integer, kind as Integer returns Integer:
+    Let kw be proc qb_join_keyword with kind
+    If kw is equal to 1:
+        Let txt be " LEFT JOIN "
+        Return proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, txt, 11
+    End If
+    If kw is equal to 2:
+        Let txt2 be " RIGHT JOIN "
+        Return proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, txt2, 12
+    End If
+    If kw is equal to 3:
+        Let txt3 be " FULL JOIN "
+        Return proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, txt3, 11
+    End If
+    Let txt4 be " INNER JOIN "
+    Return proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, txt4, 12
+End Process
+
+Process called "qb_emit_select" takes b as Integer, dialect as Integer, buffer_holder as Integer, capacity_holder as Integer, length_holder as Integer, placeholder_index_holder as Integer returns Integer:
+    Let select_kw be "SELECT "
+    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, select_kw, 7
+    Let columns be proc memory_get_int64 from Mem with b, QB_OFF_COLUMNS
+    If columns is equal to 0:
+        Let star be "*"
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, star, 1
+    Otherwise:
+        Let first be 1
+        Let cursor be columns
+        While cursor is not equal to 0:
+            If first is equal to 0:
+                Let comma be ", "
+                proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, comma, 2
+            End If
+            Let text be proc memory_get_int64 from Mem with cursor, STR_OFF_TEXT
+            Let text_len be proc memory_get_int64 from Mem with cursor, STR_OFF_LEN
+            proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, text, text_len
+            Set first to 0
+            Set cursor to proc memory_get_int64 from Mem with cursor, STR_OFF_NEXT
+        End While
+    End If
+    Let table_ptr be proc memory_get_int64 from Mem with b, QB_OFF_TABLE
+    Let table_len be proc memory_get_int64 from Mem with b, QB_OFF_TABLE_LEN
+    If table_ptr is not equal to 0:
+        Let from_kw be " FROM "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, from_kw, 6
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, table_ptr, table_len
+    End If
+
+    Let join_cursor be proc memory_get_int64 from Mem with b, QB_OFF_JOINS
+    While join_cursor is not equal to 0:
+        Let kind be proc memory_get_int64 from Mem with join_cursor, JOIN_OFF_KIND
+        proc qb_append_join_keyword with buffer_holder, capacity_holder, length_holder, kind
+        Let jt be proc memory_get_int64 from Mem with join_cursor, JOIN_OFF_TABLE
+        Let jt_len be proc memory_get_int64 from Mem with join_cursor, JOIN_OFF_TABLE_LEN
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, jt, jt_len
+        Let on_kw be " ON "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, on_kw, 4
+        Let on_clause be proc memory_get_int64 from Mem with join_cursor, JOIN_OFF_ON
+        Let on_len be proc memory_get_int64 from Mem with join_cursor, JOIN_OFF_ON_LEN
+        proc qb_append_predicate_text with buffer_holder, capacity_holder, length_holder, dialect, placeholder_index_holder, on_clause, on_len
+        Set join_cursor to proc memory_get_int64 from Mem with join_cursor, JOIN_OFF_NEXT
+    End While
+
+    Let preds be proc memory_get_int64 from Mem with b, QB_OFF_PREDS
+    If preds is not equal to 0:
+        Let where_kw be " WHERE "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, where_kw, 7
+        Let cursor2 be preds
+        Let first2 be 1
+        While cursor2 is not equal to 0:
+            If first2 is equal to 0:
+                Let comb be proc memory_get_int64 from Mem with cursor2, PRED_OFF_COMB
+                If comb is equal to PRED_OR:
+                    Let or_kw be " OR "
+                    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, or_kw, 4
+                Otherwise:
+                    Let and_kw be " AND "
+                    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, and_kw, 5
+                End If
+            End If
+            Let text be proc memory_get_int64 from Mem with cursor2, PRED_OFF_TEXT
+            Let text_len be proc memory_get_int64 from Mem with cursor2, PRED_OFF_LEN
+            proc qb_append_predicate_text with buffer_holder, capacity_holder, length_holder, dialect, placeholder_index_holder, text, text_len
+            Set first2 to 0
+            Set cursor2 to proc memory_get_int64 from Mem with cursor2, PRED_OFF_NEXT
+        End While
+    End If
+
+    Let group_head be proc memory_get_int64 from Mem with b, QB_OFF_GROUP
+    If group_head is not equal to 0:
+        Let group_kw be " GROUP BY "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, group_kw, 10
+        Let cursor3 be group_head
+        Let first3 be 1
+        While cursor3 is not equal to 0:
+            If first3 is equal to 0:
+                Let comma2 be ", "
+                proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, comma2, 2
+            End If
+            Let text2 be proc memory_get_int64 from Mem with cursor3, STR_OFF_TEXT
+            Let text_len2 be proc memory_get_int64 from Mem with cursor3, STR_OFF_LEN
+            proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, text2, text_len2
+            Set first3 to 0
+            Set cursor3 to proc memory_get_int64 from Mem with cursor3, STR_OFF_NEXT
+        End While
+    End If
+
+    Let having_head be proc memory_get_int64 from Mem with b, QB_OFF_HAVING
+    If having_head is not equal to 0:
+        Let having_kw be " HAVING "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, having_kw, 8
+        Let cursor4 be having_head
+        Let first4 be 1
+        While cursor4 is not equal to 0:
+            If first4 is equal to 0:
+                Let and_kw2 be " AND "
+                proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, and_kw2, 5
+            End If
+            Let text3 be proc memory_get_int64 from Mem with cursor4, PRED_OFF_TEXT
+            Let text_len3 be proc memory_get_int64 from Mem with cursor4, PRED_OFF_LEN
+            proc qb_append_predicate_text with buffer_holder, capacity_holder, length_holder, dialect, placeholder_index_holder, text3, text_len3
+            Set first4 to 0
+            Set cursor4 to proc memory_get_int64 from Mem with cursor4, PRED_OFF_NEXT
+        End While
+    End If
+
+    Let order_head be proc memory_get_int64 from Mem with b, QB_OFF_ORDER
+    If order_head is not equal to 0:
+        Let order_kw be " ORDER BY "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, order_kw, 10
+        Let cursor5 be order_head
+        Let first5 be 1
+        While cursor5 is not equal to 0:
+            If first5 is equal to 0:
+                Let comma3 be ", "
+                proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, comma3, 2
+            End If
+            Let text4 be proc memory_get_int64 from Mem with cursor5, STR_OFF_TEXT
+            Let text_len4 be proc memory_get_int64 from Mem with cursor5, STR_OFF_LEN
+            proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, text4, text_len4
+            Set first5 to 0
+            Set cursor5 to proc memory_get_int64 from Mem with cursor5, STR_OFF_NEXT
+        End While
+    End If
+
+    Let limit be proc memory_get_int64 from Mem with b, QB_OFF_LIMIT
+    If limit is greater than or equal to 0:
+        Let limit_kw be " LIMIT "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, limit_kw, 7
+        proc qb_append_integer_decimal with buffer_holder, capacity_holder, length_holder, limit
+    End If
+    Let offset be proc memory_get_int64 from Mem with b, QB_OFF_OFFSET
+    If offset is greater than or equal to 0:
+        Let offset_kw be " OFFSET "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, offset_kw, 8
+        proc qb_append_integer_decimal with buffer_holder, capacity_holder, length_holder, offset
+    End If
+    Return QB_OK
+End Process
+
+Process called "qb_emit_insert" takes b as Integer, dialect as Integer, buffer_holder as Integer, capacity_holder as Integer, length_holder as Integer, placeholder_index_holder as Integer returns Integer:
+    Let insert_kw be "INSERT INTO "
+    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, insert_kw, 12
+    Let table_ptr be proc memory_get_int64 from Mem with b, QB_OFF_TABLE
+    Let table_len be proc memory_get_int64 from Mem with b, QB_OFF_TABLE_LEN
+    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, table_ptr, table_len
+    Let columns be proc memory_get_int64 from Mem with b, QB_OFF_COLUMNS
+    Let column_count be 0
+    Let cursor be columns
+    If cursor is not equal to 0:
+        Let open_paren be " ("
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, open_paren, 2
+        Let first be 1
+        While cursor is not equal to 0:
+            If first is equal to 0:
+                Let comma be ", "
+                proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, comma, 2
+            End If
+            Let text be proc memory_get_int64 from Mem with cursor, STR_OFF_TEXT
+            Let text_len be proc memory_get_int64 from Mem with cursor, STR_OFF_LEN
+            proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, text, text_len
+            Set first to 0
+            Set column_count to column_count plus 1
+            Set cursor to proc memory_get_int64 from Mem with cursor, STR_OFF_NEXT
+        End While
+        Let close_paren be ")"
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, close_paren, 1
+    End If
+    Let values_kw be " VALUES ("
+    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, values_kw, 9
+    Let n be column_count
+    If n is equal to 0:
+        Note: Allow inserting based on bound parameter count if no columns named.
+        Set n to proc builder_param_count with b
+    End If
+    Let i be 0
+    While i is less than n:
+        If i is greater than 0:
+            Let comma2 be ", "
+            proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, comma2, 2
+        End If
+        proc qb_emit_placeholder with buffer_holder, capacity_holder, length_holder, dialect, placeholder_index_holder
+        Set i to i plus 1
+    End While
+    Let close_paren2 be ")"
+    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, close_paren2, 1
+    Return QB_OK
+End Process
+
+Process called "qb_emit_update" takes b as Integer, dialect as Integer, buffer_holder as Integer, capacity_holder as Integer, length_holder as Integer, placeholder_index_holder as Integer returns Integer:
+    Let update_kw be "UPDATE "
+    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, update_kw, 7
+    Let table_ptr be proc memory_get_int64 from Mem with b, QB_OFF_TABLE
+    Let table_len be proc memory_get_int64 from Mem with b, QB_OFF_TABLE_LEN
+    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, table_ptr, table_len
+    Let set_kw be " SET "
+    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, set_kw, 5
+    Let columns be proc memory_get_int64 from Mem with b, QB_OFF_COLUMNS
+    Let cursor be columns
+    Let first be 1
+    While cursor is not equal to 0:
+        If first is equal to 0:
+            Let comma be ", "
+            proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, comma, 2
+        End If
+        Let text be proc memory_get_int64 from Mem with cursor, STR_OFF_TEXT
+        Let text_len be proc memory_get_int64 from Mem with cursor, STR_OFF_LEN
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, text, text_len
+        Let equals be " = "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, equals, 3
+        proc qb_emit_placeholder with buffer_holder, capacity_holder, length_holder, dialect, placeholder_index_holder
+        Set first to 0
+        Set cursor to proc memory_get_int64 from Mem with cursor, STR_OFF_NEXT
+    End While
+    Let preds be proc memory_get_int64 from Mem with b, QB_OFF_PREDS
+    If preds is not equal to 0:
+        Let where_kw be " WHERE "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, where_kw, 7
+        Let cursor2 be preds
+        Let first2 be 1
+        While cursor2 is not equal to 0:
+            If first2 is equal to 0:
+                Let comb be proc memory_get_int64 from Mem with cursor2, PRED_OFF_COMB
+                If comb is equal to PRED_OR:
+                    Let or_kw be " OR "
+                    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, or_kw, 4
+                Otherwise:
+                    Let and_kw be " AND "
+                    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, and_kw, 5
+                End If
+            End If
+            Let text2 be proc memory_get_int64 from Mem with cursor2, PRED_OFF_TEXT
+            Let text_len2 be proc memory_get_int64 from Mem with cursor2, PRED_OFF_LEN
+            proc qb_append_predicate_text with buffer_holder, capacity_holder, length_holder, dialect, placeholder_index_holder, text2, text_len2
+            Set first2 to 0
+            Set cursor2 to proc memory_get_int64 from Mem with cursor2, PRED_OFF_NEXT
+        End While
+    End If
+    Return QB_OK
+End Process
+
+Process called "qb_emit_delete" takes b as Integer, dialect as Integer, buffer_holder as Integer, capacity_holder as Integer, length_holder as Integer, placeholder_index_holder as Integer returns Integer:
+    Let delete_kw be "DELETE FROM "
+    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, delete_kw, 12
+    Let table_ptr be proc memory_get_int64 from Mem with b, QB_OFF_TABLE
+    Let table_len be proc memory_get_int64 from Mem with b, QB_OFF_TABLE_LEN
+    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, table_ptr, table_len
+    Let preds be proc memory_get_int64 from Mem with b, QB_OFF_PREDS
+    If preds is not equal to 0:
+        Let where_kw be " WHERE "
+        proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, where_kw, 7
+        Let cursor be preds
+        Let first be 1
+        While cursor is not equal to 0:
+            If first is equal to 0:
+                Let comb be proc memory_get_int64 from Mem with cursor, PRED_OFF_COMB
+                If comb is equal to PRED_OR:
+                    Let or_kw be " OR "
+                    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, or_kw, 4
+                Otherwise:
+                    Let and_kw be " AND "
+                    proc qb_append_bytes with buffer_holder, capacity_holder, length_holder, and_kw, 5
+                End If
+            End If
+            Let text be proc memory_get_int64 from Mem with cursor, PRED_OFF_TEXT
+            Let text_len be proc memory_get_int64 from Mem with cursor, PRED_OFF_LEN
+            proc qb_append_predicate_text with buffer_holder, capacity_holder, length_holder, dialect, placeholder_index_holder, text, text_len
+            Set first to 0
+            Set cursor to proc memory_get_int64 from Mem with cursor, PRED_OFF_NEXT
+        End While
+    End If
+    Return QB_OK
+End Process
+
+Process called "builder_to_sql" takes b as Integer, out_sql_len_holder as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let dialect be proc memory_get_int64 from Mem with b, QB_OFF_DIALECT
+    Let kind be proc memory_get_int64 from Mem with b, QB_OFF_KIND
+
+    Let buffer_holder be proc allocate from Memory with 8
+    If buffer_holder is equal to 0:
+        Return 0
+    End If
+    Let capacity_holder be proc allocate from Memory with 8
+    If capacity_holder is equal to 0:
+        proc deallocate from Memory with buffer_holder
+        Return 0
+    End If
+    Let length_holder be proc allocate from Memory with 8
+    If length_holder is equal to 0:
+        proc deallocate from Memory with capacity_holder
+        proc deallocate from Memory with buffer_holder
+        Return 0
+    End If
+    Let placeholder_index_holder be proc allocate from Memory with 8
+    If placeholder_index_holder is equal to 0:
+        proc deallocate from Memory with length_holder
+        proc deallocate from Memory with capacity_holder
+        proc deallocate from Memory with buffer_holder
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with buffer_holder, 0, 0
+    proc memory_set_int64 from Mem with capacity_holder, 0, 0
+    proc memory_set_int64 from Mem with length_holder, 0, 0
+    proc memory_set_int64 from Mem with placeholder_index_holder, 0, 0
+
+    If kind is equal to BUILDER_KIND_SELECT:
+        proc qb_emit_select with b, dialect, buffer_holder, capacity_holder, length_holder, placeholder_index_holder
+    End If
+    If kind is equal to BUILDER_KIND_INSERT:
+        proc qb_emit_insert with b, dialect, buffer_holder, capacity_holder, length_holder, placeholder_index_holder
+    End If
+    If kind is equal to BUILDER_KIND_UPDATE:
+        proc qb_emit_update with b, dialect, buffer_holder, capacity_holder, length_holder, placeholder_index_holder
+    End If
+    If kind is equal to BUILDER_KIND_DELETE:
+        proc qb_emit_delete with b, dialect, buffer_holder, capacity_holder, length_holder, placeholder_index_holder
+    End If
+
+    Let buf be proc memory_get_int64 from Mem with buffer_holder, 0
+    Let length be proc memory_get_int64 from Mem with length_holder, 0
+    If out_sql_len_holder is not equal to 0:
+        proc memory_set_int64 from Mem with out_sql_len_holder, 0, length
+    End If
+    proc deallocate from Memory with placeholder_index_holder
+    proc deallocate from Memory with length_holder
+    proc deallocate from Memory with capacity_holder
+    proc deallocate from Memory with buffer_holder
+    Return buf
+End Process
+
+Process called "builder_first_param" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with b, QB_OFF_PARAMS
+End Process
+
+Process called "builder_next_param" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with p, PARAM_OFF_NEXT
+End Process
+
+Process called "builder_param_tag" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return PARAM_TAG_NULL
+    End If
+    Return proc memory_get_int64 from Mem with p, PARAM_OFF_TAG
+End Process
+
+Process called "builder_param_data" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with p, PARAM_OFF_DATA
+End Process
+
+Process called "builder_param_text" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with p, PARAM_OFF_TEXT
+End Process

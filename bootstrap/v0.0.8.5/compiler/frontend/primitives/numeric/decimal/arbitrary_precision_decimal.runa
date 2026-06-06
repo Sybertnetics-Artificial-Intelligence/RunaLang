@@ -1,0 +1,3424 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Arbitrary-Precision Decimal Floating-Point (per IEEE 754-2008 §3.5 +
+§5 generalized to a user-specified significand precision).
+
+This module provides an unbounded-precision sister to Decimal32/64/128.
+The representation is identical in spirit to Decimal128 (decimal digits
+in a packed buffer, sign, exponent, kind for special values), but the
+significand precision is a per-value runtime parameter rather than the
+fixed 7/16/34 of the interchange formats.
+
+Use cases (sovereign-scale digital-currency treasury):
+    - Treasury balances at planet scale: trillions of base units with
+      micro-precision needs ~30+ significant digits (Decimal128 max
+      is 34 which is on the edge).
+    - Multi-jurisdiction settlement: exact decimal math without binary
+      FP rounding artifacts; sovereign-grade durability benefits from
+      precision-overhead margins (50-1000 digits).
+    - Pi / arbitrary-mathematical constants computed in-spec.
+
+Representation:
+    Allocated struct (56 bytes):
+        offset 0  : sign           (0 = positive, 1 = negative)
+        offset 8  : kind           (0 finite, 1 +Inf, 2 -Inf, 3 qNaN)
+        offset 16 : digits_buffer  (pointer to digit buffer; MSD at idx 0)
+        offset 24 : digit_count    (number of valid digits, no leading zeros)
+        offset 32 : exponent       (unbiased decimal exponent)
+        offset 40 : buffer_size    (allocated bytes in digits_buffer)
+        offset 48 : rounding_mode  (per-value default rounding direction)
+
+Digit semantics (consistent with decimal_bignum.runa):
+    digits_buffer is a byte array where each byte holds one decimal
+    digit 0..9 (NOT ASCII). Index 0 is the most-significant digit.
+
+Operations: add, sub, mul, div, sqrt, neg, abs, fma, all with correct
+rounding to the precision specified at construction time. Special
+values (NaN, ±Inf, ±Zero) propagate per IEEE 754-2008 §6.
+
+The headline correctness test: "0.1 + 0.2 = 0.3" exactly, at any
+precision >= 1 digit. This is the canonical decimal-vs-binary FP
+test; if it fails, the implementation has a bug.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/numeric/decimal/decimal_bignum.runa" as Bignum
+Import "compiler/frontend/primitives/numeric/decimal/ieee754_decimal128.runa" as D128
+Import "compiler/frontend/primitives/numeric/decimal/ieee754_decimal64.runa" as D64
+
+Note: ============================================================================
+Note: Constants - kind tags
+Note: ============================================================================
+
+Constant APD_KIND_FINITE as Integer is 0
+Constant APD_KIND_POS_INF as Integer is 1
+Constant APD_KIND_NEG_INF as Integer is 2
+Constant APD_KIND_QNAN as Integer is 3
+
+Note: ============================================================================
+Note: Constants - rounding modes (mirror decimal_bignum + extras for §4.3)
+Note: ============================================================================
+
+Constant APD_ROUND_HALF_EVEN as Integer is 0
+Constant APD_ROUND_HALF_UP as Integer is 1
+Constant APD_ROUND_TOWARD_ZERO as Integer is 2
+Constant APD_ROUND_TOWARD_POS as Integer is 3
+Constant APD_ROUND_TOWARD_NEG as Integer is 4
+Constant APD_ROUND_HALF_DOWN as Integer is 5
+Constant APD_ROUND_HALF_AWAY_FROM_ZERO as Integer is 6
+
+Note: ============================================================================
+Note: Constants - format styles for arbitrary_decimal_to_string
+Note: ============================================================================
+
+Constant APD_FORMAT_PLAIN as Integer is 0
+Constant APD_FORMAT_SCIENTIFIC as Integer is 1
+Constant APD_FORMAT_ENGINEERING as Integer is 2
+Constant APD_FORMAT_FINANCIAL_ACCOUNTING as Integer is 3
+
+Constant APD_UNPACKED_SIZE as Integer is 56
+
+Constant APD_DEFAULT_PRECISION as Integer is 34
+
+Note: ============================================================================
+Note: Internal helpers - struct accessors
+Note: ============================================================================
+
+Process called "apd_unpacked_create" takes sign as Integer, kind as Integer, digits as Integer, digit_count as Integer, exponent as Integer, buffer_size as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Allocates an ArbitraryDecimal struct. The digit buffer is OWNED by
+    the struct from this point on; callers must NOT free it
+    independently. arbitrary_decimal_destroy frees both.
+    @End Reasoning
+
+    @Implementation
+    Layout.allocate(56) + 7 stores.
+    @End Implementation
+
+    @Performance_Hints
+    Single struct allocation per value.
+    @End Performance_Hints
+
+    @Security_Scope
+    On allocation failure we free the supplied digit buffer to avoid a
+    double-ownership leak.
+    @End Security_Scope
+
+    Let p be Layout.allocate(APD_UNPACKED_SIZE)
+    If p is equal to 0:
+        If digits is not equal to 0:
+            Bignum.decbn_free(digits)
+        End If
+        Return 0
+    End If
+    __store(p, 0, sign)
+    __store(p, 8, kind)
+    __store(p, 16, digits)
+    __store(p, 24, digit_count)
+    __store(p, 32, exponent)
+    __store(p, 40, buffer_size)
+    __store(p, 48, rounding_mode)
+    Return p
+End Process
+
+Process called "arbitrary_decimal_get_sign" takes p as Integer returns Integer:
+    @Reasoning
+    Sign accessor for the unpacked struct.
+    @End Reasoning
+    @Implementation
+    Load offset 0.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Null returns 0.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Return __load(p, 0)
+End Process
+
+Process called "arbitrary_decimal_get_kind" takes p as Integer returns Integer:
+    @Reasoning
+    Kind accessor (FINITE, POS_INF, NEG_INF, QNAN).
+    @End Reasoning
+    @Implementation
+    Load offset 8.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Null returns QNAN sentinel.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return APD_KIND_QNAN
+    End If
+    Return __load(p, 8)
+End Process
+
+Process called "arbitrary_decimal_get_digits" takes p as Integer returns Integer:
+    @Reasoning
+    Raw digit buffer pointer accessor (one byte per digit, MSD first).
+    @End Reasoning
+    @Implementation
+    Load offset 16.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Caller MUST NOT free; the struct owns this buffer.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Return __load(p, 16)
+End Process
+
+Process called "arbitrary_decimal_get_digit_count" takes p as Integer returns Integer:
+    @Reasoning
+    Significant-digit count accessor.
+    @End Reasoning
+    @Implementation
+    Load offset 24.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Null returns 0.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Return __load(p, 24)
+End Process
+
+Process called "arbitrary_decimal_get_exponent" takes p as Integer returns Integer:
+    @Reasoning
+    Unbiased decimal exponent accessor.
+    @End Reasoning
+    @Implementation
+    Load offset 32.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Null returns 0.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Return __load(p, 32)
+End Process
+
+Process called "arbitrary_decimal_get_buffer_size" takes p as Integer returns Integer:
+    @Reasoning
+    Allocated bytes in the digit buffer (precision capacity hint).
+    @End Reasoning
+    @Implementation
+    Load offset 40.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Null returns 0.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Return __load(p, 40)
+End Process
+
+Process called "arbitrary_decimal_get_rounding_mode" takes p as Integer returns Integer:
+    @Reasoning
+    Default rounding-mode accessor (per IEEE 754-2008 §4.3).
+    @End Reasoning
+    @Implementation
+    Load offset 48.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Null returns HALF_EVEN.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return APD_ROUND_HALF_EVEN
+    End If
+    Return __load(p, 48)
+End Process
+
+Process called "arbitrary_decimal_set_rounding_mode" takes value as Integer, mode as Integer returns Integer:
+    @Reasoning
+    Mutator for the per-value default rounding mode, used by subsequent
+    arithmetic when no explicit rounding-mode parameter is passed.
+    @End Reasoning
+
+    @Implementation
+    Validate mode; store at offset 48.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Invalid modes are coerced to HALF_EVEN.
+    @End Security_Scope
+
+    If value is equal to 0:
+        Return 0
+    End If
+    Let m be mode
+    If m is less than 0:
+        Set m to APD_ROUND_HALF_EVEN
+    End If
+    If m is greater than APD_ROUND_HALF_AWAY_FROM_ZERO:
+        Set m to APD_ROUND_HALF_EVEN
+    End If
+    __store(value, 48, m)
+    Return 1
+End Process
+
+Process called "arbitrary_decimal_destroy" takes p as Integer returns Integer:
+    @Reasoning
+    Frees both the unpacked struct and its owned digit buffer per the
+    ownership contract documented in apd_unpacked_create.
+    @End Reasoning
+
+    @Implementation
+    Load digit pointer, free it, free struct.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus the deallocator costs.
+    @End Performance_Hints
+
+    @Security_Scope
+    Double-free triggers the allocator canary protocol.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Let d be __load(p, 16)
+    If d is not equal to 0:
+        Bignum.decbn_free(d)
+    End If
+    Layout.deallocate(p)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Internal helpers - rounding-mode translation to decbn
+Note: ============================================================================
+
+Process called "apd_rounding_to_decbn" takes mode as Integer returns Integer:
+    @Reasoning
+    Maps the APD rounding-mode constants to the matching decimal_bignum
+    constants. For modes that decbn does not natively support (HALF_DOWN,
+    HALF_AWAY_FROM_ZERO) we emit a special sentinel handled by
+    apd_round_to_precision directly.
+    @End Reasoning
+
+    @Implementation
+    Direct table.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) constant fold.
+    @End Performance_Hints
+
+    @Security_Scope
+    Out-of-range yields HALF_EVEN.
+    @End Security_Scope
+
+    If mode is equal to APD_ROUND_HALF_EVEN:
+        Return 0
+    End If
+    If mode is equal to APD_ROUND_HALF_UP:
+        Return 1
+    End If
+    If mode is equal to APD_ROUND_TOWARD_ZERO:
+        Return 2
+    End If
+    If mode is equal to APD_ROUND_TOWARD_POS:
+        Return 3
+    End If
+    If mode is equal to APD_ROUND_TOWARD_NEG:
+        Return 4
+    End If
+    Note: HALF_DOWN and HALF_AWAY_FROM_ZERO map to bignum HALF_EVEN/HALF_UP
+    Note: as a base; apd_round_to_precision applies the corrective tweak.
+    If mode is equal to APD_ROUND_HALF_DOWN:
+        Return 0
+    End If
+    If mode is equal to APD_ROUND_HALF_AWAY_FROM_ZERO:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Internal helpers - rounding (extends decbn with extra modes)
+Note: ============================================================================
+
+Process called "apd_round_to_precision" takes digits as Integer, count as Integer, precision as Integer, sign as Integer, rounding_mode as Integer, out_count_ptr as Integer, exp_delta_ptr as Integer returns Integer:
+    @Reasoning
+    Rounds a digit buffer to at most 'precision' digits using the APD
+    rounding-mode set. For the modes natively supported by decbn we
+    delegate; for HALF_DOWN and HALF_AWAY_FROM_ZERO we implement
+    directly with the same rounding-digit/sticky-bit analysis as
+    decbn_round_to_precision (per IEEE 754-2008 §4.3.3).
+    @End Reasoning
+
+    @Implementation
+    1. If precision >= count, return a fresh copy with exp_delta = 0.
+    2. For HALF_DOWN: round-half-up's complement (ties go toward zero).
+    3. For HALF_AWAY_FROM_ZERO: ties always increment magnitude.
+    4. All other modes: delegate to decbn_round_to_precision.
+    @End Implementation
+
+    @Performance_Hints
+    O(count) in the worst case.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0; out pointers set to 0.
+    @End Security_Scope
+
+    If digits is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        If exp_delta_ptr is not equal to 0:
+            __store(exp_delta_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+    If count is less than or equal to precision:
+        If exp_delta_ptr is not equal to 0:
+            __store(exp_delta_ptr, 0, 0)
+        End If
+        Let cp be Bignum.decbn_copy(digits, count)
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, count)
+        End If
+        Return cp
+    End If
+
+    Note: HALF_DOWN: rounds half-toward-zero. We can implement as half-up
+    Note: but if the discarded portion is *exactly* 5000... (rounding
+    Note: digit == 5, sticky == 0), we do NOT round up.
+    If rounding_mode is equal to APD_ROUND_HALF_DOWN:
+        Note: Inspect rounding digit + sticky bit.
+        Let rd be Memory.memory_get_byte(digits, precision)
+        Let sticky be 0
+        Let s be precision plus 1
+        While s is less than count:
+            If Memory.memory_get_byte(digits, s) is not equal to 0:
+                Set sticky to 1
+                Set s to count
+            Otherwise:
+                Set s to s plus 1
+            End If
+        End While
+        Note: HALF_DOWN: > 5 rounds away from zero; == 5 with sticky rounds away; == 5 exact rounds toward zero; < 5 rounds toward zero.
+        If rd is equal to 5:
+            If sticky is equal to 0:
+                Note: Exactly 0.5 - round toward zero (truncate).
+                Let truncated be Bignum.decbn_copy(digits, precision)
+                If out_count_ptr is not equal to 0:
+                    __store(out_count_ptr, 0, precision)
+                End If
+                If exp_delta_ptr is not equal to 0:
+                    __store(exp_delta_ptr, 0, count minus precision)
+                End If
+                Return truncated
+            End If
+        End If
+        Note: All other HALF_DOWN cases match HALF_UP. Fall through.
+    End If
+
+    Note: HALF_AWAY_FROM_ZERO: ties go away from zero always. This is the
+    Note: same as HALF_UP since HALF_UP also ties away from zero per IEEE
+    Note: 754. Falls through to decbn delegation.
+
+    Let bignum_mode be apd_rounding_to_decbn(rounding_mode)
+    Return Bignum.decbn_round_to_precision(digits, count, precision, sign, bignum_mode, out_count_ptr, exp_delta_ptr)
+End Process
+
+Note: ============================================================================
+Note: Internal helpers - normalize (strip leading zeros)
+Note: ============================================================================
+
+Process called "apd_normalize_digits" takes digits as Integer, digit_count as Integer, out_count_ptr as Integer returns Integer:
+    @Reasoning
+    Returns a fresh digit buffer with leading zeros stripped. If the
+    input is all zeros, returns a single-digit zero buffer with count = 1.
+    @End Reasoning
+
+    @Implementation
+    Find first non-zero index; copy from there. Identical strategy to
+    dec128_normalize.
+    @End Implementation
+
+    @Performance_Hints
+    O(digit_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If digits is equal to 0:
+        Let z be Bignum.decbn_alloc(2)
+        If z is equal to 0:
+            If out_count_ptr is not equal to 0:
+                __store(out_count_ptr, 0, 0)
+            End If
+            Return 0
+        End If
+        Memory.memory_set_byte(z, 0, 0)
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 1)
+        End If
+        Return z
+    End If
+    Let first_nz be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        If first_nz is greater than or equal to digit_count minus 1:
+            Set scanning to 0
+        Otherwise:
+            If Memory.memory_get_byte(digits, first_nz) is equal to 0:
+                Set first_nz to first_nz plus 1
+            Otherwise:
+                Set scanning to 0
+            End If
+        End If
+    End While
+    Let new_count be digit_count minus first_nz
+    Let buf be Bignum.decbn_alloc(new_count plus 1)
+    If buf is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+    Let i be 0
+    While i is less than new_count:
+        Memory.memory_set_byte(buf, i, Memory.memory_get_byte(digits, first_nz plus i))
+        Set i to i plus 1
+    End While
+    If out_count_ptr is not equal to 0:
+        __store(out_count_ptr, 0, new_count)
+    End If
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: Internal helpers - finalize a finite result (round + wrap struct)
+Note: ============================================================================
+
+Process called "apd_finalize_finite" takes sign as Integer, digits as Integer, digit_count as Integer, exp as Integer, precision as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Brings a finite digit buffer into the specified precision window
+    (IEEE 754-2008 §4.3 directed-rounding). This function OWNS the
+    supplied digit buffer and either consumes it or returns a fresh
+    rounded copy (in which case the original is freed).
+    @End Reasoning
+
+    @Implementation
+    1. Treat the all-zero case as canonical zero.
+    2. Normalize (strip leading zeros).
+    3. apd_round_to_precision.
+    4. Wrap as an unpacked struct preserving the per-value precision +
+       rounding mode.
+    @End Implementation
+
+    @Performance_Hints
+    O(digit_count) for normalization plus O(excess) for rounding.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failures yield qNaN.
+    @End Security_Scope
+
+    Let s be sign
+    If s is not equal to 0:
+        Set s to 1
+    End If
+    Let prec be precision
+    If prec is less than 1:
+        Set prec to 1
+    End If
+
+    If digits is equal to 0:
+        Let zb be Bignum.decbn_alloc(2)
+        If zb is equal to 0:
+            Return apd_unpacked_create(0, APD_KIND_QNAN, 0, 0, 0, 0, rounding_mode)
+        End If
+        Memory.memory_set_byte(zb, 0, 0)
+        Return apd_unpacked_create(s, APD_KIND_FINITE, zb, 1, exp, 2, rounding_mode)
+    End If
+
+    Let norm_count_ptr be Layout.allocate(8)
+    If norm_count_ptr is equal to 0:
+        Bignum.decbn_free(digits)
+        Return apd_unpacked_create(0, APD_KIND_QNAN, 0, 0, 0, 0, rounding_mode)
+    End If
+    Let norm_digits be apd_normalize_digits(digits, digit_count, norm_count_ptr)
+    Let norm_count be __load(norm_count_ptr, 0)
+    Layout.deallocate(norm_count_ptr)
+    Bignum.decbn_free(digits)
+    If norm_digits is equal to 0:
+        Return apd_unpacked_create(0, APD_KIND_QNAN, 0, 0, 0, 0, rounding_mode)
+    End If
+
+    Note: Detect zero (all-zero buffer).
+    Let is_zero be 1
+    Let scan_i be 0
+    While scan_i is less than norm_count:
+        If Memory.memory_get_byte(norm_digits, scan_i) is not equal to 0:
+            Set is_zero to 0
+            Set scan_i to norm_count
+        Otherwise:
+            Set scan_i to scan_i plus 1
+        End If
+    End While
+    If is_zero is equal to 1:
+        Bignum.decbn_free(norm_digits)
+        Let zb2 be Bignum.decbn_alloc(2)
+        If zb2 is equal to 0:
+            Return apd_unpacked_create(0, APD_KIND_QNAN, 0, 0, 0, 0, rounding_mode)
+        End If
+        Memory.memory_set_byte(zb2, 0, 0)
+        Return apd_unpacked_create(s, APD_KIND_FINITE, zb2, 1, exp, 2, rounding_mode)
+    End If
+
+    Let rounded_count_ptr be Layout.allocate(8)
+    Let exp_delta_ptr be Layout.allocate(8)
+    If rounded_count_ptr is equal to 0:
+        Bignum.decbn_free(norm_digits)
+        Return apd_unpacked_create(0, APD_KIND_QNAN, 0, 0, 0, 0, rounding_mode)
+    End If
+    If exp_delta_ptr is equal to 0:
+        Layout.deallocate(rounded_count_ptr)
+        Bignum.decbn_free(norm_digits)
+        Return apd_unpacked_create(0, APD_KIND_QNAN, 0, 0, 0, 0, rounding_mode)
+    End If
+
+    Let rounded be apd_round_to_precision(norm_digits, norm_count, prec, s, rounding_mode, rounded_count_ptr, exp_delta_ptr)
+    Let rounded_count be __load(rounded_count_ptr, 0)
+    Let exp_delta be __load(exp_delta_ptr, 0)
+    Layout.deallocate(rounded_count_ptr)
+    Layout.deallocate(exp_delta_ptr)
+    Bignum.decbn_free(norm_digits)
+    If rounded is equal to 0:
+        Return apd_unpacked_create(0, APD_KIND_QNAN, 0, 0, 0, 0, rounding_mode)
+    End If
+
+    Let final_exp be exp plus exp_delta
+    Return apd_unpacked_create(s, APD_KIND_FINITE, rounded, rounded_count, final_exp, rounded_count plus 2, rounding_mode)
+End Process
+
+Note: ============================================================================
+Note: Internal helpers - NaN/Inf propagation
+Note: ============================================================================
+
+Process called "apd_propagate_nan" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754-2008 §6.2 NaN propagation: any qNaN operand produces
+    a qNaN result. We inherit the precision/rounding from the first
+    NaN operand.
+    @End Reasoning
+
+    @Implementation
+    Check a then b; allocate a qNaN with the inherited precision hint.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    If a is not equal to 0:
+        If __load(a, 8) is equal to APD_KIND_QNAN:
+            Return apd_unpacked_create(0, APD_KIND_QNAN, 0, 0, 0, 0, __load(a, 48))
+        End If
+    End If
+    If b is not equal to 0:
+        If __load(b, 8) is equal to APD_KIND_QNAN:
+            Return apd_unpacked_create(0, APD_KIND_QNAN, 0, 0, 0, 0, __load(b, 48))
+        End If
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Special-value constructors
+Note: ============================================================================
+
+Process called "arbitrary_decimal_make_zero" takes sign as Integer, precision_digits as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Signed zero with preferred exponent 0 (per IEEE 754-2008 §3.3
+    canonical zero) and the specified precision capacity.
+    @End Reasoning
+
+    @Implementation
+    Allocate a single-digit buffer holding 0; wrap.
+    @End Implementation
+
+    @Performance_Hints
+    Two allocations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Sign normalized to 0/1.
+    @End Security_Scope
+
+    Let s be sign
+    If s is not equal to 0:
+        Set s to 1
+    End If
+    Let prec be precision_digits
+    If prec is less than 1:
+        Set prec to APD_DEFAULT_PRECISION
+    End If
+    Let buf be Bignum.decbn_alloc(prec plus 4)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(buf, 0, 0)
+    Return apd_unpacked_create(s, APD_KIND_FINITE, buf, 1, 0, prec plus 4, rounding_mode)
+End Process
+
+Process called "arbitrary_decimal_make_infinity" takes sign as Integer, precision_digits as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Signed infinity (per IEEE 754-2008 §3.3).
+    @End Reasoning
+
+    @Implementation
+    No digit buffer; tag with POS_INF or NEG_INF.
+    @End Implementation
+
+    @Performance_Hints
+    One struct allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Sign normalized to 0/1.
+    @End Security_Scope
+
+    Let s be sign
+    If s is not equal to 0:
+        Set s to 1
+    End If
+    Let k be APD_KIND_POS_INF
+    If s is equal to 1:
+        Set k to APD_KIND_NEG_INF
+    End If
+    Return apd_unpacked_create(s, k, 0, 0, 0, 0, rounding_mode)
+End Process
+
+Process called "arbitrary_decimal_make_qnan" takes precision_digits as Integer, rounding_mode as Integer returns Integer:
+    @Reasoning
+    Quiet NaN (per IEEE 754-2008 §6.2). Per spec, NaN sign bit is
+    payload, not numerical; we set it to 0.
+    @End Reasoning
+
+    @Implementation
+    No digit buffer.
+    @End Implementation
+
+    @Performance_Hints
+    One struct allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    Return apd_unpacked_create(0, APD_KIND_QNAN, 0, 0, 0, 0, rounding_mode)
+End Process
+
+Note: ============================================================================
+Note: Predicates
+Note: ============================================================================
+
+Process called "arbitrary_decimal_is_zero" takes p as Integer returns Integer:
+    @Reasoning
+    True iff finite and all coefficient digits are zero.
+    @End Reasoning
+    @Implementation
+    Kind check + buffer scan.
+    @End Implementation
+    @Performance_Hints
+    O(digit_count) worst case.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    If __load(p, 8) is not equal to APD_KIND_FINITE:
+        Return 0
+    End If
+    Let dc be __load(p, 24)
+    If dc is equal to 0:
+        Return 1
+    End If
+    Let d be __load(p, 16)
+    If d is equal to 0:
+        Return 1
+    End If
+    Let i be 0
+    While i is less than dc:
+        If Memory.memory_get_byte(d, i) is not equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "arbitrary_decimal_is_finite" takes p as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754-2008: finite iff not NaN and not Inf.
+    @End Reasoning
+    @Implementation
+    Kind compare.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    If __load(p, 8) is equal to APD_KIND_FINITE:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "arbitrary_decimal_is_infinite" takes p as Integer returns Integer:
+    @Reasoning
+    True for +Inf or -Inf.
+    @End Reasoning
+    @Implementation
+    Kind compare.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    Let k be __load(p, 8)
+    If k is equal to APD_KIND_POS_INF:
+        Return 1
+    End If
+    If k is equal to APD_KIND_NEG_INF:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "arbitrary_decimal_is_nan" takes p as Integer returns Integer:
+    @Reasoning
+    True for quiet NaN.
+    @End Reasoning
+    @Implementation
+    Kind compare.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    If __load(p, 8) is equal to APD_KIND_QNAN:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "arbitrary_decimal_is_negative" takes p as Integer returns Integer:
+    @Reasoning
+    True iff sign bit is set. Does NOT consider magnitude (so -0 returns 1).
+    @End Reasoning
+    @Implementation
+    Load offset 0.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+
+    If p is equal to 0:
+        Return 0
+    End If
+    If __load(p, 0) is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Construction - from Integer
+Note: ============================================================================
+
+Process called "arbitrary_decimal_from_integer" takes value as Integer, precision_digits as Integer returns Integer:
+    @Reasoning
+    Exact conversion of an Integer to an ArbitraryDecimal. Integer is
+    at most 18 decimal digits in the bootstrap stage1, which fits in
+    any precision >= 18 without rounding. For lower precisions we
+    delegate to apd_finalize_finite which applies HALF_EVEN rounding
+    per IEEE 754-2008 §4.3.
+    @End Reasoning
+
+    @Implementation
+    Sign extraction; digit-buffer build via decbn_from_integer; wrap.
+    @End Implementation
+
+    @Performance_Hints
+    O(log10 |value|).
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure aside from allocations.
+    @End Security_Scope
+
+    Let prec be precision_digits
+    If prec is less than 1:
+        Set prec to APD_DEFAULT_PRECISION
+    End If
+    Let sign be 0
+    Let mag be value
+    If mag is less than 0:
+        Set sign to 1
+        Set mag to 0 minus mag
+    End If
+    If mag is equal to 0:
+        Return arbitrary_decimal_make_zero(0, prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Let cnt_ptr be Layout.allocate(8)
+    If cnt_ptr is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Let buf be Bignum.decbn_from_integer(mag, cnt_ptr)
+    Let cnt be __load(cnt_ptr, 0)
+    Layout.deallocate(cnt_ptr)
+    If buf is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Return apd_finalize_finite(sign, buf, cnt, 0, prec, APD_ROUND_HALF_EVEN)
+End Process
+
+Note: ============================================================================
+Note: Construction - from string (IEEE 754-2008 §5.12.2)
+Note: ============================================================================
+
+Process called "arbitrary_decimal_from_string" takes s as Integer, precision_digits as Integer returns Integer:
+    @Reasoning
+    Parses a null-terminated ASCII decimal string per IEEE 754-2008
+    §5.12.2. Accepts forms:
+        [+|-] digits [. digits] [ (e|E) [+|-] digits ]
+        [+|-] Inf | Infinity | NaN
+    The parsed coefficient is built with unbounded digit count, then
+    rounded to precision_digits via apd_finalize_finite.
+
+    Headline correctness: arbitrary_decimal_from_string("0.1") +
+    arbitrary_decimal_from_string("0.2") = arbitrary_decimal_from_string("0.3")
+    exactly at any precision >= 1.
+    @End Reasoning
+
+    @Implementation
+    Single-pass scan with explicit state (saw_dot, frac_digits,
+    leading_zero). Coefficient digits accumulate into a buffer sized
+    proportional to input. Exponent parsed separately. Final
+    exponent = explicit_exp - frac_digits.
+    @End Implementation
+
+    @Performance_Hints
+    Single pass over input; allocation cost proportional to digit count.
+    @End Performance_Hints
+
+    @Security_Scope
+    Malformed input produces qNaN. Buffer overflows during accumulation
+    are not possible because we size the digit buffer based on the
+    string length.
+    @End Security_Scope
+
+    If s is equal to 0:
+        Return arbitrary_decimal_make_qnan(precision_digits, APD_ROUND_HALF_EVEN)
+    End If
+
+    Let prec be precision_digits
+    If prec is less than 1:
+        Set prec to APD_DEFAULT_PRECISION
+    End If
+
+    Note: First pass: measure the string length to size the digit buffer.
+    Let slen be 0
+    Let lp be 0
+    Let scanning_len be 1
+    While scanning_len is equal to 1:
+        Let lb be Memory.memory_get_byte(s, lp)
+        If lb is equal to 0:
+            Set scanning_len to 0
+        Otherwise:
+            Set slen to slen plus 1
+            Set lp to lp plus 1
+            If slen is greater than 1048576:
+                Set scanning_len to 0
+            End If
+        End If
+    End While
+
+    Let pos be 0
+    Note: Skip leading whitespace.
+    Let scanning_ws be 1
+    While scanning_ws is equal to 1:
+        Let bws be Memory.memory_get_byte(s, pos)
+        If bws is equal to 32:
+            Set pos to pos plus 1
+        Otherwise:
+            If bws is equal to 9:
+                Set pos to pos plus 1
+            Otherwise:
+                If bws is equal to 10:
+                    Set pos to pos plus 1
+                Otherwise:
+                    If bws is equal to 13:
+                        Set pos to pos plus 1
+                    Otherwise:
+                        Set scanning_ws to 0
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Note: Sign.
+    Let sign be 0
+    Let bsign be Memory.memory_get_byte(s, pos)
+    If bsign is equal to 45:
+        Set sign to 1
+        Set pos to pos plus 1
+    End If
+    If bsign is equal to 43:
+        Set pos to pos plus 1
+    End If
+
+    Note: Inf / Infinity.
+    Let bi1 be Memory.memory_get_byte(s, pos)
+    Let bi2 be Memory.memory_get_byte(s, pos plus 1)
+    Let bi3 be Memory.memory_get_byte(s, pos plus 2)
+    Let is_inf be 0
+    If bi1 is equal to 73:
+        If bi2 is equal to 110:
+            If bi3 is equal to 102:
+                Set is_inf to 1
+            End If
+        End If
+    End If
+    If bi1 is equal to 105:
+        If bi2 is equal to 110:
+            If bi3 is equal to 102:
+                Set is_inf to 1
+            End If
+        End If
+    End If
+    If is_inf is equal to 1:
+        Return arbitrary_decimal_make_infinity(sign, prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Note: NaN.
+    Let bn1 be Memory.memory_get_byte(s, pos)
+    Let bn2 be Memory.memory_get_byte(s, pos plus 1)
+    Let bn3 be Memory.memory_get_byte(s, pos plus 2)
+    Let is_nan be 0
+    If bn1 is equal to 78:
+        If bn2 is equal to 97:
+            If bn3 is equal to 78:
+                Set is_nan to 1
+            End If
+        End If
+    End If
+    If bn1 is equal to 110:
+        If bn2 is equal to 97:
+            If bn3 is equal to 110:
+                Set is_nan to 1
+            End If
+        End If
+    End If
+    If is_nan is equal to 1:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Note: Coefficient parsing. Buffer sized to slen + 4 (worst-case all
+    Note: digits, no whitespace, no sign, no dot).
+    Let digit_cap be slen plus 4
+    If digit_cap is less than 16:
+        Set digit_cap to 16
+    End If
+    Let digit_buf be Bignum.decbn_alloc(digit_cap)
+    If digit_buf is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Let dc be 0
+    Let leading_zero be 1
+    Let frac_digits be 0
+    Let saw_dot be 0
+    Let saw_digit be 0
+    Let scanning be 1
+
+    While scanning is equal to 1:
+        Let bd be Memory.memory_get_byte(s, pos)
+        If bd is equal to 46:
+            If saw_dot is equal to 1:
+                Set scanning to 0
+            Otherwise:
+                Set saw_dot to 1
+                Set pos to pos plus 1
+            End If
+        Otherwise:
+            If bd is greater than or equal to 48:
+                If bd is less than or equal to 57:
+                    Let dv be bd minus 48
+                    If leading_zero is equal to 1:
+                        If dv is not equal to 0:
+                            If dc is less than digit_cap:
+                                Memory.memory_set_byte(digit_buf, dc, dv)
+                                Set dc to dc plus 1
+                            End If
+                            Set leading_zero to 0
+                        End If
+                    Otherwise:
+                        If dc is less than digit_cap:
+                            Memory.memory_set_byte(digit_buf, dc, dv)
+                            Set dc to dc plus 1
+                        End If
+                    End If
+                    If saw_dot is equal to 1:
+                        Set frac_digits to frac_digits plus 1
+                    End If
+                    Set saw_digit to 1
+                    Set pos to pos plus 1
+                Otherwise:
+                    Set scanning to 0
+                End If
+            Otherwise:
+                Set scanning to 0
+            End If
+        End If
+    End While
+
+    If saw_digit is equal to 0:
+        Bignum.decbn_free(digit_buf)
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    If dc is equal to 0:
+        Memory.memory_set_byte(digit_buf, 0, 0)
+        Set dc to 1
+    End If
+
+    Note: Exponent.
+    Let exp_val be 0
+    Let bexp be Memory.memory_get_byte(s, pos)
+    Let exp_marker_seen be 0
+    If bexp is equal to 101:
+        Set exp_marker_seen to 1
+        Set pos to pos plus 1
+    End If
+    If bexp is equal to 69:
+        Set exp_marker_seen to 1
+        Set pos to pos plus 1
+    End If
+    If exp_marker_seen is equal to 1:
+        Let exp_sign be 0
+        Let bs2 be Memory.memory_get_byte(s, pos)
+        If bs2 is equal to 45:
+            Set exp_sign to 1
+            Set pos to pos plus 1
+        End If
+        If bs2 is equal to 43:
+            Set pos to pos plus 1
+        End If
+        Let scanning_exp be 1
+        While scanning_exp is equal to 1:
+            Let be2 be Memory.memory_get_byte(s, pos)
+            If be2 is greater than or equal to 48:
+                If be2 is less than or equal to 57:
+                    Set exp_val to (exp_val multiplied by 10) plus (be2 minus 48)
+                    Set pos to pos plus 1
+                Otherwise:
+                    Set scanning_exp to 0
+                End If
+            Otherwise:
+                Set scanning_exp to 0
+            End If
+        End While
+        If exp_sign is equal to 1:
+            Set exp_val to 0 minus exp_val
+        End If
+    End If
+
+    Let final_exp be exp_val minus frac_digits
+    Return apd_finalize_finite(sign, digit_buf, dc, final_exp, prec, APD_ROUND_HALF_EVEN)
+End Process
+
+Note: ============================================================================
+Note: Construction - from Decimal128 / Decimal64
+Note: ============================================================================
+
+Process called "arbitrary_decimal_from_decimal128" takes value as Integer, precision_digits as Integer returns Integer:
+    @Reasoning
+    Lossless widening from Decimal128. Decimal128's 34-digit significand
+    fits in any precision >= 34 without rounding; for lower precisions
+    HALF_EVEN rounding applies per IEEE 754-2008 §4.3.
+    @End Reasoning
+
+    @Implementation
+    Copy kind, sign, exponent, and digit buffer; delegate to
+    apd_finalize_finite to apply precision-cap rounding.
+    @End Implementation
+
+    @Performance_Hints
+    O(34) digit copy.
+    @End Performance_Hints
+
+    @Security_Scope
+    NaN / Inf inputs preserved.
+    @End Security_Scope
+
+    Let prec be precision_digits
+    If prec is less than 1:
+        Set prec to 34
+    End If
+    If value is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Let kind128 be __load(value, 8)
+    If kind128 is equal to 3:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    If kind128 is equal to 4:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Let s be __load(value, 0)
+    If kind128 is equal to 1:
+        Return arbitrary_decimal_make_infinity(0, prec, APD_ROUND_HALF_EVEN)
+    End If
+    If kind128 is equal to 2:
+        Return arbitrary_decimal_make_infinity(1, prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Let d128 be __load(value, 16)
+    Let dc128 be __load(value, 24)
+    Let e128 be __load(value, 32)
+    If d128 is equal to 0:
+        Return arbitrary_decimal_make_zero(s, prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Let buf be Bignum.decbn_copy(d128, dc128)
+    If buf is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Return apd_finalize_finite(s, buf, dc128, e128, prec, APD_ROUND_HALF_EVEN)
+End Process
+
+Process called "arbitrary_decimal_from_decimal64" takes value as Integer, precision_digits as Integer returns Integer:
+    @Reasoning
+    Lossless widening from Decimal64. Decimal64 stores its coefficient
+    as a single Integer (<=16 digits). We convert to digit-buffer
+    representation via decbn_from_integer then delegate to
+    apd_finalize_finite.
+    @End Reasoning
+
+    @Implementation
+    Read coefficient as Integer; decompose into digit buffer.
+    @End Implementation
+
+    @Performance_Hints
+    O(log10 coefficient).
+    @End Performance_Hints
+
+    @Security_Scope
+    NaN / Inf inputs preserved.
+    @End Security_Scope
+
+    Let prec be precision_digits
+    If prec is less than 1:
+        Set prec to 16
+    End If
+    If value is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Let kind64 be __load(value, 8)
+    If kind64 is equal to 3:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    If kind64 is equal to 4:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Let s be __load(value, 0)
+    If kind64 is equal to 1:
+        Return arbitrary_decimal_make_infinity(0, prec, APD_ROUND_HALF_EVEN)
+    End If
+    If kind64 is equal to 2:
+        Return arbitrary_decimal_make_infinity(1, prec, APD_ROUND_HALF_EVEN)
+    End If
+    Let coeff be __load(value, 16)
+    Let e64 be __load(value, 24)
+    If coeff is equal to 0:
+        Return arbitrary_decimal_make_zero(s, prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Let cnt_ptr be Layout.allocate(8)
+    If cnt_ptr is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Let buf be Bignum.decbn_from_integer(coeff, cnt_ptr)
+    Let cnt be __load(cnt_ptr, 0)
+    Layout.deallocate(cnt_ptr)
+    If buf is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Return apd_finalize_finite(s, buf, cnt, e64, prec, APD_ROUND_HALF_EVEN)
+End Process
+
+Note: ============================================================================
+Note: Comparison
+Note: ============================================================================
+
+Process called "arbitrary_decimal_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Three-way compare returning -1, 0, +1, or -2 (NaN unordered).
+    Implements IEEE 754-2008 §5.6.1 compareSignalingTotalOrder
+    minus the totalOrder tiebreak (which we do not need; equality is
+    sufficient for arithmetic dispatch).
+    @End Reasoning
+
+    @Implementation
+    1. NaN -> -2 unordered.
+    2. Inf handling (POS > finite > NEG; +Inf = +Inf; -Inf = -Inf).
+    3. Sign handling (-x < +y for any x,y>0).
+    4. Same-sign: align exponents to the smaller value, compare
+       magnitudes in the digit-buffer domain.
+    @End Implementation
+
+    @Performance_Hints
+    Best case O(1) for sign-differing operands; worst case O(digit
+    count + |exp diff|).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns -2 (sentinel matches NaN unordered).
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return -2
+    End If
+    If b is equal to 0:
+        Return -2
+    End If
+    Let ka be __load(a, 8)
+    Let kb be __load(b, 8)
+    If ka is equal to APD_KIND_QNAN:
+        Return -2
+    End If
+    If kb is equal to APD_KIND_QNAN:
+        Return -2
+    End If
+
+    If ka is equal to APD_KIND_POS_INF:
+        If kb is equal to APD_KIND_POS_INF:
+            Return 0
+        End If
+        Return 1
+    End If
+    If ka is equal to APD_KIND_NEG_INF:
+        If kb is equal to APD_KIND_NEG_INF:
+            Return 0
+        End If
+        Return -1
+    End If
+    If kb is equal to APD_KIND_POS_INF:
+        Return -1
+    End If
+    If kb is equal to APD_KIND_NEG_INF:
+        Return 1
+    End If
+
+    Let sa be __load(a, 0)
+    Let sb be __load(b, 0)
+    Let ea be __load(a, 32)
+    Let eb be __load(b, 32)
+    Let da be __load(a, 16)
+    Let db be __load(b, 16)
+    Let dca be __load(a, 24)
+    Let dcb be __load(b, 24)
+
+    Let a_zero be arbitrary_decimal_is_zero(a)
+    Let b_zero be arbitrary_decimal_is_zero(b)
+    If a_zero is equal to 1:
+        If b_zero is equal to 1:
+            Return 0
+        End If
+    End If
+
+    If sa is not equal to sb:
+        If a_zero is equal to 1:
+            If b_zero is equal to 1:
+                Return 0
+            End If
+        End If
+        If sa is equal to 1:
+            Return -1
+        End If
+        Return 1
+    End If
+
+    Note: Same sign: align both digit buffers to the smaller exponent.
+    Let exp_common be ea
+    If eb is less than ea:
+        Set exp_common to eb
+    End If
+    Let shift_a be ea minus exp_common
+    Let shift_b be eb minus exp_common
+
+    Let scaled_a_count be dca plus shift_a
+    Let scaled_b_count be dcb plus shift_b
+    Let scaled_a be Bignum.decbn_alloc(scaled_a_count plus 1)
+    If scaled_a is equal to 0:
+        Return -2
+    End If
+    Let scaled_b be Bignum.decbn_alloc(scaled_b_count plus 1)
+    If scaled_b is equal to 0:
+        Bignum.decbn_free(scaled_a)
+        Return -2
+    End If
+
+    Let ai be 0
+    While ai is less than dca:
+        Memory.memory_set_byte(scaled_a, ai, Memory.memory_get_byte(da, ai))
+        Set ai to ai plus 1
+    End While
+    Let az be 0
+    While az is less than shift_a:
+        Memory.memory_set_byte(scaled_a, dca plus az, 0)
+        Set az to az plus 1
+    End While
+
+    Let bi be 0
+    While bi is less than dcb:
+        Memory.memory_set_byte(scaled_b, bi, Memory.memory_get_byte(db, bi))
+        Set bi to bi plus 1
+    End While
+    Let bz be 0
+    While bz is less than shift_b:
+        Memory.memory_set_byte(scaled_b, dcb plus bz, 0)
+        Set bz to bz plus 1
+    End While
+
+    Let cmp be Bignum.decbn_compare_magnitude(scaled_a, scaled_a_count, scaled_b, scaled_b_count)
+    Bignum.decbn_free(scaled_a)
+    Bignum.decbn_free(scaled_b)
+    If sa is equal to 1:
+        Return 0 minus cmp
+    End If
+    Return cmp
+End Process
+
+Process called "arbitrary_decimal_eq" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754-2008 §5.11 compareQuietEqual: NaN != anything.
+    @End Reasoning
+    @Implementation
+    Wraps arbitrary_decimal_compare with the NaN-unordered guard.
+    @End Implementation
+    @Performance_Hints
+    Comparable to arbitrary_decimal_compare.
+    @End Performance_Hints
+    @Security_Scope
+    NaN inputs always return 0.
+    @End Security_Scope
+
+    Let c be arbitrary_decimal_compare(a, b)
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "arbitrary_decimal_ne" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Logical negation of arbitrary_decimal_eq. Per IEEE 754-2008
+    §5.11 NaN comparisons are always 'not equal'.
+    @End Reasoning
+    @Implementation
+    Inverts the equal flag; NaN -> ne returns 1 (matching IEEE).
+    @End Implementation
+    @Performance_Hints
+    Comparable to arbitrary_decimal_compare.
+    @End Performance_Hints
+    @Security_Scope
+    NaN inputs always return 1.
+    @End Security_Scope
+
+    Let c be arbitrary_decimal_compare(a, b)
+    If c is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "arbitrary_decimal_lt" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754-2008 §5.11 compareQuietLess.
+    @End Reasoning
+    @Implementation
+    Three-way compare == -1.
+    @End Implementation
+    @Performance_Hints
+    Comparable to arbitrary_decimal_compare.
+    @End Performance_Hints
+    @Security_Scope
+    NaN -> 0 (unordered).
+    @End Security_Scope
+
+    Let c be arbitrary_decimal_compare(a, b)
+    If c is equal to -1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "arbitrary_decimal_le" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754-2008 §5.11 compareQuietLessEqual.
+    @End Reasoning
+    @Implementation
+    Three-way compare in {-1, 0}.
+    @End Implementation
+    @Performance_Hints
+    Comparable to arbitrary_decimal_compare.
+    @End Performance_Hints
+    @Security_Scope
+    NaN -> 0 (unordered).
+    @End Security_Scope
+
+    Let c be arbitrary_decimal_compare(a, b)
+    If c is equal to -1:
+        Return 1
+    End If
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "arbitrary_decimal_gt" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754-2008 §5.11 compareQuietGreater.
+    @End Reasoning
+    @Implementation
+    Three-way compare == 1.
+    @End Implementation
+    @Performance_Hints
+    Comparable to arbitrary_decimal_compare.
+    @End Performance_Hints
+    @Security_Scope
+    NaN -> 0 (unordered).
+    @End Security_Scope
+
+    Let c be arbitrary_decimal_compare(a, b)
+    If c is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "arbitrary_decimal_ge" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754-2008 §5.11 compareQuietGreaterEqual.
+    @End Reasoning
+    @Implementation
+    Three-way compare in {0, 1}.
+    @End Implementation
+    @Performance_Hints
+    Comparable to arbitrary_decimal_compare.
+    @End Performance_Hints
+    @Security_Scope
+    NaN -> 0 (unordered).
+    @End Security_Scope
+
+    Let c be arbitrary_decimal_compare(a, b)
+    If c is equal to 1:
+        Return 1
+    End If
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Negation, abs
+Note: ============================================================================
+
+Process called "arbitrary_decimal_neg" takes a as Integer returns Integer:
+    @Reasoning
+    Bit-level sign flip with NaN/Inf preserved. Per IEEE 754-2008 §5.5.1
+    negate(NaN) -> NaN; negate(+Inf) -> -Inf and vice versa.
+    @End Reasoning
+
+    @Implementation
+    Copy digit buffer; flip sign and kind for infinities; preserve
+    precision and rounding mode.
+    @End Implementation
+
+    @Performance_Hints
+    One digit-buffer copy plus one struct allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure aside from allocations.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return arbitrary_decimal_make_qnan(APD_DEFAULT_PRECISION, APD_ROUND_HALF_EVEN)
+    End If
+    Let sa be __load(a, 0)
+    Let ka be __load(a, 8)
+    Let da be __load(a, 16)
+    Let dca be __load(a, 24)
+    Let ea be __load(a, 32)
+    Let bs be __load(a, 40)
+    Let rm be __load(a, 48)
+
+    If ka is equal to APD_KIND_QNAN:
+        Return arbitrary_decimal_make_qnan(bs, rm)
+    End If
+    Let new_sign be 1
+    If sa is equal to 1:
+        Set new_sign to 0
+    End If
+    Let new_kind be ka
+    If ka is equal to APD_KIND_POS_INF:
+        Set new_kind to APD_KIND_NEG_INF
+    End If
+    If ka is equal to APD_KIND_NEG_INF:
+        Set new_kind to APD_KIND_POS_INF
+    End If
+    Let copy_digits be 0
+    If da is not equal to 0:
+        Set copy_digits to Bignum.decbn_copy(da, dca)
+        If copy_digits is equal to 0:
+            Return arbitrary_decimal_make_qnan(bs, rm)
+        End If
+    End If
+    Return apd_unpacked_create(new_sign, new_kind, copy_digits, dca, ea, bs, rm)
+End Process
+
+Process called "arbitrary_decimal_abs" takes a as Integer returns Integer:
+    @Reasoning
+    Absolute value: clear sign bit, preserve everything else. Per IEEE
+    754-2008 §5.5.1 abs(NaN) -> NaN; abs(-Inf) -> +Inf.
+    @End Reasoning
+
+    @Implementation
+    Copy digit buffer; set sign to 0; map NEG_INF -> POS_INF.
+    @End Implementation
+
+    @Performance_Hints
+    One digit-buffer copy plus one struct allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure aside from allocations.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return arbitrary_decimal_make_qnan(APD_DEFAULT_PRECISION, APD_ROUND_HALF_EVEN)
+    End If
+    Let ka be __load(a, 8)
+    Let da be __load(a, 16)
+    Let dca be __load(a, 24)
+    Let ea be __load(a, 32)
+    Let bs be __load(a, 40)
+    Let rm be __load(a, 48)
+    If ka is equal to APD_KIND_QNAN:
+        Return arbitrary_decimal_make_qnan(bs, rm)
+    End If
+    Let new_kind be ka
+    If ka is equal to APD_KIND_NEG_INF:
+        Set new_kind to APD_KIND_POS_INF
+    End If
+    Let copy_digits be 0
+    If da is not equal to 0:
+        Set copy_digits to Bignum.decbn_copy(da, dca)
+        If copy_digits is equal to 0:
+            Return arbitrary_decimal_make_qnan(bs, rm)
+        End If
+    End If
+    Return apd_unpacked_create(0, new_kind, copy_digits, dca, ea, bs, rm)
+End Process
+
+Note: ============================================================================
+Note: Addition / subtraction
+Note: ============================================================================
+
+Process called "arbitrary_decimal_add" takes a as Integer, b as Integer, precision_digits as Integer returns Integer:
+    @Reasoning
+    Arbitrary-precision decimal addition per IEEE 754-2008 §5.4.1. The
+    inputs may carry different per-value precisions; the result uses
+    the precision specified in the precision_digits argument (the
+    caller dictates the answer's precision; this is the IEEE
+    convention for the "preferredWidth" attribute).
+
+    Headline test: arbitrary_decimal_from_string("0.1") +
+    arbitrary_decimal_from_string("0.2") = arbitrary_decimal_from_string("0.3")
+    must hold exactly at any precision >= 1.
+    @End Reasoning
+
+    @Implementation
+    1. NaN propagation, Inf handling (+Inf + -Inf -> qNaN invalid).
+    2. Align both operands to the smaller exponent by zero-padding the
+       higher-exponent operand's digit buffer.
+    3. Same sign -> decbn_add_magnitude; else compare magnitudes,
+       decbn_sub_magnitude, sign of result = sign of larger operand.
+    4. apd_finalize_finite to round to precision.
+    @End Implementation
+
+    @Performance_Hints
+    Alignment can scale up to precision + 2 digits in pathological cases.
+    @End Performance_Hints
+
+    @Security_Scope
+    Inf + (-Inf) signals invalid -> qNaN.
+    @End Security_Scope
+
+    Let prec be precision_digits
+    If prec is less than 1:
+        Set prec to APD_DEFAULT_PRECISION
+    End If
+    Let np be apd_propagate_nan(a, b)
+    If np is not equal to 0:
+        Return np
+    End If
+    If a is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    If b is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Let ka be __load(a, 8)
+    Let kb be __load(b, 8)
+    Let rm be __load(a, 48)
+    If rm is less than 0:
+        Set rm to APD_ROUND_HALF_EVEN
+    End If
+    If rm is greater than APD_ROUND_HALF_AWAY_FROM_ZERO:
+        Set rm to APD_ROUND_HALF_EVEN
+    End If
+
+    If ka is equal to APD_KIND_POS_INF:
+        If kb is equal to APD_KIND_NEG_INF:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Return arbitrary_decimal_make_infinity(0, prec, rm)
+    End If
+    If ka is equal to APD_KIND_NEG_INF:
+        If kb is equal to APD_KIND_POS_INF:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Return arbitrary_decimal_make_infinity(1, prec, rm)
+    End If
+    If kb is equal to APD_KIND_POS_INF:
+        Return arbitrary_decimal_make_infinity(0, prec, rm)
+    End If
+    If kb is equal to APD_KIND_NEG_INF:
+        Return arbitrary_decimal_make_infinity(1, prec, rm)
+    End If
+
+    Let sa be __load(a, 0)
+    Let sb be __load(b, 0)
+    Let da be __load(a, 16)
+    Let db be __load(b, 16)
+    Let dca be __load(a, 24)
+    Let dcb be __load(b, 24)
+    Let ea be __load(a, 32)
+    Let eb be __load(b, 32)
+
+    Note: Align both operands to a single exp_common per IEEE 754-2008 §5.4.1.
+    Note: Natural choice is min(ea, eb), but the larger-magnitude operand
+    Note: would then require scaling UP by (max - min) digits. To bound
+    Note: the alignment buffer size we cap the upward scale at cap_shift =
+    Note: prec + 4 digits (the +4 supplies 4 extra digits of working
+    Note: precision beyond the final round window). When the exponent
+    Note: gap exceeds cap_shift, exp_common is re-anchored UP to
+    Note: max(ea, eb) - cap_shift; the larger operand then scales UP by
+    Note: exactly cap_shift digits and the smaller operand scales DOWN
+    Note: by (gap - cap_shift) digits, with any non-zero discarded
+    Note: digit recorded as combined_sticky. Both scaled buffers share
+    Note: a common LSB-extension digit (value = combined_sticky on the
+    Note: smaller-magnitude operand, 0 on the other; result_exp shifts
+    Note: down by 1) so decbn_add_magnitude / decbn_sub_magnitude (which
+    Note: right-justify operands) see the sticky bit as a proper digit
+    Note: of the sum and the subsequent apd_round_to_precision applies
+    Note: round-half-even (and the other IEEE 754 modes) correctly.
+    Let cap_shift be prec plus 4
+    Let max_exp be ea
+    If eb is greater than ea:
+        Set max_exp to eb
+    End If
+    Let min_exp be eb
+    If ea is less than eb:
+        Set min_exp to ea
+    End If
+    Let exp_common be min_exp
+    If (max_exp minus min_exp) is greater than cap_shift:
+        Set exp_common to max_exp minus cap_shift
+    End If
+
+    Let shift_a be ea minus exp_common
+    Let shift_b be eb minus exp_common
+
+    Note: Compute the down-shift amount for each operand (digits dropped
+    Note: from the LSB end of the buffer in MSB-first storage). At most
+    Note: one of down_a/down_b is non-zero since exp_common is anchored
+    Note: to one operand's exponent.
+    Let down_a be 0
+    If shift_a is less than 0:
+        Set down_a to 0 minus shift_a
+        Set shift_a to 0
+    End If
+    Let down_b be 0
+    If shift_b is less than 0:
+        Set down_b to 0 minus shift_b
+        Set shift_b to 0
+    End If
+
+    Note: kept_X = digits retained from operand X. Any non-zero digit in
+    Note: positions [kept_X .. dcX - 1] (LSB-end discards) sets sticky_X.
+    Let kept_a be dca minus down_a
+    If kept_a is less than 0:
+        Set kept_a to 0
+    End If
+    Let kept_b be dcb minus down_b
+    If kept_b is less than 0:
+        Set kept_b to 0
+    End If
+
+    Let sticky_a be 0
+    If down_a is greater than 0:
+        Let scan_a be kept_a
+        Let scan_a_done be 0
+        While scan_a_done is equal to 0:
+            If scan_a is greater than or equal to dca:
+                Set scan_a_done to 1
+            Otherwise:
+                If Memory.memory_get_byte(da, scan_a) is not equal to 0:
+                    Set sticky_a to 1
+                    Set scan_a_done to 1
+                Otherwise:
+                    Set scan_a to scan_a plus 1
+                End If
+            End If
+        End While
+    End If
+    Let sticky_b be 0
+    If down_b is greater than 0:
+        Let scan_b be kept_b
+        Let scan_b_done be 0
+        While scan_b_done is equal to 0:
+            If scan_b is greater than or equal to dcb:
+                Set scan_b_done to 1
+            Otherwise:
+                If Memory.memory_get_byte(db, scan_b) is not equal to 0:
+                    Set sticky_b to 1
+                    Set scan_b_done to 1
+                Otherwise:
+                    Set scan_b to scan_b plus 1
+                End If
+            End If
+        End While
+    End If
+
+    Note: combined_sticky = sticky from EITHER operand. If either operand
+    Note: dropped non-zero LSB digits, append a shared LSB digit to BOTH
+    Note: scaled buffers (value = the operand's own sticky bit so the
+    Note: digit-place is preserved) and decrement exp_common by 1 so the
+    Note: result exponent matches the new combined-buffer LSB position.
+    Let combined_sticky be sticky_a bitwise or sticky_b
+    Let sticky_pad be combined_sticky
+    If sticky_pad is not equal to 0:
+        Set exp_common to exp_common minus 1
+    End If
+
+    Let scaled_a_count be kept_a plus shift_a plus sticky_pad
+    Let scaled_b_count be kept_b plus shift_b plus sticky_pad
+    If scaled_a_count is less than 1:
+        Set scaled_a_count to 1
+    End If
+    If scaled_b_count is less than 1:
+        Set scaled_b_count to 1
+    End If
+
+    Let scaled_a be Bignum.decbn_alloc(scaled_a_count plus 1)
+    If scaled_a is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+    Let scaled_b be Bignum.decbn_alloc(scaled_b_count plus 1)
+    If scaled_b is equal to 0:
+        Bignum.decbn_free(scaled_a)
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+
+    Note: scaled_a layout (MSB-first):
+    Note: [da[0]..da[kept_a-1]] [0..0 x shift_a] [sticky_a if sticky_pad else nothing]
+    Let ai be 0
+    While ai is less than kept_a:
+        Memory.memory_set_byte(scaled_a, ai, Memory.memory_get_byte(da, ai))
+        Set ai to ai plus 1
+    End While
+    Let az be 0
+    While az is less than shift_a:
+        Memory.memory_set_byte(scaled_a, kept_a plus az, 0)
+        Set az to az plus 1
+    End While
+    If sticky_pad is equal to 1:
+        Memory.memory_set_byte(scaled_a, kept_a plus shift_a, sticky_a)
+    End If
+    If (kept_a plus shift_a plus sticky_pad) is equal to 0:
+        Memory.memory_set_byte(scaled_a, 0, 0)
+    End If
+
+    Let bi be 0
+    While bi is less than kept_b:
+        Memory.memory_set_byte(scaled_b, bi, Memory.memory_get_byte(db, bi))
+        Set bi to bi plus 1
+    End While
+    Let bz be 0
+    While bz is less than shift_b:
+        Memory.memory_set_byte(scaled_b, kept_b plus bz, 0)
+        Set bz to bz plus 1
+    End While
+    If sticky_pad is equal to 1:
+        Memory.memory_set_byte(scaled_b, kept_b plus shift_b, sticky_b)
+    End If
+    If (kept_b plus shift_b plus sticky_pad) is equal to 0:
+        Memory.memory_set_byte(scaled_b, 0, 0)
+    End If
+
+    Let result_sign be 0
+    Let combined_buf be 0
+    Let combined_count_ptr be Layout.allocate(8)
+    If combined_count_ptr is equal to 0:
+        Bignum.decbn_free(scaled_a)
+        Bignum.decbn_free(scaled_b)
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+
+    If sa is equal to sb:
+        Set combined_buf to Bignum.decbn_add_magnitude(scaled_a, scaled_a_count, scaled_b, scaled_b_count, combined_count_ptr)
+        Set result_sign to sa
+    Otherwise:
+        Let cmp be Bignum.decbn_compare_magnitude(scaled_a, scaled_a_count, scaled_b, scaled_b_count)
+        If cmp is greater than 0:
+            Set combined_buf to Bignum.decbn_sub_magnitude(scaled_a, scaled_a_count, scaled_b, scaled_b_count, combined_count_ptr)
+            Set result_sign to sa
+        End If
+        If cmp is less than 0:
+            Set combined_buf to Bignum.decbn_sub_magnitude(scaled_b, scaled_b_count, scaled_a, scaled_a_count, combined_count_ptr)
+            Set result_sign to sb
+        End If
+        If cmp is equal to 0:
+            Let zb be Bignum.decbn_alloc(2)
+            If zb is equal to 0:
+                Layout.deallocate(combined_count_ptr)
+                Bignum.decbn_free(scaled_a)
+                Bignum.decbn_free(scaled_b)
+                Return arbitrary_decimal_make_qnan(prec, rm)
+            End If
+            Memory.memory_set_byte(zb, 0, 0)
+            Set combined_buf to zb
+            __store(combined_count_ptr, 0, 1)
+            If rm is equal to APD_ROUND_TOWARD_NEG:
+                Set result_sign to 1
+            Otherwise:
+                Set result_sign to 0
+            End If
+        End If
+    End If
+    Let combined_count be __load(combined_count_ptr, 0)
+    Layout.deallocate(combined_count_ptr)
+    Bignum.decbn_free(scaled_a)
+    Bignum.decbn_free(scaled_b)
+
+    If combined_buf is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+
+    Return apd_finalize_finite(result_sign, combined_buf, combined_count, exp_common, prec, rm)
+End Process
+
+Process called "arbitrary_decimal_sub" takes a as Integer, b as Integer, precision_digits as Integer returns Integer:
+    @Reasoning
+    Subtraction is defined per IEEE 754-2008 §5.4.1 as a + (-b).
+    @End Reasoning
+
+    @Implementation
+    Compose neg then add.
+    @End Implementation
+
+    @Performance_Hints
+    One extra struct allocation versus a direct subtract.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same NaN/Inf semantics as add.
+    @End Security_Scope
+
+    Let neg_b be arbitrary_decimal_neg(b)
+    If neg_b is equal to 0:
+        Let prec be precision_digits
+        If prec is less than 1:
+            Set prec to APD_DEFAULT_PRECISION
+        End If
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Let result be arbitrary_decimal_add(a, neg_b, precision_digits)
+    arbitrary_decimal_destroy(neg_b)
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Multiplication
+Note: ============================================================================
+
+Process called "arbitrary_decimal_mul" takes a as Integer, b as Integer, precision_digits as Integer returns Integer:
+    @Reasoning
+    Arbitrary-precision decimal multiplication per IEEE 754-2008 §5.4.1.
+    The intermediate product can have up to dca + dcb digits, which is
+    held exactly in a digit buffer and then rounded to precision_digits.
+    @End Reasoning
+
+    @Implementation
+    1. NaN propagation, Inf handling (Inf * 0 -> qNaN invalid).
+    2. Compute coefficient product via decbn_mul.
+    3. Add exponents.
+    4. apd_finalize_finite.
+    @End Implementation
+
+    @Performance_Hints
+    O(dca * dcb) with the classical schoolbook algorithm in decbn_mul.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure -> qNaN.
+    @End Security_Scope
+
+    Let prec be precision_digits
+    If prec is less than 1:
+        Set prec to APD_DEFAULT_PRECISION
+    End If
+    Let np be apd_propagate_nan(a, b)
+    If np is not equal to 0:
+        Return np
+    End If
+    If a is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    If b is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Let ka be __load(a, 8)
+    Let kb be __load(b, 8)
+    Let sa be __load(a, 0)
+    Let sb be __load(b, 0)
+    Let rm be __load(a, 48)
+    If rm is less than 0:
+        Set rm to APD_ROUND_HALF_EVEN
+    End If
+    If rm is greater than APD_ROUND_HALF_AWAY_FROM_ZERO:
+        Set rm to APD_ROUND_HALF_EVEN
+    End If
+
+    Let result_sign be 0
+    If sa is not equal to sb:
+        Set result_sign to 1
+    End If
+
+    Let a_inf be 0
+    If ka is equal to APD_KIND_POS_INF:
+        Set a_inf to 1
+    End If
+    If ka is equal to APD_KIND_NEG_INF:
+        Set a_inf to 1
+    End If
+    Let b_inf be 0
+    If kb is equal to APD_KIND_POS_INF:
+        Set b_inf to 1
+    End If
+    If kb is equal to APD_KIND_NEG_INF:
+        Set b_inf to 1
+    End If
+
+    Let a_zero be arbitrary_decimal_is_zero(a)
+    Let b_zero be arbitrary_decimal_is_zero(b)
+
+    If a_inf is equal to 1:
+        If b_zero is equal to 1:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Return arbitrary_decimal_make_infinity(result_sign, prec, rm)
+    End If
+    If b_inf is equal to 1:
+        If a_zero is equal to 1:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Return arbitrary_decimal_make_infinity(result_sign, prec, rm)
+    End If
+
+    Let da be __load(a, 16)
+    Let db be __load(b, 16)
+    Let dca be __load(a, 24)
+    Let dcb be __load(b, 24)
+    Let ea be __load(a, 32)
+    Let eb be __load(b, 32)
+    Let exp_sum be ea plus eb
+
+    If a_zero is equal to 1:
+        Return arbitrary_decimal_make_zero(result_sign, prec, rm)
+    End If
+    If b_zero is equal to 1:
+        Return arbitrary_decimal_make_zero(result_sign, prec, rm)
+    End If
+
+    Let prod_count_ptr be Layout.allocate(8)
+    If prod_count_ptr is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+    Let prod be Bignum.decbn_mul(da, dca, db, dcb, prod_count_ptr)
+    Let prod_count be __load(prod_count_ptr, 0)
+    Layout.deallocate(prod_count_ptr)
+    If prod is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+
+    Return apd_finalize_finite(result_sign, prod, prod_count, exp_sum, prec, rm)
+End Process
+
+Note: ============================================================================
+Note: Division
+Note: ============================================================================
+
+Process called "arbitrary_decimal_div" takes a as Integer, b as Integer, precision_digits as Integer returns Integer:
+    @Reasoning
+    Arbitrary-precision decimal division per IEEE 754-2008 §5.4.1. We
+    pre-scale the dividend by 10^(precision+1) digits so that the
+    integer quotient carries (precision + 1) decimal digits, then use
+    sticky-bit injection to preserve rounding-decision information
+    discarded by the long-division floor.
+
+    For 1/7 to 100 digits this produces "0.142857142857..." with the
+    period-6 repeating sequence. For 1/3 to 1000 digits all digits are 3.
+    @End Reasoning
+
+    @Implementation
+    1. NaN/Inf/zero special cases.
+    2. Append (precision + 1) zero digits to dividend's buffer.
+    3. decbn_div_mod.
+    4. Sticky-bit OR into quotient's last digit if remainder is non-zero.
+    5. apd_finalize_finite.
+    @End Implementation
+
+    @Performance_Hints
+    O((precision+1) * dcb * 10) for the schoolbook long division.
+    @End Performance_Hints
+
+    @Security_Scope
+    0 / 0 -> qNaN; x / 0 (x != 0) -> signed infinity (divideByZero
+    signal per IEEE 754-2008 §7.3).
+    @End Security_Scope
+
+    Let prec be precision_digits
+    If prec is less than 1:
+        Set prec to APD_DEFAULT_PRECISION
+    End If
+    Let np be apd_propagate_nan(a, b)
+    If np is not equal to 0:
+        Return np
+    End If
+    If a is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    If b is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Let ka be __load(a, 8)
+    Let kb be __load(b, 8)
+    Let sa be __load(a, 0)
+    Let sb be __load(b, 0)
+    Let rm be __load(a, 48)
+    If rm is less than 0:
+        Set rm to APD_ROUND_HALF_EVEN
+    End If
+    If rm is greater than APD_ROUND_HALF_AWAY_FROM_ZERO:
+        Set rm to APD_ROUND_HALF_EVEN
+    End If
+
+    Let result_sign be 0
+    If sa is not equal to sb:
+        Set result_sign to 1
+    End If
+
+    Let a_inf be 0
+    If ka is equal to APD_KIND_POS_INF:
+        Set a_inf to 1
+    End If
+    If ka is equal to APD_KIND_NEG_INF:
+        Set a_inf to 1
+    End If
+    Let b_inf be 0
+    If kb is equal to APD_KIND_POS_INF:
+        Set b_inf to 1
+    End If
+    If kb is equal to APD_KIND_NEG_INF:
+        Set b_inf to 1
+    End If
+
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Return arbitrary_decimal_make_infinity(result_sign, prec, rm)
+    End If
+    If b_inf is equal to 1:
+        Return arbitrary_decimal_make_zero(result_sign, prec, rm)
+    End If
+
+    Let a_zero be arbitrary_decimal_is_zero(a)
+    Let b_zero be arbitrary_decimal_is_zero(b)
+    If b_zero is equal to 1:
+        If a_zero is equal to 1:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Return arbitrary_decimal_make_infinity(result_sign, prec, rm)
+    End If
+    If a_zero is equal to 1:
+        Let ea0 be __load(a, 32)
+        Let eb0 be __load(b, 32)
+        Let zero_exp be ea0 minus eb0
+        Let zb0 be Bignum.decbn_alloc(prec plus 4)
+        If zb0 is equal to 0:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Memory.memory_set_byte(zb0, 0, 0)
+        Return apd_unpacked_create(result_sign, APD_KIND_FINITE, zb0, 1, zero_exp, prec plus 4, rm)
+    End If
+
+    Let da be __load(a, 16)
+    Let db be __load(b, 16)
+    Let dca be __load(a, 24)
+    Let dcb be __load(b, 24)
+    Let ea be __load(a, 32)
+    Let eb be __load(b, 32)
+
+    Let guard_digits be prec plus 1
+    Let scaled_count be dca plus guard_digits
+    Let scaled be Bignum.decbn_alloc(scaled_count plus 1)
+    If scaled is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+    Let si be 0
+    While si is less than dca:
+        Memory.memory_set_byte(scaled, si, Memory.memory_get_byte(da, si))
+        Set si to si plus 1
+    End While
+    Let zi be 0
+    While zi is less than guard_digits:
+        Memory.memory_set_byte(scaled, dca plus zi, 0)
+        Set zi to zi plus 1
+    End While
+
+    Let q_count_ptr be Layout.allocate(8)
+    Let r_count_ptr be Layout.allocate(8)
+    Let r_out_ptr be Layout.allocate(8)
+    If q_count_ptr is equal to 0:
+        Bignum.decbn_free(scaled)
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+    If r_count_ptr is equal to 0:
+        Layout.deallocate(q_count_ptr)
+        Bignum.decbn_free(scaled)
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+    If r_out_ptr is equal to 0:
+        Layout.deallocate(q_count_ptr)
+        Layout.deallocate(r_count_ptr)
+        Bignum.decbn_free(scaled)
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+    __store(r_out_ptr, 0, 0)
+
+    Let q_buf be Bignum.decbn_div_mod(scaled, scaled_count, db, dcb, q_count_ptr, r_count_ptr, r_out_ptr)
+    Let q_count be __load(q_count_ptr, 0)
+    Let r_count be __load(r_count_ptr, 0)
+    Let rem_buf be __load(r_out_ptr, 0)
+    Layout.deallocate(q_count_ptr)
+    Layout.deallocate(r_count_ptr)
+    Layout.deallocate(r_out_ptr)
+    Bignum.decbn_free(scaled)
+    If q_buf is equal to 0:
+        If rem_buf is not equal to 0:
+            Bignum.decbn_free(rem_buf)
+        End If
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+
+    Note: Sticky bit: if any remainder digit is non-zero we have lost
+    Note: precision; OR a +1 into the quotient's last digit if it is even
+    Note: (Knuth TAOCP Vol 2 §4.3 sticky-injection idiom).
+    Let rem_nonzero be 0
+    Let rni be 0
+    While rni is less than r_count:
+        If Memory.memory_get_byte(rem_buf, rni) is not equal to 0:
+            Set rem_nonzero to 1
+            Set rni to r_count
+        Otherwise:
+            Set rni to rni plus 1
+        End If
+    End While
+    If rem_buf is not equal to 0:
+        Bignum.decbn_free(rem_buf)
+    End If
+    If rem_nonzero is equal to 1:
+        Let last_q be Memory.memory_get_byte(q_buf, q_count minus 1)
+        If last_q is equal to ((last_q divided by 2) multiplied by 2):
+            Memory.memory_set_byte(q_buf, q_count minus 1, last_q plus 1)
+        End If
+    End If
+
+    Let final_exp be ea minus eb minus guard_digits
+    Return apd_finalize_finite(result_sign, q_buf, q_count, final_exp, prec, rm)
+End Process
+
+Note: ============================================================================
+Note: Square root
+Note: ============================================================================
+
+Process called "arbitrary_decimal_sqrt" takes a as Integer, precision_digits as Integer returns Integer:
+    @Reasoning
+    Arbitrary-precision sqrt per IEEE 754-2008 §5.4.1. We scale the
+    coefficient up to >= 2 * precision_digits with an even exponent,
+    then run Newton iteration in the digit-buffer domain.
+
+    Negative input is invalid -> qNaN.
+    sqrt(+Inf) = +Inf; sqrt(+0) = +0; sqrt(-0) = -0; sqrt(NaN) = NaN.
+    @End Reasoning
+
+    @Implementation
+    1. Sign/NaN/Inf/zero special cases.
+    2. Scale up to >= 2 * precision digits via zero-pad with even exp.
+    3. Newton: x_new = (x + scaled / x) / 2, monotonic-decrease term.
+    4. Halve exponent.
+    5. apd_finalize_finite.
+    @End Implementation
+
+    @Performance_Hints
+    Converges in ~log2(precision) iterations. Each iteration is a
+    long-division (the dominant cost).
+    @End Performance_Hints
+
+    @Security_Scope
+    Negative -> qNaN with invalid signal per §7.2.
+    @End Security_Scope
+
+    Let prec be precision_digits
+    If prec is less than 1:
+        Set prec to APD_DEFAULT_PRECISION
+    End If
+
+    If a is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    Let ka be __load(a, 8)
+    Let rm be __load(a, 48)
+    If rm is less than 0:
+        Set rm to APD_ROUND_HALF_EVEN
+    End If
+    If rm is greater than APD_ROUND_HALF_AWAY_FROM_ZERO:
+        Set rm to APD_ROUND_HALF_EVEN
+    End If
+    If ka is equal to APD_KIND_QNAN:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+
+    Let sa be __load(a, 0)
+    Let da be __load(a, 16)
+    Let dca be __load(a, 24)
+    Let ea be __load(a, 32)
+
+    If ka is equal to APD_KIND_NEG_INF:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+    If ka is equal to APD_KIND_POS_INF:
+        Return arbitrary_decimal_make_infinity(0, prec, rm)
+    End If
+
+    If arbitrary_decimal_is_zero(a) is equal to 1:
+        Let zb be Bignum.decbn_alloc(2)
+        If zb is equal to 0:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Memory.memory_set_byte(zb, 0, 0)
+        Return apd_unpacked_create(sa, APD_KIND_FINITE, zb, 1, ea divided by 2, 2, rm)
+    End If
+
+    If sa is equal to 1:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+
+    Note: Scale up to >= 2 * precision digits.
+    Let target_digits be prec multiplied by 2
+    Let scaled_count be dca
+    Let scaled_exp be ea
+    Let scaled be Bignum.decbn_copy(da, dca)
+    If scaled is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+    While scaled_count is less than target_digits:
+        Let bigger_buf be Bignum.decbn_alloc(scaled_count plus 3)
+        If bigger_buf is equal to 0:
+            Bignum.decbn_free(scaled)
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Let cpi be 0
+        While cpi is less than scaled_count:
+            Memory.memory_set_byte(bigger_buf, cpi, Memory.memory_get_byte(scaled, cpi))
+            Set cpi to cpi plus 1
+        End While
+        Memory.memory_set_byte(bigger_buf, scaled_count, 0)
+        Memory.memory_set_byte(bigger_buf, scaled_count plus 1, 0)
+        Bignum.decbn_free(scaled)
+        Set scaled to bigger_buf
+        Set scaled_count to scaled_count plus 2
+        Set scaled_exp to scaled_exp minus 2
+    End While
+
+    Note: Ensure exponent is even.
+    If scaled_exp minus ((scaled_exp divided by 2) multiplied by 2) is not equal to 0:
+        Let bigger_buf2 be Bignum.decbn_alloc(scaled_count plus 2)
+        If bigger_buf2 is equal to 0:
+            Bignum.decbn_free(scaled)
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Let cpi2 be 0
+        While cpi2 is less than scaled_count:
+            Memory.memory_set_byte(bigger_buf2, cpi2, Memory.memory_get_byte(scaled, cpi2))
+            Set cpi2 to cpi2 plus 1
+        End While
+        Memory.memory_set_byte(bigger_buf2, scaled_count, 0)
+        Bignum.decbn_free(scaled)
+        Set scaled to bigger_buf2
+        Set scaled_count to scaled_count plus 1
+        Set scaled_exp to scaled_exp minus 1
+    End If
+
+    Note: Initial guess: 10^((d/2)-1) (1 followed by (d/2)-1 zeros).
+    Let guess_count be scaled_count divided by 2
+    If guess_count is less than 1:
+        Set guess_count to 1
+    End If
+    Let guess be Bignum.decbn_alloc(guess_count plus 2)
+    If guess is equal to 0:
+        Bignum.decbn_free(scaled)
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+    Memory.memory_set_byte(guess, 0, 1)
+    Let gi be 1
+    While gi is less than guess_count:
+        Memory.memory_set_byte(guess, gi, 0)
+        Set gi to gi plus 1
+    End While
+
+    Note: Newton iteration: x_new = (x + scaled / x) / 2 with monotonic-
+    Note: decrease termination. Cap iterations defensively.
+    Let iter be 0
+    Let done be 0
+    While done is equal to 0:
+        If iter is greater than 200:
+            Set done to 1
+        Otherwise:
+            Let q_count_ptr be Layout.allocate(8)
+            Let r_count_ptr be Layout.allocate(8)
+            Let r_out_ptr be Layout.allocate(8)
+            If q_count_ptr is equal to 0:
+                Set done to 1
+                Set iter to 999
+            Otherwise:
+                If r_count_ptr is equal to 0:
+                    Layout.deallocate(q_count_ptr)
+                    Set done to 1
+                    Set iter to 999
+                Otherwise:
+                    If r_out_ptr is equal to 0:
+                        Layout.deallocate(q_count_ptr)
+                        Layout.deallocate(r_count_ptr)
+                        Set done to 1
+                        Set iter to 999
+                    Otherwise:
+                        __store(r_out_ptr, 0, 0)
+                        Let div_quot be Bignum.decbn_div_mod(scaled, scaled_count, guess, guess_count, q_count_ptr, r_count_ptr, r_out_ptr)
+                        Let dq_count be __load(q_count_ptr, 0)
+                        Let dr_buf be __load(r_out_ptr, 0)
+                        Layout.deallocate(q_count_ptr)
+                        Layout.deallocate(r_count_ptr)
+                        Layout.deallocate(r_out_ptr)
+                        If dr_buf is not equal to 0:
+                            Bignum.decbn_free(dr_buf)
+                        End If
+                        If div_quot is equal to 0:
+                            Set done to 1
+                        Otherwise:
+                            Let add_count_ptr be Layout.allocate(8)
+                            If add_count_ptr is equal to 0:
+                                Bignum.decbn_free(div_quot)
+                                Set done to 1
+                            Otherwise:
+                                Let sum be Bignum.decbn_add_magnitude(guess, guess_count, div_quot, dq_count, add_count_ptr)
+                                Let sum_count be __load(add_count_ptr, 0)
+                                Layout.deallocate(add_count_ptr)
+                                Bignum.decbn_free(div_quot)
+                                If sum is equal to 0:
+                                    Set done to 1
+                                Otherwise:
+                                    Let two_buf be Bignum.decbn_alloc(2)
+                                    If two_buf is equal to 0:
+                                        Bignum.decbn_free(sum)
+                                        Set done to 1
+                                    Otherwise:
+                                        Memory.memory_set_byte(two_buf, 0, 2)
+                                        Let nq_count_ptr be Layout.allocate(8)
+                                        Let nr_count_ptr be Layout.allocate(8)
+                                        Let nr_out_ptr be Layout.allocate(8)
+                                        If nq_count_ptr is equal to 0:
+                                            Bignum.decbn_free(sum)
+                                            Bignum.decbn_free(two_buf)
+                                            Set done to 1
+                                        Otherwise:
+                                            If nr_count_ptr is equal to 0:
+                                                Layout.deallocate(nq_count_ptr)
+                                                Bignum.decbn_free(sum)
+                                                Bignum.decbn_free(two_buf)
+                                                Set done to 1
+                                            Otherwise:
+                                                If nr_out_ptr is equal to 0:
+                                                    Layout.deallocate(nq_count_ptr)
+                                                    Layout.deallocate(nr_count_ptr)
+                                                    Bignum.decbn_free(sum)
+                                                    Bignum.decbn_free(two_buf)
+                                                    Set done to 1
+                                                Otherwise:
+                                                    __store(nr_out_ptr, 0, 0)
+                                                    Let new_guess be Bignum.decbn_div_mod(sum, sum_count, two_buf, 1, nq_count_ptr, nr_count_ptr, nr_out_ptr)
+                                                    Let ng_count be __load(nq_count_ptr, 0)
+                                                    Let nr_buf be __load(nr_out_ptr, 0)
+                                                    Layout.deallocate(nq_count_ptr)
+                                                    Layout.deallocate(nr_count_ptr)
+                                                    Layout.deallocate(nr_out_ptr)
+                                                    Bignum.decbn_free(sum)
+                                                    Bignum.decbn_free(two_buf)
+                                                    If nr_buf is not equal to 0:
+                                                        Bignum.decbn_free(nr_buf)
+                                                    End If
+                                                    If new_guess is equal to 0:
+                                                        Set done to 1
+                                                    Otherwise:
+                                                        Let cmp_ng be Bignum.decbn_compare_magnitude(new_guess, ng_count, guess, guess_count)
+                                                        If cmp_ng is greater than or equal to 0:
+                                                            Bignum.decbn_free(new_guess)
+                                                            Set done to 1
+                                                        Otherwise:
+                                                            Bignum.decbn_free(guess)
+                                                            Set guess to new_guess
+                                                            Set guess_count to ng_count
+                                                            Set iter to iter plus 1
+                                                        End If
+                                                    End If
+                                                End If
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Bignum.decbn_free(scaled)
+    Let result_exp be scaled_exp divided by 2
+    Return apd_finalize_finite(0, guess, guess_count, result_exp, prec, rm)
+End Process
+
+Note: ============================================================================
+Note: Fused multiply-add
+Note: ============================================================================
+
+Process called "arbitrary_decimal_fma" takes a as Integer, b as Integer, c as Integer, precision_digits as Integer returns Integer:
+    @Reasoning
+    Fused multiply-add per IEEE 754-2008 §5.4.1: (a * b) + c with a
+    SINGLE correctly-rounded result. The exact product is computed in
+    the digit-buffer domain (up to dca+dcb digits, unbounded by
+    precision_digits) and then added to c with the user's rounding
+    mode. The "single rounding" property holds because the intermediate
+    product is exact in the buffer representation; only the final
+    add+round step introduces rounding.
+    @End Reasoning
+
+    @Implementation
+    1. NaN propagation across all three operands.
+    2. Inf handling: Inf*0 + anything -> qNaN; otherwise propagate Inf.
+    3. Compute exact product (no precision cap).
+    4. Wrap as an unpacked struct with sufficient precision capacity
+       to hold the full product.
+    5. arbitrary_decimal_add with the user's rounding mode and
+       precision_digits.
+    @End Implementation
+
+    @Performance_Hints
+    One large mul + one add. Heavier than separate mul+add by ~25%
+    but produces the IEEE 754-2008 correctly-rounded result.
+    @End Performance_Hints
+
+    @Security_Scope
+    Inf * 0 + anything -> qNaN; Inf*finite + opposite-sign-Inf -> qNaN.
+    @End Security_Scope
+
+    Let prec be precision_digits
+    If prec is less than 1:
+        Set prec to APD_DEFAULT_PRECISION
+    End If
+    Let np_ab be apd_propagate_nan(a, b)
+    If np_ab is not equal to 0:
+        Return np_ab
+    End If
+    Let np_c be apd_propagate_nan(c, c)
+    If np_c is not equal to 0:
+        Return np_c
+    End If
+    If a is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    If b is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+    If c is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, APD_ROUND_HALF_EVEN)
+    End If
+
+    Let ka be __load(a, 8)
+    Let kb be __load(b, 8)
+    Let kc be __load(c, 8)
+    Let sa be __load(a, 0)
+    Let sb be __load(b, 0)
+    Let sc be __load(c, 0)
+    Let rm be __load(a, 48)
+    If rm is less than 0:
+        Set rm to APD_ROUND_HALF_EVEN
+    End If
+    If rm is greater than APD_ROUND_HALF_AWAY_FROM_ZERO:
+        Set rm to APD_ROUND_HALF_EVEN
+    End If
+
+    Let sign_p be 0
+    If sa is not equal to sb:
+        Set sign_p to 1
+    End If
+
+    Let a_inf be 0
+    If ka is equal to APD_KIND_POS_INF:
+        Set a_inf to 1
+    End If
+    If ka is equal to APD_KIND_NEG_INF:
+        Set a_inf to 1
+    End If
+    Let b_inf be 0
+    If kb is equal to APD_KIND_POS_INF:
+        Set b_inf to 1
+    End If
+    If kb is equal to APD_KIND_NEG_INF:
+        Set b_inf to 1
+    End If
+    Let c_inf be 0
+    If kc is equal to APD_KIND_POS_INF:
+        Set c_inf to 1
+    End If
+    If kc is equal to APD_KIND_NEG_INF:
+        Set c_inf to 1
+    End If
+
+    Let a_zero be arbitrary_decimal_is_zero(a)
+    Let b_zero be arbitrary_decimal_is_zero(b)
+
+    Let prod_is_inf be 0
+    If a_inf is equal to 1:
+        If b_zero is equal to 1:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Set prod_is_inf to 1
+    End If
+    If b_inf is equal to 1:
+        If a_zero is equal to 1:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Set prod_is_inf to 1
+    End If
+
+    If prod_is_inf is equal to 1:
+        If c_inf is equal to 1:
+            If sc is not equal to sign_p:
+                Return arbitrary_decimal_make_qnan(prec, rm)
+            End If
+        End If
+        Return arbitrary_decimal_make_infinity(sign_p, prec, rm)
+    End If
+    If c_inf is equal to 1:
+        Return arbitrary_decimal_make_infinity(sc, prec, rm)
+    End If
+
+    Note: All finite. Compute exact product, wrap, then add c.
+    Let da be __load(a, 16)
+    Let db be __load(b, 16)
+    Let dca be __load(a, 24)
+    Let dcb be __load(b, 24)
+    Let ea be __load(a, 32)
+    Let eb be __load(b, 32)
+    Let exp_sum be ea plus eb
+
+    If a_zero is equal to 1:
+        Let copy_c be arbitrary_decimal_neg(c)
+        If copy_c is equal to 0:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Let restored be arbitrary_decimal_neg(copy_c)
+        arbitrary_decimal_destroy(copy_c)
+        Return restored
+    End If
+    If b_zero is equal to 1:
+        Let copy_c2 be arbitrary_decimal_neg(c)
+        If copy_c2 is equal to 0:
+            Return arbitrary_decimal_make_qnan(prec, rm)
+        End If
+        Let restored2 be arbitrary_decimal_neg(copy_c2)
+        arbitrary_decimal_destroy(copy_c2)
+        Return restored2
+    End If
+
+    Let prod_count_ptr be Layout.allocate(8)
+    If prod_count_ptr is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+    Let prod be Bignum.decbn_mul(da, dca, db, dcb, prod_count_ptr)
+    Let prod_count be __load(prod_count_ptr, 0)
+    Layout.deallocate(prod_count_ptr)
+    If prod is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+
+    Let exact_prod be apd_unpacked_create(sign_p, APD_KIND_FINITE, prod, prod_count, exp_sum, prod_count plus 2, rm)
+    If exact_prod is equal to 0:
+        Return arbitrary_decimal_make_qnan(prec, rm)
+    End If
+
+    Let result be arbitrary_decimal_add(exact_prod, c, prec)
+    arbitrary_decimal_destroy(exact_prod)
+    Return result
+End Process
+
+Note: ============================================================================
+Note: String formatting (IEEE 754-2008 §5.12.2 + financial extensions)
+Note: ============================================================================
+
+Process called "apd_count_int_digits" takes value as Integer returns Integer:
+    @Reasoning
+    Counts decimal digits in a non-negative Integer. Used by the
+    exponent formatter.
+    @End Reasoning
+    @Implementation
+    Successive division by 10.
+    @End Implementation
+    @Performance_Hints
+    O(log10 value).
+    @End Performance_Hints
+    @Security_Scope
+    Negative input treated as absolute value.
+    @End Security_Scope
+
+    Let v be value
+    If v is less than 0:
+        Set v to 0 minus v
+    End If
+    If v is equal to 0:
+        Return 1
+    End If
+    Let n be 0
+    While v is greater than 0:
+        Set n to n plus 1
+        Set v to v divided by 10
+    End While
+    Return n
+End Process
+
+Process called "apd_write_int" takes value as Integer, out as Integer, offset as Integer returns Integer:
+    @Reasoning
+    Writes a signed Integer as ASCII into out starting at offset.
+    Returns the number of bytes written.
+    @End Reasoning
+    @Implementation
+    Sign byte (if negative), then digits from MSD to LSD via reverse.
+    @End Implementation
+    @Performance_Hints
+    O(log10 |value|).
+    @End Performance_Hints
+    @Security_Scope
+    Caller must ensure adequate buffer capacity (at most 20 bytes for
+    signed 64-bit Integer).
+    @End Security_Scope
+
+    Let cur be offset
+    Let v be value
+    If v is less than 0:
+        Memory.memory_set_byte(out, cur, 45)
+        Set cur to cur plus 1
+        Set v to 0 minus v
+    End If
+    If v is equal to 0:
+        Memory.memory_set_byte(out, cur, 48)
+        Return cur plus 1 minus offset
+    End If
+    Let tmp be Layout.allocate(24)
+    If tmp is equal to 0:
+        Return 0
+    End If
+    Let tp be 0
+    While v is greater than 0:
+        Let dd be v minus ((v divided by 10) multiplied by 10)
+        Memory.memory_set_byte(tmp, tp, dd plus 48)
+        Set tp to tp plus 1
+        Set v to v divided by 10
+    End While
+    Let mi be tp minus 1
+    While mi is greater than or equal to 0:
+        Memory.memory_set_byte(out, cur, Memory.memory_get_byte(tmp, mi))
+        Set cur to cur plus 1
+        Set mi to mi minus 1
+    End While
+    Layout.deallocate(tmp)
+    Return cur minus offset
+End Process
+
+Process called "apd_write_plain" takes p as Integer, out as Integer, out_size as Integer returns Integer:
+    @Reasoning
+    Plain decimal formatting: "[-]ddd.ddd" with no exponent suffix.
+    Handles arbitrary exponent positions including those where leading
+    zeros must be inserted ("0.000123") or trailing zeros appended
+    ("12300000").
+    @End Reasoning
+
+    @Implementation
+    1. Sign byte.
+    2. If exponent >= 0: emit digits, then |exp| trailing zeros.
+    3. If exponent < 0: with k = -exp digit positions after the point,
+       emit either "0.000...digits" (when k > digit_count) or insert
+       the dot at position digit_count - k.
+    @End Implementation
+
+    @Performance_Hints
+    O(digit_count + |exp|).
+    @End Performance_Hints
+
+    @Security_Scope
+    Insufficient output buffer returns 0.
+    @End Security_Scope
+
+    Let sa be __load(p, 0)
+    Let da be __load(p, 16)
+    Let dca be __load(p, 24)
+    Let ea be __load(p, 32)
+    Let pos be 0
+    If sa is equal to 1:
+        Memory.memory_set_byte(out, pos, 45)
+        Set pos to pos plus 1
+    End If
+
+    If ea is greater than or equal to 0:
+        Note: Emit digits then trailing zeros.
+        Let i be 0
+        While i is less than dca:
+            If pos is greater than or equal to out_size minus 1:
+                Memory.memory_set_byte(out, out_size minus 1, 0)
+                Return 0
+            End If
+            Memory.memory_set_byte(out, pos, Memory.memory_get_byte(da, i) plus 48)
+            Set pos to pos plus 1
+            Set i to i plus 1
+        End While
+        Let z be 0
+        While z is less than ea:
+            If pos is greater than or equal to out_size minus 1:
+                Memory.memory_set_byte(out, out_size minus 1, 0)
+                Return 0
+            End If
+            Memory.memory_set_byte(out, pos, 48)
+            Set pos to pos plus 1
+            Set z to z plus 1
+        End While
+    Otherwise:
+        Let neg_e be 0 minus ea
+        If neg_e is greater than or equal to dca:
+            Note: "0.000...digits"
+            Memory.memory_set_byte(out, pos, 48)
+            Set pos to pos plus 1
+            Memory.memory_set_byte(out, pos, 46)
+            Set pos to pos plus 1
+            Let lz be 0
+            While lz is less than neg_e minus dca:
+                If pos is greater than or equal to out_size minus 1:
+                    Memory.memory_set_byte(out, out_size minus 1, 0)
+                    Return 0
+                End If
+                Memory.memory_set_byte(out, pos, 48)
+                Set pos to pos plus 1
+                Set lz to lz plus 1
+            End While
+            Let i2 be 0
+            While i2 is less than dca:
+                If pos is greater than or equal to out_size minus 1:
+                    Memory.memory_set_byte(out, out_size minus 1, 0)
+                    Return 0
+                End If
+                Memory.memory_set_byte(out, pos, Memory.memory_get_byte(da, i2) plus 48)
+                Set pos to pos plus 1
+                Set i2 to i2 plus 1
+            End While
+        Otherwise:
+            Note: Dot at position dca - neg_e.
+            Let dot_pos be dca minus neg_e
+            Let i3 be 0
+            While i3 is less than dca:
+                If i3 is equal to dot_pos:
+                    If pos is greater than or equal to out_size minus 1:
+                        Memory.memory_set_byte(out, out_size minus 1, 0)
+                        Return 0
+                    End If
+                    Memory.memory_set_byte(out, pos, 46)
+                    Set pos to pos plus 1
+                End If
+                If pos is greater than or equal to out_size minus 1:
+                    Memory.memory_set_byte(out, out_size minus 1, 0)
+                    Return 0
+                End If
+                Memory.memory_set_byte(out, pos, Memory.memory_get_byte(da, i3) plus 48)
+                Set pos to pos plus 1
+                Set i3 to i3 plus 1
+            End While
+        End If
+    End If
+    Memory.memory_set_byte(out, pos, 0)
+    Return pos
+End Process
+
+Process called "apd_write_scientific" takes p as Integer, out as Integer, out_size as Integer returns Integer:
+    @Reasoning
+    Scientific notation: "[-]D.DDDeEXP" with the implicit dot after the
+    first significant digit. Matches IEEE 754-2008 §5.12.2's expressed
+    decimal form.
+    @End Reasoning
+
+    @Implementation
+    1. Sign byte.
+    2. First digit + "." + remaining digits (skip dot if dca == 1).
+    3. "e" + signed exponent of the form (ea + dca - 1).
+    @End Implementation
+
+    @Performance_Hints
+    O(digit_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Insufficient buffer returns 0.
+    @End Security_Scope
+
+    Let sa be __load(p, 0)
+    Let da be __load(p, 16)
+    Let dca be __load(p, 24)
+    Let ea be __load(p, 32)
+    Let pos be 0
+    If sa is equal to 1:
+        Memory.memory_set_byte(out, pos, 45)
+        Set pos to pos plus 1
+    End If
+    If dca is equal to 0:
+        Memory.memory_set_byte(out, pos, 48)
+        Set pos to pos plus 1
+        Memory.memory_set_byte(out, pos, 101)
+        Set pos to pos plus 1
+        Memory.memory_set_byte(out, pos, 48)
+        Set pos to pos plus 1
+        Memory.memory_set_byte(out, pos, 0)
+        Return pos
+    End If
+    Memory.memory_set_byte(out, pos, Memory.memory_get_byte(da, 0) plus 48)
+    Set pos to pos plus 1
+    If dca is greater than 1:
+        Memory.memory_set_byte(out, pos, 46)
+        Set pos to pos plus 1
+        Let k be 1
+        While k is less than dca:
+            If pos is greater than or equal to out_size minus 1:
+                Memory.memory_set_byte(out, out_size minus 1, 0)
+                Return 0
+            End If
+            Memory.memory_set_byte(out, pos, Memory.memory_get_byte(da, k) plus 48)
+            Set pos to pos plus 1
+            Set k to k plus 1
+        End While
+    End If
+    Memory.memory_set_byte(out, pos, 101)
+    Set pos to pos plus 1
+    Let exp_eff be ea plus dca minus 1
+    Let wrote be apd_write_int(exp_eff, out, pos)
+    Set pos to pos plus wrote
+    Memory.memory_set_byte(out, pos, 0)
+    Return pos
+End Process
+
+Process called "apd_write_engineering" takes p as Integer, out as Integer, out_size as Integer returns Integer:
+    @Reasoning
+    Engineering notation: like scientific, but the exponent is constrained
+    to a multiple of 3 and the mantissa has 1-3 digits before the dot.
+    Used in scientific/engineering display where SI-prefix alignment is
+    expected.
+    @End Reasoning
+
+    @Implementation
+    1. Compute effective exponent E = ea + dca - 1.
+    2. Find E_eng = floor(E / 3) * 3 (handling negatives: -1/3 = -1 in
+       floor semantics, but integer division truncates toward zero; we
+       adjust for negatives explicitly).
+    3. Mantissa shift = E - E_eng (in {0, 1, 2}); the mantissa has
+       (1 + shift) digits before the dot.
+    @End Implementation
+
+    @Performance_Hints
+    O(digit_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Insufficient buffer returns 0.
+    @End Security_Scope
+
+    Let sa be __load(p, 0)
+    Let da be __load(p, 16)
+    Let dca be __load(p, 24)
+    Let ea be __load(p, 32)
+    Let pos be 0
+    If sa is equal to 1:
+        Memory.memory_set_byte(out, pos, 45)
+        Set pos to pos plus 1
+    End If
+    If dca is equal to 0:
+        Memory.memory_set_byte(out, pos, 48)
+        Set pos to pos plus 1
+        Memory.memory_set_byte(out, pos, 101)
+        Set pos to pos plus 1
+        Memory.memory_set_byte(out, pos, 48)
+        Set pos to pos plus 1
+        Memory.memory_set_byte(out, pos, 0)
+        Return pos
+    End If
+
+    Let E be ea plus dca minus 1
+    Let E_eng be 0
+    Let shift be 0
+    Note: floor(E / 3) toward negative infinity.
+    If E is greater than or equal to 0:
+        Set E_eng to (E divided by 3) multiplied by 3
+        Set shift to E minus E_eng
+    Otherwise:
+        Note: For negative E, integer division truncates toward zero. To
+        Note: get floor, subtract 2 (or up to 2) from E before dividing.
+        Let neg_E be 0 minus E
+        Let mod3 be neg_E minus ((neg_E divided by 3) multiplied by 3)
+        If mod3 is equal to 0:
+            Set E_eng to E
+            Set shift to 0
+        Otherwise:
+            Set E_eng to E minus (3 minus mod3)
+            Set shift to 3 minus mod3
+        End If
+    End If
+
+    Let mant_int_digits be shift plus 1
+    Note: Emit mantissa: mant_int_digits before dot, then dot then remaining.
+    Let k be 0
+    While k is less than dca:
+        If k is equal to mant_int_digits:
+            If pos is greater than or equal to out_size minus 1:
+                Memory.memory_set_byte(out, out_size minus 1, 0)
+                Return 0
+            End If
+            Memory.memory_set_byte(out, pos, 46)
+            Set pos to pos plus 1
+        End If
+        If pos is greater than or equal to out_size minus 1:
+            Memory.memory_set_byte(out, out_size minus 1, 0)
+            Return 0
+        End If
+        Memory.memory_set_byte(out, pos, Memory.memory_get_byte(da, k) plus 48)
+        Set pos to pos plus 1
+        Set k to k plus 1
+    End While
+    If dca is less than mant_int_digits:
+        Let trz be dca
+        While trz is less than mant_int_digits:
+            If pos is greater than or equal to out_size minus 1:
+                Memory.memory_set_byte(out, out_size minus 1, 0)
+                Return 0
+            End If
+            Memory.memory_set_byte(out, pos, 48)
+            Set pos to pos plus 1
+            Set trz to trz plus 1
+        End While
+    End If
+    Memory.memory_set_byte(out, pos, 101)
+    Set pos to pos plus 1
+    Let wrote be apd_write_int(E_eng, out, pos)
+    Set pos to pos plus wrote
+    Memory.memory_set_byte(out, pos, 0)
+    Return pos
+End Process
+
+Process called "apd_write_financial" takes p as Integer, out as Integer, out_size as Integer returns Integer:
+    @Reasoning
+    Financial-accounting format: fixed two decimal places (cent
+    precision), parentheses for negative numbers per US GAAP financial
+    statement convention. The value is conceptually rounded to two
+    decimal places for display but the underlying ArbitraryDecimal is
+    not mutated.
+    @End Reasoning
+
+    @Implementation
+    1. Make a working copy of the digit buffer.
+    2. Adjust to exponent -2 by either appending zeros (exp > -2),
+       round-half-even truncation (exp < -2), or no change.
+    3. Emit "(...)" if negative, otherwise emit plain digits with the
+       dot two positions from the right.
+    @End Implementation
+
+    @Performance_Hints
+    O(digit_count + |exp + 2|).
+    @End Performance_Hints
+
+    @Security_Scope
+    Insufficient buffer returns 0.
+    @End Security_Scope
+
+    Let sa be __load(p, 0)
+    Let da be __load(p, 16)
+    Let dca be __load(p, 24)
+    Let ea be __load(p, 32)
+    Note: Build a working buffer scaled to exponent -2.
+    Let target_exp be -2
+    Let work_count be dca
+    Let work_buf be Bignum.decbn_copy(da, dca)
+    If work_buf is equal to 0:
+        Return 0
+    End If
+
+    If ea is greater than target_exp:
+        Note: Append (ea - target_exp) trailing zeros.
+        Let add_z be ea minus target_exp
+        Let big_buf be Bignum.decbn_alloc(work_count plus add_z plus 2)
+        If big_buf is equal to 0:
+            Bignum.decbn_free(work_buf)
+            Return 0
+        End If
+        Let cpi be 0
+        While cpi is less than work_count:
+            Memory.memory_set_byte(big_buf, cpi, Memory.memory_get_byte(work_buf, cpi))
+            Set cpi to cpi plus 1
+        End While
+        Let zi be 0
+        While zi is less than add_z:
+            Memory.memory_set_byte(big_buf, work_count plus zi, 0)
+            Set zi to zi plus 1
+        End While
+        Bignum.decbn_free(work_buf)
+        Set work_buf to big_buf
+        Set work_count to work_count plus add_z
+    End If
+    If ea is less than target_exp:
+        Note: Round-half-even truncate (target_exp - ea) digits.
+        Let drop be target_exp minus ea
+        If drop is greater than or equal to work_count:
+            Bignum.decbn_free(work_buf)
+            Let pos2 be 0
+            If sa is equal to 1:
+                Memory.memory_set_byte(out, pos2, 40)
+                Set pos2 to pos2 plus 1
+            End If
+            Memory.memory_set_byte(out, pos2, 48)
+            Set pos2 to pos2 plus 1
+            Memory.memory_set_byte(out, pos2, 46)
+            Set pos2 to pos2 plus 1
+            Memory.memory_set_byte(out, pos2, 48)
+            Set pos2 to pos2 plus 1
+            Memory.memory_set_byte(out, pos2, 48)
+            Set pos2 to pos2 plus 1
+            If sa is equal to 1:
+                Memory.memory_set_byte(out, pos2, 41)
+                Set pos2 to pos2 plus 1
+            End If
+            Memory.memory_set_byte(out, pos2, 0)
+            Return pos2
+        End If
+        Let kept be work_count minus drop
+        Let rd be Memory.memory_get_byte(work_buf, kept)
+        Let sticky be 0
+        Let si be kept plus 1
+        While si is less than work_count:
+            If Memory.memory_get_byte(work_buf, si) is not equal to 0:
+                Set sticky to 1
+                Set si to work_count
+            Otherwise:
+                Set si to si plus 1
+            End If
+        End While
+        Let rup be 0
+        If rd is greater than 5:
+            Set rup to 1
+        Otherwise:
+            If rd is equal to 5:
+                If sticky is equal to 1:
+                    Set rup to 1
+                Otherwise:
+                    If kept is greater than 0:
+                        Let lk be Memory.memory_get_byte(work_buf, kept minus 1)
+                        If lk is not equal to ((lk divided by 2) multiplied by 2):
+                            Set rup to 1
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set work_count to kept
+        If rup is equal to 1:
+            Let carry be 1
+            Let cp be work_count minus 1
+            While cp is greater than or equal to 0:
+                If carry is equal to 0:
+                    Set cp to -1
+                Otherwise:
+                    Let d2 be Memory.memory_get_byte(work_buf, cp)
+                    Set d2 to d2 plus 1
+                    If d2 is equal to 10:
+                        Memory.memory_set_byte(work_buf, cp, 0)
+                        Set carry to 1
+                    Otherwise:
+                        Memory.memory_set_byte(work_buf, cp, d2)
+                        Set carry to 0
+                    End If
+                    Set cp to cp minus 1
+                End If
+            End While
+            If carry is equal to 1:
+                Let r2 be work_count minus 1
+                While r2 is greater than or equal to 0:
+                    Memory.memory_set_byte(work_buf, r2 plus 1, Memory.memory_get_byte(work_buf, r2))
+                    Set r2 to r2 minus 1
+                End While
+                Memory.memory_set_byte(work_buf, 0, 1)
+                Set work_count to work_count plus 1
+            End If
+        End If
+    End If
+
+    Let pos be 0
+    If sa is equal to 1:
+        Memory.memory_set_byte(out, pos, 40)
+        Set pos to pos plus 1
+    End If
+    Note: Emit with dot at position work_count - 2.
+    If work_count is less than 3:
+        Note: Pad with leading zero(s) to ensure at least "0.dd".
+        Memory.memory_set_byte(out, pos, 48)
+        Set pos to pos plus 1
+        Memory.memory_set_byte(out, pos, 46)
+        Set pos to pos plus 1
+        If work_count is equal to 1:
+            Memory.memory_set_byte(out, pos, 48)
+            Set pos to pos plus 1
+        End If
+        Let kk be 0
+        While kk is less than work_count:
+            Memory.memory_set_byte(out, pos, Memory.memory_get_byte(work_buf, kk) plus 48)
+            Set pos to pos plus 1
+            Set kk to kk plus 1
+        End While
+    Otherwise:
+        Let dot_pos be work_count minus 2
+        Let kk2 be 0
+        While kk2 is less than work_count:
+            If kk2 is equal to dot_pos:
+                Memory.memory_set_byte(out, pos, 46)
+                Set pos to pos plus 1
+            End If
+            Memory.memory_set_byte(out, pos, Memory.memory_get_byte(work_buf, kk2) plus 48)
+            Set pos to pos plus 1
+            Set kk2 to kk2 plus 1
+        End While
+    End If
+    Bignum.decbn_free(work_buf)
+    If sa is equal to 1:
+        Memory.memory_set_byte(out, pos, 41)
+        Set pos to pos plus 1
+    End If
+    Memory.memory_set_byte(out, pos, 0)
+    Return pos
+End Process
+
+Process called "arbitrary_decimal_to_string" takes value as Integer, buffer as Integer, buffer_size as Integer, format_style as Integer returns Integer:
+    @Reasoning
+    Multi-style decimal formatter per IEEE 754-2008 §5.12.2 plus
+    accounting-style extensions. Selects between plain, scientific,
+    engineering, and financial outputs.
+
+    Special values: NaN -> "NaN", +Inf -> "Inf", -Inf -> "-Inf".
+    @End Reasoning
+
+    @Implementation
+    Dispatch on format_style with shared NaN/Inf handling.
+    @End Implementation
+
+    @Performance_Hints
+    O(digit_count) plus the style-specific overhead.
+    @End Performance_Hints
+
+    @Security_Scope
+    Insufficient buffer returns 0 with no partial writes guaranteed.
+    Callers must provide buffer_size >= digit_count + 32 for safety.
+    @End Security_Scope
+
+    If buffer is equal to 0:
+        Return 0
+    End If
+    If buffer_size is less than 8:
+        Return 0
+    End If
+    If value is equal to 0:
+        Memory.memory_set_byte(buffer, 0, 78)
+        Memory.memory_set_byte(buffer, 1, 97)
+        Memory.memory_set_byte(buffer, 2, 78)
+        Memory.memory_set_byte(buffer, 3, 0)
+        Return 3
+    End If
+
+    Let ka be __load(value, 8)
+    If ka is equal to APD_KIND_QNAN:
+        Memory.memory_set_byte(buffer, 0, 78)
+        Memory.memory_set_byte(buffer, 1, 97)
+        Memory.memory_set_byte(buffer, 2, 78)
+        Memory.memory_set_byte(buffer, 3, 0)
+        Return 3
+    End If
+    If ka is equal to APD_KIND_POS_INF:
+        Memory.memory_set_byte(buffer, 0, 73)
+        Memory.memory_set_byte(buffer, 1, 110)
+        Memory.memory_set_byte(buffer, 2, 102)
+        Memory.memory_set_byte(buffer, 3, 0)
+        Return 3
+    End If
+    If ka is equal to APD_KIND_NEG_INF:
+        Memory.memory_set_byte(buffer, 0, 45)
+        Memory.memory_set_byte(buffer, 1, 73)
+        Memory.memory_set_byte(buffer, 2, 110)
+        Memory.memory_set_byte(buffer, 3, 102)
+        Memory.memory_set_byte(buffer, 4, 0)
+        Return 4
+    End If
+
+    If format_style is equal to APD_FORMAT_SCIENTIFIC:
+        Return apd_write_scientific(value, buffer, buffer_size)
+    End If
+    If format_style is equal to APD_FORMAT_ENGINEERING:
+        Return apd_write_engineering(value, buffer, buffer_size)
+    End If
+    If format_style is equal to APD_FORMAT_FINANCIAL_ACCOUNTING:
+        Return apd_write_financial(value, buffer, buffer_size)
+    End If
+    Return apd_write_plain(value, buffer, buffer_size)
+End Process

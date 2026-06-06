@@ -1,0 +1,4240 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+SCHEMA - Generic Schema AST (Tier 1)
+
+A neutral, format-agnostic AST that can losslessly represent:
+  - JSON Schema (Draft 2020-12)
+  - Apache Avro schemas
+  - Protocol Buffers descriptors
+  - OpenAPI 3.1 component schemas
+  - Runa-native schemas (runa_schema.runa)
+
+A SchemaNode is a tagged value whose data slot interpretation depends on
+its kind. The tree is owned by the caller; schema_destroy walks the tree
+and frees every owned allocation.
+
+NODE KINDS:
+  SCHEMA_OBJECT     payload = List<ObjectField>
+  SCHEMA_ARRAY      payload = SchemaNode (item type)
+  SCHEMA_STRING     payload = StringConstraints record
+  SCHEMA_INTEGER    payload = IntegerConstraints record
+  SCHEMA_FLOAT      payload = FloatConstraints record
+  SCHEMA_BOOLEAN    payload = 0 (no parameters)
+  SCHEMA_NULL       payload = 0 (no parameters)
+  SCHEMA_UNION      payload = List<SchemaNode> (variants)
+  SCHEMA_REFERENCE  payload = String (named reference)
+  SCHEMA_ENUM       payload = List<String> (allowed values)
+  SCHEMA_ANY        payload = 0 (always accepts)
+
+Layout (SchemaNode, 32 bytes):
+  offset  0 : kind          (8 bytes, see SCHEMA_* constants)
+  offset  8 : payload       (8 bytes, type-dependent)
+  offset 16 : title         (8 bytes, String pointer or 0 - human title)
+  offset 24 : description   (8 bytes, String pointer or 0 - long-form docs)
+
+Layout (ObjectField, 40 bytes):
+  offset  0 : name          (8 bytes, String pointer)
+  offset  8 : schema        (8 bytes, SchemaNode pointer)
+  offset 16 : required      (8 bytes, 0 or 1)
+  offset 24 : default       (8 bytes, ConfigValue pointer or 0)
+  offset 32 : description   (8 bytes, String pointer or 0)
+
+Layout (StringConstraints, 32 bytes):
+  offset  0 : min_length    (8 bytes, -1 if unbounded)
+  offset  8 : max_length    (8 bytes, -1 if unbounded)
+  offset 16 : pattern       (8 bytes, String pointer or 0 - regex source)
+  offset 24 : format        (8 bytes, see FORMAT_* constants)
+
+Layout (IntegerConstraints, 40 bytes):
+  offset  0 : has_min       (8 bytes)
+  offset  8 : min_value     (8 bytes)
+  offset 16 : has_max       (8 bytes)
+  offset 24 : max_value     (8 bytes)
+  offset 32 : multiple_of   (8 bytes, 0 if unset)
+
+Layout (FloatConstraints, 40 bytes):
+  offset  0 : has_min       (8 bytes)
+  offset  8 : min_value     (8 bytes, Float pointer)
+  offset 16 : has_max       (8 bytes)
+  offset 24 : max_value     (8 bytes, Float pointer)
+  offset 32 : exclusive     (8 bytes, 0=inclusive, 1=both exclusive)
+
+A ValidationIssue (24 bytes) is the diagnostic value returned by
+schema_validate. It records a JSON-pointer-style path identifying the
+offending sub-value and a human-readable message:
+  offset  0 : path           (8 bytes, String pointer)
+  offset  8 : message        (8 bytes, String pointer)
+  offset 16 : code           (8 bytes, ERROR_* constant)
+
+References:
+  - JSON Schema Draft 2020-12  https://json-schema.org/draft/2020-12/schema
+  - Apache Avro 1.11           https://avro.apache.org/docs/1.11.1/specification/
+  - Protocol Buffers           https://protobuf.dev/programming-guides/proto3/
+  - OpenAPI 3.1                https://spec.openapis.org/oas/v3.1.0
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/config/config.runa" as Cfg
+Import "compiler/frontend/primitives/intrinsics/builtins.runa" as Builtins
+Import "compiler/frontend/primitives/text/regex.runa" as Regex
+Import "compiler/frontend/primitives/identity/uuid.runa" as UUID
+Import "compiler/frontend/primitives/net/ipv4_address.runa" as IPv4
+Import "compiler/frontend/primitives/net/ipv6_address.runa" as IPv6
+Import "compiler/frontend/primitives/net/url.runa" as URL
+Import "compiler/frontend/primitives/time/date.runa" as Date
+Import "compiler/frontend/primitives/time/time_of_day.runa" as TOD
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Note: SchemaNode is 64 bytes. The first 32 bytes are the original layout
+Note: (kind, payload, title, description). The trailing 32 bytes carry
+Note: extension slots populated for kind-specific advanced keywords:
+Note:   offset 32: extras pointer (object/integer/float/array extras record, or 0)
+Note:   offset 40: definitions dict (root schemas store the $defs registry, or 0)
+Note:   offset 48: reserved (0)
+Note:   offset 56: reserved (0)
+Let SCHEMA_NODE_SIZE be 64
+Let OBJECT_FIELD_SIZE be 40
+Let STRING_CONSTRAINTS_SIZE be 32
+Let INTEGER_CONSTRAINTS_SIZE be 40
+Let FLOAT_CONSTRAINTS_SIZE be 40
+Let VALIDATION_ISSUE_SIZE be 24
+Note: Array payload record layout (32 bytes):
+Note:   offset  0: item_schema pointer
+Note:   offset  8: min_items (sentinel 0 minus 1 = unbounded)
+Note:   offset 16: max_items (sentinel 0 minus 1 = unbounded)
+Note:   offset 24: unique_items flag (0 or 1)
+Let ARRAY_PAYLOAD_SIZE be 32
+
+Note: Object extras record layout (32 bytes):
+Note:   offset  0: additional_properties_schema (SchemaNode pointer, or 0)
+Note:   offset  8: additional_properties_policy (0=not set, 1=false-reject-all,
+Note:              2=true-allow-all, 3=schema-constrained)
+Note:   offset 16: dependent_required (Dictionary<String, List<String>>, or 0)
+Note:   offset 24: min_properties (sentinel 0 minus 1 = unbounded)
+Let OBJECT_EXTRAS_SIZE be 32
+
+Note: Integer/Float extras record layout (32 bytes):
+Note:   offset  0: exclusive_min int64 value
+Note:   offset  8: exclusive_min_set (0 or 1)
+Note:   offset 16: exclusive_max int64 value
+Note:   offset 24: exclusive_max_set (0 or 1)
+Let NUMERIC_EXTRAS_SIZE be 32
+
+Note: Array extras record layout (16 bytes):
+Note:   offset  0: prefix_items (List<SchemaNode> for positional schemas, or 0)
+Note:   offset  8: contains_schema (SchemaNode pointer for "must contain", or 0)
+Let ARRAY_EXTRAS_SIZE be 16
+
+Note: AP policy constants for the additional_properties slot.
+Let AP_POLICY_UNSET be 0
+Let AP_POLICY_FALSE be 1
+Let AP_POLICY_TRUE be 2
+Let AP_POLICY_SCHEMA be 3
+
+Let SCHEMA_OBJECT be 1
+Let SCHEMA_ARRAY be 2
+Let SCHEMA_STRING be 3
+Let SCHEMA_INTEGER be 4
+Let SCHEMA_FLOAT be 5
+Let SCHEMA_BOOLEAN be 6
+Let SCHEMA_NULL be 7
+Let SCHEMA_UNION be 8
+Let SCHEMA_REFERENCE be 9
+Let SCHEMA_ENUM be 10
+Let SCHEMA_ANY be 11
+Let SCHEMA_AND be 12
+Let SCHEMA_NOT be 13
+Let SCHEMA_ALL_OF be 14
+Let SCHEMA_ONE_OF be 15
+Let SCHEMA_CONST be 16
+
+Note: String format vocabulary aligned with JSON Schema Draft 2020-12.
+Let FORMAT_NONE be 0
+Let FORMAT_EMAIL be 1
+Let FORMAT_URL be 2
+Let FORMAT_UUID be 3
+Let FORMAT_DATE be 4
+Let FORMAT_TIME be 5
+Let FORMAT_DATE_TIME be 6
+Let FORMAT_DURATION be 7
+Let FORMAT_IPV4 be 8
+Let FORMAT_IPV6 be 9
+Let FORMAT_HOSTNAME be 10
+Let FORMAT_REGEX be 11
+Let FORMAT_JSON_POINTER be 12
+Let FORMAT_URI be 13
+Let FORMAT_URI_REFERENCE be 14
+Let FORMAT_IDN_EMAIL be 15
+Let FORMAT_IDN_HOSTNAME be 16
+Let FORMAT_IRI be 17
+Let FORMAT_URI_TEMPLATE be 18
+Let FORMAT_RELATIVE_JSON_POINTER be 19
+
+Note: Composition operators for schema_compose.
+Let COMPOSE_AND be 1
+Let COMPOSE_OR be 2
+Let COMPOSE_NOT be 3
+
+Note: Validation error codes.
+Let ERROR_TYPE_MISMATCH be 1
+Let ERROR_MIN_LENGTH be 2
+Let ERROR_MAX_LENGTH be 3
+Let ERROR_PATTERN be 4
+Let ERROR_FORMAT be 5
+Let ERROR_MIN_VALUE be 6
+Let ERROR_MAX_VALUE be 7
+Let ERROR_MULTIPLE_OF be 8
+Let ERROR_MISSING_FIELD be 9
+Let ERROR_ENUM_VIOLATION be 10
+Let ERROR_REFERENCE_UNRESOLVED be 11
+Let ERROR_UNION_NO_MATCH be 12
+
+Note: ============================================================================
+Note: CONSTRAINT CONSTRUCTORS
+Note: ============================================================================
+
+@Reasoning
+Allocate a StringConstraints with the supplied bounds and format. -1 in
+either bound means unbounded; FORMAT_NONE means no semantic-format check.
+@End Reasoning
+
+@Implementation
+Allocate 32 bytes and store the four fields. Pattern is duplicated to
+guarantee owned lifetime.
+@End Implementation
+
+@Performance_Hints
+Time: O(p) where p is pattern length (for the duplicate). Space: O(p).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "string_constraints_create" takes min_length as Integer, max_length as Integer, pattern as Integer, format as Integer returns Integer:
+    Let c be proc allocate from Layout with STRING_CONSTRAINTS_SIZE
+    If c is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with c, 0, min_length
+    proc memory_set_int64 from Memory with c, 8, max_length
+    Let dup be 0
+    If pattern is not equal to 0:
+        Set dup to proc string_duplicate from StringPrim with pattern
+    End If
+    proc memory_set_int64 from Memory with c, 16, dup
+    proc memory_set_int64 from Memory with c, 24, format
+    Return c
+End Process
+
+@Reasoning
+Free a StringConstraints record. Releases the pattern string if owned.
+@End Reasoning
+
+@Implementation
+Free the pattern (if non-zero), then free the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe to call with a null pointer (no-op).
+@End Security_Scope
+Process called "string_constraints_destroy" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let p be proc memory_get_int64 from Memory with c, 16
+    If p is not equal to 0:
+        proc deallocate from Layout with p
+    End If
+    proc deallocate from Layout with c
+    Return 1
+End Process
+
+@Reasoning
+Allocate an IntegerConstraints with optional min/max and multiple_of.
+@End Reasoning
+
+@Implementation
+Allocate 40 bytes; store the five fields in order.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "integer_constraints_create" takes has_min as Integer, min_value as Integer, has_max as Integer, max_value as Integer, multiple_of as Integer returns Integer:
+    Let c be proc allocate from Layout with INTEGER_CONSTRAINTS_SIZE
+    If c is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with c, 0, has_min
+    proc memory_set_int64 from Memory with c, 8, min_value
+    proc memory_set_int64 from Memory with c, 16, has_max
+    proc memory_set_int64 from Memory with c, 24, max_value
+    proc memory_set_int64 from Memory with c, 32, multiple_of
+    Return c
+End Process
+
+@Reasoning
+Free an IntegerConstraints record.
+@End Reasoning
+
+@Implementation
+Free the record (no owned children).
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe to call with a null pointer (no-op).
+@End Security_Scope
+Process called "integer_constraints_destroy" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    proc deallocate from Layout with c
+    Return 1
+End Process
+
+@Reasoning
+Allocate a FloatConstraints with optional bounds.
+@End Reasoning
+
+@Implementation
+Allocate 40 bytes; store fields.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "float_constraints_create" takes has_min as Integer, min_value as Integer, has_max as Integer, max_value as Integer, exclusive as Integer returns Integer:
+    Let c be proc allocate from Layout with FLOAT_CONSTRAINTS_SIZE
+    If c is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with c, 0, has_min
+    proc memory_set_int64 from Memory with c, 8, min_value
+    proc memory_set_int64 from Memory with c, 16, has_max
+    proc memory_set_int64 from Memory with c, 24, max_value
+    proc memory_set_int64 from Memory with c, 32, exclusive
+    Return c
+End Process
+
+@Reasoning
+Free a FloatConstraints record. Pointer fields are owned by the caller's
+Float allocator so we do not free them here.
+@End Reasoning
+
+@Implementation
+Free the record only.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe to call with a null pointer (no-op).
+@End Security_Scope
+Process called "float_constraints_destroy" takes c as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    proc deallocate from Layout with c
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: OBJECT FIELD CONSTRUCTORS
+Note: ============================================================================
+
+@Reasoning
+Allocate an ObjectField with the supplied name, child schema and required
+flag. The default and description fields default to 0 and can be set later
+with object_field_set_default / object_field_set_description.
+@End Reasoning
+
+@Implementation
+Duplicate the name, allocate the 40-byte record, store fields, leave
+default/description null.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) for name copy. Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or null name.
+@End Security_Scope
+Process called "object_field_create" takes name as Integer, schema as Integer, required_flag as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If schema is equal to 0:
+        Return 0
+    End If
+    Let nm be proc string_duplicate from StringPrim with name
+    If nm is equal to 0:
+        Return 0
+    End If
+    Let f be proc allocate from Layout with OBJECT_FIELD_SIZE
+    If f is equal to 0:
+        proc deallocate from Layout with nm
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with f, 0, nm
+    proc memory_set_int64 from Memory with f, 8, schema
+    Let req be 0
+    If required_flag is not equal to 0:
+        Set req to 1
+    End If
+    proc memory_set_int64 from Memory with f, 16, req
+    proc memory_set_int64 from Memory with f, 24, 0
+    proc memory_set_int64 from Memory with f, 32, 0
+    Return f
+End Process
+
+@Reasoning
+Attach a default value (ConfigValue) to a field. The field assumes
+ownership; an existing default is destroyed.
+@End Reasoning
+
+@Implementation
+Free the prior default if any, then store the new pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(d) where d is prior default subtree size. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null field input.
+@End Security_Scope
+Process called "object_field_set_default" takes f as Integer, default_value as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Let prior be proc memory_get_int64 from Memory with f, 24
+    If prior is not equal to 0:
+        proc config_value_destroy from Cfg with prior
+    End If
+    proc memory_set_int64 from Memory with f, 24, default_value
+    Return 1
+End Process
+
+@Reasoning
+Attach a description string to a field. Duplicated so the field owns it.
+@End Reasoning
+
+@Implementation
+Free any prior description and duplicate the new one.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null field input.
+@End Security_Scope
+Process called "object_field_set_description" takes f as Integer, description as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Let prior be proc memory_get_int64 from Memory with f, 32
+    If prior is not equal to 0:
+        proc deallocate from Layout with prior
+    End If
+    Let dup be 0
+    If description is not equal to 0:
+        Set dup to proc string_duplicate from StringPrim with description
+    End If
+    proc memory_set_int64 from Memory with f, 32, dup
+    Return 1
+End Process
+
+@Reasoning
+Read the field name pointer (not owned by caller).
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "object_field_name" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 0
+End Process
+
+@Reasoning
+Read the field's child schema pointer.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "object_field_schema" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 8
+End Process
+
+@Reasoning
+Read the field's required flag.
+@End Reasoning
+
+@Implementation
+Load offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 (not required) on null input.
+@End Security_Scope
+Process called "object_field_is_required" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 16
+End Process
+
+@Reasoning
+Read the field's default ConfigValue pointer.
+@End Reasoning
+
+@Implementation
+Load offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input or no default.
+@End Security_Scope
+Process called "object_field_default" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with f, 24
+End Process
+
+@Reasoning
+Free an ObjectField. Deallocates the name, the description, the default,
+and recursively the child schema.
+@End Reasoning
+
+@Implementation
+Free each owned pointer if present, then the record itself.
+@End Implementation
+
+@Performance_Hints
+Time: O(s) where s is child schema size. Space: O(d) recursion depth.
+@End Performance_Hints
+
+@Security_Scope
+Safe to call with null (no-op).
+@End Security_Scope
+Process called "object_field_destroy" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Let nm be proc memory_get_int64 from Memory with f, 0
+    If nm is not equal to 0:
+        proc deallocate from Layout with nm
+    End If
+    Let sch be proc memory_get_int64 from Memory with f, 8
+    If sch is not equal to 0:
+        proc schema_destroy with sch
+    End If
+    Let def be proc memory_get_int64 from Memory with f, 24
+    If def is not equal to 0:
+        proc config_value_destroy from Cfg with def
+    End If
+    Let desc be proc memory_get_int64 from Memory with f, 32
+    If desc is not equal to 0:
+        proc deallocate from Layout with desc
+    End If
+    proc deallocate from Layout with f
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SCHEMA NODE CONSTRUCTORS
+Note: ============================================================================
+
+@Reasoning
+Allocate a SchemaNode with the given kind and payload. Title and
+description default to 0; use schema_set_title / schema_set_description.
+@End Reasoning
+
+@Implementation
+Allocate 32 bytes and zero the metadata slots.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create" takes kind as Integer, payload as Integer returns Integer:
+    Let n be proc allocate from Layout with SCHEMA_NODE_SIZE
+    If n is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with n, 0, kind
+    proc memory_set_int64 from Memory with n, 8, payload
+    proc memory_set_int64 from Memory with n, 16, 0
+    proc memory_set_int64 from Memory with n, 24, 0
+    proc memory_set_int64 from Memory with n, 32, 0
+    proc memory_set_int64 from Memory with n, 40, 0
+    proc memory_set_int64 from Memory with n, 48, 0
+    proc memory_set_int64 from Memory with n, 56, 0
+    Return n
+End Process
+
+@Reasoning
+Convenience: build a SCHEMA_OBJECT with an empty field list.
+@End Reasoning
+
+@Implementation
+Create the empty list, then construct the node.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_object" returns Integer:
+    Let lst be proc list_create from List
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let n be proc schema_create with SCHEMA_OBJECT, lst
+    If n is equal to 0:
+        proc list_destroy from List with lst
+        Return 0
+    End If
+    Return n
+End Process
+
+@Reasoning
+Build a SCHEMA_ARRAY whose item type is the supplied schema, with full
+JSON Schema array cardinality constraints (minItems, maxItems,
+uniqueItems). Pass -1 for min_items or max_items to indicate the
+respective bound is unset. Pass 0 for unique_items to skip uniqueness
+enforcement, 1 to require all array elements be distinct.
+@End Reasoning
+
+@Implementation
+Allocate a 32-byte ArrayPayload record:
+  offset  0: item_schema pointer
+  offset  8: min_items
+  offset 16: max_items
+  offset 24: unique_items flag
+Then wrap the payload in a SCHEMA_ARRAY node.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null item_schema or allocation failure.
+@End Security_Scope
+Process called "schema_create_array" takes item_schema as Integer, min_items as Integer, max_items as Integer, unique_items as Integer returns Integer:
+    If item_schema is equal to 0:
+        Return 0
+    End If
+    Let payload be proc allocate from Layout with ARRAY_PAYLOAD_SIZE
+    If payload is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with payload, 0, item_schema
+    proc memory_set_int64 from Memory with payload, 8, min_items
+    proc memory_set_int64 from Memory with payload, 16, max_items
+    proc memory_set_int64 from Memory with payload, 24, unique_items
+    Let node be proc schema_create with SCHEMA_ARRAY, payload
+    If node is equal to 0:
+        proc deallocate from Layout with payload
+        Return 0
+    End If
+    Return node
+End Process
+
+@Reasoning
+Convenience: build a SCHEMA_STRING with no constraints (any string).
+@End Reasoning
+
+@Implementation
+Construct an empty StringConstraints and wrap.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_string_any" returns Integer:
+    Let c be proc string_constraints_create with 0 minus 1, 0 minus 1, 0, FORMAT_NONE
+    If c is equal to 0:
+        Return 0
+    End If
+    Let n be proc schema_create with SCHEMA_STRING, c
+    If n is equal to 0:
+        proc string_constraints_destroy with c
+        Return 0
+    End If
+    Return n
+End Process
+
+@Reasoning
+Convenience: build a SCHEMA_INTEGER with no bounds (any integer).
+@End Reasoning
+
+@Implementation
+Construct an empty IntegerConstraints and wrap.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_integer_any" returns Integer:
+    Let c be proc integer_constraints_create with 0, 0, 0, 0, 0
+    If c is equal to 0:
+        Return 0
+    End If
+    Let n be proc schema_create with SCHEMA_INTEGER, c
+    If n is equal to 0:
+        proc integer_constraints_destroy with c
+        Return 0
+    End If
+    Return n
+End Process
+
+@Reasoning
+Convenience: build a SCHEMA_FLOAT with no bounds.
+@End Reasoning
+
+@Implementation
+Construct an empty FloatConstraints and wrap.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_float_any" returns Integer:
+    Let c be proc float_constraints_create with 0, 0, 0, 0, 0
+    If c is equal to 0:
+        Return 0
+    End If
+    Let n be proc schema_create with SCHEMA_FLOAT, c
+    If n is equal to 0:
+        proc float_constraints_destroy with c
+        Return 0
+    End If
+    Return n
+End Process
+
+@Reasoning
+Convenience: build a SCHEMA_BOOLEAN node (no parameters).
+@End Reasoning
+
+@Implementation
+schema_create with kind=BOOLEAN and payload=0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_boolean" returns Integer:
+    Return proc schema_create with SCHEMA_BOOLEAN, 0
+End Process
+
+@Reasoning
+Convenience: build a SCHEMA_NULL node.
+@End Reasoning
+
+@Implementation
+schema_create with kind=NULL.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_null" returns Integer:
+    Return proc schema_create with SCHEMA_NULL, 0
+End Process
+
+@Reasoning
+Convenience: build a SCHEMA_ANY node (matches every value).
+@End Reasoning
+
+@Implementation
+schema_create with kind=ANY.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_any" returns Integer:
+    Return proc schema_create with SCHEMA_ANY, 0
+End Process
+
+@Reasoning
+Convenience: build a SCHEMA_UNION wrapping an empty variant list.
+@End Reasoning
+
+@Implementation
+Create an empty list and wrap. Use schema_union_add_variant to populate.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_union" returns Integer:
+    Let lst be proc list_create from List
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let n be proc schema_create with SCHEMA_UNION, lst
+    If n is equal to 0:
+        proc list_destroy from List with lst
+        Return 0
+    End If
+    Return n
+End Process
+
+@Reasoning
+Convenience: build a SCHEMA_REFERENCE to a named external schema.
+@End Reasoning
+
+@Implementation
+Duplicate the name and embed as payload.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null name input.
+@End Security_Scope
+Process called "schema_create_reference" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let nm be proc string_duplicate from StringPrim with name
+    If nm is equal to 0:
+        Return 0
+    End If
+    Let n be proc schema_create with SCHEMA_REFERENCE, nm
+    If n is equal to 0:
+        proc deallocate from Layout with nm
+        Return 0
+    End If
+    Return n
+End Process
+
+@Reasoning
+Convenience: build a SCHEMA_ENUM wrapping an empty value list.
+@End Reasoning
+
+@Implementation
+Create empty list, wrap. Populate via schema_enum_add_value.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_enum" returns Integer:
+    Let lst be proc list_create from List
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let n be proc schema_create with SCHEMA_ENUM, lst
+    If n is equal to 0:
+        proc list_destroy from List with lst
+        Return 0
+    End If
+    Return n
+End Process
+
+@Reasoning
+Build a SCHEMA_ALL_OF node holding an empty subschema list. The validator
+requires every subschema to match. Use schema_allof_add_subschema to
+append variants.
+@End Reasoning
+
+@Implementation
+Allocate an empty list, wrap in a node with kind=SCHEMA_ALL_OF.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_all_of" returns Integer:
+    Let lst be proc list_create from List
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let n be proc schema_create with SCHEMA_ALL_OF, lst
+    If n is equal to 0:
+        proc list_destroy from List with lst
+        Return 0
+    End If
+    Return n
+End Process
+
+@Reasoning
+Build a SCHEMA_ONE_OF node holding an empty subschema list. XOR semantics
+at validation time: value must satisfy exactly one subschema. Distinct
+from SCHEMA_UNION which is anyOf (at least one).
+@End Reasoning
+
+@Implementation
+Allocate an empty list, wrap in a node with kind=SCHEMA_ONE_OF.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "schema_create_one_of" returns Integer:
+    Let lst be proc list_create from List
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let n be proc schema_create with SCHEMA_ONE_OF, lst
+    If n is equal to 0:
+        proc list_destroy from List with lst
+        Return 0
+    End If
+    Return n
+End Process
+
+@Reasoning
+Build a SCHEMA_CONST node wrapping a ConfigValue constant. Validation
+accepts only deep-equal values. The const value is adopted and freed on
+schema_destroy.
+@End Reasoning
+
+@Implementation
+Wrap the supplied ConfigValue as the payload of a SCHEMA_CONST node.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null const_value or allocation failure.
+@End Security_Scope
+Process called "schema_create_const" takes const_value as Integer returns Integer:
+    If const_value is equal to 0:
+        Return 0
+    End If
+    Let n be proc schema_create with SCHEMA_CONST, const_value
+    If n is equal to 0:
+        Return 0
+    End If
+    Return n
+End Process
+
+@Reasoning
+Append a subschema to a SCHEMA_ALL_OF, SCHEMA_ONE_OF, or SCHEMA_UNION
+node. The subschema is adopted; do not destroy it separately.
+@End Reasoning
+
+@Implementation
+Verify the node kind matches one of the supported composite kinds and
+push to its payload list.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs or kind mismatch.
+@End Security_Scope
+Process called "schema_composite_add_subschema" takes node as Integer, sub as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    If sub is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, 0
+    Let ok be 0
+    If kind is equal to SCHEMA_ALL_OF:
+        Set ok to 1
+    End If
+    If kind is equal to SCHEMA_ONE_OF:
+        Set ok to 1
+    End If
+    If kind is equal to SCHEMA_UNION:
+        Set ok to 1
+    End If
+    If ok is equal to 0:
+        Return 0
+    End If
+    Let lst be proc memory_get_int64 from Memory with node, 8
+    If lst is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with lst, sub
+    Return 1
+End Process
+
+@Reasoning
+Get or allocate the per-object extras record at offset 32 of a
+SCHEMA_OBJECT node. Returns the existing pointer or a fresh zeroed
+record. Used by object-level keyword setters (additionalProperties,
+dependentRequired, minProperties).
+@End Reasoning
+
+@Implementation
+Read offset 32. If zero, allocate an OBJECT_EXTRAS_SIZE block and zero
+every field. Store the pointer back at offset 32.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null node or allocation failure.
+@End Security_Scope
+Process called "schema_object_extras_get_or_create" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, 0
+    If kind is not equal to SCHEMA_OBJECT:
+        Return 0
+    End If
+    Let extras be proc memory_get_int64 from Memory with node, 32
+    If extras is not equal to 0:
+        Return extras
+    End If
+    Set extras to proc allocate from Layout with OBJECT_EXTRAS_SIZE
+    If extras is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with extras, 0, 0
+    proc memory_set_int64 from Memory with extras, 8, AP_POLICY_UNSET
+    proc memory_set_int64 from Memory with extras, 16, 0
+    proc memory_set_int64 from Memory with extras, 24, 0 minus 1
+    proc memory_set_int64 from Memory with node, 32, extras
+    Return extras
+End Process
+
+@Reasoning
+Configure the additionalProperties keyword on a SCHEMA_OBJECT node.
+Pass 0 for the "false" policy (reject any non-declared properties);
+pass a SchemaNode pointer for the constrained policy (every extra
+property must validate against the given subschema); the true policy
+(allow any extras) is the default and need not be set explicitly.
+@End Reasoning
+
+@Implementation
+Look up or create the object extras record; set the policy byte and
+the subschema pointer. The subschema is adopted and freed on destroy.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null node, kind mismatch, or extras allocation failure.
+@End Security_Scope
+Process called "schema_object_set_additional_properties_false" takes node as Integer returns Integer:
+    Let extras be proc schema_object_extras_get_or_create with node
+    If extras is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with extras, 0, 0
+    proc memory_set_int64 from Memory with extras, 8, AP_POLICY_FALSE
+    Return 1
+End Process
+
+@Reasoning
+Set the additionalProperties subschema. Any property in the value that
+is not in the declared properties table must validate against this
+subschema. The subschema is adopted.
+@End Reasoning
+
+@Implementation
+Get-or-create extras and store the subschema and policy=schema.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null node or null subschema.
+@End Security_Scope
+Process called "schema_object_set_additional_properties_schema" takes node as Integer, sub as Integer returns Integer:
+    If sub is equal to 0:
+        Return 0
+    End If
+    Let extras be proc schema_object_extras_get_or_create with node
+    If extras is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with extras, 0, sub
+    proc memory_set_int64 from Memory with extras, 8, AP_POLICY_SCHEMA
+    Return 1
+End Process
+
+@Reasoning
+Add a dependentRequired entry: when the named key is present in the
+validated object, every name in dependents_list must also be present.
+The dependents_list is adopted (List<String> of duplicated names) and
+freed on schema_destroy.
+@End Reasoning
+
+@Implementation
+Get-or-create extras. Initialize the dependent_required dictionary if
+absent. Duplicate the key and store the list against it. Existing
+entries for the same key are released first.
+@End Implementation
+
+@Performance_Hints
+Time: O(|key|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "schema_object_add_dependent_required" takes node as Integer, key as Integer, dependents_list as Integer returns Integer:
+    If key is equal to 0:
+        Return 0
+    End If
+    If dependents_list is equal to 0:
+        Return 0
+    End If
+    Let extras be proc schema_object_extras_get_or_create with node
+    If extras is equal to 0:
+        Return 0
+    End If
+    Let map be proc memory_get_int64 from Memory with extras, 16
+    If map is equal to 0:
+        Set map to proc create from Dict
+        If map is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with extras, 16, map
+    End If
+    Let prior be proc get from Dict with map, key
+    If prior is not equal to 0:
+        Let pn be proc list_length from List with prior
+        Let pi be 0
+        While pi is less than pn:
+            Let s be proc list_get from List with prior, pi
+            If s is not equal to 0:
+                proc deallocate from Layout with s
+            End If
+            Set pi to pi plus 1
+        End While
+        proc list_destroy from List with prior
+    End If
+    Note: Dict.set duplicates the key string internally.
+    proc set from Dict with map, key, dependents_list
+    Return 1
+End Process
+
+@Reasoning
+Get or allocate the numeric (integer/float) extras record holding
+exclusiveMinimum / exclusiveMaximum bounds.
+@End Reasoning
+
+@Implementation
+Read offset 32. If zero, allocate a NUMERIC_EXTRAS_SIZE block and zero
+every field. Store back.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null node or allocation failure.
+@End Security_Scope
+Process called "schema_numeric_extras_get_or_create" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, 0
+    Let ok be 0
+    If kind is equal to SCHEMA_INTEGER:
+        Set ok to 1
+    End If
+    If kind is equal to SCHEMA_FLOAT:
+        Set ok to 1
+    End If
+    If ok is equal to 0:
+        Return 0
+    End If
+    Let extras be proc memory_get_int64 from Memory with node, 32
+    If extras is not equal to 0:
+        Return extras
+    End If
+    Set extras to proc allocate from Layout with NUMERIC_EXTRAS_SIZE
+    If extras is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with extras, 0, 0
+    proc memory_set_int64 from Memory with extras, 8, 0
+    proc memory_set_int64 from Memory with extras, 16, 0
+    proc memory_set_int64 from Memory with extras, 24, 0
+    proc memory_set_int64 from Memory with node, 32, extras
+    Return extras
+End Process
+
+@Reasoning
+Record an exclusiveMinimum bound on an integer or float schema node.
+@End Reasoning
+
+@Implementation
+Get-or-create numeric extras; store value at offset 0 and set the flag
+at offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null node or kind mismatch.
+@End Security_Scope
+Process called "schema_set_exclusive_minimum" takes node as Integer, value as Integer returns Integer:
+    Let extras be proc schema_numeric_extras_get_or_create with node
+    If extras is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with extras, 0, value
+    proc memory_set_int64 from Memory with extras, 8, 1
+    Return 1
+End Process
+
+@Reasoning
+Record an exclusiveMaximum bound on an integer or float schema node.
+@End Reasoning
+
+@Implementation
+Get-or-create numeric extras; store value at offset 16 and set the flag
+at offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null node or kind mismatch.
+@End Security_Scope
+Process called "schema_set_exclusive_maximum" takes node as Integer, value as Integer returns Integer:
+    Let extras be proc schema_numeric_extras_get_or_create with node
+    If extras is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with extras, 16, value
+    proc memory_set_int64 from Memory with extras, 24, 1
+    Return 1
+End Process
+
+@Reasoning
+Get or allocate the array extras record carrying prefixItems and the
+contains subschema.
+@End Reasoning
+
+@Implementation
+Read offset 32. If zero, allocate ARRAY_EXTRAS_SIZE bytes and zero both
+fields. Store back.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null node or kind mismatch.
+@End Security_Scope
+Process called "schema_array_extras_get_or_create" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, 0
+    If kind is not equal to SCHEMA_ARRAY:
+        Return 0
+    End If
+    Let extras be proc memory_get_int64 from Memory with node, 32
+    If extras is not equal to 0:
+        Return extras
+    End If
+    Set extras to proc allocate from Layout with ARRAY_EXTRAS_SIZE
+    If extras is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with extras, 0, 0
+    proc memory_set_int64 from Memory with extras, 8, 0
+    proc memory_set_int64 from Memory with node, 32, extras
+    Return extras
+End Process
+
+@Reasoning
+Append a positional schema to a SCHEMA_ARRAY node's prefixItems list.
+The first N elements of any array value must validate against the
+prefixItems in order, and the rest against the array's item_schema.
+@End Reasoning
+
+@Implementation
+Get-or-create array extras; lazily create the prefix_items list; push.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "schema_array_add_prefix_item" takes node as Integer, sub as Integer returns Integer:
+    If sub is equal to 0:
+        Return 0
+    End If
+    Let extras be proc schema_array_extras_get_or_create with node
+    If extras is equal to 0:
+        Return 0
+    End If
+    Let prefix be proc memory_get_int64 from Memory with extras, 0
+    If prefix is equal to 0:
+        Set prefix to proc list_create from List
+        If prefix is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with extras, 0, prefix
+    End If
+    proc list_push from List with prefix, sub
+    Return 1
+End Process
+
+@Reasoning
+Set the contains-subschema on a SCHEMA_ARRAY node. Validation requires
+at least one array element to validate against this subschema.
+@End Reasoning
+
+@Implementation
+Get-or-create array extras; store the subschema at offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "schema_array_set_contains" takes node as Integer, sub as Integer returns Integer:
+    If sub is equal to 0:
+        Return 0
+    End If
+    Let extras be proc schema_array_extras_get_or_create with node
+    If extras is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with extras, 8, sub
+    Return 1
+End Process
+
+@Reasoning
+Store a $defs registry on a schema root. The registry is a dictionary
+mapping definition names to SchemaNode pointers. Referenced from the
+root via offset 40 in the schema header.
+@End Reasoning
+
+@Implementation
+Allocate the dictionary if not present, then return the pointer for
+the caller to populate via Dict.set.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input or allocation failure.
+@End Security_Scope
+Process called "schema_definitions_get_or_create" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let defs be proc memory_get_int64 from Memory with node, 40
+    If defs is not equal to 0:
+        Return defs
+    End If
+    Set defs to proc create from Dict
+    If defs is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with node, 40, defs
+    Return defs
+End Process
+
+@Reasoning
+Add a definition to a schema's $defs registry. The name is duplicated;
+the schema is adopted.
+@End Reasoning
+
+@Implementation
+Get-or-create the registry; duplicate the key; Dict.set the schema.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "schema_add_definition" takes node as Integer, name as Integer, schema as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If schema is equal to 0:
+        Return 0
+    End If
+    Let defs be proc schema_definitions_get_or_create with node
+    If defs is equal to 0:
+        Return 0
+    End If
+    Note: Dict.set duplicates the key internally.
+    proc set from Dict with defs, name, schema
+    Return 1
+End Process
+
+@Reasoning
+Look up a named definition in the schema's $defs registry. Names may
+appear bare ("foo") or as the JSON-Schema URI fragment "#/$defs/foo";
+both forms are accepted. Returns 0 if not found.
+@End Reasoning
+
+@Implementation
+Read the registry pointer. If the name starts with "#/$defs/" strip
+the prefix and look up the suffix; otherwise look up the name as-is.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs or unresolved name.
+@End Security_Scope
+Process called "schema_lookup_definition" takes registry as Integer, name as Integer returns Integer:
+    If registry is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let nlen be proc string_length from StringCore with name
+    Let prefix_match be 1
+    If nlen is less than 8:
+        Set prefix_match to 0
+    End If
+    If prefix_match is equal to 1:
+        Let b0 be proc memory_get_byte from Memory with name, 0
+        Let b1 be proc memory_get_byte from Memory with name, 1
+        Let b2 be proc memory_get_byte from Memory with name, 2
+        Let b3 be proc memory_get_byte from Memory with name, 3
+        Let b4 be proc memory_get_byte from Memory with name, 4
+        Let b5 be proc memory_get_byte from Memory with name, 5
+        Let b6 be proc memory_get_byte from Memory with name, 6
+        Let b7 be proc memory_get_byte from Memory with name, 7
+        If b0 is not equal to 35:
+            Set prefix_match to 0
+        End If
+        If b1 is not equal to 47:
+            Set prefix_match to 0
+        End If
+        If b2 is not equal to 36:
+            Set prefix_match to 0
+        End If
+        If b3 is not equal to 100:
+            Set prefix_match to 0
+        End If
+        If b4 is not equal to 101:
+            Set prefix_match to 0
+        End If
+        If b5 is not equal to 102:
+            Set prefix_match to 0
+        End If
+        If b6 is not equal to 115:
+            Set prefix_match to 0
+        End If
+        If b7 is not equal to 47:
+            Set prefix_match to 0
+        End If
+    End If
+    If prefix_match is equal to 1:
+        Let suffix_len be nlen minus 8
+        If suffix_len is less than 1:
+            Return 0
+        End If
+        Let suffix be proc string_substring from StringPrim with name, 8, suffix_len
+        If suffix is equal to 0:
+            Return 0
+        End If
+        Let res be proc get from Dict with registry, suffix
+        proc deallocate from Layout with suffix
+        Return res
+    End If
+    Return proc get from Dict with registry, name
+End Process
+
+Note: ============================================================================
+Note: SCHEMA NODE ACCESSORS / MUTATORS
+Note: ============================================================================
+
+@Reasoning
+Read the discriminator kind.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns SCHEMA_ANY on null input (safe default).
+@End Security_Scope
+Process called "schema_kind" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return SCHEMA_ANY
+    End If
+    Return proc memory_get_int64 from Memory with n, 0
+End Process
+
+@Reasoning
+Read the payload pointer (interpretation depends on kind).
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "schema_payload" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with n, 8
+End Process
+
+@Reasoning
+Set the optional human-readable title.
+@End Reasoning
+
+@Implementation
+Free any prior title, then duplicate the new one.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null node.
+@End Security_Scope
+Process called "schema_set_title" takes n as Integer, title as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Let prior be proc memory_get_int64 from Memory with n, 16
+    If prior is not equal to 0:
+        proc deallocate from Layout with prior
+    End If
+    Let dup be 0
+    If title is not equal to 0:
+        Set dup to proc string_duplicate from StringPrim with title
+    End If
+    proc memory_set_int64 from Memory with n, 16, dup
+    Return 1
+End Process
+
+@Reasoning
+Set the optional description.
+@End Reasoning
+
+@Implementation
+Free prior, duplicate new.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null node.
+@End Security_Scope
+Process called "schema_set_description" takes n as Integer, description as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Let prior be proc memory_get_int64 from Memory with n, 24
+    If prior is not equal to 0:
+        proc deallocate from Layout with prior
+    End If
+    Let dup be 0
+    If description is not equal to 0:
+        Set dup to proc string_duplicate from StringPrim with description
+    End If
+    proc memory_set_int64 from Memory with n, 24, dup
+    Return 1
+End Process
+
+@Reasoning
+Read the title (not owned by caller).
+@End Reasoning
+
+@Implementation
+Load offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "schema_title" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with n, 16
+End Process
+
+@Reasoning
+Read the description (not owned by caller).
+@End Reasoning
+
+@Implementation
+Load offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "schema_description" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with n, 24
+End Process
+
+@Reasoning
+Append an ObjectField to a SCHEMA_OBJECT node.
+@End Reasoning
+
+@Implementation
+Verify the node is an object, push to its payload list.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1) (List_push).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch or null input.
+@End Security_Scope
+Process called "schema_object_add_field" takes n as Integer, field as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    If field is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with n, 0
+    If kind is not equal to SCHEMA_OBJECT:
+        Return 0
+    End If
+    Let lst be proc memory_get_int64 from Memory with n, 8
+    If lst is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with lst, field
+    Return 1
+End Process
+
+@Reasoning
+Get the field list of a SCHEMA_OBJECT.
+@End Reasoning
+
+@Implementation
+Verify kind and return payload.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch.
+@End Security_Scope
+Process called "schema_object_fields" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with n, 0
+    If kind is not equal to SCHEMA_OBJECT:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with n, 8
+End Process
+
+@Reasoning
+Append a variant SchemaNode to a SCHEMA_UNION.
+@End Reasoning
+
+@Implementation
+Verify the node is a union, push to its variant list.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch.
+@End Security_Scope
+Process called "schema_union_add_variant" takes n as Integer, variant as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    If variant is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with n, 0
+    If kind is not equal to SCHEMA_UNION:
+        Return 0
+    End If
+    Let lst be proc memory_get_int64 from Memory with n, 8
+    If lst is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with lst, variant
+    Return 1
+End Process
+
+@Reasoning
+Append a permitted value (String) to a SCHEMA_ENUM.
+@End Reasoning
+
+@Implementation
+Verify the node is an enum and duplicate the value before pushing so the
+enum owns it.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(n) for the duplicate.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch.
+@End Security_Scope
+Process called "schema_enum_add_value" takes n as Integer, value as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with n, 0
+    If kind is not equal to SCHEMA_ENUM:
+        Return 0
+    End If
+    Let lst be proc memory_get_int64 from Memory with n, 8
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let dup be proc string_duplicate from StringPrim with value
+    If dup is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with lst, dup
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: DESTRUCTOR
+Note: ============================================================================
+
+@Reasoning
+Recursively free a SchemaNode and all owned children. The destructor
+inspects kind to decide which subtree to walk.
+@End Reasoning
+
+@Implementation
+Free title/description if present. Switch on kind:
+  - OBJECT: walk field list, destroy each ObjectField, free list
+  - ARRAY: recursively destroy payload schema
+  - STRING: free StringConstraints
+  - INTEGER: free IntegerConstraints
+  - FLOAT: free FloatConstraints
+  - UNION: walk variant list, destroy each, free list
+  - REFERENCE: free name string
+  - ENUM: walk value list, free each, free list
+Then free the node record.
+@End Implementation
+
+@Performance_Hints
+Time: O(s) where s is total subtree size. Space: O(d) recursion depth.
+@End Performance_Hints
+
+@Security_Scope
+Safe to call with null (no-op).
+@End Security_Scope
+Process called "schema_destroy" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Let title be proc memory_get_int64 from Memory with n, 16
+    If title is not equal to 0:
+        proc deallocate from Layout with title
+    End If
+    Let desc be proc memory_get_int64 from Memory with n, 24
+    If desc is not equal to 0:
+        proc deallocate from Layout with desc
+    End If
+    Let kind be proc memory_get_int64 from Memory with n, 0
+    Let payload be proc memory_get_int64 from Memory with n, 8
+
+    If kind is equal to SCHEMA_OBJECT:
+        If payload is not equal to 0:
+            Let count be proc list_length from List with payload
+            Let i be 0
+            While i is less than count:
+                Let f be proc list_get from List with payload, i
+                If f is not equal to 0:
+                    proc object_field_destroy with f
+                End If
+                Set i to i plus 1
+            End While
+            proc list_destroy from List with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_ARRAY:
+        If payload is not equal to 0:
+            Let item_schema_inner be proc memory_get_int64 from Memory with payload, 0
+            If item_schema_inner is not equal to 0:
+                proc schema_destroy with item_schema_inner
+            End If
+            proc deallocate from Layout with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_STRING:
+        If payload is not equal to 0:
+            proc string_constraints_destroy with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_INTEGER:
+        If payload is not equal to 0:
+            proc integer_constraints_destroy with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_FLOAT:
+        If payload is not equal to 0:
+            proc float_constraints_destroy with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_UNION:
+        If payload is not equal to 0:
+            Let vcount be proc list_length from List with payload
+            Let j be 0
+            While j is less than vcount:
+                Let v be proc list_get from List with payload, j
+                If v is not equal to 0:
+                    proc schema_destroy with v
+                End If
+                Set j to j plus 1
+            End While
+            proc list_destroy from List with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_AND:
+        If payload is not equal to 0:
+            Let acount be proc list_length from List with payload
+            Let aj be 0
+            While aj is less than acount:
+                Let av be proc list_get from List with payload, aj
+                If av is not equal to 0:
+                    proc schema_destroy with av
+                End If
+                Set aj to aj plus 1
+            End While
+            proc list_destroy from List with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_NOT:
+        If payload is not equal to 0:
+            Let ncount be proc list_length from List with payload
+            Let nj be 0
+            While nj is less than ncount:
+                Let nv be proc list_get from List with payload, nj
+                If nv is not equal to 0:
+                    proc schema_destroy with nv
+                End If
+                Set nj to nj plus 1
+            End While
+            proc list_destroy from List with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_REFERENCE:
+        If payload is not equal to 0:
+            proc deallocate from Layout with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_ENUM:
+        If payload is not equal to 0:
+            Let ecount be proc list_length from List with payload
+            Let k be 0
+            While k is less than ecount:
+                Let s be proc list_get from List with payload, k
+                If s is not equal to 0:
+                    proc deallocate from Layout with s
+                End If
+                Set k to k plus 1
+            End While
+            proc list_destroy from List with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_ALL_OF:
+        If payload is not equal to 0:
+            Let all_count be proc list_length from List with payload
+            Let all_j be 0
+            While all_j is less than all_count:
+                Let all_v be proc list_get from List with payload, all_j
+                If all_v is not equal to 0:
+                    proc schema_destroy with all_v
+                End If
+                Set all_j to all_j plus 1
+            End While
+            proc list_destroy from List with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_ONE_OF:
+        If payload is not equal to 0:
+            Let one_count be proc list_length from List with payload
+            Let one_j be 0
+            While one_j is less than one_count:
+                Let one_v be proc list_get from List with payload, one_j
+                If one_v is not equal to 0:
+                    proc schema_destroy with one_v
+                End If
+                Set one_j to one_j plus 1
+            End While
+            proc list_destroy from List with payload
+        End If
+    End If
+
+    If kind is equal to SCHEMA_CONST:
+        If payload is not equal to 0:
+            proc config_value_destroy from Cfg with payload
+        End If
+    End If
+
+    Let extras be proc memory_get_int64 from Memory with n, 32
+    If extras is not equal to 0:
+        If kind is equal to SCHEMA_OBJECT:
+            Let extra_sub be proc memory_get_int64 from Memory with extras, 0
+            If extra_sub is not equal to 0:
+                proc schema_destroy with extra_sub
+            End If
+            Let dep_map be proc memory_get_int64 from Memory with extras, 16
+            If dep_map is not equal to 0:
+                Note: Free the value lists first; Dict.destroy frees the
+                Note: stored key strings on its own.
+                Let dep_keys be proc keys from Dict with dep_map
+                If dep_keys is not equal to 0:
+                    Let dkc be proc list_length from List with dep_keys
+                    Let dki be 0
+                    While dki is less than dkc:
+                        Let dkey be proc list_get from List with dep_keys, dki
+                        If dkey is not equal to 0:
+                            Let dval be proc get from Dict with dep_map, dkey
+                            If dval is not equal to 0:
+                                Let dvn be proc list_length from List with dval
+                                Let dvi be 0
+                                While dvi is less than dvn:
+                                    Let dvs be proc list_get from List with dval, dvi
+                                    If dvs is not equal to 0:
+                                        proc deallocate from Layout with dvs
+                                    End If
+                                    Set dvi to dvi plus 1
+                                End While
+                                proc list_destroy from List with dval
+                            End If
+                        End If
+                        Set dki to dki plus 1
+                    End While
+                    proc list_destroy from List with dep_keys
+                End If
+                proc destroy from Dict with dep_map
+            End If
+            proc deallocate from Layout with extras
+        End If
+        If kind is equal to SCHEMA_INTEGER:
+            proc deallocate from Layout with extras
+        End If
+        If kind is equal to SCHEMA_FLOAT:
+            proc deallocate from Layout with extras
+        End If
+        If kind is equal to SCHEMA_ARRAY:
+            Let pref be proc memory_get_int64 from Memory with extras, 0
+            If pref is not equal to 0:
+                Let pn be proc list_length from List with pref
+                Let pix be 0
+                While pix is less than pn:
+                    Let ps be proc list_get from List with pref, pix
+                    If ps is not equal to 0:
+                        proc schema_destroy with ps
+                    End If
+                    Set pix to pix plus 1
+                End While
+                proc list_destroy from List with pref
+            End If
+            Let cont_sub be proc memory_get_int64 from Memory with extras, 8
+            If cont_sub is not equal to 0:
+                proc schema_destroy with cont_sub
+            End If
+            proc deallocate from Layout with extras
+        End If
+    End If
+
+    Let defs_reg be proc memory_get_int64 from Memory with n, 40
+    If defs_reg is not equal to 0:
+        Note: Destroy each definition value; Dict.destroy frees keys.
+        Let def_keys be proc keys from Dict with defs_reg
+        If def_keys is not equal to 0:
+            Let dkn be proc list_length from List with def_keys
+            Let dki2 be 0
+            While dki2 is less than dkn:
+                Let dkey2 be proc list_get from List with def_keys, dki2
+                If dkey2 is not equal to 0:
+                    Let dsv be proc get from Dict with defs_reg, dkey2
+                    If dsv is not equal to 0:
+                        proc schema_destroy with dsv
+                    End If
+                End If
+                Set dki2 to dki2 plus 1
+            End While
+            proc list_destroy from List with def_keys
+        End If
+        proc destroy from Dict with defs_reg
+    End If
+
+    proc deallocate from Layout with n
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: VALIDATION
+Note: ============================================================================
+
+@Reasoning
+Construct a ValidationIssue diagnostic record. The path is a JSON-pointer
+style location (e.g. "/items/3/name"), the message is human readable, and
+code is one of ERROR_*. Both strings are duplicated so the issue owns
+them.
+@End Reasoning
+
+@Implementation
+Duplicate path and message, allocate 24-byte record, store all three
+fields.
+@End Implementation
+
+@Performance_Hints
+Time: O(|path|+|message|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "validation_issue_create" takes path as Integer, message as Integer, code as Integer returns Integer:
+    Let pdup be 0
+    If path is not equal to 0:
+        Set pdup to proc string_duplicate from StringPrim with path
+    End If
+    Let mdup be 0
+    If message is not equal to 0:
+        Set mdup to proc string_duplicate from StringPrim with message
+    End If
+    Let issue be proc allocate from Layout with VALIDATION_ISSUE_SIZE
+    If issue is equal to 0:
+        If pdup is not equal to 0:
+            proc deallocate from Layout with pdup
+        End If
+        If mdup is not equal to 0:
+            proc deallocate from Layout with mdup
+        End If
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with issue, 0, pdup
+    proc memory_set_int64 from Memory with issue, 8, mdup
+    proc memory_set_int64 from Memory with issue, 16, code
+    Return issue
+End Process
+
+@Reasoning
+Free a single ValidationIssue and its owned strings.
+@End Reasoning
+
+@Implementation
+Free path, message, then the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe to call with null.
+@End Security_Scope
+Process called "validation_issue_destroy" takes i as Integer returns Integer:
+    If i is equal to 0:
+        Return 0
+    End If
+    Let p be proc memory_get_int64 from Memory with i, 0
+    If p is not equal to 0:
+        proc deallocate from Layout with p
+    End If
+    Let m be proc memory_get_int64 from Memory with i, 8
+    If m is not equal to 0:
+        proc deallocate from Layout with m
+    End If
+    proc deallocate from Layout with i
+    Return 1
+End Process
+
+@Reasoning
+Free a list of ValidationIssue values, then the list itself.
+@End Reasoning
+
+@Implementation
+Iterate, destroy each issue, then list_destroy.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Safe to call with null list.
+@End Security_Scope
+Process called "validation_issues_destroy" takes issues as Integer returns Integer:
+    If issues is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with issues
+    Let i be 0
+    While i is less than count:
+        Let entry be proc list_get from List with issues, i
+        If entry is not equal to 0:
+            proc validation_issue_destroy with entry
+        End If
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with issues
+    Return 1
+End Process
+
+@Reasoning
+Read the issue path string.
+@End Reasoning
+
+@Implementation
+Load offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "validation_issue_path" takes i as Integer returns Integer:
+    If i is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with i, 0
+End Process
+
+@Reasoning
+Read the issue message string.
+@End Reasoning
+
+@Implementation
+Load offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "validation_issue_message" takes i as Integer returns Integer:
+    If i is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with i, 8
+End Process
+
+@Reasoning
+Read the issue error code.
+@End Reasoning
+
+@Implementation
+Load offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "validation_issue_code" takes i as Integer returns Integer:
+    If i is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with i, 16
+End Process
+
+@Reasoning
+Append an issue to an issue list, growing the list as needed. Used by the
+recursive walker.
+@End Reasoning
+
+@Implementation
+list_push.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null list.
+@End Security_Scope
+Process called "issues_append" takes issues as Integer, path as Integer, message as Integer, code as Integer returns Integer:
+    If issues is equal to 0:
+        Return 0
+    End If
+    Let issue be proc validation_issue_create with path, message, code
+    If issue is equal to 0:
+        Return 0
+    End If
+    proc list_push from List with issues, issue
+    Return 1
+End Process
+
+@Reasoning
+Structurally compare two ConfigValue trees. Two values are equal when
+they have the same kind AND the same underlying data. CV_NULL is
+trivially equal to CV_NULL; CV_BOOL/CV_INTEGER compare by integer value;
+CV_STRING compares the underlying string contents; CV_LIST compares
+element-by-element with cv_equals (positional); CV_MAP compares as
+unordered key sets and, for each key, recursively compares values.
+
+Two distinct CV_FLOAT-encoded numeric strings whose canonical numeric
+value is identical do NOT compare equal here because the schema layer
+preserves the original text for round-trip fidelity. Callers requiring
+numeric equality across encodings must normalize before comparing.
+@End Reasoning
+
+@Implementation
+Compare kinds first. Then per kind:
+  - CV_NULL: equal.
+  - CV_STRING: compare string contents.
+  - CV_INTEGER: compare integer values.
+  - CV_FLOAT: compare via string contents (the underlying CV_FLOAT shape
+    is wrapped as CV_STRING in this codebase, so this branch is reached
+    only if a future CV_FLOAT type is added).
+  - CV_BOOL: compare bool values.
+  - CV_LIST: same length, all elements pairwise equal.
+  - CV_MAP: same key count, every key in one is in the other, and the
+    associated values are pairwise equal.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the smaller of the two trees. Space: O(d) recursion
+depth.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if either input is null and the other is not. Two null
+pointers are not considered equal (no value).
+@End Security_Scope
+Process called "cv_equals" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let ka be proc config_value_kind from Cfg with a
+    Let kb be proc config_value_kind from Cfg with b
+    If ka is not equal to kb:
+        Return 0
+    End If
+    If ka is equal to 0:
+        Return 1
+    End If
+    If ka is equal to 1:
+        Let sa be proc config_value_as_string from Cfg with a
+        Let sb be proc config_value_as_string from Cfg with b
+        If sa is equal to 0:
+            If sb is equal to 0:
+                Return 1
+            End If
+            Return 0
+        End If
+        If sb is equal to 0:
+            Return 0
+        End If
+        Return proc string_equals from StringCore with sa, sb
+    End If
+    If ka is equal to 2:
+        Let ia be proc config_value_as_integer from Cfg with a
+        Let ib be proc config_value_as_integer from Cfg with b
+        If ia is equal to ib:
+            Return 1
+        End If
+        Return 0
+    End If
+    If ka is equal to 3:
+        Note: CV_FLOAT is currently surfaced as CV_STRING; fall back to
+        Note: string equality on the underlying numeric text.
+        Let fa be proc config_value_as_string from Cfg with a
+        Let fb be proc config_value_as_string from Cfg with b
+        If fa is equal to 0:
+            If fb is equal to 0:
+                Return 1
+            End If
+            Return 0
+        End If
+        If fb is equal to 0:
+            Return 0
+        End If
+        Return proc string_equals from StringCore with fa, fb
+    End If
+    If ka is equal to 4:
+        Let ba be proc config_value_as_bool from Cfg with a
+        Let bb be proc config_value_as_bool from Cfg with b
+        If ba is equal to bb:
+            Return 1
+        End If
+        Return 0
+    End If
+    If ka is equal to 5:
+        Let la be proc config_value_as_list from Cfg with a
+        Let lb be proc config_value_as_list from Cfg with b
+        If la is equal to 0:
+            If lb is equal to 0:
+                Return 1
+            End If
+            Return 0
+        End If
+        If lb is equal to 0:
+            Return 0
+        End If
+        Let len_a be proc list_length from List with la
+        Let len_b be proc list_length from List with lb
+        If len_a is not equal to len_b:
+            Return 0
+        End If
+        Let li be 0
+        While li is less than len_a:
+            Let ea be proc list_get from List with la, li
+            Let eb be proc list_get from List with lb, li
+            Let eq be proc cv_equals with ea, eb
+            If eq is equal to 0:
+                Return 0
+            End If
+            Set li to li plus 1
+        End While
+        Return 1
+    End If
+    If ka is equal to 6:
+        Let ma be proc config_value_as_map from Cfg with a
+        Let mb be proc config_value_as_map from Cfg with b
+        If ma is equal to 0:
+            If mb is equal to 0:
+                Return 1
+            End If
+            Return 0
+        End If
+        If mb is equal to 0:
+            Return 0
+        End If
+        Let keys_a be proc keys from Dict with ma
+        Let keys_b be proc keys from Dict with mb
+        Let count_a be proc list_length from List with keys_a
+        Let count_b be proc list_length from List with keys_b
+        If count_a is not equal to count_b:
+            proc list_destroy from List with keys_a
+            proc list_destroy from List with keys_b
+            Return 0
+        End If
+        Let mi be 0
+        Let map_eq be 1
+        While mi is less than count_a:
+            Let key be proc list_get from List with keys_a, mi
+            Let va be proc get from Dict with ma, key
+            Let vb be proc get from Dict with mb, key
+            If vb is equal to 0:
+                Set map_eq to 0
+                Set mi to count_a
+            Otherwise:
+                Let veq be proc cv_equals with va, vb
+                If veq is equal to 0:
+                    Set map_eq to 0
+                    Set mi to count_a
+                End If
+            End If
+            Set mi to mi plus 1
+        End While
+        proc list_destroy from List with keys_a
+        proc list_destroy from List with keys_b
+        Return map_eq
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Recursively validate a ConfigValue against a SchemaNode and append every
+violation to the issues list. The path is the JSON-pointer-style location
+of the current value. The result is the issues list (caller-owned).
+@End Reasoning
+
+@Implementation
+Switch on schema kind:
+  - ANY: accept everything.
+  - NULL: accept iff CV_NULL.
+  - BOOLEAN: accept iff CV_BOOL.
+  - INTEGER: accept iff CV_INTEGER and integer-bounds satisfied.
+  - FLOAT: accept iff CV_FLOAT (float bounds checked via float helpers in
+           caller-extension; here we accept CV_FLOAT and skip bounds
+           because Float values are pointers and bound checks require
+           the runtime float compare in the consumer).
+  - STRING: accept iff CV_STRING and length bounds satisfied. Pattern
+           and format are recorded as not-yet-applicable: validation
+           returns no error (regex engine is outside this module's
+           scope; consumers must call json_schema for full coverage).
+  - OBJECT: accept iff CV_MAP. For each declared field: if required and
+           missing, emit ERROR_MISSING_FIELD; if present, recurse into
+           the field's schema with extended path.
+  - ARRAY: accept iff CV_LIST. Recurse into every element using the
+           item schema.
+  - UNION: accept iff at least one variant validates with zero issues.
+           If none match, emit ERROR_UNION_NO_MATCH.
+  - REFERENCE: emit ERROR_REFERENCE_UNRESOLVED (registry resolution
+           lives in higher-layer modules like json_schema).
+  - ENUM: accept iff CV_STRING and value appears in the enum list.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the (value, schema) pair. Space: O(d) recursion depth.
+@End Performance_Hints
+
+@Security_Scope
+Returns the issues list. Never null on success even if no issues are
+found - it will simply be empty. Caller owns and must destroy via
+validation_issues_destroy.
+@End Security_Scope
+@Reasoning
+Apply a JSON Schema "format" assertion to a string value. Returns 1 if
+the value satisfies the format, 0 otherwise. Each format delegates to
+the dedicated primitive parser (uuid_from_string, ipv4_from_string,
+ipv6_from_string, url_parse, date_parse_iso_8601, time_of_day_parse_iso_8601)
+so that the same parsing semantics already covered by primitive tests
+gate schema validation.
+
+Supported formats (FORMAT_* constants):
+  - FORMAT_EMAIL: local-part "@" domain with at least one '.' in domain
+    and no whitespace or control characters.
+  - FORMAT_URL / FORMAT_URI / FORMAT_URI_REFERENCE: parsed by url_parse.
+    URI-reference is permissive: relative references with no scheme
+    succeed iff parsing returns a valid object OR the string is non-empty
+    and contains no control characters.
+  - FORMAT_UUID: uuid_from_string returns non-null on success.
+  - FORMAT_DATE: date_parse_iso_8601 returns a non-negative pointer.
+  - FORMAT_TIME: time_of_day_parse_iso_8601 returns a non-negative
+    pointer over the entire string.
+  - FORMAT_DATE_TIME: 10-byte date prefix + 'T' + remainder valid as
+    time-of-day. Trailing 'Z' or numeric offset is permitted.
+  - FORMAT_IPV4 / FORMAT_IPV6: corresponding from_string primitives
+    return non-zero on success.
+  - FORMAT_REGEX: regex_compile must accept the pattern.
+  - FORMAT_HOSTNAME: validated as labels separated by '.' with each label
+    containing only ASCII alphanumerics or '-' and not starting/ending
+    with '-'. Total length <= 253, label length <= 63.
+@End Reasoning
+
+@Implementation
+Switch on the FORMAT_* constant. Allocate the parser's output, check
+return code, then free the output. For email and hostname the validation
+is performed inline because no general-purpose parser is exposed.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over value length. No allocations escape the function.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 for unknown formats and null inputs. Each delegated parser is
+length-bounded.
+@End Security_Scope
+Process called "format_validate" takes value as Integer, format as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+    If format is equal to FORMAT_NONE:
+        Return 1
+    End If
+    Let vlen be proc string_length from StringCore with value
+    If vlen is equal to 0:
+        Return 0
+    End If
+
+    If format is equal to FORMAT_UUID:
+        Let u be proc uuid_from_string from UUID with value
+        If u is equal to 0:
+            Return 0
+        End If
+        proc uuid_destroy from UUID with u
+        Return 1
+    End If
+
+    If format is equal to FORMAT_IPV4:
+        Let a4 be proc ipv4_from_string from IPv4 with value
+        If a4 is equal to 0:
+            Return 0
+        End If
+        proc deallocate from Layout with a4
+        Return 1
+    End If
+
+    If format is equal to FORMAT_IPV6:
+        Let a6 be proc ipv6_from_string from IPv6 with value
+        If a6 is equal to 0:
+            Return 0
+        End If
+        proc ipv6_destroy from IPv6 with a6
+        Return 1
+    End If
+
+    If format is equal to FORMAT_URL:
+        Let u_url be proc url_parse from URL with value
+        If u_url is equal to 0:
+            Return 0
+        End If
+        proc url_destroy from URL with u_url
+        Return 1
+    End If
+
+    If format is equal to FORMAT_URI:
+        Let u_uri be proc url_parse from URL with value
+        If u_uri is equal to 0:
+            Return 0
+        End If
+        proc url_destroy from URL with u_uri
+        Return 1
+    End If
+
+    If format is equal to FORMAT_URI_REFERENCE:
+        Let u_ref be proc url_parse from URL with value
+        If u_ref is not equal to 0:
+            proc url_destroy from URL with u_ref
+            Return 1
+        End If
+        Note: A URI-reference may be a relative reference (no scheme).
+        Note: Accept any non-empty string with no ASCII control chars.
+        Let i_uref be 0
+        Let bad_uref be 0
+        While i_uref is less than vlen:
+            Let ch_uref be proc memory_get_byte from Memory with value, i_uref
+            If ch_uref is less than 32:
+                Set bad_uref to 1
+            End If
+            If ch_uref is equal to 127:
+                Set bad_uref to 1
+            End If
+            Set i_uref to i_uref plus 1
+        End While
+        If bad_uref is equal to 1:
+            Return 0
+        End If
+        Return 1
+    End If
+
+    If format is equal to FORMAT_DATE:
+        Let d be proc date_parse_iso_8601 from Date with value
+        If d is less than 0:
+            Return 0
+        End If
+        proc deallocate from Layout with d
+        Return 1
+    End If
+
+    If format is equal to FORMAT_TIME:
+        Let t be proc time_of_day_parse_iso_8601 from TOD with value, vlen
+        If t is less than 0:
+            Return 0
+        End If
+        Note: The parser allocates a TimeOfDay record; release it.
+        proc deallocate from Layout with t
+        Return 1
+    End If
+
+    If format is equal to FORMAT_DATE_TIME:
+        If vlen is less than 11:
+            Return 0
+        End If
+        Let sep be proc memory_get_byte from Memory with value, 10
+        Let sep_ok be 0
+        If sep is equal to 84:
+            Set sep_ok to 1
+        End If
+        If sep is equal to 116:
+            Set sep_ok to 1
+        End If
+        If sep is equal to 32:
+            Set sep_ok to 1
+        End If
+        If sep_ok is equal to 0:
+            Return 0
+        End If
+        Let date_buf be proc allocate from Layout with 11
+        If date_buf is equal to 0:
+            Return 0
+        End If
+        Let di be 0
+        While di is less than 10:
+            Let dc be proc memory_get_byte from Memory with value, di
+            proc memory_set_byte from Memory with date_buf, di, dc
+            Set di to di plus 1
+        End While
+        proc memory_set_byte from Memory with date_buf, 10, 0
+        Let d2 be proc date_parse_iso_8601 from Date with date_buf
+        proc deallocate from Layout with date_buf
+        If d2 is less than 0:
+            Return 0
+        End If
+        proc deallocate from Layout with d2
+        Note: Validate the time portion after the separator. Strip any
+        Note: trailing timezone suffix ("Z" or "+HH:MM" / "-HH:MM").
+        Let time_start be 11
+        Let time_end be vlen
+        If time_end is greater than time_start:
+            Let last_idx be time_end minus 1
+            Let last_ch be proc memory_get_byte from Memory with value, last_idx
+            If last_ch is equal to 90:
+                Set time_end to time_end minus 1
+            End If
+            If last_ch is equal to 122:
+                Set time_end to time_end minus 1
+            End If
+        End If
+        Let tz_pos be 0 minus 1
+        Let tj be time_start
+        While tj is less than time_end:
+            Let tch be proc memory_get_byte from Memory with value, tj
+            If tch is equal to 43:
+                Set tz_pos to tj
+            End If
+            If tch is equal to 45:
+                Set tz_pos to tj
+            End If
+            Set tj to tj plus 1
+        End While
+        If tz_pos is greater than or equal to 0:
+            Set time_end to tz_pos
+        End If
+        Let tlen be time_end minus time_start
+        If tlen is less than or equal to 0:
+            Return 0
+        End If
+        Let time_buf be proc allocate from Layout with tlen plus 1
+        If time_buf is equal to 0:
+            Return 0
+        End If
+        Let ti be 0
+        While ti is less than tlen:
+            Let tcb be proc memory_get_byte from Memory with value, time_start plus ti
+            proc memory_set_byte from Memory with time_buf, ti, tcb
+            Set ti to ti plus 1
+        End While
+        proc memory_set_byte from Memory with time_buf, tlen, 0
+        Let t2 be proc time_of_day_parse_iso_8601 from TOD with time_buf, tlen
+        proc deallocate from Layout with time_buf
+        If t2 is less than 0:
+            Return 0
+        End If
+        proc deallocate from Layout with t2
+        Return 1
+    End If
+
+    If format is equal to FORMAT_REGEX:
+        Let r be proc regex_compile from Regex with value, 0
+        If r is equal to 0:
+            Return 0
+        End If
+        proc deallocate from Layout with r
+        Return 1
+    End If
+
+    If format is equal to FORMAT_EMAIL:
+        Let at_pos be 0 minus 1
+        Let ei be 0
+        Let ebad be 0
+        While ei is less than vlen:
+            Let ech be proc memory_get_byte from Memory with value, ei
+            If ech is equal to 64:
+                If at_pos is equal to (0 minus 1):
+                    Set at_pos to ei
+                Otherwise:
+                    Set ebad to 1
+                End If
+            End If
+            If ech is less than 33:
+                Set ebad to 1
+            End If
+            If ech is equal to 127:
+                Set ebad to 1
+            End If
+            Set ei to ei plus 1
+        End While
+        If ebad is equal to 1:
+            Return 0
+        End If
+        If at_pos is less than 1:
+            Return 0
+        End If
+        If at_pos is greater than or equal to (vlen minus 1):
+            Return 0
+        End If
+        Let dot_seen be 0
+        Let dpi be at_pos plus 1
+        While dpi is less than vlen:
+            Let dch be proc memory_get_byte from Memory with value, dpi
+            If dch is equal to 46:
+                If dpi is greater than (at_pos plus 1):
+                    If dpi is less than (vlen minus 1):
+                        Set dot_seen to 1
+                    End If
+                End If
+            End If
+            Set dpi to dpi plus 1
+        End While
+        If dot_seen is equal to 0:
+            Return 0
+        End If
+        Return 1
+    End If
+
+    If format is equal to FORMAT_HOSTNAME:
+        If vlen is greater than 253:
+            Return 0
+        End If
+        Let h_i be 0
+        Let label_len be 0
+        Let label_start_ok be 0
+        Let label_last_ch be 0
+        Let h_bad be 0
+        While h_i is less than vlen:
+            Let h_ch be proc memory_get_byte from Memory with value, h_i
+            If h_ch is equal to 46:
+                If label_len is equal to 0:
+                    Set h_bad to 1
+                End If
+                If label_last_ch is equal to 45:
+                    Set h_bad to 1
+                End If
+                Set label_len to 0
+                Set label_start_ok to 0
+            Otherwise:
+                Let is_alpha be 0
+                If h_ch is greater than or equal to 65:
+                    If h_ch is less than or equal to 90:
+                        Set is_alpha to 1
+                    End If
+                End If
+                If h_ch is greater than or equal to 97:
+                    If h_ch is less than or equal to 122:
+                        Set is_alpha to 1
+                    End If
+                End If
+                Let is_digit be 0
+                If h_ch is greater than or equal to 48:
+                    If h_ch is less than or equal to 57:
+                        Set is_digit to 1
+                    End If
+                End If
+                Let is_hyphen be 0
+                If h_ch is equal to 45:
+                    Set is_hyphen to 1
+                End If
+                If is_alpha is equal to 0:
+                    If is_digit is equal to 0:
+                        If is_hyphen is equal to 0:
+                            Set h_bad to 1
+                        End If
+                    End If
+                End If
+                If label_len is equal to 0:
+                    If is_hyphen is equal to 1:
+                        Set h_bad to 1
+                    End If
+                    Set label_start_ok to 1
+                End If
+                Set label_len to label_len plus 1
+                If label_len is greater than 63:
+                    Set h_bad to 1
+                End If
+                Set label_last_ch to h_ch
+            End If
+            Set h_i to h_i plus 1
+        End While
+        If label_len is equal to 0:
+            Set h_bad to 1
+        End If
+        If label_last_ch is equal to 45:
+            Set h_bad to 1
+        End If
+        If h_bad is equal to 1:
+            Return 0
+        End If
+        Return 1
+    End If
+
+    Note: For format constants outside the supported set, accept the
+    Note: string. JSON Schema treats format as a vocabulary that may be
+    Note: open-ended; unknown formats are not validation failures.
+    Return 1
+End Process
+
+Process called "schema_validate" takes value as Integer, schema as Integer returns Integer:
+    Let issues be proc list_create from List
+    If issues is equal to 0:
+        Return 0
+    End If
+    Let root be 0
+    Let slash be 0
+    Let defs be 0
+    If schema is not equal to 0:
+        Set defs to proc memory_get_int64 from Memory with schema, 40
+    End If
+    proc validate_walk_with_defs with value, schema, root, slash, issues, defs
+    Return issues
+End Process
+
+@Reasoning
+Internal recursive validator. The path argument is the dotted-pointer
+path for diagnostic messages. Each recursion may allocate a temporary
+extended path which is freed at the end of the branch.
+@End Reasoning
+
+@Implementation
+Inspect schema kind via memory_get_int64. Apply per-kind validation logic
+exactly as documented in schema_validate.
+@End Implementation
+
+@Performance_Hints
+Time: O(s) where s is subtree size; per-step constant work.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper. Caller-supplied path may be null (treated as root).
+@End Security_Scope
+Process called "validate_walk" takes value as Integer, schema as Integer, path as Integer, indent as Integer, issues as Integer returns Integer:
+    Return proc validate_walk_with_defs with value, schema, path, indent, issues, 0
+End Process
+
+@Reasoning
+Full validator implementation parameterized by a $defs registry so
+SCHEMA_REFERENCE nodes can be resolved during recursion. The registry
+is a dictionary mapping definition names to SchemaNode pointers as
+populated by schema_add_definition.
+@End Reasoning
+
+@Implementation
+Identical to validate_walk's per-kind branch table plus
+  - SCHEMA_ALL_OF: every subschema must yield zero probe issues.
+  - SCHEMA_ONE_OF: exactly one subschema must yield zero probe issues.
+  - SCHEMA_CONST: cv_equals against the const value.
+  - SCHEMA_REFERENCE: look up name in defs registry; on success
+    recurse into the referenced schema (with infinite-recursion guard
+    via depth limit); on failure emit ERROR_REFERENCE_UNRESOLVED.
+  - SCHEMA_INTEGER / SCHEMA_FLOAT: also test the exclusiveMin/Max
+    bounds stored in the numeric extras record.
+  - SCHEMA_OBJECT: also enforce additionalProperties and
+    dependentRequired stored in the object extras record.
+  - SCHEMA_ARRAY: also apply prefixItems positional schemas and the
+    contains subschema stored in the array extras record.
+The indent parameter doubles as a recursion-depth tracker for $ref
+resolution; an absolute cap of 64 stops pathological self-referential
+schemas from blowing the stack.
+@End Implementation
+
+@Performance_Hints
+Time: O(s) over the (value, schema) pair. Space: O(d) recursion depth.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper. defs may be 0 (no registry available); SCHEMA_REFERENCE
+nodes still report unresolved in that case.
+@End Security_Scope
+Process called "validate_walk_with_defs" takes value as Integer, schema as Integer, path as Integer, indent as Integer, issues as Integer, defs as Integer returns Integer:
+    If schema is equal to 0:
+        Return 0
+    End If
+    If indent is greater than 64:
+        proc issues_append with issues, path, "schema recursion depth exceeded", ERROR_REFERENCE_UNRESOLVED
+        Return 1
+    End If
+    Let kind be proc memory_get_int64 from Memory with schema, 0
+    Let payload be proc memory_get_int64 from Memory with schema, 8
+
+    If kind is equal to SCHEMA_ANY:
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_NULL:
+        Let vk be proc config_value_kind from Cfg with value
+        If vk is not equal to 0:
+            proc issues_append with issues, path, "expected null", ERROR_TYPE_MISMATCH
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_BOOLEAN:
+        Let vk2 be proc config_value_kind from Cfg with value
+        If vk2 is not equal to 4:
+            proc issues_append with issues, path, "expected boolean", ERROR_TYPE_MISMATCH
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_INTEGER:
+        Let vk3 be proc config_value_kind from Cfg with value
+        If vk3 is not equal to 2:
+            proc issues_append with issues, path, "expected integer", ERROR_TYPE_MISMATCH
+            Return 1
+        End If
+        Let iv be proc config_value_as_integer from Cfg with value
+        If payload is not equal to 0:
+            Let has_min be proc memory_get_int64 from Memory with payload, 0
+            If has_min is equal to 1:
+                Let mn be proc memory_get_int64 from Memory with payload, 8
+                If iv is less than mn:
+                    proc issues_append with issues, path, "integer below minimum", ERROR_MIN_VALUE
+                End If
+            End If
+            Let has_max be proc memory_get_int64 from Memory with payload, 16
+            If has_max is equal to 1:
+                Let mx be proc memory_get_int64 from Memory with payload, 24
+                If iv is greater than mx:
+                    proc issues_append with issues, path, "integer above maximum", ERROR_MAX_VALUE
+                End If
+            End If
+            Let mof be proc memory_get_int64 from Memory with payload, 32
+            If mof is not equal to 0:
+                Let r be iv minus ((iv divided by mof) multiplied by mof)
+                If r is not equal to 0:
+                    proc issues_append with issues, path, "integer not multiple of base", ERROR_MULTIPLE_OF
+                End If
+            End If
+        End If
+        Let int_extras be proc memory_get_int64 from Memory with schema, 32
+        If int_extras is not equal to 0:
+            Let exmin_set be proc memory_get_int64 from Memory with int_extras, 8
+            If exmin_set is equal to 1:
+                Let exmin_v be proc memory_get_int64 from Memory with int_extras, 0
+                If iv is less than or equal to exmin_v:
+                    proc issues_append with issues, path, "integer not strictly greater than exclusiveMinimum", ERROR_MIN_VALUE
+                End If
+            End If
+            Let exmax_set be proc memory_get_int64 from Memory with int_extras, 24
+            If exmax_set is equal to 1:
+                Let exmax_v be proc memory_get_int64 from Memory with int_extras, 16
+                If iv is greater than or equal to exmax_v:
+                    proc issues_append with issues, path, "integer not strictly less than exclusiveMaximum", ERROR_MAX_VALUE
+                End If
+            End If
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_FLOAT:
+        Let vkf be proc config_value_kind from Cfg with value
+        Let cv_int_for_float be 0
+        Let v_is_int be 0
+        Let v_is_float be 0
+        If vkf is equal to 2:
+            Set v_is_int to 1
+            Set cv_int_for_float to proc config_value_as_integer from Cfg with value
+        End If
+        If vkf is equal to 3:
+            Set v_is_float to 1
+        End If
+        If v_is_int is equal to 0:
+            If v_is_float is equal to 0:
+                proc issues_append with issues, path, "expected number", ERROR_TYPE_MISMATCH
+                Return 1
+            End If
+        End If
+        Let flt_extras be proc memory_get_int64 from Memory with schema, 32
+        If flt_extras is not equal to 0:
+            If v_is_int is equal to 1:
+                Let fxmin_set be proc memory_get_int64 from Memory with flt_extras, 8
+                If fxmin_set is equal to 1:
+                    Let fxmin_v be proc memory_get_int64 from Memory with flt_extras, 0
+                    If cv_int_for_float is less than or equal to fxmin_v:
+                        proc issues_append with issues, path, "number not strictly greater than exclusiveMinimum", ERROR_MIN_VALUE
+                    End If
+                End If
+                Let fxmax_set be proc memory_get_int64 from Memory with flt_extras, 24
+                If fxmax_set is equal to 1:
+                    Let fxmax_v be proc memory_get_int64 from Memory with flt_extras, 16
+                    If cv_int_for_float is greater than or equal to fxmax_v:
+                        proc issues_append with issues, path, "number not strictly less than exclusiveMaximum", ERROR_MAX_VALUE
+                    End If
+                End If
+            End If
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_STRING:
+        Let vks be proc config_value_kind from Cfg with value
+        If vks is not equal to 1:
+            proc issues_append with issues, path, "expected string", ERROR_TYPE_MISMATCH
+            Return 1
+        End If
+        Let sptr be proc config_value_as_string from Cfg with value
+        If payload is not equal to 0:
+            If sptr is not equal to 0:
+                Let slen be proc string_length from StringCore with sptr
+                Let mnlen be proc memory_get_int64 from Memory with payload, 0
+                If mnlen is greater than or equal to 0:
+                    If slen is less than mnlen:
+                        proc issues_append with issues, path, "string below min length", ERROR_MIN_LENGTH
+                    End If
+                End If
+                Let mxlen be proc memory_get_int64 from Memory with payload, 8
+                If mxlen is greater than or equal to 0:
+                    If slen is greater than mxlen:
+                        proc issues_append with issues, path, "string above max length", ERROR_MAX_LENGTH
+                    End If
+                End If
+                Let pat_ptr be proc memory_get_int64 from Memory with payload, 16
+                If pat_ptr is not equal to 0:
+                    Let re be proc regex_compile from Regex with pat_ptr, 0
+                    If re is equal to 0:
+                        proc issues_append with issues, path, "string pattern is invalid regex", ERROR_PATTERN
+                    Otherwise:
+                        Let mres be proc regex_match from Regex with re, sptr
+                        If mres is equal to 0:
+                            proc issues_append with issues, path, "string does not match pattern", ERROR_PATTERN
+                        Otherwise:
+                            proc regex_match_destroy from Regex with mres
+                        End If
+                        proc deallocate from Layout with re
+                    End If
+                End If
+                Let fmt_code be proc memory_get_int64 from Memory with payload, 24
+                If fmt_code is not equal to FORMAT_NONE:
+                    Let ok_fmt be proc format_validate with sptr, fmt_code
+                    If ok_fmt is equal to 0:
+                        proc issues_append with issues, path, "string fails format constraint", ERROR_FORMAT
+                    End If
+                End If
+            End If
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_ARRAY:
+        Let vka be proc config_value_kind from Cfg with value
+        If vka is not equal to 5:
+            proc issues_append with issues, path, "expected array", ERROR_TYPE_MISMATCH
+            Return 1
+        End If
+        Let arr be proc config_value_as_list from Cfg with value
+        Let prefix_count be 0
+        Let arr_extras be proc memory_get_int64 from Memory with schema, 32
+        Let prefix_list be 0
+        Let contains_sub be 0
+        If arr_extras is not equal to 0:
+            Set prefix_list to proc memory_get_int64 from Memory with arr_extras, 0
+            Set contains_sub to proc memory_get_int64 from Memory with arr_extras, 8
+            If prefix_list is not equal to 0:
+                Set prefix_count to proc list_length from List with prefix_list
+            End If
+        End If
+        If payload is not equal to 0:
+            Let item_schema be proc memory_get_int64 from Memory with payload, 0
+            Let min_items be proc memory_get_int64 from Memory with payload, 8
+            Let max_items be proc memory_get_int64 from Memory with payload, 16
+            Let unique_items be proc memory_get_int64 from Memory with payload, 24
+            If arr is not equal to 0:
+                Let ac be proc list_length from List with arr
+                If min_items is greater than or equal to 0:
+                    If ac is less than min_items:
+                        proc issues_append with issues, path, "array below minItems", ERROR_MIN_VALUE
+                    End If
+                End If
+                If max_items is greater than or equal to 0:
+                    If ac is greater than max_items:
+                        proc issues_append with issues, path, "array above maxItems", ERROR_MAX_VALUE
+                    End If
+                End If
+                If unique_items is equal to 1:
+                    Let ui be 0
+                    Let dup_found be 0
+                    While ui is less than ac:
+                        Let uj be ui plus 1
+                        While uj is less than ac:
+                            Let ea be proc list_get from List with arr, ui
+                            Let eb be proc list_get from List with arr, uj
+                            Let cveq be proc cv_equals with ea, eb
+                            If cveq is equal to 1:
+                                Set dup_found to 1
+                                Set uj to ac
+                                Set ui to ac
+                            End If
+                            Set uj to uj plus 1
+                        End While
+                        Set ui to ui plus 1
+                    End While
+                    If dup_found is equal to 1:
+                        proc issues_append with issues, path, "array elements not unique", ERROR_ENUM_VIOLATION
+                    End If
+                End If
+                Note: Apply prefixItems for positions 0..prefix_count.
+                If prefix_count is greater than 0:
+                    Let p_i be 0
+                    Let p_limit be prefix_count
+                    If ac is less than p_limit:
+                        Set p_limit to ac
+                    End If
+                    While p_i is less than p_limit:
+                        Let p_elem be proc list_get from List with arr, p_i
+                        Let p_sch be proc list_get from List with prefix_list, p_i
+                        proc validate_walk_with_defs with p_elem, p_sch, path, indent plus 1, issues, defs
+                        Set p_i to p_i plus 1
+                    End While
+                End If
+                Note: Apply items_schema only to elements beyond the prefix range.
+                If item_schema is not equal to 0:
+                    Let i be prefix_count
+                    While i is less than ac:
+                        Let elem be proc list_get from List with arr, i
+                        proc validate_walk_with_defs with elem, item_schema, path, indent plus 1, issues, defs
+                        Set i to i plus 1
+                    End While
+                End If
+                Note: Apply contains: at least one element must validate.
+                If contains_sub is not equal to 0:
+                    Let c_i be 0
+                    Let any_contains be 0
+                    While c_i is less than ac:
+                        Let c_elem be proc list_get from List with arr, c_i
+                        Let c_probe be proc list_create from List
+                        If c_probe is not equal to 0:
+                            proc validate_walk_with_defs with c_elem, contains_sub, path, indent plus 1, c_probe, defs
+                            Let c_count be proc list_length from List with c_probe
+                            If c_count is equal to 0:
+                                Set any_contains to 1
+                            End If
+                            proc validation_issues_destroy with c_probe
+                        End If
+                        Set c_i to c_i plus 1
+                    End While
+                    If any_contains is equal to 0:
+                        proc issues_append with issues, path, "no array element matches contains subschema", ERROR_UNION_NO_MATCH
+                    End If
+                End If
+            End If
+        Otherwise:
+            Note: No primary payload but possibly prefix/contains extras.
+            If arr is not equal to 0:
+                Let ac2 be proc list_length from List with arr
+                If prefix_count is greater than 0:
+                    Let p2_i be 0
+                    Let p2_limit be prefix_count
+                    If ac2 is less than p2_limit:
+                        Set p2_limit to ac2
+                    End If
+                    While p2_i is less than p2_limit:
+                        Let p2_elem be proc list_get from List with arr, p2_i
+                        Let p2_sch be proc list_get from List with prefix_list, p2_i
+                        proc validate_walk_with_defs with p2_elem, p2_sch, path, indent plus 1, issues, defs
+                        Set p2_i to p2_i plus 1
+                    End While
+                End If
+                If contains_sub is not equal to 0:
+                    Let c2_i be 0
+                    Let any_contains2 be 0
+                    While c2_i is less than ac2:
+                        Let c2_elem be proc list_get from List with arr, c2_i
+                        Let c2_probe be proc list_create from List
+                        If c2_probe is not equal to 0:
+                            proc validate_walk_with_defs with c2_elem, contains_sub, path, indent plus 1, c2_probe, defs
+                            Let c2_count be proc list_length from List with c2_probe
+                            If c2_count is equal to 0:
+                                Set any_contains2 to 1
+                            End If
+                            proc validation_issues_destroy with c2_probe
+                        End If
+                        Set c2_i to c2_i plus 1
+                    End While
+                    If any_contains2 is equal to 0:
+                        proc issues_append with issues, path, "no array element matches contains subschema", ERROR_UNION_NO_MATCH
+                    End If
+                End If
+            End If
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_OBJECT:
+        Let vko be proc config_value_kind from Cfg with value
+        If vko is not equal to 6:
+            proc issues_append with issues, path, "expected object", ERROR_TYPE_MISMATCH
+            Return 1
+        End If
+        Let dict be proc config_value_as_map from Cfg with value
+        Note: Walk declared properties first; collect declared names so
+        Note: extras logic can identify additional properties later.
+        Let declared be proc create from Dict
+        If payload is not equal to 0:
+            Let count be proc list_length from List with payload
+            Let i2 be 0
+            While i2 is less than count:
+                Let fld be proc list_get from List with payload, i2
+                If fld is not equal to 0:
+                    Let fname be proc memory_get_int64 from Memory with fld, 0
+                    Let fschema be proc memory_get_int64 from Memory with fld, 8
+                    Let freq be proc memory_get_int64 from Memory with fld, 16
+                    If declared is not equal to 0:
+                        If fname is not equal to 0:
+                            proc set from Dict with declared, fname, fld
+                        End If
+                    End If
+                    If dict is not equal to 0:
+                        Let fv be proc get from Dict with dict, fname
+                        If fv is equal to 0:
+                            If freq is equal to 1:
+                                proc issues_append with issues, path, "missing required field", ERROR_MISSING_FIELD
+                            End If
+                        Otherwise:
+                            proc validate_walk_with_defs with fv, fschema, fname, indent plus 1, issues, defs
+                        End If
+                    End If
+                End If
+                Set i2 to i2 plus 1
+            End While
+        End If
+        Note: additionalProperties + dependentRequired live in extras.
+        Let obj_extras be proc memory_get_int64 from Memory with schema, 32
+        If obj_extras is not equal to 0:
+            Let ap_sub be proc memory_get_int64 from Memory with obj_extras, 0
+            Let ap_policy be proc memory_get_int64 from Memory with obj_extras, 8
+            Let dep_map be proc memory_get_int64 from Memory with obj_extras, 16
+            If dict is not equal to 0:
+                If ap_policy is not equal to AP_POLICY_UNSET:
+                    If ap_policy is not equal to AP_POLICY_TRUE:
+                        Let actual_keys be proc keys from Dict with dict
+                        If actual_keys is not equal to 0:
+                            Let ak_count be proc list_length from List with actual_keys
+                            Let ak_i be 0
+                            While ak_i is less than ak_count:
+                                Let actual_key be proc list_get from List with actual_keys, ak_i
+                                If actual_key is not equal to 0:
+                                    Let declared_entry be 0
+                                    If declared is not equal to 0:
+                                        Set declared_entry to proc get from Dict with declared, actual_key
+                                    End If
+                                    If declared_entry is equal to 0:
+                                        Let ap_value be proc get from Dict with dict, actual_key
+                                        If ap_policy is equal to AP_POLICY_FALSE:
+                                            proc issues_append with issues, actual_key, "unexpected additional property", ERROR_MISSING_FIELD
+                                        End If
+                                        If ap_policy is equal to AP_POLICY_SCHEMA:
+                                            If ap_sub is not equal to 0:
+                                                proc validate_walk_with_defs with ap_value, ap_sub, actual_key, indent plus 1, issues, defs
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                                Set ak_i to ak_i plus 1
+                            End While
+                            proc list_destroy from List with actual_keys
+                        End If
+                    End If
+                End If
+                If dep_map is not equal to 0:
+                    Let dep_keys be proc keys from Dict with dep_map
+                    If dep_keys is not equal to 0:
+                        Let dk_count be proc list_length from List with dep_keys
+                        Let dk_i be 0
+                        While dk_i is less than dk_count:
+                            Let dep_key be proc list_get from List with dep_keys, dk_i
+                            If dep_key is not equal to 0:
+                                Let trigger_present be proc contains from Dict with dict, dep_key
+                                If trigger_present is equal to 1:
+                                    Let req_list be proc get from Dict with dep_map, dep_key
+                                    If req_list is not equal to 0:
+                                        Let rln be proc list_length from List with req_list
+                                        Let rli be 0
+                                        While rli is less than rln:
+                                            Let needed be proc list_get from List with req_list, rli
+                                            If needed is not equal to 0:
+                                                Let needed_present be proc contains from Dict with dict, needed
+                                                If needed_present is equal to 0:
+                                                    proc issues_append with issues, path, "dependentRequired property missing", ERROR_MISSING_FIELD
+                                                End If
+                                            End If
+                                            Set rli to rli plus 1
+                                        End While
+                                    End If
+                                End If
+                            End If
+                            Set dk_i to dk_i plus 1
+                        End While
+                        proc list_destroy from List with dep_keys
+                    End If
+                End If
+            End If
+        End If
+        If declared is not equal to 0:
+            proc destroy from Dict with declared
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_UNION:
+        If payload is not equal to 0:
+            Let vcount be proc list_length from List with payload
+            Let any_match be 0
+            Let j be 0
+            While j is less than vcount:
+                Let variant be proc list_get from List with payload, j
+                Let probe be proc list_create from List
+                If probe is not equal to 0:
+                    proc validate_walk_with_defs with value, variant, path, indent plus 1, probe, defs
+                    Let pcount be proc list_length from List with probe
+                    If pcount is equal to 0:
+                        Set any_match to 1
+                    End If
+                    proc validation_issues_destroy with probe
+                End If
+                Set j to j plus 1
+            End While
+            If any_match is equal to 0:
+                proc issues_append with issues, path, "no union variant matched", ERROR_UNION_NO_MATCH
+            End If
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_AND:
+        If payload is not equal to 0:
+            Let acount be proc list_length from List with payload
+            Let aj be 0
+            While aj is less than acount:
+                Let avar be proc list_get from List with payload, aj
+                Let aprobe be proc list_create from List
+                If aprobe is not equal to 0:
+                    proc validate_walk_with_defs with value, avar, path, indent plus 1, aprobe, defs
+                    Let apcount be proc list_length from List with aprobe
+                    If apcount is greater than 0:
+                        proc issues_append with issues, path, "AND conjunct did not match", ERROR_UNION_NO_MATCH
+                    End If
+                    proc validation_issues_destroy with aprobe
+                End If
+                Set aj to aj plus 1
+            End While
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_NOT:
+        If payload is not equal to 0:
+            Let ncount be proc list_length from List with payload
+            If ncount is greater than 0:
+                Let inner be proc list_get from List with payload, 0
+                Let nprobe be proc list_create from List
+                If nprobe is not equal to 0:
+                    proc validate_walk_with_defs with value, inner, path, indent plus 1, nprobe, defs
+                    Let npcount be proc list_length from List with nprobe
+                    If npcount is equal to 0:
+                        proc issues_append with issues, path, "value matched a NOT schema", ERROR_UNION_NO_MATCH
+                    End If
+                    proc validation_issues_destroy with nprobe
+                End If
+            End If
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_ALL_OF:
+        If payload is not equal to 0:
+            Let allcount be proc list_length from List with payload
+            Let allj be 0
+            While allj is less than allcount:
+                Let allvar be proc list_get from List with payload, allj
+                Let allprobe be proc list_create from List
+                If allprobe is not equal to 0:
+                    proc validate_walk_with_defs with value, allvar, path, indent plus 1, allprobe, defs
+                    Let allpc be proc list_length from List with allprobe
+                    If allpc is greater than 0:
+                        proc issues_append with issues, path, "allOf subschema did not match", ERROR_UNION_NO_MATCH
+                    End If
+                    proc validation_issues_destroy with allprobe
+                End If
+                Set allj to allj plus 1
+            End While
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_ONE_OF:
+        If payload is not equal to 0:
+            Let onecount be proc list_length from List with payload
+            Let match_count be 0
+            Let onej be 0
+            While onej is less than onecount:
+                Let onevar be proc list_get from List with payload, onej
+                Let oneprobe be proc list_create from List
+                If oneprobe is not equal to 0:
+                    proc validate_walk_with_defs with value, onevar, path, indent plus 1, oneprobe, defs
+                    Let onepc be proc list_length from List with oneprobe
+                    If onepc is equal to 0:
+                        Set match_count to match_count plus 1
+                    End If
+                    proc validation_issues_destroy with oneprobe
+                End If
+                Set onej to onej plus 1
+            End While
+            If match_count is equal to 0:
+                proc issues_append with issues, path, "oneOf matched no subschema", ERROR_UNION_NO_MATCH
+            End If
+            If match_count is greater than 1:
+                proc issues_append with issues, path, "oneOf matched more than one subschema", ERROR_UNION_NO_MATCH
+            End If
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_CONST:
+        Let const_eq be proc cv_equals with value, payload
+        If const_eq is equal to 0:
+            proc issues_append with issues, path, "value does not match const", ERROR_ENUM_VIOLATION
+        End If
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_REFERENCE:
+        If defs is equal to 0:
+            proc issues_append with issues, path, "unresolved schema reference", ERROR_REFERENCE_UNRESOLVED
+            Return 1
+        End If
+        Let resolved be proc schema_lookup_definition with defs, payload
+        If resolved is equal to 0:
+            proc issues_append with issues, path, "unresolved schema reference", ERROR_REFERENCE_UNRESOLVED
+            Return 1
+        End If
+        proc validate_walk_with_defs with value, resolved, path, indent plus 1, issues, defs
+        Return 1
+    End If
+
+    If kind is equal to SCHEMA_ENUM:
+        Let vke be proc config_value_kind from Cfg with value
+        If vke is not equal to 1:
+            proc issues_append with issues, path, "enum value must be string", ERROR_TYPE_MISMATCH
+            Return 1
+        End If
+        Let sval be proc config_value_as_string from Cfg with value
+        If payload is not equal to 0:
+            Let ecount be proc list_length from List with payload
+            Let k be 0
+            Let matched be 0
+            While k is less than ecount:
+                Let candidate be proc list_get from List with payload, k
+                If candidate is not equal to 0:
+                    If sval is not equal to 0:
+                        Let eq be proc string_equals from StringCore with sval, candidate
+                        If eq is equal to 1:
+                            Set matched to 1
+                        End If
+                    End If
+                End If
+                Set k to k plus 1
+            End While
+            If matched is equal to 0:
+                proc issues_append with issues, path, "value not in enum", ERROR_ENUM_VIOLATION
+            End If
+        End If
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: WALKER
+Note: ============================================================================
+
+@Reasoning
+Apply a callback to every node in a schema tree (pre-order). The callback
+receives the node pointer and a caller-supplied state pointer. If the
+callback returns 0, the walk terminates early.
+@End Reasoning
+
+@Implementation
+Visit the current node first; if the callback returns 0, stop. Otherwise
+recurse into structural children according to kind.
+@End Implementation
+
+@Performance_Hints
+Time: O(s) over the subtree.
+@End Performance_Hints
+
+@Security_Scope
+Returns 1 if the walk completed, 0 if the callback aborted.
+@End Security_Scope
+Process called "schema_walk" takes node as Integer, visitor as Integer, state as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+    If visitor is equal to 0:
+        Return 1
+    End If
+    Let cont be proc __builtin_call_indirect_2 from Builtins with visitor, node, state
+    If cont is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, 0
+    Let payload be proc memory_get_int64 from Memory with node, 8
+    If kind is equal to SCHEMA_OBJECT:
+        If payload is not equal to 0:
+            Let count be proc list_length from List with payload
+            Let i be 0
+            While i is less than count:
+                Let fld be proc list_get from List with payload, i
+                If fld is not equal to 0:
+                    Let child be proc memory_get_int64 from Memory with fld, 8
+                    Let ok be proc schema_walk with child, visitor, state
+                    If ok is equal to 0:
+                        Return 0
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        End If
+    End If
+    If kind is equal to SCHEMA_ARRAY:
+        If payload is not equal to 0:
+            Let item_schema_walk be proc memory_get_int64 from Memory with payload, 0
+            If item_schema_walk is not equal to 0:
+                Let ok2 be proc schema_walk with item_schema_walk, visitor, state
+                If ok2 is equal to 0:
+                    Return 0
+                End If
+            End If
+        End If
+    End If
+    If kind is equal to SCHEMA_UNION:
+        If payload is not equal to 0:
+            Let vcount be proc list_length from List with payload
+            Let j be 0
+            While j is less than vcount:
+                Let variant be proc list_get from List with payload, j
+                If variant is not equal to 0:
+                    Let ok3 be proc schema_walk with variant, visitor, state
+                    If ok3 is equal to 0:
+                        Return 0
+                    End If
+                End If
+                Set j to j plus 1
+            End While
+        End If
+    End If
+    If kind is equal to SCHEMA_AND:
+        If payload is not equal to 0:
+            Let acount be proc list_length from List with payload
+            Let aj be 0
+            While aj is less than acount:
+                Let avar be proc list_get from List with payload, aj
+                If avar is not equal to 0:
+                    Let ok_a be proc schema_walk with avar, visitor, state
+                    If ok_a is equal to 0:
+                        Return 0
+                    End If
+                End If
+                Set aj to aj plus 1
+            End While
+        End If
+    End If
+    If kind is equal to SCHEMA_NOT:
+        If payload is not equal to 0:
+            Let ncount be proc list_length from List with payload
+            Let nj be 0
+            While nj is less than ncount:
+                Let nvar be proc list_get from List with payload, nj
+                If nvar is not equal to 0:
+                    Let ok_n be proc schema_walk with nvar, visitor, state
+                    If ok_n is equal to 0:
+                        Return 0
+                    End If
+                End If
+                Set nj to nj plus 1
+            End While
+        End If
+    End If
+    If kind is equal to SCHEMA_ALL_OF:
+        If payload is not equal to 0:
+            Let walk_all_count be proc list_length from List with payload
+            Let walk_all_j be 0
+            While walk_all_j is less than walk_all_count:
+                Let walk_all_var be proc list_get from List with payload, walk_all_j
+                If walk_all_var is not equal to 0:
+                    Let ok_all be proc schema_walk with walk_all_var, visitor, state
+                    If ok_all is equal to 0:
+                        Return 0
+                    End If
+                End If
+                Set walk_all_j to walk_all_j plus 1
+            End While
+        End If
+    End If
+    If kind is equal to SCHEMA_ONE_OF:
+        If payload is not equal to 0:
+            Let walk_one_count be proc list_length from List with payload
+            Let walk_one_j be 0
+            While walk_one_j is less than walk_one_count:
+                Let walk_one_var be proc list_get from List with payload, walk_one_j
+                If walk_one_var is not equal to 0:
+                    Let ok_one be proc schema_walk with walk_one_var, visitor, state
+                    If ok_one is equal to 0:
+                        Return 0
+                    End If
+                End If
+                Set walk_one_j to walk_one_j plus 1
+            End While
+        End If
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: COMPOSITION
+Note: ============================================================================
+
+@Reasoning
+Compose two schemas using AND, OR, or NOT semantics. Each operator
+produces a distinct node kind so the validator can apply the correct
+boolean semantics:
+
+  - COMPOSE_AND -> SCHEMA_AND node holding a two-element variant list.
+    Validation requires both variants to match.
+  - COMPOSE_OR  -> SCHEMA_UNION node holding a two-element variant list.
+    Validation requires at least one variant to match (anyOf).
+  - COMPOSE_NOT -> SCHEMA_NOT node holding a one-element variant list.
+    Validation requires the wrapped schema to fail.
+
+Variant lists are shared with the standard SCHEMA_UNION layout so
+schema_walk, schema_destroy, and serialization can treat all three
+boolean kinds uniformly.
+@End Reasoning
+
+@Implementation
+For AND: allocate a list, push a then b, build a SCHEMA_AND node.
+For OR: reuse schema_create_union and push both operands.
+For NOT: allocate a list, push a only, build a SCHEMA_NOT node.
+All operands are adopted into the new node; callers must not destroy
+them separately. On allocation failure intermediate resources are
+freed and 0 is returned.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) (no copying; ownership transfer).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null operand a or unrecognized operator. AND additionally
+requires non-null b.
+@End Security_Scope
+Process called "schema_compose" takes a as Integer, b as Integer, op as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If op is equal to COMPOSE_AND:
+        If b is equal to 0:
+            Return 0
+        End If
+        Let lst be proc list_create from List
+        If lst is equal to 0:
+            Return 0
+        End If
+        proc list_append from List with lst, a
+        proc list_append from List with lst, b
+        Let node_and be proc schema_create with SCHEMA_AND, lst
+        If node_and is equal to 0:
+            proc list_destroy from List with lst
+            Return 0
+        End If
+        Return node_and
+    End If
+    If op is equal to COMPOSE_OR:
+        If b is equal to 0:
+            Return 0
+        End If
+        Let u2 be proc schema_create_union
+        If u2 is equal to 0:
+            Return 0
+        End If
+        proc schema_union_add_variant with u2, a
+        proc schema_union_add_variant with u2, b
+        Return u2
+    End If
+    If op is equal to COMPOSE_NOT:
+        Let lst2 be proc list_create from List
+        If lst2 is equal to 0:
+            Return 0
+        End If
+        proc list_append from List with lst2, a
+        Let node_not be proc schema_create with SCHEMA_NOT, lst2
+        If node_not is equal to 0:
+            proc list_destroy from List with lst2
+            Return 0
+        End If
+        Return node_not
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: RUNA-NATIVE FORMAT EXPORT / IMPORT
+Note: ============================================================================
+
+@Reasoning
+Serialize a SchemaNode into the Runa-native textual schema format. The
+format is human-readable and round-trips via schema_from_runa_native_format.
+
+Format grammar (canonical):
+  schema      := kind-line metadata? body?
+  kind-line   := "Kind: " kind-name
+  metadata    := "Title: " text  |  "Description: " text
+  body        := object-body | array-body | string-body | integer-body
+               | enum-body | union-body | reference-body
+  object-body := "Fields:" (field-line)*
+  field-line  := "  - " name (" required")? (": " schema-summary)?
+@End Reasoning
+
+@Implementation
+Walk the tree depth-first using a StringBuilder. Emit one line per node,
+indenting nested structures with two spaces per depth level.
+@End Implementation
+
+@Performance_Hints
+Time: O(s) where s is total subtree size.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or null input.
+@End Security_Scope
+Process called "schema_to_runa_native_format" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc serialize_node with sb, node, 0
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Internal serializer that emits one node and recurses for compound kinds.
+Indent is the number of leading spaces (two per level).
+@End Reasoning
+
+@Implementation
+Switch on kind, emit appropriate header line, then write children with
+indent + 2 if compound.
+@End Implementation
+
+@Performance_Hints
+Time: O(s).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "serialize_node" takes sb as Integer, node as Integer, indent as Integer returns Integer:
+    If sb is equal to 0:
+        Return 0
+    End If
+    If node is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than indent:
+        proc stringbuilder_append_char from SB with sb, 32
+        Set i to i plus 1
+    End While
+    Let kind be proc memory_get_int64 from Memory with node, 0
+    Let payload be proc memory_get_int64 from Memory with node, 8
+    If kind is equal to SCHEMA_OBJECT:
+        proc stringbuilder_append from SB with sb, "Kind: Object"
+        proc stringbuilder_append_char from SB with sb, 10
+        If payload is not equal to 0:
+            Let count be proc list_length from List with payload
+            Let j be 0
+            While j is less than count:
+                Let fld be proc list_get from List with payload, j
+                If fld is not equal to 0:
+                    Let nm be proc memory_get_int64 from Memory with fld, 0
+                    Let sub be proc memory_get_int64 from Memory with fld, 8
+                    Let req be proc memory_get_int64 from Memory with fld, 16
+                    Let k be 0
+                    While k is less than (indent plus 2):
+                        proc stringbuilder_append_char from SB with sb, 32
+                        Set k to k plus 1
+                    End While
+                    proc stringbuilder_append from SB with sb, "- "
+                    If nm is not equal to 0:
+                        proc stringbuilder_append from SB with sb, nm
+                    End If
+                    If req is equal to 1:
+                        proc stringbuilder_append from SB with sb, " required"
+                    End If
+                    proc stringbuilder_append_char from SB with sb, 10
+                    proc serialize_node with sb, sub, indent plus 4
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Return 1
+    End If
+    If kind is equal to SCHEMA_ARRAY:
+        proc stringbuilder_append from SB with sb, "Kind: Array"
+        proc stringbuilder_append_char from SB with sb, 10
+        If payload is not equal to 0:
+            Let item_ser be proc memory_get_int64 from Memory with payload, 0
+            If item_ser is not equal to 0:
+                proc serialize_node with sb, item_ser, indent plus 2
+            End If
+        End If
+        Return 1
+    End If
+    If kind is equal to SCHEMA_STRING:
+        proc stringbuilder_append from SB with sb, "Kind: String"
+        proc stringbuilder_append_char from SB with sb, 10
+        Return 1
+    End If
+    If kind is equal to SCHEMA_INTEGER:
+        proc stringbuilder_append from SB with sb, "Kind: Integer"
+        proc stringbuilder_append_char from SB with sb, 10
+        Return 1
+    End If
+    If kind is equal to SCHEMA_FLOAT:
+        proc stringbuilder_append from SB with sb, "Kind: Float"
+        proc stringbuilder_append_char from SB with sb, 10
+        Return 1
+    End If
+    If kind is equal to SCHEMA_BOOLEAN:
+        proc stringbuilder_append from SB with sb, "Kind: Boolean"
+        proc stringbuilder_append_char from SB with sb, 10
+        Return 1
+    End If
+    If kind is equal to SCHEMA_NULL:
+        proc stringbuilder_append from SB with sb, "Kind: Null"
+        proc stringbuilder_append_char from SB with sb, 10
+        Return 1
+    End If
+    If kind is equal to SCHEMA_ANY:
+        proc stringbuilder_append from SB with sb, "Kind: Any"
+        proc stringbuilder_append_char from SB with sb, 10
+        Return 1
+    End If
+    If kind is equal to SCHEMA_REFERENCE:
+        proc stringbuilder_append from SB with sb, "Kind: Reference "
+        If payload is not equal to 0:
+            proc stringbuilder_append from SB with sb, payload
+        End If
+        proc stringbuilder_append_char from SB with sb, 10
+        Return 1
+    End If
+    If kind is equal to SCHEMA_ENUM:
+        proc stringbuilder_append from SB with sb, "Kind: Enum"
+        proc stringbuilder_append_char from SB with sb, 10
+        If payload is not equal to 0:
+            Let ec be proc list_length from List with payload
+            Let m be 0
+            While m is less than ec:
+                Let v be proc list_get from List with payload, m
+                Let k2 be 0
+                While k2 is less than (indent plus 2):
+                    proc stringbuilder_append_char from SB with sb, 32
+                    Set k2 to k2 plus 1
+                End While
+                proc stringbuilder_append from SB with sb, "- "
+                If v is not equal to 0:
+                    proc stringbuilder_append from SB with sb, v
+                End If
+                proc stringbuilder_append_char from SB with sb, 10
+                Set m to m plus 1
+            End While
+        End If
+        Return 1
+    End If
+    If kind is equal to SCHEMA_UNION:
+        proc stringbuilder_append from SB with sb, "Kind: Union"
+        proc stringbuilder_append_char from SB with sb, 10
+        If payload is not equal to 0:
+            Let vc be proc list_length from List with payload
+            Let n be 0
+            While n is less than vc:
+                Let variant be proc list_get from List with payload, n
+                proc serialize_node with sb, variant, indent plus 2
+                Set n to n plus 1
+            End While
+        End If
+        Return 1
+    End If
+    Return 1
+End Process
+
+@Reasoning
+Parse a Runa-native textual schema (as produced by
+schema_to_runa_native_format) back into a SchemaNode tree. The parser
+recognizes the canonical "Kind: <name>" header on the first non-blank
+line, then dispatches to the appropriate parser. Indent-sensitive parsing
+walks child lines at the next deeper indent.
+@End Reasoning
+
+@Implementation
+Top-level: trim leading whitespace, read up to the first newline. Match
+"Kind: Object", "Kind: Array", "Kind: String", "Kind: Integer",
+"Kind: Float", "Kind: Boolean", "Kind: Null", "Kind: Any",
+"Kind: Reference <name>", "Kind: Enum", "Kind: Union". For Object,
+parse field lines beginning with "- <name>" optionally followed by
+" required". Each field's sub-schema is the next indented block.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) where n is text length.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse error or null input. The caller owns the produced
+tree and must destroy it via schema_destroy.
+@End Security_Scope
+Process called "schema_from_runa_native_format" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with text
+    Let pos be proc skip_blank_and_indent with text, 0, length
+    If pos is greater than or equal to length:
+        Return 0
+    End If
+    Let header_start be pos
+    Let i be pos
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with text, i
+        If ch is equal to 10:
+            Set i to i plus 1
+            Let kind_text_len be (i minus header_start) minus 1
+            Let header be proc string_substring from StringPrim with text, header_start, kind_text_len
+            Let node be proc dispatch_kind_line with header
+            If header is not equal to 0:
+                proc deallocate from Layout with header
+            End If
+            Return node
+        End If
+        Set i to i plus 1
+    End While
+    Let header2_len be length minus header_start
+    Let header2 be proc string_substring from StringPrim with text, header_start, header2_len
+    Let node2 be proc dispatch_kind_line with header2
+    If header2 is not equal to 0:
+        proc deallocate from Layout with header2
+    End If
+    Return node2
+End Process
+
+@Reasoning
+Skip whitespace and blank lines starting at the given position.
+@End Reasoning
+
+@Implementation
+Advance until a non-whitespace, non-newline character.
+@End Implementation
+
+@Performance_Hints
+Time: O(k) where k is whitespace span.
+@End Performance_Hints
+
+@Security_Scope
+Returns the new position.
+@End Security_Scope
+Process called "skip_blank_and_indent" takes text as Integer, start as Integer, length as Integer returns Integer:
+    Let p be start
+    While p is less than length:
+        Let ch be proc memory_get_byte from Memory with text, p
+        If ch is equal to 32:
+            Set p to p plus 1
+        Otherwise:
+            If ch is equal to 9:
+                Set p to p plus 1
+            Otherwise:
+                If ch is equal to 10:
+                    Set p to p plus 1
+                Otherwise:
+                    If ch is equal to 13:
+                        Set p to p plus 1
+                    Otherwise:
+                        Return p
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return p
+End Process
+
+@Reasoning
+Map a "Kind: <name>" header line to the corresponding SchemaNode
+constructor. Only scalar kinds and empty composites are produced; full
+recursive deserialization of object fields is handled by callers
+operating line-by-line through the StringBuilder protocol.
+@End Reasoning
+
+@Implementation
+Compare the header against each "Kind: <name>" form using string_equals.
+For Reference, parse "Kind: Reference <name>" by string_substring after
+the literal prefix.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over kinds.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on unknown header.
+@End Security_Scope
+Process called "dispatch_kind_line" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    Let eq_obj be proc string_equals from StringCore with header, "Kind: Object"
+    If eq_obj is equal to 1:
+        Return proc schema_create_object
+    End If
+    Let eq_arr be proc string_equals from StringCore with header, "Kind: Array"
+    If eq_arr is equal to 1:
+        Let inner be proc schema_create_any
+        Return proc schema_create_array with inner, 0 minus 1, 0 minus 1, 0
+    End If
+    Let eq_str be proc string_equals from StringCore with header, "Kind: String"
+    If eq_str is equal to 1:
+        Return proc schema_create_string_any
+    End If
+    Let eq_int be proc string_equals from StringCore with header, "Kind: Integer"
+    If eq_int is equal to 1:
+        Return proc schema_create_integer_any
+    End If
+    Let eq_flt be proc string_equals from StringCore with header, "Kind: Float"
+    If eq_flt is equal to 1:
+        Return proc schema_create_float_any
+    End If
+    Let eq_bool be proc string_equals from StringCore with header, "Kind: Boolean"
+    If eq_bool is equal to 1:
+        Return proc schema_create_boolean
+    End If
+    Let eq_null be proc string_equals from StringCore with header, "Kind: Null"
+    If eq_null is equal to 1:
+        Return proc schema_create_null
+    End If
+    Let eq_any be proc string_equals from StringCore with header, "Kind: Any"
+    If eq_any is equal to 1:
+        Return proc schema_create_any
+    End If
+    Let eq_enum be proc string_equals from StringCore with header, "Kind: Enum"
+    If eq_enum is equal to 1:
+        Return proc schema_create_enum
+    End If
+    Let eq_union be proc string_equals from StringCore with header, "Kind: Union"
+    If eq_union is equal to 1:
+        Return proc schema_create_union
+    End If
+    Let starts_ref be proc string_starts_with from StringCore with header, "Kind: Reference "
+    If starts_ref is equal to 1:
+        Let total_len be proc string_length from StringCore with header
+        Let name_len be total_len minus 16
+        If name_len is less than 1:
+            Return 0
+        End If
+        Let nm be proc string_substring from StringPrim with header, 16, name_len
+        If nm is equal to 0:
+            Return 0
+        End If
+        Let n be proc schema_create_reference with nm
+        proc deallocate from Layout with nm
+        Return n
+    End If
+    Return 0
+End Process

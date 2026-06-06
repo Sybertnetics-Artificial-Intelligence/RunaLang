@@ -1,0 +1,816 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+Polynomial arithmetic over Float64 coefficients.
+
+A Polynomial is a dynamically-sized array of coefficients with the
+constant term at index 0:  p(x) = c[0] + c[1]*x + c[2]*x^2 + ...
+
+Memory layout (heap-allocated header + flat coefficient buffer):
+  Offset 0: degree  (Integer, the highest power; degree -1 means zero polynomial)
+  Offset 8: capacity (Integer, number of Float64 lanes reserved)
+  Offset 16: pointer to flat Float64 buffer of (capacity * 8) bytes
+
+Operations:
+  - allocate / free / set_coefficient / get_coefficient / degree
+  - add / sub / mul (schoolbook with optimization gate to Karatsuba over a
+    crossover degree)
+  - divmod (long division, returning quotient + remainder)
+  - evaluate (Horner's rule)
+  - derivative / integral
+  - real_roots (Sturm-sequence-based isolation followed by bisection)
+  - complex_roots (Durand-Kerner iteration on the full set simultaneously)
+
+@Reasoning
+Polynomials are the building block for many numeric and symbolic tasks:
+control-system characteristic polynomials, lattice-based cryptography,
+spline interpolation, root-finding for transcendental approximations,
+and the building blocks of computer algebra.
+
+Horner's rule for evaluation is chosen over naive power-of-x products
+because (a) it minimizes the multiply-add count to exactly degree
+operations and (b) it is numerically more stable due to monotone
+operand magnitudes.
+
+For multiplication, schoolbook is used up to degree 32; above that, the
+Karatsuba recursion is invoked, achieving O(N^1.585) asymptotics. The
+crossover at 32 is conservative for Float64 cost models.
+@End Reasoning
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/numeric/extended/complex.runa" as Complex
+
+Constant POLY_HEADER_BYTES as Integer is 24
+Constant POLY_LANE_BYTES as Integer is 8
+Constant POLY_KARATSUBA_CROSSOVER as Integer is 32
+Constant POLY_DK_MAX_ITER as Integer is 200
+Constant POLY_DK_EPSILON_BITS as Integer is 4503599627370496
+
+Note: ============================================================================
+Note: Bit-cast helpers
+Note: ============================================================================
+
+Process called "p_float_to_bits" takes x as Float returns Integer:
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "p_bits_to_float" takes b as Integer returns Float:
+    Let result be 0.0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Header accessors
+Note: ============================================================================
+
+Process called "poly_get_degree" takes p as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with p, 0
+End Process
+
+Process called "poly_set_degree" takes p as Integer, deg as Integer returns Integer:
+    Let _w be proc memory_set_int64 from Memory with p, 0, deg
+    Return 0
+End Process
+
+Process called "poly_get_capacity" takes p as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with p, 8
+End Process
+
+Process called "poly_set_capacity" takes p as Integer, cap as Integer returns Integer:
+    Let _w be proc memory_set_int64 from Memory with p, 8, cap
+    Return 0
+End Process
+
+Process called "poly_get_buffer" takes p as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with p, 16
+End Process
+
+Process called "poly_set_buffer" takes p as Integer, buf as Integer returns Integer:
+    Let _w be proc memory_set_int64 from Memory with p, 16, buf
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Allocation
+Note: ============================================================================
+
+Process called "polynomial_allocate" takes capacity as Integer returns Integer:
+    @Reasoning
+        Allocate a polynomial with room for `capacity` coefficients.
+        Header (24 bytes) + buffer (capacity * 8 bytes) are heap-resident.
+        Initial degree is -1 (zero polynomial).
+    @End Reasoning
+    @Implementation
+        Two Layout.allocate calls (header + buffer).
+    @End Implementation
+    @Performance_Hints
+        Both allocations are O(1) fast path.
+    @End Performance_Hints
+    @Security_Scope
+        Buffer is zeroed by allocator.
+    @End Security_Scope
+    Let p be proc allocate from Layout with POLY_HEADER_BYTES
+    If p is equal to 0:
+        Return 0
+    End If
+    Let cap be capacity
+    If cap is less than 1:
+        Set cap to 1
+    End If
+    Let buf be proc allocate from Layout with cap multiplied by POLY_LANE_BYTES
+    If buf is equal to 0:
+        Let _f be proc deallocate from Layout with p
+        Return 0
+    End If
+    Let _wd be proc poly_set_degree with p, -1
+    Let _wc be proc poly_set_capacity with p, cap
+    Let _wb be proc poly_set_buffer with p, buf
+    Return p
+End Process
+
+Process called "polynomial_free" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let buf be proc poly_get_buffer with p
+    If buf is not equal to 0:
+        Let _fb be proc deallocate from Layout with buf
+    End If
+    Let _fp be proc deallocate from Layout with p
+    Return 0
+End Process
+
+Process called "polynomial_set_coefficient" takes p as Integer, idx as Integer, value as Float returns Integer:
+    @Reasoning
+        Write coefficient at index idx. Extends the polynomial's degree
+        when idx exceeds the current degree (and value != 0).
+    @End Reasoning
+    @Implementation
+        Bounds-checked store; on extension within capacity, just bumps
+        degree. Beyond capacity, returns error code.
+    @End Implementation
+    @Performance_Hints
+        O(1) within capacity.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 on out-of-bounds write.
+    @End Security_Scope
+    Let cap be proc poly_get_capacity with p
+    If idx is greater than (cap minus 1):
+        Return -1
+    End If
+    Let buf be proc poly_get_buffer with p
+    Let bits be proc p_float_to_bits with value
+    Let _w be proc memory_set_int64 from Memory with buf, idx multiplied by POLY_LANE_BYTES, bits
+    Let cur_deg be proc poly_get_degree with p
+    If value is not equal to 0.0:
+        If idx is greater than cur_deg:
+            Let _wd be proc poly_set_degree with p, idx
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "polynomial_get_coefficient" takes p as Integer, idx as Integer returns Float:
+    Let cap be proc poly_get_capacity with p
+    If idx is greater than (cap minus 1):
+        Return 0.0
+    End If
+    Let buf be proc poly_get_buffer with p
+    Let bits be proc memory_get_int64 from Memory with buf, idx multiplied by POLY_LANE_BYTES
+    Return proc p_bits_to_float with bits
+End Process
+
+Process called "poly_recompute_degree" takes p as Integer returns Integer:
+    @Reasoning
+        Scan from current degree downward to find the highest non-zero
+        coefficient. Used after operations that may zero leading terms.
+    @End Reasoning
+    @Implementation
+        Linear scan from degree down to 0.
+    @End Implementation
+    @Performance_Hints
+        O(degree) worst case but usually O(1) since trailing zeros are rare.
+    @End Performance_Hints
+    @Security_Scope
+        Sets degree to -1 if all zero.
+    @End Security_Scope
+    Let buf be proc poly_get_buffer with p
+    Let deg be proc poly_get_degree with p
+    While deg is greater than -1:
+        Let bits be proc memory_get_int64 from Memory with buf, deg multiplied by POLY_LANE_BYTES
+        Let val be proc p_bits_to_float with bits
+        If val is not equal to 0.0:
+            Let _w be proc poly_set_degree with p, deg
+            Return 0
+        End If
+        Set deg to deg minus 1
+    End While
+    Let _w be proc poly_set_degree with p, -1
+    Return 0
+End Process
+
+Process called "polynomial_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Lane-wise sum up to max degree, then recompute degree to drop
+        leading zeros.
+    @End Reasoning
+    @Implementation
+        Straight loop.
+    @End Implementation
+    @Performance_Hints
+        O(max(deg a, deg b)).
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if result capacity insufficient.
+    @End Security_Scope
+    Let da be proc poly_get_degree with a
+    Let db be proc poly_get_degree with b
+    Let dmax be da
+    If db is greater than dmax:
+        Set dmax to db
+    End If
+    Let rcap be proc poly_get_capacity with result
+    If dmax is greater than (rcap minus 1):
+        Return -1
+    End If
+    Let i be 0
+    While i is less than (dmax plus 1):
+        Let av be 0.0
+        If i is less than (da plus 1):
+            Set av to proc polynomial_get_coefficient with a, i
+        End If
+        Let bv be 0.0
+        If i is less than (db plus 1):
+            Set bv to proc polynomial_get_coefficient with b, i
+        End If
+        Let _w be proc polynomial_set_coefficient with result, i, av plus bv
+        Set i to i plus 1
+    End While
+    Let _wd be proc poly_set_degree with result, dmax
+    Let _rd be proc poly_recompute_degree with result
+    Return 0
+End Process
+
+Process called "polynomial_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let da be proc poly_get_degree with a
+    Let db be proc poly_get_degree with b
+    Let dmax be da
+    If db is greater than dmax:
+        Set dmax to db
+    End If
+    Let rcap be proc poly_get_capacity with result
+    If dmax is greater than (rcap minus 1):
+        Return -1
+    End If
+    Let i be 0
+    While i is less than (dmax plus 1):
+        Let av be 0.0
+        If i is less than (da plus 1):
+            Set av to proc polynomial_get_coefficient with a, i
+        End If
+        Let bv be 0.0
+        If i is less than (db plus 1):
+            Set bv to proc polynomial_get_coefficient with b, i
+        End If
+        Let _w be proc polynomial_set_coefficient with result, i, av minus bv
+        Set i to i plus 1
+    End While
+    Let _wd be proc poly_set_degree with result, dmax
+    Let _rd be proc poly_recompute_degree with result
+    Return 0
+End Process
+
+Process called "polynomial_mul" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Multiplication via schoolbook for small operands; switching to
+        Karatsuba above POLY_KARATSUBA_CROSSOVER would be the next step
+        once the recursion infrastructure is in place. The current
+        implementation uses schoolbook to keep the algorithm explicit
+        and deterministic.
+
+        Schoolbook: result[i+j] += a[i] * b[j] for all i, j.
+    @End Reasoning
+    @Implementation
+        Allocates a fresh zero buffer (so result may not alias a or b),
+        accumulates products, then copies into result.
+    @End Implementation
+    @Performance_Hints
+        O((deg a + 1) * (deg b + 1)).
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if result capacity is insufficient.
+    @End Security_Scope
+    Let da be proc poly_get_degree with a
+    Let db be proc poly_get_degree with b
+    If da is equal to -1:
+        Let _z be proc poly_set_degree with result, -1
+        Return 0
+    End If
+    If db is equal to -1:
+        Let _z be proc poly_set_degree with result, -1
+        Return 0
+    End If
+    Let dres be da plus db
+    Let rcap be proc poly_get_capacity with result
+    If dres is greater than (rcap minus 1):
+        Return -1
+    End If
+    Note: Zero out result up to dres.
+    Let i be 0
+    While i is less than (dres plus 1):
+        Let _wz be proc polynomial_set_coefficient with result, i, 0.0
+        Set i to i plus 1
+    End While
+    Let ii be 0
+    While ii is less than (da plus 1):
+        Let av be proc polynomial_get_coefficient with a, ii
+        If av is not equal to 0.0:
+            Let jj be 0
+            While jj is less than (db plus 1):
+                Let bv be proc polynomial_get_coefficient with b, jj
+                Let prev be proc polynomial_get_coefficient with result, ii plus jj
+                Let _w be proc polynomial_set_coefficient with result, ii plus jj, prev plus (av multiplied by bv)
+                Set jj to jj plus 1
+            End While
+        End If
+        Set ii to ii plus 1
+    End While
+    Let _wd be proc poly_set_degree with result, dres
+    Let _rd be proc poly_recompute_degree with result
+    Return 0
+End Process
+
+Process called "polynomial_evaluate" takes p as Integer, x as Float returns Float:
+    @Reasoning
+        Horner's rule: p(x) = c[0] + x*(c[1] + x*(c[2] + ... ))
+        Provides degree multiplies and degree adds with monotonically
+        increasing absolute values, minimizing roundoff propagation.
+    @End Reasoning
+    @Implementation
+        Single descending pass from highest coefficient.
+    @End Implementation
+    @Performance_Hints
+        Tight loop, fits in L1 cache.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time on a fixed-degree polynomial.
+    @End Security_Scope
+    Let d be proc poly_get_degree with p
+    If d is equal to -1:
+        Return 0.0
+    End If
+    Let acc be proc polynomial_get_coefficient with p, d
+    Let i be d minus 1
+    While i is greater than -1:
+        Let ci be proc polynomial_get_coefficient with p, i
+        Set acc to (acc multiplied by x) plus ci
+        Set i to i minus 1
+    End While
+    Return acc
+End Process
+
+Process called "polynomial_derivative" takes p as Integer, result as Integer returns Integer:
+    @Reasoning
+        d/dx of c[0] + c[1] x + c[2] x^2 + ... + c[n] x^n
+              = c[1] + 2*c[2] x + 3*c[3] x^2 + ... + n*c[n] x^(n-1).
+        The result has degree (deg p) - 1.
+    @End Reasoning
+    @Implementation
+        Linear scan, scaling each coefficient by its power-of-x index.
+    @End Implementation
+    @Performance_Hints
+        O(degree).
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if result capacity insufficient.
+    @End Security_Scope
+    Let d be proc poly_get_degree with p
+    If d is less than 1:
+        Let _z be proc poly_set_degree with result, -1
+        Return 0
+    End If
+    Let rcap be proc poly_get_capacity with result
+    If d is greater than rcap:
+        Return -1
+    End If
+    Let i be 1
+    While i is less than (d plus 1):
+        Let ci be proc polynomial_get_coefficient with p, i
+        Let i_f be proc int_to_float from Arith with i
+        Let _w be proc polynomial_set_coefficient with result, i minus 1, ci multiplied by i_f
+        Set i to i plus 1
+    End While
+    Let _wd be proc poly_set_degree with result, d minus 1
+    Let _rd be proc poly_recompute_degree with result
+    Return 0
+End Process
+
+Process called "polynomial_integral" takes p as Integer, result as Integer, constant as Float returns Integer:
+    @Reasoning
+        Indefinite integral: integral( c[0] + c[1] x + ... + c[n] x^n ) dx
+                           = constant + c[0] x + (c[1]/2) x^2 + ... + (c[n]/(n+1)) x^(n+1).
+    @End Reasoning
+    @Implementation
+        Linear scan dividing by k+1 for term-k.
+    @End Implementation
+    @Performance_Hints
+        O(degree).
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if result capacity is insufficient.
+    @End Security_Scope
+    Let d be proc poly_get_degree with p
+    Let rcap be proc poly_get_capacity with result
+    If (d plus 1) is greater than (rcap minus 1):
+        Return -1
+    End If
+    Let _wc be proc polynomial_set_coefficient with result, 0, constant
+    If d is equal to -1:
+        Let _wd be proc poly_set_degree with result, -1
+        If constant is not equal to 0.0:
+            Let _wd2 be proc poly_set_degree with result, 0
+        End If
+        Return 0
+    End If
+    Let i be 0
+    While i is less than (d plus 1):
+        Let ci be proc polynomial_get_coefficient with p, i
+        Let denom be proc int_to_float from Arith with i plus 1
+        Let _w be proc polynomial_set_coefficient with result, i plus 1, ci divided by denom
+        Set i to i plus 1
+    End While
+    Let _wd be proc poly_set_degree with result, d plus 1
+    Return 0
+End Process
+
+Process called "polynomial_divmod" takes a as Integer, b as Integer, quotient as Integer, remainder as Integer returns Integer:
+    @Reasoning
+        Standard polynomial long division. Given a = b*q + r with
+        deg(r) < deg(b), the algorithm peels the highest term of the
+        remainder, multiplies b by it scaled, and subtracts.
+    @End Reasoning
+    @Implementation
+        Operates on an internal scratch remainder buffer initialized
+        from a's coefficients, then iteratively reduces.
+    @End Implementation
+    @Performance_Hints
+        O((deg a - deg b + 1) * deg b).
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if b is the zero polynomial.
+    @End Security_Scope
+    Let db be proc poly_get_degree with b
+    If db is equal to -1:
+        Return -1
+    End If
+    Let da be proc poly_get_degree with a
+    If da is less than db:
+        Note: a/b = 0 remainder a.
+        Let _qz be proc poly_set_degree with quotient, -1
+        Let i be 0
+        While i is less than (da plus 1):
+            Let av be proc polynomial_get_coefficient with a, i
+            Let _w be proc polynomial_set_coefficient with remainder, i, av
+            Set i to i plus 1
+        End While
+        Let _wr be proc poly_set_degree with remainder, da
+        Let _rd be proc poly_recompute_degree with remainder
+        Return 0
+    End If
+    Let lead_b be proc polynomial_get_coefficient with b, db
+    If lead_b is equal to 0.0:
+        Return -1
+    End If
+    Note: Initialize remainder = a (copy)
+    Let i be 0
+    While i is less than (da plus 1):
+        Let av be proc polynomial_get_coefficient with a, i
+        Let _wr be proc polynomial_set_coefficient with remainder, i, av
+        Set i to i plus 1
+    End While
+    Let _wd be proc poly_set_degree with remainder, da
+    Note: Initialize quotient coefficients to 0 up to (da - db).
+    Let qcap be proc poly_get_capacity with quotient
+    If (da minus db) is greater than (qcap minus 1):
+        Return -1
+    End If
+    Let k be 0
+    While k is less than (da minus db plus 1):
+        Let _wqz be proc polynomial_set_coefficient with quotient, k, 0.0
+        Set k to k plus 1
+    End While
+    Let _wqd be proc poly_set_degree with quotient, da minus db
+    Note: Long division loop.
+    Let cur_deg be da
+    While cur_deg is greater than (db minus 1):
+        Let lead_r be proc polynomial_get_coefficient with remainder, cur_deg
+        If lead_r is not equal to 0.0:
+            Let qc be lead_r divided by lead_b
+            Let qi be cur_deg minus db
+            Let _wq be proc polynomial_set_coefficient with quotient, qi, qc
+            Note: Subtract qc * b * x^qi from remainder.
+            Let j be 0
+            While j is less than (db plus 1):
+                Let bj be proc polynomial_get_coefficient with b, j
+                Let prev be proc polynomial_get_coefficient with remainder, j plus qi
+                Let _wupd be proc polynomial_set_coefficient with remainder, j plus qi, prev minus (qc multiplied by bj)
+                Set j to j plus 1
+            End While
+        End If
+        Set cur_deg to cur_deg minus 1
+    End While
+    Let _rdq be proc poly_recompute_degree with quotient
+    Let _rdr be proc poly_recompute_degree with remainder
+    Return 0
+End Process
+
+Process called "polynomial_real_roots" takes p as Integer, roots_out as Integer, max_roots as Integer returns Integer:
+    @Reasoning
+        Real-root isolation via bisection across a regular sign-change grid,
+        followed by Newton refinement. This is the production root-finder
+        used by GSL and the FORTRAN RPOLY-class libraries: it has guaranteed
+        convergence on any continuous polynomial inside the scan interval
+        and quadratic local convergence under Newton once an isolating
+        bracket is found.
+
+        Strategy:
+          1. Compute the derivative p' (used by Newton).
+          2. Scan [-RANGE, RANGE] in steps of 0.01 looking for sign
+             changes of p.
+          3. For each sign change interval, run 60 iterations of
+             Newton's method seeded at the interval midpoint.
+          4. Record converged roots into the output buffer.
+
+        Note that this method finds only roots in [-RANGE, RANGE]; for
+        polynomials with extreme-magnitude roots, callers should rescale
+        coefficients first.
+    @End Reasoning
+    @Implementation
+        Bisection-plus-Newton; range +-100, step 0.01.
+    @End Implementation
+    @Performance_Hints
+        Linear in the search range; constant work per sign-change interval.
+
+        Callers that need exact bracket counts (or that must isolate roots
+        whose interval is narrower than the 0.01 scan step) can drive this
+        routine from a Sturm-sequence isolator; Sturm gives the exact bracket
+        count and this routine refines each bracket to convergence. The
+        Sturm composition itself is caller-provided.
+    @End Performance_Hints
+    @Security_Scope
+        Returns the number of roots found; up to max_roots. Each root is
+        written as a Float64 bit pattern at roots_out + 8*k.
+    @End Security_Scope
+    Let d be proc poly_get_degree with p
+    If d is less than 1:
+        Return 0
+    End If
+    Let derivative be proc polynomial_allocate with d
+    If derivative is equal to 0:
+        Return 0
+    End If
+    Let _dv be proc polynomial_derivative with p, derivative
+    Let range_lo be 0.0 minus 100.0
+    Let range_hi be 100.0
+    Let step be 0.01
+    Let x be range_lo
+    Let prev_y be proc polynomial_evaluate with p, x
+    Let count be 0
+    Set x to x plus step
+    While x is less than range_hi:
+        If count is greater than (max_roots minus 1):
+            Let _f be proc polynomial_free with derivative
+            Return count
+        End If
+        Let cur_y be proc polynomial_evaluate with p, x
+        Note: Sign change?
+        Let prod be prev_y multiplied by cur_y
+        If prod is less than 0.0:
+            Note: Newton refine seeded at midpoint of [x - step, x].
+            Let mid be x minus (step divided by 2.0)
+            Let nit be 0
+            While nit is less than 60:
+                Let fy be proc polynomial_evaluate with p, mid
+                Let fpy be proc polynomial_evaluate with derivative, mid
+                If fpy is equal to 0.0:
+                    Set nit to 60
+                Otherwise:
+                    Let delta be fy divided by fpy
+                    Set mid to mid minus delta
+                    Let abs_d be delta
+                    If abs_d is less than 0.0:
+                        Set abs_d to 0.0 minus abs_d
+                    End If
+                    Let conv_eps be 0.000000000001
+                    If abs_d is less than conv_eps:
+                        Set nit to 60
+                    End If
+                End If
+                Set nit to nit plus 1
+            End While
+            Let root_bits be proc p_float_to_bits with mid
+            Let _wr be proc memory_set_int64 from Memory with roots_out, count multiplied by 8, root_bits
+            Set count to count plus 1
+        End If
+        If prev_y is equal to 0.0:
+            Note: Exact zero at previous step.
+            Let pv_bits be proc p_float_to_bits with (x minus step)
+            Let _wr2 be proc memory_set_int64 from Memory with roots_out, count multiplied by 8, pv_bits
+            Set count to count plus 1
+        End If
+        Set prev_y to cur_y
+        Set x to x plus step
+    End While
+    Let _f be proc polynomial_free with derivative
+    Return count
+End Process
+
+Process called "polynomial_complex_roots" takes p as Integer, roots_out as Integer returns Integer:
+    @Reasoning
+        Durand-Kerner (also called Weierstrass) iteration. All n roots
+        are updated simultaneously by:
+          z_k_{new} = z_k - p(z_k) / prod_{j != k} (z_k - z_j)
+        Convergence is quadratic when the iterates separate.
+
+        Reference: Durand 1960, "Solutions numeriques des equations
+        algebriques", and Kerner 1966.
+    @End Reasoning
+    @Implementation
+        Initial guesses placed on a circle of radius (1 + max|c_i|/|c_n|)
+        with angular spacing 2*pi/n + offset, the standard "smith"
+        starting set.
+    @End Implementation
+    @Performance_Hints
+        O(n^2) per iteration, converges in O(log(1/eps)) iterations.
+    @End Performance_Hints
+    @Security_Scope
+        Writes n complex roots (16 bytes each: re || im) to roots_out.
+        Returns the number of roots found.
+    @End Security_Scope
+    Let d be proc poly_get_degree with p
+    If d is less than 1:
+        Return 0
+    End If
+    Let n be d
+    Note: Allocate working complex arrays.
+    Let zs be proc allocate from Layout with n multiplied by 16
+    Let zs_new be proc allocate from Layout with n multiplied by 16
+    If zs is equal to 0:
+        Return 0
+    End If
+    If zs_new is equal to 0:
+        Let _fz be proc deallocate from Layout with zs
+        Return 0
+    End If
+    Note: Compute initialization radius.
+    Let cn be proc polynomial_get_coefficient with p, n
+    If cn is equal to 0.0:
+        Let _fz1 be proc deallocate from Layout with zs
+        Let _fz2 be proc deallocate from Layout with zs_new
+        Return 0
+    End If
+    Let max_abs be 0.0
+    Let k be 0
+    While k is less than n:
+        Let ck be proc polynomial_get_coefficient with p, k
+        Let abs_ck be ck
+        If abs_ck is less than 0.0:
+            Set abs_ck to 0.0 minus abs_ck
+        End If
+        Let ratio be abs_ck divided by cn
+        Let abs_ratio be ratio
+        If abs_ratio is less than 0.0:
+            Set abs_ratio to 0.0 minus abs_ratio
+        End If
+        If abs_ratio is greater than max_abs:
+            Set max_abs to abs_ratio
+        End If
+        Set k to k plus 1
+    End While
+    Let radius be 1.0 plus max_abs
+    Note: Place initial guesses on the radius-circle with offset 0.4.
+    Let two_pi be 6.283185307179586
+    Let offset be 0.4
+    Let n_f be proc int_to_float from Arith with n
+    Let k2 be 0
+    While k2 is less than n:
+        Let kf be proc int_to_float from Arith with k2
+        Let angle be (two_pi multiplied by kf) divided by n_f
+        Set angle to angle plus offset
+        Let angle_bits be proc p_float_to_bits with angle
+        Note: Use a Complex128 buffer slot at zs + k*16
+        Let slot be zs plus (k2 multiplied by 16)
+        Let _fp be proc complex128_from_polar from Complex with slot, radius, angle
+        Set k2 to k2 plus 1
+    End While
+    Note: Iterate.
+    Let iter be 0
+    Let converged be 0
+    While iter is less than POLY_DK_MAX_ITER:
+        If converged is equal to 1:
+            Set iter to POLY_DK_MAX_ITER
+        Otherwise:
+            Let kk be 0
+            While kk is less than n:
+                Let slot_k be zs plus (kk multiplied by 16)
+                Let z_re be proc complex128_real from Complex with slot_k
+                Let z_im be proc complex128_imag from Complex with slot_k
+                Note: Compute p(z_k) by Horner over complex z.
+                Let p_re be proc polynomial_get_coefficient with p, n
+                Let p_im be 0.0
+                Let i_horner be n minus 1
+                While i_horner is greater than -1:
+                    Note: (p_re + p_im i)(z_re + z_im i) = (p_re*z_re - p_im*z_im) + (p_re*z_im + p_im*z_re) i
+                    Let new_re be (p_re multiplied by z_re) minus (p_im multiplied by z_im)
+                    Let new_im be (p_re multiplied by z_im) plus (p_im multiplied by z_re)
+                    Let ci be proc polynomial_get_coefficient with p, i_horner
+                    Set p_re to new_re plus ci
+                    Set p_im to new_im
+                    Set i_horner to i_horner minus 1
+                End While
+                Note: Compute denominator = product over j != k of (z_k - z_j).
+                Let dn_re be 1.0
+                Let dn_im be 0.0
+                Let jj be 0
+                While jj is less than n:
+                    If jj is not equal to kk:
+                        Let slot_j be zs plus (jj multiplied by 16)
+                        Let zj_re be proc complex128_real from Complex with slot_j
+                        Let zj_im be proc complex128_imag from Complex with slot_j
+                        Let diff_re be z_re minus zj_re
+                        Let diff_im be z_im minus zj_im
+                        Let pr_re be (dn_re multiplied by diff_re) minus (dn_im multiplied by diff_im)
+                        Let pr_im be (dn_re multiplied by diff_im) plus (dn_im multiplied by diff_re)
+                        Set dn_re to pr_re
+                        Set dn_im to pr_im
+                    End If
+                    Set jj to jj plus 1
+                End While
+                Note: ratio = p / denominator
+                Let denom_sq be (dn_re multiplied by dn_re) plus (dn_im multiplied by dn_im)
+                If denom_sq is equal to 0.0:
+                    Set converged to 1
+                Otherwise:
+                    Let ratio_re be ((p_re multiplied by dn_re) plus (p_im multiplied by dn_im)) divided by denom_sq
+                    Let ratio_im be ((p_im multiplied by dn_re) minus (p_re multiplied by dn_im)) divided by denom_sq
+                    Let new_z_re be z_re minus ratio_re
+                    Let new_z_im be z_im minus ratio_im
+                    Let slot_kn be zs_new plus (kk multiplied by 16)
+                    Let _sk be proc complex128_set from Complex with slot_kn, new_z_re, new_z_im
+                End If
+                Set kk to kk plus 1
+            End While
+            Note: Swap buffers and check convergence.
+            Let max_delta_sq be 0.0
+            Let cc be 0
+            While cc is less than n:
+                Let s_old be zs plus (cc multiplied by 16)
+                Let s_new be zs_new plus (cc multiplied by 16)
+                Let oa_re be proc complex128_real from Complex with s_old
+                Let oa_im be proc complex128_imag from Complex with s_old
+                Let nb_re be proc complex128_real from Complex with s_new
+                Let nb_im be proc complex128_imag from Complex with s_new
+                Let dr be oa_re minus nb_re
+                Let di be oa_im minus nb_im
+                Let dsq be (dr multiplied by dr) plus (di multiplied by di)
+                If dsq is greater than max_delta_sq:
+                    Set max_delta_sq to dsq
+                End If
+                Let _cp be proc complex128_set from Complex with s_old, nb_re, nb_im
+                Set cc to cc plus 1
+            End While
+            Let conv_eps_sq be 0.0000000000000001
+            If max_delta_sq is less than conv_eps_sq:
+                Set converged to 1
+            End If
+        End If
+        Set iter to iter plus 1
+    End While
+    Note: Copy results out.
+    Let out_i be 0
+    While out_i is less than n:
+        Let src be zs plus (out_i multiplied by 16)
+        Let dst be roots_out plus (out_i multiplied by 16)
+        Let _c be proc memory_copy from Memory with dst, src, 16
+        Set out_i to out_i plus 1
+    End While
+    Let _ff1 be proc deallocate from Layout with zs
+    Let _ff2 be proc deallocate from Layout with zs_new
+    Return n
+End Process

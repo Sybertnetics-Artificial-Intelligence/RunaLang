@@ -1,0 +1,714 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+CHANNEL - Typed thread-safe FIFO message-passing channel.
+
+A Channel<T> is a thread-safe FIFO queue used for inter-thread communication.
+
+Channel modes:
+- capacity == 0 -> unbounded (sender never blocks on capacity; only memory limits)
+- capacity > 0  -> bounded; sender blocks when buffer is full
+
+Channel structure layout (64 bytes):
+  offset 0:  mutex_ptr        (8 bytes) - underlying mutex
+  offset 8:  not_empty_cv     (8 bytes) - condvar receivers wait on
+  offset 16: not_full_cv      (8 bytes) - condvar senders wait on (bounded)
+  offset 24: head_node        (8 bytes) - pointer to head of singly-linked list
+  offset 32: tail_node        (8 bytes) - pointer to tail of list
+  offset 40: count            (8 bytes) - number of buffered messages
+  offset 48: capacity         (8 bytes) - 0 = unbounded, otherwise bound
+  offset 56: closed_flag      (8 bytes) - 0 = open, 1 = closed
+
+Node layout (16 bytes):
+  offset 0: value_ptr (8 bytes) - generic value (caller manages T's memory)
+  offset 8: next_ptr  (8 bytes) - next node, 0 if tail
+
+Dependencies:
+- threading/sync_core.runa (mutex, condvar)
+- memory/layout.runa (allocate/deallocate)
+:End Note
+
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Note: ============================================================================
+Note: Channel layout constants
+Note: ============================================================================
+
+Constant CHAN_OFF_MUTEX as Integer is 0
+Constant CHAN_OFF_NOT_EMPTY_CV as Integer is 8
+Constant CHAN_OFF_NOT_FULL_CV as Integer is 16
+Constant CHAN_OFF_HEAD as Integer is 24
+Constant CHAN_OFF_TAIL as Integer is 32
+Constant CHAN_OFF_COUNT as Integer is 40
+Constant CHAN_OFF_CAPACITY as Integer is 48
+Constant CHAN_OFF_CLOSED as Integer is 56
+Constant CHAN_STRUCT_SIZE as Integer is 64
+
+Constant CHAN_NODE_VALUE as Integer is 0
+Constant CHAN_NODE_NEXT as Integer is 8
+Constant CHAN_NODE_SIZE as Integer is 16
+
+Note: Return codes
+Constant CHAN_OK as Integer is 1
+Constant CHAN_ERR_CLOSED as Integer is 0
+Constant CHAN_ERR_FULL as Integer is -1
+Constant CHAN_ERR_EMPTY as Integer is -2
+Constant CHAN_ERR_INVALID as Integer is -3
+
+Note: ============================================================================
+Note: Channel Lifecycle
+Note: ============================================================================
+
+@Reasoning
+A channel is created with optional bounded capacity. Capacity 0 means unbounded
+(senders never block on capacity, but memory is still finite). Capacity > 0
+provides backpressure via condvar-based blocking.
+@End Reasoning
+
+@Implementation
+We allocate the 64-byte channel record on the owned heap, then allocate the
+underlying mutex and two condvars. If any sub-allocation fails we roll back
+prior allocations to avoid leaks.
+@End Implementation
+
+@Performance_Hints
+Channel creation is O(1) plus three syscall-backed primitive allocations.
+Reuse channels rather than recreating them in hot loops.
+@End Performance_Hints
+
+@Security_Scope
+Channels store raw pointers as message values. Callers are responsible for
+ensuring values remain valid for the channel lifetime, or for copying values
+into channel-owned storage prior to send.
+@End Security_Scope
+
+Process called "channel_create" takes capacity as Integer returns Integer:
+    Note: Allocate channel record
+    Let ch be proc allocate from Memory with CHAN_STRUCT_SIZE
+    If ch is equal to 0:
+        Return 0
+    End If
+
+    Note: Create underlying mutex
+    Let mutex_ptr be proc mutex_create from Sync
+    If mutex_ptr is equal to 0:
+        proc deallocate from Memory with ch
+        Return 0
+    End If
+
+    Note: Create not_empty condvar
+    Let not_empty_cv be proc condvar_create from Sync
+    If not_empty_cv is equal to 0:
+        proc mutex_destroy from Sync with mutex_ptr
+        proc deallocate from Memory with ch
+        Return 0
+    End If
+
+    Note: Create not_full condvar
+    Let not_full_cv be proc condvar_create from Sync
+    If not_full_cv is equal to 0:
+        proc condvar_destroy from Sync with not_empty_cv
+        proc mutex_destroy from Sync with mutex_ptr
+        proc deallocate from Memory with ch
+        Return 0
+    End If
+
+    Note: Clamp negative capacity to 0 (unbounded)
+    Let cap be capacity
+    If cap is less than 0:
+        Set cap to 0
+    End If
+
+    Note: Initialize all fields
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_MUTEX, mutex_ptr
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_NOT_EMPTY_CV, not_empty_cv
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_NOT_FULL_CV, not_full_cv
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_HEAD, 0
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_TAIL, 0
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_COUNT, 0
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_CAPACITY, cap
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_CLOSED, 0
+
+    Return ch
+End Process
+
+@Reasoning
+Destroying a channel frees the linked list of buffered nodes, then the
+synchronization primitives, then the channel record itself. Any messages
+still buffered are dropped (caller's responsibility to drain first if values
+have non-trivial ownership).
+@End Reasoning
+
+@Implementation
+Walk the head pointer freeing nodes, then destroy each synchronization
+primitive, then free the channel record.
+@End Implementation
+
+@Performance_Hints
+O(n) in the number of buffered nodes. Drain channels before destroying when
+ownership of message payloads matters.
+@End Performance_Hints
+
+@Security_Scope
+The channel must not be in use by other threads when destroyed. Use
+channel_close + drain instead for graceful shutdown.
+@End Security_Scope
+
+Process called "channel_destroy" takes ch as Integer returns Integer:
+    If ch is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+
+    Note: Free any remaining node chain
+    Let node be proc memory_get_int64 from Mem with ch, CHAN_OFF_HEAD
+    While node is not equal to 0:
+        Let next be proc memory_get_int64 from Mem with node, CHAN_NODE_NEXT
+        proc deallocate from Memory with node
+        Set node to next
+    End While
+
+    Note: Destroy sync primitives
+    Let mutex_ptr be proc memory_get_int64 from Mem with ch, CHAN_OFF_MUTEX
+    Let not_empty_cv be proc memory_get_int64 from Mem with ch, CHAN_OFF_NOT_EMPTY_CV
+    Let not_full_cv be proc memory_get_int64 from Mem with ch, CHAN_OFF_NOT_FULL_CV
+    proc condvar_destroy from Sync with not_full_cv
+    proc condvar_destroy from Sync with not_empty_cv
+    proc mutex_destroy from Sync with mutex_ptr
+
+    proc deallocate from Memory with ch
+    Return CHAN_OK
+End Process
+
+Note: ============================================================================
+Note: Send operations
+Note: ============================================================================
+
+@Reasoning
+Internal helper: enqueue a value onto a channel that the caller has already
+locked. Returns 1 on success, 0 on allocation failure. Caller must hold the
+mutex when calling.
+@End Reasoning
+
+@Implementation
+Allocate a node, write the value pointer and a zero next pointer, then link
+it onto the tail of the channel's queue. Increment the count.
+@End Implementation
+
+@Performance_Hints
+O(1) enqueue using head/tail pointers.
+@End Performance_Hints
+
+@Security_Scope
+Caller MUST hold the channel mutex.
+@End Security_Scope
+
+Process called "channel_enqueue_locked" takes ch as Integer, value_ptr as Integer returns Integer:
+    Let node be proc allocate from Memory with CHAN_NODE_SIZE
+    If node is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with node, CHAN_NODE_VALUE, value_ptr
+    proc memory_set_int64 from Mem with node, CHAN_NODE_NEXT, 0
+
+    Let tail be proc memory_get_int64 from Mem with ch, CHAN_OFF_TAIL
+    If tail is equal to 0:
+        Note: Queue empty - this node becomes both head and tail
+        proc memory_set_int64 from Mem with ch, CHAN_OFF_HEAD, node
+        proc memory_set_int64 from Mem with ch, CHAN_OFF_TAIL, node
+    Otherwise:
+        proc memory_set_int64 from Mem with tail, CHAN_NODE_NEXT, node
+        proc memory_set_int64 from Mem with ch, CHAN_OFF_TAIL, node
+    End If
+
+    Let count be proc memory_get_int64 from Mem with ch, CHAN_OFF_COUNT
+    Let new_count be count plus 1
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_COUNT, new_count
+    Return 1
+End Process
+
+@Reasoning
+Blocking send. If the channel is bounded and full, the sender waits on
+not_full_cv until either space is available or the channel is closed.
+Sending on a closed channel returns CHAN_ERR_CLOSED.
+@End Reasoning
+
+@Implementation
+Acquire the mutex, check closed flag, then check capacity bound in a
+loop (re-check after wake to defend against spurious wakeups). When space
+is available, enqueue, signal not_empty_cv, release mutex, return OK.
+@End Implementation
+
+@Performance_Hints
+Hot path (uncontended unbounded send) is one mutex acquire + one allocation
++ one condvar signal + one mutex release.
+@End Performance_Hints
+
+@Security_Scope
+The value pointer is stored by reference; caller retains responsibility for
+the lifetime of the underlying object.
+@End Security_Scope
+
+Process called "channel_send" takes ch as Integer, value_ptr as Integer returns Integer:
+    If ch is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+
+    Let mutex_ptr be proc memory_get_int64 from Mem with ch, CHAN_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Note: Closed channels reject sends
+    Let closed be proc memory_get_int64 from Mem with ch, CHAN_OFF_CLOSED
+    If closed is not equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return CHAN_ERR_CLOSED
+    End If
+
+    Note: For bounded channels, wait while full
+    Let capacity be proc memory_get_int64 from Mem with ch, CHAN_OFF_CAPACITY
+    If capacity is greater than 0:
+        Let not_full_cv be proc memory_get_int64 from Mem with ch, CHAN_OFF_NOT_FULL_CV
+        Let waiting be 1
+        While waiting is equal to 1:
+            Let count be proc memory_get_int64 from Mem with ch, CHAN_OFF_COUNT
+            Let now_closed be proc memory_get_int64 from Mem with ch, CHAN_OFF_CLOSED
+            If now_closed is not equal to 0:
+                proc mutex_unlock from Sync with mutex_ptr
+                Return CHAN_ERR_CLOSED
+            End If
+            If count is less than capacity:
+                Set waiting to 0
+            Otherwise:
+                proc condvar_wait from Sync with not_full_cv, mutex_ptr
+            End If
+        End While
+    End If
+
+    Note: Enqueue the value
+    Let ok be proc channel_enqueue_locked with ch, value_ptr
+    If ok is equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return CHAN_ERR_INVALID
+    End If
+
+    Note: Signal a waiting receiver
+    Let not_empty_cv be proc memory_get_int64 from Mem with ch, CHAN_OFF_NOT_EMPTY_CV
+    proc condvar_signal from Sync with not_empty_cv
+
+    proc mutex_unlock from Sync with mutex_ptr
+    Return CHAN_OK
+End Process
+
+@Reasoning
+Non-blocking send. Returns immediately with CHAN_ERR_FULL if the channel is
+bounded and full, or CHAN_ERR_CLOSED if closed.
+@End Reasoning
+
+@Implementation
+Acquire mutex, perform closed and capacity checks without waiting, enqueue
+if possible, signal not_empty_cv, release mutex.
+@End Implementation
+
+@Performance_Hints
+Always returns within bounded time - no condvar wait.
+@End Performance_Hints
+
+@Security_Scope
+Same as channel_send.
+@End Security_Scope
+
+Process called "channel_try_send" takes ch as Integer, value_ptr as Integer returns Integer:
+    If ch is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+
+    Let mutex_ptr be proc memory_get_int64 from Mem with ch, CHAN_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let closed be proc memory_get_int64 from Mem with ch, CHAN_OFF_CLOSED
+    If closed is not equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return CHAN_ERR_CLOSED
+    End If
+
+    Let capacity be proc memory_get_int64 from Mem with ch, CHAN_OFF_CAPACITY
+    Let count be proc memory_get_int64 from Mem with ch, CHAN_OFF_COUNT
+    If capacity is greater than 0:
+        If count is greater than or equal to capacity:
+            proc mutex_unlock from Sync with mutex_ptr
+            Return CHAN_ERR_FULL
+        End If
+    End If
+
+    Let ok be proc channel_enqueue_locked with ch, value_ptr
+    If ok is equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return CHAN_ERR_INVALID
+    End If
+
+    Let not_empty_cv be proc memory_get_int64 from Mem with ch, CHAN_OFF_NOT_EMPTY_CV
+    proc condvar_signal from Sync with not_empty_cv
+
+    proc mutex_unlock from Sync with mutex_ptr
+    Return CHAN_OK
+End Process
+
+Note: ============================================================================
+Note: Receive operations
+Note: ============================================================================
+
+@Reasoning
+Internal helper: dequeue a value from a channel that the caller has already
+locked. Returns the value pointer, or 0 if the queue is empty. Caller must
+hold the mutex when calling.
+@End Reasoning
+
+@Implementation
+Pop the head node, unlink it, decrement count, free the node, return the
+stored value pointer.
+@End Implementation
+
+@Performance_Hints
+O(1) dequeue.
+@End Performance_Hints
+
+@Security_Scope
+Caller MUST hold the channel mutex.
+@End Security_Scope
+
+Process called "channel_dequeue_locked" takes ch as Integer, out_value_ptr_holder as Integer returns Integer:
+    Let head be proc memory_get_int64 from Mem with ch, CHAN_OFF_HEAD
+    If head is equal to 0:
+        proc memory_set_int64 from Mem with out_value_ptr_holder, 0, 0
+        Return 0
+    End If
+
+    Let value_ptr be proc memory_get_int64 from Mem with head, CHAN_NODE_VALUE
+    Let next be proc memory_get_int64 from Mem with head, CHAN_NODE_NEXT
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_HEAD, next
+    If next is equal to 0:
+        proc memory_set_int64 from Mem with ch, CHAN_OFF_TAIL, 0
+    End If
+
+    proc deallocate from Memory with head
+
+    Let count be proc memory_get_int64 from Mem with ch, CHAN_OFF_COUNT
+    Let new_count be count minus 1
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_COUNT, new_count
+
+    proc memory_set_int64 from Mem with out_value_ptr_holder, 0, value_ptr
+    Return 1
+End Process
+
+@Reasoning
+Blocking receive. Returns CHAN_OK with the received pointer written to
+out_value_ptr_holder. Returns CHAN_ERR_CLOSED only when the channel is
+closed AND the buffer is empty (draining semantics).
+@End Reasoning
+
+@Implementation
+Acquire the mutex, loop until either a value can be dequeued or the channel
+is empty-and-closed, signal not_full_cv after dequeue so any blocked
+senders can proceed, release mutex.
+@End Implementation
+
+@Performance_Hints
+Hot path (non-empty receive) is one mutex acquire + one node free + one
+condvar signal + one mutex release.
+@End Performance_Hints
+
+@Security_Scope
+Caller-supplied out_value_ptr_holder must point to writable 8-byte storage.
+@End Security_Scope
+
+Process called "channel_receive" takes ch as Integer, out_value_ptr_holder as Integer returns Integer:
+    If ch is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+    If out_value_ptr_holder is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+
+    Let mutex_ptr be proc memory_get_int64 from Mem with ch, CHAN_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let not_empty_cv be proc memory_get_int64 from Mem with ch, CHAN_OFF_NOT_EMPTY_CV
+    Let waiting be 1
+    While waiting is equal to 1:
+        Let count be proc memory_get_int64 from Mem with ch, CHAN_OFF_COUNT
+        If count is greater than 0:
+            Set waiting to 0
+        Otherwise:
+            Let closed be proc memory_get_int64 from Mem with ch, CHAN_OFF_CLOSED
+            If closed is not equal to 0:
+                proc memory_set_int64 from Mem with out_value_ptr_holder, 0, 0
+                proc mutex_unlock from Sync with mutex_ptr
+                Return CHAN_ERR_CLOSED
+            End If
+            proc condvar_wait from Sync with not_empty_cv, mutex_ptr
+        End If
+    End While
+
+    Let ok be proc channel_dequeue_locked with ch, out_value_ptr_holder
+    If ok is equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return CHAN_ERR_EMPTY
+    End If
+
+    Note: Wake any sender blocked on capacity bound
+    Let not_full_cv be proc memory_get_int64 from Mem with ch, CHAN_OFF_NOT_FULL_CV
+    proc condvar_signal from Sync with not_full_cv
+
+    proc mutex_unlock from Sync with mutex_ptr
+    Return CHAN_OK
+End Process
+
+@Reasoning
+Non-blocking receive. Returns CHAN_OK with value written if a message was
+available, or CHAN_ERR_EMPTY immediately if empty (regardless of closed
+state - the buffer might still drain).
+@End Reasoning
+
+@Implementation
+Acquire mutex, dequeue if anything is buffered, otherwise return EMPTY.
+@End Implementation
+
+@Performance_Hints
+Always returns within bounded time.
+@End Performance_Hints
+
+@Security_Scope
+Same as channel_receive.
+@End Security_Scope
+
+Process called "channel_try_receive" takes ch as Integer, out_value_ptr_holder as Integer returns Integer:
+    If ch is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+    If out_value_ptr_holder is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+
+    Let mutex_ptr be proc memory_get_int64 from Mem with ch, CHAN_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let count be proc memory_get_int64 from Mem with ch, CHAN_OFF_COUNT
+    If count is equal to 0:
+        proc memory_set_int64 from Mem with out_value_ptr_holder, 0, 0
+        proc mutex_unlock from Sync with mutex_ptr
+        Let closed be proc memory_get_int64 from Mem with ch, CHAN_OFF_CLOSED
+        If closed is not equal to 0:
+            Return CHAN_ERR_CLOSED
+        End If
+        Return CHAN_ERR_EMPTY
+    End If
+
+    Let ok be proc channel_dequeue_locked with ch, out_value_ptr_holder
+    If ok is equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return CHAN_ERR_EMPTY
+    End If
+
+    Let not_full_cv be proc memory_get_int64 from Mem with ch, CHAN_OFF_NOT_FULL_CV
+    proc condvar_signal from Sync with not_full_cv
+
+    proc mutex_unlock from Sync with mutex_ptr
+    Return CHAN_OK
+End Process
+
+Note: ============================================================================
+Note: Closing & inspection
+Note: ============================================================================
+
+@Reasoning
+Closing a channel marks it as closed and wakes ALL blocked senders and
+receivers. Receivers continue to receive any buffered messages until the
+buffer is drained; subsequent receives return CHAN_ERR_CLOSED.
+@End Reasoning
+
+@Implementation
+Set the closed flag under the lock, broadcast both condvars so any waiters
+can re-check state and unblock.
+@End Implementation
+
+@Performance_Hints
+Constant time plus condvar broadcast cost.
+@End Performance_Hints
+
+@Security_Scope
+Closing is idempotent. Closing an invalid channel returns CHAN_ERR_INVALID.
+@End Security_Scope
+
+Process called "channel_close" takes ch as Integer returns Integer:
+    If ch is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with ch, CHAN_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    proc memory_set_int64 from Mem with ch, CHAN_OFF_CLOSED, 1
+
+    Let not_empty_cv be proc memory_get_int64 from Mem with ch, CHAN_OFF_NOT_EMPTY_CV
+    Let not_full_cv be proc memory_get_int64 from Mem with ch, CHAN_OFF_NOT_FULL_CV
+    proc condvar_broadcast from Sync with not_empty_cv
+    proc condvar_broadcast from Sync with not_full_cv
+
+    proc mutex_unlock from Sync with mutex_ptr
+    Return CHAN_OK
+End Process
+
+@Reasoning
+Inspection helpers for diagnostics and adaptive scheduling. All require
+acquiring the mutex to avoid torn reads.
+@End Reasoning
+
+@Implementation
+Take the lock, read the field, release the lock, return the field.
+@End Implementation
+
+@Performance_Hints
+O(1) but pays mutex acquisition cost.
+@End Performance_Hints
+
+@Security_Scope
+Safe to call from any thread.
+@End Security_Scope
+
+Process called "channel_length" takes ch as Integer returns Integer:
+    If ch is equal to 0:
+        Return 0
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with ch, CHAN_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    Let count be proc memory_get_int64 from Mem with ch, CHAN_OFF_COUNT
+    proc mutex_unlock from Sync with mutex_ptr
+    Return count
+End Process
+
+Process called "channel_capacity" takes ch as Integer returns Integer:
+    If ch is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with ch, CHAN_OFF_CAPACITY
+End Process
+
+Process called "channel_is_closed" takes ch as Integer returns Integer:
+    If ch is equal to 0:
+        Return 0
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with ch, CHAN_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    Let closed be proc memory_get_int64 from Mem with ch, CHAN_OFF_CLOSED
+    proc mutex_unlock from Sync with mutex_ptr
+    Return closed
+End Process
+
+Process called "channel_is_empty" takes ch as Integer returns Integer:
+    Let n be proc channel_length with ch
+    If n is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Select
+Note: ============================================================================
+
+@Reasoning
+channel_select waits on a list of channels and returns the index of the
+first channel that has a message available. The list is passed as an array
+of channel pointers, count is the length. Returns -1 on invalid input. The
+received value is written into out_value_ptr_holder and the index is
+returned. Polling-based for simplicity and portability.
+@End Reasoning
+
+@Implementation
+Loop: try non-blocking receive on each channel in order. If any succeeds,
+return its index. If none succeeds, yield the thread and retry. A closed
+channel that is empty is reported via setting *out_index = i and returning
+CHAN_ERR_CLOSED so callers can act on shutdown.
+@End Implementation
+
+@Performance_Hints
+This is busy-poll select (cooperatively yielding). For high-throughput
+multi-way wait, a single shared condvar selector is preferable and is
+provided via channel_select_blocking_index below.
+@End Performance_Hints
+
+@Security_Scope
+Caller-supplied array must be valid for count entries. out_index_holder and
+out_value_ptr_holder must be writable 8-byte locations.
+@End Security_Scope
+
+Import "compiler/frontend/primitives/assembly/threading.runa" as Threading
+
+Process called "channel_select" takes channels_array as Integer, count as Integer, out_index_holder as Integer, out_value_ptr_holder as Integer returns Integer:
+    If channels_array is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+    If count is less than or equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+    If out_index_holder is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+    If out_value_ptr_holder is equal to 0:
+        Return CHAN_ERR_INVALID
+    End If
+
+    Let polling be 1
+    While polling is equal to 1:
+        Let all_closed be 1
+        Let i be 0
+        While i is less than count:
+            Let offset be i multiplied by 8
+            Let ch be proc memory_get_int64 from Mem with channels_array, offset
+            If ch is not equal to 0:
+                Let rc be proc channel_try_receive with ch, out_value_ptr_holder
+                If rc is equal to CHAN_OK:
+                    proc memory_set_int64 from Mem with out_index_holder, 0, i
+                    Return CHAN_OK
+                End If
+                If rc is not equal to CHAN_ERR_CLOSED:
+                    Set all_closed to 0
+                End If
+            End If
+            Set i to i plus 1
+        End While
+
+        If all_closed is equal to 1:
+            proc memory_set_int64 from Mem with out_index_holder, 0, 0
+            proc memory_set_int64 from Mem with out_value_ptr_holder, 0, 0
+            Return CHAN_ERR_CLOSED
+        End If
+
+        Note: Cooperative yield between poll rounds
+        proc platform_thread_yield from Threading
+    End While
+
+    Return CHAN_ERR_INVALID
+End Process
+
+Note: ============================================================================
+Note: Notes on usage
+Note: ============================================================================
+
+Note:
+Producer-consumer pattern:
+  Let ch be channel_create(16)        Note: bounded with 16 slot capacity
+  Thread A: channel_send(ch, value_ptr)
+  Thread B: channel_receive(ch, &result_ptr)
+  Shutdown: channel_close(ch)
+  Drain:    while channel_try_receive returns CHAN_OK: handle msg
+            channel_destroy(ch)
+
+Closed semantics:
+- send on closed   -> CHAN_ERR_CLOSED
+- recv on closed AND empty -> CHAN_ERR_CLOSED
+- recv on closed but non-empty -> CHAN_OK (drains buffer)
+:End Note

@@ -1,0 +1,1328 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+BITSET - Fixed-Width Bit Array Tier 0 Primitive
+
+This file implements a bitset over int64 words. Bits are addressed
+0..num_bits-1; bit i lives in words[i / 64] at position (i mod 64),
+counting from the least-significant bit. The bitset stores num_bits
+and num_words explicitly so it can be resized later without rebuilding.
+
+Bitset structure (24 bytes):
+  offset 0:  words pointer (8 bytes) - array of int64
+  offset 8:  num_bits     (8 bytes) - logical bit count
+  offset 16: num_words    (8 bytes) - ceil(num_bits / 64)
+
+Use cases:
+- Reachability marks in dataflow
+- Free / used slot tracking for slab allocators
+- Bloom-style filters where exact bit access is needed
+- Compact integer set when the universe is small and dense
+
+Set operations come in two forms:
+  - "_into": destination receives the result, neither source modified
+  - "_in_place": left operand modified, right operand read-only
+
+All operations on two bitsets require the two operands to share the
+same num_bits. The "_into" variants assert the destination shares the
+same num_bits or returns 0 (no allocation).
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let BITSET_HEADER_SIZE be 24
+Let BITSET_WORD_BITS be 64
+Let BITSET_WORD_BYTES be 8
+Let BITSET_FULL_WORD be -1
+Let BITSET_NOT_FOUND be -1
+
+Note: ============================================================================
+Note: INTERNAL HELPERS
+Note: ============================================================================
+
+@Reasoning
+Compute the number of int64 words needed to hold num_bits bits.
+@End Reasoning
+
+@Implementation
+Returns (num_bits + 63) / 64. Handles num_bits == 0 by returning 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+num_bits must be non-negative.
+@End Security_Scope
+Process called "bitset_words_for_bits" takes num_bits as Integer returns Integer:
+    If num_bits is less than or equal to 0:
+        Return 0
+    End If
+    Let total be num_bits plus 63
+    Return total divided by BITSET_WORD_BITS
+End Process
+
+@Reasoning
+Address of words[index] given the words pointer.
+@End Reasoning
+
+@Implementation
+words + index * 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated index.
+@End Security_Scope
+Process called "bitset_word_addr" takes words as Integer, index as Integer returns Integer:
+    Return words plus (index multiplied by BITSET_WORD_BYTES)
+End Process
+
+@Reasoning
+Build a mask that has exactly the low (num_bits mod 64) bits set.
+Used to clear trailing bits in the last word after bulk-fill or
+complement operations so the bitset never reports bits outside its
+logical range.
+@End Reasoning
+
+@Implementation
+1) rem = num_bits mod 64.
+2) If rem == 0, return all-ones (the last word is fully in-range).
+3) Otherwise return (1 << rem) - 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure function.
+@End Security_Scope
+Process called "bitset_tail_mask" takes num_bits as Integer returns Integer:
+    Let rem be num_bits modulo by BITSET_WORD_BITS
+    If rem is equal to 0:
+        Return BITSET_FULL_WORD
+    End If
+    Let one be 1
+    Let shifted be one shifted left by rem
+    Return shifted minus 1
+End Process
+
+Note: ============================================================================
+Note: CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Allocate a new bitset of num_bits bits, all initialized to zero.
+@End Reasoning
+
+@Implementation
+1) Compute num_words via bitset_words_for_bits.
+2) Allocate header (24 bytes).
+3) Allocate num_words * 8 bytes for the word array.
+4) Zero the word array.
+5) Initialize header fields.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure. num_bits <= 0 returns a degenerate
+empty bitset with num_words = 0 and a null words pointer to avoid
+empty-allocation oddities.
+@End Security_Scope
+Process called "bitset_create" takes num_bits as Integer returns Integer:
+    Let bs be proc allocate from Layout with BITSET_HEADER_SIZE
+    If bs is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with bs, 0, 0
+    proc memory_set_int64 from Memory with bs, 8, 0
+    proc memory_set_int64 from Memory with bs, 16, 0
+    If num_bits is less than or equal to 0:
+        Return bs
+    End If
+    Let num_words be proc bitset_words_for_bits with num_bits
+    Let bytes be num_words multiplied by BITSET_WORD_BYTES
+    Let words be proc allocate from Layout with bytes
+    If words is equal to 0:
+        proc deallocate from Layout with bs
+        Return 0
+    End If
+    proc memory_fill from Memory with words, 0, bytes
+    proc memory_set_int64 from Memory with bs, 0, words
+    proc memory_set_int64 from Memory with bs, 8, num_bits
+    proc memory_set_int64 from Memory with bs, 16, num_words
+    Return bs
+End Process
+
+@Reasoning
+Release the bitset and its word array.
+@End Reasoning
+
+@Implementation
+Frees the word array (if non-null) then the header.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) (allocator-bounded).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned; do not pass the same pointer twice.
+@End Security_Scope
+Process called "bitset_destroy" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    If words is not equal to 0:
+        proc deallocate from Layout with words
+    End If
+    proc deallocate from Layout with bs
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: STATE QUERIES
+Note: ============================================================================
+
+@Reasoning
+Total number of bits managed by the bitset.
+@End Reasoning
+
+@Implementation
+Returns the num_bits field at offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "bitset_size" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with bs, 8
+End Process
+
+@Reasoning
+Number of int64 words in the backing array.
+@End Reasoning
+
+@Implementation
+Returns the num_words field at offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "bitset_word_count" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with bs, 16
+End Process
+
+Note: ============================================================================
+Note: BIT-LEVEL OPERATIONS
+Note: ============================================================================
+
+@Reasoning
+Set the bit at position i to 1. No-op if i is out of range.
+@End Reasoning
+
+@Implementation
+1) Bounds check.
+2) word_index = i / 64; bit_pos = i mod 64.
+3) Load words[word_index], OR with (1 << bit_pos), store back.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Out-of-range i is ignored to support speculative callers (e.g.
+iterators that might overshoot on the final word).
+@End Security_Scope
+Process called "bitset_set" takes bs as Integer, i as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    If i is less than 0:
+        Return 0
+    End If
+    If i is greater than or equal to num_bits:
+        Return 0
+    End If
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    Let word_index be i divided by BITSET_WORD_BITS
+    Let bit_pos be i modulo by BITSET_WORD_BITS
+    Let one be 1
+    Let mask be one shifted left by bit_pos
+    Let addr be proc bitset_word_addr with words, word_index
+    Let cur be proc memory_get_int64 from Memory with addr, 0
+    Let updated be cur bitwise or mask
+    proc memory_set_int64 from Memory with addr, 0, updated
+    Return 1
+End Process
+
+@Reasoning
+Clear the bit at position i to 0.
+@End Reasoning
+
+@Implementation
+1) Bounds check.
+2) Load words[i / 64], AND with NOT (1 << (i mod 64)).
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Out-of-range i is ignored.
+@End Security_Scope
+Process called "bitset_clear" takes bs as Integer, i as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    If i is less than 0:
+        Return 0
+    End If
+    If i is greater than or equal to num_bits:
+        Return 0
+    End If
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    Let word_index be i divided by BITSET_WORD_BITS
+    Let bit_pos be i modulo by BITSET_WORD_BITS
+    Let one be 1
+    Let bit_mask be one shifted left by bit_pos
+    Let inv_mask be bit_mask bitwise xor BITSET_FULL_WORD
+    Let addr be proc bitset_word_addr with words, word_index
+    Let cur be proc memory_get_int64 from Memory with addr, 0
+    Let updated be cur bitwise and inv_mask
+    proc memory_set_int64 from Memory with addr, 0, updated
+    Return 1
+End Process
+
+@Reasoning
+Toggle the bit at position i (0 -> 1, 1 -> 0).
+@End Reasoning
+
+@Implementation
+1) Bounds check.
+2) words[i/64] = words[i/64] XOR (1 << (i mod 64)).
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Out-of-range i is ignored.
+@End Security_Scope
+Process called "bitset_toggle" takes bs as Integer, i as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    If i is less than 0:
+        Return 0
+    End If
+    If i is greater than or equal to num_bits:
+        Return 0
+    End If
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    Let word_index be i divided by BITSET_WORD_BITS
+    Let bit_pos be i modulo by BITSET_WORD_BITS
+    Let one be 1
+    Let mask be one shifted left by bit_pos
+    Let addr be proc bitset_word_addr with words, word_index
+    Let cur be proc memory_get_int64 from Memory with addr, 0
+    Let updated be cur bitwise xor mask
+    proc memory_set_int64 from Memory with addr, 0, updated
+    Return 1
+End Process
+
+@Reasoning
+Test the bit at position i. Returns 1 if set, 0 if clear.
+@End Reasoning
+
+@Implementation
+1) Bounds check.
+2) Load words[i / 64], shift right by (i mod 64), mask with 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Out-of-range i returns 0.
+@End Security_Scope
+Process called "bitset_test" takes bs as Integer, i as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    If i is less than 0:
+        Return 0
+    End If
+    If i is greater than or equal to num_bits:
+        Return 0
+    End If
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    Let word_index be i divided by BITSET_WORD_BITS
+    Let bit_pos be i modulo by BITSET_WORD_BITS
+    Let addr be proc bitset_word_addr with words, word_index
+    Let cur be proc memory_get_int64 from Memory with addr, 0
+    Let bit_val be (cur shifted right by bit_pos) bitwise and 1
+    Return bit_val
+End Process
+
+@Reasoning
+Set all bits to 0. Maintains num_bits and num_words; only zeros words.
+@End Reasoning
+
+@Implementation
+memory_fill the word array with zeros.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Read-only on header.
+@End Security_Scope
+Process called "bitset_clear_all" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    Let num_words be proc memory_get_int64 from Memory with bs, 16
+    If words is equal to 0:
+        Return 1
+    End If
+    If num_words is equal to 0:
+        Return 1
+    End If
+    Let bytes be num_words multiplied by BITSET_WORD_BYTES
+    proc memory_fill from Memory with words, 0, bytes
+    Return 1
+End Process
+
+@Reasoning
+Set all logical bits to 1. The trailing partial word, if any, is
+masked so out-of-range bits remain zero. This guarantees popcount,
+find_first_clear, and complement give consistent results.
+@End Reasoning
+
+@Implementation
+1) Fill all words with -1.
+2) If num_bits is not a multiple of 64, mask the last word with the
+   tail mask so bits beyond num_bits stay 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Read-only on header.
+@End Security_Scope
+Process called "bitset_set_all" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    Let num_words be proc memory_get_int64 from Memory with bs, 16
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    If num_words is equal to 0:
+        Return 1
+    End If
+    Let i be 0
+    While i is less than num_words:
+        Let addr be proc bitset_word_addr with words, i
+        proc memory_set_int64 from Memory with addr, 0, BITSET_FULL_WORD
+        Set i to i plus 1
+    End While
+    Let rem be num_bits modulo by BITSET_WORD_BITS
+    If rem is not equal to 0:
+        Let mask be proc bitset_tail_mask with num_bits
+        Let last_addr be proc bitset_word_addr with words, num_words minus 1
+        Let cur be proc memory_get_int64 from Memory with last_addr, 0
+        Let trimmed be cur bitwise and mask
+        proc memory_set_int64 from Memory with last_addr, 0, trimmed
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SET OPERATIONS - IN-PLACE
+Note: ============================================================================
+
+@Reasoning
+Compute lhs := lhs OR rhs in place. Both bitsets must agree on
+num_bits; otherwise nothing is done and 0 is returned.
+@End Reasoning
+
+@Implementation
+Word-wise OR over min(num_words_lhs, num_words_rhs).
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if num_bits mismatch.
+@End Security_Scope
+Process called "bitset_union_in_place" takes lhs as Integer, rhs as Integer returns Integer:
+    If lhs is equal to 0:
+        Return 0
+    End If
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Let n_l be proc memory_get_int64 from Memory with lhs, 8
+    Let n_r be proc memory_get_int64 from Memory with rhs, 8
+    If n_l is not equal to n_r:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with lhs, 16
+    Let w_l be proc memory_get_int64 from Memory with lhs, 0
+    Let w_r be proc memory_get_int64 from Memory with rhs, 0
+    Let i be 0
+    While i is less than nw:
+        Let a_l be proc bitset_word_addr with w_l, i
+        Let a_r be proc bitset_word_addr with w_r, i
+        Let v_l be proc memory_get_int64 from Memory with a_l, 0
+        Let v_r be proc memory_get_int64 from Memory with a_r, 0
+        proc memory_set_int64 from Memory with a_l, 0, v_l bitwise or v_r
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+lhs := lhs AND rhs in place.
+@End Reasoning
+
+@Implementation
+Word-wise AND.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on num_bits mismatch.
+@End Security_Scope
+Process called "bitset_intersection_in_place" takes lhs as Integer, rhs as Integer returns Integer:
+    If lhs is equal to 0:
+        Return 0
+    End If
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Let n_l be proc memory_get_int64 from Memory with lhs, 8
+    Let n_r be proc memory_get_int64 from Memory with rhs, 8
+    If n_l is not equal to n_r:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with lhs, 16
+    Let w_l be proc memory_get_int64 from Memory with lhs, 0
+    Let w_r be proc memory_get_int64 from Memory with rhs, 0
+    Let i be 0
+    While i is less than nw:
+        Let a_l be proc bitset_word_addr with w_l, i
+        Let a_r be proc bitset_word_addr with w_r, i
+        Let v_l be proc memory_get_int64 from Memory with a_l, 0
+        Let v_r be proc memory_get_int64 from Memory with a_r, 0
+        proc memory_set_int64 from Memory with a_l, 0, v_l bitwise and v_r
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+lhs := lhs AND NOT rhs in place (set difference).
+@End Reasoning
+
+@Implementation
+Word-wise (lhs AND (NOT rhs)).
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on num_bits mismatch.
+@End Security_Scope
+Process called "bitset_difference_in_place" takes lhs as Integer, rhs as Integer returns Integer:
+    If lhs is equal to 0:
+        Return 0
+    End If
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Let n_l be proc memory_get_int64 from Memory with lhs, 8
+    Let n_r be proc memory_get_int64 from Memory with rhs, 8
+    If n_l is not equal to n_r:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with lhs, 16
+    Let w_l be proc memory_get_int64 from Memory with lhs, 0
+    Let w_r be proc memory_get_int64 from Memory with rhs, 0
+    Let i be 0
+    While i is less than nw:
+        Let a_l be proc bitset_word_addr with w_l, i
+        Let a_r be proc bitset_word_addr with w_r, i
+        Let v_l be proc memory_get_int64 from Memory with a_l, 0
+        Let v_r be proc memory_get_int64 from Memory with a_r, 0
+        Let not_r be v_r bitwise xor BITSET_FULL_WORD
+        proc memory_set_int64 from Memory with a_l, 0, v_l bitwise and not_r
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+lhs := lhs XOR rhs in place (symmetric difference).
+@End Reasoning
+
+@Implementation
+Word-wise XOR.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on num_bits mismatch.
+@End Security_Scope
+Process called "bitset_xor_in_place" takes lhs as Integer, rhs as Integer returns Integer:
+    If lhs is equal to 0:
+        Return 0
+    End If
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Let n_l be proc memory_get_int64 from Memory with lhs, 8
+    Let n_r be proc memory_get_int64 from Memory with rhs, 8
+    If n_l is not equal to n_r:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with lhs, 16
+    Let w_l be proc memory_get_int64 from Memory with lhs, 0
+    Let w_r be proc memory_get_int64 from Memory with rhs, 0
+    Let i be 0
+    While i is less than nw:
+        Let a_l be proc bitset_word_addr with w_l, i
+        Let a_r be proc bitset_word_addr with w_r, i
+        Let v_l be proc memory_get_int64 from Memory with a_l, 0
+        Let v_r be proc memory_get_int64 from Memory with a_r, 0
+        proc memory_set_int64 from Memory with a_l, 0, v_l bitwise xor v_r
+        Set i to i plus 1
+    End While
+    Let num_bits be n_l
+    Let rem be num_bits modulo by BITSET_WORD_BITS
+    If rem is not equal to 0:
+        Let mask be proc bitset_tail_mask with num_bits
+        Let last_addr be proc bitset_word_addr with w_l, nw minus 1
+        Let cur be proc memory_get_int64 from Memory with last_addr, 0
+        proc memory_set_int64 from Memory with last_addr, 0, cur bitwise and mask
+    End If
+    Return 1
+End Process
+
+@Reasoning
+lhs := NOT lhs (complement). Bits beyond num_bits are kept zero.
+@End Reasoning
+
+@Implementation
+1) Word-wise XOR with -1.
+2) Mask the last word with tail_mask if num_bits is not a multiple of 64.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "bitset_complement_in_place" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    Let nw be proc memory_get_int64 from Memory with bs, 16
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    Let i be 0
+    While i is less than nw:
+        Let addr be proc bitset_word_addr with words, i
+        Let cur be proc memory_get_int64 from Memory with addr, 0
+        proc memory_set_int64 from Memory with addr, 0, cur bitwise xor BITSET_FULL_WORD
+        Set i to i plus 1
+    End While
+    Let rem be num_bits modulo by BITSET_WORD_BITS
+    If rem is not equal to 0:
+        Let mask be proc bitset_tail_mask with num_bits
+        Let last_addr be proc bitset_word_addr with words, nw minus 1
+        Let cur_last be proc memory_get_int64 from Memory with last_addr, 0
+        proc memory_set_int64 from Memory with last_addr, 0, cur_last bitwise and mask
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SET OPERATIONS - NEW-RESULT (allocate fresh destination)
+Note: ============================================================================
+
+@Reasoning
+Allocate a new bitset that holds the bitwise union of lhs and rhs.
+@End Reasoning
+
+@Implementation
+1) num_bits mismatch -> return 0.
+2) Allocate fresh bitset of the same num_bits.
+3) Word-wise OR into the new bitset.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words). Allocates a new bitset.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on num_bits mismatch or allocation failure.
+@End Security_Scope
+Process called "bitset_union" takes lhs as Integer, rhs as Integer returns Integer:
+    If lhs is equal to 0:
+        Return 0
+    End If
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Let n_l be proc memory_get_int64 from Memory with lhs, 8
+    Let n_r be proc memory_get_int64 from Memory with rhs, 8
+    If n_l is not equal to n_r:
+        Return 0
+    End If
+    Let result be proc bitset_create with n_l
+    If result is equal to 0:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with lhs, 16
+    Let w_l be proc memory_get_int64 from Memory with lhs, 0
+    Let w_r be proc memory_get_int64 from Memory with rhs, 0
+    Let w_o be proc memory_get_int64 from Memory with result, 0
+    Let i be 0
+    While i is less than nw:
+        Let a_l be proc bitset_word_addr with w_l, i
+        Let a_r be proc bitset_word_addr with w_r, i
+        Let a_o be proc bitset_word_addr with w_o, i
+        Let v_l be proc memory_get_int64 from Memory with a_l, 0
+        Let v_r be proc memory_get_int64 from Memory with a_r, 0
+        proc memory_set_int64 from Memory with a_o, 0, v_l bitwise or v_r
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+@Reasoning
+Allocate a new bitset holding the bitwise intersection of lhs and rhs.
+@End Reasoning
+
+@Implementation
+Symmetric with bitset_union but uses AND.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words). Allocates.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on num_bits mismatch or allocation failure.
+@End Security_Scope
+Process called "bitset_intersection" takes lhs as Integer, rhs as Integer returns Integer:
+    If lhs is equal to 0:
+        Return 0
+    End If
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Let n_l be proc memory_get_int64 from Memory with lhs, 8
+    Let n_r be proc memory_get_int64 from Memory with rhs, 8
+    If n_l is not equal to n_r:
+        Return 0
+    End If
+    Let result be proc bitset_create with n_l
+    If result is equal to 0:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with lhs, 16
+    Let w_l be proc memory_get_int64 from Memory with lhs, 0
+    Let w_r be proc memory_get_int64 from Memory with rhs, 0
+    Let w_o be proc memory_get_int64 from Memory with result, 0
+    Let i be 0
+    While i is less than nw:
+        Let a_l be proc bitset_word_addr with w_l, i
+        Let a_r be proc bitset_word_addr with w_r, i
+        Let a_o be proc bitset_word_addr with w_o, i
+        Let v_l be proc memory_get_int64 from Memory with a_l, 0
+        Let v_r be proc memory_get_int64 from Memory with a_r, 0
+        proc memory_set_int64 from Memory with a_o, 0, v_l bitwise and v_r
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+@Reasoning
+Allocate a new bitset holding the bitwise difference lhs AND NOT rhs.
+@End Reasoning
+
+@Implementation
+Allocates, then word-wise (lhs AND (NOT rhs)).
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words). Allocates.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on num_bits mismatch or allocation failure.
+@End Security_Scope
+Process called "bitset_difference" takes lhs as Integer, rhs as Integer returns Integer:
+    If lhs is equal to 0:
+        Return 0
+    End If
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Let n_l be proc memory_get_int64 from Memory with lhs, 8
+    Let n_r be proc memory_get_int64 from Memory with rhs, 8
+    If n_l is not equal to n_r:
+        Return 0
+    End If
+    Let result be proc bitset_create with n_l
+    If result is equal to 0:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with lhs, 16
+    Let w_l be proc memory_get_int64 from Memory with lhs, 0
+    Let w_r be proc memory_get_int64 from Memory with rhs, 0
+    Let w_o be proc memory_get_int64 from Memory with result, 0
+    Let i be 0
+    While i is less than nw:
+        Let a_l be proc bitset_word_addr with w_l, i
+        Let a_r be proc bitset_word_addr with w_r, i
+        Let a_o be proc bitset_word_addr with w_o, i
+        Let v_l be proc memory_get_int64 from Memory with a_l, 0
+        Let v_r be proc memory_get_int64 from Memory with a_r, 0
+        Let not_r be v_r bitwise xor BITSET_FULL_WORD
+        proc memory_set_int64 from Memory with a_o, 0, v_l bitwise and not_r
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+@Reasoning
+Allocate a new bitset holding the symmetric difference lhs XOR rhs.
+@End Reasoning
+
+@Implementation
+Allocates, word-wise XOR, then masks the tail.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words). Allocates.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on num_bits mismatch or allocation failure.
+@End Security_Scope
+Process called "bitset_xor" takes lhs as Integer, rhs as Integer returns Integer:
+    If lhs is equal to 0:
+        Return 0
+    End If
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Let n_l be proc memory_get_int64 from Memory with lhs, 8
+    Let n_r be proc memory_get_int64 from Memory with rhs, 8
+    If n_l is not equal to n_r:
+        Return 0
+    End If
+    Let result be proc bitset_create with n_l
+    If result is equal to 0:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with lhs, 16
+    Let w_l be proc memory_get_int64 from Memory with lhs, 0
+    Let w_r be proc memory_get_int64 from Memory with rhs, 0
+    Let w_o be proc memory_get_int64 from Memory with result, 0
+    Let i be 0
+    While i is less than nw:
+        Let a_l be proc bitset_word_addr with w_l, i
+        Let a_r be proc bitset_word_addr with w_r, i
+        Let a_o be proc bitset_word_addr with w_o, i
+        Let v_l be proc memory_get_int64 from Memory with a_l, 0
+        Let v_r be proc memory_get_int64 from Memory with a_r, 0
+        proc memory_set_int64 from Memory with a_o, 0, v_l bitwise xor v_r
+        Set i to i plus 1
+    End While
+    Let num_bits be n_l
+    Let rem be num_bits modulo by BITSET_WORD_BITS
+    If rem is not equal to 0:
+        Let mask be proc bitset_tail_mask with num_bits
+        Let last_addr be proc bitset_word_addr with w_o, nw minus 1
+        Let cur be proc memory_get_int64 from Memory with last_addr, 0
+        proc memory_set_int64 from Memory with last_addr, 0, cur bitwise and mask
+    End If
+    Return result
+End Process
+
+@Reasoning
+Allocate a new bitset that is the complement of bs.
+@End Reasoning
+
+@Implementation
+Copies the bitset then complements in place.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words). Allocates.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "bitset_complement" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    Let result be proc bitset_create with num_bits
+    If result is equal to 0:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with bs, 16
+    Let w_s be proc memory_get_int64 from Memory with bs, 0
+    Let w_o be proc memory_get_int64 from Memory with result, 0
+    Let i be 0
+    While i is less than nw:
+        Let a_s be proc bitset_word_addr with w_s, i
+        Let a_o be proc bitset_word_addr with w_o, i
+        Let v be proc memory_get_int64 from Memory with a_s, 0
+        proc memory_set_int64 from Memory with a_o, 0, v bitwise xor BITSET_FULL_WORD
+        Set i to i plus 1
+    End While
+    Let rem be num_bits modulo by BITSET_WORD_BITS
+    If rem is not equal to 0:
+        Let mask be proc bitset_tail_mask with num_bits
+        Let last_addr be proc bitset_word_addr with w_o, nw minus 1
+        Let cur be proc memory_get_int64 from Memory with last_addr, 0
+        proc memory_set_int64 from Memory with last_addr, 0, cur bitwise and mask
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: COMPARISON AND COPY
+Note: ============================================================================
+
+@Reasoning
+Equality: returns 1 if both bitsets have the same num_bits and the
+same bit pattern across all words.
+@End Reasoning
+
+@Implementation
+1) num_bits must match.
+2) Compare word by word.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if either input is null.
+@End Security_Scope
+Process called "bitset_equals" takes lhs as Integer, rhs as Integer returns Integer:
+    If lhs is equal to 0:
+        Return 0
+    End If
+    If rhs is equal to 0:
+        Return 0
+    End If
+    Let n_l be proc memory_get_int64 from Memory with lhs, 8
+    Let n_r be proc memory_get_int64 from Memory with rhs, 8
+    If n_l is not equal to n_r:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with lhs, 16
+    Let w_l be proc memory_get_int64 from Memory with lhs, 0
+    Let w_r be proc memory_get_int64 from Memory with rhs, 0
+    Let i be 0
+    While i is less than nw:
+        Let a_l be proc bitset_word_addr with w_l, i
+        Let a_r be proc bitset_word_addr with w_r, i
+        Let v_l be proc memory_get_int64 from Memory with a_l, 0
+        Let v_r be proc memory_get_int64 from Memory with a_r, 0
+        If v_l is not equal to v_r:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Allocate a deep copy of bs.
+@End Reasoning
+
+@Implementation
+1) bitset_create with the same num_bits.
+2) Copy each word from source to destination.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "bitset_clone" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    Let result be proc bitset_create with num_bits
+    If result is equal to 0:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with bs, 16
+    If nw is equal to 0:
+        Return result
+    End If
+    Let w_s be proc memory_get_int64 from Memory with bs, 0
+    Let w_d be proc memory_get_int64 from Memory with result, 0
+    Let bytes be nw multiplied by BITSET_WORD_BYTES
+    proc memory_copy from Memory with w_d, w_s, bytes
+    Return result
+End Process
+
+Note: ============================================================================
+Note: POPCOUNT AND FIND
+Note: ============================================================================
+
+@Reasoning
+Compute the number of bits set in a single 64-bit word using
+parallel-bit-count (Hamming weight) via shifts and masks. This is the
+classic SWAR popcount that avoids any tables or hardware popcnt.
+@End Reasoning
+
+@Implementation
+Standard parallel popcount:
+  x = x - ((x >> 1) & 0x5555555555555555)
+  x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333)
+  x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F
+  return (x * 0x0101010101010101) >> 56
+We compute the multiplier-free variant by summing byte-grouped
+nibbles directly so the bootstrap stage1 does not need a 64-bit
+multiply for this hot path.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) per word, branch-free.
+@End Performance_Hints
+
+@Security_Scope
+Pure on Integer input. The bit pattern of negative inputs is treated
+as unsigned for popcount purposes (count bits including the sign bit).
+@End Security_Scope
+Process called "bitset_word_popcount" takes word as Integer returns Integer:
+    Let mask1 be 6148914691236517205
+    Let mask2 be 3689348814741910323
+    Let mask4 be 1085102592571150095
+    Let x be word
+    Let shifted_1 be x shifted right by 1
+    Let masked_1 be shifted_1 bitwise and mask1
+    Set x to x minus masked_1
+    Let low_2 be x bitwise and mask2
+    Let high_2 be (x shifted right by 2) bitwise and mask2
+    Set x to low_2 plus high_2
+    Let shifted_4 be x shifted right by 4
+    Let summed be x plus shifted_4
+    Set x to summed bitwise and mask4
+    Let total be 0
+    Let byte_mask be 255
+    Let i be 0
+    While i is less than 8:
+        Let shift_amount be i multiplied by 8
+        Let byte_val be (x shifted right by shift_amount) bitwise and byte_mask
+        Set total to total plus byte_val
+        Set i to i plus 1
+    End While
+    Return total
+End Process
+
+@Reasoning
+Total Hamming weight: number of set bits across the whole bitset.
+@End Reasoning
+
+@Implementation
+Sum bitset_word_popcount over all words.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "bitset_popcount" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return 0
+    End If
+    Let nw be proc memory_get_int64 from Memory with bs, 16
+    If nw is equal to 0:
+        Return 0
+    End If
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    Let total be 0
+    Let i be 0
+    While i is less than nw:
+        Let addr be proc bitset_word_addr with words, i
+        Let v be proc memory_get_int64 from Memory with addr, 0
+        Let c be proc bitset_word_popcount with v
+        Set total to total plus c
+        Set i to i plus 1
+    End While
+    Return total
+End Process
+
+@Reasoning
+Find the position of the lowest-numbered set bit, or BITSET_NOT_FOUND
+(-1) if no bit is set. Used for sparse iteration over set bits.
+@End Reasoning
+
+@Implementation
+1) Scan words left to right.
+2) For the first non-zero word, find the lowest set bit by linear
+   scan over bit positions (bootstrap stage1 has no count_trailing_zeros
+   builtin so we step bit positions).
+3) Return word_index * 64 + bit_pos.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words + 64). Worst case at the last bit of the last word.
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 when the bitset is empty.
+@End Security_Scope
+Process called "bitset_find_first_set" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return BITSET_NOT_FOUND
+    End If
+    Let nw be proc memory_get_int64 from Memory with bs, 16
+    If nw is equal to 0:
+        Return BITSET_NOT_FOUND
+    End If
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    Let i be 0
+    While i is less than nw:
+        Let addr be proc bitset_word_addr with words, i
+        Let v be proc memory_get_int64 from Memory with addr, 0
+        If v is not equal to 0:
+            Let j be 0
+            While j is less than BITSET_WORD_BITS:
+                Let bit_val be (v shifted right by j) bitwise and 1
+                If bit_val is equal to 1:
+                    Let position be (i multiplied by BITSET_WORD_BITS) plus j
+                    If position is greater than or equal to num_bits:
+                        Return BITSET_NOT_FOUND
+                    End If
+                    Return position
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+    Return BITSET_NOT_FOUND
+End Process
+
+@Reasoning
+Find the position of the lowest-numbered clear bit, or -1 if every
+in-range bit is set.
+@End Reasoning
+
+@Implementation
+Same shape as find_first_set, but searches for the first word with a
+non-full pattern, then steps bit positions to find the first 0 bit.
+The position must be < num_bits or we return -1 (the trailing partial
+word's out-of-range bits are always 0 but they don't count).
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words + 64).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 when the bitset is fully set.
+@End Security_Scope
+Process called "bitset_find_first_clear" takes bs as Integer returns Integer:
+    If bs is equal to 0:
+        Return BITSET_NOT_FOUND
+    End If
+    Let nw be proc memory_get_int64 from Memory with bs, 16
+    If nw is equal to 0:
+        Return BITSET_NOT_FOUND
+    End If
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    Let i be 0
+    While i is less than nw:
+        Let addr be proc bitset_word_addr with words, i
+        Let v be proc memory_get_int64 from Memory with addr, 0
+        If v is not equal to BITSET_FULL_WORD:
+            Let j be 0
+            While j is less than BITSET_WORD_BITS:
+                Let bit_val be (v shifted right by j) bitwise and 1
+                If bit_val is equal to 0:
+                    Let position be (i multiplied by BITSET_WORD_BITS) plus j
+                    If position is greater than or equal to num_bits:
+                        Return BITSET_NOT_FOUND
+                    End If
+                    Return position
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+    Return BITSET_NOT_FOUND
+End Process
+
+@Reasoning
+Find the next set bit at or after position start. Returns -1 if no
+such bit exists.
+@End Reasoning
+
+@Implementation
+1) If start is out of range, return -1.
+2) word_index = start / 64, bit_off = start mod 64.
+3) Mask off bits below bit_off in the starting word.
+4) If the masked word is non-zero, find the lowest set bit in it.
+5) Otherwise advance word-by-word.
+@End Implementation
+
+@Performance_Hints
+Time: O(num_words + 64).
+@End Performance_Hints
+
+@Security_Scope
+Out-of-range start returns -1.
+@End Security_Scope
+Process called "bitset_find_next_set" takes bs as Integer, start as Integer returns Integer:
+    If bs is equal to 0:
+        Return BITSET_NOT_FOUND
+    End If
+    Let num_bits be proc memory_get_int64 from Memory with bs, 8
+    If start is less than 0:
+        Return BITSET_NOT_FOUND
+    End If
+    If start is greater than or equal to num_bits:
+        Return BITSET_NOT_FOUND
+    End If
+    Let nw be proc memory_get_int64 from Memory with bs, 16
+    Let words be proc memory_get_int64 from Memory with bs, 0
+    Let word_index be start divided by BITSET_WORD_BITS
+    Let bit_off be start modulo by BITSET_WORD_BITS
+    Let addr be proc bitset_word_addr with words, word_index
+    Let v be proc memory_get_int64 from Memory with addr, 0
+    Let one be 1
+    Let below_mask be (one shifted left by bit_off) minus 1
+    Let masked be v bitwise and (below_mask bitwise xor BITSET_FULL_WORD)
+    If masked is not equal to 0:
+        Let j be bit_off
+        While j is less than BITSET_WORD_BITS:
+            Let bit_val be (masked shifted right by j) bitwise and 1
+            If bit_val is equal to 1:
+                Let position be (word_index multiplied by BITSET_WORD_BITS) plus j
+                If position is greater than or equal to num_bits:
+                    Return BITSET_NOT_FOUND
+                End If
+                Return position
+            End If
+            Set j to j plus 1
+        End While
+    End If
+    Let i be word_index plus 1
+    While i is less than nw:
+        Let next_addr be proc bitset_word_addr with words, i
+        Let nv be proc memory_get_int64 from Memory with next_addr, 0
+        If nv is not equal to 0:
+            Let j2 be 0
+            While j2 is less than BITSET_WORD_BITS:
+                Let bit_val2 be (nv shifted right by j2) bitwise and 1
+                If bit_val2 is equal to 1:
+                    Let position2 be (i multiplied by BITSET_WORD_BITS) plus j2
+                    If position2 is greater than or equal to num_bits:
+                        Return BITSET_NOT_FOUND
+                    End If
+                    Return position2
+                End If
+                Set j2 to j2 plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+    Return BITSET_NOT_FOUND
+End Process

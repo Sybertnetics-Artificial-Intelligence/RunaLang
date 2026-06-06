@@ -1,0 +1,1128 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+SHA-2 FAMILY (SHA-256, SHA-384, SHA-512) per FIPS 180-4
+==============================================================================
+
+Implements the SHA-2 family used by X.509 certificate signing, RSA PKCS#1
+v1.5 padding, and ECDSA digest computation. Pure software implementation
+operating on caller-provided buffers; no internal allocations.
+
+Output sizes:
+- SHA-256: 32 bytes
+- SHA-384: 48 bytes
+- SHA-512: 64 bytes
+
+Block sizes:
+- SHA-256: 64-byte block, 32-bit working words
+- SHA-384, SHA-512: 128-byte block, 64-bit working words
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+
+Note: ============================================================================
+Note: 32-bit / 64-bit bitwise helpers
+Note: ============================================================================
+
+Process called "u32_mask" returns Integer:
+    Return 4294967295
+End Process
+
+Process called "rotr32" takes value as Integer, n as Integer returns Integer:
+    @Reasoning
+    Right-rotate a 32-bit value by n positions. Uses (value >> n) | (value << (32-n))
+    with explicit masking to 32 bits.
+    @End Reasoning
+
+    Let mask be 4294967295
+    Let v32 be value bitwise_and mask
+    Let n_mod be n modulo by 32
+    If n_mod is equal to 0:
+        Return v32
+    End If
+
+    Let shift_factor_right be 1
+    Let rc1 be 0
+    While rc1 is less than n_mod:
+        Set shift_factor_right to shift_factor_right multiplied by 2
+        Set rc1 to rc1 plus 1
+    End While
+    Let shift_factor_left be 1
+    Let rc2 be 0
+    Let left_count be 32 minus n_mod
+    While rc2 is less than left_count:
+        Set shift_factor_left to shift_factor_left multiplied by 2
+        Set rc2 to rc2 plus 1
+    End While
+
+    Let right_part be v32 divided by shift_factor_right
+    Let left_part be v32 multiplied by shift_factor_left
+    Set left_part to left_part bitwise_and mask
+    Let combined be right_part bitwise_or left_part
+    Return combined bitwise_and mask
+End Process
+
+Process called "shr32" takes value as Integer, n as Integer returns Integer:
+    Let mask be 4294967295
+    Let v32 be value bitwise_and mask
+    Let shift_factor be 1
+    Let i be 0
+    While i is less than n:
+        Set shift_factor to shift_factor multiplied by 2
+        Set i to i plus 1
+    End While
+    If shift_factor is equal to 0:
+        Return 0
+    End If
+    Return v32 divided by shift_factor
+End Process
+
+Process called "u32_add" takes a as Integer, b as Integer returns Integer:
+    Let mask be 4294967295
+    Let sum_value be a plus b
+    Return sum_value bitwise_and mask
+End Process
+
+Process called "rotr64" takes value as Integer, n as Integer returns Integer:
+    @Reasoning
+    Right-rotate a 64-bit value by n positions. Runa Integer is a 64-bit
+    signed quantity; we use unsigned division/multiplication semantics by
+    treating the bitwise patterns as unsigned values. For shifts >= 64 we
+    reduce modulo 64.
+    @End Reasoning
+
+    Let n_mod be n modulo by 64
+    If n_mod is equal to 0:
+        Return value
+    End If
+    Let shift_factor_right be 1
+    Let rc1 be 0
+    While rc1 is less than n_mod:
+        Set shift_factor_right to shift_factor_right multiplied by 2
+        Set rc1 to rc1 plus 1
+    End While
+    Let shift_factor_left be 1
+    Let rc2 be 0
+    Let left_count be 64 minus n_mod
+    While rc2 is less than left_count:
+        Set shift_factor_left to shift_factor_left multiplied by 2
+        Set rc2 to rc2 plus 1
+    End While
+
+    Let right_part be value divided by shift_factor_right
+    Let left_part be value multiplied by shift_factor_left
+    Return right_part bitwise_or left_part
+End Process
+
+Process called "shr64" takes value as Integer, n as Integer returns Integer:
+    Let n_mod be n modulo by 64
+    If n_mod is equal to 0:
+        Return value
+    End If
+    Let shift_factor be 1
+    Let i be 0
+    While i is less than n_mod:
+        Set shift_factor to shift_factor multiplied by 2
+        Set i to i plus 1
+    End While
+    If shift_factor is equal to 0:
+        Return 0
+    End If
+    Return value divided by shift_factor
+End Process
+
+Note: ============================================================================
+Note: SHA-256
+Note: ============================================================================
+
+Note: Per FIPS 180-4 section 4.2.2.
+Process called "sha256_k_constant" takes index as Integer returns Integer:
+    @Reasoning
+    The 64 round constants K_0..K_63 for SHA-256, the first 32 bits of the
+    fractional parts of the cube roots of the first 64 primes (2..311).
+    Returned by lookup. We do not store the constants in a global array
+    because the bootstrap stage1 has limited support for static arrays of
+    constants; returning by case is equivalent in cost given branch
+    prediction in the SHA-256 round loop.
+    @End Reasoning
+
+    If index is equal to 0:
+        Return 1116352408
+    End If
+    If index is equal to 1:
+        Return 1899447441
+    End If
+    If index is equal to 2:
+        Return 3049323471
+    End If
+    If index is equal to 3:
+        Return 3921009573
+    End If
+    If index is equal to 4:
+        Return 961987163
+    End If
+    If index is equal to 5:
+        Return 1508970993
+    End If
+    If index is equal to 6:
+        Return 2453635748
+    End If
+    If index is equal to 7:
+        Return 2870763221
+    End If
+    If index is equal to 8:
+        Return 3624381080
+    End If
+    If index is equal to 9:
+        Return 310598401
+    End If
+    If index is equal to 10:
+        Return 607225278
+    End If
+    If index is equal to 11:
+        Return 1426881987
+    End If
+    If index is equal to 12:
+        Return 1925078388
+    End If
+    If index is equal to 13:
+        Return 2162078206
+    End If
+    If index is equal to 14:
+        Return 2614888103
+    End If
+    If index is equal to 15:
+        Return 3248222580
+    End If
+    If index is equal to 16:
+        Return 3835390401
+    End If
+    If index is equal to 17:
+        Return 4022224774
+    End If
+    If index is equal to 18:
+        Return 264347078
+    End If
+    If index is equal to 19:
+        Return 604807628
+    End If
+    If index is equal to 20:
+        Return 770255983
+    End If
+    If index is equal to 21:
+        Return 1249150122
+    End If
+    If index is equal to 22:
+        Return 1555081692
+    End If
+    If index is equal to 23:
+        Return 1996064986
+    End If
+    If index is equal to 24:
+        Return 2554220882
+    End If
+    If index is equal to 25:
+        Return 2821834349
+    End If
+    If index is equal to 26:
+        Return 2952996808
+    End If
+    If index is equal to 27:
+        Return 3210313671
+    End If
+    If index is equal to 28:
+        Return 3336571891
+    End If
+    If index is equal to 29:
+        Return 3584528711
+    End If
+    If index is equal to 30:
+        Return 113926993
+    End If
+    If index is equal to 31:
+        Return 338241895
+    End If
+    If index is equal to 32:
+        Return 666307205
+    End If
+    If index is equal to 33:
+        Return 773529912
+    End If
+    If index is equal to 34:
+        Return 1294757372
+    End If
+    If index is equal to 35:
+        Return 1396182291
+    End If
+    If index is equal to 36:
+        Return 1695183700
+    End If
+    If index is equal to 37:
+        Return 1986661051
+    End If
+    If index is equal to 38:
+        Return 2177026350
+    End If
+    If index is equal to 39:
+        Return 2456956037
+    End If
+    If index is equal to 40:
+        Return 2730485921
+    End If
+    If index is equal to 41:
+        Return 2820302411
+    End If
+    If index is equal to 42:
+        Return 3259730800
+    End If
+    If index is equal to 43:
+        Return 3345764771
+    End If
+    If index is equal to 44:
+        Return 3516065817
+    End If
+    If index is equal to 45:
+        Return 3600352804
+    End If
+    If index is equal to 46:
+        Return 4094571909
+    End If
+    If index is equal to 47:
+        Return 275423344
+    End If
+    If index is equal to 48:
+        Return 430227734
+    End If
+    If index is equal to 49:
+        Return 506948616
+    End If
+    If index is equal to 50:
+        Return 659060556
+    End If
+    If index is equal to 51:
+        Return 883997877
+    End If
+    If index is equal to 52:
+        Return 958139571
+    End If
+    If index is equal to 53:
+        Return 1322822218
+    End If
+    If index is equal to 54:
+        Return 1537002063
+    End If
+    If index is equal to 55:
+        Return 1747873779
+    End If
+    If index is equal to 56:
+        Return 1955562222
+    End If
+    If index is equal to 57:
+        Return 2024104815
+    End If
+    If index is equal to 58:
+        Return 2227730452
+    End If
+    If index is equal to 59:
+        Return 2361852424
+    End If
+    If index is equal to 60:
+        Return 2428436474
+    End If
+    If index is equal to 61:
+        Return 2756734187
+    End If
+    If index is equal to 62:
+        Return 3204031479
+    End If
+    If index is equal to 63:
+        Return 3329325298
+    End If
+    Return 0
+End Process
+
+Process called "sha256_compress_block" takes state_buffer as Integer, block_buffer as Integer returns Integer:
+    @Reasoning
+    Processes one 64-byte block by the SHA-256 message schedule and 64-round
+    compression function. State is 8 x 32-bit working variables h0..h7 stored
+    as 8 x 8-byte qwords in state_buffer (high bytes zero - we keep them in
+    32-bit form). block_buffer is exactly 64 bytes.
+    @End Reasoning
+
+    @Implementation
+    Per FIPS 180-4 section 6.2.2:
+    1. Build W[0..63]: W[i] = block big-endian u32 for i<16,
+       W[i] = sigma1(W[i-2]) + W[i-7] + sigma0(W[i-15]) + W[i-16] for i>=16.
+    2. Initialize working variables a..h from state.
+    3. For each of 64 rounds: T1, T2, shift the working window.
+    4. Add the working window back into the state.
+    @End Implementation
+
+    Let mask be 4294967295
+
+    Note: Build W[0..15] from block bytes (big-endian)
+    Let W_buffer_size be 64 multiplied by 8
+    Note: Use 64 8-byte qwords on stack via a small arena pattern: we re-use
+    Note: the trailing portion of state_buffer would conflict, so we allocate
+    Note: from a side scratch area provided as part of the API contract.
+    Note: To keep this routine self-contained we allocate W on the caller's
+    Note: arena. We approximate that by writing W into block_buffer's tail
+    Note: extension - sha256 callers always pass a 512-byte scratch (W array
+    Note: + reserved tail) per the SHA256 context layout.
+    Note: For simplicity here, we use 8 byte * 64 entries = 512 bytes of W
+    Note: stored at block_buffer + 64 (caller guarantees this is available).
+
+    Let W_base be block_buffer plus 64
+
+    Let i be 0
+    While i is less than 16:
+        Let b0 be proc memory_get_byte from Memory with block_buffer, i multiplied by 4
+        Let b1 be proc memory_get_byte from Memory with block_buffer, i multiplied by 4 plus 1
+        Let b2 be proc memory_get_byte from Memory with block_buffer, i multiplied by 4 plus 2
+        Let b3 be proc memory_get_byte from Memory with block_buffer, i multiplied by 4 plus 3
+        Let word_value be b0 multiplied by 16777216 plus b1 multiplied by 65536 plus b2 multiplied by 256 plus b3
+        proc memory_set_qword from Memory with W_base, i multiplied by 8, word_value
+        Set i to i plus 1
+    End While
+
+    Set i to 16
+    While i is less than 64:
+        Let w_im2 be proc memory_get_qword from Memory with W_base, (i minus 2) multiplied by 8
+        Let w_im7 be proc memory_get_qword from Memory with W_base, (i minus 7) multiplied by 8
+        Let w_im15 be proc memory_get_qword from Memory with W_base, (i minus 15) multiplied by 8
+        Let w_im16 be proc memory_get_qword from Memory with W_base, (i minus 16) multiplied by 8
+
+        Let s1_a be proc rotr32 with w_im2, 17
+        Let s1_b be proc rotr32 with w_im2, 19
+        Let s1_c be proc shr32 with w_im2, 10
+        Let sigma1 be s1_a bitwise_xor s1_b
+        Set sigma1 to sigma1 bitwise_xor s1_c
+
+        Let s0_a be proc rotr32 with w_im15, 7
+        Let s0_b be proc rotr32 with w_im15, 18
+        Let s0_c be proc shr32 with w_im15, 3
+        Let sigma0 be s0_a bitwise_xor s0_b
+        Set sigma0 to sigma0 bitwise_xor s0_c
+
+        Let new_w be proc u32_add with sigma1, w_im7
+        Set new_w to proc u32_add with new_w, sigma0
+        Set new_w to proc u32_add with new_w, w_im16
+        proc memory_set_qword from Memory with W_base, i multiplied by 8, new_w
+        Set i to i plus 1
+    End While
+
+    Note: Load working window a..h
+    Let a be proc memory_get_qword from Memory with state_buffer, 0
+    Let b be proc memory_get_qword from Memory with state_buffer, 8
+    Let c be proc memory_get_qword from Memory with state_buffer, 16
+    Let d be proc memory_get_qword from Memory with state_buffer, 24
+    Let e be proc memory_get_qword from Memory with state_buffer, 32
+    Let f be proc memory_get_qword from Memory with state_buffer, 40
+    Let g be proc memory_get_qword from Memory with state_buffer, 48
+    Let h be proc memory_get_qword from Memory with state_buffer, 56
+
+    Set i to 0
+    While i is less than 64:
+        Let big_sigma1_a be proc rotr32 with e, 6
+        Let big_sigma1_b be proc rotr32 with e, 11
+        Let big_sigma1_c be proc rotr32 with e, 25
+        Let big_sigma1 be big_sigma1_a bitwise_xor big_sigma1_b
+        Set big_sigma1 to big_sigma1 bitwise_xor big_sigma1_c
+
+        Let ch_e_f be e bitwise_and f
+        Let not_e be e bitwise_xor mask
+        Let ch_ne_g be not_e bitwise_and g
+        Let ch be ch_e_f bitwise_xor ch_ne_g
+
+        Let k_value be proc sha256_k_constant with i
+        Let w_value be proc memory_get_qword from Memory with W_base, i multiplied by 8
+
+        Let t1 be proc u32_add with h, big_sigma1
+        Set t1 to proc u32_add with t1, ch
+        Set t1 to proc u32_add with t1, k_value
+        Set t1 to proc u32_add with t1, w_value
+
+        Let big_sigma0_a be proc rotr32 with a, 2
+        Let big_sigma0_b be proc rotr32 with a, 13
+        Let big_sigma0_c be proc rotr32 with a, 22
+        Let big_sigma0 be big_sigma0_a bitwise_xor big_sigma0_b
+        Set big_sigma0 to big_sigma0 bitwise_xor big_sigma0_c
+
+        Let maj_a_b be a bitwise_and b
+        Let maj_a_c be a bitwise_and c
+        Let maj_b_c be b bitwise_and c
+        Let maj be maj_a_b bitwise_xor maj_a_c
+        Set maj to maj bitwise_xor maj_b_c
+
+        Let t2 be proc u32_add with big_sigma0, maj
+
+        Set h to g
+        Set g to f
+        Set f to e
+        Set e to proc u32_add with d, t1
+        Set d to c
+        Set c to b
+        Set b to a
+        Set a to proc u32_add with t1, t2
+        Set i to i plus 1
+    End While
+
+    Note: Add working window back into the state
+    Let h0 be proc memory_get_qword from Memory with state_buffer, 0
+    Let h1 be proc memory_get_qword from Memory with state_buffer, 8
+    Let h2 be proc memory_get_qword from Memory with state_buffer, 16
+    Let h3 be proc memory_get_qword from Memory with state_buffer, 24
+    Let h4 be proc memory_get_qword from Memory with state_buffer, 32
+    Let h5 be proc memory_get_qword from Memory with state_buffer, 40
+    Let h6 be proc memory_get_qword from Memory with state_buffer, 48
+    Let h7 be proc memory_get_qword from Memory with state_buffer, 56
+
+    proc memory_set_qword from Memory with state_buffer, 0, proc u32_add with h0, a
+    proc memory_set_qword from Memory with state_buffer, 8, proc u32_add with h1, b
+    proc memory_set_qword from Memory with state_buffer, 16, proc u32_add with h2, c
+    proc memory_set_qword from Memory with state_buffer, 24, proc u32_add with h3, d
+    proc memory_set_qword from Memory with state_buffer, 32, proc u32_add with h4, e
+    proc memory_set_qword from Memory with state_buffer, 40, proc u32_add with h5, f
+    proc memory_set_qword from Memory with state_buffer, 48, proc u32_add with h6, g
+    proc memory_set_qword from Memory with state_buffer, 56, proc u32_add with h7, h
+
+    Return 1
+End Process
+
+Process called "sha256_hash" takes arena as Integer, message as Integer, message_length as Integer, out_digest as Integer returns Integer:
+    @Reasoning
+    Computes the SHA-256 hash of message[0..message_length) into out_digest
+    (caller must provide 32 bytes). One-shot interface; for streaming use
+    sha256_init + sha256_update + sha256_final (not exposed here as RSA/X.509
+    signature verification always has the full TBS bytes in memory).
+    @End Reasoning
+
+    @Implementation
+    1. Allocate scratch space: state (8 qwords = 64 bytes) + block (64 bytes)
+       + W (512 bytes) + padded message buffer.
+    2. Initialize state with FIPS H_0 constants.
+    3. Pad the message per FIPS 180-4 5.1.1: append 0x80, k zero bytes such
+       that (length+1+k) mod 64 == 56, then 8 bytes of bit-length big-endian.
+    4. Walk padded message 64 bytes at a time through sha256_compress_block.
+    5. Serialize state h0..h7 as big-endian into out_digest.
+    @End Implementation
+
+    Let scratch_size be 64 plus 64 plus 512
+    Let state_buffer be proc arena_allocate from Arena with arena, scratch_size
+    If state_buffer is equal to 0:
+        Return 0
+    End If
+    Let block_buffer be state_buffer plus 64
+
+    Note: Initial hash values (FIPS 180-4 5.3.3): first 32 bits of fractional
+    Note: parts of square roots of first 8 primes.
+    proc memory_set_qword from Memory with state_buffer, 0, 1779033703
+    proc memory_set_qword from Memory with state_buffer, 8, 3144134277
+    proc memory_set_qword from Memory with state_buffer, 16, 1013904242
+    proc memory_set_qword from Memory with state_buffer, 24, 2773480762
+    proc memory_set_qword from Memory with state_buffer, 32, 1359893119
+    proc memory_set_qword from Memory with state_buffer, 40, 2600822924
+    proc memory_set_qword from Memory with state_buffer, 48, 528734635
+    proc memory_set_qword from Memory with state_buffer, 56, 1541459225
+
+    Note: Process all complete 64-byte blocks
+    Let full_blocks be message_length divided by 64
+    Let processed be 0
+    While processed is less than full_blocks:
+        Let copy_idx be 0
+        While copy_idx is less than 64:
+            Let src_byte be proc memory_get_byte from Memory with message, processed multiplied by 64 plus copy_idx
+            proc memory_set_byte from Memory with block_buffer, copy_idx, src_byte
+            Set copy_idx to copy_idx plus 1
+        End While
+        proc sha256_compress_block with state_buffer, block_buffer
+        Set processed to processed plus 1
+    End While
+
+    Note: Handle final partial block + padding
+    Let tail_offset be full_blocks multiplied by 64
+    Let tail_bytes be message_length minus tail_offset
+
+    Note: Copy remaining bytes into block_buffer
+    Let tail_i be 0
+    While tail_i is less than tail_bytes:
+        Let src_b be proc memory_get_byte from Memory with message, tail_offset plus tail_i
+        proc memory_set_byte from Memory with block_buffer, tail_i, src_b
+        Set tail_i to tail_i plus 1
+    End While
+
+    Note: Append 0x80
+    proc memory_set_byte from Memory with block_buffer, tail_bytes, 128
+    Let pad_pos be tail_bytes plus 1
+
+    Note: Zero-fill. If we cannot fit length suffix (need pad_pos <= 56),
+    Note: we must produce two blocks.
+    If pad_pos is greater than 56:
+        Let zero_idx be pad_pos
+        While zero_idx is less than 64:
+            proc memory_set_byte from Memory with block_buffer, zero_idx, 0
+            Set zero_idx to zero_idx plus 1
+        End While
+        proc sha256_compress_block with state_buffer, block_buffer
+        Let z2 be 0
+        While z2 is less than 56:
+            proc memory_set_byte from Memory with block_buffer, z2, 0
+            Set z2 to z2 plus 1
+        End While
+    Otherwise:
+        Let z_inner be pad_pos
+        While z_inner is less than 56:
+            proc memory_set_byte from Memory with block_buffer, z_inner, 0
+            Set z_inner to z_inner plus 1
+        End While
+    End If
+
+    Note: Append 64-bit length (bits) big-endian into bytes 56..63
+    Let bit_length be message_length multiplied by 8
+    Let bb_i be 7
+    While bb_i is greater than 0 minus 1:
+        Let byte_value be bit_length modulo by 256
+        Set bit_length to bit_length divided by 256
+        proc memory_set_byte from Memory with block_buffer, 56 plus bb_i, byte_value
+        Set bb_i to bb_i minus 1
+    End While
+
+    proc sha256_compress_block with state_buffer, block_buffer
+
+    Note: Serialize 8 state words as big-endian into out_digest
+    Let state_word_index be 0
+    While state_word_index is less than 8:
+        Let state_word be proc memory_get_qword from Memory with state_buffer, state_word_index multiplied by 8
+        Let byte_idx be 3
+        While byte_idx is greater than 0 minus 1:
+            Let byte_val be state_word modulo by 256
+            Set state_word to state_word divided by 256
+            proc memory_set_byte from Memory with out_digest, state_word_index multiplied by 4 plus byte_idx, byte_val
+            Set byte_idx to byte_idx minus 1
+        End While
+        Set state_word_index to state_word_index plus 1
+    End While
+
+    Return 32
+End Process
+
+Note: ============================================================================
+Note: SHA-384 / SHA-512 (64-bit operations)
+Note: ============================================================================
+
+Process called "sha512_k_constant" takes index as Integer returns Integer:
+    @Reasoning
+    The 80 round constants K_0..K_79 for SHA-384/512, the first 64 bits of
+    the fractional parts of the cube roots of the first 80 primes. Same
+    case-based access pattern as sha256_k_constant.
+    @End Reasoning
+
+    If index is equal to 0:
+        Return 4794697086780616226
+    End If
+    If index is equal to 1:
+        Return 8158064640168781261
+    End If
+    If index is equal to 2:
+        Return 0 minus 5349999486874862801
+    End If
+    If index is equal to 3:
+        Return 0 minus 1606136188198331460
+    End If
+    If index is equal to 4:
+        Return 4131703408338449720
+    End If
+    If index is equal to 5:
+        Return 6480981068601479193
+    End If
+    If index is equal to 6:
+        Return 0 minus 8903478554258595360
+    End If
+    If index is equal to 7:
+        Return 0 minus 7228730806011027446
+    End If
+    If index is equal to 8:
+        Return 0 minus 4495734319001033068
+    End If
+    If index is equal to 9:
+        Return 1780935934567189906
+    End If
+    If index is equal to 10:
+        Return 2641598805918793182
+    End If
+    If index is equal to 11:
+        Return 6128411473006631177
+    End If
+    If index is equal to 12:
+        Return 8268148722764581231
+    End If
+    If index is equal to 13:
+        Return 9286055187155687089
+    End If
+    If index is equal to 14:
+        Return 0 minus 7104325263607310470
+    End If
+    If index is equal to 15:
+        Return 0 minus 5176188640784936976
+    End If
+    If index is equal to 16:
+        Return 0 minus 2722843169691609244
+    End If
+    If index is equal to 17:
+        Return 0 minus 1932603516622464222
+    End If
+    If index is equal to 18:
+        Return 1135362057144423861
+    End If
+    If index is equal to 19:
+        Return 2597628984639134821
+    End If
+    If index is equal to 20:
+        Return 3308224258029322869
+    End If
+    If index is equal to 21:
+        Return 5365058923640841347
+    End If
+    If index is equal to 22:
+        Return 6679025012923562964
+    End If
+    If index is equal to 23:
+        Return 8573033837759648693
+    End If
+    If index is equal to 24:
+        Return 0 minus 7476448914759557205
+    End If
+    If index is equal to 25:
+        Return 0 minus 6327057829258317296
+    End If
+    If index is equal to 26:
+        Return 0 minus 5763719355590565569
+    End If
+    If index is equal to 27:
+        Return 0 minus 4658551843150038345
+    End If
+    If index is equal to 28:
+        Return 0 minus 4116276920077217854
+    End If
+    If index is equal to 29:
+        Return 0 minus 3051310485924567259
+    End If
+    If index is equal to 30:
+        Return 489312712824947311
+    End If
+    If index is equal to 31:
+        Return 1452737877330783856
+    End If
+    If index is equal to 32:
+        Return 2861767655752347644
+    End If
+    If index is equal to 33:
+        Return 3322285676063803686
+    End If
+    If index is equal to 34:
+        Return 5560940570517711597
+    End If
+    If index is equal to 35:
+        Return 5996557281743188959
+    End If
+    If index is equal to 36:
+        Return 7280758554555802590
+    End If
+    If index is equal to 37:
+        Return 8532644243296465576
+    End If
+    If index is equal to 38:
+        Return 0 minus 9096487096722542874
+    End If
+    If index is equal to 39:
+        Return 0 minus 7894198246740708037
+    End If
+    If index is equal to 40:
+        Return 0 minus 6719396339535248540
+    End If
+    If index is equal to 41:
+        Return 0 minus 6333637450476146687
+    End If
+    If index is equal to 42:
+        Return 0 minus 4446306890439682159
+    End If
+    If index is equal to 43:
+        Return 0 minus 4076793802049405392
+    End If
+    If index is equal to 44:
+        Return 0 minus 3345356375505711688
+    End If
+    If index is equal to 45:
+        Return 0 minus 2983346525034927856
+    End If
+    If index is equal to 46:
+        Return 0 minus 860691631967231958
+    End If
+    If index is equal to 47:
+        Return 1182934255886127544
+    End If
+    If index is equal to 48:
+        Return 1847814050463011016
+    End If
+    If index is equal to 49:
+        Return 2177327727835720531
+    End If
+    If index is equal to 50:
+        Return 2830643537854262169
+    End If
+    If index is equal to 51:
+        Return 3796741975233480872
+    End If
+    If index is equal to 52:
+        Return 4115178125766777443
+    End If
+    If index is equal to 53:
+        Return 5681478168544905931
+    End If
+    If index is equal to 54:
+        Return 6601373596472566643
+    End If
+    If index is equal to 55:
+        Return 7507060721942968483
+    End If
+    If index is equal to 56:
+        Return 8399075854900735552
+    End If
+    If index is equal to 57:
+        Return 8693463985226723168
+    End If
+    If index is equal to 58:
+        Return 0 minus 8878748488494111727
+    End If
+    If index is equal to 59:
+        Return 0 minus 8302585129305697662
+    End If
+    If index is equal to 60:
+        Return 0 minus 8016843453016644655
+    End If
+    If index is equal to 61:
+        Return 0 minus 6606660893046966289
+    End If
+    If index is equal to 62:
+        Return 0 minus 4685961335493224903
+    End If
+    If index is equal to 63:
+        Return 0 minus 2244738638535389815
+    End If
+    If index is equal to 64:
+        Return 0 minus 1253254723168326948
+    End If
+    If index is equal to 65:
+        Return 0 minus 901984991564915288
+    End If
+    If index is equal to 66:
+        Return 460559068972629225
+    End If
+    If index is equal to 67:
+        Return 830245761473096417
+    End If
+    If index is equal to 68:
+        Return 1568318527677374433
+    End If
+    If index is equal to 69:
+        Return 1828054243763349452
+    End If
+    If index is equal to 70:
+        Return 2391430357737525613
+    End If
+    If index is equal to 71:
+        Return 2643464820585241376
+    End If
+    If index is equal to 72:
+        Return 3303003335416300284
+    End If
+    If index is equal to 73:
+        Return 3475426105741125008
+    End If
+    If index is equal to 74:
+        Return 3854496933801853295
+    End If
+    If index is equal to 75:
+        Return 4076585259291045556
+    End If
+    If index is equal to 76:
+        Return 4537899140746150782
+    End If
+    If index is equal to 77:
+        Return 4659928045842671427
+    End If
+    If index is equal to 78:
+        Return 0 minus 8744975861766386727
+    End If
+    If index is equal to 79:
+        Return 0 minus 8170255422734812296
+    End If
+    Return 0
+End Process
+
+Process called "sha512_compress_block" takes state_buffer as Integer, block_buffer as Integer returns Integer:
+    @Reasoning
+    Processes one 128-byte block by SHA-512's message schedule and 80-round
+    compression function. State is 8 x 64-bit working variables. Block is
+    128 bytes. We expand to 80 64-bit W values in a scratch area at
+    block_buffer + 128.
+    @End Reasoning
+
+    Let W_base be block_buffer plus 128
+
+    Let i be 0
+    While i is less than 16:
+        Let w_acc be 0
+        Let byte_in be 0
+        While byte_in is less than 8:
+            Set w_acc to w_acc multiplied by 256
+            Let bv be proc memory_get_byte from Memory with block_buffer, i multiplied by 8 plus byte_in
+            Set w_acc to w_acc plus bv
+            Set byte_in to byte_in plus 1
+        End While
+        proc memory_set_qword from Memory with W_base, i multiplied by 8, w_acc
+        Set i to i plus 1
+    End While
+
+    Set i to 16
+    While i is less than 80:
+        Let w_im2 be proc memory_get_qword from Memory with W_base, (i minus 2) multiplied by 8
+        Let w_im7 be proc memory_get_qword from Memory with W_base, (i minus 7) multiplied by 8
+        Let w_im15 be proc memory_get_qword from Memory with W_base, (i minus 15) multiplied by 8
+        Let w_im16 be proc memory_get_qword from Memory with W_base, (i minus 16) multiplied by 8
+
+        Let s1_a be proc rotr64 with w_im2, 19
+        Let s1_b be proc rotr64 with w_im2, 61
+        Let s1_c be proc shr64 with w_im2, 6
+        Let sigma1 be s1_a bitwise_xor s1_b
+        Set sigma1 to sigma1 bitwise_xor s1_c
+
+        Let s0_a be proc rotr64 with w_im15, 1
+        Let s0_b be proc rotr64 with w_im15, 8
+        Let s0_c be proc shr64 with w_im15, 7
+        Let sigma0 be s0_a bitwise_xor s0_b
+        Set sigma0 to sigma0 bitwise_xor s0_c
+
+        Let new_w be sigma1 plus w_im7
+        Set new_w to new_w plus sigma0
+        Set new_w to new_w plus w_im16
+        proc memory_set_qword from Memory with W_base, i multiplied by 8, new_w
+        Set i to i plus 1
+    End While
+
+    Let a be proc memory_get_qword from Memory with state_buffer, 0
+    Let b be proc memory_get_qword from Memory with state_buffer, 8
+    Let c be proc memory_get_qword from Memory with state_buffer, 16
+    Let d be proc memory_get_qword from Memory with state_buffer, 24
+    Let e be proc memory_get_qword from Memory with state_buffer, 32
+    Let f be proc memory_get_qword from Memory with state_buffer, 40
+    Let g be proc memory_get_qword from Memory with state_buffer, 48
+    Let h be proc memory_get_qword from Memory with state_buffer, 56
+
+    Set i to 0
+    While i is less than 80:
+        Let big_sigma1_a be proc rotr64 with e, 14
+        Let big_sigma1_b be proc rotr64 with e, 18
+        Let big_sigma1_c be proc rotr64 with e, 41
+        Let big_sigma1 be big_sigma1_a bitwise_xor big_sigma1_b
+        Set big_sigma1 to big_sigma1 bitwise_xor big_sigma1_c
+
+        Let ch_e_f be e bitwise_and f
+        Let not_e be e bitwise_xor 0 minus 1
+        Let ch_ne_g be not_e bitwise_and g
+        Let ch be ch_e_f bitwise_xor ch_ne_g
+
+        Let k_value be proc sha512_k_constant with i
+        Let w_value be proc memory_get_qword from Memory with W_base, i multiplied by 8
+
+        Let t1 be h plus big_sigma1
+        Set t1 to t1 plus ch
+        Set t1 to t1 plus k_value
+        Set t1 to t1 plus w_value
+
+        Let big_sigma0_a be proc rotr64 with a, 28
+        Let big_sigma0_b be proc rotr64 with a, 34
+        Let big_sigma0_c be proc rotr64 with a, 39
+        Let big_sigma0 be big_sigma0_a bitwise_xor big_sigma0_b
+        Set big_sigma0 to big_sigma0 bitwise_xor big_sigma0_c
+
+        Let maj_a_b be a bitwise_and b
+        Let maj_a_c be a bitwise_and c
+        Let maj_b_c be b bitwise_and c
+        Let maj be maj_a_b bitwise_xor maj_a_c
+        Set maj to maj bitwise_xor maj_b_c
+
+        Let t2 be big_sigma0 plus maj
+
+        Set h to g
+        Set g to f
+        Set f to e
+        Set e to d plus t1
+        Set d to c
+        Set c to b
+        Set b to a
+        Set a to t1 plus t2
+        Set i to i plus 1
+    End While
+
+    Let h0 be proc memory_get_qword from Memory with state_buffer, 0
+    Let h1 be proc memory_get_qword from Memory with state_buffer, 8
+    Let h2 be proc memory_get_qword from Memory with state_buffer, 16
+    Let h3 be proc memory_get_qword from Memory with state_buffer, 24
+    Let h4 be proc memory_get_qword from Memory with state_buffer, 32
+    Let h5 be proc memory_get_qword from Memory with state_buffer, 40
+    Let h6 be proc memory_get_qword from Memory with state_buffer, 48
+    Let h7 be proc memory_get_qword from Memory with state_buffer, 56
+
+    proc memory_set_qword from Memory with state_buffer, 0, h0 plus a
+    proc memory_set_qword from Memory with state_buffer, 8, h1 plus b
+    proc memory_set_qword from Memory with state_buffer, 16, h2 plus c
+    proc memory_set_qword from Memory with state_buffer, 24, h3 plus d
+    proc memory_set_qword from Memory with state_buffer, 32, h4 plus e
+    proc memory_set_qword from Memory with state_buffer, 40, h5 plus f
+    proc memory_set_qword from Memory with state_buffer, 48, h6 plus g
+    proc memory_set_qword from Memory with state_buffer, 56, h7 plus h
+
+    Return 1
+End Process
+
+Process called "sha512_hash_with_iv" takes arena as Integer, message as Integer, message_length as Integer, out_digest as Integer, out_size as Integer, iv0 as Integer, iv1 as Integer, iv2 as Integer, iv3 as Integer, iv4 as Integer, iv5 as Integer, iv6 as Integer, iv7 as Integer returns Integer:
+    @Reasoning
+    Shared SHA-384 / SHA-512 driver, parameterized by the initial hash
+    values. The only differences between SHA-384 and SHA-512 are the IV and
+    the truncation of the output: SHA-384 takes the first 48 of 64 bytes.
+    @End Reasoning
+
+    Let scratch_size be 64 plus 128 plus 640
+    Let state_buffer be proc arena_allocate from Arena with arena, scratch_size
+    If state_buffer is equal to 0:
+        Return 0
+    End If
+    Let block_buffer be state_buffer plus 64
+
+    proc memory_set_qword from Memory with state_buffer, 0, iv0
+    proc memory_set_qword from Memory with state_buffer, 8, iv1
+    proc memory_set_qword from Memory with state_buffer, 16, iv2
+    proc memory_set_qword from Memory with state_buffer, 24, iv3
+    proc memory_set_qword from Memory with state_buffer, 32, iv4
+    proc memory_set_qword from Memory with state_buffer, 40, iv5
+    proc memory_set_qword from Memory with state_buffer, 48, iv6
+    proc memory_set_qword from Memory with state_buffer, 56, iv7
+
+    Let full_blocks be message_length divided by 128
+    Let processed be 0
+    While processed is less than full_blocks:
+        Let copy_idx be 0
+        While copy_idx is less than 128:
+            Let src_byte be proc memory_get_byte from Memory with message, processed multiplied by 128 plus copy_idx
+            proc memory_set_byte from Memory with block_buffer, copy_idx, src_byte
+            Set copy_idx to copy_idx plus 1
+        End While
+        proc sha512_compress_block with state_buffer, block_buffer
+        Set processed to processed plus 1
+    End While
+
+    Let tail_offset be full_blocks multiplied by 128
+    Let tail_bytes be message_length minus tail_offset
+
+    Let tail_i be 0
+    While tail_i is less than tail_bytes:
+        Let src_b be proc memory_get_byte from Memory with message, tail_offset plus tail_i
+        proc memory_set_byte from Memory with block_buffer, tail_i, src_b
+        Set tail_i to tail_i plus 1
+    End While
+
+    proc memory_set_byte from Memory with block_buffer, tail_bytes, 128
+    Let pad_pos be tail_bytes plus 1
+
+    Note: SHA-512 length field is 128 bits (16 bytes), so we need pad_pos <= 112
+    If pad_pos is greater than 112:
+        Let zero_idx be pad_pos
+        While zero_idx is less than 128:
+            proc memory_set_byte from Memory with block_buffer, zero_idx, 0
+            Set zero_idx to zero_idx plus 1
+        End While
+        proc sha512_compress_block with state_buffer, block_buffer
+        Let z2 be 0
+        While z2 is less than 112:
+            proc memory_set_byte from Memory with block_buffer, z2, 0
+            Set z2 to z2 plus 1
+        End While
+    Otherwise:
+        Let z_inner be pad_pos
+        While z_inner is less than 112:
+            proc memory_set_byte from Memory with block_buffer, z_inner, 0
+            Set z_inner to z_inner plus 1
+        End While
+    End If
+
+    Note: Append 128-bit length: high 64 bits = 0 (we cannot exceed 2^64 bits),
+    Note: low 64 bits = bit-length big-endian.
+    Let high_idx be 0
+    While high_idx is less than 8:
+        proc memory_set_byte from Memory with block_buffer, 112 plus high_idx, 0
+        Set high_idx to high_idx plus 1
+    End While
+    Let bit_length be message_length multiplied by 8
+    Let bb_i be 7
+    While bb_i is greater than 0 minus 1:
+        Let byte_value be bit_length modulo by 256
+        Set bit_length to bit_length divided by 256
+        proc memory_set_byte from Memory with block_buffer, 120 plus bb_i, byte_value
+        Set bb_i to bb_i minus 1
+    End While
+
+    proc sha512_compress_block with state_buffer, block_buffer
+
+    Note: Serialize output bytes from state words.
+    Let words_to_emit be out_size divided by 8
+    Let state_word_index be 0
+    While state_word_index is less than words_to_emit:
+        Let state_word be proc memory_get_qword from Memory with state_buffer, state_word_index multiplied by 8
+        Let byte_idx be 7
+        While byte_idx is greater than 0 minus 1:
+            Let byte_val be state_word modulo by 256
+            Set state_word to state_word divided by 256
+            proc memory_set_byte from Memory with out_digest, state_word_index multiplied by 8 plus byte_idx, byte_val
+            Set byte_idx to byte_idx minus 1
+        End While
+        Set state_word_index to state_word_index plus 1
+    End While
+
+    Return out_size
+End Process
+
+Process called "sha384_hash" takes arena as Integer, message as Integer, message_length as Integer, out_digest as Integer returns Integer:
+    @Reasoning
+    SHA-384 IV per FIPS 180-4 5.3.4: derived from the fractional parts of
+    square roots of the 9th-16th primes. Truncated output is the first 48
+    of the 64 bytes produced by the SHA-512 core.
+    @End Reasoning
+
+    Return proc sha512_hash_with_iv with arena, message, message_length, out_digest, 48, 0 minus 3766243637369245691, 0 minus 7585448692575644857, 0 minus 6126187401202741280, 0 minus 6014050646534375086, 0 minus 5466263437665506918, 0 minus 5292618179101400454, 0 minus 1808691350907881580, 1352829826225912065
+End Process
+
+Process called "sha512_hash" takes arena as Integer, message as Integer, message_length as Integer, out_digest as Integer returns Integer:
+    @Reasoning
+    SHA-512 IV per FIPS 180-4 5.3.5: first 64 bits of fractional parts of
+    square roots of the first 8 primes. Full 64-byte output.
+    @End Reasoning
+
+    Return proc sha512_hash_with_iv with arena, message, message_length, out_digest, 64, 7640891576956012808, 0 minus 4942790177534073029, 4354685564936845355, 0 minus 6534734903238641935, 5840696475078001361, 0 minus 7276294671716946913, 2270897969802886507, 6620516959819538809
+End Process

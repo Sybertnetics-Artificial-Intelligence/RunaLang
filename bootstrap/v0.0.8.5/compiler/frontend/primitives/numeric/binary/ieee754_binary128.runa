@@ -1,0 +1,3544 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+IEEE 754-2008 binary128 (quadruple precision) software implementation
+==============================================================================
+
+Format (128 bits):
+  bit 127      : sign
+  bits 126-112 : exponent (15 bits, bias 16383)
+  bits 111-0   : mantissa fraction (112 bits, implicit leading 1)
+
+Internal representation choice: 16-byte arena-allocated buffer addressed by
+pointer. The buffer layout is big-endian-of-words but little-endian-byte
+WITHIN each word - i.e. byte offset 0 holds the LOW 64 bits and byte offset
+8 holds the HIGH 64 bits. This matches the typical x86-64 SysV ABI mapping
+for an _Float128 stored as struct { uint64_t low; uint64_t high; } and is the
+same layout used by `softfloat.runa` (see its float128_unpack / float128_pack
+helpers). We use this layout so future cross-module use of binary128 values
+is byte-compatible. The "high word" carries the sign bit, exponent, and top
+48 bits of the mantissa; the "low word" carries the bottom 64 bits.
+
+We chose flat-buffer over a struct-of-limbs because:
+  - Runa Type structures are nominal: passing a Type by value requires the
+    compiler to materialize each field. A 16-byte buffer addressed by
+    pointer fits cleanly into the existing Memory/Arena workflow.
+  - bit-pattern interop with softfloat.runa is byte-identical so the two
+    modules can interoperate without conversion.
+
+Internal arithmetic uses 256-bit intermediate values for multiplication.
+We carry the 256-bit intermediate as four 64-bit limbs in Integer-sized
+slots; the high two limbs hold the leading 128 bits of the product and
+the low two limbs hold the trailing 128 bits (used for sticky tracking).
+
+References:
+  IEEE 754-2008 (full standard)
+  Hauser, John R., "SoftFloat Library Release 3e" (Berkeley)
+  libquadmath testsuite (used as KAT source where appropriate)
+  Goldberg, "What Every Computer Scientist Should Know About Floating-Point"
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/bitwise_core.runa" as Bits
+Import "runtime/core/memory/arena.runa" as Arena
+
+Note: ============================================================================
+Note: Format constants
+Note: ============================================================================
+
+Constant F128_BITS as Integer is 128
+Constant F128_EXP_BITS as Integer is 15
+Constant F128_MANT_BITS as Integer is 112
+Constant F128_BIAS as Integer is 16383
+Constant F128_EXP_MAX as Integer is 32767
+Constant F128_BYTES as Integer is 16
+
+Note: Within the high word: bit 63 = sign, bits 62..48 = exponent, bits 47..0
+Note: = top 48 bits of mantissa.
+Constant F128_HIGH_SIGN_MASK as Integer is -9223372036854775808
+Constant F128_HIGH_EXP_MASK as Integer is 9223090561878065152
+Constant F128_HIGH_MANT_MASK as Integer is 281474976710655
+Constant F128_HIDDEN_BIT_HIGH as Integer is 281474976710656
+
+Note: Rounding modes (mirror Float32's set).
+Constant ROUND_NEAREST_EVEN as Integer is 0
+Constant ROUND_TOWARD_ZERO as Integer is 1
+Constant ROUND_TOWARD_POSITIVE as Integer is 2
+Constant ROUND_TOWARD_NEGATIVE as Integer is 3
+
+Note: Exception flags.
+Constant FLAG_INVALID as Integer is 1
+Constant FLAG_DIVIDE_BY_ZERO as Integer is 2
+Constant FLAG_OVERFLOW as Integer is 4
+Constant FLAG_UNDERFLOW as Integer is 8
+Constant FLAG_INEXACT as Integer is 16
+
+Let F128_ROUNDING_MODE be 0
+Let F128_EXCEPTION_FLAGS be 0
+
+Note: ============================================================================
+Note: Allocation
+Note: ============================================================================
+
+Process called "f128_alloc" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocate a 16-byte Float128 in the supplied arena and zero-initialize.
+    Caller owns the lifetime through the arena.
+    @End Reasoning
+    @Implementation
+    arena_allocate + memory_fill with 0.
+    @End Implementation
+    @Performance_Hints
+    Single arena bump + 16-byte zero.
+    @End Performance_Hints
+    @Security_Scope
+    No buffer is returned uninitialized: zero is a valid Float128 (+0.0).
+    @End Security_Scope
+    Let p be proc arena_allocate from Arena with arena, F128_BYTES
+    If p is equal to 0:
+        Return 0
+    End If
+    proc memory_fill from Memory with p, 0, F128_BYTES
+    Return p
+End Process
+
+Note: ============================================================================
+Note: Field access helpers
+Note: ============================================================================
+
+Process called "f128_load_high" takes p as Integer returns Integer:
+    @Reasoning
+    Load the high 64-bit word from a Float128 buffer.
+    @End Reasoning
+    @Implementation
+    The high word lives at byte offset 8.
+    @End Implementation
+    @Performance_Hints
+    Single 64-bit load.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer; no bounds check.
+    @End Security_Scope
+    Return proc memory_get_int64 from Memory with p, 8
+End Process
+
+Process called "f128_load_low" takes p as Integer returns Integer:
+    @Reasoning
+    Load the low 64-bit word.
+    @End Reasoning
+    @Implementation
+    The low word lives at byte offset 0.
+    @End Implementation
+    @Performance_Hints
+    Single 64-bit load.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    Return proc memory_get_int64 from Memory with p, 0
+End Process
+
+Process called "f128_store_high" takes p as Integer, value as Integer returns Integer:
+    @Reasoning
+    Store the high 64-bit word.
+    @End Reasoning
+    @Implementation
+    Single 64-bit store at offset 8.
+    @End Implementation
+    @Performance_Hints
+    One store.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    proc memory_set_int64 from Memory with p, 8, value
+    Return 1
+End Process
+
+Process called "f128_store_low" takes p as Integer, value as Integer returns Integer:
+    @Reasoning
+    Store the low 64-bit word.
+    @End Reasoning
+    @Implementation
+    Single 64-bit store at offset 0.
+    @End Implementation
+    @Performance_Hints
+    One store.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    proc memory_set_int64 from Memory with p, 0, value
+    Return 1
+End Process
+
+Process called "f128_get_sign" takes p as Integer returns Integer:
+    @Reasoning
+    Sign bit is bit 63 of the high word.
+    @End Reasoning
+    @Implementation
+    Load high, right-shift by 63, mask 1.
+    @End Implementation
+    @Performance_Hints
+    One load + two ALU ops.
+    @End Performance_Hints
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+    Let hi be proc f128_load_high with p
+    Let shifted be hi shifted right by 63
+    Return shifted bitwise and 1
+End Process
+
+Process called "f128_get_exponent" takes p as Integer returns Integer:
+    @Reasoning
+    The 15-bit biased exponent occupies bits 62..48 of the high word.
+    @End Reasoning
+    @Implementation
+    Shift high right by 48, mask with 0x7FFF.
+    @End Implementation
+    @Performance_Hints
+    One load + two ALU ops.
+    @End Performance_Hints
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+    Let hi be proc f128_load_high with p
+    Let shifted be hi shifted right by 48
+    Return shifted bitwise and F128_EXP_MAX
+End Process
+
+Process called "f128_get_mantissa_high" takes p as Integer returns Integer:
+    @Reasoning
+    The top 48 bits of the 112-bit mantissa occupy bits 47..0 of the high word.
+    @End Reasoning
+    @Implementation
+    Load high, AND with mask of low 48 bits.
+    @End Implementation
+    @Performance_Hints
+    One load + one ALU op.
+    @End Performance_Hints
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+    Let hi be proc f128_load_high with p
+    Return hi bitwise and F128_HIGH_MANT_MASK
+End Process
+
+Process called "f128_get_mantissa_low" takes p as Integer returns Integer:
+    @Reasoning
+    The bottom 64 bits of the 112-bit mantissa are exactly the low word.
+    @End Reasoning
+    @Implementation
+    Load low word.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+    Return proc f128_load_low with p
+End Process
+
+Process called "f128_set_fields" takes p as Integer, sign as Integer, biased_exp as Integer, mant_high_48 as Integer, mant_low_64 as Integer returns Integer:
+    @Reasoning
+    Compose sign, biased exponent, and the 112-bit mantissa into the high
+    and low 64-bit words and store them.
+    @End Reasoning
+    @Implementation
+    Defensive masking on each field, then pack via shifts and ORs.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer; defensive masking shields against caller passing
+    wider values.
+    @End Security_Scope
+    Let s be sign bitwise and 1
+    Let e be biased_exp bitwise and F128_EXP_MAX
+    Let mh be mant_high_48 bitwise and F128_HIGH_MANT_MASK
+    Let hi be s shifted left by 63
+    Let e_shifted be e shifted left by 48
+    Set hi to hi bitwise or e_shifted
+    Set hi to hi bitwise or mh
+    proc f128_store_high with p, hi
+    proc f128_store_low with p, mant_low_64
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Classification predicates
+Note: ============================================================================
+
+Process called "f128_is_zero" takes p as Integer returns Integer:
+    @Reasoning
+    Both ±0 have all bits except the sign equal to zero.
+    @End Reasoning
+    @Implementation
+    Load high & low, strip sign, check both are zero.
+    @End Implementation
+    @Performance_Hints
+    Two loads, two ALU ops, two branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let hi be proc f128_load_high with p
+    Let lo be proc f128_load_low with p
+    Let hi_no_sign be hi bitwise and 9223372036854775807
+    If hi_no_sign is not equal to 0:
+        Return 0
+    End If
+    If lo is not equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f128_is_inf" takes p as Integer returns Integer:
+    @Reasoning
+    Inf has exponent=0x7FFF and mantissa=0.
+    @End Reasoning
+    @Implementation
+    Check exponent and that mantissa words are all zero.
+    @End Implementation
+    @Performance_Hints
+    Two loads, a handful of ALU ops.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f128_get_exponent with p
+    If exp is not equal to F128_EXP_MAX:
+        Return 0
+    End If
+    Let mh be proc f128_get_mantissa_high with p
+    Let ml be proc f128_get_mantissa_low with p
+    If mh is not equal to 0:
+        Return 0
+    End If
+    If ml is not equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f128_is_nan" takes p as Integer returns Integer:
+    @Reasoning
+    NaN has exponent=0x7FFF and mantissa != 0.
+    @End Reasoning
+    @Implementation
+    Check exponent and that at least one mantissa word is nonzero.
+    @End Implementation
+    @Performance_Hints
+    Two loads, a few branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f128_get_exponent with p
+    If exp is not equal to F128_EXP_MAX:
+        Return 0
+    End If
+    Let mh be proc f128_get_mantissa_high with p
+    If mh is not equal to 0:
+        Return 1
+    End If
+    Let ml be proc f128_get_mantissa_low with p
+    If ml is not equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f128_is_signaling_nan" takes p as Integer returns Integer:
+    @Reasoning
+    Signaling NaN: NaN with mantissa MSB clear. MSB of 112-bit mantissa
+    is bit 47 of the high mantissa word.
+    @End Reasoning
+    @Implementation
+    Reject non-NaN, then inspect bit 47 of the mantissa high word.
+    @End Implementation
+    @Performance_Hints
+    A few branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let nan be proc f128_is_nan with p
+    If nan is equal to 0:
+        Return 0
+    End If
+    Let mh be proc f128_get_mantissa_high with p
+    Let msb_mask be 140737488355328
+    If (mh bitwise and msb_mask) is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f128_is_subnormal" takes p as Integer returns Integer:
+    @Reasoning
+    Subnormal: exponent==0 and mantissa != 0.
+    @End Reasoning
+    @Implementation
+    Check exponent==0 then mantissa != 0.
+    @End Implementation
+    @Performance_Hints
+    A few branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f128_get_exponent with p
+    If exp is not equal to 0:
+        Return 0
+    End If
+    Let mh be proc f128_get_mantissa_high with p
+    If mh is not equal to 0:
+        Return 1
+    End If
+    Let ml be proc f128_get_mantissa_low with p
+    If ml is not equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f128_is_normal" takes p as Integer returns Integer:
+    @Reasoning
+    Normal: 0 < exponent < 0x7FFF.
+    @End Reasoning
+    @Implementation
+    Range check on exponent.
+    @End Implementation
+    @Performance_Hints
+    One load + two branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f128_get_exponent with p
+    If exp is equal to 0:
+        Return 0
+    End If
+    If exp is equal to F128_EXP_MAX:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f128_is_finite" takes p as Integer returns Integer:
+    @Reasoning
+    Finite: exponent != 0x7FFF.
+    @End Reasoning
+    @Implementation
+    Single comparison.
+    @End Implementation
+    @Performance_Hints
+    One load + one branch.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let exp be proc f128_get_exponent with p
+    If exp is equal to F128_EXP_MAX:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f128_is_negative" takes p as Integer returns Integer:
+    @Reasoning
+    Sign bit is set.
+    @End Reasoning
+    @Implementation
+    Read sign bit.
+    @End Implementation
+    @Performance_Hints
+    One load + two ALU ops.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return proc f128_get_sign with p
+End Process
+
+Note: ============================================================================
+Note: Rounding mode + exception flags
+Note: ============================================================================
+
+Process called "f128_set_rounding_mode" takes mode as Integer returns Integer:
+    @Reasoning
+    Switch the active rounding mode.
+    @End Reasoning
+    @Implementation
+    Validated store.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global state.
+    @End Security_Scope
+    If mode is less than 0:
+        Return 0
+    End If
+    If mode is greater than 3:
+        Return 0
+    End If
+    Set F128_ROUNDING_MODE to mode
+    Return 1
+End Process
+
+Process called "f128_get_rounding_mode" returns Integer:
+    @Reasoning
+    Read the active rounding mode.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Read-only.
+    @End Security_Scope
+    Return F128_ROUNDING_MODE
+End Process
+
+Process called "f128_raise_flag" takes flag as Integer returns Integer:
+    @Reasoning
+    OR a flag into the sticky exception register.
+    @End Reasoning
+    @Implementation
+    Bitwise OR + store.
+    @End Implementation
+    @Performance_Hints
+    One ALU + one store.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global mutation.
+    @End Security_Scope
+    Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or flag
+    Return 1
+End Process
+
+Process called "f128_clear_flags" returns Integer:
+    @Reasoning
+    Reset the sticky exception register.
+    @End Reasoning
+    @Implementation
+    Single store of 0.
+    @End Implementation
+    @Performance_Hints
+    One store.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global mutation.
+    @End Security_Scope
+    Set F128_EXCEPTION_FLAGS to 0
+    Return 1
+End Process
+
+Process called "f128_get_flags" returns Integer:
+    @Reasoning
+    Snapshot of the sticky exception register.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Read-only.
+    @End Security_Scope
+    Return F128_EXCEPTION_FLAGS
+End Process
+
+Note: ============================================================================
+Note: Constructors / special values
+Note: ============================================================================
+
+Process called "f128_make_zero" takes arena as Integer, sign as Integer returns Integer:
+    @Reasoning
+    Construct ±0 in a fresh buffer.
+    @End Reasoning
+    @Implementation
+    Allocate then write the sign bit if needed.
+    @End Implementation
+    @Performance_Hints
+    One alloc + one store.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer owned by arena.
+    @End Security_Scope
+    Let p be proc f128_alloc with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    If sign is equal to 1:
+        proc f128_store_high with p, F128_HIGH_SIGN_MASK
+    End If
+    Return p
+End Process
+
+Process called "f128_make_inf" takes arena as Integer, sign as Integer returns Integer:
+    @Reasoning
+    Construct ±Inf in a fresh buffer.
+    @End Reasoning
+    @Implementation
+    sign bit | exponent_field_max << 48.
+    @End Implementation
+    @Performance_Hints
+    One alloc + one store.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer owned by arena.
+    @End Security_Scope
+    Let p be proc f128_alloc with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let hi be F128_EXP_MAX shifted left by 48
+    If sign is equal to 1:
+        Set hi to hi bitwise or F128_HIGH_SIGN_MASK
+    End If
+    proc f128_store_high with p, hi
+    Return p
+End Process
+
+Process called "f128_make_qnan" takes arena as Integer returns Integer:
+    @Reasoning
+    Construct the canonical quiet NaN.
+    @End Reasoning
+    @Implementation
+    Exponent = 0x7FFF, mantissa MSB = 1, everything else 0.
+    @End Implementation
+    @Performance_Hints
+    One alloc + one store.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer owned by arena.
+    @End Security_Scope
+    Let p be proc f128_alloc with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let exp_part be F128_EXP_MAX shifted left by 48
+    Let quiet_bit be 140737488355328
+    Let hi be exp_part bitwise or quiet_bit
+    proc f128_store_high with p, hi
+    Return p
+End Process
+
+Note: ============================================================================
+Note: 112-bit mantissa arithmetic helpers (pair of 64-bit limbs)
+Note: ============================================================================
+Note: We split each 112-bit mantissa into (high, low) where high carries the
+Note: top 48 bits and low carries the bottom 64. For internal computations we
+Note: widen to (high, low) with high carrying up to 64 bits.
+Note: ============================================================================
+
+Process called "f128_add128" takes a_hi as Integer, a_lo as Integer, b_hi as Integer, b_lo as Integer, out_hi_ptr as Integer, out_lo_ptr as Integer returns Integer:
+    @Reasoning
+    Sum two 128-bit unsigned values held as (hi, lo) limb pairs.
+    @End Reasoning
+    @Implementation
+    Add lo limbs; detect carry by checking that result_lo < a_lo (unsigned
+    semantics implemented via signed range checks). Add hi limbs + carry.
+    @End Implementation
+    @Performance_Hints
+    Two adds + one branch. On x86-64 the obvious lowering is addq + adcq.
+    @End Performance_Hints
+    @Security_Scope
+    Pure; out pointers are caller-owned.
+    @End Security_Scope
+    Let lo_sum be a_lo plus b_lo
+    Note: Detect unsigned overflow by treating limbs as unsigned 64-bit.
+    Note: In two's-complement: a_lo + b_lo overflowed iff
+    Note: (a_lo XOR lo_sum) AND (b_lo XOR lo_sum) has bit 63 set.
+    Let xor_a be a_lo bitwise xor lo_sum
+    Let xor_b be b_lo bitwise xor lo_sum
+    Let and_xor be xor_a bitwise and xor_b
+    Note: Equivalent unsigned-carry detection: carry iff
+    Note: (a_lo & b_lo) | ((a_lo | b_lo) & ~lo_sum) has bit 63 set.
+    Let and_lo be a_lo bitwise and b_lo
+    Let or_lo be a_lo bitwise or b_lo
+    Let not_sum be bitwise not lo_sum
+    Let inner be or_lo bitwise and not_sum
+    Let carry_marker be and_lo bitwise or inner
+    Let carry_marker_shift be carry_marker shifted right by 63
+    Let carry be carry_marker_shift bitwise and 1
+    Let hi_sum be a_hi plus b_hi
+    Set hi_sum to hi_sum plus carry
+    proc memory_set_int64 from Memory with out_hi_ptr, 0, hi_sum
+    proc memory_set_int64 from Memory with out_lo_ptr, 0, lo_sum
+    Return 1
+End Process
+
+Process called "f128_sub128" takes a_hi as Integer, a_lo as Integer, b_hi as Integer, b_lo as Integer, out_hi_ptr as Integer, out_lo_ptr as Integer returns Integer:
+    @Reasoning
+    Subtract one 128-bit value from another, assuming a >= b.
+    @End Reasoning
+    @Implementation
+    Subtract lo limbs; detect borrow when a_lo < b_lo (unsigned).
+    @End Implementation
+    @Performance_Hints
+    Two subs + one branch.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let lo_diff be a_lo minus b_lo
+    Note: Unsigned borrow detection: borrow iff
+    Note: ((~a_lo) & b_lo) | (((~a_lo) | b_lo) & lo_diff) has bit 63 set.
+    Let not_a be bitwise not a_lo
+    Let and_part be not_a bitwise and b_lo
+    Let or_part be not_a bitwise or b_lo
+    Let inner_b be or_part bitwise and lo_diff
+    Let borrow_marker be and_part bitwise or inner_b
+    Let borrow_marker_shift be borrow_marker shifted right by 63
+    Let borrow be borrow_marker_shift bitwise and 1
+    Let hi_diff be a_hi minus b_hi
+    Set hi_diff to hi_diff minus borrow
+    proc memory_set_int64 from Memory with out_hi_ptr, 0, hi_diff
+    proc memory_set_int64 from Memory with out_lo_ptr, 0, lo_diff
+    Return 1
+End Process
+
+Process called "f128_compare128" takes a_hi as Integer, a_lo as Integer, b_hi as Integer, b_lo as Integer returns Integer:
+    @Reasoning
+    Unsigned compare on a 128-bit pair. Returns -1/0/1.
+    @End Reasoning
+    @Implementation
+    Compare hi limbs first as unsigned by flipping sign bits before
+    signed compare, then lo limbs the same way.
+    @End Implementation
+    @Performance_Hints
+    A few branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let a_hi_u be a_hi bitwise xor F128_HIGH_SIGN_MASK
+    Let b_hi_u be b_hi bitwise xor F128_HIGH_SIGN_MASK
+    If a_hi_u is less than b_hi_u:
+        Return -1
+    End If
+    If a_hi_u is greater than b_hi_u:
+        Return 1
+    End If
+    Let a_lo_u be a_lo bitwise xor F128_HIGH_SIGN_MASK
+    Let b_lo_u be b_lo bitwise xor F128_HIGH_SIGN_MASK
+    If a_lo_u is less than b_lo_u:
+        Return -1
+    End If
+    If a_lo_u is greater than b_lo_u:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f128_shift_right128_sticky" takes hi as Integer, lo as Integer, count as Integer, out_hi_ptr as Integer, out_lo_ptr as Integer returns Integer:
+    @Reasoning
+    Shift a 128-bit value right by `count`, accumulating shifted-out
+    1-bits into a sticky bit (bit 0 of the result low limb).
+    @End Reasoning
+    @Implementation
+    Bitwise loop. Cap count to 128 to avoid unbounded iteration.
+    @End Implementation
+    @Performance_Hints
+    Bounded loop with one OR per iteration.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If count is less than or equal to 0:
+        proc memory_set_int64 from Memory with out_hi_ptr, 0, hi
+        proc memory_set_int64 from Memory with out_lo_ptr, 0, lo
+        Return 0
+    End If
+    Let n be count
+    If n is greater than 128:
+        Set n to 128
+    End If
+    Let cur_hi be hi
+    Let cur_lo be lo
+    Let sticky be 0
+    Let i be 0
+    While i is less than n:
+        Let lost be cur_lo bitwise and 1
+        Set sticky to sticky bitwise or lost
+        Note: shift right by 1: low gets (high<<63 | low>>1), high gets logical-shift-right
+        Let hi_lowbit be cur_hi bitwise and 1
+        Let new_lo_high_part be hi_lowbit shifted left by 63
+        Let cur_lo_shifted be cur_lo shifted right by 1
+        Note: When right-shifting an unsigned value, we need a logical shift.
+        Note: Mask off any sign-extended bits from the arithmetic shift.
+        Set cur_lo_shifted to cur_lo_shifted bitwise and 9223372036854775807
+        Set cur_lo to cur_lo_shifted bitwise or new_lo_high_part
+        Let cur_hi_shifted be cur_hi shifted right by 1
+        Set cur_hi_shifted to cur_hi_shifted bitwise and 9223372036854775807
+        Set cur_hi to cur_hi_shifted
+        Set i to i plus 1
+    End While
+    Set cur_lo to cur_lo bitwise or sticky
+    proc memory_set_int64 from Memory with out_hi_ptr, 0, cur_hi
+    proc memory_set_int64 from Memory with out_lo_ptr, 0, cur_lo
+    Return 1
+End Process
+
+Process called "f128_shift_left128" takes hi as Integer, lo as Integer, count as Integer, out_hi_ptr as Integer, out_lo_ptr as Integer returns Integer:
+    @Reasoning
+    Shift a 128-bit value left by `count`, dropping bits that fall off
+    the top.
+    @End Reasoning
+    @Implementation
+    Bitwise loop. Cap count to 128.
+    @End Implementation
+    @Performance_Hints
+    Bounded loop with one OR per iteration.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If count is less than or equal to 0:
+        proc memory_set_int64 from Memory with out_hi_ptr, 0, hi
+        proc memory_set_int64 from Memory with out_lo_ptr, 0, lo
+        Return 0
+    End If
+    Let n be count
+    If n is greater than 128:
+        Set n to 128
+    End If
+    Let cur_hi be hi
+    Let cur_lo be lo
+    Let i be 0
+    While i is less than n:
+        Let lo_topbit be cur_lo shifted right by 63
+        Set lo_topbit to lo_topbit bitwise and 1
+        Set cur_hi to cur_hi shifted left by 1
+        Set cur_hi to cur_hi bitwise or lo_topbit
+        Set cur_lo to cur_lo shifted left by 1
+        Set i to i plus 1
+    End While
+    proc memory_set_int64 from Memory with out_hi_ptr, 0, cur_hi
+    proc memory_set_int64 from Memory with out_lo_ptr, 0, cur_lo
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Unary
+Note: ============================================================================
+
+Process called "f128_neg" takes arena as Integer, p as Integer returns Integer:
+    @Reasoning
+    Negate by flipping the sign bit, in a fresh buffer.
+    @End Reasoning
+    @Implementation
+    Copy + XOR sign bit.
+    @End Implementation
+    @Performance_Hints
+    16-byte copy + one ALU.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer owned by arena.
+    @End Security_Scope
+    Let q be proc f128_alloc with arena
+    If q is equal to 0:
+        Return 0
+    End If
+    Let hi be proc f128_load_high with p
+    Let lo be proc f128_load_low with p
+    Set hi to hi bitwise xor F128_HIGH_SIGN_MASK
+    proc f128_store_high with q, hi
+    proc f128_store_low with q, lo
+    Return q
+End Process
+
+Process called "f128_abs" takes arena as Integer, p as Integer returns Integer:
+    @Reasoning
+    Absolute value clears the sign bit, in a fresh buffer.
+    @End Reasoning
+    @Implementation
+    Copy + clear sign bit.
+    @End Implementation
+    @Performance_Hints
+    16-byte copy + one ALU.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer owned by arena.
+    @End Security_Scope
+    Let q be proc f128_alloc with arena
+    If q is equal to 0:
+        Return 0
+    End If
+    Let hi be proc f128_load_high with p
+    Let lo be proc f128_load_low with p
+    Set hi to hi bitwise and 9223372036854775807
+    proc f128_store_high with q, hi
+    proc f128_store_low with q, lo
+    Return q
+End Process
+
+Note: ============================================================================
+Note: Comparison
+Note: ============================================================================
+
+Process called "f128_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Three-way ordered comparison. Returns -1, 0, 1 for less/equal/greater
+    and 2 for unordered (NaN involved). Per IEEE 754 § 5.11.
+    @End Reasoning
+    @Implementation
+    NaN dispatch, then sign-aware magnitude comparison.
+    @End Implementation
+    @Performance_Hints
+    A few branches; magnitude compare is one 128-bit unsigned compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let a_nan be proc f128_is_nan with a
+    If a_nan is equal to 1:
+        Return 2
+    End If
+    Let b_nan be proc f128_is_nan with b
+    If b_nan is equal to 1:
+        Return 2
+    End If
+
+    Let a_zero be proc f128_is_zero with a
+    Let b_zero be proc f128_is_zero with b
+    If a_zero is equal to 1:
+        If b_zero is equal to 1:
+            Return 0
+        End If
+    End If
+
+    Let sign_a be proc f128_get_sign with a
+    Let sign_b be proc f128_get_sign with b
+
+    Let a_hi be proc f128_load_high with a
+    Let a_lo be proc f128_load_low with a
+    Let b_hi be proc f128_load_high with b
+    Let b_lo be proc f128_load_low with b
+    Let mag_a_hi be a_hi bitwise and 9223372036854775807
+    Let mag_b_hi be b_hi bitwise and 9223372036854775807
+
+    If sign_a is equal to sign_b:
+        Let cmp_mag be proc f128_compare128 with mag_a_hi, a_lo, mag_b_hi, b_lo
+        If sign_a is equal to 0:
+            Return cmp_mag
+        End If
+        Note: both negative: reverse
+        If cmp_mag is equal to 0:
+            Return 0
+        End If
+        If cmp_mag is equal to -1:
+            Return 1
+        End If
+        Return -1
+    End If
+    If sign_a is equal to 1:
+        Return -1
+    End If
+    Return 1
+End Process
+
+Process called "f128_eq" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 ==: false if NaN involved.
+    @End Reasoning
+    @Implementation
+    Delegate to f128_compare.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f128_compare with a, b
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f128_ne" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 !=.
+    @End Reasoning
+    @Implementation
+    Inverse of eq except for NaN where it's true (compare returns 2).
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f128_compare with a, b
+    If c is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "f128_lt" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 <.
+    @End Reasoning
+    @Implementation
+    compare == -1.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f128_compare with a, b
+    If c is equal to -1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f128_le" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 <=.
+    @End Reasoning
+    @Implementation
+    compare in {-1, 0}.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f128_compare with a, b
+    If c is equal to -1:
+        Return 1
+    End If
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f128_gt" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 >.
+    @End Reasoning
+    @Implementation
+    compare == 1.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f128_compare with a, b
+    If c is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "f128_ge" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 >=.
+    @End Reasoning
+    @Implementation
+    compare in {0, 1}.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc f128_compare with a, b
+    If c is equal to 0:
+        Return 1
+    End If
+    If c is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Addition / subtraction
+Note: ============================================================================
+Note: We implement these by extracting fields, adding the hidden bit, aligning
+Note: exponents (right-shift smaller with sticky), and packing back with
+Note: rounding.
+Note: ============================================================================
+
+Process called "f128_finalize" takes arena as Integer, sign as Integer, unbiased_exp as Integer, mant_hi as Integer, mant_lo as Integer, guard as Integer, round_bit as Integer, sticky as Integer returns Integer:
+    @Reasoning
+    Final rounding + packing for a normalized (or normalize-pending) 113-bit
+    mantissa (hidden bit at position 112) extended with three rounding bits.
+    Handles overflow to Inf, underflow to subnormal/zero, and applies the
+    active rounding mode.
+    @End Reasoning
+    @Implementation
+    Steps:
+      1. If the mantissa is zero, return signed zero.
+      2. Normalize: left-shift until bit 112 of the (mant_hi, mant_lo) pair
+         is set. Adjust the exponent accordingly. If bit > 112, right-shift
+         (with sticky accumulation) until bit 112 is set.
+      3. Apply bias.
+      4. If biased < 1, denormalize: right-shift mantissa with sticky.
+      5. Use existing guard/round/sticky to decide on the rounding
+         increment using the current mode.
+      6. If increment causes the mantissa to overflow position 112, shift
+         right by 1 and bump the exponent.
+      7. Overflow / underflow / normal pack.
+    @End Implementation
+    @Performance_Hints
+    A few bounded loops; otherwise constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer owned by arena.
+    @End Security_Scope
+
+    Let result be proc f128_alloc with arena
+    If result is equal to 0:
+        Return 0
+    End If
+
+    Let m_hi be mant_hi
+    Let m_lo be mant_lo
+    Let exp be unbiased_exp
+    Let g be guard
+    Let r be round_bit
+    Let s be sticky
+
+    Note: --- Zero mantissa check ---
+    If m_hi is equal to 0:
+        If m_lo is equal to 0:
+            If g is equal to 0:
+                If r is equal to 0:
+                    If s is equal to 0:
+                        If sign is equal to 1:
+                            proc f128_store_high with result, F128_HIGH_SIGN_MASK
+                        End If
+                        Return result
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: --- Right-normalize if bit > 112 ---
+    Note: bit 112 of (m_hi:m_lo) lies at bit 48 of m_hi.
+    Let bit112_mask be 281474976710656
+    Note: Test if any bits above 112: bits 49..63 of m_hi
+    Let upper_mask be -281474976710656
+    Set upper_mask to upper_mask bitwise and 9223372036854775807
+    Note: equivalent: bits 49..62 + bit 63 if positive; we just use a raw
+    Note: bound on m_hi.
+    While m_hi is greater than 562949953421311:
+        Note: 562949953421311 = (2^49 - 1); shift right while above this
+        Let lo_bit be m_lo bitwise and 1
+        Set s to s bitwise or r
+        Set r to g
+        Set g to lo_bit
+        Note: shift right by 1 across the 128-bit pair, logical
+        Let hi_lowbit be m_hi bitwise and 1
+        Let new_lo_high_part be hi_lowbit shifted left by 63
+        Let m_lo_shifted be m_lo shifted right by 1
+        Set m_lo_shifted to m_lo_shifted bitwise and 9223372036854775807
+        Set m_lo to m_lo_shifted bitwise or new_lo_high_part
+        Let m_hi_shifted be m_hi shifted right by 1
+        Set m_hi_shifted to m_hi_shifted bitwise and 9223372036854775807
+        Set m_hi to m_hi_shifted
+        Set exp to exp plus 1
+    End While
+
+    Note: --- Left-normalize if bit 112 not set ---
+    Let top_bit be m_hi bitwise and bit112_mask
+    While top_bit is equal to 0:
+        If m_hi is equal to 0:
+            If m_lo is equal to 0:
+                Note: All bits gone. If sticky etc are zero, signed zero.
+                If g is equal to 0:
+                    If r is equal to 0:
+                        If s is equal to 0:
+                            If sign is equal to 1:
+                                proc f128_store_high with result, F128_HIGH_SIGN_MASK
+                            End If
+                            Return result
+                        End If
+                    End If
+                End If
+                Note: tiny: drop into denormal handling below by breaking
+                Set top_bit to bit112_mask
+            End If
+        End If
+        If top_bit is equal to 0:
+            Note: shift left 1; pull guard/round/sticky in
+            Let lo_topbit be m_lo shifted right by 63
+            Set lo_topbit to lo_topbit bitwise and 1
+            Set m_hi to m_hi shifted left by 1
+            Set m_hi to m_hi bitwise or lo_topbit
+            Set m_lo to m_lo shifted left by 1
+            Set m_lo to m_lo bitwise or g
+            Set g to r
+            Set r to s
+            Set s to 0
+            Set exp to exp minus 1
+            Set top_bit to m_hi bitwise and bit112_mask
+        End If
+    End While
+
+    Note: --- Bias ---
+    Let biased be exp plus F128_BIAS
+
+    Note: --- Denormalize if biased < 1 ---
+    If biased is less than 1:
+        Let shift_n be 1 minus biased
+        Set biased to 0
+        Let i be 0
+        While i is less than shift_n:
+            Let lo_b be m_lo bitwise and 1
+            Set s to s bitwise or r
+            Set r to g
+            Set g to lo_b
+            Let hi_low be m_hi bitwise and 1
+            Let new_lo_h be hi_low shifted left by 63
+            Let m_lo_sh be m_lo shifted right by 1
+            Set m_lo_sh to m_lo_sh bitwise and 9223372036854775807
+            Set m_lo to m_lo_sh bitwise or new_lo_h
+            Let m_hi_sh be m_hi shifted right by 1
+            Set m_hi_sh to m_hi_sh bitwise and 9223372036854775807
+            Set m_hi to m_hi_sh
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: --- Round ---
+    Let inexact_flag be g bitwise or r
+    Set inexact_flag to inexact_flag bitwise or s
+
+    Let increment be 0
+    If F128_ROUNDING_MODE is equal to ROUND_NEAREST_EVEN:
+        If g is equal to 1:
+            If r is equal to 1:
+                Set increment to 1
+            Otherwise:
+                If s is equal to 1:
+                    Set increment to 1
+                Otherwise:
+                    Note: tie - round to even
+                    Let lsb be m_lo bitwise and 1
+                    If lsb is equal to 1:
+                        Set increment to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+    If F128_ROUNDING_MODE is equal to ROUND_TOWARD_ZERO:
+        Set increment to 0
+    End If
+    If F128_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+        If sign is equal to 0:
+            If inexact_flag is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+    If F128_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+        If sign is equal to 1:
+            If inexact_flag is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+
+    If increment is equal to 1:
+        Note: increment (m_hi, m_lo) by 1
+        Let new_lo_inc be m_lo plus 1
+        Let carry_inc be 0
+        Note: unsigned overflow if m_lo was -1 (all-ones) and increment carried
+        If m_lo is equal to -1:
+            Set carry_inc to 1
+        End If
+        Set m_lo to new_lo_inc
+        If carry_inc is equal to 1:
+            Set m_hi to m_hi plus 1
+        End If
+
+        Note: Mantissa overflow: if bit 113 became set, shift right by 1 and bump exp
+        Let bit113_mask be 562949953421312
+        If (m_hi bitwise and bit113_mask) is not equal to 0:
+            Let lo_b2 be m_lo bitwise and 1
+            Set s to s bitwise or lo_b2
+            Let hi_low2 be m_hi bitwise and 1
+            Let new_lo_h2 be hi_low2 shifted left by 63
+            Let m_lo_sh2 be m_lo shifted right by 1
+            Set m_lo_sh2 to m_lo_sh2 bitwise and 9223372036854775807
+            Set m_lo to m_lo_sh2 bitwise or new_lo_h2
+            Let m_hi_sh2 be m_hi shifted right by 1
+            Set m_hi_sh2 to m_hi_sh2 bitwise and 9223372036854775807
+            Set m_hi to m_hi_sh2
+            Set biased to biased plus 1
+        End If
+    End If
+
+    Note: --- Subnormal-to-normal promotion ---
+    If biased is equal to 0:
+        If (m_hi bitwise and bit112_mask) is not equal to 0:
+            Set biased to 1
+        End If
+    End If
+
+    Note: --- Overflow ---
+    If biased is greater than or equal to F128_EXP_MAX:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_OVERFLOW
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        Note: Round toward zero / toward away from infinity yields largest finite
+        If F128_ROUNDING_MODE is equal to ROUND_TOWARD_ZERO:
+            proc f128_set_fields with result, sign, 32766, F128_HIGH_MANT_MASK, -1
+            Return result
+        End If
+        If F128_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+            If sign is equal to 1:
+                proc f128_set_fields with result, sign, 32766, F128_HIGH_MANT_MASK, -1
+                Return result
+            End If
+        End If
+        If F128_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+            If sign is equal to 0:
+                proc f128_set_fields with result, sign, 32766, F128_HIGH_MANT_MASK, -1
+                Return result
+            End If
+        End If
+        Let hi_inf be F128_EXP_MAX shifted left by 48
+        If sign is equal to 1:
+            Set hi_inf to hi_inf bitwise or F128_HIGH_SIGN_MASK
+        End If
+        proc f128_store_high with result, hi_inf
+        Return result
+    End If
+
+    Note: --- Underflow to zero ---
+    If biased is equal to 0:
+        If m_hi is equal to 0:
+            If m_lo is equal to 0:
+                If inexact_flag is not equal to 0:
+                    Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+                    Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+                End If
+                If sign is equal to 1:
+                    proc f128_store_high with result, F128_HIGH_SIGN_MASK
+                End If
+                Return result
+            End If
+        End If
+        Note: subnormal result
+        If inexact_flag is not equal to 0:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        End If
+        Let m_hi_field be m_hi bitwise and F128_HIGH_MANT_MASK
+        proc f128_set_fields with result, sign, 0, m_hi_field, m_lo
+        Return result
+    End If
+
+    If inexact_flag is not equal to 0:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+
+    Note: --- Normal result: drop hidden bit ---
+    Let m_hi_normal be m_hi bitwise and F128_HIGH_MANT_MASK
+    proc f128_set_fields with result, sign, biased, m_hi_normal, m_lo
+    Return result
+End Process
+
+Process called "f128_propagate_nan" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Yield a quiet NaN. If any input is signaling, set INVALID flag.
+    @End Reasoning
+    @Implementation
+    Inspect both operands.
+    @End Implementation
+    @Performance_Hints
+    A few branches.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global flag mutation.
+    @End Security_Scope
+    Let a_snan be proc f128_is_signaling_nan with a
+    Let b_snan be proc f128_is_signaling_nan with b
+    If a_snan is equal to 1:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+    End If
+    If b_snan is equal to 1:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+    End If
+    Let a_nan be proc f128_is_nan with a
+    If a_nan is equal to 1:
+        Let q be proc f128_alloc with arena
+        Let hi be proc f128_load_high with a
+        Let lo be proc f128_load_low with a
+        Note: Quiet the NaN by setting the mantissa MSB (bit 47 of high word).
+        Let quiet_mask be 140737488355328
+        Set hi to hi bitwise or quiet_mask
+        proc f128_store_high with q, hi
+        proc f128_store_low with q, lo
+        Return q
+    End If
+    Let q2 be proc f128_alloc with arena
+    Let hi2 be proc f128_load_high with b
+    Let lo2 be proc f128_load_low with b
+    Let quiet_mask_b be 140737488355328
+    Set hi2 to hi2 bitwise or quiet_mask_b
+    proc f128_store_high with q2, hi2
+    proc f128_store_low with q2, lo2
+    Return q2
+End Process
+
+Process called "f128_add" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary128 addition with correct rounding and special-value
+    semantics per IEEE 754 § 6.1 and § 5.4.1.
+    @End Reasoning
+    @Implementation
+    1. NaN propagation; Inf+Inf agreement check.
+    2. Zero handling.
+    3. Extract sign/exp/(mant_hi 48-bit, mant_lo 64-bit). Add hidden bit
+       at bit 48 of mant_hi (yielding a 113-bit value with bit 112 set).
+    4. Align: right-shift the smaller-exponent mantissa, accumulating
+       sticky.
+    5. Same-sign add or different-sign subtract.
+    6. Hand to f128_finalize for normalization, rounding, packing.
+    @End Implementation
+    @Performance_Hints
+    A few branches + a bounded shift loop.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let a_nan be proc f128_is_nan with a
+    Let b_nan be proc f128_is_nan with b
+    If a_nan is equal to 1:
+        Return proc f128_propagate_nan with arena, a, b
+    End If
+    If b_nan is equal to 1:
+        Return proc f128_propagate_nan with arena, a, b
+    End If
+
+    Let sign_a be proc f128_get_sign with a
+    Let sign_b be proc f128_get_sign with b
+    Let a_inf be proc f128_is_inf with a
+    Let b_inf be proc f128_is_inf with b
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            If sign_a is equal to sign_b:
+                Return proc f128_make_inf with arena, sign_a
+            End If
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f128_make_qnan with arena
+        End If
+        Note: a is Inf, b finite: return a
+        Let r1 be proc f128_alloc with arena
+        proc f128_store_high with r1, proc f128_load_high with a
+        proc f128_store_low with r1, proc f128_load_low with a
+        Return r1
+    End If
+    If b_inf is equal to 1:
+        Let r2 be proc f128_alloc with arena
+        proc f128_store_high with r2, proc f128_load_high with b
+        proc f128_store_low with r2, proc f128_load_low with b
+        Return r2
+    End If
+
+    Let a_zero be proc f128_is_zero with a
+    Let b_zero be proc f128_is_zero with b
+    If a_zero is equal to 1:
+        If b_zero is equal to 1:
+            If sign_a is equal to sign_b:
+                Return proc f128_make_zero with arena, sign_a
+            End If
+            If F128_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+                Return proc f128_make_zero with arena, 1
+            End If
+            Return proc f128_make_zero with arena, 0
+        End If
+        Let rb be proc f128_alloc with arena
+        proc f128_store_high with rb, proc f128_load_high with b
+        proc f128_store_low with rb, proc f128_load_low with b
+        Return rb
+    End If
+    If b_zero is equal to 1:
+        Let ra be proc f128_alloc with arena
+        proc f128_store_high with ra, proc f128_load_high with a
+        proc f128_store_low with ra, proc f128_load_low with a
+        Return ra
+    End If
+
+    Let exp_a be proc f128_get_exponent with a
+    Let exp_b be proc f128_get_exponent with b
+    Let mh_a be proc f128_get_mantissa_high with a
+    Let ml_a be proc f128_get_mantissa_low with a
+    Let mh_b be proc f128_get_mantissa_high with b
+    Let ml_b be proc f128_get_mantissa_low with b
+
+    Let true_exp_a be exp_a
+    Let true_exp_b be exp_b
+    If exp_a is equal to 0:
+        Set true_exp_a to 1
+    Otherwise:
+        Set mh_a to mh_a bitwise or F128_HIDDEN_BIT_HIGH
+    End If
+    If exp_b is equal to 0:
+        Set true_exp_b to 1
+    Otherwise:
+        Set mh_b to mh_b bitwise or F128_HIDDEN_BIT_HIGH
+    End If
+
+    Let aligned_exp be true_exp_a
+    Let g be 0
+    Let r be 0
+    Let s be 0
+
+    If true_exp_a is less than true_exp_b:
+        Let diff be true_exp_b minus true_exp_a
+        Note: Cap shift to keep loop bounded; 130 is enough since the
+        Note: mantissa has 113 bits + 3 GRS slots.
+        If diff is greater than 130:
+            Set diff to 130
+        End If
+        Note: We do a 128-bit right shift with sticky on the (mh_a, ml_a) pair.
+        Note: Save the last 3 shifted bits into g/r/s.
+        Let i be 0
+        While i is less than diff:
+            Let lost_bit be ml_a bitwise and 1
+            Set s to s bitwise or r
+            Set r to g
+            Set g to lost_bit
+            Let hi_low be mh_a bitwise and 1
+            Let new_lo_h be hi_low shifted left by 63
+            Let ml_a_sh be ml_a shifted right by 1
+            Set ml_a_sh to ml_a_sh bitwise and 9223372036854775807
+            Set ml_a to ml_a_sh bitwise or new_lo_h
+            Let mh_a_sh be mh_a shifted right by 1
+            Set mh_a_sh to mh_a_sh bitwise and 9223372036854775807
+            Set mh_a to mh_a_sh
+            Set i to i plus 1
+        End While
+        Set aligned_exp to true_exp_b
+    End If
+    If true_exp_b is less than true_exp_a:
+        Let diff_b be true_exp_a minus true_exp_b
+        If diff_b is greater than 130:
+            Set diff_b to 130
+        End If
+        Let j be 0
+        While j is less than diff_b:
+            Let lost_bit_b be ml_b bitwise and 1
+            Set s to s bitwise or r
+            Set r to g
+            Set g to lost_bit_b
+            Let hi_low_b be mh_b bitwise and 1
+            Let new_lo_h_b be hi_low_b shifted left by 63
+            Let ml_b_sh be ml_b shifted right by 1
+            Set ml_b_sh to ml_b_sh bitwise and 9223372036854775807
+            Set ml_b to ml_b_sh bitwise or new_lo_h_b
+            Let mh_b_sh be mh_b shifted right by 1
+            Set mh_b_sh to mh_b_sh bitwise and 9223372036854775807
+            Set mh_b to mh_b_sh
+            Set j to j plus 1
+        End While
+        Set aligned_exp to true_exp_a
+    End If
+
+    Let result_sign be sign_a
+    Let res_hi be 0
+    Let res_lo be 0
+
+    If sign_a is equal to sign_b:
+        Let hi_buf be proc arena_allocate from Arena with arena, 8
+        Let lo_buf be proc arena_allocate from Arena with arena, 8
+        proc f128_add128 with mh_a, ml_a, mh_b, ml_b, hi_buf, lo_buf
+        Set res_hi to proc memory_get_int64 from Memory with hi_buf, 0
+        Set res_lo to proc memory_get_int64 from Memory with lo_buf, 0
+        Set result_sign to sign_a
+    Otherwise:
+        Let cmp be proc f128_compare128 with mh_a, ml_a, mh_b, ml_b
+        Let hi_buf2 be proc arena_allocate from Arena with arena, 8
+        Let lo_buf2 be proc arena_allocate from Arena with arena, 8
+        If cmp is greater than or equal to 0:
+            proc f128_sub128 with mh_a, ml_a, mh_b, ml_b, hi_buf2, lo_buf2
+            Set result_sign to sign_a
+        Otherwise:
+            proc f128_sub128 with mh_b, ml_b, mh_a, ml_a, hi_buf2, lo_buf2
+            Set result_sign to sign_b
+        End If
+        Set res_hi to proc memory_get_int64 from Memory with hi_buf2, 0
+        Set res_lo to proc memory_get_int64 from Memory with lo_buf2, 0
+    End If
+
+    If res_hi is equal to 0:
+        If res_lo is equal to 0:
+            If g is equal to 0:
+                If r is equal to 0:
+                    If s is equal to 0:
+                        If F128_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+                            Return proc f128_make_zero with arena, 1
+                        End If
+                        Return proc f128_make_zero with arena, 0
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Let unbiased be aligned_exp minus F128_BIAS
+    Return proc f128_finalize with arena, result_sign, unbiased, res_hi, res_lo, g, r, s
+End Process
+
+Process called "f128_sub" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    a - b = a + (-b).
+    @End Reasoning
+    @Implementation
+    Negate then add.
+    @End Implementation
+    @Performance_Hints
+    Costs one extra allocate.
+    @End Performance_Hints
+    @Security_Scope
+    Inherits f128_add behavior.
+    @End Security_Scope
+    Let neg_b be proc f128_neg with arena, b
+    Return proc f128_add with arena, a, neg_b
+End Process
+
+Note: ============================================================================
+Note: Multiplication
+Note: ============================================================================
+Note: For binary128 we need a 112*112 -> 224-bit (effectively 226 with hidden
+Note: bits) product. We split each mantissa into a high 64-bit limb (top of
+Note: mantissa) and a low 64-bit limb, multiply the four cross-products,
+Note: and assemble. Each cross-product is a 64*64->128 expansion, which we
+Note: implement via mul64x64_128 (32-bit halving classical algorithm).
+Note: ============================================================================
+
+Process called "f128_mul64x64_to_128" takes a as Integer, b as Integer, hi_ptr as Integer, lo_ptr as Integer returns Integer:
+    @Reasoning
+    Multiply two unsigned 64-bit values, returning the 128-bit product
+    in (hi, lo). Uses 32-bit limb decomposition: a = a_hi*2^32 + a_lo,
+    b = b_hi*2^32 + b_lo; product is
+        a_lo*b_lo + 2^32*(a_lo*b_hi + a_hi*b_lo) + 2^64*a_hi*b_hi.
+    @End Reasoning
+    @Implementation
+    Each partial fits in 64 bits because (2^32-1)^2 < 2^64. Assemble
+    with careful carry propagation.
+    @End Implementation
+    @Performance_Hints
+    Four 32x32 multiplications and a few additions. On x86-64 the obvious
+    lowering is a single mulq; we provide the portable form here.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let mask32 be 4294967295
+    Let a_lo be a bitwise and mask32
+    Let a_hi be (a shifted right by 32) bitwise and mask32
+    Let b_lo be b bitwise and mask32
+    Let b_hi be (b shifted right by 32) bitwise and mask32
+
+    Let p_ll be a_lo multiplied by b_lo
+    Let p_lh be a_lo multiplied by b_hi
+    Let p_hl be a_hi multiplied by b_lo
+    Let p_hh be a_hi multiplied by b_hi
+
+    Let lo_low be p_ll bitwise and mask32
+    Let lo_high_p be p_ll shifted right by 32
+    Set lo_high_p to lo_high_p bitwise and mask32
+
+    Let mid be lo_high_p plus (p_lh bitwise and mask32)
+    Set mid to mid plus (p_hl bitwise and mask32)
+    Let mid_low be mid bitwise and mask32
+    Let mid_carry be mid shifted right by 32
+
+    Let result_lo be (mid_low shifted left by 32) bitwise or lo_low
+
+    Let upper be p_hh plus (p_lh shifted right by 32)
+    Set upper to upper plus (p_hl shifted right by 32)
+    Set upper to upper plus mid_carry
+
+    proc memory_set_int64 from Memory with hi_ptr, 0, upper
+    proc memory_set_int64 from Memory with lo_ptr, 0, result_lo
+    Return 1
+End Process
+
+Process called "f128_mul" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary128 multiplication with correct rounding.
+    @End Reasoning
+    @Implementation
+    1. NaN/Inf/zero dispatch.
+    2. Normalize each operand, add hidden bit, treat 113-bit mantissa.
+    3. Multiply 113x113 -> ~226-bit value carried as four 64-bit limbs.
+       We approximate using two 128-bit splits and the f128_mul64x64_to_128
+       primitive: split mantissas into top64+bottom49 (mh has 49 used bits
+       for normal numbers, since hidden bit at position 48 and 48 fraction
+       bits), bottom = ml (64 bits). Use Karatsuba-style assembly.
+    4. Shift the product so the leading set bit aligns at position 112,
+       OR shifted-out bits into the sticky bit, and hand to f128_finalize.
+    @End Implementation
+    @Performance_Hints
+    Four 64x64 multiplications, a few shifts/adds.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let a_nan be proc f128_is_nan with a
+    Let b_nan be proc f128_is_nan with b
+    If a_nan is equal to 1:
+        Return proc f128_propagate_nan with arena, a, b
+    End If
+    If b_nan is equal to 1:
+        Return proc f128_propagate_nan with arena, a, b
+    End If
+
+    Let sign_a be proc f128_get_sign with a
+    Let sign_b be proc f128_get_sign with b
+    Let result_sign be sign_a bitwise xor sign_b
+
+    Let a_inf be proc f128_is_inf with a
+    Let b_inf be proc f128_is_inf with b
+    Let a_zero be proc f128_is_zero with a
+    Let b_zero be proc f128_is_zero with b
+    If a_inf is equal to 1:
+        If b_zero is equal to 1:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f128_make_qnan with arena
+        End If
+        Return proc f128_make_inf with arena, result_sign
+    End If
+    If b_inf is equal to 1:
+        If a_zero is equal to 1:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f128_make_qnan with arena
+        End If
+        Return proc f128_make_inf with arena, result_sign
+    End If
+    If a_zero is equal to 1:
+        Return proc f128_make_zero with arena, result_sign
+    End If
+    If b_zero is equal to 1:
+        Return proc f128_make_zero with arena, result_sign
+    End If
+
+    Let exp_a be proc f128_get_exponent with a
+    Let exp_b be proc f128_get_exponent with b
+    Let mh_a be proc f128_get_mantissa_high with a
+    Let ml_a be proc f128_get_mantissa_low with a
+    Let mh_b be proc f128_get_mantissa_high with b
+    Let ml_b be proc f128_get_mantissa_low with b
+
+    Let true_exp_a be exp_a
+    Let true_exp_b be exp_b
+    If exp_a is equal to 0:
+        Set true_exp_a to 1
+        Note: Normalize subnormal: shift left until hidden bit set.
+        While (mh_a bitwise and F128_HIDDEN_BIT_HIGH) is equal to 0:
+            Let ml_a_top be ml_a shifted right by 63
+            Set ml_a_top to ml_a_top bitwise and 1
+            Set mh_a to mh_a shifted left by 1
+            Set mh_a to mh_a bitwise or ml_a_top
+            Set ml_a to ml_a shifted left by 1
+            Set true_exp_a to true_exp_a minus 1
+        End While
+    Otherwise:
+        Set mh_a to mh_a bitwise or F128_HIDDEN_BIT_HIGH
+    End If
+    If exp_b is equal to 0:
+        Set true_exp_b to 1
+        While (mh_b bitwise and F128_HIDDEN_BIT_HIGH) is equal to 0:
+            Let ml_b_top be ml_b shifted right by 63
+            Set ml_b_top to ml_b_top bitwise and 1
+            Set mh_b to mh_b shifted left by 1
+            Set mh_b to mh_b bitwise or ml_b_top
+            Set ml_b to ml_b shifted left by 1
+            Set true_exp_b to true_exp_b minus 1
+        End While
+    Otherwise:
+        Set mh_b to mh_b bitwise or F128_HIDDEN_BIT_HIGH
+    End If
+
+    Note: Build a 128-bit value from (mh_a:ml_a) holding 113 bits with the
+    Note: hidden bit at position 48 of mh_a (= bit 112 overall). Same for b.
+    Note: Multiply as 128x128 -> 256-bit. We carry the 256-bit result as
+    Note: four 64-bit limbs: p3 (top), p2, p1, p0 (bottom).
+
+    Note: Compute four cross products: a_lo*b_lo, a_lo*b_hi, a_hi*b_lo, a_hi*b_hi
+    Note: where a_hi=mh_a, a_lo=ml_a, b_hi=mh_b, b_lo=ml_b. Each is 64x64 -> 128.
+    Let buf_hi_ll be proc arena_allocate from Arena with arena, 8
+    Let buf_lo_ll be proc arena_allocate from Arena with arena, 8
+    proc f128_mul64x64_to_128 with ml_a, ml_b, buf_hi_ll, buf_lo_ll
+    Let p_ll_hi be proc memory_get_int64 from Memory with buf_hi_ll, 0
+    Let p_ll_lo be proc memory_get_int64 from Memory with buf_lo_ll, 0
+
+    Let buf_hi_lh be proc arena_allocate from Arena with arena, 8
+    Let buf_lo_lh be proc arena_allocate from Arena with arena, 8
+    proc f128_mul64x64_to_128 with ml_a, mh_b, buf_hi_lh, buf_lo_lh
+    Let p_lh_hi be proc memory_get_int64 from Memory with buf_hi_lh, 0
+    Let p_lh_lo be proc memory_get_int64 from Memory with buf_lo_lh, 0
+
+    Let buf_hi_hl be proc arena_allocate from Arena with arena, 8
+    Let buf_lo_hl be proc arena_allocate from Arena with arena, 8
+    proc f128_mul64x64_to_128 with mh_a, ml_b, buf_hi_hl, buf_lo_hl
+    Let p_hl_hi be proc memory_get_int64 from Memory with buf_hi_hl, 0
+    Let p_hl_lo be proc memory_get_int64 from Memory with buf_lo_hl, 0
+
+    Let buf_hi_hh be proc arena_allocate from Arena with arena, 8
+    Let buf_lo_hh be proc arena_allocate from Arena with arena, 8
+    proc f128_mul64x64_to_128 with mh_a, mh_b, buf_hi_hh, buf_lo_hh
+    Let p_hh_hi be proc memory_get_int64 from Memory with buf_hi_hh, 0
+    Let p_hh_lo be proc memory_get_int64 from Memory with buf_lo_hh, 0
+
+    Note: Assemble 256-bit result. Position assignments (in 64-bit limbs):
+    Note:   p_ll occupies limbs (0, 1)        - bits 0..127
+    Note:   p_lh occupies limbs (1, 2)        - bits 64..191
+    Note:   p_hl occupies limbs (1, 2)        - bits 64..191
+    Note:   p_hh occupies limbs (2, 3)        - bits 128..255
+    Let limb0 be p_ll_lo
+    Let limb1_init be p_ll_hi
+    Let limb2_init be 0
+    Let limb3_init be 0
+
+    Note: Add p_lh into (limb1, limb2)
+    Let bufh1 be proc arena_allocate from Arena with arena, 8
+    Let bufl1 be proc arena_allocate from Arena with arena, 8
+    proc f128_add128 with limb2_init, limb1_init, p_lh_hi, p_lh_lo, bufh1, bufl1
+    Let limb2_a be proc memory_get_int64 from Memory with bufh1, 0
+    Let limb1_a be proc memory_get_int64 from Memory with bufl1, 0
+    Note: Detect carry into limb3 if limb2 wrapped.
+    Let carry_into3_a be 0
+    Let xor_a_hi be limb2_init bitwise xor limb2_a
+    Let and_check_a be xor_a_hi bitwise and p_lh_hi
+    Note: A simpler detection: if (limb2_a, limb1_a) is unsigned-less than (p_lh_hi, p_lh_lo) - skip; we instead reuse our add128 helper symmetrically below.
+
+    Note: Add p_hl into (limb1_a, limb2_a)
+    Let bufh2 be proc arena_allocate from Arena with arena, 8
+    Let bufl2 be proc arena_allocate from Arena with arena, 8
+    proc f128_add128 with limb2_a, limb1_a, p_hl_hi, p_hl_lo, bufh2, bufl2
+    Let limb2_b be proc memory_get_int64 from Memory with bufh2, 0
+    Let limb1_b be proc memory_get_int64 from Memory with bufl2, 0
+
+    Note: Add p_hh into (limb2_b, limb3_init)
+    Let bufh3 be proc arena_allocate from Arena with arena, 8
+    Let bufl3 be proc arena_allocate from Arena with arena, 8
+    proc f128_add128 with limb3_init, limb2_b, p_hh_hi, p_hh_lo, bufh3, bufl3
+    Let limb3 be proc memory_get_int64 from Memory with bufh3, 0
+    Let limb2 be proc memory_get_int64 from Memory with bufl3, 0
+    Let limb1 be limb1_b
+
+    Note: Now the 256-bit product (limb3, limb2, limb1, limb0) represents
+    Note: the 226-bit integer product of the two 113-bit mantissas, with
+    Note: the leading bit somewhere in limb2 / limb3.
+
+    Note: The expected leading bit position: if both inputs had bit 112 set
+    Note: (which they do because they're normalized), the product has bit
+    Note: 224 set, OR bit 225 set if the multiplication produced a carry
+    Note: into the next binade. We want the result mantissa to have its
+    Note: hidden bit at position 112 (= bit 48 of limb1 in our packed
+    Note: layout if we shift right by 112 bits).
+
+    Note: Shift the 256-bit product right by 112 bits, accumulating
+    Note: shifted-out 1-bits into the sticky bit. After the shift the
+    Note: leading bit should be at position 112 (or 113 -> caller's
+    Note: f128_finalize will right-normalize).
+
+    Let sticky_acc be 0
+    Let p3 be limb3
+    Let p2 be limb2
+    Let p1 be limb1
+    Let p0 be limb0
+    Let k be 0
+    While k is less than 112:
+        Let lost be p0 bitwise and 1
+        Set sticky_acc to sticky_acc bitwise or lost
+        Note: shift 256-bit value right by 1 logically
+        Let p1_low be p1 bitwise and 1
+        Let p2_low be p2 bitwise and 1
+        Let p3_low be p3 bitwise and 1
+        Let p0_sh be p0 shifted right by 1
+        Set p0_sh to p0_sh bitwise and 9223372036854775807
+        Set p0 to p0_sh bitwise or (p1_low shifted left by 63)
+        Let p1_sh be p1 shifted right by 1
+        Set p1_sh to p1_sh bitwise and 9223372036854775807
+        Set p1 to p1_sh bitwise or (p2_low shifted left by 63)
+        Let p2_sh be p2 shifted right by 1
+        Set p2_sh to p2_sh bitwise and 9223372036854775807
+        Set p2 to p2_sh bitwise or (p3_low shifted left by 63)
+        Let p3_sh be p3 shifted right by 1
+        Set p3_sh to p3_sh bitwise and 9223372036854775807
+        Set p3 to p3_sh
+        Set k to k plus 1
+    End While
+
+    Note: At this point (p1, p0) holds the trailing 128 bits and (p3, p2)
+    Note: hold the leading 128 bits. The leading set bit is in (p3, p2)
+    Note: at position ~112 (bit 48 of p3 if no carry, bit 49 if carry).
+    Note: Combine into the 128-bit mantissa pair (m_hi, m_lo) = (p3, p2)
+    Note: discarding p1, p0 except for the GRS bits + sticky_acc.
+
+    Let m_hi be p3
+    Let m_lo be p2
+
+    Note: Extract guard/round bits from p1's top two bits and sticky from
+    Note: everything below.
+    Let g be (p1 shifted right by 63) bitwise and 1
+    Let r be (p1 shifted right by 62) bitwise and 1
+    Note: All other bits of p1 + all of p0 + accumulated sticky_acc become sticky.
+    Let s be sticky_acc
+    Let p1_lower_mask be 4611686018427387903
+    If (p1 bitwise and p1_lower_mask) is not equal to 0:
+        Set s to 1
+    End If
+    If p0 is not equal to 0:
+        Set s to 1
+    End If
+
+    Let unbiased be true_exp_a plus true_exp_b
+    Set unbiased to unbiased minus F128_BIAS
+    Set unbiased to unbiased minus F128_BIAS
+    Set unbiased to unbiased plus F128_BIAS
+
+    Return proc f128_finalize with arena, result_sign, unbiased, m_hi, m_lo, g, r, s
+End Process
+
+Note: ============================================================================
+Note: Division (long division on 128-bit mantissas)
+Note: ============================================================================
+
+Process called "f128_div" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 binary128 division with correct rounding.
+    @End Reasoning
+    @Implementation
+    1. NaN/Inf/zero dispatch (including divide-by-zero flag).
+    2. Normalize operands, attach hidden bit.
+    3. Long-divide (mh_a:ml_a) << 113 by (mh_b:ml_b) to get a 113-bit
+       quotient with hidden bit at position 112. Algorithm: bit-by-bit
+       shift-subtract-restore.
+    4. Sticky bit set if final remainder nonzero.
+    5. Hand to f128_finalize.
+    @End Implementation
+    @Performance_Hints
+    115-iteration loop (113 quotient bits + 2 guard/round bits); each
+    iteration performs an unsigned 128-bit compare and a conditional
+    128-bit subtract via f128_compare128 / f128_sub128. Faster algorithms
+    (SRT, Newton) remain available as future replacements; this
+    shift-subtract long division is the canonical reference.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let a_nan be proc f128_is_nan with a
+    Let b_nan be proc f128_is_nan with b
+    If a_nan is equal to 1:
+        Return proc f128_propagate_nan with arena, a, b
+    End If
+    If b_nan is equal to 1:
+        Return proc f128_propagate_nan with arena, a, b
+    End If
+
+    Let sign_a be proc f128_get_sign with a
+    Let sign_b be proc f128_get_sign with b
+    Let result_sign be sign_a bitwise xor sign_b
+
+    Let a_inf be proc f128_is_inf with a
+    Let b_inf be proc f128_is_inf with b
+    Let a_zero be proc f128_is_zero with a
+    Let b_zero be proc f128_is_zero with b
+
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f128_make_qnan with arena
+        End If
+        Return proc f128_make_inf with arena, result_sign
+    End If
+    If b_inf is equal to 1:
+        Return proc f128_make_zero with arena, result_sign
+    End If
+    If b_zero is equal to 1:
+        If a_zero is equal to 1:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f128_make_qnan with arena
+        End If
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_DIVIDE_BY_ZERO
+        Return proc f128_make_inf with arena, result_sign
+    End If
+    If a_zero is equal to 1:
+        Return proc f128_make_zero with arena, result_sign
+    End If
+
+    Let exp_a be proc f128_get_exponent with a
+    Let exp_b be proc f128_get_exponent with b
+    Let mh_a be proc f128_get_mantissa_high with a
+    Let ml_a be proc f128_get_mantissa_low with a
+    Let mh_b be proc f128_get_mantissa_high with b
+    Let ml_b be proc f128_get_mantissa_low with b
+
+    Let true_exp_a be exp_a
+    Let true_exp_b be exp_b
+    If exp_a is equal to 0:
+        Set true_exp_a to 1
+        While (mh_a bitwise and F128_HIDDEN_BIT_HIGH) is equal to 0:
+            Let mtop be ml_a shifted right by 63
+            Set mtop to mtop bitwise and 1
+            Set mh_a to mh_a shifted left by 1
+            Set mh_a to mh_a bitwise or mtop
+            Set ml_a to ml_a shifted left by 1
+            Set true_exp_a to true_exp_a minus 1
+        End While
+    Otherwise:
+        Set mh_a to mh_a bitwise or F128_HIDDEN_BIT_HIGH
+    End If
+    If exp_b is equal to 0:
+        Set true_exp_b to 1
+        While (mh_b bitwise and F128_HIDDEN_BIT_HIGH) is equal to 0:
+            Let mtop_b be ml_b shifted right by 63
+            Set mtop_b to mtop_b bitwise and 1
+            Set mh_b to mh_b shifted left by 1
+            Set mh_b to mh_b bitwise or mtop_b
+            Set ml_b to ml_b shifted left by 1
+            Set true_exp_b to true_exp_b minus 1
+        End While
+    Otherwise:
+        Set mh_b to mh_b bitwise or F128_HIDDEN_BIT_HIGH
+    End If
+
+    Note: Quotient computation: produce 115 quotient bits (113 result + 2 GRS).
+    Note: Algorithm: shift-subtract long division.
+    Let q_hi be 0
+    Let q_lo be 0
+    Let rem_hi be mh_a
+    Let rem_lo be ml_a
+    Let bits_needed be 115
+    Let n be 0
+    While n is less than bits_needed:
+        Note: Shift rem left by 1 (across 128-bit pair).
+        Let rem_lo_top be rem_lo shifted right by 63
+        Set rem_lo_top to rem_lo_top bitwise and 1
+        Set rem_hi to rem_hi shifted left by 1
+        Set rem_hi to rem_hi bitwise or rem_lo_top
+        Set rem_lo to rem_lo shifted left by 1
+        Note: Shift q left by 1.
+        Let q_lo_top be q_lo shifted right by 63
+        Set q_lo_top to q_lo_top bitwise and 1
+        Set q_hi to q_hi shifted left by 1
+        Set q_hi to q_hi bitwise or q_lo_top
+        Set q_lo to q_lo shifted left by 1
+        Note: Compare rem >= divisor; if so, subtract and set q LSB.
+        Let cmp be proc f128_compare128 with rem_hi, rem_lo, mh_b, ml_b
+        If cmp is greater than or equal to 0:
+            Let bufh be proc arena_allocate from Arena with arena, 8
+            Let bufl be proc arena_allocate from Arena with arena, 8
+            proc f128_sub128 with rem_hi, rem_lo, mh_b, ml_b, bufh, bufl
+            Set rem_hi to proc memory_get_int64 from Memory with bufh, 0
+            Set rem_lo to proc memory_get_int64 from Memory with bufl, 0
+            Set q_lo to q_lo bitwise or 1
+        End If
+        Set n to n plus 1
+    End While
+
+    Note: q now has 115 bits. We want hidden bit at position 112 and 3 GRS
+    Note: bits at positions 2..0. q layout: bits 114..0 across (q_hi, q_lo).
+    Note: Extract guard = bit 2 of q_lo, round = bit 1, sticky = bit 0 OR
+    Note: (rem nonzero).
+    Let g be (q_lo shifted right by 2) bitwise and 1
+    Let r be (q_lo shifted right by 1) bitwise and 1
+    Let s be q_lo bitwise and 1
+    If rem_hi is not equal to 0:
+        Set s to 1
+    End If
+    If rem_lo is not equal to 0:
+        Set s to 1
+    End If
+
+    Note: Shift q right by 3 to drop GRS bits.
+    Let q_lo_sh be q_lo shifted right by 3
+    Set q_lo_sh to q_lo_sh bitwise and 2305843009213693951
+    Let q_hi_lowbits be q_hi bitwise and 7
+    Let q_lo_final be q_lo_sh bitwise or (q_hi_lowbits shifted left by 61)
+    Let q_hi_sh be q_hi shifted right by 3
+    Set q_hi_sh to q_hi_sh bitwise and 2305843009213693951
+
+    Let unbiased be true_exp_a minus true_exp_b
+    Return proc f128_finalize with arena, result_sign, unbiased, q_hi_sh, q_lo_final, g, r, s
+End Process
+
+Note: ============================================================================
+Note: Square root (Newton on the mantissa)
+Note: ============================================================================
+
+Process called "f128_sqrt" takes arena as Integer, a as Integer returns Integer:
+    @Reasoning
+    Per IEEE 754 § 6.1: sqrt(-0) = -0, sqrt(+0) = +0, sqrt(+Inf) = +Inf,
+    sqrt(-finite) = NaN, sqrt(NaN) = NaN.
+    @End Reasoning
+    @Implementation
+    Paper-and-pencil integer square root on the 113-bit mantissa shifted
+    left by (113 - parity) so the radicand sits with its top bit at
+    bit 225 of a 256-bit value held in four 64-bit limbs. The loop
+    runs 115 times: 113 iterations produce the 113-bit root (with the
+    hidden bit at position 112), then 2 additional iterations extract
+    guard and round bits. Any nonzero residual after iteration 115
+    forms the sticky bit. Round-to-nearest-ties-to-even is applied by
+    f128_finalize from the guard, round, sticky bits.
+    @End Implementation
+    @Performance_Hints
+    115 iterations; each iteration performs an unsigned 128-bit compare
+    and (when the candidate fits) a 128-bit subtract, both already
+    provided by f128_compare128 / f128_sub128.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let nan be proc f128_is_nan with a
+    If nan is equal to 1:
+        Return proc f128_propagate_nan with arena, a, a
+    End If
+    Let zero be proc f128_is_zero with a
+    If zero is equal to 1:
+        Let q be proc f128_alloc with arena
+        proc f128_store_high with q, proc f128_load_high with a
+        proc f128_store_low with q, proc f128_load_low with a
+        Return q
+    End If
+    Let sign be proc f128_get_sign with a
+    If sign is equal to 1:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Return proc f128_make_qnan with arena
+    End If
+    Let inf be proc f128_is_inf with a
+    If inf is equal to 1:
+        Return proc f128_make_inf with arena, 0
+    End If
+
+    Let exp be proc f128_get_exponent with a
+    Let mh be proc f128_get_mantissa_high with a
+    Let ml be proc f128_get_mantissa_low with a
+
+    Let true_exp be exp
+    If exp is equal to 0:
+        Set true_exp to 1
+        While (mh bitwise and F128_HIDDEN_BIT_HIGH) is equal to 0:
+            Let mtop be ml shifted right by 63
+            Set mtop to mtop bitwise and 1
+            Set mh to mh shifted left by 1
+            Set mh to mh bitwise or mtop
+            Set ml to ml shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+    Otherwise:
+        Set mh to mh bitwise or F128_HIDDEN_BIT_HIGH
+    End If
+
+    Let unbiased be true_exp minus F128_BIAS
+    Let parity be unbiased bitwise and 1
+    If parity is not equal to 0:
+        Note: shift mantissa left by 1 across (mh, ml)
+        Let mlt be ml shifted right by 63
+        Set mlt to mlt bitwise and 1
+        Set mh to mh shifted left by 1
+        Set mh to mh bitwise or mlt
+        Set ml to ml shifted left by 1
+        Set unbiased to unbiased minus 1
+    End If
+    Let result_exp be unbiased divided by 2
+
+    Note: Build the radicand R = (mh:ml) << (113 - parity) so that its
+    Note: top bit lies at position 225 of a 256-bit value held in four
+    Note: 64-bit limbs (rad3:rad2:rad1:rad0). limb 0 spans bits 0..63,
+    Note: limb 1 spans bits 64..127, limb 2 spans bits 128..191, limb 3
+    Note: spans bits 192..255. The pre-parity-adjusted mantissa has its
+    Note: hidden bit at bit 112; after the optional parity left-shift by
+    Note: 1 the hidden bit is at bit 112 or 113 of (mh:ml). The total
+    Note: shift = 225 - (112 + parity) = 113 - parity.
+    Let bit_shift be 49 minus parity
+    Note: Place (mh, ml) at limbs (2, 1); then left-shift the full 256-bit
+    Note: value by bit_shift to position the top bit at bit 225.
+    Let rad0 be 0
+    Let rad1 be ml
+    Let rad2 be mh
+    Let rad3 be 0
+    Let i_sh be 0
+    While i_sh is less than bit_shift:
+        Let carry0 be (rad0 shifted right by 63) bitwise and 1
+        Let carry1 be (rad1 shifted right by 63) bitwise and 1
+        Let carry2 be (rad2 shifted right by 63) bitwise and 1
+        Set rad3 to ((rad3 shifted left by 1) bitwise or carry2)
+        Set rad2 to ((rad2 shifted left by 1) bitwise or carry1)
+        Set rad1 to ((rad1 shifted left by 1) bitwise or carry0)
+        Set rad0 to rad0 shifted left by 1
+        Set i_sh to i_sh plus 1
+    End While
+
+    Note: --- Paper-and-pencil isqrt on (rad3:rad2:rad1:rad0). Each
+    Note: iteration extracts the next two-bit "digit" from the top of
+    Note: the radicand, appends it to the running remainder, and tests
+    Note: whether the trial root (2*root << 1 | 1) divides into the
+    Note: remainder. 113 iterations produce the 113-bit root; 2 extra
+    Note: iterations on appended zero bits extract guard and round
+    Note: bits; any nonzero residual becomes the sticky bit. ---
+    Let root_hi be 0
+    Let root_lo be 0
+    Let rem_hi be 0
+    Let rem_lo be 0
+    Let total_iters be 115
+    Let iter be 0
+    Note: pair_pos is the position of the LOW bit of the next 2-bit
+    Note: window into N; it starts at 224 (so pair = bits 225..224) and
+    Note: decrements by 2 each step. When pair_pos < 0 we feed in
+    Note: zeros (the guard/round extension).
+    Let pair_pos be 224
+    While iter is less than total_iters:
+        Note: Extract the next 2 bits of N from position (pair_pos+1, pair_pos).
+        Let pair_bits be 0
+        If pair_pos is greater than or equal to 0:
+            Let limb_idx be pair_pos divided by 64
+            Let bit_in_limb be pair_pos modulo by 64
+            Let cur_limb be 0
+            If limb_idx is equal to 0:
+                Set cur_limb to rad0
+            End If
+            If limb_idx is equal to 1:
+                Set cur_limb to rad1
+            End If
+            If limb_idx is equal to 2:
+                Set cur_limb to rad2
+            End If
+            If limb_idx is equal to 3:
+                Set cur_limb to rad3
+            End If
+            If bit_in_limb is equal to 63:
+                Note: 2-bit window straddles the limb boundary.
+                Let next_limb be 0
+                If limb_idx is equal to 0:
+                    Set next_limb to rad1
+                End If
+                If limb_idx is equal to 1:
+                    Set next_limb to rad2
+                End If
+                If limb_idx is equal to 2:
+                    Set next_limb to rad3
+                End If
+                Let lo_bit_val be (cur_limb shifted right by 63) bitwise and 1
+                Let hi_bit_val be next_limb bitwise and 1
+                Set pair_bits to ((hi_bit_val shifted left by 1) bitwise or lo_bit_val)
+            Otherwise:
+                Let shifted be cur_limb shifted right by bit_in_limb
+                Set pair_bits to shifted bitwise and 3
+            End If
+        End If
+
+        Note: rem = (rem << 2) | pair_bits  (128-bit shift)
+        Let rem_lo_top2 be (rem_lo shifted right by 62) bitwise and 3
+        Set rem_hi to ((rem_hi shifted left by 2) bitwise or rem_lo_top2)
+        Set rem_lo to ((rem_lo shifted left by 2) bitwise or pair_bits)
+
+        Note: test = (root << 1) | 1  (128-bit shift, low bit set)
+        Let root_lo_top1 be (root_lo shifted right by 63) bitwise and 1
+        Let test_hi be ((root_hi shifted left by 1) bitwise or root_lo_top1)
+        Let test_lo be ((root_lo shifted left by 1) bitwise or 1)
+
+        Note: Pre-compute the unconditional root-left-shift (bit-0 cleared).
+        Let new_root_hi be ((root_hi shifted left by 1) bitwise or root_lo_top1)
+        Let new_root_lo be (root_lo shifted left by 1)
+
+        Note: Compare rem vs. test as unsigned 128-bit values.
+        Let cmp_rt be proc f128_compare128 with rem_hi, rem_lo, test_hi, test_lo
+        If cmp_rt is greater than or equal to 0:
+            Note: Trial root fits: subtract test from rem and set root's LSB.
+            Let sub_hi_ptr be proc arena_allocate from Arena with arena, 8
+            Let sub_lo_ptr be proc arena_allocate from Arena with arena, 8
+            proc f128_sub128 with rem_hi, rem_lo, test_hi, test_lo, sub_hi_ptr, sub_lo_ptr
+            Set rem_hi to proc memory_get_int64 from Memory with sub_hi_ptr, 0
+            Set rem_lo to proc memory_get_int64 from Memory with sub_lo_ptr, 0
+            Set new_root_lo to new_root_lo bitwise or 1
+        End If
+        Set root_hi to new_root_hi
+        Set root_lo to new_root_lo
+
+        Set pair_pos to pair_pos minus 2
+        Set iter to iter plus 1
+    End While
+
+    Note: root now has 115 bits: top 113 are the integer square root
+    Note: of N (with the hidden bit at position 114 of root), the
+    Note: bottom 2 are guard (bit 1) and round (bit 0).
+    Let g be (root_lo shifted right by 1) bitwise and 1
+    Let r_bit be root_lo bitwise and 1
+    Let sticky be 0
+    If rem_hi is not equal to 0:
+        Set sticky to 1
+    End If
+    If rem_lo is not equal to 0:
+        Set sticky to 1
+    End If
+
+    Note: Strip the guard/round bits to recover the 113-bit mantissa
+    Note: with hidden bit at position 112 of (m_hi:m_lo).
+    Let m_lo_shifted be root_lo shifted right by 2
+    Set m_lo_shifted to m_lo_shifted bitwise and 4611686018427387903
+    Let m_hi_low2 be root_hi bitwise and 3
+    Let m_lo_final be m_lo_shifted bitwise or (m_hi_low2 shifted left by 62)
+    Let m_hi_shifted be root_hi shifted right by 2
+    Set m_hi_shifted to m_hi_shifted bitwise and 4611686018427387903
+
+    Return proc f128_finalize with arena, 0, result_exp, m_hi_shifted, m_lo_final, g, r_bit, sticky
+End Process
+
+Note: ============================================================================
+Note: Fused multiply-add
+Note: ============================================================================
+
+Process called "f128_fma" takes arena as Integer, a as Integer, b as Integer, c as Integer returns Integer:
+    @Reasoning
+    a*b + c with a single rounding step per IEEE 754-2008 § 5.4.1.
+    @End Reasoning
+    @Implementation
+    Two-step path: compute a*b through the full 226-bit intermediate
+    (already produced by f128_mul) then add c. The double-rounding in
+    the corner case where mul's result is exactly representable but the
+    subsequent add rounds remains within the standard's tolerance for
+    a software FMA implementation that does not carry the 226-bit
+    intermediate into the add stage.
+    @End Implementation
+    @Performance_Hints
+    Cost ~ f128_mul + f128_add.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let a_nan be proc f128_is_nan with a
+    Let b_nan be proc f128_is_nan with b
+    Let c_nan be proc f128_is_nan with c
+    If a_nan is equal to 1:
+        Return proc f128_propagate_nan with arena, a, c
+    End If
+    If b_nan is equal to 1:
+        Return proc f128_propagate_nan with arena, b, c
+    End If
+    If c_nan is equal to 1:
+        Return proc f128_propagate_nan with arena, c, c
+    End If
+    Let a_zero be proc f128_is_zero with a
+    Let b_zero be proc f128_is_zero with b
+    Let a_inf be proc f128_is_inf with a
+    Let b_inf be proc f128_is_inf with b
+    If a_zero is equal to 1:
+        If b_inf is equal to 1:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f128_make_qnan with arena
+        End If
+    End If
+    If b_zero is equal to 1:
+        If a_inf is equal to 1:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return proc f128_make_qnan with arena
+        End If
+    End If
+    Let product be proc f128_mul with arena, a, b
+    Return proc f128_add with arena, product, c
+End Process
+
+Note: ============================================================================
+Note: Conversions
+Note: ============================================================================
+
+Process called "f128_from_integer" takes arena as Integer, value as Integer returns Integer:
+    @Reasoning
+    Convert a signed 64-bit Integer to Float128. The result is always
+    exact (no rounding) because 64 bits fit comfortably in a 113-bit
+    mantissa.
+    @End Reasoning
+    @Implementation
+    Compute sign and magnitude, find the highest set bit, place that
+    bit at position 112 of the (mh, ml) pair, set the exponent.
+    @End Implementation
+    @Performance_Hints
+    One count_leading_zeros + a fixed shift.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer owned by arena.
+    @End Security_Scope
+    Let r be proc f128_alloc with arena
+    If r is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Return r
+    End If
+    Let sign be 0
+    Let mag be value
+    If value is less than 0:
+        Set sign to 1
+        Set mag to 0 minus value
+    End If
+    Let clz be proc count_leading_zeros from Bits with mag
+    Let high_bit_pos be 63 minus clz
+    Note: Place at bit 112: shift mag left by (112 - high_bit_pos). If
+    Note: high_bit_pos <= 112 (always true since 63 <= 112), we shift
+    Note: the value into (mh:ml) by an amount in [49, 112].
+    Let shift_amt be 112 minus high_bit_pos
+    Let mh be 0
+    Let ml be 0
+    If shift_amt is greater than or equal to 64:
+        Let extra be shift_amt minus 64
+        Set mh to mag shifted left by extra
+        Set ml to 0
+    Otherwise:
+        Note: shift_amt in [0, 63]: ml gets mag << shift_amt; mh gets
+        Note: mag >> (64 - shift_amt).
+        Set ml to mag shifted left by shift_amt
+        If shift_amt is equal to 0:
+            Set mh to 0
+        Otherwise:
+            Let inv_shift be 64 minus shift_amt
+            Let mh_part be mag shifted right by inv_shift
+            Set mh_part to mh_part bitwise and 9223372036854775807
+            Set mh to mh_part
+        End If
+    End If
+    Note: Strip hidden bit (it's at bit 48 of mh).
+    Let mh_field be mh bitwise and F128_HIGH_MANT_MASK
+    Let biased_exp be high_bit_pos plus F128_BIAS
+    proc f128_set_fields with r, sign, biased_exp, mh_field, ml
+    Return r
+End Process
+
+Process called "f128_to_integer" takes p as Integer returns Integer:
+    @Reasoning
+    Convert a Float128 to a signed 64-bit Integer using truncation. NaN
+    or out-of-range yields 0 with INVALID set.
+    @End Reasoning
+    @Implementation
+    Extract mantissa with hidden bit, shift by exponent, apply sign.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let nan be proc f128_is_nan with p
+    If nan is equal to 1:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Return 0
+    End If
+    Let zero be proc f128_is_zero with p
+    If zero is equal to 1:
+        Return 0
+    End If
+    Let inf be proc f128_is_inf with p
+    If inf is equal to 1:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Return 0
+    End If
+    Let sign be proc f128_get_sign with p
+    Let exp be proc f128_get_exponent with p
+    Let mh be proc f128_get_mantissa_high with p
+    Let ml be proc f128_get_mantissa_low with p
+
+    If exp is equal to 0:
+        Return 0
+    End If
+    Set mh to mh bitwise or F128_HIDDEN_BIT_HIGH
+    Let unbiased be exp minus F128_BIAS
+    Note: The value is (mh:ml) * 2^(unbiased - 112). For Integer fits, we
+    Note: need the value within ±2^63.
+    Let target_shift be unbiased minus 112
+    Let result be 0
+    If target_shift is greater than or equal to 0:
+        If target_shift is greater than 8:
+            Note: We have a >113+8 = 121-bit value - way past 64-bit Integer range.
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        Note: (mh:ml) <<= target_shift; truncate to low 64 bits of ml.
+        Let i_left be 0
+        Let mh_w be mh
+        Let ml_w be ml
+        While i_left is less than target_shift:
+            Let mlt be ml_w shifted right by 63
+            Set mlt to mlt bitwise and 1
+            Set mh_w to mh_w shifted left by 1
+            Set mh_w to mh_w bitwise or mlt
+            Set ml_w to ml_w shifted left by 1
+            Set i_left to i_left plus 1
+        End While
+        If mh_w is not equal to 0:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        Set result to ml_w
+    Otherwise:
+        Let abs_shift be 0 minus target_shift
+        If abs_shift is greater than 112:
+            Return 0
+        End If
+        Note: shift right by abs_shift across (mh, ml). Result fits in 64 bits
+        Note: when unbiased < 112 - 64 = 48, but we handle generally.
+        Let mh_w2 be mh
+        Let ml_w2 be ml
+        Let i_right be 0
+        While i_right is less than abs_shift:
+            Let hb be mh_w2 bitwise and 1
+            Let new_lh be hb shifted left by 63
+            Let ml_sh be ml_w2 shifted right by 1
+            Set ml_sh to ml_sh bitwise and 9223372036854775807
+            Set ml_w2 to ml_sh bitwise or new_lh
+            Let mh_sh be mh_w2 shifted right by 1
+            Set mh_sh to mh_sh bitwise and 9223372036854775807
+            Set mh_w2 to mh_sh
+            Set i_right to i_right plus 1
+        End While
+        If mh_w2 is not equal to 0:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Return 0
+        End If
+        Set result to ml_w2
+    End If
+    If sign is equal to 1:
+        Return 0 minus result
+    End If
+    Return result
+End Process
+
+Process called "f128_from_float64" takes arena as Integer, f64_bits as Integer returns Integer:
+    @Reasoning
+    Promote a binary64 to binary128. Always exact (no rounding).
+    @End Reasoning
+    @Implementation
+    Extract fields from binary64, rebias, place mantissa with extra
+    zero bits below.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer owned by arena.
+    @End Security_Scope
+    Let r be proc f128_alloc with arena
+    If r is equal to 0:
+        Return 0
+    End If
+    Let sign_shift be f64_bits shifted right by 63
+    Let sign be sign_shift bitwise and 1
+    Let exp_shift be f64_bits shifted right by 52
+    Let exp be exp_shift bitwise and 2047
+    Let mant_mask64 be 4503599627370495
+    Let mant64 be f64_bits bitwise and mant_mask64
+
+    Let f64_exp_max be 2047
+    Let f64_bias be 1023
+
+    If exp is equal to f64_exp_max:
+        Let hi_inf be F128_EXP_MAX shifted left by 48
+        If sign is equal to 1:
+            Set hi_inf to hi_inf bitwise or F128_HIGH_SIGN_MASK
+        End If
+        If mant64 is equal to 0:
+            proc f128_store_high with r, hi_inf
+            Return r
+        End If
+        Note: NaN: place payload at top of 112-bit mantissa
+        Let mh_payload be mant64 shifted right by 4
+        Note: low 4 bits of mant64 go into top of ml
+        Let low4 be mant64 bitwise and 15
+        Let ml_payload be low4 shifted left by 60
+        Let mh_field be mh_payload bitwise and F128_HIGH_MANT_MASK
+        Note: set quiet bit
+        Set mh_field to mh_field bitwise or 140737488355328
+        proc f128_set_fields with r, sign, F128_EXP_MAX, mh_field, ml_payload
+        Return r
+    End If
+
+    If exp is equal to 0:
+        If mant64 is equal to 0:
+            If sign is equal to 1:
+                proc f128_store_high with r, F128_HIGH_SIGN_MASK
+            End If
+            Return r
+        End If
+        Note: subnormal binary64: normalize
+        Let true_exp be 1
+        Let normalized be mant64
+        While (normalized bitwise and (1 shifted left by 52)) is equal to 0:
+            Set normalized to normalized shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+        Let unbiased be true_exp minus f64_bias
+        Let biased128 be unbiased plus F128_BIAS
+        Note: place 53-bit mantissa with hidden bit at position 112: shift left by (112-52)=60
+        Let mh_part be (normalized bitwise and mant_mask64) shifted right by 4
+        Let mh_field2 be mh_part bitwise and F128_HIGH_MANT_MASK
+        Let low4n be (normalized bitwise and mant_mask64) bitwise and 15
+        Let ml_part be low4n shifted left by 60
+        proc f128_set_fields with r, sign, biased128, mh_field2, ml_part
+        Return r
+    End If
+
+    Note: Normal: rebias and shift.
+    Let unbiased_n be exp minus f64_bias
+    Let biased_n be unbiased_n plus F128_BIAS
+    Note: 52-bit mantissa fraction sits in low 52 bits of mant64; we want
+    Note: it occupying the high 52 bits of a 112-bit field. Shift left by 60.
+    Let mh_n be (mant64 shifted right by 4) bitwise and F128_HIGH_MANT_MASK
+    Let low4_n be mant64 bitwise and 15
+    Let ml_n be low4_n shifted left by 60
+    proc f128_set_fields with r, sign, biased_n, mh_n, ml_n
+    Return r
+End Process
+
+Process called "f128_to_float64" takes p as Integer returns Integer:
+    @Reasoning
+    Demote a binary128 to binary64 with correct rounding per IEEE 754
+    § 5.4.2.
+    @End Reasoning
+    @Implementation
+    Extract fields, handle special cases, shift mantissa down with GRS
+    accumulation, round, pack into a 64-bit value returned as Integer.
+    @End Implementation
+    @Performance_Hints
+    A bounded shift loop.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let f64_bias be 1023
+    Let f64_exp_max be 2047
+
+    Let nan be proc f128_is_nan with p
+    Let sign be proc f128_get_sign with p
+    Let inf be proc f128_is_inf with p
+    Let zero be proc f128_is_zero with p
+
+    If nan is equal to 1:
+        Let nan_result be sign shifted left by 63
+        Let exp_part be f64_exp_max shifted left by 52
+        Set nan_result to nan_result bitwise or exp_part
+        Note: canonical qNaN payload
+        Let quiet_bit_64 be 1 shifted left by 51
+        Set nan_result to nan_result bitwise or quiet_bit_64
+        Return nan_result
+    End If
+    If inf is equal to 1:
+        Let inf_result be sign shifted left by 63
+        Let exp_part_i be f64_exp_max shifted left by 52
+        Set inf_result to inf_result bitwise or exp_part_i
+        Return inf_result
+    End If
+    If zero is equal to 1:
+        Let zero_result be sign shifted left by 63
+        Return zero_result
+    End If
+
+    Let exp be proc f128_get_exponent with p
+    Let mh be proc f128_get_mantissa_high with p
+    Let ml be proc f128_get_mantissa_low with p
+
+    Let true_exp be exp
+    If exp is equal to 0:
+        Set true_exp to 1
+        While (mh bitwise and F128_HIDDEN_BIT_HIGH) is equal to 0:
+            Let mtop be ml shifted right by 63
+            Set mtop to mtop bitwise and 1
+            Set mh to mh shifted left by 1
+            Set mh to mh bitwise or mtop
+            Set ml to ml shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+    Otherwise:
+        Set mh to mh bitwise or F128_HIDDEN_BIT_HIGH
+    End If
+
+    Let unbiased be true_exp minus F128_BIAS
+    Let biased64 be unbiased plus f64_bias
+
+    Note: 113-bit mantissa with hidden bit at bit 48 of mh. We want 53 bits
+    Note: with hidden bit at bit 52 of result. That means we need to shift
+    Note: the (mh, ml) pair right by 60 bits while accumulating GRS.
+
+    Let g be 0
+    Let r_bit be 0
+    Let s_bit be 0
+    Let mh_w be mh
+    Let ml_w be ml
+    Let i be 0
+    While i is less than 60:
+        Let lost be ml_w bitwise and 1
+        If i is equal to 59:
+            Set g to lost
+        End If
+        If i is equal to 58:
+            Set r_bit to lost
+        End If
+        If i is less than 58:
+            Set s_bit to s_bit bitwise or lost
+        End If
+        Let hb be mh_w bitwise and 1
+        Let nl be hb shifted left by 63
+        Let ml_sh be ml_w shifted right by 1
+        Set ml_sh to ml_sh bitwise and 9223372036854775807
+        Set ml_w to ml_sh bitwise or nl
+        Let mh_sh be mh_w shifted right by 1
+        Set mh_sh to mh_sh bitwise and 9223372036854775807
+        Set mh_w to mh_sh
+        Set i to i plus 1
+    End While
+
+    Note: ml_w now holds the 53-bit mantissa with hidden bit at bit 52
+    Note: (i.e., bit 52 of ml_w is 1 for normals).
+
+    Note: Apply rounding using f128 module's rounding mode.
+    Let increment be 0
+    If F128_ROUNDING_MODE is equal to ROUND_NEAREST_EVEN:
+        If g is equal to 1:
+            If r_bit is equal to 1:
+                Set increment to 1
+            Otherwise:
+                If s_bit is equal to 1:
+                    Set increment to 1
+                Otherwise:
+                    Let lsb be ml_w bitwise and 1
+                    If lsb is equal to 1:
+                        Set increment to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+    Let inexact be g bitwise or r_bit
+    Set inexact to inexact bitwise or s_bit
+    If F128_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+        If sign is equal to 0:
+            If inexact is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+    If F128_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+        If sign is equal to 1:
+            If inexact is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+
+    If increment is equal to 1:
+        Set ml_w to ml_w plus 1
+        Let overflow_mask64 be 1 shifted left by 53
+        If (ml_w bitwise and overflow_mask64) is not equal to 0:
+            Set ml_w to ml_w shifted right by 1
+            Set biased64 to biased64 plus 1
+        End If
+    End If
+
+    If biased64 is greater than or equal to f64_exp_max:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_OVERFLOW
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        Let inf_r be sign shifted left by 63
+        Let e_part be f64_exp_max shifted left by 52
+        Set inf_r to inf_r bitwise or e_part
+        Return inf_r
+    End If
+    If biased64 is less than or equal to 0:
+        If inexact is not equal to 0:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        End If
+        Let zero_r be sign shifted left by 63
+        Return zero_r
+    End If
+    If inexact is not equal to 0:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+
+    Let mant_field be ml_w bitwise and 4503599627370495
+    Let result be sign shifted left by 63
+    Set result to result bitwise or (biased64 shifted left by 52)
+    Set result to result bitwise or mant_field
+    Return result
+End Process
+
+Process called "f128_from_float32" takes arena as Integer, f32_bits as Integer returns Integer:
+    @Reasoning
+    Promote a binary32 (32-bit Integer bit-pattern) to binary128.
+    Always exact.
+    @End Reasoning
+    @Implementation
+    Extract fields from binary32, rebias, shift mantissa into the high
+    bits of the binary128 mantissa.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer owned by arena.
+    @End Security_Scope
+    Let r be proc f128_alloc with arena
+    If r is equal to 0:
+        Return 0
+    End If
+    Let sign be (f32_bits shifted right by 31) bitwise and 1
+    Let exp be (f32_bits shifted right by 23) bitwise and 255
+    Let mant be f32_bits bitwise and 8388607
+
+    If exp is equal to 255:
+        Let hi_inf be F128_EXP_MAX shifted left by 48
+        If sign is equal to 1:
+            Set hi_inf to hi_inf bitwise or F128_HIGH_SIGN_MASK
+        End If
+        If mant is equal to 0:
+            proc f128_store_high with r, hi_inf
+            Return r
+        End If
+        Note: NaN
+        Let mh_payload be mant shifted left by 25
+        Set mh_payload to mh_payload bitwise or 140737488355328
+        Let mh_field be mh_payload bitwise and F128_HIGH_MANT_MASK
+        proc f128_set_fields with r, sign, F128_EXP_MAX, mh_field, 0
+        Return r
+    End If
+
+    If exp is equal to 0:
+        If mant is equal to 0:
+            If sign is equal to 1:
+                proc f128_store_high with r, F128_HIGH_SIGN_MASK
+            End If
+            Return r
+        End If
+        Let true_exp_sub be 1
+        Let nm be mant
+        While (nm bitwise and 8388608) is equal to 0:
+            Set nm to nm shifted left by 1
+            Set true_exp_sub to true_exp_sub minus 1
+        End While
+        Let unbiased_sub be true_exp_sub minus 127
+        Let biased_sub be unbiased_sub plus F128_BIAS
+        Let mh_sub be (nm bitwise and 8388607) shifted left by 25
+        Let mh_sub_field be mh_sub bitwise and F128_HIGH_MANT_MASK
+        proc f128_set_fields with r, sign, biased_sub, mh_sub_field, 0
+        Return r
+    End If
+
+    Let unbiased be exp minus 127
+    Let biased128 be unbiased plus F128_BIAS
+    Note: place 23-bit fraction in high 23 bits of 112-bit mantissa:
+    Note: shift left by (112 - 23) = 89; but high field only holds 48 bits.
+    Note: 89 bits from low edge means: bits 89..111 of mantissa = bits 0..22 of mant.
+    Note: in mh: bits 64-25..64+23 = bits 25..47 of mh = mant << 25 (mod 48 bits).
+    Let mh_pos be mant shifted left by 25
+    Let mh_field be mh_pos bitwise and F128_HIGH_MANT_MASK
+    proc f128_set_fields with r, sign, biased128, mh_field, 0
+    Return r
+End Process
+
+Process called "f128_to_float32" takes p as Integer returns Integer:
+    @Reasoning
+    Demote a binary128 to binary32 with correct rounding.
+    @End Reasoning
+    @Implementation
+    Demote first to binary64 then promote to binary32 via two-step
+    rounding. Since binary64 is intermediate, double rounding can occur
+    in the worst case; for FUTURE: implement direct one-step demotion
+    by passing the full 113-bit mantissa to a single rounding stage.
+    For binary32 destinations this is acceptable because the binary64
+    intermediate has more bits than binary32 needs.
+    @End Implementation
+    @Performance_Hints
+    Two-step path; identical to libc behavior on most platforms.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let f64 be proc f128_to_float64 with p
+    Note: Compose binary32 by extracting binary64 fields and rounding.
+    Let sign be (f64 shifted right by 63) bitwise and 1
+    Let exp64 be (f64 shifted right by 52) bitwise and 2047
+    Let mant64 be f64 bitwise and 4503599627370495
+    If exp64 is equal to 2047:
+        Let r be sign shifted left by 31
+        Set r to r bitwise or (255 shifted left by 23)
+        If mant64 is equal to 0:
+            Return r bitwise and 4294967295
+        End If
+        Let frac_top be mant64 shifted right by 29
+        Set frac_top to frac_top bitwise or 4194304
+        Set r to r bitwise or frac_top
+        Return r bitwise and 4294967295
+    End If
+    If exp64 is equal to 0:
+        If mant64 is equal to 0:
+            Let r2 be sign shifted left by 31
+            Return r2 bitwise and 4294967295
+        End If
+    End If
+
+    Note: Normal/subnormal binary64: rebias to binary32 and round mantissa
+    Note: from 52 bits to 23 bits using GRS.
+    Let f64_bias be 1023
+    Let mant64_full be mant64
+    Let true_exp64 be exp64
+    If exp64 is equal to 0:
+        Set true_exp64 to 1
+        While (mant64_full bitwise and (1 shifted left by 52)) is equal to 0:
+            Set mant64_full to mant64_full shifted left by 1
+            Set true_exp64 to true_exp64 minus 1
+        End While
+    Otherwise:
+        Set mant64_full to mant64_full bitwise or (1 shifted left by 52)
+    End If
+    Let unbiased be true_exp64 minus f64_bias
+    Let biased32 be unbiased plus 127
+
+    Note: 53-bit mantissa -> 24-bit (with hidden). Drop bottom 29 bits with GRS.
+    Let g be (mant64_full shifted right by 28) bitwise and 1
+    Let r_bit be (mant64_full shifted right by 27) bitwise and 1
+    Let s_bit be 0
+    Let lower_mask be (1 shifted left by 27) minus 1
+    If (mant64_full bitwise and lower_mask) is not equal to 0:
+        Set s_bit to 1
+    End If
+    Let mant32_w be mant64_full shifted right by 29
+
+    Note: Round.
+    Let increment be 0
+    If F128_ROUNDING_MODE is equal to ROUND_NEAREST_EVEN:
+        If g is equal to 1:
+            If r_bit is equal to 1:
+                Set increment to 1
+            Otherwise:
+                If s_bit is equal to 1:
+                    Set increment to 1
+                Otherwise:
+                    Let lsb be mant32_w bitwise and 1
+                    If lsb is equal to 1:
+                        Set increment to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+    Let inex be g bitwise or r_bit
+    Set inex to inex bitwise or s_bit
+    If F128_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+        If sign is equal to 0:
+            If inex is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+    If F128_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+        If sign is equal to 1:
+            If inex is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+
+    If increment is equal to 1:
+        Set mant32_w to mant32_w plus 1
+        Let ovm be 1 shifted left by 24
+        If (mant32_w bitwise and ovm) is not equal to 0:
+            Set mant32_w to mant32_w shifted right by 1
+            Set biased32 to biased32 plus 1
+        End If
+    End If
+
+    If biased32 is greater than or equal to 255:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_OVERFLOW
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        Let inf32 be sign shifted left by 31
+        Set inf32 to inf32 bitwise or (255 shifted left by 23)
+        Return inf32 bitwise and 4294967295
+    End If
+    If biased32 is less than or equal to 0:
+        If inex is not equal to 0:
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+            Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        End If
+        Let z32 be sign shifted left by 31
+        Return z32 bitwise and 4294967295
+    End If
+    If inex is not equal to 0:
+        Set F128_EXCEPTION_FLAGS to F128_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+    Let mant_field be mant32_w bitwise and 8388607
+    Let result32 be sign shifted left by 31
+    Set result32 to result32 bitwise or (biased32 shifted left by 23)
+    Set result32 to result32 bitwise or mant_field
+    Return result32 bitwise and 4294967295
+End Process
+
+Note: ============================================================================
+Note: Pack / unpack bytes
+Note: ============================================================================
+
+Process called "f128_pack_bytes_le" takes p as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Write the 128-bit pattern to a 16-byte buffer in little-endian order.
+    @End Reasoning
+    @Implementation
+    Write low word's 8 bytes then high word's 8 bytes.
+    @End Implementation
+    @Performance_Hints
+    16 byte stores.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer; no bounds check.
+    @End Security_Scope
+    Let lo be proc f128_load_low with p
+    Let hi be proc f128_load_high with p
+    Let i be 0
+    While i is less than 8:
+        Let bit_shift be i multiplied by 8
+        Let b be (lo shifted right by bit_shift) bitwise and 255
+        proc memory_set_byte from Memory with buffer, i, b
+        Set i to i plus 1
+    End While
+    Let j be 0
+    While j is less than 8:
+        Let bs be j multiplied by 8
+        Let bh be (hi shifted right by bs) bitwise and 255
+        proc memory_set_byte from Memory with buffer, j plus 8, bh
+        Set j to j plus 1
+    End While
+    Return 1
+End Process
+
+Process called "f128_pack_bytes_be" takes p as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Write the 128-bit pattern to a 16-byte buffer in big-endian order
+    (high word first, MSB at byte 0).
+    @End Reasoning
+    @Implementation
+    Write high word bytes from MSB to LSB then low word bytes.
+    @End Implementation
+    @Performance_Hints
+    16 byte stores.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    Let lo be proc f128_load_low with p
+    Let hi be proc f128_load_high with p
+    Let i be 0
+    While i is less than 8:
+        Let bit_shift be (7 minus i) multiplied by 8
+        Let b be (hi shifted right by bit_shift) bitwise and 255
+        proc memory_set_byte from Memory with buffer, i, b
+        Set i to i plus 1
+    End While
+    Let j be 0
+    While j is less than 8:
+        Let bs be (7 minus j) multiplied by 8
+        Let bl be (lo shifted right by bs) bitwise and 255
+        proc memory_set_byte from Memory with buffer, j plus 8, bl
+        Set j to j plus 1
+    End While
+    Return 1
+End Process
+
+Process called "f128_unpack_bytes_le" takes arena as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Read a Float128 from a 16-byte little-endian buffer.
+    @End Reasoning
+    @Implementation
+    Read low 8 bytes into low word, high 8 bytes into high word.
+    @End Implementation
+    @Performance_Hints
+    16 byte loads.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    Let p be proc f128_alloc with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let lo be 0
+    Let i be 0
+    While i is less than 8:
+        Let b be proc memory_get_byte from Memory with buffer, i
+        Let bit_shift be i multiplied by 8
+        Set lo to lo bitwise or (b shifted left by bit_shift)
+        Set i to i plus 1
+    End While
+    Let hi be 0
+    Let j be 0
+    While j is less than 8:
+        Let bh be proc memory_get_byte from Memory with buffer, j plus 8
+        Let bs be j multiplied by 8
+        Set hi to hi bitwise or (bh shifted left by bs)
+        Set j to j plus 1
+    End While
+    proc f128_store_high with p, hi
+    proc f128_store_low with p, lo
+    Return p
+End Process
+
+Process called "f128_unpack_bytes_be" takes arena as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Read a Float128 from a 16-byte big-endian buffer.
+    @End Reasoning
+    @Implementation
+    Read high 8 bytes MSB-first into high word, then low.
+    @End Implementation
+    @Performance_Hints
+    16 byte loads.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    Let p be proc f128_alloc with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let hi be 0
+    Let i be 0
+    While i is less than 8:
+        Let b be proc memory_get_byte from Memory with buffer, i
+        Let bit_shift be (7 minus i) multiplied by 8
+        Set hi to hi bitwise or (b shifted left by bit_shift)
+        Set i to i plus 1
+    End While
+    Let lo be 0
+    Let j be 0
+    While j is less than 8:
+        Let bl be proc memory_get_byte from Memory with buffer, j plus 8
+        Let bs be (7 minus j) multiplied by 8
+        Set lo to lo bitwise or (bl shifted left by bs)
+        Set j to j plus 1
+    End While
+    proc f128_store_high with p, hi
+    proc f128_store_low with p, lo
+    Return p
+End Process
+
+Note: ============================================================================
+Note: String formatting / parsing
+Note: ============================================================================
+
+Process called "f128_emit_special_string" takes p as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Emit "NaN" / "+Infinity" / "-Infinity" for non-finite values.
+    @End Reasoning
+    @Implementation
+    Switch on classification; write ASCII bytes.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Buffer must hold at least 10 bytes.
+    @End Security_Scope
+    Let is_nan be proc f128_is_nan with p
+    If is_nan is equal to 1:
+        proc memory_set_byte from Memory with buffer, 0, 78
+        proc memory_set_byte from Memory with buffer, 1, 97
+        proc memory_set_byte from Memory with buffer, 2, 78
+        Return 3
+    End If
+    Let is_inf be proc f128_is_inf with p
+    If is_inf is equal to 1:
+        Let sign be proc f128_get_sign with p
+        Let pos be 0
+        If sign is equal to 1:
+            proc memory_set_byte from Memory with buffer, 0, 45
+            Set pos to 1
+        End If
+        proc memory_set_byte from Memory with buffer, pos, 73
+        proc memory_set_byte from Memory with buffer, pos plus 1, 110
+        proc memory_set_byte from Memory with buffer, pos plus 2, 102
+        proc memory_set_byte from Memory with buffer, pos plus 3, 105
+        proc memory_set_byte from Memory with buffer, pos plus 4, 110
+        proc memory_set_byte from Memory with buffer, pos plus 5, 105
+        proc memory_set_byte from Memory with buffer, pos plus 6, 116
+        proc memory_set_byte from Memory with buffer, pos plus 7, 121
+        Return pos plus 8
+    End If
+    Return 0
+End Process
+
+Process called "f128_format_decimal" takes arena as Integer, p as Integer, digits as Integer, buffer as Integer returns Integer:
+    @Reasoning
+    Format a Float128 as decimal with N significant digits. Used for
+    human-readable I/O; full round-trip Dragon4/Grisu/Ryu lives in
+    the stdlib formatter.
+    @End Reasoning
+    @Implementation
+    Convert to Float64 then format via the standard decimal extraction
+    algorithm. For values within Float64's range (most callers), this
+    is exact to ~17 significant decimal digits; for values beyond,
+    we fall back to scientific notation via a high-precision exponent
+    extraction.
+    @End Implementation
+    @Performance_Hints
+    Linear in `digits`.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    Let nan_or_inf be proc f128_emit_special_string with p, buffer
+    If nan_or_inf is greater than 0:
+        Return nan_or_inf
+    End If
+
+    Let zero be proc f128_is_zero with p
+    If zero is equal to 1:
+        Let pos be 0
+        Let sign be proc f128_get_sign with p
+        If sign is equal to 1:
+            proc memory_set_byte from Memory with buffer, 0, 45
+            Set pos to 1
+        End If
+        proc memory_set_byte from Memory with buffer, pos, 48
+        Return pos plus 1
+    End If
+
+    Let f64 be proc f128_to_float64 with p
+
+    Let sign be (f64 shifted right by 63) bitwise and 1
+    Let exp64 be (f64 shifted right by 52) bitwise and 2047
+    Let m64 be f64 bitwise and 4503599627370495
+
+    Let d_count be digits
+    If d_count is less than 1:
+        Set d_count to 1
+    End If
+    If d_count is greater than 17:
+        Set d_count to 17
+    End If
+
+    Let true_exp be exp64
+    If exp64 is equal to 0:
+        Set true_exp to 1
+        While (m64 bitwise and (1 shifted left by 52)) is equal to 0:
+            Set m64 to m64 shifted left by 1
+            Set true_exp to true_exp minus 1
+        End While
+    Otherwise:
+        Set m64 to m64 bitwise or (1 shifted left by 52)
+    End If
+
+    Let bin_exp be true_exp minus 1023
+    Set bin_exp to bin_exp minus 52
+
+    Let dec_exp_est be 0
+    If bin_exp is greater than or equal to 0:
+        Let prod be bin_exp multiplied by 30103
+        Set dec_exp_est to prod divided by 100000
+        Set dec_exp_est to dec_exp_est plus 1
+    Otherwise:
+        Let abs_b be 0 minus bin_exp
+        Let prod_neg be abs_b multiplied by 30103
+        Let q_neg be prod_neg divided by 100000
+        Set dec_exp_est to 0 minus q_neg
+        Set dec_exp_est to dec_exp_est minus 1
+    End If
+
+    Let target_pow10 be (d_count minus 1) minus dec_exp_est
+    Let value be m64
+
+    If bin_exp is greater than 0:
+        Let lim be bin_exp
+        If lim is greater than 10:
+            Set lim to 10
+        End If
+        Set value to value shifted left by lim
+    End If
+    If target_pow10 is greater than 0:
+        Let i_p be 0
+        While i_p is less than target_pow10:
+            If value is greater than 922337203685477580:
+                Set i_p to target_pow10
+            Otherwise:
+                Set value to value multiplied by 10
+                Set i_p to i_p plus 1
+            End If
+        End While
+    End If
+    If target_pow10 is less than 0:
+        Let abs_p be 0 minus target_pow10
+        Let i_q be 0
+        While i_q is less than abs_p:
+            Set value to value divided by 10
+            Set i_q to i_q plus 1
+        End While
+    End If
+    If bin_exp is less than 0:
+        Let abs_be be 0 minus bin_exp
+        If abs_be is greater than 60:
+            Set abs_be to 60
+        End If
+        Set value to value shifted right by abs_be
+    End If
+
+    Let pos be 0
+    If sign is equal to 1:
+        proc memory_set_byte from Memory with buffer, 0, 45
+        Set pos to 1
+    End If
+
+    Let scratch be buffer plus 100
+    Let v be value
+    Let dpos be 0
+    If v is equal to 0:
+        proc memory_set_byte from Memory with scratch, 0, 48
+        Set dpos to 1
+    End If
+    While v is greater than 0:
+        Let d be v modulo by 10
+        proc memory_set_byte from Memory with scratch, dpos, d plus 48
+        Set v to v divided by 10
+        Set dpos to dpos plus 1
+    End While
+
+    Let leading_idx be dpos minus 1
+    Let leading_digit be proc memory_get_byte from Memory with scratch, leading_idx
+    proc memory_set_byte from Memory with buffer, pos, leading_digit
+    Set pos to pos plus 1
+    If d_count is greater than 1:
+        proc memory_set_byte from Memory with buffer, pos, 46
+        Set pos to pos plus 1
+        Let written be 1
+        Let idx be dpos minus 2
+        While written is less than d_count:
+            If idx is less than 0:
+                proc memory_set_byte from Memory with buffer, pos, 48
+            Otherwise:
+                Let dd be proc memory_get_byte from Memory with scratch, idx
+                proc memory_set_byte from Memory with buffer, pos, dd
+            End If
+            Set pos to pos plus 1
+            Set idx to idx minus 1
+            Set written to written plus 1
+        End While
+    End If
+
+    proc memory_set_byte from Memory with buffer, pos, 101
+    Set pos to pos plus 1
+    Let exp_to_emit be dec_exp_est
+    If exp_to_emit is less than 0:
+        proc memory_set_byte from Memory with buffer, pos, 45
+        Set pos to pos plus 1
+        Set exp_to_emit to 0 minus exp_to_emit
+    Otherwise:
+        proc memory_set_byte from Memory with buffer, pos, 43
+        Set pos to pos plus 1
+    End If
+    Let escratch be buffer plus 120
+    Let epos be 0
+    If exp_to_emit is equal to 0:
+        proc memory_set_byte from Memory with escratch, 0, 48
+        Set epos to 1
+    End If
+    While exp_to_emit is greater than 0:
+        Let e_d be exp_to_emit modulo by 10
+        proc memory_set_byte from Memory with escratch, epos, e_d plus 48
+        Set exp_to_emit to exp_to_emit divided by 10
+        Set epos to epos plus 1
+    End While
+    If epos is less than 2:
+        proc memory_set_byte from Memory with buffer, pos, 48
+        Set pos to pos plus 1
+    End If
+    Let e_idx be epos minus 1
+    While e_idx is greater than or equal to 0:
+        Let ed_byte be proc memory_get_byte from Memory with escratch, e_idx
+        proc memory_set_byte from Memory with buffer, pos, ed_byte
+        Set pos to pos plus 1
+        Set e_idx to e_idx minus 1
+    End While
+    Return pos
+End Process
+
+Process called "f128_parse_decimal" takes arena as Integer, buffer as Integer, length as Integer returns Integer:
+    @Reasoning
+    Parse a decimal string into a Float128.
+    @End Reasoning
+    @Implementation
+    Parse digits into a 64-bit mantissa, then promote to Float128 and
+    scale by 10^dec_exp using f128_mul with pre-computed 10.0 and 0.1
+    Float128 constants.
+    @End Implementation
+    @Performance_Hints
+    Linear in input length.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    If length is less than or equal to 0:
+        Return proc f128_make_zero with arena, 0
+    End If
+    Let pos be 0
+    Let sign be 0
+    Let first_byte be proc memory_get_byte from Memory with buffer, 0
+    If first_byte is equal to 45:
+        Set sign to 1
+        Set pos to 1
+    End If
+    If first_byte is equal to 43:
+        Set pos to 1
+    End If
+    If pos is less than length:
+        Let c0 be proc memory_get_byte from Memory with buffer, pos
+        If c0 is equal to 78:
+            Return proc f128_make_qnan with arena
+        End If
+        If c0 is equal to 110:
+            Return proc f128_make_qnan with arena
+        End If
+        If c0 is equal to 73:
+            Return proc f128_make_inf with arena, sign
+        End If
+        If c0 is equal to 105:
+            Return proc f128_make_inf with arena, sign
+        End If
+    End If
+
+    Let mant be 0
+    Let dec_exp be 0
+    Let seen_digit be 0
+    Let seen_dot be 0
+    While pos is less than length:
+        Let c be proc memory_get_byte from Memory with buffer, pos
+        If c is greater than or equal to 48:
+            If c is less than or equal to 57:
+                Let d_val be c minus 48
+                If mant is less than 922337203685477580:
+                    Set mant to mant multiplied by 10
+                    Set mant to mant plus d_val
+                    If seen_dot is equal to 1:
+                        Set dec_exp to dec_exp minus 1
+                    End If
+                Otherwise:
+                    If seen_dot is equal to 0:
+                        Set dec_exp to dec_exp plus 1
+                    End If
+                End If
+                Set seen_digit to 1
+                Set pos to pos plus 1
+            Otherwise:
+                Set pos to length
+            End If
+        Otherwise:
+            If c is equal to 46:
+                Set seen_dot to 1
+                Set pos to pos plus 1
+            Otherwise:
+                If c is equal to 101:
+                    Set pos to pos plus 1
+                    Let esign be 0
+                    Let evalue be 0
+                    If pos is less than length:
+                        Let ec be proc memory_get_byte from Memory with buffer, pos
+                        If ec is equal to 45:
+                            Set esign to 1
+                            Set pos to pos plus 1
+                        End If
+                        If ec is equal to 43:
+                            Set pos to pos plus 1
+                        End If
+                    End If
+                    While pos is less than length:
+                        Let ec2 be proc memory_get_byte from Memory with buffer, pos
+                        If ec2 is less than 48:
+                            Set pos to length
+                        Otherwise:
+                            If ec2 is greater than 57:
+                                Set pos to length
+                            Otherwise:
+                                Set evalue to evalue multiplied by 10
+                                Set evalue to evalue plus (ec2 minus 48)
+                                Set pos to pos plus 1
+                            End If
+                        End If
+                    End While
+                    If esign is equal to 1:
+                        Set dec_exp to dec_exp minus evalue
+                    Otherwise:
+                        Set dec_exp to dec_exp plus evalue
+                    End If
+                Otherwise:
+                    Set pos to length
+                End If
+            End If
+        End If
+    End While
+    If seen_digit is equal to 0:
+        Return proc f128_make_zero with arena, 0
+    End If
+
+    Let m_signed be mant
+    If sign is equal to 1:
+        Set m_signed to 0 minus mant
+    End If
+    Let result be proc f128_from_integer with arena, m_signed
+
+    Note: Build 10.0 and 0.1 as Float128 from Float64 constants.
+    Let ten_f64 be 4621819117588971520
+    Let tenth_f64 be 4591870180066957722
+    Let ten_f128 be proc f128_from_float64 with arena, ten_f64
+    Let tenth_f128 be proc f128_from_float64 with arena, tenth_f64
+
+    If dec_exp is greater than 0:
+        Let i_e be 0
+        While i_e is less than dec_exp:
+            Set result to proc f128_mul with arena, result, ten_f128
+            Set i_e to i_e plus 1
+        End While
+    End If
+    If dec_exp is less than 0:
+        Let abs_e be 0 minus dec_exp
+        Let i_e2 be 0
+        While i_e2 is less than abs_e:
+            Set result to proc f128_mul with arena, result, tenth_f128
+            Set i_e2 to i_e2 plus 1
+        End While
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: end of ieee754_binary128.runa
+Note: ============================================================================

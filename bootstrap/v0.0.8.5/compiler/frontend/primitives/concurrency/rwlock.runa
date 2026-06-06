@@ -1,0 +1,402 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+RWLOCK<T> - Reader-Writer lock protecting an inner value.
+
+Multiple readers OR single writer. Writer preference avoids writer
+starvation (the default policy).
+
+RWLock structure layout (32 bytes):
+  offset 0:  inner_rwlock_ptr (8 bytes) - underlying sync_core rwlock
+  offset 8:  value_ptr        (8 bytes) - owned value pointer
+  offset 16: writer_pref      (8 bytes) - 1 if writer-preferred (default)
+  offset 24: poisoned         (8 bytes) - 1 if poisoned
+
+ReadGuard (16 bytes):
+  offset 0: rwlock_ref (8 bytes)
+  offset 8: active     (8 bytes)
+
+WriteGuard (24 bytes):
+  offset 0:  rwlock_ref (8 bytes)
+  offset 8:  value_ptr  (8 bytes)
+  offset 16: active     (8 bytes)
+
+Dependencies:
+- threading/sync_core.runa
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant RWLOCK_OFF_INNER as Integer is 0
+Constant RWLOCK_OFF_VALUE as Integer is 8
+Constant RWLOCK_OFF_WRITER_PREF as Integer is 16
+Constant RWLOCK_OFF_POISONED as Integer is 24
+Constant RWLOCK_STRUCT_SIZE as Integer is 32
+
+Constant RD_GUARD_OFF_LOCK as Integer is 0
+Constant RD_GUARD_OFF_ACTIVE as Integer is 8
+Constant RD_GUARD_STRUCT_SIZE as Integer is 16
+
+Constant WR_GUARD_OFF_LOCK as Integer is 0
+Constant WR_GUARD_OFF_VALUE as Integer is 8
+Constant WR_GUARD_OFF_ACTIVE as Integer is 16
+Constant WR_GUARD_STRUCT_SIZE as Integer is 24
+
+Constant RW_OK as Integer is 1
+Constant RW_ERR_INVALID as Integer is 0
+
+@Reasoning
+Create a typed RWLock<T> with writer preference (default). The protected
+value pointer is stored inside the lock; readers see it via ReadGuard
+(read-only access), writers via WriteGuard (mutable access).
+@End Reasoning
+
+@Implementation
+Allocate the 32-byte record, allocate the platform rwlock, populate fields.
+@End Implementation
+
+@Performance_Hints
+O(1) plus the platform rwlock allocation cost.
+@End Performance_Hints
+
+@Security_Scope
+The value pointer must remain valid until rwlock_into_inner or rwlock_destroy.
+@End Security_Scope
+
+Process called "rwlock_create" takes initial_value_ptr as Integer returns Integer:
+    Let rw be proc allocate from Memory with RWLOCK_STRUCT_SIZE
+    If rw is equal to 0:
+        Return 0
+    End If
+
+    Let inner be proc rwlock_create from Sync
+    If inner is equal to 0:
+        proc deallocate from Memory with rw
+        Return 0
+    End If
+
+    proc memory_set_int64 from Mem with rw, RWLOCK_OFF_INNER, inner
+    proc memory_set_int64 from Mem with rw, RWLOCK_OFF_VALUE, initial_value_ptr
+    proc memory_set_int64 from Mem with rw, RWLOCK_OFF_WRITER_PREF, 1
+    proc memory_set_int64 from Mem with rw, RWLOCK_OFF_POISONED, 0
+    Return rw
+End Process
+
+@Reasoning
+Configure writer preference. Set to 1 (default) to avoid writer starvation,
+or 0 to allow reader-priority semantics when read-heavy throughput is
+critical and writer latency is acceptable.
+@End Reasoning
+
+@Implementation
+Plain field write. Underlying platform rwlock policy may not respect the
+hint on every platform; this flag is advisory metadata.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "rwlock_set_writer_preference" takes rw as Integer, prefer_writer as Integer returns Integer:
+    If rw is equal to 0:
+        Return RW_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with rw, RWLOCK_OFF_WRITER_PREF, prefer_writer
+    Return RW_OK
+End Process
+
+@Reasoning
+Acquire a read guard. Multiple readers may hold the lock concurrently.
+Blocks while a writer holds it.
+@End Reasoning
+
+@Implementation
+Read-lock the inner rwlock, then allocate a ReadGuard record. Release with
+rwlock_release_read.
+@End Implementation
+
+@Performance_Hints
+Read-side path is non-exclusive; uncontended reads are cheap.
+@End Performance_Hints
+
+@Security_Scope
+ReadGuard must be released exactly once.
+@End Security_Scope
+
+Process called "rwlock_read" takes rw as Integer returns Integer:
+    If rw is equal to 0:
+        Return 0
+    End If
+    Let inner be proc memory_get_int64 from Mem with rw, RWLOCK_OFF_INNER
+    Let rc be proc rwlock_read_lock from Sync with inner
+    If rc is equal to 0:
+        Return 0
+    End If
+    Let g be proc allocate from Memory with RD_GUARD_STRUCT_SIZE
+    If g is equal to 0:
+        proc rwlock_unlock from Sync with inner
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with g, RD_GUARD_OFF_LOCK, rw
+    proc memory_set_int64 from Mem with g, RD_GUARD_OFF_ACTIVE, 1
+    Return g
+End Process
+
+@Reasoning
+Try to acquire a read guard without blocking. Returns 0 if a writer holds
+the lock.
+@End Reasoning
+
+@Implementation
+Try-read-lock the inner rwlock; on success allocate and return a guard.
+@End Implementation
+
+@Performance_Hints
+Bounded-time; useful for opportunistic reads.
+@End Performance_Hints
+
+@Security_Scope
+Returned guard, if non-zero, must be released exactly once.
+@End Security_Scope
+
+Process called "rwlock_try_read" takes rw as Integer returns Integer:
+    If rw is equal to 0:
+        Return 0
+    End If
+    Let inner be proc memory_get_int64 from Mem with rw, RWLOCK_OFF_INNER
+    Let rc be proc rwlock_try_read_lock from Sync with inner
+    If rc is not equal to 1:
+        Return 0
+    End If
+    Let g be proc allocate from Memory with RD_GUARD_STRUCT_SIZE
+    If g is equal to 0:
+        proc rwlock_unlock from Sync with inner
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with g, RD_GUARD_OFF_LOCK, rw
+    proc memory_set_int64 from Mem with g, RD_GUARD_OFF_ACTIVE, 1
+    Return g
+End Process
+
+@Reasoning
+Acquire an exclusive write guard. Blocks until no readers or writers hold
+the lock. Returns a guard granting mutable access to the protected value.
+@End Reasoning
+
+@Implementation
+Write-lock the inner rwlock, allocate a WriteGuard with the current value
+pointer cached for fast access. Release with rwlock_release_write.
+@End Implementation
+
+@Performance_Hints
+Write acquisition is exclusive; expect higher contention cost than reads.
+@End Performance_Hints
+
+@Security_Scope
+Guard must be released exactly once.
+@End Security_Scope
+
+Process called "rwlock_write" takes rw as Integer returns Integer:
+    If rw is equal to 0:
+        Return 0
+    End If
+    Let inner be proc memory_get_int64 from Mem with rw, RWLOCK_OFF_INNER
+    Let rc be proc rwlock_write_lock from Sync with inner
+    If rc is equal to 0:
+        Return 0
+    End If
+    Let g be proc allocate from Memory with WR_GUARD_STRUCT_SIZE
+    If g is equal to 0:
+        proc rwlock_unlock from Sync with inner
+        Return 0
+    End If
+    Let value_ptr be proc memory_get_int64 from Mem with rw, RWLOCK_OFF_VALUE
+    proc memory_set_int64 from Mem with g, WR_GUARD_OFF_LOCK, rw
+    proc memory_set_int64 from Mem with g, WR_GUARD_OFF_VALUE, value_ptr
+    proc memory_set_int64 from Mem with g, WR_GUARD_OFF_ACTIVE, 1
+    Return g
+End Process
+
+@Reasoning
+Try to acquire an exclusive write guard without blocking. Returns 0 if any
+reader or writer currently holds the lock.
+@End Reasoning
+
+@Implementation
+Try-write-lock the inner rwlock; on success allocate and return a guard.
+@End Implementation
+
+@Performance_Hints
+Bounded-time. Useful for opportunistic mutation.
+@End Performance_Hints
+
+@Security_Scope
+Returned guard, if non-zero, must be released exactly once.
+@End Security_Scope
+
+Process called "rwlock_try_write" takes rw as Integer returns Integer:
+    If rw is equal to 0:
+        Return 0
+    End If
+    Let inner be proc memory_get_int64 from Mem with rw, RWLOCK_OFF_INNER
+    Let rc be proc rwlock_try_write_lock from Sync with inner
+    If rc is not equal to 1:
+        Return 0
+    End If
+    Let g be proc allocate from Memory with WR_GUARD_STRUCT_SIZE
+    If g is equal to 0:
+        proc rwlock_unlock from Sync with inner
+        Return 0
+    End If
+    Let value_ptr be proc memory_get_int64 from Mem with rw, RWLOCK_OFF_VALUE
+    proc memory_set_int64 from Mem with g, WR_GUARD_OFF_LOCK, rw
+    proc memory_set_int64 from Mem with g, WR_GUARD_OFF_VALUE, value_ptr
+    proc memory_set_int64 from Mem with g, WR_GUARD_OFF_ACTIVE, 1
+    Return g
+End Process
+
+@Reasoning
+Release a read guard.
+@End Reasoning
+
+@Implementation
+Mark inactive, unlock the inner rwlock once, free the guard.
+@End Implementation
+
+@Performance_Hints
+O(1) plus platform unlock cost.
+@End Performance_Hints
+
+@Security_Scope
+Double-release is a no-op.
+@End Security_Scope
+
+Process called "rwlock_release_read" takes g as Integer returns Integer:
+    If g is equal to 0:
+        Return RW_ERR_INVALID
+    End If
+    Let active be proc memory_get_int64 from Mem with g, RD_GUARD_OFF_ACTIVE
+    If active is equal to 0:
+        Return RW_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with g, RD_GUARD_OFF_ACTIVE, 0
+    Let rw be proc memory_get_int64 from Mem with g, RD_GUARD_OFF_LOCK
+    If rw is not equal to 0:
+        Let inner be proc memory_get_int64 from Mem with rw, RWLOCK_OFF_INNER
+        proc rwlock_unlock from Sync with inner
+    End If
+    proc deallocate from Memory with g
+    Return RW_OK
+End Process
+
+@Reasoning
+Release a write guard.
+@End Reasoning
+
+@Implementation
+Mark inactive, unlock the inner rwlock, free the guard.
+@End Implementation
+
+@Performance_Hints
+O(1) plus platform unlock cost.
+@End Performance_Hints
+
+@Security_Scope
+Double-release is a no-op.
+@End Security_Scope
+
+Process called "rwlock_release_write" takes g as Integer returns Integer:
+    If g is equal to 0:
+        Return RW_ERR_INVALID
+    End If
+    Let active be proc memory_get_int64 from Mem with g, WR_GUARD_OFF_ACTIVE
+    If active is equal to 0:
+        Return RW_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with g, WR_GUARD_OFF_ACTIVE, 0
+    Let rw be proc memory_get_int64 from Mem with g, WR_GUARD_OFF_LOCK
+    If rw is not equal to 0:
+        Let inner be proc memory_get_int64 from Mem with rw, RWLOCK_OFF_INNER
+        proc rwlock_unlock from Sync with inner
+    End If
+    proc deallocate from Memory with g
+    Return RW_OK
+End Process
+
+@Reasoning
+Accessors for the protected value pointer through guards. ReadGuard yields
+read-only by convention (returned pointer should not be written through),
+WriteGuard yields a mutable pointer.
+@End Reasoning
+
+@Implementation
+Read the cached pointer from the guard / parent rwlock.
+@End Implementation
+
+@Performance_Hints
+O(1) plain memory access.
+@End Performance_Hints
+
+@Security_Scope
+The returned pointer is valid only while the guard is held.
+@End Security_Scope
+
+Process called "rwlock_read_guard_value" takes g as Integer returns Integer:
+    If g is equal to 0:
+        Return 0
+    End If
+    Let active be proc memory_get_int64 from Mem with g, RD_GUARD_OFF_ACTIVE
+    If active is equal to 0:
+        Return 0
+    End If
+    Let rw be proc memory_get_int64 from Mem with g, RD_GUARD_OFF_LOCK
+    If rw is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with rw, RWLOCK_OFF_VALUE
+End Process
+
+Process called "rwlock_write_guard_value" takes g as Integer returns Integer:
+    If g is equal to 0:
+        Return 0
+    End If
+    Let active be proc memory_get_int64 from Mem with g, WR_GUARD_OFF_ACTIVE
+    If active is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with g, WR_GUARD_OFF_VALUE
+End Process
+
+Process called "rwlock_write_guard_set_value" takes g as Integer, new_value_ptr as Integer returns Integer:
+    If g is equal to 0:
+        Return RW_ERR_INVALID
+    End If
+    Let active be proc memory_get_int64 from Mem with g, WR_GUARD_OFF_ACTIVE
+    If active is equal to 0:
+        Return RW_ERR_INVALID
+    End If
+    Let rw be proc memory_get_int64 from Mem with g, WR_GUARD_OFF_LOCK
+    proc memory_set_int64 from Mem with rw, RWLOCK_OFF_VALUE, new_value_ptr
+    proc memory_set_int64 from Mem with g, WR_GUARD_OFF_VALUE, new_value_ptr
+    Return RW_OK
+End Process
+
+Process called "rwlock_destroy" takes rw as Integer returns Integer:
+    If rw is equal to 0:
+        Return RW_ERR_INVALID
+    End If
+    Let inner be proc memory_get_int64 from Mem with rw, RWLOCK_OFF_INNER
+    proc rwlock_destroy from Sync with inner
+    proc deallocate from Memory with rw
+    Return RW_OK
+End Process

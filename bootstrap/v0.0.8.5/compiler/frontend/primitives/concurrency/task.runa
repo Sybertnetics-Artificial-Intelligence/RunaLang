@@ -1,0 +1,898 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+TASK - Cooperative task / coroutine abstraction built on top of the
+work-stealing deque.
+
+A Task represents a unit of cooperative work submitted to a scheduler.
+Each task carries a function pointer (Process pointer), an opaque user
+argument, a state machine, a cooperative cancellation flag, and a
+shared completion state that callers can join.
+
+State machine:
+  NEW       -> task created, not yet scheduled
+  READY     -> pushed onto a work-stealing deque
+  RUNNING   -> a worker is executing the function
+  WAITING   -> task voluntarily yielded; back on the ready deque
+  COMPLETED -> function returned; result_value holds the return value
+
+Task layout (88 bytes):
+  offset 0:  id                (8 bytes) - monotonically assigned id
+  offset 8:  state             (8 bytes) - one of TASK_STATE_*
+  offset 16: fn_ptr            (8 bytes) - function pointer (Process)
+  offset 24: arg_ptr           (8 bytes) - opaque argument
+  offset 32: result_value      (8 bytes) - return value once COMPLETED
+  offset 40: cancel_flag       (8 bytes) - 0 = live, 1 = cancellation requested
+  offset 48: mutex_ptr         (8 bytes) - protects join condition
+  offset 56: cv_ptr            (8 bytes) - signaled when state -> COMPLETED
+  offset 64: scheduler_ptr     (8 bytes) - owning Scheduler or 0
+  offset 72: priority          (8 bytes) - scheduling priority hint
+  offset 80: parent_id         (8 bytes) - id of parent task (0 if root)
+
+Scheduler layout (40 bytes):
+  offset 0:  queue_ptr         (8 bytes) - work-stealing deque
+  offset 8:  next_task_id      (8 bytes) - atomic id allocator
+  offset 16: live_task_count   (8 bytes) - tracked outstanding tasks
+  offset 24: mutex_ptr         (8 bytes) - protects counters
+  offset 32: shutdown_flag     (8 bytes) - 1 = scheduler stopped
+
+Dependencies:
+- threading/sync_core.runa
+- threading/thread_core.runa
+- core/atomic_core.runa
+- memory/layout.runa
+- core/memory_core.runa
+- concurrency/work_stealing_queue.runa
+:End Note
+
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/threading/thread_core.runa" as Thread
+Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/concurrency/work_stealing_queue.runa" as WSQ
+
+Note: ============================================================================
+Note: Task layout constants
+Note: ============================================================================
+
+Constant TASK_OFF_ID as Integer is 0
+Constant TASK_OFF_STATE as Integer is 8
+Constant TASK_OFF_FN as Integer is 16
+Constant TASK_OFF_ARG as Integer is 24
+Constant TASK_OFF_RESULT as Integer is 32
+Constant TASK_OFF_CANCEL as Integer is 40
+Constant TASK_OFF_MUTEX as Integer is 48
+Constant TASK_OFF_CV as Integer is 56
+Constant TASK_OFF_SCHED as Integer is 64
+Constant TASK_OFF_PRIORITY as Integer is 72
+Constant TASK_OFF_PARENT as Integer is 80
+Constant TASK_STRUCT_SIZE as Integer is 88
+
+Constant TASK_STATE_NEW as Integer is 0
+Constant TASK_STATE_READY as Integer is 1
+Constant TASK_STATE_RUNNING as Integer is 2
+Constant TASK_STATE_WAITING as Integer is 3
+Constant TASK_STATE_COMPLETED as Integer is 4
+
+Constant TASK_OK as Integer is 1
+Constant TASK_ERR_INVALID as Integer is 0
+Constant TASK_ERR_CANCELLED as Integer is -1
+Constant TASK_ERR_NOT_READY as Integer is -2
+Constant TASK_ERR_FULL as Integer is -3
+Constant TASK_ERR_SHUTDOWN as Integer is -4
+
+Constant TASK_PRIORITY_LOW as Integer is 0
+Constant TASK_PRIORITY_NORMAL as Integer is 1
+Constant TASK_PRIORITY_HIGH as Integer is 2
+
+Note: ============================================================================
+Note: Scheduler layout constants
+Note: ============================================================================
+
+Constant SCHED_OFF_QUEUE as Integer is 0
+Constant SCHED_OFF_NEXT_ID as Integer is 8
+Constant SCHED_OFF_LIVE as Integer is 16
+Constant SCHED_OFF_MUTEX as Integer is 24
+Constant SCHED_OFF_SHUTDOWN as Integer is 32
+Constant SCHED_STRUCT_SIZE as Integer is 40
+
+Constant SCHED_DEFAULT_CAPACITY as Integer is 1024
+
+Note: ============================================================================
+Note: Scheduler lifecycle
+Note: ============================================================================
+
+@Reasoning
+A scheduler owns the work-stealing deque, the id allocator and the live
+task counter. A program typically uses a small number of schedulers
+(commonly one per CPU). Tasks reference their scheduler so that yields
+can re-queue work without callers passing it around.
+@End Reasoning
+
+@Implementation
+Allocate the 40-byte record, allocate the underlying WSQ with the given
+capacity, allocate a guarding mutex for the counters and seed the id
+allocator at 1.
+@End Implementation
+
+@Performance_Hints
+Scheduler creation is O(1) plus a couple of primitive allocations. The
+hot path through schedule/yield touches only the WSQ.
+@End Performance_Hints
+
+@Security_Scope
+Schedulers are heap-owned. Callers must invoke scheduler_destroy when
+no more tasks reference them.
+@End Security_Scope
+
+Process called "scheduler_create" takes capacity as Integer returns Integer:
+    Let cap be capacity
+    If cap is less than or equal to 0:
+        Set cap to SCHED_DEFAULT_CAPACITY
+    End If
+    Let s be proc allocate from Memory with SCHED_STRUCT_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+    Let q be proc wsq_create from WSQ with cap
+    If q is equal to 0:
+        proc deallocate from Memory with s
+        Return 0
+    End If
+    Let mtx be proc mutex_create from Sync
+    If mtx is equal to 0:
+        proc wsq_destroy from WSQ with q
+        proc deallocate from Memory with s
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with s, SCHED_OFF_QUEUE, q
+    proc memory_set_int64 from Mem with s, SCHED_OFF_NEXT_ID, 1
+    proc memory_set_int64 from Mem with s, SCHED_OFF_LIVE, 0
+    proc memory_set_int64 from Mem with s, SCHED_OFF_MUTEX, mtx
+    proc memory_set_int64 from Mem with s, SCHED_OFF_SHUTDOWN, 0
+    Return s
+End Process
+
+Process called "scheduler_destroy" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let q be proc memory_get_int64 from Mem with s, SCHED_OFF_QUEUE
+    If q is not equal to 0:
+        proc wsq_destroy from WSQ with q
+    End If
+    Let mtx be proc memory_get_int64 from Mem with s, SCHED_OFF_MUTEX
+    If mtx is not equal to 0:
+        proc mutex_destroy from Sync with mtx
+    End If
+    proc deallocate from Memory with s
+    Return TASK_OK
+End Process
+
+Process called "scheduler_shutdown" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with s, SCHED_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    proc memory_set_int64 from Mem with s, SCHED_OFF_SHUTDOWN, 1
+    proc mutex_unlock from Sync with mtx
+    Return TASK_OK
+End Process
+
+Process called "scheduler_is_shutdown" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 1
+    End If
+    Return proc memory_get_int64 from Mem with s, SCHED_OFF_SHUTDOWN
+End Process
+
+Process called "scheduler_live_count" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc memory_get_int64 from Mem with s, SCHED_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let live be proc memory_get_int64 from Mem with s, SCHED_OFF_LIVE
+    proc mutex_unlock from Sync with mtx
+    Return live
+End Process
+
+@Reasoning
+Atomically allocate a new task id. The scheduler keeps a monotonic
+counter and increments it under the scheduler mutex so that creation
+across multiple threads stays unique.
+@End Reasoning
+
+@Implementation
+Lock the scheduler mutex, read the current counter, store counter+1
+and return the previous value.
+@End Implementation
+
+@Performance_Hints
+A single mutex acquisition per task creation. For very high create
+rates this can be replaced by an atomic_fetch_add primitive without
+changing the public API.
+@End Performance_Hints
+
+@Security_Scope
+Internal to the scheduler. The counter never wraps in practice (64-bit).
+@End Security_Scope
+
+Process called "scheduler_allocate_id" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc memory_get_int64 from Mem with s, SCHED_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let id be proc memory_get_int64 from Mem with s, SCHED_OFF_NEXT_ID
+    proc memory_set_int64 from Mem with s, SCHED_OFF_NEXT_ID, (id plus 1)
+    proc mutex_unlock from Sync with mtx
+    Return id
+End Process
+
+Process called "scheduler_increment_live" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with s, SCHED_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let live be proc memory_get_int64 from Mem with s, SCHED_OFF_LIVE
+    proc memory_set_int64 from Mem with s, SCHED_OFF_LIVE, (live plus 1)
+    proc mutex_unlock from Sync with mtx
+    Return TASK_OK
+End Process
+
+Process called "scheduler_decrement_live" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with s, SCHED_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let live be proc memory_get_int64 from Mem with s, SCHED_OFF_LIVE
+    If live is greater than 0:
+        proc memory_set_int64 from Mem with s, SCHED_OFF_LIVE, (live minus 1)
+    End If
+    proc mutex_unlock from Sync with mtx
+    Return TASK_OK
+End Process
+
+Note: ============================================================================
+Note: Task lifecycle
+Note: ============================================================================
+
+@Reasoning
+Create a NEW task bound to the given function pointer and argument. The
+task starts in TASK_STATE_NEW until a call to task_submit places it on
+the scheduler's queue.
+@End Reasoning
+
+@Implementation
+Allocate 88 bytes, allocate a mutex and condvar for join synchronisation,
+populate all fields and return the task pointer.
+@End Implementation
+
+@Performance_Hints
+Roughly the same cost as a future allocation: one heap allocation, one
+mutex_create and one condvar_create.
+@End Performance_Hints
+
+@Security_Scope
+The function pointer must remain valid for the lifetime of the task.
+The argument pointer is owned by the caller; we do not retain it.
+@End Security_Scope
+
+Process called "task_create" takes scheduler as Integer, fn_ptr as Integer, arg_ptr as Integer returns Integer:
+    If scheduler is equal to 0:
+        Return 0
+    End If
+    If fn_ptr is equal to 0:
+        Return 0
+    End If
+    Let t be proc allocate from Memory with TASK_STRUCT_SIZE
+    If t is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc mutex_create from Sync
+    If mtx is equal to 0:
+        proc deallocate from Memory with t
+        Return 0
+    End If
+    Let cv be proc condvar_create from Sync
+    If cv is equal to 0:
+        proc mutex_destroy from Sync with mtx
+        proc deallocate from Memory with t
+        Return 0
+    End If
+    Let id be proc scheduler_allocate_id with scheduler
+    proc memory_set_int64 from Mem with t, TASK_OFF_ID, id
+    proc memory_set_int64 from Mem with t, TASK_OFF_STATE, TASK_STATE_NEW
+    proc memory_set_int64 from Mem with t, TASK_OFF_FN, fn_ptr
+    proc memory_set_int64 from Mem with t, TASK_OFF_ARG, arg_ptr
+    proc memory_set_int64 from Mem with t, TASK_OFF_RESULT, 0
+    proc memory_set_int64 from Mem with t, TASK_OFF_CANCEL, 0
+    proc memory_set_int64 from Mem with t, TASK_OFF_MUTEX, mtx
+    proc memory_set_int64 from Mem with t, TASK_OFF_CV, cv
+    proc memory_set_int64 from Mem with t, TASK_OFF_SCHED, scheduler
+    proc memory_set_int64 from Mem with t, TASK_OFF_PRIORITY, TASK_PRIORITY_NORMAL
+    proc memory_set_int64 from Mem with t, TASK_OFF_PARENT, 0
+    Return t
+End Process
+
+Process called "task_destroy" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with t, TASK_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Mem with t, TASK_OFF_CV
+    If cv is not equal to 0:
+        proc condvar_destroy from Sync with cv
+    End If
+    If mtx is not equal to 0:
+        proc mutex_destroy from Sync with mtx
+    End If
+    proc deallocate from Memory with t
+    Return TASK_OK
+End Process
+
+Process called "task_id" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with t, TASK_OFF_ID
+End Process
+
+Process called "task_state" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_STATE_NEW
+    End If
+    Let mtx be proc memory_get_int64 from Mem with t, TASK_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let st be proc memory_get_int64 from Mem with t, TASK_OFF_STATE
+    proc mutex_unlock from Sync with mtx
+    Return st
+End Process
+
+Process called "task_set_priority" takes t as Integer, priority as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let p be priority
+    If p is less than TASK_PRIORITY_LOW:
+        Set p to TASK_PRIORITY_LOW
+    End If
+    If p is greater than TASK_PRIORITY_HIGH:
+        Set p to TASK_PRIORITY_HIGH
+    End If
+    proc memory_set_int64 from Mem with t, TASK_OFF_PRIORITY, p
+    Return TASK_OK
+End Process
+
+Process called "task_get_priority" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_PRIORITY_NORMAL
+    End If
+    Return proc memory_get_int64 from Mem with t, TASK_OFF_PRIORITY
+End Process
+
+Process called "task_set_parent" takes t as Integer, parent_id as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with t, TASK_OFF_PARENT, parent_id
+    Return TASK_OK
+End Process
+
+Process called "task_parent_id" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with t, TASK_OFF_PARENT
+End Process
+
+Process called "task_argument" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with t, TASK_OFF_ARG
+End Process
+
+Process called "task_function" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with t, TASK_OFF_FN
+End Process
+
+Note: ============================================================================
+Note: Scheduling
+Note: ============================================================================
+
+@Reasoning
+Push a task onto the scheduler's deque so a worker may dispatch it. We
+refuse submissions while the scheduler is shutting down so that
+in-flight calls drain cleanly.
+@End Reasoning
+
+@Implementation
+Move the task to TASK_STATE_READY, increment the live counter, and call
+wsq_push. If wsq_push reports FULL the task remains NEW and the caller
+can retry or back off.
+@End Implementation
+
+@Performance_Hints
+A single wsq_push on the owner's deque is wait-free in the uncontended
+case. The mutex used here only protects the small state machine.
+@End Performance_Hints
+
+@Security_Scope
+The submitted task must outlive its execution; callers typically wait
+on task_join before freeing it.
+@End Security_Scope
+
+Process called "task_submit" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let s be proc memory_get_int64 from Mem with t, TASK_OFF_SCHED
+    If s is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    If proc scheduler_is_shutdown with s is equal to 1:
+        Return TASK_ERR_SHUTDOWN
+    End If
+    Let mtx be proc memory_get_int64 from Mem with t, TASK_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let st be proc memory_get_int64 from Mem with t, TASK_OFF_STATE
+    If st is not equal to TASK_STATE_NEW:
+        If st is not equal to TASK_STATE_WAITING:
+            proc mutex_unlock from Sync with mtx
+            Return TASK_ERR_NOT_READY
+        End If
+    End If
+    proc memory_set_int64 from Mem with t, TASK_OFF_STATE, TASK_STATE_READY
+    proc mutex_unlock from Sync with mtx
+
+    Let q be proc memory_get_int64 from Mem with s, SCHED_OFF_QUEUE
+    Let push_rc be proc wsq_push from WSQ with q, t
+    If push_rc is less than 0:
+        Note: Roll back state if the deque rejected us
+        proc mutex_lock from Sync with mtx
+        proc memory_set_int64 from Mem with t, TASK_OFF_STATE, TASK_STATE_NEW
+        proc mutex_unlock from Sync with mtx
+        Return TASK_ERR_FULL
+    End If
+    proc scheduler_increment_live with s
+    Return TASK_OK
+End Process
+
+Process called "task_spawn" takes scheduler as Integer, fn_ptr as Integer, arg_ptr as Integer returns Integer:
+    Let t be proc task_create with scheduler, fn_ptr, arg_ptr
+    If t is equal to 0:
+        Return 0
+    End If
+    Let rc be proc task_submit with t
+    If rc is not equal to TASK_OK:
+        proc task_destroy with t
+        Return 0
+    End If
+    Return t
+End Process
+
+@Reasoning
+Acquire the next ready task for the calling worker. A worker first tries
+to pop from its owned deque (cache-friendly) and falls back to stealing.
+This implementation operates on a single deque per scheduler; multi-deque
+sharding is layered above this primitive.
+@End Reasoning
+
+@Implementation
+Try wsq_pop_local first. If that returns 0, attempt wsq_steal. Return
+the task pointer or 0 if the scheduler has nothing left to run.
+@End Implementation
+
+@Performance_Hints
+Local pops are wait-free; steals incur a single CAS each.
+@End Performance_Hints
+
+@Security_Scope
+Callers must not pop a task while it is still being submitted; the
+internal state mutex serialises submit/transition.
+@End Security_Scope
+
+Process called "scheduler_dequeue" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let q be proc memory_get_int64 from Mem with s, SCHED_OFF_QUEUE
+    Let t be proc wsq_pop_local from WSQ with q
+    If t is not equal to 0:
+        Return t
+    End If
+    Set t to proc wsq_steal from WSQ with q
+    Return t
+End Process
+
+@Reasoning
+Mark a task as RUNNING so observers (cancel, join) can see progress.
+The state mutex serialises this transition with task_cancel so that a
+worker cannot start a task that has already been cancelled.
+@End Reasoning
+
+@Implementation
+Lock the mutex, ensure state is READY (or WAITING after a yield), set
+RUNNING and unlock.
+@End Implementation
+
+@Performance_Hints
+A single mutex acquire per dispatch.
+@End Performance_Hints
+
+@Security_Scope
+The worker calling this owns the task pointer until it transitions to
+COMPLETED.
+@End Security_Scope
+
+Process called "task_begin_execution" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with t, TASK_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let cancelled be proc memory_get_int64 from Mem with t, TASK_OFF_CANCEL
+    If cancelled is equal to 1:
+        proc mutex_unlock from Sync with mtx
+        Return TASK_ERR_CANCELLED
+    End If
+    Let st be proc memory_get_int64 from Mem with t, TASK_OFF_STATE
+    If st is not equal to TASK_STATE_READY:
+        If st is not equal to TASK_STATE_WAITING:
+            proc mutex_unlock from Sync with mtx
+            Return TASK_ERR_NOT_READY
+        End If
+    End If
+    proc memory_set_int64 from Mem with t, TASK_OFF_STATE, TASK_STATE_RUNNING
+    proc mutex_unlock from Sync with mtx
+    Return TASK_OK
+End Process
+
+@Reasoning
+Cooperative yield: a running task voluntarily relinquishes the worker
+and is pushed back onto the deque. Callers continue from where they left
+off when re-dispatched by a worker.
+@End Reasoning
+
+@Implementation
+Transition the state from RUNNING to WAITING, push the task back on the
+scheduler's deque and request the OS to yield the current OS thread so
+another worker can run.
+@End Implementation
+
+@Performance_Hints
+Yield is rarely on the hot path; it costs a state transition, a deque
+push and an OS yield.
+@End Performance_Hints
+
+@Security_Scope
+Only the worker currently executing the task may call this.
+@End Security_Scope
+
+Process called "task_yield" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let s be proc memory_get_int64 from Mem with t, TASK_OFF_SCHED
+    If s is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with t, TASK_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let cancelled be proc memory_get_int64 from Mem with t, TASK_OFF_CANCEL
+    If cancelled is equal to 1:
+        proc mutex_unlock from Sync with mtx
+        Return TASK_ERR_CANCELLED
+    End If
+    proc memory_set_int64 from Mem with t, TASK_OFF_STATE, TASK_STATE_WAITING
+    proc mutex_unlock from Sync with mtx
+
+    Let q be proc memory_get_int64 from Mem with s, SCHED_OFF_QUEUE
+    Let push_rc be proc wsq_push from WSQ with q, t
+    If push_rc is less than 0:
+        Note: Deque is full; the worker must keep running this task
+        proc mutex_lock from Sync with mtx
+        proc memory_set_int64 from Mem with t, TASK_OFF_STATE, TASK_STATE_RUNNING
+        proc mutex_unlock from Sync with mtx
+        Return TASK_ERR_FULL
+    End If
+    proc thread_yield from Thread
+    Return TASK_OK
+End Process
+
+@Reasoning
+Complete a task with the given result value. This is the writer side of
+the join: it stores the result, transitions the state to COMPLETED, and
+wakes any thread blocked on task_join.
+@End Reasoning
+
+@Implementation
+Lock the state mutex, store result, set state to COMPLETED, broadcast
+the condvar (multiple joiners are permitted) and decrement the
+scheduler's live counter.
+@End Implementation
+
+@Performance_Hints
+One mutex acquire + one condvar broadcast.
+@End Performance_Hints
+
+@Security_Scope
+Called by the worker that executed the task.
+@End Security_Scope
+
+Process called "task_complete" takes t as Integer, result as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with t, TASK_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Mem with t, TASK_OFF_CV
+    proc mutex_lock from Sync with mtx
+    proc memory_set_int64 from Mem with t, TASK_OFF_RESULT, result
+    proc memory_set_int64 from Mem with t, TASK_OFF_STATE, TASK_STATE_COMPLETED
+    proc condvar_broadcast from Sync with cv
+    proc mutex_unlock from Sync with mtx
+    Let s be proc memory_get_int64 from Mem with t, TASK_OFF_SCHED
+    If s is not equal to 0:
+        proc scheduler_decrement_live with s
+    End If
+    Return TASK_OK
+End Process
+
+@Reasoning
+Signal cooperative cancellation. Tasks must observe the flag at safe
+points (e.g. on entry to long-running loops) and exit promptly. Setting
+the flag also wakes any waiter so they can re-check cancellation.
+@End Reasoning
+
+@Implementation
+Set the cancel flag under the state mutex and broadcast the condvar so
+that joiners observe the change without spinning.
+@End Implementation
+
+@Performance_Hints
+One mutex acquire + broadcast.
+@End Performance_Hints
+
+@Security_Scope
+Cancellation is advisory; tasks that ignore it cannot be forcefully
+terminated by this layer.
+@End Security_Scope
+
+Process called "task_cancel" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with t, TASK_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Mem with t, TASK_OFF_CV
+    proc mutex_lock from Sync with mtx
+    proc memory_set_int64 from Mem with t, TASK_OFF_CANCEL, 1
+    proc condvar_broadcast from Sync with cv
+    proc mutex_unlock from Sync with mtx
+    Return TASK_OK
+End Process
+
+Process called "task_is_cancelled" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc memory_get_int64 from Mem with t, TASK_OFF_MUTEX
+    proc mutex_lock from Sync with mtx
+    Let c be proc memory_get_int64 from Mem with t, TASK_OFF_CANCEL
+    proc mutex_unlock from Sync with mtx
+    Return c
+End Process
+
+Note: ============================================================================
+Note: Join
+Note: ============================================================================
+
+@Reasoning
+Block the calling thread until the task transitions to COMPLETED, then
+return its result. Cancelled tasks that finish still report their
+result; tasks that never run will not unblock here, so callers must
+ensure the scheduler is making progress.
+@End Reasoning
+
+@Implementation
+Standard mutex+condvar wait loop: while state is not COMPLETED, call
+condvar_wait. When it leaves the loop, read the result under the same
+mutex and unlock.
+@End Implementation
+
+@Performance_Hints
+Joining a completed task is wait-free past the lock acquire. A pending
+task pays the cost of a kernel-level wait.
+@End Performance_Hints
+
+@Security_Scope
+The caller must not destroy the task before it transitions; multiple
+threads can join the same task safely.
+@End Security_Scope
+
+Process called "task_join" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Let mtx be proc memory_get_int64 from Mem with t, TASK_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Mem with t, TASK_OFF_CV
+    proc mutex_lock from Sync with mtx
+    While 1 is equal to 1:
+        Let st be proc memory_get_int64 from Mem with t, TASK_OFF_STATE
+        If st is equal to TASK_STATE_COMPLETED:
+            Let result be proc memory_get_int64 from Mem with t, TASK_OFF_RESULT
+            proc mutex_unlock from Sync with mtx
+            Return result
+        End If
+        proc condvar_wait from Sync with cv, mtx
+    End While
+    proc mutex_unlock from Sync with mtx
+    Return 0
+End Process
+
+@Reasoning
+Bounded join with a microsecond timeout. Returns the result or
+TASK_ERR_NOT_READY if the deadline elapses first.
+@End Reasoning
+
+@Implementation
+Use condvar_timed_wait inside a loop. If the wait reports timeout (0)
+and the task is still not COMPLETED, return without blocking further.
+@End Implementation
+
+@Performance_Hints
+One mutex acquire plus at most one kernel timed wait.
+@End Performance_Hints
+
+@Security_Scope
+Same as task_join.
+@End Security_Scope
+
+Process called "task_try_join" takes t as Integer, timeout_us as Integer, out_result_holder as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    If out_result_holder is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let mtx be proc memory_get_int64 from Mem with t, TASK_OFF_MUTEX
+    Let cv be proc memory_get_int64 from Mem with t, TASK_OFF_CV
+    proc mutex_lock from Sync with mtx
+    Let st be proc memory_get_int64 from Mem with t, TASK_OFF_STATE
+    If st is equal to TASK_STATE_COMPLETED:
+        Let result be proc memory_get_int64 from Mem with t, TASK_OFF_RESULT
+        proc memory_set_int64 from Mem with out_result_holder, 0, result
+        proc mutex_unlock from Sync with mtx
+        Return TASK_OK
+    End If
+    proc condvar_timed_wait from Sync with cv, mtx, timeout_us
+    Set st to proc memory_get_int64 from Mem with t, TASK_OFF_STATE
+    If st is equal to TASK_STATE_COMPLETED:
+        Let result2 be proc memory_get_int64 from Mem with t, TASK_OFF_RESULT
+        proc memory_set_int64 from Mem with out_result_holder, 0, result2
+        proc mutex_unlock from Sync with mtx
+        Return TASK_OK
+    End If
+    proc mutex_unlock from Sync with mtx
+    Return TASK_ERR_NOT_READY
+End Process
+
+@Reasoning
+Indirect invocation helper. Allows a worker to dispatch a task without
+knowing the concrete function type at the call site, mirroring the
+indirect-call helpers used in future_promise.runa.
+@End Reasoning
+
+@Implementation
+Read the function pointer and argument from the task and call through
+the standard 1-argument indirect-call shim. Callers that need
+multi-argument shims should add specialised wrappers.
+@End Implementation
+
+@Performance_Hints
+A single indirect call.
+@End Performance_Hints
+
+@Security_Scope
+The function pointer must be a valid Process address. Cancellation is
+checked before the dispatch.
+@End Security_Scope
+
+Process called "task_runtime_call_indirect_1" takes fn as Integer, a as Integer returns Integer:
+    Note: Indirect-call shim — real x86_64 indirect dispatch via inline asm.
+    Note: fn at [rbp-8], a at [rbp-16], result at [rbp-24]. The function pointer
+    Note: goes into rax, `a` becomes the System V first argument register rdi,
+    Note: `call rax` performs the indirect branch, and the callee's return value
+    Note: (already in rax) is stashed into result's stack slot for the Return
+    Note: statement's epilogue.
+    Let result be 0
+    Inline Assembly:
+        .intel_syntax noprefix
+        mov rax, qword ptr [rbp-8]
+        mov rdi, qword ptr [rbp-16]
+        call rax
+        mov qword ptr [rbp-24], rax
+        .att_syntax prefix
+    End Assembly
+    Return result
+End Process
+
+Process called "task_dispatch" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return TASK_ERR_INVALID
+    End If
+    Let rc be proc task_begin_execution with t
+    If rc is not equal to TASK_OK:
+        If rc is equal to TASK_ERR_CANCELLED:
+            proc task_complete with t, 0
+        End If
+        Return rc
+    End If
+    Let fn be proc memory_get_int64 from Mem with t, TASK_OFF_FN
+    Let arg be proc memory_get_int64 from Mem with t, TASK_OFF_ARG
+    Let result be proc task_runtime_call_indirect_1 with fn, arg
+    proc task_complete with t, result
+    Return TASK_OK
+End Process
+
+Note: ============================================================================
+Note: Worker driver
+Note: ============================================================================
+
+@Reasoning
+Workers loop until the scheduler shuts down and all tasks have drained.
+This routine is what an OS-level worker thread runs once it has a
+scheduler reference.
+@End Reasoning
+
+@Implementation
+Loop: peek shutdown flag and live count. If shutdown is requested and
+the deque is empty, exit. Otherwise attempt to dequeue and dispatch a
+task. If the deque is empty, yield to give other workers a chance.
+@End Implementation
+
+@Performance_Hints
+The loop is tight; OS yields when nothing is available avoid spinning.
+@End Performance_Hints
+
+@Security_Scope
+Workers must not be re-entered after scheduler_destroy.
+@End Security_Scope
+
+Process called "scheduler_run_once" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let t be proc scheduler_dequeue with s
+    If t is equal to 0:
+        Return 0
+    End If
+    proc task_dispatch with t
+    Return 1
+End Process
+
+Process called "scheduler_run_until_empty" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let executed be 0
+    While 1 is equal to 1:
+        Let did_work be proc scheduler_run_once with s
+        If did_work is equal to 0:
+            Return executed
+        End If
+        Set executed to executed plus 1
+    End While
+    Return executed
+End Process

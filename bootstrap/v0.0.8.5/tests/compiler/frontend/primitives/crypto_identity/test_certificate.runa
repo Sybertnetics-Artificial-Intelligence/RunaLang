@@ -1,0 +1,699 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Tests for crypto_identity/certificate.runa.
+
+Verifies certificate_signature_algorithm_from_tlv correctly maps each
+supported X.509 signatureAlgorithm OID to its CryptoAlgorithm tag:
+  - Ed25519                 (OID 1.3.101.112)
+  - Ed448                   (OID 1.3.101.113)
+  - ECDSA with SHA-256      (OID 1.2.840.10045.4.3.2)
+  - ECDSA with SHA-384      (OID 1.2.840.10045.4.3.3)
+  - ECDSA with SHA-512      (OID 1.2.840.10045.4.3.4)
+  - RSA PKCS1v15 SHA-256    (OID 1.2.840.113549.1.1.11) -> 2048/3072/4096
+  - RSA PKCS1v15 SHA-384    (OID 1.2.840.113549.1.1.12) -> 2048/3072/4096
+  - RSA PKCS1v15 SHA-512    (OID 1.2.840.113549.1.1.13) -> 2048/3072/4096
+  - RSA PSS                 (OID 1.2.840.113549.1.1.10) with explicit params
+  - Unknown OID -> ALG_UNKNOWN
+
+Test strategy: construct minimal DER-encoded AlgorithmIdentifier
+TLVs as raw byte arrays in arena memory, parse them via
+Asn1Der.asn1_parse_tlv, then invoke certificate_signature_algorithm_from_tlv
+with the resulting TLV pointer. For RSA OIDs, also construct a
+minimal synthetic cert_handle exposing an SPKI TLV that declares the
+target modulus length so the dispatcher can compute the modulus
+index. For PSS we additionally embed a parameters block carrying the
+hashAlgorithm OID so the per-hash variant resolves.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "compiler/frontend/primitives/crypto_identity/certificate.runa" as Cert
+Import "compiler/frontend/import_system/crypto/asn1_der.runa" as Asn1Der
+
+Note: ============================================================================
+Note: DER CONSTRUCTION HELPERS
+Note: ============================================================================
+
+Process called "write_bytes" takes buf as Integer, offset as Integer, src_ptr as Integer, src_len as Integer returns Integer:
+    Note: Copy src_len bytes from src_ptr into buf starting at offset.
+    Note: Returns new offset.
+    Memory.memory_copy(buf plus offset, src_ptr, src_len)
+    Return offset plus src_len
+End Process
+
+Process called "write_byte" takes buf as Integer, offset as Integer, value as Integer returns Integer:
+    Memory.memory_set_byte(buf, offset, value)
+    Return offset plus 1
+End Process
+
+Process called "build_alg_id_with_oid" takes arena as Integer, oid_bytes as Integer, oid_len as Integer returns Integer:
+    Note: Build a SEQUENCE containing only an OID (no parameters).
+    Note: DER layout:
+    Note:   30 LEN
+    Note:     06 oid_len <oid bytes>
+    Note: Returns a parsed TLV pointer or 0 on failure.
+    Let total_size be 2 plus 2 plus oid_len
+    Let buf be Arena.arena_allocate(arena, total_size)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Note: SEQUENCE header
+    Let i be write_byte(buf, 0, 48)
+    Set i to write_byte(buf, i, 2 plus oid_len)
+    Note: OID header + body
+    Set i to write_byte(buf, i, 6)
+    Set i to write_byte(buf, i, oid_len)
+    Set i to write_bytes(buf, i, oid_bytes, oid_len)
+    Return Asn1Der.asn1_parse_tlv(arena, buf, 0, total_size)
+End Process
+
+Process called "build_ed25519_oid" takes arena as Integer returns Integer:
+    Note: 1.3.101.112 -> DER body 2B 65 70.
+    Let buf be Arena.arena_allocate(arena, 3)
+    Memory.memory_set_byte(buf, 0, 43)
+    Memory.memory_set_byte(buf, 1, 101)
+    Memory.memory_set_byte(buf, 2, 112)
+    Return buf
+End Process
+
+Process called "build_ed448_oid" takes arena as Integer returns Integer:
+    Note: 1.3.101.113 -> DER body 2B 65 71.
+    Let buf be Arena.arena_allocate(arena, 3)
+    Memory.memory_set_byte(buf, 0, 43)
+    Memory.memory_set_byte(buf, 1, 101)
+    Memory.memory_set_byte(buf, 2, 113)
+    Return buf
+End Process
+
+Process called "build_ecdsa_sha256_oid" takes arena as Integer returns Integer:
+    Note: 1.2.840.10045.4.3.2 -> DER body 2A 86 48 CE 3D 04 03 02.
+    Let buf be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 206)
+    Memory.memory_set_byte(buf, 4, 61)
+    Memory.memory_set_byte(buf, 5, 4)
+    Memory.memory_set_byte(buf, 6, 3)
+    Memory.memory_set_byte(buf, 7, 2)
+    Return buf
+End Process
+
+Process called "build_ecdsa_sha384_oid" takes arena as Integer returns Integer:
+    Note: 1.2.840.10045.4.3.3.
+    Let buf be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 206)
+    Memory.memory_set_byte(buf, 4, 61)
+    Memory.memory_set_byte(buf, 5, 4)
+    Memory.memory_set_byte(buf, 6, 3)
+    Memory.memory_set_byte(buf, 7, 3)
+    Return buf
+End Process
+
+Process called "build_ecdsa_sha512_oid" takes arena as Integer returns Integer:
+    Note: 1.2.840.10045.4.3.4.
+    Let buf be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 206)
+    Memory.memory_set_byte(buf, 4, 61)
+    Memory.memory_set_byte(buf, 5, 4)
+    Memory.memory_set_byte(buf, 6, 3)
+    Memory.memory_set_byte(buf, 7, 4)
+    Return buf
+End Process
+
+Process called "build_rsa_pkcs1v15_sha256_oid" takes arena as Integer returns Integer:
+    Note: 1.2.840.113549.1.1.11 -> DER body 2A 86 48 86 F7 0D 01 01 0B.
+    Let buf be Arena.arena_allocate(arena, 9)
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 134)
+    Memory.memory_set_byte(buf, 4, 247)
+    Memory.memory_set_byte(buf, 5, 13)
+    Memory.memory_set_byte(buf, 6, 1)
+    Memory.memory_set_byte(buf, 7, 1)
+    Memory.memory_set_byte(buf, 8, 11)
+    Return buf
+End Process
+
+Process called "build_rsa_pkcs1v15_sha384_oid" takes arena as Integer returns Integer:
+    Note: 1.2.840.113549.1.1.12.
+    Let buf be Arena.arena_allocate(arena, 9)
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 134)
+    Memory.memory_set_byte(buf, 4, 247)
+    Memory.memory_set_byte(buf, 5, 13)
+    Memory.memory_set_byte(buf, 6, 1)
+    Memory.memory_set_byte(buf, 7, 1)
+    Memory.memory_set_byte(buf, 8, 12)
+    Return buf
+End Process
+
+Process called "build_rsa_pkcs1v15_sha512_oid" takes arena as Integer returns Integer:
+    Note: 1.2.840.113549.1.1.13.
+    Let buf be Arena.arena_allocate(arena, 9)
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 134)
+    Memory.memory_set_byte(buf, 4, 247)
+    Memory.memory_set_byte(buf, 5, 13)
+    Memory.memory_set_byte(buf, 6, 1)
+    Memory.memory_set_byte(buf, 7, 1)
+    Memory.memory_set_byte(buf, 8, 13)
+    Return buf
+End Process
+
+Process called "build_rsa_pss_oid" takes arena as Integer returns Integer:
+    Note: 1.2.840.113549.1.1.10.
+    Let buf be Arena.arena_allocate(arena, 9)
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 134)
+    Memory.memory_set_byte(buf, 4, 247)
+    Memory.memory_set_byte(buf, 5, 13)
+    Memory.memory_set_byte(buf, 6, 1)
+    Memory.memory_set_byte(buf, 7, 1)
+    Memory.memory_set_byte(buf, 8, 10)
+    Return buf
+End Process
+
+Process called "build_sha256_oid_body" takes arena as Integer returns Integer:
+    Note: 2.16.840.1.101.3.4.2.1 -> DER body 60 86 48 01 65 03 04 02 01.
+    Let buf be Arena.arena_allocate(arena, 9)
+    Memory.memory_set_byte(buf, 0, 96)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 1)
+    Memory.memory_set_byte(buf, 4, 101)
+    Memory.memory_set_byte(buf, 5, 3)
+    Memory.memory_set_byte(buf, 6, 4)
+    Memory.memory_set_byte(buf, 7, 2)
+    Memory.memory_set_byte(buf, 8, 1)
+    Return buf
+End Process
+
+Process called "build_sha384_oid_body" takes arena as Integer returns Integer:
+    Note: 2.16.840.1.101.3.4.2.2 -> DER body 60 86 48 01 65 03 04 02 02.
+    Let buf be Arena.arena_allocate(arena, 9)
+    Memory.memory_set_byte(buf, 0, 96)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 1)
+    Memory.memory_set_byte(buf, 4, 101)
+    Memory.memory_set_byte(buf, 5, 3)
+    Memory.memory_set_byte(buf, 6, 4)
+    Memory.memory_set_byte(buf, 7, 2)
+    Memory.memory_set_byte(buf, 8, 2)
+    Return buf
+End Process
+
+Process called "build_sha512_oid_body" takes arena as Integer returns Integer:
+    Note: 2.16.840.1.101.3.4.2.3 -> DER body 60 86 48 01 65 03 04 02 03.
+    Let buf be Arena.arena_allocate(arena, 9)
+    Memory.memory_set_byte(buf, 0, 96)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 1)
+    Memory.memory_set_byte(buf, 4, 101)
+    Memory.memory_set_byte(buf, 5, 3)
+    Memory.memory_set_byte(buf, 6, 4)
+    Memory.memory_set_byte(buf, 7, 2)
+    Memory.memory_set_byte(buf, 8, 3)
+    Return buf
+End Process
+
+Process called "build_pss_alg_id" takes arena as Integer, hash_oid_body as Integer, hash_oid_len as Integer returns Integer:
+    Note: Construct a SEQUENCE for the PSS AlgorithmIdentifier:
+    Note:   30 <total>
+    Note:     06 09 <PSS OID body>          -- algorithm
+    Note:     30 <param_len>                -- parameters
+    Note:       A0 <ctx0_len>               -- [0] hashAlgorithm
+    Note:         30 <inner_len>            -- AlgorithmIdentifier
+    Note:           06 <hash_oid_len> <body>
+    Note:           05 00                   -- NULL parameters
+
+    Note: Inner AlgorithmIdentifier = 2 + hash_oid_len + 2 = hash_oid_len + 4
+    Note: [0] body = 2 + (hash_oid_len + 4) = hash_oid_len + 6
+    Note: Parameters body = 2 + (hash_oid_len + 6) = hash_oid_len + 8
+    Note: Outer SEQUENCE body = 2 + 9 + 2 + (hash_oid_len + 8) = hash_oid_len + 21
+    Note: Total bytes = 2 + (hash_oid_len + 21) = hash_oid_len + 23
+
+    Let inner_alg_id_len be hash_oid_len plus 4
+    Let ctx0_len be inner_alg_id_len plus 2
+    Let params_len be ctx0_len plus 2
+    Let outer_len be 11 plus params_len plus 2
+    Let total_size be outer_len plus 2
+
+    Let buf be Arena.arena_allocate(arena, total_size)
+    If buf is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    Set i to write_byte(buf, i, 48)
+    Set i to write_byte(buf, i, outer_len)
+    Note: PSS OID
+    Set i to write_byte(buf, i, 6)
+    Set i to write_byte(buf, i, 9)
+    Set i to write_byte(buf, i, 42)
+    Set i to write_byte(buf, i, 134)
+    Set i to write_byte(buf, i, 72)
+    Set i to write_byte(buf, i, 134)
+    Set i to write_byte(buf, i, 247)
+    Set i to write_byte(buf, i, 13)
+    Set i to write_byte(buf, i, 1)
+    Set i to write_byte(buf, i, 1)
+    Set i to write_byte(buf, i, 10)
+    Note: parameters SEQUENCE
+    Set i to write_byte(buf, i, 48)
+    Set i to write_byte(buf, i, params_len)
+    Note: [0] hashAlgorithm context tag
+    Set i to write_byte(buf, i, 160)
+    Set i to write_byte(buf, i, ctx0_len)
+    Note: inner AlgorithmIdentifier
+    Set i to write_byte(buf, i, 48)
+    Set i to write_byte(buf, i, inner_alg_id_len)
+    Note: hash OID
+    Set i to write_byte(buf, i, 6)
+    Set i to write_byte(buf, i, hash_oid_len)
+    Set i to write_bytes(buf, i, hash_oid_body, hash_oid_len)
+    Note: NULL parameters
+    Set i to write_byte(buf, i, 5)
+    Set i to write_byte(buf, i, 0)
+
+    Return Asn1Der.asn1_parse_tlv(arena, buf, 0, total_size)
+End Process
+
+Process called "build_synthetic_cert_handle_for_modulus" takes arena as Integer, modulus_bytes as Integer returns Integer:
+    Note: Build a minimal x509_cert handle that exposes an SPKI TLV at
+    Note: slot offset 72. The SPKI is shaped as:
+    Note:   30 <spki_len>
+    Note:     30 <alg_len>             -- AlgorithmIdentifier (any opaque)
+    Note:       06 09 2A 86 48 86 F7 0D 01 01 01   -- rsaEncryption OID
+    Note:       05 00                              -- NULL parameters
+    Note:     03 <bs_len> 00            -- BIT STRING wrapping inner SEQUENCE
+    Note:       30 <inner_len>          -- RSAPublicKey SEQUENCE
+    Note:         02 <mod_len> <modulus bytes> -- modulus INTEGER
+    Note:         02 03 01 00 01                 -- publicExponent INTEGER
+
+    Note: We size modulus content as modulus_bytes + 1 (leading 0 to keep
+    Note: the INTEGER positive when MSB=1), which mirrors real RSA SPKI.
+    Note: certificate_rsa_modulus_byte_length strips the leading zero, so
+    Note: the dispatcher sees exactly modulus_bytes.
+
+    Let modulus_content_len be modulus_bytes plus 1
+    Note: modulus_content_len for 256 is 257; needs 2-byte long-form length.
+    Note: We always use 2-byte long-form length for the modulus INTEGER and
+    Note: also for the inner SEQUENCE, BIT STRING, and outer SEQUENCE to
+    Note: keep DER construction uniform across 256/384/512 modulus sizes.
+    Let exp_tlv_total be 5
+    Let inner_seq_content_len be 4 plus modulus_content_len plus exp_tlv_total
+    Note: Inner SEQUENCE: tag(1) + len(3 long-form) + content
+    Let inner_seq_total be 4 plus inner_seq_content_len
+    Let bs_content_len be 1 plus inner_seq_total
+    Let bs_total be 4 plus bs_content_len
+    Let alg_id_len be 13
+    Note: AlgorithmIdentifier short-form: 30 0D 06 09 ...rsaEnc... 05 00
+    Note: total = 2 + 13 = 15
+    Let alg_id_total be 15
+    Let spki_content_len be alg_id_total plus bs_total
+    Let spki_total be 4 plus spki_content_len
+
+    Let buf be Arena.arena_allocate(arena, spki_total)
+    If buf is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    Note: Outer SPKI SEQUENCE with 2-byte long-form length.
+    Set i to write_byte(buf, i, 48)
+    Set i to write_byte(buf, i, 130)
+    Set i to write_byte(buf, i, spki_content_len divided by 256)
+    Set i to write_byte(buf, i, spki_content_len modulo by 256)
+    Note: AlgorithmIdentifier
+    Set i to write_byte(buf, i, 48)
+    Set i to write_byte(buf, i, 13)
+    Set i to write_byte(buf, i, 6)
+    Set i to write_byte(buf, i, 9)
+    Set i to write_byte(buf, i, 42)
+    Set i to write_byte(buf, i, 134)
+    Set i to write_byte(buf, i, 72)
+    Set i to write_byte(buf, i, 134)
+    Set i to write_byte(buf, i, 247)
+    Set i to write_byte(buf, i, 13)
+    Set i to write_byte(buf, i, 1)
+    Set i to write_byte(buf, i, 1)
+    Set i to write_byte(buf, i, 1)
+    Set i to write_byte(buf, i, 5)
+    Set i to write_byte(buf, i, 0)
+    Note: BIT STRING wrapping RSAPublicKey.
+    Set i to write_byte(buf, i, 3)
+    Set i to write_byte(buf, i, 130)
+    Set i to write_byte(buf, i, bs_content_len divided by 256)
+    Set i to write_byte(buf, i, bs_content_len modulo by 256)
+    Set i to write_byte(buf, i, 0)
+    Note: Inner RSAPublicKey SEQUENCE.
+    Set i to write_byte(buf, i, 48)
+    Set i to write_byte(buf, i, 130)
+    Set i to write_byte(buf, i, inner_seq_content_len divided by 256)
+    Set i to write_byte(buf, i, inner_seq_content_len modulo by 256)
+    Note: modulus INTEGER.
+    Set i to write_byte(buf, i, 2)
+    Set i to write_byte(buf, i, 130)
+    Set i to write_byte(buf, i, modulus_content_len divided by 256)
+    Set i to write_byte(buf, i, modulus_content_len modulo by 256)
+    Note: leading zero (positive sign) then modulus_bytes of arbitrary data.
+    Set i to write_byte(buf, i, 0)
+    Let k be 0
+    While k is less than modulus_bytes:
+        Memory.memory_set_byte(buf, i plus k, (k plus 17) modulo by 256)
+        Set k to k plus 1
+    End While
+    Set i to i plus modulus_bytes
+    Note: publicExponent INTEGER (65537).
+    Set i to write_byte(buf, i, 2)
+    Set i to write_byte(buf, i, 3)
+    Set i to write_byte(buf, i, 1)
+    Set i to write_byte(buf, i, 0)
+    Set i to write_byte(buf, i, 1)
+
+    Let spki_tlv be Asn1Der.asn1_parse_tlv(arena, buf, 0, spki_total)
+    If spki_tlv is equal to 0:
+        Return 0
+    End If
+    Note: Build cert_handle with SPKI pointer at offset 72.
+    Let handle be Arena.arena_allocate(arena, 96)
+    If handle is equal to 0:
+        Return 0
+    End If
+    Let z be 0
+    While z is less than 96:
+        Memory.memory_set_byte(handle, z, 0)
+        Set z to z plus 1
+    End While
+    Memory.memory_set_qword(handle, 72, spki_tlv)
+    Return handle
+End Process
+
+Note: ============================================================================
+Note: TESTS - Edwards curve OIDs (no cert_handle needed)
+Note: ============================================================================
+
+Process called "test_ed25519_oid" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: Ed25519")
+    Let arena be Arena.arena_create(1048576)
+    Let oid_body be build_ed25519_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 3)
+    T.assert_not_null(results, "Ed25519 alg_id parsed", alg_id)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, 0)
+    T.assert_equal(results, "Ed25519 OID -> ALG_ED25519", tag, Alg.ALG_ED25519)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ed448_oid" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: Ed448")
+    Let arena be Arena.arena_create(1048576)
+    Let oid_body be build_ed448_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 3)
+    T.assert_not_null(results, "Ed448 alg_id parsed", alg_id)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, 0)
+    T.assert_equal(results, "Ed448 OID -> ALG_ED448", tag, Alg.ALG_ED448)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: TESTS - ECDSA curve OIDs (no cert_handle needed)
+Note: ============================================================================
+
+Process called "test_ecdsa_p256_oid" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: ECDSA P-256")
+    Let arena be Arena.arena_create(1048576)
+    Let oid_body be build_ecdsa_sha256_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 8)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, 0)
+    T.assert_equal(results, "ECDSA-SHA256 OID -> ALG_ECDSA_P256", tag, Alg.ALG_ECDSA_P256)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ecdsa_p384_oid" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: ECDSA P-384")
+    Let arena be Arena.arena_create(1048576)
+    Let oid_body be build_ecdsa_sha384_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 8)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, 0)
+    T.assert_equal(results, "ECDSA-SHA384 OID -> ALG_ECDSA_P384", tag, Alg.ALG_ECDSA_P384)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ecdsa_p521_oid" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: ECDSA P-521")
+    Let arena be Arena.arena_create(1048576)
+    Let oid_body be build_ecdsa_sha512_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 8)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, 0)
+    T.assert_equal(results, "ECDSA-SHA512 OID -> ALG_ECDSA_P521", tag, Alg.ALG_ECDSA_P521)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: TESTS - RSA PKCS1v15 OIDs (need cert_handle with modulus length)
+Note: ============================================================================
+
+Process called "test_rsa_pkcs1v15_sha256_2048" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PKCS1v15 SHA-256 / 2048")
+    Let arena be Arena.arena_create(4194304)
+    Let oid_body be build_rsa_pkcs1v15_sha256_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 256)
+    T.assert_not_null(results, "2048-bit synthetic cert_handle built", handle)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PKCS1v15-SHA256 / 2048 -> 110", tag, Alg.ALG_RSA_PKCS1V15_SHA256_2048)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha256_3072" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PKCS1v15 SHA-256 / 3072")
+    Let arena be Arena.arena_create(4194304)
+    Let oid_body be build_rsa_pkcs1v15_sha256_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 384)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PKCS1v15-SHA256 / 3072 -> 111", tag, Alg.ALG_RSA_PKCS1V15_SHA256_3072)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha256_4096" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PKCS1v15 SHA-256 / 4096")
+    Let arena be Arena.arena_create(4194304)
+    Let oid_body be build_rsa_pkcs1v15_sha256_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 512)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PKCS1v15-SHA256 / 4096 -> 112", tag, Alg.ALG_RSA_PKCS1V15_SHA256_4096)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha384_2048" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PKCS1v15 SHA-384 / 2048")
+    Let arena be Arena.arena_create(4194304)
+    Let oid_body be build_rsa_pkcs1v15_sha384_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 256)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PKCS1v15-SHA384 / 2048 -> 113", tag, Alg.ALG_RSA_PKCS1V15_SHA384_2048)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha384_3072" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PKCS1v15 SHA-384 / 3072")
+    Let arena be Arena.arena_create(4194304)
+    Let oid_body be build_rsa_pkcs1v15_sha384_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 384)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PKCS1v15-SHA384 / 3072 -> 114", tag, Alg.ALG_RSA_PKCS1V15_SHA384_3072)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha384_4096" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PKCS1v15 SHA-384 / 4096")
+    Let arena be Arena.arena_create(4194304)
+    Let oid_body be build_rsa_pkcs1v15_sha384_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 512)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PKCS1v15-SHA384 / 4096 -> 115", tag, Alg.ALG_RSA_PKCS1V15_SHA384_4096)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha512_2048" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PKCS1v15 SHA-512 / 2048")
+    Let arena be Arena.arena_create(4194304)
+    Let oid_body be build_rsa_pkcs1v15_sha512_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 256)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PKCS1v15-SHA512 / 2048 -> 116", tag, Alg.ALG_RSA_PKCS1V15_SHA512_2048)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha512_3072" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PKCS1v15 SHA-512 / 3072")
+    Let arena be Arena.arena_create(4194304)
+    Let oid_body be build_rsa_pkcs1v15_sha512_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 384)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PKCS1v15-SHA512 / 3072 -> 117", tag, Alg.ALG_RSA_PKCS1V15_SHA512_3072)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha512_4096" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PKCS1v15 SHA-512 / 4096")
+    Let arena be Arena.arena_create(4194304)
+    Let oid_body be build_rsa_pkcs1v15_sha512_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 512)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PKCS1v15-SHA512 / 4096 -> 118", tag, Alg.ALG_RSA_PKCS1V15_SHA512_4096)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: TESTS - RSA PSS variants (need PSS parameters with hashAlgorithm OID)
+Note: ============================================================================
+
+Process called "test_rsa_pss_sha256_2048" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PSS SHA-256 / 2048")
+    Let arena be Arena.arena_create(4194304)
+    Let hash_oid_body be build_sha256_oid_body(arena)
+    Let alg_id be build_pss_alg_id(arena, hash_oid_body, 9)
+    T.assert_not_null(results, "PSS-SHA256 alg_id parsed", alg_id)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 256)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PSS-SHA256 / 2048 -> 120", tag, Alg.ALG_RSA_PSS_SHA256_2048)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pss_sha384_3072" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PSS SHA-384 / 3072")
+    Let arena be Arena.arena_create(4194304)
+    Let hash_oid_body be build_sha384_oid_body(arena)
+    Let alg_id be build_pss_alg_id(arena, hash_oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 384)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PSS-SHA384 / 3072 -> 124", tag, Alg.ALG_RSA_PSS_SHA384_3072)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pss_sha512_4096" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA PSS SHA-512 / 4096")
+    Let arena be Arena.arena_create(4194304)
+    Let hash_oid_body be build_sha512_oid_body(arena)
+    Let alg_id be build_pss_alg_id(arena, hash_oid_body, 9)
+    Let handle be build_synthetic_cert_handle_for_modulus(arena, 512)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, handle)
+    T.assert_equal(results, "PSS-SHA512 / 4096 -> 128", tag, Alg.ALG_RSA_PSS_SHA512_4096)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: TESTS - rejection paths
+Note: ============================================================================
+
+Process called "test_unknown_oid" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: unknown OID -> ALG_UNKNOWN")
+    Let arena be Arena.arena_create(1048576)
+    Note: Use an arbitrary unassigned OID 1.3.99.99 -> DER body 2B 63 63.
+    Let buf be Arena.arena_allocate(arena, 3)
+    Memory.memory_set_byte(buf, 0, 43)
+    Memory.memory_set_byte(buf, 1, 99)
+    Memory.memory_set_byte(buf, 2, 99)
+    Let alg_id be build_alg_id_with_oid(arena, buf, 3)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, 0)
+    T.assert_equal(results, "unknown OID -> ALG_UNKNOWN", tag, Alg.ALG_UNKNOWN)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_null_alg_id" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: NULL alg_id -> ALG_UNKNOWN")
+    Let arena be Arena.arena_create(1048576)
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, 0, 0)
+    T.assert_equal(results, "NULL alg_id -> ALG_UNKNOWN", tag, Alg.ALG_UNKNOWN)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_no_cert_handle" takes results as Integer returns Integer:
+    T.begin_suite(results, "certificate.signature_algorithm_from_tlv: RSA-PKCS1v15 with no cert_handle -> ALG_UNKNOWN")
+    Let arena be Arena.arena_create(1048576)
+    Let oid_body be build_rsa_pkcs1v15_sha256_oid(arena)
+    Let alg_id be build_alg_id_with_oid(arena, oid_body, 9)
+    Note: cert_handle=0 -> modulus length=0 -> modulus_index=-1 -> ALG_UNKNOWN.
+    Let tag be Cert.certificate_signature_algorithm_from_tlv(arena, alg_id, 0)
+    T.assert_equal(results, "RSA PKCS1v15 without cert_handle -> ALG_UNKNOWN", tag, Alg.ALG_UNKNOWN)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+    test_ed25519_oid(results)
+    test_ed448_oid(results)
+    test_ecdsa_p256_oid(results)
+    test_ecdsa_p384_oid(results)
+    test_ecdsa_p521_oid(results)
+    test_rsa_pkcs1v15_sha256_2048(results)
+    test_rsa_pkcs1v15_sha256_3072(results)
+    test_rsa_pkcs1v15_sha256_4096(results)
+    test_rsa_pkcs1v15_sha384_2048(results)
+    test_rsa_pkcs1v15_sha384_3072(results)
+    test_rsa_pkcs1v15_sha384_4096(results)
+    test_rsa_pkcs1v15_sha512_2048(results)
+    test_rsa_pkcs1v15_sha512_3072(results)
+    test_rsa_pkcs1v15_sha512_4096(results)
+    test_rsa_pss_sha256_2048(results)
+    test_rsa_pss_sha384_3072(results)
+    test_rsa_pss_sha512_4096(results)
+    test_unknown_oid(results)
+    test_null_alg_id(results)
+    test_rsa_pkcs1v15_no_cert_handle(results)
+    T.print_summary(results)
+    Let failed be T.get_failed(results)
+    T.destroy_test_results(results)
+    Return failed
+End Process

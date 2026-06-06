@@ -1,0 +1,1473 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+ADDRESS - Network-tagged blockchain address value
+==============================================================================
+
+A blockchain Address carries:
+  - the network identifier (Ethereum, Bitcoin, Solana, Cosmos, etc.)
+  - the raw address bytes (the canonical underlying bytes, not the
+    human-readable encoding)
+  - the optional encoded form (e.g., bech32 string for Cosmos)
+
+ADDRESSES OF DIFFERENT NETWORKS ARE NOT INTERCHANGEABLE. The constructors
+validate the encoding-specific checksum and reject cross-network input
+(e.g., a Bitcoin address with Ethereum prefix bytes).
+
+Memory layout (40 bytes):
+  offset  0 : network identifier (8 bytes, integer)
+  offset  8 : address_bytes ptr  (8 bytes)
+  offset 16 : address_bytes len  (8 bytes)
+  offset 24 : encoded_string ptr (8 bytes; optional, 0 if not stored)
+  offset 32 : encoded_string len (8 bytes)
+
+Network identifiers:
+  NETWORK_ETHEREUM = 1   (EIP-55 hex)
+  NETWORK_BITCOIN  = 2   (Base58Check)
+  NETWORK_SOLANA   = 3   (Base58 of 32-byte Ed25519 public key)
+  NETWORK_COSMOS   = 4   (Bech32 with human-readable prefix)
+
+References:
+- EIP-55 (Mixed-case checksum address encoding for Ethereum addresses).
+- Bitcoin Wiki: Base58Check encoding.
+- Solana docs: account addresses are 32-byte Ed25519 public keys, base58.
+- BIP-173 (Bech32 for SegWit) and Cosmos SDK bech32 with HRP separator.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/bytes.runa" as BytesP
+Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/sha2.runa" as Sha2
+Import "compiler/frontend/import_system/crypto/sha3.runa" as Sha3
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+
+Let ADDRESS_STRUCT_SIZE be 40
+Let ADDR_OFF_NETWORK be 0
+Let ADDR_OFF_BYTES_PTR be 8
+Let ADDR_OFF_BYTES_LEN be 16
+Let ADDR_OFF_ENCODED_PTR be 24
+Let ADDR_OFF_ENCODED_LEN be 32
+
+Let NETWORK_ETHEREUM be 1
+Let NETWORK_BITCOIN be 2
+Let NETWORK_SOLANA be 3
+Let NETWORK_COSMOS be 4
+
+Note: ============================================================================
+Note: SECTION 1: Internal helpers (Keccak-256, Base58 decode, byte utilities)
+Note: ============================================================================
+
+@Reasoning
+Compute Keccak-256 (the pre-NIST variant used by Ethereum) of a message.
+Differs from FIPS-202 SHA3-256 only in the padding byte: Keccak uses
+0x01 as the first padding byte, while SHA3 uses 0x06. The underlying
+Keccak-f[1600] permutation is shared.
+@End Reasoning
+
+@Implementation
+Direct port of sha3_hash_internal in sha3.runa, with the padding byte
+changed from 6 to 1. Rate is 136 bytes (the 256-bit security level
+rate for Keccak-1600).
+@End Implementation
+
+@Performance_Hints
+O(message_length / 136) Keccak-f1600 invocations. The bulk cost is the
+permutation; each invocation is fixed work.
+@End Performance_Hints
+
+@Security_Scope
+The output is non-secret. Used by Ethereum for address derivation
+(keccak256(public_key_64)[12..32]) and EIP-55 checksum mixing.
+
+References:
+- Ethereum Yellow Paper section 4.1: address derivation.
+- EIP-55: Mixed-case checksum address encoding.
+- FIPS 202 (note: Ethereum uses pre-FIPS Keccak, not FIPS SHA-3).
+@End Security_Scope
+Process called "addr_keccak256" takes arena as Integer, message as Integer, message_length as Integer, out_digest as Integer returns Integer:
+    Let rate_bytes be 136
+    Let scratch_total be 200 plus 200 plus 40 plus 40 plus rate_bytes
+    Let scratch_buffer be Arena.arena_allocate(arena, scratch_total)
+    If scratch_buffer is equal to 0:
+        Return 0
+    End If
+    Let state be scratch_buffer
+    Let scratch_b be state plus 200
+    Let scratch_c be scratch_b plus 200
+    Let scratch_d be scratch_c plus 40
+    Let block_buffer be scratch_d plus 40
+
+    Let zi be 0
+    While zi is less than 200:
+        Memory.memory_set_byte(state, zi, 0)
+        Set zi to zi plus 1
+    End While
+
+    Note: Absorb full blocks.
+    Let full_blocks be message_length divided by rate_bytes
+    Let processed be 0
+    While processed is less than full_blocks:
+        Let xor_idx be 0
+        While xor_idx is less than rate_bytes:
+            Let src_b be Memory.memory_get_byte(message, (processed multiplied by rate_bytes) plus xor_idx)
+            Let state_b be Memory.memory_get_byte(state, xor_idx)
+            Memory.memory_set_byte(state, xor_idx, state_b bitwise_xor src_b)
+            Set xor_idx to xor_idx plus 1
+        End While
+        Sha3.keccak_f1600(state, scratch_b, scratch_c, scratch_d)
+        Set processed to processed plus 1
+    End While
+
+    Note: Tail block.
+    Let tail_offset be full_blocks multiplied by rate_bytes
+    Let tail_bytes be message_length minus tail_offset
+
+    Let pi be 0
+    While pi is less than rate_bytes:
+        Memory.memory_set_byte(block_buffer, pi, 0)
+        Set pi to pi plus 1
+    End While
+    Let copy_t be 0
+    While copy_t is less than tail_bytes:
+        Let src_t be Memory.memory_get_byte(message, tail_offset plus copy_t)
+        Memory.memory_set_byte(block_buffer, copy_t, src_t)
+        Set copy_t to copy_t plus 1
+    End While
+
+    Note: Keccak-256 (pre-NIST) padding byte is 0x01 (FIPS-202 uses 0x06).
+    Memory.memory_set_byte(block_buffer, tail_bytes, 1)
+    Let last_b be Memory.memory_get_byte(block_buffer, rate_bytes minus 1)
+    Memory.memory_set_byte(block_buffer, rate_bytes minus 1, last_b bitwise_or 128)
+
+    Let xor_idx_final be 0
+    While xor_idx_final is less than rate_bytes:
+        Let blk_b be Memory.memory_get_byte(block_buffer, xor_idx_final)
+        Let st_b be Memory.memory_get_byte(state, xor_idx_final)
+        Memory.memory_set_byte(state, xor_idx_final, st_b bitwise_xor blk_b)
+        Set xor_idx_final to xor_idx_final plus 1
+    End While
+
+    Sha3.keccak_f1600(state, scratch_b, scratch_c, scratch_d)
+
+    Note: Squeeze 32 bytes.
+    Let si be 0
+    While si is less than 32:
+        Let sb be Memory.memory_get_byte(state, si)
+        Memory.memory_set_byte(out_digest, si, sb)
+        Set si to si plus 1
+    End While
+    Return 32
+End Process
+
+@Reasoning
+Returns the integer value 0..57 of a Bitcoin Base58 character, or -1 if
+the character is not in the alphabet. The alphabet is:
+  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+omitting 0/O/I/l/+/=/ to avoid visually-confusable characters.
+@End Reasoning
+
+@Implementation
+Linear scan over the alphabet (the 58 characters fit a compact lookup
+with no allocation). Inverse of bytes_internal_base58_char in bytes.runa.
+@End Implementation
+
+@Performance_Hints
+O(1) per character (small constant 58).
+@End Performance_Hints
+
+@Security_Scope
+Decoding validates each character; rejection on first invalid char.
+@End Security_Scope
+Process called "addr_base58_char_value" takes c as Integer returns Integer:
+    If c is equal to 49:
+        Return 0
+    End If
+    If c is equal to 50:
+        Return 1
+    End If
+    If c is equal to 51:
+        Return 2
+    End If
+    If c is equal to 52:
+        Return 3
+    End If
+    If c is equal to 53:
+        Return 4
+    End If
+    If c is equal to 54:
+        Return 5
+    End If
+    If c is equal to 55:
+        Return 6
+    End If
+    If c is equal to 56:
+        Return 7
+    End If
+    If c is equal to 57:
+        Return 8
+    End If
+    Note: A=65..H=72 -> 9..16
+    If c is greater than or equal to 65:
+        If c is less than or equal to 72:
+            Return (c minus 65) plus 9
+        End If
+    End If
+    Note: J=74..N=78 -> 17..21
+    If c is greater than or equal to 74:
+        If c is less than or equal to 78:
+            Return (c minus 74) plus 17
+        End If
+    End If
+    Note: P=80..Z=90 -> 22..32
+    If c is greater than or equal to 80:
+        If c is less than or equal to 90:
+            Return (c minus 80) plus 22
+        End If
+    End If
+    Note: a=97..k=107 -> 33..43
+    If c is greater than or equal to 97:
+        If c is less than or equal to 107:
+            Return (c minus 97) plus 33
+        End If
+    End If
+    Note: m=109..z=122 -> 44..57
+    If c is greater than or equal to 109:
+        If c is less than or equal to 122:
+            Return (c minus 109) plus 44
+        End If
+    End If
+    Return 0 minus 1
+End Process
+
+@Reasoning
+Compute the length of a NUL-terminated C-style string by scanning bytes.
+@End Reasoning
+
+@Implementation
+Walk bytes until 0 found, return offset.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+Caller-controlled pointer; safe only on NUL-terminated buffers.
+@End Security_Scope
+Process called "addr_cstr_length" takes str as Integer returns Integer:
+    Let n be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let b be Memory.memory_get_byte(str, n)
+        If b is equal to 0:
+            Set scanning to 0
+        Otherwise:
+            Set n to n plus 1
+        End If
+    End While
+    Return n
+End Process
+
+@Reasoning
+Decode a Base58 string into raw bytes using the standard Bitcoin
+"big-integer base-256 to base-58 division" algorithm, in reverse:
+multiply by 58, add next character value, carry through bytes.
+
+The output buffer is written into out_buffer; the maximum output size
+is ceil(input_length * log(58)/log(256)) = ceil(input_length * 0.7322).
+Caller must allocate at least max_out_capacity = input_length bytes.
+
+Returns the number of decoded output bytes (which may be less than the
+allocated capacity), or 0 on invalid characters.
+@End Reasoning
+
+@Implementation
+Standard Base58 decode:
+  1. Count leading '1' chars (each maps to one leading zero byte).
+  2. For each remaining char c: value = base58_value(c); fail if -1.
+  3. Multiply out_buffer (as base-256 big-endian bigint) by 58 and add
+     value; propagate carry through the byte buffer.
+  4. Skip leading zero bytes in the bigint (they are not "leading-1
+     zeros") and prepend the counted leading-1 zeros.
+@End Implementation
+
+@Performance_Hints
+O(n * m) where n = input chars, m = output bytes. For typical 25-50
+character addresses this is trivially small.
+@End Performance_Hints
+
+@Security_Scope
+Decoding validates each character. The output buffer is the caller's
+responsibility; the helper does not over-write.
+@End Security_Scope
+Process called "addr_base58_decode" takes input_str as Integer, input_length as Integer, out_buffer as Integer, max_out_capacity as Integer returns Integer:
+    If input_str is equal to 0:
+        Return 0
+    End If
+    If input_length is less than 1:
+        Return 0
+    End If
+    If out_buffer is equal to 0:
+        Return 0
+    End If
+    Note: Count leading '1' chars (ASCII 49 = '1') -> leading zero bytes.
+    Let leading_ones be 0
+    Let i be 0
+    Let still_one be 1
+    While still_one is equal to 1:
+        If i is greater than or equal to input_length:
+            Set still_one to 0
+        Otherwise:
+            Let ch be Memory.memory_get_byte(input_str, i)
+            If ch is equal to 49:
+                Set leading_ones to leading_ones plus 1
+                Set i to i plus 1
+            Otherwise:
+                Set still_one to 0
+            End If
+        End If
+    End While
+
+    Note: Zero the output buffer.
+    Let zi be 0
+    While zi is less than max_out_capacity:
+        Memory.memory_set_byte(out_buffer, zi, 0)
+        Set zi to zi plus 1
+    End While
+
+    Note: Process each character (including leading '1's) per Bitcoin Core.
+    Let result_high_idx be max_out_capacity minus 1
+    Let c_idx be 0
+    While c_idx is less than input_length:
+        Let cc be Memory.memory_get_byte(input_str, c_idx)
+        Let v be addr_base58_char_value(cc)
+        If v is less than 0:
+            Return 0
+        End If
+        Let carry be v
+        Let b_idx be result_high_idx
+        Let keep_going be 1
+        While keep_going is equal to 1:
+            Let cur be Memory.memory_get_byte(out_buffer, b_idx)
+            Let sum_v be (cur multiplied by 58) plus carry
+            Memory.memory_set_byte(out_buffer, b_idx, sum_v modulo by 256)
+            Set carry to sum_v divided by 256
+            If b_idx is equal to 0:
+                Set keep_going to 0
+            Otherwise:
+                If carry is equal to 0:
+                    Set keep_going to 0
+                Otherwise:
+                    Set b_idx to b_idx minus 1
+                End If
+            End If
+        End While
+        Set c_idx to c_idx plus 1
+    End While
+
+    Note: Find first non-zero byte in out_buffer.
+    Let first_nz be 0
+    Let scan be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        If scan is greater than or equal to max_out_capacity:
+            Set scanning to 0
+        Otherwise:
+            Let cur_b be Memory.memory_get_byte(out_buffer, scan)
+            If cur_b is equal to 0:
+                Set scan to scan plus 1
+            Otherwise:
+                Set first_nz to scan
+                Set scanning to 0
+            End If
+        End If
+    End While
+    If scan is greater than or equal to max_out_capacity:
+        Set first_nz to max_out_capacity
+    End If
+
+    Note: Output is leading_ones zero bytes followed by buffer[first_nz..end].
+    Let payload_len be max_out_capacity minus first_nz
+    Let total_len be leading_ones plus payload_len
+    If total_len is greater than max_out_capacity:
+        Return 0
+    End If
+
+    Note: Shift payload bytes left to position [leading_ones..total_len),
+    Note: then write leading-zero bytes at positions [0..leading_ones).
+    Let move_idx be 0
+    While move_idx is less than payload_len:
+        Let src_b be Memory.memory_get_byte(out_buffer, first_nz plus move_idx)
+        Memory.memory_set_byte(out_buffer, leading_ones plus move_idx, src_b)
+        Set move_idx to move_idx plus 1
+    End While
+    Let lz_idx be 0
+    While lz_idx is less than leading_ones:
+        Memory.memory_set_byte(out_buffer, lz_idx, 0)
+        Set lz_idx to lz_idx plus 1
+    End While
+
+    Note: Zero the rest of the buffer beyond total_len.
+    Let tail_idx be total_len
+    While tail_idx is less than max_out_capacity:
+        Memory.memory_set_byte(out_buffer, tail_idx, 0)
+        Set tail_idx to tail_idx plus 1
+    End While
+
+    Return total_len
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Construction (low-level)
+Note: ============================================================================
+
+@Reasoning
+Construct an Address from a network tag and raw address bytes. This is
+the low-level constructor used by the network-specific decoders.
+@End Reasoning
+
+@Implementation
+Allocate struct + bytes copy, store fields.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+Network-specific validation is the caller's responsibility at this
+level; the public network-specific procs in section 4+ do the work.
+@End Security_Scope
+Process called "address_create" takes arena as Integer, network as Integer, bytes_in as Integer, bytes_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If bytes_in is equal to 0:
+        Return 0
+    End If
+    If bytes_length is less than 1:
+        Return 0
+    End If
+    Let a be Arena.arena_allocate(arena, ADDRESS_STRUCT_SIZE)
+    If a is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than ADDRESS_STRUCT_SIZE:
+        Memory.memory_set_byte(a, zi, 0)
+        Set zi to zi plus 1
+    End While
+    Let buf be Arena.arena_allocate(arena, bytes_length)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(buf, bytes_in, bytes_length)
+    Memory.memory_set_qword(a, ADDR_OFF_NETWORK, network)
+    Memory.memory_set_qword(a, ADDR_OFF_BYTES_PTR, buf)
+    Memory.memory_set_qword(a, ADDR_OFF_BYTES_LEN, bytes_length)
+    Memory.memory_set_qword(a, ADDR_OFF_ENCODED_PTR, 0)
+    Memory.memory_set_qword(a, ADDR_OFF_ENCODED_LEN, 0)
+    Return a
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Accessors
+Note: ============================================================================
+
+@Reasoning
+Returns the network identifier.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "address_network" takes a as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(a, ADDR_OFF_NETWORK)
+End Process
+
+@Reasoning
+Returns the address byte pointer.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 8.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Public material.
+@End Security_Scope
+Process called "address_bytes" takes a as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(a, ADDR_OFF_BYTES_PTR)
+End Process
+
+@Reasoning
+Returns the address byte length.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 16.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Public.
+@End Security_Scope
+Process called "address_byte_length" takes a as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(a, ADDR_OFF_BYTES_LEN)
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Ethereum
+Note: ============================================================================
+
+@Reasoning
+Construct an Ethereum Address from a 40-character hex string. The
+optional "0x" prefix is accepted and stripped. EIP-55 mixed-case
+checksum is validated: every uppercase hex digit at position i must
+correspond to a high nibble of keccak256(lowercase_address)[i/2], or
+the input is rejected.
+
+Accepts all-lowercase or all-uppercase inputs (which have no checksum
+information by construction), and accepts EIP-55-correct mixed-case.
+Rejects mixed-case strings whose case-pattern does NOT match the
+EIP-55 derivation. This prevents the common typo-induced address
+substitution.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Strip "0x" prefix if present.
+  2. Require length == 40.
+  3. Decode hex into 20-byte address.
+  4. Determine if input is all-lower, all-upper, or mixed.
+  5. If mixed: compute keccak256(lower_hex_chars) and re-derive the
+     EIP-55 case pattern; compare against input. Reject on mismatch.
+  6. Allocate Address with NETWORK_ETHEREUM and 20-byte payload.
+@End Implementation
+
+@Performance_Hints
+O(n) for parse + one keccak256(40 bytes).
+@End Performance_Hints
+
+@Security_Scope
+The EIP-55 check is the protection against single-character typos in
+Ethereum addresses (a 4-bit-per-char checksum has expected failure
+probability ~1/2 per typo on average). This proc REJECTS mixed-case
+inputs that fail the check, which is the safe default; downstream code
+must NOT silently accept such inputs.
+
+References:
+- EIP-55: Mixed-case checksum address encoding for Ethereum addresses
+  (Hawkins 2016).
+- Ethereum Yellow Paper section 4.1.
+@End Security_Scope
+Process called "address_ethereum_from_hex" takes arena as Integer, hex_str as Integer, hex_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If hex_str is equal to 0:
+        Return 0
+    End If
+
+    Note: Strip 0x prefix if present.
+    Let start_off be 0
+    Let raw_len be hex_length
+    If hex_length is greater than or equal to 2:
+        Let p0 be Memory.memory_get_byte(hex_str, 0)
+        Let p1 be Memory.memory_get_byte(hex_str, 1)
+        If p0 is equal to 48:
+            If p1 is equal to 120:
+                Set start_off to 2
+                Set raw_len to raw_len minus 2
+            End If
+            If p1 is equal to 88:
+                Set start_off to 2
+                Set raw_len to raw_len minus 2
+            End If
+        End If
+    End If
+
+    If raw_len is not equal to 40:
+        Return 0
+    End If
+
+    Note: Decode 20 raw bytes and classify case.
+    Let addr_bytes be Arena.arena_allocate(arena, 20)
+    If addr_bytes is equal to 0:
+        Return 0
+    End If
+    Let has_upper be 0
+    Let has_lower be 0
+    Let pi be 0
+    While pi is less than 20:
+        Let hi_c be Memory.memory_get_byte(hex_str, start_off plus (pi multiplied by 2))
+        Let lo_c be Memory.memory_get_byte(hex_str, (start_off plus (pi multiplied by 2)) plus 1)
+        Let hi_v be Char.hex_digit_value(hi_c)
+        Let lo_v be Char.hex_digit_value(lo_c)
+        If hi_v is less than 0:
+            Return 0
+        End If
+        If lo_v is less than 0:
+            Return 0
+        End If
+        Note: Track case for a-f / A-F to decide EIP-55 check requirement.
+        If hi_c is greater than or equal to 65:
+            If hi_c is less than or equal to 70:
+                Set has_upper to 1
+            End If
+        End If
+        If hi_c is greater than or equal to 97:
+            If hi_c is less than or equal to 102:
+                Set has_lower to 1
+            End If
+        End If
+        If lo_c is greater than or equal to 65:
+            If lo_c is less than or equal to 70:
+                Set has_upper to 1
+            End If
+        End If
+        If lo_c is greater than or equal to 97:
+            If lo_c is less than or equal to 102:
+                Set has_lower to 1
+            End If
+        End If
+        Memory.memory_set_byte(addr_bytes, pi, (hi_v multiplied by 16) plus lo_v)
+        Set pi to pi plus 1
+    End While
+
+    Note: If both upper and lower hex letters present, validate EIP-55.
+    If has_upper is equal to 1:
+        If has_lower is equal to 1:
+            Let lower_hex be Arena.arena_allocate(arena, 40)
+            If lower_hex is equal to 0:
+                Return 0
+            End If
+            Let li be 0
+            While li is less than 40:
+                Let c be Memory.memory_get_byte(hex_str, start_off plus li)
+                If c is greater than or equal to 65:
+                    If c is less than or equal to 70:
+                        Set c to c plus 32
+                    End If
+                End If
+                Memory.memory_set_byte(lower_hex, li, c)
+                Set li to li plus 1
+            End While
+            Let chk_buf be Arena.arena_allocate(arena, 32)
+            If chk_buf is equal to 0:
+                Return 0
+            End If
+            Let kr be addr_keccak256(arena, lower_hex, 40, chk_buf)
+            If kr is equal to 0:
+                Return 0
+            End If
+            Note: For each i in 0..39: high nibble of chk_buf[i/2]
+            Note: (if i even) or low nibble (if i odd) >= 8 means the hex
+            Note: character at position i must be uppercase (A-F), else
+            Note: lowercase. Letters only; digits ignored.
+            Let vi be 0
+            While vi is less than 40:
+                Let raw_c be Memory.memory_get_byte(hex_str, start_off plus vi)
+                Let is_letter be 0
+                If raw_c is greater than or equal to 65:
+                    If raw_c is less than or equal to 70:
+                        Set is_letter to 1
+                    End If
+                End If
+                If raw_c is greater than or equal to 97:
+                    If raw_c is less than or equal to 102:
+                        Set is_letter to 1
+                    End If
+                End If
+                If is_letter is equal to 1:
+                    Let byte_idx be vi divided by 2
+                    Let nib_b be Memory.memory_get_byte(chk_buf, byte_idx)
+                    Let nibble be 0
+                    If (vi modulo by 2) is equal to 0:
+                        Set nibble to nib_b divided by 16
+                    Otherwise:
+                        Set nibble to nib_b modulo by 16
+                    End If
+                    Let expect_upper be 0
+                    If nibble is greater than or equal to 8:
+                        Set expect_upper to 1
+                    End If
+                    Let actual_upper be 0
+                    If raw_c is less than or equal to 70:
+                        Set actual_upper to 1
+                    End If
+                    If actual_upper is not equal to expect_upper:
+                        Return 0
+                    End If
+                End If
+                Set vi to vi plus 1
+            End While
+        End If
+    End If
+
+    Return address_create(arena, NETWORK_ETHEREUM, addr_bytes, 20)
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Bitcoin
+Note: ============================================================================
+
+@Reasoning
+Construct a Bitcoin address from a Base58Check string. The format is:
+  base58( version_byte || payload || checksum_4 )
+where checksum_4 = first 4 bytes of sha256(sha256(version_byte || payload)).
+
+Valid input lengths after Base58 decoding:
+  25 bytes total: 1 version + 20 payload + 4 checksum (P2PKH / P2SH).
+  37 bytes total: 1 version + 32 payload + 4 checksum (variant).
+The version byte distinguishes mainnet / testnet / P2SH / etc.
+
+The decoded payload (without version or checksum) is stored as the
+address bytes; the version byte is stored at offset[0] of the buffer
+to preserve mainnet/testnet distinguishability while still using
+a single NETWORK_BITCOIN tag.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate input.
+  2. Base58-decode into 25-byte buffer.
+  3. Split into version|payload|checksum.
+  4. Verify checksum: sha256(sha256(version||payload))[0..4] == checksum.
+  5. Allocate Address bytes = version || payload (21 bytes).
+@End Implementation
+
+@Performance_Hints
+Two SHA-256 invocations on 21-byte input plus one Base58 decode.
+@End Performance_Hints
+
+@Security_Scope
+Checksum verification catches single-character typos with probability
+1 - 2^-32 ~ 100%. Rejecting on checksum failure is mandatory; a silent
+default would route funds to the wrong address.
+
+References:
+- Bitcoin Wiki: Base58Check encoding.
+- BIP-13: Pay-to-Script-Hash (P2SH) base58 encoding.
+@End Security_Scope
+Process called "address_bitcoin_from_base58" takes arena as Integer, b58_str as Integer, b58_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If b58_str is equal to 0:
+        Return 0
+    End If
+    If b58_length is less than 26:
+        Return 0
+    End If
+    If b58_length is greater than 60:
+        Return 0
+    End If
+
+    Note: Allocate a generous decode buffer. Base58 decode of a 60-char
+    Note: string is at most 60 bytes (well above the 25-byte target).
+    Let decode_cap be b58_length
+    Let decoded be Arena.arena_allocate(arena, decode_cap)
+    If decoded is equal to 0:
+        Return 0
+    End If
+    Let dec_len be addr_base58_decode(b58_str, b58_length, decoded, decode_cap)
+    If dec_len is equal to 0:
+        Return 0
+    End If
+    If dec_len is less than 25:
+        Return 0
+    End If
+
+    Note: Split: version(1) + payload(dec_len-5) + checksum(4).
+    Let payload_offset be 0
+    Let payload_len be dec_len minus 4
+    Let checksum_offset be payload_len
+
+    Note: Compute sha256(sha256(version || payload)).
+    Let h1 be Arena.arena_allocate(arena, 32)
+    If h1 is equal to 0:
+        Return 0
+    End If
+    Let h2 be Arena.arena_allocate(arena, 32)
+    If h2 is equal to 0:
+        Return 0
+    End If
+    Let r1 be Sha2.sha256_hash(arena, decoded plus payload_offset, payload_len, h1)
+    If r1 is equal to 0:
+        Return 0
+    End If
+    Let r2 be Sha2.sha256_hash(arena, h1, 32, h2)
+    If r2 is equal to 0:
+        Return 0
+    End If
+
+    Note: Compare h2[0..4] to checksum[0..4] in constant time.
+    Let chk_match be Secure.constant_time_compare(h2, decoded plus checksum_offset, 4)
+    If chk_match is equal to 0:
+        Return 0
+    End If
+
+    Return address_create(arena, NETWORK_BITCOIN, decoded, payload_len)
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: Solana
+Note: ============================================================================
+
+@Reasoning
+Solana addresses are 32-byte Ed25519 public keys encoded in Base58
+(no checksum byte). The encoding is between 32 and 44 characters
+typically (most public keys produce 44 chars; addresses starting with
+many leading-zero bytes shrink).
+
+This proc decodes Base58 and validates the result is exactly 32 bytes.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate input length is 32..44.
+  2. Base58-decode into 32-byte target.
+  3. Validate decoded length is exactly 32.
+  4. Allocate Address with NETWORK_SOLANA.
+@End Implementation
+
+@Performance_Hints
+O(input chars) Base58 decode.
+@End Performance_Hints
+
+@Security_Scope
+Solana addresses have no checksum (the format relies on rejecting
+non-Ed25519-key addresses at signature verification time). The
+length validation is the only structural check available.
+
+For destinations that you have not received via a trusted channel,
+DO NOT rely on Solana address validation alone; require a recent
+signed message from the holder as proof of control.
+@End Security_Scope
+Process called "address_solana_from_base58" takes arena as Integer, b58_str as Integer, b58_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If b58_str is equal to 0:
+        Return 0
+    End If
+    If b58_length is less than 32:
+        Return 0
+    End If
+    If b58_length is greater than 44:
+        Return 0
+    End If
+
+    Let decode_cap be 48
+    Let decoded be Arena.arena_allocate(arena, decode_cap)
+    If decoded is equal to 0:
+        Return 0
+    End If
+    Let dec_len be addr_base58_decode(b58_str, b58_length, decoded, decode_cap)
+    If dec_len is not equal to 32:
+        Return 0
+    End If
+    Return address_create(arena, NETWORK_SOLANA, decoded, 32)
+End Process
+
+Note: ============================================================================
+Note: SECTION 7: Cosmos (Bech32)
+Note: ============================================================================
+
+@Reasoning
+Bech32 (BIP-173) encodes a binary string with a human-readable prefix
+(HRP) and a 6-character checksum. The format is:
+  hrp || "1" || data_chars || checksum
+where:
+  hrp        : lowercase ASCII letters
+  data_chars : Base32-encoded payload using the alphabet
+               "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+  checksum   : 6 Bech32 characters computed via polymod over GF(2^5).
+
+Validation requires:
+  - Last separator '1' present.
+  - hrp non-empty, lowercase letters only.
+  - data chars from the Bech32 alphabet only.
+  - checksum polymod equals BECH32_CONST (1 for original Bech32,
+    0x2bc830a3 for Bech32m).
+
+This proc supports both Bech32 (BIP-173) and Bech32m (BIP-350); the
+constant is chosen by the caller via a separate bech32m flag.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Find last '1' in input; everything before is HRP, after is data.
+  2. Validate HRP is non-empty, all chars in 'a'..'z'.
+  3. Decode data chars to 5-bit values.
+  4. Compute polymod over expanded HRP || data and verify.
+  5. Convert data[0..len-6] from 5-bit groups to 8-bit bytes.
+  6. Allocate Address with NETWORK_COSMOS and the byte payload.
+     Also stores the original encoded string for round-trip.
+@End Implementation
+
+@Performance_Hints
+O(n) parse + O(n) polymod.
+@End Performance_Hints
+
+@Security_Scope
+The polymod checksum detects up to 4 character substitutions with
+probability ~1 - 2^-30, far stronger than Base58Check's 4-byte sha2
+prefix. Mandatory check.
+
+References:
+- BIP-173: Base32 address format (Bech32).
+- BIP-350: Bech32m for v1+ witness addresses.
+- Cosmos SDK address spec: bech32 with HRP per chain.
+@End Security_Scope
+Process called "address_cosmos_from_bech32" takes arena as Integer, bech_str as Integer, bech_length as Integer returns Integer:
+    Return address_cosmos_from_bech32_variant(arena, bech_str, bech_length, 0)
+End Process
+
+@Reasoning
+Bech32 decoder with explicit variant selection: variant=0 -> Bech32
+(original), variant=1 -> Bech32m. Both variants share parsing; only
+the polymod constant differs.
+@End Reasoning
+
+@Implementation
+Same as above; selects BECH32_CONST = 1 or 0x2bc830a3.
+@End Implementation
+
+@Performance_Hints
+Same as the Bech32 path.
+@End Performance_Hints
+
+@Security_Scope
+Same as the Bech32 path.
+@End Security_Scope
+Process called "address_cosmos_from_bech32_variant" takes arena as Integer, bech_str as Integer, bech_length as Integer, variant as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If bech_str is equal to 0:
+        Return 0
+    End If
+    If bech_length is less than 8:
+        Return 0
+    End If
+    If bech_length is greater than 90:
+        Return 0
+    End If
+
+    Note: Find last '1' separator (ASCII 49).
+    Let sep_idx be 0 minus 1
+    Let scan_i be bech_length minus 1
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let cs be Memory.memory_get_byte(bech_str, scan_i)
+        If cs is equal to 49:
+            Set sep_idx to scan_i
+            Set scanning to 0
+        Otherwise:
+            If scan_i is equal to 0:
+                Set scanning to 0
+            Otherwise:
+                Set scan_i to scan_i minus 1
+            End If
+        End If
+    End While
+    If sep_idx is less than 1:
+        Return 0
+    End If
+    Let data_count be (bech_length minus sep_idx) minus 1
+    If data_count is less than 6:
+        Return 0
+    End If
+
+    Note: Decode data chars into 5-bit values; check HRP chars are lowercase.
+    Let data_vals be Arena.arena_allocate(arena, data_count)
+    If data_vals is equal to 0:
+        Return 0
+    End If
+    Let hi be 0
+    While hi is less than sep_idx:
+        Let hc be Memory.memory_get_byte(bech_str, hi)
+        If hc is less than 97:
+            Return 0
+        End If
+        If hc is greater than 122:
+            Return 0
+        End If
+        Set hi to hi plus 1
+    End While
+    Let di be 0
+    While di is less than data_count:
+        Let dc be Memory.memory_get_byte(bech_str, (sep_idx plus 1) plus di)
+        Let dv be addr_bech32_char_value(dc)
+        If dv is less than 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(data_vals, di, dv)
+        Set di to di plus 1
+    End While
+
+    Note: Compute polymod over expanded HRP || data and verify.
+    Let polymod be addr_bech32_verify_checksum(bech_str, sep_idx, data_vals, data_count)
+    Let expected be 1
+    If variant is equal to 1:
+        Set expected to 734539683
+    End If
+    Note: 0x2bc830a3 = 734539683.
+    If polymod is not equal to expected:
+        Return 0
+    End If
+
+    Note: Convert data[0..count-6] from 5-bit to 8-bit; output is the byte payload.
+    Let payload_5bit_count be data_count minus 6
+    Let max_8bit_len be (payload_5bit_count multiplied by 5) divided by 8
+    If max_8bit_len is less than 1:
+        Return 0
+    End If
+    Let payload_bytes be Arena.arena_allocate(arena, max_8bit_len plus 1)
+    If payload_bytes is equal to 0:
+        Return 0
+    End If
+    Let actual_byte_len be addr_bech32_convert_bits(data_vals, payload_5bit_count, 5, payload_bytes, max_8bit_len plus 1, 8, 0)
+    If actual_byte_len is less than 1:
+        Return 0
+    End If
+
+    Note: Build the Address. Network is NETWORK_COSMOS for any bech32-style.
+    Note: For consumers needing the HRP (chain prefix), they can re-derive it
+    Note: from the encoded string we save below.
+    Let a be address_create(arena, NETWORK_COSMOS, payload_bytes, actual_byte_len)
+    If a is equal to 0:
+        Return 0
+    End If
+    Note: Store the original encoded string for round-trip.
+    Let enc_copy be Arena.arena_allocate(arena, bech_length)
+    If enc_copy is equal to 0:
+        Return a
+    End If
+    Memory.memory_copy(enc_copy, bech_str, bech_length)
+    Memory.memory_set_qword(a, ADDR_OFF_ENCODED_PTR, enc_copy)
+    Memory.memory_set_qword(a, ADDR_OFF_ENCODED_LEN, bech_length)
+    Return a
+End Process
+
+@Reasoning
+Returns the 5-bit value 0..31 for a Bech32 character (lowercase only),
+or -1 for invalid. The Bech32 alphabet is:
+  "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+which is intentionally chosen to detect single-character substitutions
+in BCH-style polymod (BIP-173 section "Choice of character set").
+@End Reasoning
+
+@Implementation
+Direct enumeration of the 32-character alphabet.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Decoder is strict (lowercase only) per BIP-173.
+@End Security_Scope
+Process called "addr_bech32_char_value" takes c as Integer returns Integer:
+    Note: 'q'=113 -> 0, 'p'=112 -> 1, 'z'=122 -> 2, ...
+    If c is equal to 113:
+        Return 0
+    End If
+    If c is equal to 112:
+        Return 1
+    End If
+    If c is equal to 122:
+        Return 2
+    End If
+    If c is equal to 114:
+        Return 3
+    End If
+    If c is equal to 121:
+        Return 4
+    End If
+    If c is equal to 57:
+        Return 5
+    End If
+    If c is equal to 120:
+        Return 6
+    End If
+    If c is equal to 56:
+        Return 7
+    End If
+    If c is equal to 103:
+        Return 8
+    End If
+    If c is equal to 102:
+        Return 9
+    End If
+    If c is equal to 50:
+        Return 10
+    End If
+    If c is equal to 116:
+        Return 11
+    End If
+    If c is equal to 118:
+        Return 12
+    End If
+    If c is equal to 100:
+        Return 13
+    End If
+    If c is equal to 119:
+        Return 14
+    End If
+    If c is equal to 48:
+        Return 15
+    End If
+    If c is equal to 115:
+        Return 16
+    End If
+    If c is equal to 51:
+        Return 17
+    End If
+    If c is equal to 106:
+        Return 18
+    End If
+    If c is equal to 110:
+        Return 19
+    End If
+    If c is equal to 53:
+        Return 20
+    End If
+    If c is equal to 52:
+        Return 21
+    End If
+    If c is equal to 107:
+        Return 22
+    End If
+    If c is equal to 104:
+        Return 23
+    End If
+    If c is equal to 99:
+        Return 24
+    End If
+    If c is equal to 101:
+        Return 25
+    End If
+    If c is equal to 54:
+        Return 26
+    End If
+    If c is equal to 109:
+        Return 27
+    End If
+    If c is equal to 117:
+        Return 28
+    End If
+    If c is equal to 97:
+        Return 29
+    End If
+    If c is equal to 55:
+        Return 30
+    End If
+    If c is equal to 108:
+        Return 31
+    End If
+    Return 0 minus 1
+End Process
+
+@Reasoning
+Compute the BCH polymod of HRP-expansion || data, per BIP-173. The
+polymod is iterated as:
+  c = 1
+  for v in expanded:
+      b = c >> 25
+      c = ((c & 0x1ffffff) << 5) ^ v
+      for i in 0..4:
+          c ^= GEN[i] if (b >> i) & 1
+where GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3].
+
+HRP expansion per BIP-173:
+  expanded = [c >> 5 for c in hrp] + [0] + [c & 31 for c in hrp]
+
+The function returns the resulting polymod value c.
+@End Reasoning
+
+@Implementation
+Builds the expanded sequence on the fly without materializing into a
+buffer (just iterates the three sub-ranges). Constants are from
+BIP-173 section "Bech32".
+@End Implementation
+
+@Performance_Hints
+O(hrp_len + data_len). One iteration over each character.
+@End Performance_Hints
+
+@Security_Scope
+Pure polynomial computation; no secret-dependent paths.
+@End Security_Scope
+Process called "addr_bech32_verify_checksum" takes hrp_str as Integer, hrp_len as Integer, data_vals as Integer, data_len as Integer returns Integer:
+    Let c be 1
+    Note: hrp high nibbles.
+    Let hi be 0
+    While hi is less than hrp_len:
+        Let cc be Memory.memory_get_byte(hrp_str, hi)
+        Let v be cc divided by 32
+        Set c to addr_bech32_polymod_step(c, v)
+        Set hi to hi plus 1
+    End While
+    Note: separator 0.
+    Set c to addr_bech32_polymod_step(c, 0)
+    Note: hrp low nibbles.
+    Let li be 0
+    While li is less than hrp_len:
+        Let cc2 be Memory.memory_get_byte(hrp_str, li)
+        Let v2 be cc2 modulo by 32
+        Set c to addr_bech32_polymod_step(c, v2)
+        Set li to li plus 1
+    End While
+    Note: data values.
+    Let di be 0
+    While di is less than data_len:
+        Let dv be Memory.memory_get_byte(data_vals, di)
+        Set c to addr_bech32_polymod_step(c, dv)
+        Set di to di plus 1
+    End While
+    Return c
+End Process
+
+@Reasoning
+Single polymod step. Implements one iteration of the BCH polymod
+recurrence using the GF(2^5) generator constants from BIP-173.
+@End Reasoning
+
+@Implementation
+b = c >> 25, c = ((c & 0x1ffffff) << 5) xor v, then conditionally xor
+each of GEN[0..4] = {0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd,
+0x2a1462b3} if the corresponding bit of b is set.
+@End Implementation
+
+@Performance_Hints
+O(1) — five conditional xors per step.
+@End Performance_Hints
+
+@Security_Scope
+Pure arithmetic.
+@End Security_Scope
+Process called "addr_bech32_polymod_step" takes c as Integer, v as Integer returns Integer:
+    Let b be c divided by 33554432
+    Note: 33554432 = 2^25.
+    Let masked be c modulo by 33554432
+    Let shifted be masked multiplied by 32
+    Let new_c be shifted bitwise_xor v
+    Note: GEN constants per BIP-173:
+    Note: 0x3b6a57b2 = 996825010
+    Note: 0x26508e6d = 642813757
+    Note: 0x1ea119fa = 513874426
+    Note: 0x3d4233dd = 1027748829
+    Note: 0x2a1462b3 = 705979059
+    If (b bitwise_and 1) is not equal to 0:
+        Set new_c to new_c bitwise_xor 996825010
+    End If
+    If (b bitwise_and 2) is not equal to 0:
+        Set new_c to new_c bitwise_xor 642813757
+    End If
+    If (b bitwise_and 4) is not equal to 0:
+        Set new_c to new_c bitwise_xor 513874426
+    End If
+    If (b bitwise_and 8) is not equal to 0:
+        Set new_c to new_c bitwise_xor 1027748829
+    End If
+    If (b bitwise_and 16) is not equal to 0:
+        Set new_c to new_c bitwise_xor 705979059
+    End If
+    Return new_c
+End Process
+
+@Reasoning
+Convert a sequence of from_bits-bit values to to_bits-bit values per
+BIP-173 convertbits routine. Handles the leftover-bit boundary by
+optionally requiring (pad=1) trailing zero bits or rejecting (pad=0).
+@End Reasoning
+
+@Implementation
+Standard accumulator: walk input, shift accumulator left by from_bits,
+or in the next input, emit (acc >> excess) when accumulator holds
+to_bits or more.
+@End Implementation
+
+@Performance_Hints
+O(n) where n is the input count.
+@End Performance_Hints
+
+@Security_Scope
+Pure arithmetic; rejects non-padded input when pad=0 (the canonical
+decode path).
+@End Security_Scope
+Process called "addr_bech32_convert_bits" takes input_buf as Integer, input_count as Integer, from_bits as Integer, out_buf as Integer, out_capacity as Integer, to_bits as Integer, pad as Integer returns Integer:
+    Let acc be 0
+    Let bits be 0
+    Let written be 0
+    Let max_v be 1
+    Let mk_i be 0
+    While mk_i is less than to_bits:
+        Set max_v to max_v multiplied by 2
+        Set mk_i to mk_i plus 1
+    End While
+    Set max_v to max_v minus 1
+
+    Let in_mask be 1
+    Let im_i be 0
+    While im_i is less than from_bits:
+        Set in_mask to in_mask multiplied by 2
+        Set im_i to im_i plus 1
+    End While
+    Set in_mask to in_mask minus 1
+
+    Let i be 0
+    While i is less than input_count:
+        Let v be Memory.memory_get_byte(input_buf, i)
+        If v is greater than in_mask:
+            Return 0
+        End If
+        Note: acc = (acc << from_bits) | v
+        Let shift_factor be 1
+        Let sf_i be 0
+        While sf_i is less than from_bits:
+            Set shift_factor to shift_factor multiplied by 2
+            Set sf_i to sf_i plus 1
+        End While
+        Set acc to (acc multiplied by shift_factor) bitwise_or v
+        Set bits to bits plus from_bits
+        While bits is greater than or equal to to_bits:
+            Set bits to bits minus to_bits
+            Let div_factor be 1
+            Let df_i be 0
+            While df_i is less than bits:
+                Set div_factor to div_factor multiplied by 2
+                Set df_i to df_i plus 1
+            End While
+            Let chunk be (acc divided by div_factor) bitwise_and max_v
+            If written is greater than or equal to out_capacity:
+                Return 0
+            End If
+            Memory.memory_set_byte(out_buf, written, chunk)
+            Set written to written plus 1
+        End While
+        Set i to i plus 1
+    End While
+
+    If pad is equal to 1:
+        If bits is greater than 0:
+            Let div_factor2 be 1
+            Let df2_i be 0
+            Let shift_left be to_bits minus bits
+            While df2_i is less than shift_left:
+                Set div_factor2 to div_factor2 multiplied by 2
+                Set df2_i to df2_i plus 1
+            End While
+            Let final_chunk be (acc multiplied by div_factor2) bitwise_and max_v
+            If written is greater than or equal to out_capacity:
+                Return 0
+            End If
+            Memory.memory_set_byte(out_buf, written, final_chunk)
+            Set written to written plus 1
+        End If
+    Otherwise:
+        Note: No-pad mode: leftover bits must be zero.
+        If bits is greater than 0:
+            Let trail_mask be 1
+            Let tm_i be 0
+            While tm_i is less than bits:
+                Set trail_mask to trail_mask multiplied by 2
+                Set tm_i to tm_i plus 1
+            End While
+            Set trail_mask to trail_mask minus 1
+            Let trail_bits be acc bitwise_and trail_mask
+            If trail_bits is not equal to 0:
+                Return 0
+            End If
+        End If
+    End If
+    Return written
+End Process
+
+Note: ============================================================================
+Note: SECTION 8: Equality
+Note: ============================================================================
+
+@Reasoning
+Two addresses are equal iff they share network AND byte payload (constant-
+time compare on bytes). Cross-network comparison ALWAYS returns 0.
+@End Reasoning
+
+@Implementation
+Algorithm/length checks then constant_time_compare.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+Constant-time on byte content (treats address bytes as if they were
+secrets, conservatively). Network-tag and length checks are early-exit
+because they are public.
+@End Security_Scope
+Process called "address_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let na be address_network(a)
+    Let nb be address_network(b)
+    If na is not equal to nb:
+        Return 0
+    End If
+    Let la be address_byte_length(a)
+    Let lb be address_byte_length(b)
+    If la is not equal to lb:
+        Return 0
+    End If
+    Let ba be address_bytes(a)
+    Let bb be address_bytes(b)
+    Return Secure.constant_time_compare(ba, bb, la)
+End Process

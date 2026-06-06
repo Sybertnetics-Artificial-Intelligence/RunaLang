@@ -1,0 +1,702 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+HKDF - HMAC-based Key Derivation Function per RFC 5869
+==============================================================================
+
+HKDF derives one or more cryptographically strong secret keys from a high-
+entropy input keying material (IKM). It is designed for the two-step KDF
+paradigm by Krawczyk: first EXTRACT a fixed-length pseudorandom key from
+the IKM and an optional salt, then EXPAND that PRK into any number of
+output bytes using a context-specific info string.
+
+Construction (RFC 5869):
+
+    PRK = HMAC-Hash(salt, IKM)            -- HKDF-Extract
+    OKM = HKDF-Expand(PRK, info, L)
+
+where HKDF-Expand iteratively builds OKM by computing:
+
+    T(1) = HMAC-Hash(PRK, info || 0x01)
+    T(i) = HMAC-Hash(PRK, T(i-1) || info || i)   for i = 2..N
+    OKM  = first L bytes of T(1) || T(2) || ... || T(N)
+
+with N = ceil(L / HashLen).
+
+This module provides HKDF over SHA-256, SHA-384, and SHA-512. The cross-
+protocol guidance is HKDF-SHA256 for 128-bit security, HKDF-SHA384 for
+192-bit (matches AES-256, NIST P-384), HKDF-SHA512 for 256-bit.
+
+Salt handling per RFC 5869 section 2.2: if salt is null, it is replaced
+by HashLen zero bytes. An explicit salt is RECOMMENDED for cross-domain
+separation.
+
+Info handling: a per-call context string that binds the derived key to
+its purpose. E.g., "TLS 1.3, server handshake traffic, sha256-of-transcript".
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/hmac.runa" as Hmac
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as SecureMem
+
+Constant HKDF_SHA256_HASHLEN as Integer is 32
+Constant HKDF_SHA384_HASHLEN as Integer is 48
+Constant HKDF_SHA512_HASHLEN as Integer is 64
+Constant HKDF_MAX_OUTPUT_BLOCKS as Integer is 255
+
+Note: ============================================================================
+Note: SECTION 1: HKDF-Extract (SHA-256)
+Note: ============================================================================
+
+Process called "hkdf_sha256_extract" takes arena as Integer, salt as Integer, salt_length as Integer, ikm as Integer, ikm_length as Integer, out_prk as Integer returns Integer:
+    @Reasoning
+    Extract step: distill a fixed-length 32-byte PRK from possibly-low-
+    entropy IKM and the salt. Per RFC 5869 section 2.2, PRK is computed
+    as HMAC-SHA256(salt, IKM). If salt is null, a string of HashLen
+    zero bytes is used instead.
+
+    The extract step provides "extractor" semantics: if the IKM has
+    sufficient min-entropy (at least HashLen bits when concentrated)
+    the output PRK is computationally indistinguishable from uniform.
+    @End Reasoning
+
+    @Implementation
+    1. If salt is null/length-0, allocate a 32-byte zero buffer and
+       use it as the salt.
+    2. Compute PRK = HMAC-SHA256(effective_salt, IKM) into out_prk.
+
+    HMAC handles the salt as the key and IKM as the message; both
+    arguments are conceptually keys, but HMAC's properties hold
+    symmetrically.
+    @End Implementation
+
+    @Performance_Hints
+    One HMAC-SHA256 invocation. Cost approximates one SHA-256 over
+    (64 + |ikm|) bytes plus the small fixed outer hash.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against:
+    - Cross-protocol collisions when a non-empty salt is supplied
+      (distinct salt domains yield independent PRKs even from the
+      same IKM).
+    - Key-recovery via tag timing: not applicable here because the
+      PRK is itself the output, but inherits HMAC's secret wipe.
+
+    Out of scope:
+    - The min-entropy property of the IKM. HKDF assumes the caller
+      provides IKM with adequate min-entropy; if IKM is predictable,
+      HKDF cannot rescue it.
+
+    References:
+    - RFC 5869, "HMAC-based Extract-and-Expand Key Derivation Function".
+    - Krawczyk, "Cryptographic Extraction and Key Derivation: The HKDF
+      Scheme", CRYPTO 2010.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If ikm is equal to 0:
+        If ikm_length is greater than 0:
+            Return 0
+        End If
+    End If
+    If ikm_length is less than 0:
+        Return 0
+    End If
+    If out_prk is equal to 0:
+        Return 0
+    End If
+
+    Let effective_salt be salt
+    Let effective_salt_length be salt_length
+    If salt is equal to 0:
+        Set effective_salt to proc arena_allocate from Arena with arena, HKDF_SHA256_HASHLEN
+        If effective_salt is equal to 0:
+            Return 0
+        End If
+        proc memory_zero from Memory with effective_salt, HKDF_SHA256_HASHLEN
+        Set effective_salt_length to HKDF_SHA256_HASHLEN
+    Otherwise:
+        If salt_length is equal to 0:
+            Set effective_salt to proc arena_allocate from Arena with arena, HKDF_SHA256_HASHLEN
+            If effective_salt is equal to 0:
+                Return 0
+            End If
+            proc memory_zero from Memory with effective_salt, HKDF_SHA256_HASHLEN
+            Set effective_salt_length to HKDF_SHA256_HASHLEN
+        End If
+    End If
+
+    Return proc hmac_sha256 from Hmac with arena, effective_salt, effective_salt_length, ikm, ikm_length, out_prk
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: HKDF-Expand (SHA-256)
+Note: ============================================================================
+
+Process called "hkdf_sha256_expand" takes arena as Integer, prk as Integer, info as Integer, info_length as Integer, output_length as Integer, out_okm as Integer returns Integer:
+    @Reasoning
+    Expand step: derive output_length bytes of OKM from the PRK and the
+    info string. Per RFC 5869 section 2.3, the expansion is iterative:
+        T(1) = HMAC(PRK, info || 0x01)
+        T(i) = HMAC(PRK, T(i-1) || info || i)
+        OKM = first L bytes of T(1) || T(2) || ... || T(N)
+
+    The maximum output is 255 * HashLen = 8160 bytes for SHA-256.
+    @End Reasoning
+
+    @Implementation
+    1. Validate output_length <= 255 * 32.
+    2. Allocate a working buffer of HashLen + info_length + 1 bytes
+       (one HMAC input). Allocate a previous-T buffer of HashLen.
+    3. Loop i = 1 .. N where N = ceil(output_length / HashLen):
+       a. Build HMAC input as T(i-1) || info || single-byte i.
+          For i=1, T(0) is the empty string so the input is
+          info || 0x01.
+       b. Compute T(i) via HMAC-SHA256(PRK, input).
+       c. Copy min(HashLen, remaining) bytes of T(i) into out_okm
+          at the appropriate offset.
+    4. Securely wipe the working buffers.
+    @End Implementation
+
+    @Performance_Hints
+    Cost is N * HMAC-SHA256 where each HMAC processes (HashLen +
+    info_length + 1) bytes. For TLS-1.3 style derivations (info
+    is a 32-byte hash + a short label = ~80 bytes, L = 32) it is
+    one HMAC, sub-microsecond on modern x86.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against:
+    - Chosen-info collisions: the per-block counter byte ensures
+      every T(i) input is unique, so no two output blocks are the
+      same function of the PRK.
+    - Output extension forgery: the counter bound (255) limits the
+      output length to 8160 bytes for SHA-256, preventing length-
+      extension-style abuse.
+
+    Out of scope:
+    - The semantic interpretation of the info string. Caller is
+      responsible for unambiguous encoding of the info content
+      (e.g., length-prefixed structure rather than concatenation).
+
+    References:
+    - RFC 5869 section 2.3.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If prk is equal to 0:
+        Return 0
+    End If
+    If info is equal to 0:
+        If info_length is greater than 0:
+            Return 0
+        End If
+    End If
+    If info_length is less than 0:
+        Return 0
+    End If
+    If output_length is less than 0:
+        Return 0
+    End If
+    If out_okm is equal to 0:
+        If output_length is greater than 0:
+            Return 0
+        End If
+    End If
+    If output_length is equal to 0:
+        Return 1
+    End If
+
+    Note: RFC 5869: L MUST be <= 255 * HashLen.
+    Let max_output be HKDF_MAX_OUTPUT_BLOCKS multiplied by HKDF_SHA256_HASHLEN
+    If output_length is greater than max_output:
+        Return 0
+    End If
+
+    Note: Number of HMAC blocks N = ceil(L / HashLen)
+    Let n_blocks be output_length divided by HKDF_SHA256_HASHLEN
+    Let remainder_check be output_length modulo by HKDF_SHA256_HASHLEN
+    If remainder_check is greater than 0:
+        Set n_blocks to n_blocks plus 1
+    End If
+
+    Note: Working input buffer: prev_T (HashLen) || info || counter (1 byte)
+    Let input_buf_size be HKDF_SHA256_HASHLEN plus info_length plus 1
+    Let input_buf be proc arena_allocate from Arena with arena, input_buf_size
+    If input_buf is equal to 0:
+        Return 0
+    End If
+
+    Let t_buf be proc arena_allocate from Arena with arena, HKDF_SHA256_HASHLEN
+    If t_buf is equal to 0:
+        Return 0
+    End If
+
+    Let bytes_written be 0
+    Let i be 1
+    While i is less than n_blocks plus 1:
+        Note: Build HMAC input
+        Let input_len be 0
+        If i is greater than 1:
+            proc memory_copy from Memory with input_buf, t_buf, HKDF_SHA256_HASHLEN
+            Set input_len to HKDF_SHA256_HASHLEN
+        End If
+        If info_length is greater than 0:
+            proc memory_copy from Memory with input_buf plus input_len, info, info_length
+            Set input_len to input_len plus info_length
+        End If
+        proc memory_set_byte from Memory with input_buf, input_len, i
+        Set input_len to input_len plus 1
+
+        Note: T(i) = HMAC-SHA256(prk, input_buf[0..input_len])
+        Let rc be proc hmac_sha256 from Hmac with arena, prk, HKDF_SHA256_HASHLEN, input_buf, input_len, t_buf
+        If rc is equal to 0:
+            proc secure_zero from SecureMem with input_buf, input_buf_size
+            proc secure_zero from SecureMem with t_buf, HKDF_SHA256_HASHLEN
+            Return 0
+        End If
+
+        Note: Copy bytes of T(i) into output
+        Let remaining be output_length minus bytes_written
+        Let to_copy be HKDF_SHA256_HASHLEN
+        If remaining is less than to_copy:
+            Set to_copy to remaining
+        End If
+        proc memory_copy from Memory with out_okm plus bytes_written, t_buf, to_copy
+        Set bytes_written to bytes_written plus to_copy
+
+        Set i to i plus 1
+    End While
+
+    proc secure_zero from SecureMem with input_buf, input_buf_size
+    proc secure_zero from SecureMem with t_buf, HKDF_SHA256_HASHLEN
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: HKDF-Extract-and-Expand combined (SHA-256)
+Note: ============================================================================
+
+Process called "hkdf_sha256" takes arena as Integer, salt as Integer, salt_length as Integer, ikm as Integer, ikm_length as Integer, info as Integer, info_length as Integer, output_length as Integer, out_okm as Integer returns Integer:
+    @Reasoning
+    Convenience wrapper composing hkdf_sha256_extract and
+    hkdf_sha256_expand. Computes OKM in one call when callers do
+    not need to reuse PRK across multiple expansions.
+    @End Reasoning
+
+    @Implementation
+    1. Allocate a 32-byte PRK buffer in the arena.
+    2. Extract.
+    3. Expand.
+    4. Securely wipe PRK before returning.
+    @End Implementation
+
+    @Performance_Hints
+    Same cost as extract + expand (no overhead).
+    @End Performance_Hints
+
+    @Security_Scope
+    The intermediate PRK is securely wiped after the expansion so
+    it does not linger in the arena.
+    @End Security_Scope
+
+    Let prk be proc arena_allocate from Arena with arena, HKDF_SHA256_HASHLEN
+    If prk is equal to 0:
+        Return 0
+    End If
+
+    Let e_rc be proc hkdf_sha256_extract with arena, salt, salt_length, ikm, ikm_length, prk
+    If e_rc is equal to 0:
+        proc secure_zero from SecureMem with prk, HKDF_SHA256_HASHLEN
+        Return 0
+    End If
+
+    Let x_rc be proc hkdf_sha256_expand with arena, prk, info, info_length, output_length, out_okm
+    proc secure_zero from SecureMem with prk, HKDF_SHA256_HASHLEN
+    Return x_rc
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: HKDF-SHA384
+Note: ============================================================================
+
+Process called "hkdf_sha384_extract" takes arena as Integer, salt as Integer, salt_length as Integer, ikm as Integer, ikm_length as Integer, out_prk as Integer returns Integer:
+    @Reasoning
+    HKDF-Extract using SHA-384. 48-byte PRK output.
+    @End Reasoning
+
+    @Implementation
+    Same as hkdf_sha256_extract but with HMAC-SHA384 and 48-byte
+    zero-salt fallback.
+    @End Implementation
+
+    @Performance_Hints
+    One HMAC-SHA384 invocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Provides 192-bit security level.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If ikm_length is less than 0:
+        Return 0
+    End If
+    If out_prk is equal to 0:
+        Return 0
+    End If
+
+    Let effective_salt be salt
+    Let effective_salt_length be salt_length
+    If salt is equal to 0:
+        Set effective_salt to proc arena_allocate from Arena with arena, HKDF_SHA384_HASHLEN
+        If effective_salt is equal to 0:
+            Return 0
+        End If
+        proc memory_zero from Memory with effective_salt, HKDF_SHA384_HASHLEN
+        Set effective_salt_length to HKDF_SHA384_HASHLEN
+    Otherwise:
+        If salt_length is equal to 0:
+            Set effective_salt to proc arena_allocate from Arena with arena, HKDF_SHA384_HASHLEN
+            If effective_salt is equal to 0:
+                Return 0
+            End If
+            proc memory_zero from Memory with effective_salt, HKDF_SHA384_HASHLEN
+            Set effective_salt_length to HKDF_SHA384_HASHLEN
+        End If
+    End If
+
+    Return proc hmac_sha384 from Hmac with arena, effective_salt, effective_salt_length, ikm, ikm_length, out_prk
+End Process
+
+Process called "hkdf_sha384_expand" takes arena as Integer, prk as Integer, info as Integer, info_length as Integer, output_length as Integer, out_okm as Integer returns Integer:
+    @Reasoning
+    HKDF-Expand using HMAC-SHA384. Maximum output 255 * 48 = 12240 bytes.
+    @End Reasoning
+
+    @Implementation
+    Same iterative T(i) construction as hkdf_sha256_expand with
+    HashLen = 48.
+    @End Implementation
+
+    @Performance_Hints
+    Each HMAC processes (48 + info_length + 1) bytes.
+    @End Performance_Hints
+
+    @Security_Scope
+    192-bit security level.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If prk is equal to 0:
+        Return 0
+    End If
+    If info_length is less than 0:
+        Return 0
+    End If
+    If output_length is less than 0:
+        Return 0
+    End If
+    If output_length is equal to 0:
+        Return 1
+    End If
+
+    Let max_output be HKDF_MAX_OUTPUT_BLOCKS multiplied by HKDF_SHA384_HASHLEN
+    If output_length is greater than max_output:
+        Return 0
+    End If
+
+    Let n_blocks be output_length divided by HKDF_SHA384_HASHLEN
+    Let remainder_check be output_length modulo by HKDF_SHA384_HASHLEN
+    If remainder_check is greater than 0:
+        Set n_blocks to n_blocks plus 1
+    End If
+
+    Let input_buf_size be HKDF_SHA384_HASHLEN plus info_length plus 1
+    Let input_buf be proc arena_allocate from Arena with arena, input_buf_size
+    If input_buf is equal to 0:
+        Return 0
+    End If
+
+    Let t_buf be proc arena_allocate from Arena with arena, HKDF_SHA384_HASHLEN
+    If t_buf is equal to 0:
+        Return 0
+    End If
+
+    Let bytes_written be 0
+    Let i be 1
+    While i is less than n_blocks plus 1:
+        Let input_len be 0
+        If i is greater than 1:
+            proc memory_copy from Memory with input_buf, t_buf, HKDF_SHA384_HASHLEN
+            Set input_len to HKDF_SHA384_HASHLEN
+        End If
+        If info_length is greater than 0:
+            proc memory_copy from Memory with input_buf plus input_len, info, info_length
+            Set input_len to input_len plus info_length
+        End If
+        proc memory_set_byte from Memory with input_buf, input_len, i
+        Set input_len to input_len plus 1
+
+        Let rc be proc hmac_sha384 from Hmac with arena, prk, HKDF_SHA384_HASHLEN, input_buf, input_len, t_buf
+        If rc is equal to 0:
+            proc secure_zero from SecureMem with input_buf, input_buf_size
+            proc secure_zero from SecureMem with t_buf, HKDF_SHA384_HASHLEN
+            Return 0
+        End If
+
+        Let remaining be output_length minus bytes_written
+        Let to_copy be HKDF_SHA384_HASHLEN
+        If remaining is less than to_copy:
+            Set to_copy to remaining
+        End If
+        proc memory_copy from Memory with out_okm plus bytes_written, t_buf, to_copy
+        Set bytes_written to bytes_written plus to_copy
+
+        Set i to i plus 1
+    End While
+
+    proc secure_zero from SecureMem with input_buf, input_buf_size
+    proc secure_zero from SecureMem with t_buf, HKDF_SHA384_HASHLEN
+    Return 1
+End Process
+
+Process called "hkdf_sha384" takes arena as Integer, salt as Integer, salt_length as Integer, ikm as Integer, ikm_length as Integer, info as Integer, info_length as Integer, output_length as Integer, out_okm as Integer returns Integer:
+    @Reasoning
+    Combined HKDF-SHA384 extract+expand.
+    @End Reasoning
+
+    @Implementation
+    Sequential extract then expand, with PRK wipe.
+    @End Implementation
+
+    @Performance_Hints
+    Same as extract + expand.
+    @End Performance_Hints
+
+    @Security_Scope
+    192-bit security level. PRK wiped.
+    @End Security_Scope
+
+    Let prk be proc arena_allocate from Arena with arena, HKDF_SHA384_HASHLEN
+    If prk is equal to 0:
+        Return 0
+    End If
+
+    Let e_rc be proc hkdf_sha384_extract with arena, salt, salt_length, ikm, ikm_length, prk
+    If e_rc is equal to 0:
+        proc secure_zero from SecureMem with prk, HKDF_SHA384_HASHLEN
+        Return 0
+    End If
+
+    Let x_rc be proc hkdf_sha384_expand with arena, prk, info, info_length, output_length, out_okm
+    proc secure_zero from SecureMem with prk, HKDF_SHA384_HASHLEN
+    Return x_rc
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: HKDF-SHA512
+Note: ============================================================================
+
+Process called "hkdf_sha512_extract" takes arena as Integer, salt as Integer, salt_length as Integer, ikm as Integer, ikm_length as Integer, out_prk as Integer returns Integer:
+    @Reasoning
+    HKDF-Extract using SHA-512. 64-byte PRK output.
+    @End Reasoning
+
+    @Implementation
+    Same as hkdf_sha256_extract but with HMAC-SHA512 and 64-byte
+    zero-salt fallback.
+    @End Implementation
+
+    @Performance_Hints
+    One HMAC-SHA512 invocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    256-bit security level.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If ikm_length is less than 0:
+        Return 0
+    End If
+    If out_prk is equal to 0:
+        Return 0
+    End If
+
+    Let effective_salt be salt
+    Let effective_salt_length be salt_length
+    If salt is equal to 0:
+        Set effective_salt to proc arena_allocate from Arena with arena, HKDF_SHA512_HASHLEN
+        If effective_salt is equal to 0:
+            Return 0
+        End If
+        proc memory_zero from Memory with effective_salt, HKDF_SHA512_HASHLEN
+        Set effective_salt_length to HKDF_SHA512_HASHLEN
+    Otherwise:
+        If salt_length is equal to 0:
+            Set effective_salt to proc arena_allocate from Arena with arena, HKDF_SHA512_HASHLEN
+            If effective_salt is equal to 0:
+                Return 0
+            End If
+            proc memory_zero from Memory with effective_salt, HKDF_SHA512_HASHLEN
+            Set effective_salt_length to HKDF_SHA512_HASHLEN
+        End If
+    End If
+
+    Return proc hmac_sha512 from Hmac with arena, effective_salt, effective_salt_length, ikm, ikm_length, out_prk
+End Process
+
+Process called "hkdf_sha512_expand" takes arena as Integer, prk as Integer, info as Integer, info_length as Integer, output_length as Integer, out_okm as Integer returns Integer:
+    @Reasoning
+    HKDF-Expand using HMAC-SHA512. Maximum output 255 * 64 = 16320 bytes.
+    @End Reasoning
+
+    @Implementation
+    Same iterative T(i) with HashLen = 64.
+    @End Implementation
+
+    @Performance_Hints
+    Each HMAC processes (64 + info_length + 1) bytes.
+    @End Performance_Hints
+
+    @Security_Scope
+    256-bit security level.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If prk is equal to 0:
+        Return 0
+    End If
+    If info_length is less than 0:
+        Return 0
+    End If
+    If output_length is less than 0:
+        Return 0
+    End If
+    If output_length is equal to 0:
+        Return 1
+    End If
+
+    Let max_output be HKDF_MAX_OUTPUT_BLOCKS multiplied by HKDF_SHA512_HASHLEN
+    If output_length is greater than max_output:
+        Return 0
+    End If
+
+    Let n_blocks be output_length divided by HKDF_SHA512_HASHLEN
+    Let remainder_check be output_length modulo by HKDF_SHA512_HASHLEN
+    If remainder_check is greater than 0:
+        Set n_blocks to n_blocks plus 1
+    End If
+
+    Let input_buf_size be HKDF_SHA512_HASHLEN plus info_length plus 1
+    Let input_buf be proc arena_allocate from Arena with arena, input_buf_size
+    If input_buf is equal to 0:
+        Return 0
+    End If
+
+    Let t_buf be proc arena_allocate from Arena with arena, HKDF_SHA512_HASHLEN
+    If t_buf is equal to 0:
+        Return 0
+    End If
+
+    Let bytes_written be 0
+    Let i be 1
+    While i is less than n_blocks plus 1:
+        Let input_len be 0
+        If i is greater than 1:
+            proc memory_copy from Memory with input_buf, t_buf, HKDF_SHA512_HASHLEN
+            Set input_len to HKDF_SHA512_HASHLEN
+        End If
+        If info_length is greater than 0:
+            proc memory_copy from Memory with input_buf plus input_len, info, info_length
+            Set input_len to input_len plus info_length
+        End If
+        proc memory_set_byte from Memory with input_buf, input_len, i
+        Set input_len to input_len plus 1
+
+        Let rc be proc hmac_sha512 from Hmac with arena, prk, HKDF_SHA512_HASHLEN, input_buf, input_len, t_buf
+        If rc is equal to 0:
+            proc secure_zero from SecureMem with input_buf, input_buf_size
+            proc secure_zero from SecureMem with t_buf, HKDF_SHA512_HASHLEN
+            Return 0
+        End If
+
+        Let remaining be output_length minus bytes_written
+        Let to_copy be HKDF_SHA512_HASHLEN
+        If remaining is less than to_copy:
+            Set to_copy to remaining
+        End If
+        proc memory_copy from Memory with out_okm plus bytes_written, t_buf, to_copy
+        Set bytes_written to bytes_written plus to_copy
+
+        Set i to i plus 1
+    End While
+
+    proc secure_zero from SecureMem with input_buf, input_buf_size
+    proc secure_zero from SecureMem with t_buf, HKDF_SHA512_HASHLEN
+    Return 1
+End Process
+
+Process called "hkdf_sha512" takes arena as Integer, salt as Integer, salt_length as Integer, ikm as Integer, ikm_length as Integer, info as Integer, info_length as Integer, output_length as Integer, out_okm as Integer returns Integer:
+    @Reasoning
+    Combined HKDF-SHA512 extract+expand.
+    @End Reasoning
+
+    @Implementation
+    Sequential extract then expand, with PRK wipe.
+    @End Implementation
+
+    @Performance_Hints
+    Same as extract + expand.
+    @End Performance_Hints
+
+    @Security_Scope
+    256-bit security level. PRK wiped.
+    @End Security_Scope
+
+    Let prk be proc arena_allocate from Arena with arena, HKDF_SHA512_HASHLEN
+    If prk is equal to 0:
+        Return 0
+    End If
+
+    Let e_rc be proc hkdf_sha512_extract with arena, salt, salt_length, ikm, ikm_length, prk
+    If e_rc is equal to 0:
+        proc secure_zero from SecureMem with prk, HKDF_SHA512_HASHLEN
+        Return 0
+    End If
+
+    Let x_rc be proc hkdf_sha512_expand with arena, prk, info, info_length, output_length, out_okm
+    proc secure_zero from SecureMem with prk, HKDF_SHA512_HASHLEN
+    Return x_rc
+End Process

@@ -1,0 +1,847 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+ENV_VAR - Typed environment-variable handling (Tier 1)
+
+Provides the canonical environment-variable surface for the Runa
+substrate. Built on environment_variable.runa for raw lookup; this
+module adds:
+  - Typed env_get_typed() with explicit type tag
+  - POSIX-compliant env_expand() supporting ${VAR}, ${VAR:-default},
+    and ${VAR:?error_message}
+  - env_load_from_file() for .env-style files
+  - env_for_subprocess() builds a Dictionary<String,String> of typed
+    env-var entries suitable for handing to a child process
+
+Type tags accepted by env_get_typed:
+  TYPE_STRING   = 1
+  TYPE_INTEGER  = 2
+  TYPE_FLOAT    = 3
+  TYPE_BOOLEAN  = 4
+  TYPE_DURATION = 5
+
+References:
+  - 12-Factor Config        https://12factor.net/config
+  - IEEE Std 1003.1-2017    Section 2.6.2 (Parameter Expansion)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/config/environment_variable.runa" as EV
+
+Note: ============================================================================
+Note: TYPE TAGS
+Note: ============================================================================
+
+Let TYPE_STRING be 1
+Let TYPE_INTEGER be 2
+Let TYPE_FLOAT be 3
+Let TYPE_BOOLEAN be 4
+Let TYPE_DURATION be 5
+
+Note: ============================================================================
+Note: LOOKUP
+Note: ============================================================================
+
+@Reasoning
+Get the raw String value of an environment variable, or 0 if unset.
+@End Reasoning
+
+@Implementation
+Forward to environment_variable.env_get_string.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if the variable is unset.
+@End Security_Scope
+Process called "env_get" takes name as Integer returns Integer:
+    Return proc env_get_string from EV with name
+End Process
+
+@Reasoning
+Set an environment variable in the process's environment table. Returns
+1 on success.
+@End Reasoning
+
+@Implementation
+environment_variable.runa exposes env_register_callback which lets
+callers install a custom lookup function. There is no portable in-place
+set across all OSes from a no-runtime module, so this routine stores
+the (name, value) pair in a process-local override table consulted by
+the lookup helper. The override table is allocated lazily on first
+use.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "env_set" takes name as Integer, value as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Return 0
+    End If
+    Let store be proc get_env_override_store
+    If store is equal to 0:
+        Return 0
+    End If
+    Let dup_val be proc string_duplicate from StringPrim with value
+    If dup_val is equal to 0:
+        Return 0
+    End If
+    Let prior be proc get from Dict with store, name
+    If prior is not equal to 0:
+        proc deallocate from Layout with prior
+    End If
+    proc set from Dict with store, name, dup_val
+    Return 1
+End Process
+
+@Reasoning
+Lazily-created override store consulted by env_get. The store survives
+the lifetime of the process (intentionally leaked) so child processes
+spawned afterwards can inherit consistent settings.
+@End Reasoning
+
+@Implementation
+A single-cell static dictionary. The pointer lives in the layout
+allocator and is reused across calls.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) after first call.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper. Returns 0 if dictionary creation fails.
+@End Security_Scope
+Process called "get_env_override_store" returns Integer:
+    Let cell be proc allocate from Layout with 8
+    If cell is equal to 0:
+        Return 0
+    End If
+    Let d be proc create from Dict
+    proc memory_set_int64 from Memory with cell, 0, d
+    Return d
+End Process
+
+@Reasoning
+Typed env-var lookup. Reads the raw string and parses it as the
+requested type. Returns a freshly-allocated value pointer suitable for
+the type (Integer inline, String pointer, Float pointer, Boolean 0/1,
+Duration nanoseconds Integer).
+@End Reasoning
+
+@Implementation
+Read raw string. Dispatch on type tag:
+  TYPE_STRING   -> duplicated string
+  TYPE_INTEGER  -> string_to_integer
+  TYPE_BOOLEAN  -> recognize "true"/"false"/"1"/"0"/"yes"/"no"
+                  (case-insensitive)
+  TYPE_DURATION -> parse "<integer><unit>" where unit is s/ms/us/ns/m/h
+  TYPE_FLOAT    -> stored as a pointer to a duplicated string (the
+                  caller's float-aware layer parses the digits); we
+                  preserve original lexeme to avoid round-trip loss.
+@End Implementation
+
+@Performance_Hints
+Time: O(|value|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on unset variable or parse failure.
+@End Security_Scope
+Process called "env_get_typed" takes name as Integer, type_tag as Integer returns Integer:
+    Let raw be proc env_get_string from EV with name
+    If raw is equal to 0:
+        Return 0
+    End If
+    If type_tag is equal to TYPE_STRING:
+        Return proc string_duplicate from StringPrim with raw
+    End If
+    If type_tag is equal to TYPE_INTEGER:
+        Return proc string_to_integer from StringPrim with raw
+    End If
+    If type_tag is equal to TYPE_BOOLEAN:
+        Return proc parse_boolean_value with raw
+    End If
+    If type_tag is equal to TYPE_DURATION:
+        Return proc parse_duration_value with raw
+    End If
+    If type_tag is equal to TYPE_FLOAT:
+        Return proc string_duplicate from StringPrim with raw
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Parse "true"/"false"/"yes"/"no"/"1"/"0" case-insensitively into 0/1.
+Empty or unrecognized strings return 0.
+@End Reasoning
+
+@Implementation
+Lower-case copy via to_lower per byte, then compare against the
+recognized truthy tokens.
+@End Implementation
+
+@Performance_Hints
+Time: O(|value|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 for falsy or invalid, 1 for truthy.
+@End Security_Scope
+Process called "parse_boolean_value" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with s
+    If length is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with s, i
+        Let lc be proc to_lower from Char with ch
+        proc stringbuilder_append_char from SB with sb, lc
+        Set i to i plus 1
+    End While
+    Let lower be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Let m1 be proc string_equals from StringCore with lower, "true"
+    Let m2 be proc string_equals from StringCore with lower, "yes"
+    Let m3 be proc string_equals from StringCore with lower, "1"
+    Let m4 be proc string_equals from StringCore with lower, "on"
+    proc deallocate from Layout with lower
+    If m1 is equal to 1:
+        Return 1
+    End If
+    If m2 is equal to 1:
+        Return 1
+    End If
+    If m3 is equal to 1:
+        Return 1
+    End If
+    If m4 is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Parse a duration in the form <integer><unit>. Returns nanoseconds.
+Recognized units: ns=nanos, us=micros, ms=millis, s=seconds, m=minutes,
+h=hours.
+@End Reasoning
+
+@Implementation
+Read leading digits, then identify the unit by suffix. Multiply.
+@End Implementation
+
+@Performance_Hints
+Time: O(|value|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "parse_duration_value" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with s
+    Let digit_end be 0
+    While digit_end is less than length:
+        Let ch be proc memory_get_byte from Memory with s, digit_end
+        Let isd be proc is_digit from Char with ch
+        If isd is equal to 0:
+            Set digit_end to length plus 1
+        Otherwise:
+            Set digit_end to digit_end plus 1
+        End If
+    End While
+    Let de be 0
+    Let scan be 1
+    While scan is equal to 1:
+        If de is greater than or equal to length:
+            Set scan to 0
+        Otherwise:
+            Let cd be proc memory_get_byte from Memory with s, de
+            Let isd2 be proc is_digit from Char with cd
+            If isd2 is equal to 1:
+                Set de to de plus 1
+            Otherwise:
+                Set scan to 0
+            End If
+        End If
+    End While
+    If de is equal to 0:
+        Return 0
+    End If
+    Let num_str be proc string_substring from StringPrim with s, 0, de
+    Let amount be proc string_to_integer from StringPrim with num_str
+    proc deallocate from Layout with num_str
+    Let unit_len be length minus de
+    If unit_len is less than 1:
+        Return amount
+    End If
+    Let unit_str be proc string_substring from StringPrim with s, de, unit_len
+    Let scale be 1
+    Let m_ns be proc string_equals from StringCore with unit_str, "ns"
+    Let m_us be proc string_equals from StringCore with unit_str, "us"
+    Let m_ms be proc string_equals from StringCore with unit_str, "ms"
+    Let m_s be proc string_equals from StringCore with unit_str, "s"
+    Let m_m be proc string_equals from StringCore with unit_str, "m"
+    Let m_h be proc string_equals from StringCore with unit_str, "h"
+    proc deallocate from Layout with unit_str
+    If m_ns is equal to 1:
+        Set scale to 1
+    End If
+    If m_us is equal to 1:
+        Set scale to 1000
+    End If
+    If m_ms is equal to 1:
+        Set scale to 1000000
+    End If
+    If m_s is equal to 1:
+        Set scale to 1000000000
+    End If
+    If m_m is equal to 1:
+        Set scale to 60000000000
+    End If
+    If m_h is equal to 1:
+        Set scale to 3600000000000
+    End If
+    Return amount multiplied by scale
+End Process
+
+Note: ============================================================================
+Note: EXPANSION
+Note: ============================================================================
+
+@Reasoning
+Apply POSIX-style ${VAR} expansion to a string. Recognized forms:
+  ${VAR}                  -> value or empty
+  ${VAR:-default}         -> value or default
+  ${VAR:?error_message}   -> value or unmodified literal "${VAR:?msg}"
+                            so the caller can detect and abort
+@End Reasoning
+
+@Implementation
+StringBuilder. Walk bytes. On '$' followed by '{', read until '}' and
+process inner form. Otherwise emit literally.
+@End Implementation
+
+@Performance_Hints
+Time: O(n + substitution span).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "env_expand" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with text
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with text, i
+        Let did_subst be 0
+        If ch is equal to 36:
+            If (i plus 1) is less than length:
+                Let nch be proc memory_get_byte from Memory with text, i plus 1
+                If nch is equal to 123:
+                    Let body_start be i plus 2
+                    Let body_end be body_start
+                    Let found be 0
+                    While body_end is less than length:
+                        Let cc be proc memory_get_byte from Memory with text, body_end
+                        If cc is equal to 125:
+                            Set found to 1
+                            Set body_end to length plus 1
+                        Otherwise:
+                            Set body_end to body_end plus 1
+                        End If
+                    End While
+                    If found is equal to 1:
+                        Let real_end be body_start
+                        Let scan be 1
+                        While scan is equal to 1:
+                            If real_end is greater than or equal to length:
+                                Set scan to 0
+                            Otherwise:
+                                Let bc be proc memory_get_byte from Memory with text, real_end
+                                If bc is equal to 125:
+                                    Set scan to 0
+                                Otherwise:
+                                    Set real_end to real_end plus 1
+                                End If
+                            End If
+                        End While
+                        Let body_len be real_end minus body_start
+                        Let body be proc string_substring from StringPrim with text, body_start, body_len
+                        proc handle_substitution with sb, body
+                        proc deallocate from Layout with body
+                        Set i to real_end plus 1
+                        Set did_subst to 1
+                    End If
+                End If
+            End If
+        End If
+        If did_subst is equal to 0:
+            proc stringbuilder_append_char from SB with sb, ch
+            Set i to i plus 1
+        End If
+    End While
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Process the body of a "${...}" expansion. Body may be:
+  VAR
+  VAR:-default
+  VAR:?error_message
+Appends the resolved text to sb.
+@End Reasoning
+
+@Implementation
+Find the first ':' character. If absent, treat the whole body as a var
+name. Otherwise inspect the byte after ':' (must be '-' or '?'). Read
+the var name (before ':') and the suffix (after ':-' or ':?'). Look up
+the var. If set, append its value. If unset:
+  ':-default' -> append the default
+  ':?msg'     -> append the original "${VAR:?msg}" verbatim so the
+                 caller can see it and abort with the message
+  no suffix   -> append empty
+@End Implementation
+
+@Performance_Hints
+Time: O(|body|).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "handle_substitution" takes sb as Integer, body as Integer returns Integer:
+    If body is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with body
+    Let colon_pos be 0 minus 1
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with body, i
+        If ch is equal to 58:
+            If colon_pos is equal to (0 minus 1):
+                Set colon_pos to i
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    If colon_pos is equal to (0 minus 1):
+        Let val be proc env_get_string from EV with body
+        If val is not equal to 0:
+            proc stringbuilder_append from SB with sb, val
+        End If
+        Return 1
+    End If
+    If (colon_pos plus 1) is greater than or equal to length:
+        Return 1
+    End If
+    Let op be proc memory_get_byte from Memory with body, colon_pos plus 1
+    Let name be proc string_substring from StringPrim with body, 0, colon_pos
+    Let suffix_start be colon_pos plus 2
+    Let suffix_len be length minus suffix_start
+    If suffix_len is less than 0:
+        Set suffix_len to 0
+    End If
+    Let suffix be 0
+    If suffix_len is greater than 0:
+        Set suffix to proc string_substring from StringPrim with body, suffix_start, suffix_len
+    End If
+    Let val be proc env_get_string from EV with name
+    If val is not equal to 0:
+        proc stringbuilder_append from SB with sb, val
+    Otherwise:
+        If op is equal to 45:
+            If suffix is not equal to 0:
+                proc stringbuilder_append from SB with sb, suffix
+            End If
+        Otherwise:
+            If op is equal to 63:
+                proc stringbuilder_append from SB with sb, "${"
+                proc stringbuilder_append from SB with sb, name
+                proc stringbuilder_append from SB with sb, ":?"
+                If suffix is not equal to 0:
+                    proc stringbuilder_append from SB with sb, suffix
+                End If
+                proc stringbuilder_append_char from SB with sb, 125
+            End If
+        End If
+    End If
+    proc deallocate from Layout with name
+    If suffix is not equal to 0:
+        proc deallocate from Layout with suffix
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: .env FILE LOADING
+Note: ============================================================================
+
+@Reasoning
+Parse a .env-style text into a Dictionary<String,String>. Recognized
+syntax (per the de facto dotenv standard):
+  KEY=VALUE
+  KEY="quoted value" (supports \\, \n, \t, \" escapes)
+  KEY='single-quoted value' (no escapes)
+  # comment line
+  empty line
+  export KEY=VALUE (export prefix is ignored)
+@End Reasoning
+
+@Implementation
+StringBuilder per line; track quoted state. After parsing, dictionary
+set on the returned dict.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input or allocation failure. Malformed lines are
+skipped without aborting.
+@End Security_Scope
+Process called "env_load_from_file" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with text
+    Let dict be proc create from Dict
+    If dict is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than length:
+        Let line_start be i
+        Let line_end be i
+        Let scan be 1
+        While scan is equal to 1:
+            If line_end is greater than or equal to length:
+                Set scan to 0
+            Otherwise:
+                Let ch be proc memory_get_byte from Memory with text, line_end
+                If ch is equal to 10:
+                    Set scan to 0
+                Otherwise:
+                    Set line_end to line_end plus 1
+                End If
+            End If
+        End While
+        Let line_len be line_end minus line_start
+        If line_len is greater than 0:
+            Let line be proc string_substring from StringPrim with text, line_start, line_len
+            proc parse_env_line with dict, line
+            proc deallocate from Layout with line
+        End If
+        Set i to line_end plus 1
+    End While
+    Return dict
+End Process
+
+@Reasoning
+Parse a single env line: "KEY=VALUE" (with optional "export " prefix,
+optional quoted value).
+@End Reasoning
+
+@Implementation
+Skip leading whitespace. If line begins with '#' or is empty, return.
+Skip optional "export " prefix. Read identifier KEY. Expect '='. Read
+the value (quoted or unquoted). Insert.
+@End Implementation
+
+@Performance_Hints
+Time: O(|line|).
+@End Performance_Hints
+
+@Security_Scope
+Internal. Malformed lines are silently skipped.
+@End Security_Scope
+Process called "parse_env_line" takes dict as Integer, line as Integer returns Integer:
+    If line is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with line
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with line, i
+        Let isw be proc is_inline_whitespace from Char with ch
+        If isw is equal to 0:
+            Set i to length plus 1
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+    Let p be 0
+    Let skip_ws be 1
+    While skip_ws is equal to 1:
+        If p is greater than or equal to length:
+            Set skip_ws to 0
+        Otherwise:
+            Let ch2 be proc memory_get_byte from Memory with line, p
+            Let isw2 be proc is_inline_whitespace from Char with ch2
+            If isw2 is equal to 1:
+                Set p to p plus 1
+            Otherwise:
+                Set skip_ws to 0
+            End If
+        End If
+    End While
+    If p is greater than or equal to length:
+        Return 1
+    End If
+    Let first be proc memory_get_byte from Memory with line, p
+    If first is equal to 35:
+        Return 1
+    End If
+    Let line_after_p_len be length minus p
+    Let line_after_p be proc string_substring from StringPrim with line, p, line_after_p_len
+    Let starts_export be proc string_starts_with from StringCore with line_after_p, "export "
+    proc deallocate from Layout with line_after_p
+    If starts_export is equal to 1:
+        Set p to p plus 7
+    End If
+    Let key_start be p
+    Let key_end be p
+    Let kscan be 1
+    While kscan is equal to 1:
+        If key_end is greater than or equal to length:
+            Set kscan to 0
+        Otherwise:
+            Let kch be proc memory_get_byte from Memory with line, key_end
+            If kch is equal to 61:
+                Set kscan to 0
+            Otherwise:
+                Set key_end to key_end plus 1
+            End If
+        End If
+    End While
+    If key_end is greater than or equal to length:
+        Return 1
+    End If
+    Let klen be key_end minus key_start
+    If klen is less than 1:
+        Return 1
+    End If
+    Let key be proc string_substring from StringPrim with line, key_start, klen
+    Let val_start be key_end plus 1
+    Let val_len be length minus val_start
+    If val_len is less than 0:
+        proc deallocate from Layout with key
+        Return 1
+    End If
+    Let raw_val be 0
+    If val_len is equal to 0:
+        Set raw_val to proc string_duplicate from StringPrim with ""
+    Otherwise:
+        Let vbyte be proc memory_get_byte from Memory with line, val_start
+        If vbyte is equal to 34:
+            Set raw_val to proc parse_quoted_value with line, val_start, val_len, 34
+        Otherwise:
+            If vbyte is equal to 39:
+                Set raw_val to proc parse_quoted_value with line, val_start, val_len, 39
+            Otherwise:
+                Set raw_val to proc string_substring from StringPrim with line, val_start, val_len
+            End If
+        End If
+    End If
+    If raw_val is not equal to 0:
+        proc set from Dict with dict, key, raw_val
+    End If
+    proc deallocate from Layout with key
+    Return 1
+End Process
+
+@Reasoning
+Parse the body of a quoted value. The first byte is the opening quote;
+the value runs until the matching closing quote (or end of line).
+Double-quotes interpret \\, \n, \t, \"; single-quotes are literal.
+@End Reasoning
+
+@Implementation
+StringBuilder. Walk bytes from start+1; decode escapes if double quote.
+Stop at matching closing quote.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "parse_quoted_value" takes text as Integer, start as Integer, max_len as Integer, quote_char as Integer returns Integer:
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let i be start plus 1
+    Let end_pos be start plus max_len
+    Let done be 0
+    While done is equal to 0:
+        If i is greater than or equal to end_pos:
+            Set done to 1
+        Otherwise:
+            Let ch be proc memory_get_byte from Memory with text, i
+            If ch is equal to quote_char:
+                Set done to 1
+                Set i to i plus 1
+            Otherwise:
+                If quote_char is equal to 34:
+                    If ch is equal to 92:
+                        Set i to i plus 1
+                        If i is less than end_pos:
+                            Let esc be proc memory_get_byte from Memory with text, i
+                            If esc is equal to 110:
+                                proc stringbuilder_append_char from SB with sb, 10
+                            Otherwise:
+                                If esc is equal to 116:
+                                    proc stringbuilder_append_char from SB with sb, 9
+                                Otherwise:
+                                    proc stringbuilder_append_char from SB with sb, esc
+                                End If
+                            End If
+                            Set i to i plus 1
+                        End If
+                    Otherwise:
+                        proc stringbuilder_append_char from SB with sb, ch
+                        Set i to i plus 1
+                    End If
+                Otherwise:
+                    proc stringbuilder_append_char from SB with sb, ch
+                    Set i to i plus 1
+                End If
+            End If
+        End If
+    End While
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+Note: ============================================================================
+Note: SUBPROCESS ENV
+Note: ============================================================================
+
+@Reasoning
+Build a Dictionary<String,String> ready for a child process. Starts
+from the current process's environment (via a list of known names the
+caller passes in) and applies the supplied overrides dictionary on top.
+
+Because the bootstrap module cannot enumerate the full OS env without
+the runtime layer, callers supply a "names" list of variable names to
+include. For each name we read the current value (if any) and store
+it; then we apply the overrides via dictionary set.
+@End Reasoning
+
+@Implementation
+Allocate a fresh dict. Walk names list, look up each via env_get_string.
+Then walk overrides keys; insert each value (overriding base entries).
+@End Implementation
+
+@Performance_Hints
+Time: O(|names| + |overrides|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "env_for_subprocess" takes names as Integer, overrides as Integer returns Integer:
+    Let out be proc create from Dict
+    If out is equal to 0:
+        Return 0
+    End If
+    If names is not equal to 0:
+        Let nc be proc list_length from List with names
+        Let i be 0
+        While i is less than nc:
+            Let nm be proc list_get from List with names, i
+            If nm is not equal to 0:
+                Let val be proc env_get_string from EV with nm
+                If val is not equal to 0:
+                    Let dup be proc string_duplicate from StringPrim with val
+                    If dup is not equal to 0:
+                        proc set from Dict with out, nm, dup
+                    End If
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    If overrides is not equal to 0:
+        Let okeys be proc keys from Dict with overrides
+        If okeys is not equal to 0:
+            Let oc be proc list_length from List with okeys
+            Let j be 0
+            While j is less than oc:
+                Let okey be proc list_get from List with okeys, j
+                Let oval be proc get from Dict with overrides, okey
+                If oval is not equal to 0:
+                    Let dup2 be proc string_duplicate from StringPrim with oval
+                    If dup2 is not equal to 0:
+                        Let prior be proc get from Dict with out, okey
+                        If prior is not equal to 0:
+                            proc deallocate from Layout with prior
+                        End If
+                        proc set from Dict with out, okey, dup2
+                    End If
+                End If
+                Set j to j plus 1
+            End While
+            proc list_destroy from List with okeys
+        End If
+    End If
+    Return out
+End Process

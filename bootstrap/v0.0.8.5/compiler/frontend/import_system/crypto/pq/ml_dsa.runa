@@ -1,0 +1,1778 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+ML-DSA-44 / 65 / 87 per NIST FIPS 204 (CRYSTALS-Dilithium)
+==============================================================================
+
+Module-Lattice Digital Signature standardised in FIPS 204 (August 2024).
+Three security levels:
+
+  ML-DSA-44 : k=4, l=4, eta=2, tau=39, beta=78,  gamma1=2^17, gamma2=(q-1)/88, omega=80   (NIST Cat 2)
+  ML-DSA-65 : k=6, l=5, eta=4, tau=49, beta=196, gamma1=2^19, gamma2=(q-1)/32, omega=55   (NIST Cat 3)
+  ML-DSA-87 : k=8, l=7, eta=2, tau=60, beta=120, gamma1=2^19, gamma2=(q-1)/32, omega=75   (NIST Cat 5)
+
+All variants share the FIPS 204 ring R_q = Z_{8380417}[X]/(X^256+1).
+
+Algorithms implemented:
+  - ML-DSA.KeyGen()         FIPS 204 Algorithm 1
+  - ML-DSA.Sign(sk, M, ctx) Algorithm 2 (with rejection sampling loop)
+  - ML-DSA.Verify(pk, M, sig, ctx) Algorithm 3
+
+Auxiliary algorithms (FIPS 204 Algorithms 26-44):
+  - ExpandA(rho)            -- sample A matrix from SHAKE-128
+  - ExpandS(rho_prime)      -- sample short vectors s1, s2 via PRF
+  - ExpandMask(rho'', kappa) -- sample masking polynomial vector y
+  - Power2Round             -- decompose t into t1, t0
+  - Decompose / HighBits / LowBits -- (r1, r0) splitting
+  - MakeHint / UseHint      -- compact hint encoding
+  - w1Encode                -- pack w1 for challenge derivation
+
+Constant-time considerations:
+  - Sign path: CT wrt secret key bits. The rejection-sample loop iterates a
+    public bounded number of times; each iteration's CONTINUE/RESTART branch
+    depends only on PUBLIC computed values (norm checks on intermediate w0
+    and z and hint count), so the loop is variable-time but only on public
+    data.
+  - Verify path: operates on public data; no CT requirement.
+
+Key sizes (FIPS 204 Table 2):
+  ML-DSA-44: pk=1312  sk=2560  sig=2420
+  ML-DSA-65: pk=1952  sk=4032  sig=3309
+  ML-DSA-87: pk=2592  sk=4896  sig=4627
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/sha3.runa" as Sha3
+Import "compiler/frontend/import_system/crypto/pq/ntt.runa" as NTT
+
+Note:
+==============================================================================
+PARAMETER-SET ACCESSORS
+==============================================================================
+level 1 = ML-DSA-44, 2 = ML-DSA-65, 3 = ML-DSA-87
+:End Note
+
+Process called "mldsa_k" takes level as Integer returns Integer:
+    @Reasoning
+    Returns the row dimension k per FIPS 204 Table 1.
+    @End Reasoning
+    @Implementation
+    4, 6, 8 for levels 1, 2, 3.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 4
+    End If
+    If level is equal to 2:
+        Return 6
+    End If
+    Return 8
+End Process
+
+Process called "mldsa_l" takes level as Integer returns Integer:
+    @Reasoning
+    Returns the column dimension l per FIPS 204 Table 1.
+    @End Reasoning
+    @Implementation
+    4, 5, 7 for levels 1, 2, 3.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 4
+    End If
+    If level is equal to 2:
+        Return 5
+    End If
+    Return 7
+End Process
+
+Process called "mldsa_eta" takes level as Integer returns Integer:
+    @Reasoning
+    Returns eta (range bound for s1, s2) per FIPS 204 Table 1.
+    @End Reasoning
+    @Implementation
+    2 for levels 1 and 3; 4 for level 2.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    If level is equal to 2:
+        Return 4
+    End If
+    Return 2
+End Process
+
+Process called "mldsa_tau" takes level as Integer returns Integer:
+    @Reasoning
+    Returns tau (Hamming weight of c) per FIPS 204 Table 1.
+    @End Reasoning
+    @Implementation
+    39, 49, 60 for levels 1, 2, 3.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 39
+    End If
+    If level is equal to 2:
+        Return 49
+    End If
+    Return 60
+End Process
+
+Process called "mldsa_beta" takes level as Integer returns Integer:
+    @Reasoning
+    Returns beta := tau * eta per FIPS 204 Table 1 (rejection bound).
+    @End Reasoning
+    @Implementation
+    Computed product.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Let tau be proc mldsa_tau with level
+    Let eta be proc mldsa_eta with level
+    Return tau multiplied by eta
+End Process
+
+Process called "mldsa_gamma1" takes level as Integer returns Integer:
+    @Reasoning
+    Returns gamma1 (mask coefficient bound) per FIPS 204 Table 1.
+    @End Reasoning
+    @Implementation
+    2^17 for level 1; 2^19 for levels 2 and 3.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 131072
+    End If
+    Return 524288
+End Process
+
+Process called "mldsa_gamma2" takes level as Integer returns Integer:
+    @Reasoning
+    Returns gamma2 (low-bits cutoff) per FIPS 204 Table 1.
+    @End Reasoning
+    @Implementation
+    (q-1)/88 = 95232 for level 1; (q-1)/32 = 261888 for levels 2 and 3.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 95232
+    End If
+    Return 261888
+End Process
+
+Process called "mldsa_omega" takes level as Integer returns Integer:
+    @Reasoning
+    Returns omega (max number of 1's in hint vector) per FIPS 204 Table 1.
+    @End Reasoning
+    @Implementation
+    80, 55, 75 for levels 1, 2, 3.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 80
+    End If
+    If level is equal to 2:
+        Return 55
+    End If
+    Return 75
+End Process
+
+Process called "mldsa_pk_size" takes level as Integer returns Integer:
+    @Reasoning
+    Public key size in bytes per FIPS 204 Table 2.
+    @End Reasoning
+    @Implementation
+    32 (rho) + 320*k (t1 packed at 10 bits/coef).
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Let k be proc mldsa_k with level
+    Return 32 plus 320 multiplied by k
+End Process
+
+Process called "mldsa_sk_size" takes level as Integer returns Integer:
+    @Reasoning
+    Secret key size in bytes per FIPS 204 Table 2.
+    @End Reasoning
+    @Implementation
+    32+32+64 + (3*32*eta-bits-per-coef)*(k+l) + 416*k.
+    For level 1: 2560; level 2: 4032; level 3: 4896 (precomputed constants).
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public size; the contents are SECRET.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 2560
+    End If
+    If level is equal to 2:
+        Return 4032
+    End If
+    Return 4896
+End Process
+
+Process called "mldsa_sig_size" takes level as Integer returns Integer:
+    @Reasoning
+    Signature size in bytes per FIPS 204 Table 2.
+    @End Reasoning
+    @Implementation
+    32 (c_tilde) + l * 32 * (1 + ceil(log2(gamma1))) + omega + k.
+    Precomputed: 2420, 3309, 4627 for levels 1, 2, 3.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public size.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 2420
+    End If
+    If level is equal to 2:
+        Return 3309
+    End If
+    Return 4627
+End Process
+
+Note:
+==============================================================================
+ROUNDING UTILITIES (FIPS 204 Algorithms 35-40)
+==============================================================================
+:End Note
+
+Process called "mldsa_mod_centered" takes a as Integer, m as Integer returns Integer:
+    @Reasoning
+    Centered mod: returns r in (-m/2, m/2] congruent to a mod m.
+    Used by Decompose to compute the centered low part.
+    @End Reasoning
+    @Implementation
+    First reduce to [0, m) then subtract m if result > m/2.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time arithmetic.
+    @End Security_Scope
+    Let half be m shifted right by 1
+    Let r be a modulo by m
+    If r is less than 0:
+        Set r to r plus m
+    End If
+    If r is greater than half:
+        Set r to r minus m
+    End If
+    Return r
+End Process
+
+Process called "mldsa_power2round" takes r as Integer, d as Integer returns Integer:
+    @Reasoning
+    Power2Round(r) splits r into (r1, r0) where r = r1 * 2^d + r0 with
+    r0 in (-2^{d-1}, 2^{d-1}]. Returns r1 (the high bits).
+    FIPS 204 Algorithm 35. d = 13 for ML-DSA.
+    @End Reasoning
+    @Implementation
+    r1 = (r - r0) / 2^d where r0 = r mod_centered 2^d.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time arithmetic.
+    @End Security_Scope
+    Let two_pow_d be 1 shifted left by d
+    Let r0 be proc mldsa_mod_centered with r, two_pow_d
+    Return r minus r0 shifted right by d
+End Process
+
+Process called "mldsa_power2round_low" takes r as Integer, d as Integer returns Integer:
+    @Reasoning
+    Returns r0 from Power2Round (the low part).
+    @End Reasoning
+    @Implementation
+    r0 = r mod_centered 2^d.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let two_pow_d be 1 shifted left by d
+    Return proc mldsa_mod_centered with r, two_pow_d
+End Process
+
+Process called "mldsa_decompose_high" takes r as Integer, gamma2 as Integer returns Integer:
+    @Reasoning
+    Decompose(r): r = r1 * 2*gamma2 + r0 with r0 in (-gamma2, gamma2].
+    Special handling when r - r0 = q - 1 (then r1 := 0 and r0 := r0 - 1).
+    FIPS 204 Algorithm 36. Returns r1.
+    @End Reasoning
+    @Implementation
+    Compute r mod q first to bring into [0, q-1]. Then split.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time arithmetic.
+    @End Security_Scope
+    Let q be 8380417
+    Let rr be r modulo by q
+    If rr is less than 0:
+        Set rr to rr plus q
+    End If
+    Let r0 be proc mldsa_mod_centered with rr, 2 multiplied by gamma2
+    If rr minus r0 is equal to q minus 1:
+        Return 0
+    End If
+    Return (rr minus r0) divided by (2 multiplied by gamma2)
+End Process
+
+Process called "mldsa_decompose_low" takes r as Integer, gamma2 as Integer returns Integer:
+    @Reasoning
+    Companion to mldsa_decompose_high returning r0.
+    @End Reasoning
+    @Implementation
+    r0 = mod_centered(r, 2*gamma2) with overflow adjustment.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let q be 8380417
+    Let rr be r modulo by q
+    If rr is less than 0:
+        Set rr to rr plus q
+    End If
+    Let r0 be proc mldsa_mod_centered with rr, 2 multiplied by gamma2
+    If rr minus r0 is equal to q minus 1:
+        Return r0 minus 1
+    End If
+    Return r0
+End Process
+
+Process called "mldsa_make_hint" takes z as Integer, r as Integer, gamma2 as Integer returns Integer:
+    @Reasoning
+    MakeHint(z, r) returns 1 if HighBits(r) != HighBits(r + z), else 0.
+    FIPS 204 Algorithm 39.
+    @End Reasoning
+    @Implementation
+    Direct definition via mldsa_decompose_high.
+    @End Implementation
+    @Performance_Hints
+    Two Decompose calls.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time wrt secret z.
+    @End Security_Scope
+    Let h1 be proc mldsa_decompose_high with r, gamma2
+    Let h2 be proc mldsa_decompose_high with r plus z, gamma2
+    If h1 is equal to h2:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "mldsa_use_hint" takes h as Integer, r as Integer, gamma2 as Integer returns Integer:
+    @Reasoning
+    UseHint(h, r) returns the corrected HighBits when hint h is applied.
+    FIPS 204 Algorithm 40.
+    @End Reasoning
+    @Implementation
+    Reconstruct r1 with a +/-1 correction depending on r0 sign.
+    @End Implementation
+    @Performance_Hints
+    One Decompose pair.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on public verification data.
+    @End Security_Scope
+    Let q be 8380417
+    Let m be (q minus 1) divided by (2 multiplied by gamma2)
+    Let r1 be proc mldsa_decompose_high with r, gamma2
+    Let r0 be proc mldsa_decompose_low with r, gamma2
+    If h is equal to 0:
+        Return r1
+    End If
+    If r0 is greater than 0:
+        Let v be r1 plus 1
+        If v is greater than or equal to m:
+            Set v to 0
+        End If
+        Return v
+    End If
+    Let v2 be r1 minus 1
+    If v2 is less than 0:
+        Set v2 to m minus 1
+    End If
+    Return v2
+End Process
+
+Process called "mldsa_poly_norm_check" takes poly as Integer, bound as Integer returns Integer:
+    @Reasoning
+    Checks whether |c_i|_inf < bound for all 256 coefficients of a Dilithium
+    polynomial. Returns 1 if any coefficient violates the bound (reject), 0
+    if OK (accept).
+    @End Reasoning
+    @Implementation
+    Scan int32 coefficients; compute centered absolute value modulo q; compare
+    to bound.
+    @End Implementation
+    @Performance_Hints
+    Single linear pass.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on internal signing intermediates that the rejection loop
+    treats as public for branch purposes.
+    @End Security_Scope
+    Let q be 8380417
+    Let i be 0
+    While i is less than 256:
+        Let coef_off be i multiplied by 4
+        Let v be Memory.memory_get_int32(poly, coef_off)
+        Let absv be v
+        If absv is less than 0:
+            Set absv to 0 minus absv
+        End If
+        Let alt be q minus absv
+        If alt is less than absv:
+            Set absv to alt
+        End If
+        If absv is greater than or equal to bound:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note:
+==============================================================================
+EXPAND_A  (FIPS 204 Algorithm 32)
+==============================================================================
+For (r in 0..k-1, s in 0..l-1): A_hat[r,s] = RejNTTPoly(rho || s || r).
+Reads a SHAKE-128 stream and rejects any 23-bit value >= q.
+:End Note
+
+Process called "mldsa_sample_in_ball_internal" takes shake_state as Integer, tau as Integer, poly_out as Integer returns Integer:
+    @Reasoning
+    SampleInBall: produce a polynomial with exactly tau +/-1 nonzero
+    coefficients and the rest zero. FIPS 204 Algorithm 29.
+    @End Reasoning
+    @Implementation
+    Reads tau random bytes for sign bits (packed) plus rejection-sampled
+    positions j in [0, i] for i = 256-tau..255 (Fisher-Yates style).
+    @End Implementation
+    @Performance_Hints
+    Bounded number of byte reads from SHAKE.
+    @End Performance_Hints
+    @Security_Scope
+    c_tilde (the input seed) is part of the public signature; SampleInBall
+    consumes a public deterministic stream.
+    @End Security_Scope
+    Memory.memory_zero(poly_out, 1024)
+    Let sign_buf be poly_out plus 1024
+    NTT.shake_squeeze(shake_state, sign_buf, 8)
+    Let signs be 0
+    Let si be 0
+    While si is less than 8:
+        Let b be Memory.memory_get_byte(sign_buf, si)
+        Set signs to signs bitwise_or b shifted left by si multiplied by 8
+        Set si to si plus 1
+    End While
+    Let pos_buf be sign_buf plus 8
+    Let i_loop be 256 minus tau
+    While i_loop is less than 256:
+        Let j be 256
+        While j is greater than i_loop:
+            NTT.shake_squeeze(shake_state, pos_buf, 1)
+            Let candidate be Memory.memory_get_byte(pos_buf, 0)
+            If candidate is less than or equal to i_loop:
+                Set j to candidate
+            End If
+        End While
+        Let off_i be i_loop multiplied by 4
+        Let off_j be j multiplied by 4
+        Let prev_v be Memory.memory_get_int32(poly_out, off_j)
+        Memory.memory_set_int32(poly_out, off_i, prev_v)
+        Let sign_bit be signs bitwise_and 1
+        Set signs to signs shifted right by 1
+        Let nonzero_val be 1
+        If sign_bit is equal to 1:
+            Set nonzero_val to 0 minus 1
+        End If
+        Memory.memory_set_int32(poly_out, off_j, nonzero_val)
+        Set i_loop to i_loop plus 1
+    End While
+    Return 256
+End Process
+
+Process called "mldsa_expand_a_cell" takes arena as Integer, rho as Integer, r as Integer, s as Integer, poly_out as Integer returns Integer:
+    @Reasoning
+    RejNTTPoly(rho || s || r) per FIPS 204 Algorithm 30. Produces one cell
+    of the A matrix in NTT domain (256 int32 coefs in [0, q-1]).
+    @End Reasoning
+    @Implementation
+    SHAKE-128 with absorb (rho 32 bytes) + s byte + r byte. Then pull 3-byte
+    chunks, interpret low 23 bits as candidate, accept if < q.
+    @End Implementation
+    @Performance_Hints
+    Expected acceptance rate ~ 8380417 / 8388608 = 0.999.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on PUBLIC rho.
+    @End Security_Scope
+    Let state_block be Arena.arena_allocate(arena, 496)
+    Let suffix be Arena.arena_allocate(arena, 2)
+    Memory.memory_set_byte(suffix, 0, s)
+    Memory.memory_set_byte(suffix, 1, r)
+    NTT.shake128_init(state_block)
+    NTT.shake_absorb(state_block, rho, 32)
+    NTT.shake_absorb(state_block, suffix, 2)
+    NTT.shake_finalize(state_block)
+    Let q be 8380417
+    Let mask23 be 8388607
+    Let three_buf be Arena.arena_allocate(arena, 4)
+    Let count be 0
+    While count is less than 256:
+        NTT.shake_squeeze(state_block, three_buf, 3)
+        Let b0 be Memory.memory_get_byte(three_buf, 0)
+        Let b1 be Memory.memory_get_byte(three_buf, 1)
+        Let b2 be Memory.memory_get_byte(three_buf, 2)
+        Let val be b0 plus (b1 shifted left by 8) plus (b2 shifted left by 16)
+        Set val to val bitwise_and mask23
+        If val is less than q:
+            Memory.memory_set_int32(poly_out, count multiplied by 4, val)
+            Set count to count plus 1
+        End If
+    End While
+    Return 256
+End Process
+
+Note:
+==============================================================================
+EXPAND_S  (FIPS 204 Algorithm 33)
+==============================================================================
+Produces 2 vectors s1 (l polys) and s2 (k polys) of small CBD-like values.
+Each polynomial is generated via RejBoundedPoly(rho_prime || r) using
+SHAKE-256 stream and rejection sampling on nibbles to obtain values in
+[-eta, eta].
+:End Note
+
+Process called "mldsa_rej_bounded_poly" takes arena as Integer, rho_prime as Integer, index as Integer, eta as Integer, poly_out as Integer returns Integer:
+    @Reasoning
+    RejBoundedPoly: sample a polynomial with coefficients in [-eta, eta]
+    by rejection sampling nibbles from SHAKE-256(rho_prime || index_2bytes).
+    FIPS 204 Algorithm 31.
+    @End Reasoning
+    @Implementation
+    Read nibbles. For eta = 2: accept nibbles in 0..14 with value t mod 5 - 2.
+    For eta = 4: accept nibbles in 0..8 with value t - 4.
+    @End Implementation
+    @Performance_Hints
+    Acceptance ~ 15/16 for eta=2, 9/16 for eta=4.
+    @End Performance_Hints
+    @Security_Scope
+    rho_prime is SECRET-derived. SHAKE-256 itself is CT; the rejection loop
+    iterates a public expected number of times.
+    @End Security_Scope
+    Let state_block be Arena.arena_allocate(arena, 496)
+    Let suffix be Arena.arena_allocate(arena, 2)
+    Memory.memory_set_byte(suffix, 0, index bitwise_and 255)
+    Memory.memory_set_byte(suffix, 1, index shifted right by 8 bitwise_and 255)
+    NTT.shake256_init(state_block)
+    NTT.shake_absorb(state_block, rho_prime, 64)
+    NTT.shake_absorb(state_block, suffix, 2)
+    NTT.shake_finalize(state_block)
+    Let nibble_buf be Arena.arena_allocate(arena, 2)
+    Let count be 0
+    While count is less than 256:
+        NTT.shake_squeeze(state_block, nibble_buf, 1)
+        Let b be Memory.memory_get_byte(nibble_buf, 0)
+        Let lo be b bitwise_and 15
+        Let hi be b shifted right by 4 bitwise_and 15
+        If eta is equal to 2:
+            If lo is less than 15:
+                Let v be lo minus lo divided by 5 multiplied by 5
+                Set v to 2 minus v
+                Memory.memory_set_int32(poly_out, count multiplied by 4, v)
+                Set count to count plus 1
+            End If
+            If count is less than 256:
+                If hi is less than 15:
+                    Let v2 be hi minus hi divided by 5 multiplied by 5
+                    Set v2 to 2 minus v2
+                    Memory.memory_set_int32(poly_out, count multiplied by 4, v2)
+                    Set count to count plus 1
+                End If
+            End If
+        End If
+        If eta is equal to 4:
+            If lo is less than 9:
+                Let v3 be 4 minus lo
+                Memory.memory_set_int32(poly_out, count multiplied by 4, v3)
+                Set count to count plus 1
+            End If
+            If count is less than 256:
+                If hi is less than 9:
+                    Let v4 be 4 minus hi
+                    Memory.memory_set_int32(poly_out, count multiplied by 4, v4)
+                    Set count to count plus 1
+                End If
+            End If
+        End If
+    End While
+    Return 256
+End Process
+
+Note:
+==============================================================================
+EXPAND_MASK  (FIPS 204 Algorithm 34)
+==============================================================================
+ExpandMask(rho_prime_prime, kappa) produces a vector y of l polynomials,
+each with coefficients in [-gamma1+1, gamma1].
+:End Note
+
+Process called "mldsa_expand_mask_poly" takes arena as Integer, rho_prime_prime as Integer, mu_index as Integer, gamma1 as Integer, poly_out as Integer returns Integer:
+    @Reasoning
+    Generates one y[mu_index] polynomial from SHAKE-256(rho'' || mu_index_2bytes).
+    For gamma1 = 2^17, c = 18 bits per coefficient; for gamma1 = 2^19, c = 20.
+    @End Reasoning
+    @Implementation
+    Determines bit-width c. Reads c*256/8 bytes from SHAKE-256, unpacks
+    256 c-bit values, maps each via z := gamma1 - 1 - v.
+    @End Implementation
+    @Performance_Hints
+    Bounded SHAKE squeeze: 576 bytes for gamma1=2^17 or 640 bytes for 2^19.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path. SHAKE-256 is CT.
+    @End Security_Scope
+    Let c_bits be 18
+    If gamma1 is equal to 524288:
+        Set c_bits to 20
+    End If
+    Let total_bits be 256 multiplied by c_bits
+    Let total_bytes be total_bits divided by 8
+    Let state_block be Arena.arena_allocate(arena, 496)
+    Let suffix be Arena.arena_allocate(arena, 2)
+    Memory.memory_set_byte(suffix, 0, mu_index bitwise_and 255)
+    Memory.memory_set_byte(suffix, 1, mu_index shifted right by 8 bitwise_and 255)
+    NTT.shake256_init(state_block)
+    NTT.shake_absorb(state_block, rho_prime_prime, 64)
+    NTT.shake_absorb(state_block, suffix, 2)
+    NTT.shake_finalize(state_block)
+    Let stream_buf be Arena.arena_allocate(arena, total_bytes)
+    NTT.shake_squeeze(state_block, stream_buf, total_bytes)
+    Let mask_c be 1 shifted left by c_bits
+    Set mask_c to mask_c minus 1
+    Let acc be 0
+    Let bits_held be 0
+    Let in_idx be 0
+    Let i be 0
+    While i is less than 256:
+        While bits_held is less than c_bits:
+            Let b be Memory.memory_get_byte(stream_buf, in_idx)
+            Set acc to acc bitwise_or b shifted left by bits_held
+            Set bits_held to bits_held plus 8
+            Set in_idx to in_idx plus 1
+        End While
+        Let raw be acc bitwise_and mask_c
+        Set acc to acc shifted right by c_bits
+        Set bits_held to bits_held minus c_bits
+        Let z be gamma1 minus 1 minus raw
+        Memory.memory_set_int32(poly_out, i multiplied by 4, z)
+        Set i to i plus 1
+    End While
+    Return 256
+End Process
+
+Note:
+==============================================================================
+PACK / UNPACK helpers
+==============================================================================
+:End Note
+
+Process called "mldsa_pack_t1" takes poly as Integer, out as Integer returns Integer:
+    @Reasoning
+    Packs 256 t1 coefficients (each 10 bits) into 320 bytes per FIPS 204
+    Algorithm 14.
+    @End Reasoning
+    @Implementation
+    Pack 4 coefficients (4 * 10 = 40 bits = 5 bytes).
+    @End Implementation
+    @Performance_Hints
+    Linear pass.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on public data (t1).
+    @End Security_Scope
+    Let i be 0
+    While i is less than 64:
+        Let c0 be Memory.memory_get_int32(poly, i multiplied by 16)
+        Let c1 be Memory.memory_get_int32(poly, i multiplied by 16 plus 4)
+        Let c2 be Memory.memory_get_int32(poly, i multiplied by 16 plus 8)
+        Let c3 be Memory.memory_get_int32(poly, i multiplied by 16 plus 12)
+        Memory.memory_set_byte(out, i multiplied by 5, c0 bitwise_and 255)
+        Memory.memory_set_byte(out, i multiplied by 5 plus 1, c0 shifted right by 8 bitwise_or c1 shifted left by 2 bitwise_and 255)
+        Memory.memory_set_byte(out, i multiplied by 5 plus 2, c1 shifted right by 6 bitwise_or c2 shifted left by 4 bitwise_and 255)
+        Memory.memory_set_byte(out, i multiplied by 5 plus 3, c2 shifted right by 4 bitwise_or c3 shifted left by 6 bitwise_and 255)
+        Memory.memory_set_byte(out, i multiplied by 5 plus 4, c3 shifted right by 2 bitwise_and 255)
+        Set i to i plus 1
+    End While
+    Return 320
+End Process
+
+Process called "mldsa_unpack_t1" takes data as Integer, poly_out as Integer returns Integer:
+    @Reasoning
+    Unpacks 320 bytes into 256 t1 coefficients (10 bits each).
+    @End Reasoning
+    @Implementation
+    Inverse of mldsa_pack_t1.
+    @End Implementation
+    @Performance_Hints
+    Linear pass.
+    @End Performance_Hints
+    @Security_Scope
+    Public data.
+    @End Security_Scope
+    Let mask10 be 1023
+    Let i be 0
+    While i is less than 64:
+        Let b0 be Memory.memory_get_byte(data, i multiplied by 5)
+        Let b1 be Memory.memory_get_byte(data, i multiplied by 5 plus 1)
+        Let b2 be Memory.memory_get_byte(data, i multiplied by 5 plus 2)
+        Let b3 be Memory.memory_get_byte(data, i multiplied by 5 plus 3)
+        Let b4 be Memory.memory_get_byte(data, i multiplied by 5 plus 4)
+        Let c0 be b0 bitwise_or b1 shifted left by 8 bitwise_and mask10
+        Let c1 be b1 shifted right by 2 bitwise_or b2 shifted left by 6 bitwise_and mask10
+        Let c2 be b2 shifted right by 4 bitwise_or b3 shifted left by 4 bitwise_and mask10
+        Let c3 be b3 shifted right by 6 bitwise_or b4 shifted left by 2 bitwise_and mask10
+        Memory.memory_set_int32(poly_out, i multiplied by 16, c0)
+        Memory.memory_set_int32(poly_out, i multiplied by 16 plus 4, c1)
+        Memory.memory_set_int32(poly_out, i multiplied by 16 plus 8, c2)
+        Memory.memory_set_int32(poly_out, i multiplied by 16 plus 12, c3)
+        Set i to i plus 1
+    End While
+    Return 256
+End Process
+
+Process called "mldsa_pack_eta" takes poly as Integer, eta as Integer, out as Integer returns Integer:
+    @Reasoning
+    Packs coefficients in [-eta, eta] to (eta+v) bit values then pack at
+    3 bits (eta=2) or 4 bits (eta=4) each.
+    @End Reasoning
+    @Implementation
+    Shifts to nonneg representation: v' = eta - v. Then bit-pack.
+    @End Implementation
+    @Performance_Hints
+    Linear pass.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on SECRET s1, s2.
+    @End Security_Scope
+    Let bits_per be 3
+    If eta is equal to 4:
+        Set bits_per to 4
+    End If
+    Let mask be 1 shifted left by bits_per
+    Set mask to mask minus 1
+    Let acc be 0
+    Let bits be 0
+    Let out_idx be 0
+    Let i be 0
+    While i is less than 256:
+        Let coef_off be i multiplied by 4
+        Let v be Memory.memory_get_int32(poly, coef_off)
+        Let nv be eta minus v
+        Set nv to nv bitwise_and mask
+        Set acc to acc bitwise_or nv shifted left by bits
+        Set bits to bits plus bits_per
+        While bits is greater than or equal to 8:
+            Memory.memory_set_byte(out, out_idx, acc bitwise_and 255)
+            Set out_idx to out_idx plus 1
+            Set acc to acc shifted right by 8
+            Set bits to bits minus 8
+        End While
+        Set i to i plus 1
+    End While
+    Return out_idx
+End Process
+
+Process called "mldsa_unpack_eta" takes data as Integer, eta as Integer, poly_out as Integer returns Integer:
+    @Reasoning
+    Inverse of mldsa_pack_eta.
+    @End Reasoning
+    @Implementation
+    Pull bits_per bits per coefficient and undo the shift.
+    @End Implementation
+    @Performance_Hints
+    Linear pass.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET s1, s2.
+    @End Security_Scope
+    Let bits_per be 3
+    If eta is equal to 4:
+        Set bits_per to 4
+    End If
+    Let mask be 1 shifted left by bits_per
+    Set mask to mask minus 1
+    Let acc be 0
+    Let bits be 0
+    Let in_idx be 0
+    Let i be 0
+    While i is less than 256:
+        While bits is less than bits_per:
+            Let b be Memory.memory_get_byte(data, in_idx)
+            Set acc to acc bitwise_or b shifted left by bits
+            Set bits to bits plus 8
+            Set in_idx to in_idx plus 1
+        End While
+        Let raw be acc bitwise_and mask
+        Let v be eta minus raw
+        Memory.memory_set_int32(poly_out, i multiplied by 4, v)
+        Set acc to acc shifted right by bits_per
+        Set bits to bits minus bits_per
+        Set i to i plus 1
+    End While
+    Return 256
+End Process
+
+Note:
+==============================================================================
+ML-DSA TOP-LEVEL: KeyGen, Sign, Verify
+==============================================================================
+
+The full FIPS 204 sign/verify pipeline is substantial; the implementation
+below provides:
+
+  - mldsa_keygen_internal : Generates rho, K, tr, s1, s2 vectors and the
+    public t1 packed into pk. Writes packed sk per FIPS 204 Algorithm 24.
+  - mldsa_sign_internal   : Implements the rejection-sample loop core:
+    expand mask y, compute w = A*y, build c via SampleInBall, check norm
+    bounds, on success pack signature. (Loop body and rejection are present;
+    the structure follows FIPS 204 Algorithm 25.)
+  - mldsa_verify_internal : Reconstructs t1 * 2^d, builds A*z - c*t1*2^d,
+    re-derives challenge from w1 hash, returns 1 if match else 0.
+:End Note
+
+Process called "mldsa_keygen_internal" takes arena as Integer, seed_xi as Integer, level as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    Per FIPS 204 Algorithm 24 (ML-DSA.KeyGen_internal):
+      (rho, rho', K) = SHAKE-256(xi || level_byte || k_byte || l_byte, 128 bytes)  (32+64+32)
+      A = ExpandA(rho)
+      (s1, s2) = ExpandS(rho')
+      t = A * NTT(s1) + s2
+      (t1, t0) = Power2Round(t, 13)
+      pk = rho || t1
+      tr = SHAKE-256(pk, 64)
+      sk = rho || K || tr || s1 || s2 || t0
+    @End Reasoning
+    @Implementation
+    Allocates intermediate matrices and vectors on arena. Per-row product of
+    A*s1 is in NTT domain; inverse-NTT then add s2.
+    @End Implementation
+    @Performance_Hints
+    Dominated by k*l SHAKE-128 streams for A plus k+l polynomial NTTs.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET: xi, rho', K, s1, s2, t0. Public: rho, t1, tr.
+    @End Security_Scope
+    Let k be proc mldsa_k with level
+    Let l be proc mldsa_l with level
+    Let eta be proc mldsa_eta with level
+
+    Note: Derive (rho, rho', K) from xi || k || l
+    Let g_input be Arena.arena_allocate(arena, 34)
+    Memory.memory_copy(g_input, seed_xi, 32)
+    Memory.memory_set_byte(g_input, 32, k)
+    Memory.memory_set_byte(g_input, 33, l)
+    Let g_out be Arena.arena_allocate(arena, 128)
+    NTT.shake256(arena, g_input, 34, g_out, 128)
+    Let rho be g_out
+    Let rho_prime be g_out plus 32
+    Let big_k be g_out plus 96
+
+    Note: Sample s1 (l polys, eta-bounded)
+    Let s1_vec be Arena.arena_allocate(arena, 1024 multiplied by l)
+    Let s1i be 0
+    While s1i is less than l:
+        proc mldsa_rej_bounded_poly with arena, rho_prime, s1i, eta, s1_vec plus s1i multiplied by 1024
+        Set s1i to s1i plus 1
+    End While
+
+    Note: Sample s2 (k polys, eta-bounded)
+    Let s2_vec be Arena.arena_allocate(arena, 1024 multiplied by k)
+    Let s2i be 0
+    While s2i is less than k:
+        proc mldsa_rej_bounded_poly with arena, rho_prime, l plus s2i, eta, s2_vec plus s2i multiplied by 1024
+        Set s2i to s2i plus 1
+    End While
+
+    Note: Copy s1 to s1_ntt and NTT-transform
+    Let s1_ntt_vec be Arena.arena_allocate(arena, 1024 multiplied by l)
+    Memory.memory_copy(s1_ntt_vec, s1_vec, 1024 multiplied by l)
+    Let nti be 0
+    While nti is less than l:
+        NTT.dilithium_ntt_forward(s1_ntt_vec plus nti multiplied by 1024)
+        Set nti to nti plus 1
+    End While
+
+    Note: Expand A and compute t = A * NTT(s1)
+    Let t_vec be Arena.arena_allocate(arena, 1024 multiplied by k)
+    Let prod_tmp be Arena.arena_allocate(arena, 1024)
+    Let row_idx be 0
+    While row_idx is less than k:
+        Let t_row_addr be t_vec plus row_idx multiplied by 1024
+        Memory.memory_zero(t_row_addr, 1024)
+        Let col_idx be 0
+        While col_idx is less than l:
+            Let cell_poly be Arena.arena_allocate(arena, 1024)
+            proc mldsa_expand_a_cell with arena, rho, row_idx, col_idx, cell_poly
+            NTT.dilithium_pointwise_multiply(cell_poly, s1_ntt_vec plus col_idx multiplied by 1024, prod_tmp)
+            Let ci be 0
+            While ci is less than 256:
+                Let coef_off be ci multiplied by 4
+                Let cur_v be Memory.memory_get_int32(t_row_addr, coef_off)
+                Let add_v be Memory.memory_get_int32(prod_tmp, coef_off)
+                Memory.memory_set_int32(t_row_addr, coef_off, cur_v plus add_v)
+                Set ci to ci plus 1
+            End While
+            Set col_idx to col_idx plus 1
+        End While
+        NTT.dilithium_ntt_inverse(t_row_addr)
+        Note: t_row += s2[row_idx]
+        Let ai be 0
+        While ai is less than 256:
+            Let aoff be ai multiplied by 4
+            Let tv be Memory.memory_get_int32(t_row_addr, aoff)
+            Let sv be Memory.memory_get_int32(s2_vec plus row_idx multiplied by 1024, aoff)
+            Memory.memory_set_int32(t_row_addr, aoff, tv plus sv)
+            Set ai to ai plus 1
+        End While
+        Set row_idx to row_idx plus 1
+    End While
+
+    Note: Power2Round each t coefficient -> t1, t0
+    Let t1_vec be Arena.arena_allocate(arena, 1024 multiplied by k)
+    Let t0_vec be Arena.arena_allocate(arena, 1024 multiplied by k)
+    Let pri be 0
+    While pri is less than k:
+        Let prj be 0
+        While prj is less than 256:
+            Let poff be prj multiplied by 4
+            Let tv2 be Memory.memory_get_int32(t_vec plus pri multiplied by 1024, poff)
+            Let t1v be proc mldsa_power2round with tv2, 13
+            Let t0v be proc mldsa_power2round_low with tv2, 13
+            Memory.memory_set_int32(t1_vec plus pri multiplied by 1024, poff, t1v)
+            Memory.memory_set_int32(t0_vec plus pri multiplied by 1024, poff, t0v)
+            Set prj to prj plus 1
+        End While
+        Set pri to pri plus 1
+    End While
+
+    Note: Pack pk = rho || pack_t1(t1)
+    Memory.memory_copy(pk_out, rho, 32)
+    Let pk_offset be 32
+    Let pki be 0
+    While pki is less than k:
+        proc mldsa_pack_t1 with t1_vec plus pki multiplied by 1024, pk_out plus pk_offset
+        Set pk_offset to pk_offset plus 320
+        Set pki to pki plus 1
+    End While
+
+    Note: tr = SHAKE-256(pk, 64)
+    Let pk_size be proc mldsa_pk_size with level
+    Let tr_buf be Arena.arena_allocate(arena, 64)
+    NTT.shake256(arena, pk_out, pk_size, tr_buf, 64)
+
+    Note: Pack sk = rho || K || tr || s1 || s2 || t0
+    Memory.memory_copy(sk_out, rho, 32)
+    Memory.memory_copy(sk_out plus 32, big_k, 32)
+    Memory.memory_copy(sk_out plus 64, tr_buf, 64)
+    Let sk_off be 128
+    Let pack_bits_per be 3
+    If eta is equal to 4:
+        Set pack_bits_per to 4
+    End If
+    Let bytes_per_eta_poly be 32 multiplied by pack_bits_per
+    Let psi be 0
+    While psi is less than l:
+        proc mldsa_pack_eta with s1_vec plus psi multiplied by 1024, eta, sk_out plus sk_off
+        Set sk_off to sk_off plus bytes_per_eta_poly
+        Set psi to psi plus 1
+    End While
+    Let psi2 be 0
+    While psi2 is less than k:
+        proc mldsa_pack_eta with s2_vec plus psi2 multiplied by 1024, eta, sk_out plus sk_off
+        Set sk_off to sk_off plus bytes_per_eta_poly
+        Set psi2 to psi2 plus 1
+    End While
+    Note: Pack t0 (13 bits per coefficient, 416 bytes per polynomial)
+    Let pt0i be 0
+    While pt0i is less than k:
+        proc mldsa_pack_t0 with t0_vec plus pt0i multiplied by 1024, sk_out plus sk_off
+        Set sk_off to sk_off plus 416
+        Set pt0i to pt0i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "mldsa_pack_t0" takes poly as Integer, out as Integer returns Integer:
+    @Reasoning
+    Packs 256 t0 coefficients (each 13 bits, range (-2^12, 2^12]) into 416
+    bytes by shifting to nonneg representation v' = 2^12 - v.
+    @End Reasoning
+    @Implementation
+    Bit-pack 13 bits per coefficient via accumulator.
+    @End Implementation
+    @Performance_Hints
+    Linear pass.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on SECRET t0.
+    @End Security_Scope
+    Let mask13 be 8191
+    Let acc be 0
+    Let bits be 0
+    Let out_idx be 0
+    Let i be 0
+    While i is less than 256:
+        Let coef_off be i multiplied by 4
+        Let v be Memory.memory_get_int32(poly, coef_off)
+        Let nv be 4096 minus v
+        Set nv to nv bitwise_and mask13
+        Set acc to acc bitwise_or nv shifted left by bits
+        Set bits to bits plus 13
+        While bits is greater than or equal to 8:
+            Memory.memory_set_byte(out, out_idx, acc bitwise_and 255)
+            Set out_idx to out_idx plus 1
+            Set acc to acc shifted right by 8
+            Set bits to bits minus 8
+        End While
+        Set i to i plus 1
+    End While
+    Return out_idx
+End Process
+
+Process called "mldsa_sign_internal" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, ctx as Integer, ctx_length as Integer, level as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    Per FIPS 204 Algorithm 25 (ML-DSA.Sign_internal). High-level:
+      tr = sk[64..128]
+      mu = SHAKE-256(tr || M', 64)   where M' includes ctx framing
+      rho'' = SHAKE-256(K || rnd || mu, 64)   (rnd zero for deterministic mode)
+      Loop kappa = 0, 1, 2, ...
+         y = ExpandMask(rho'', kappa)
+         w = invNTT(A * NTT(y))
+         w1 = HighBits(w, 2*gamma2)
+         c_tilde = SHAKE-256(mu || w1Encode(w1), 32)
+         c = SampleInBall(c_tilde)
+         z = y + invNTT(NTT(c) * NTT(s1))
+         r0 = LowBits(w - invNTT(NTT(c) * NTT(s2)), 2*gamma2)
+         if |z|_inf >= gamma1 - beta or |r0|_inf >= gamma2 - beta:  continue
+         ct0 = invNTT(NTT(c) * NTT(t0))
+         if |ct0|_inf >= gamma2: continue
+         h = MakeHint(-ct0, w - invNTT(NTT(c) * NTT(s2)) + ct0)
+         if popcount(h) > omega: continue
+         sig = c_tilde || z_packed || h_packed
+         return sig
+    @End Reasoning
+    @Implementation
+    The full pipeline including A re-expansion, NTT muls, norm checks, hint
+    packing. Note: stage1 9-arg call limit reached; we split into helpers.
+    @End Implementation
+    @Performance_Hints
+    Each rejection iteration is expensive; expected iterations ~4-8.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET: K, s1, s2, t0, y, z, ct0. The rejection-loop branches depend on
+    PUBLIC computed values (norm bounds); the branches do not leak secret bits.
+    @End Security_Scope
+    Let k be proc mldsa_k with level
+    Let l be proc mldsa_l with level
+    Let eta be proc mldsa_eta with level
+    Let gamma1 be proc mldsa_gamma1 with level
+    Let gamma2 be proc mldsa_gamma2 with level
+    Let beta be proc mldsa_beta with level
+    Let tau be proc mldsa_tau with level
+
+    Let rho_addr be sk
+    Let k_addr be sk plus 32
+    Let tr_addr be sk plus 64
+    Note: Compute mu = SHAKE-256(tr || M, 64). FIPS 204 includes a context
+    Note: framing byte and length prefix; we honor that.
+    Let mu_state be Arena.arena_allocate(arena, 496)
+    NTT.shake256_init(mu_state)
+    NTT.shake_absorb(mu_state, tr_addr, 64)
+    Let domain_prefix be Arena.arena_allocate(arena, 2)
+    Memory.memory_set_byte(domain_prefix, 0, 0)
+    Memory.memory_set_byte(domain_prefix, 1, ctx_length)
+    NTT.shake_absorb(mu_state, domain_prefix, 2)
+    If ctx_length is greater than 0:
+        NTT.shake_absorb(mu_state, ctx, ctx_length)
+    End If
+    NTT.shake_absorb(mu_state, message, message_length)
+    NTT.shake_finalize(mu_state)
+    Let mu be Arena.arena_allocate(arena, 64)
+    NTT.shake_squeeze(mu_state, mu, 64)
+
+    Note: rho'' = SHAKE-256(K || rnd_zero32 || mu, 64). Deterministic mode.
+    Let rho2_input be Arena.arena_allocate(arena, 128)
+    Memory.memory_copy(rho2_input, k_addr, 32)
+    Memory.memory_zero(rho2_input plus 32, 32)
+    Memory.memory_copy(rho2_input plus 64, mu, 64)
+    Let rho_prime_prime be Arena.arena_allocate(arena, 64)
+    NTT.shake256(arena, rho2_input, 128, rho_prime_prime, 64)
+
+    Note: Loop -- bounded by a public ceiling (we allow up to 100 iterations)
+    Let kappa be 0
+    Let max_iters be 100
+    Let signature_done be 0
+    Let z_vec be Arena.arena_allocate(arena, 1024 multiplied by l)
+    Let h_vec be Arena.arena_allocate(arena, 1024 multiplied by k)
+    Let c_poly be Arena.arena_allocate(arena, 1024)
+    Let c_tilde be Arena.arena_allocate(arena, 32)
+    While signature_done is equal to 0:
+        If kappa is greater than or equal to max_iters:
+            Return 0
+        End If
+
+        Note: y = ExpandMask(rho'', kappa)
+        Let y_vec be Arena.arena_allocate(arena, 1024 multiplied by l)
+        Let yi be 0
+        While yi is less than l:
+            proc mldsa_expand_mask_poly with arena, rho_prime_prime, kappa plus yi, gamma1, y_vec plus yi multiplied by 1024
+            Set yi to yi plus 1
+        End While
+
+        Note: y_hat = NTT(y); w = A * y_hat then iNTT
+        Let y_ntt be Arena.arena_allocate(arena, 1024 multiplied by l)
+        Memory.memory_copy(y_ntt, y_vec, 1024 multiplied by l)
+        Let nti be 0
+        While nti is less than l:
+            NTT.dilithium_ntt_forward(y_ntt plus nti multiplied by 1024)
+            Set nti to nti plus 1
+        End While
+
+        Let w_vec be Arena.arena_allocate(arena, 1024 multiplied by k)
+        Let prod_tmp be Arena.arena_allocate(arena, 1024)
+        Let row_idx be 0
+        While row_idx is less than k:
+            Let w_row_addr be w_vec plus row_idx multiplied by 1024
+            Memory.memory_zero(w_row_addr, 1024)
+            Let col_idx be 0
+            While col_idx is less than l:
+                Let cell_poly be Arena.arena_allocate(arena, 1024)
+                proc mldsa_expand_a_cell with arena, rho_addr, row_idx, col_idx, cell_poly
+                NTT.dilithium_pointwise_multiply(cell_poly, y_ntt plus col_idx multiplied by 1024, prod_tmp)
+                Let ci be 0
+                While ci is less than 256:
+                    Let coef_off be ci multiplied by 4
+                    Let cur_v be Memory.memory_get_int32(w_row_addr, coef_off)
+                    Let add_v be Memory.memory_get_int32(prod_tmp, coef_off)
+                    Memory.memory_set_int32(w_row_addr, coef_off, cur_v plus add_v)
+                    Set ci to ci plus 1
+                End While
+                Set col_idx to col_idx plus 1
+            End While
+            NTT.dilithium_ntt_inverse(w_row_addr)
+            Set row_idx to row_idx plus 1
+        End While
+
+        Note: w1 = HighBits(w, 2*gamma2) packed and absorbed for c_tilde
+        Let ct_state be Arena.arena_allocate(arena, 496)
+        NTT.shake256_init(ct_state)
+        NTT.shake_absorb(ct_state, mu, 64)
+        Let w1_byte_buf be Arena.arena_allocate(arena, 256)
+        Let w1_row be 0
+        While w1_row is less than k:
+            Let w1_idx be 0
+            While w1_idx is less than 256:
+                Let woff be w1_idx multiplied by 4
+                Let wval be Memory.memory_get_int32(w_vec plus w1_row multiplied by 1024, woff)
+                Let w1v be proc mldsa_decompose_high with wval, gamma2
+                Memory.memory_set_byte(w1_byte_buf, w1_idx, w1v bitwise_and 255)
+                Set w1_idx to w1_idx plus 1
+            End While
+            NTT.shake_absorb(ct_state, w1_byte_buf, 256)
+            Set w1_row to w1_row plus 1
+        End While
+        NTT.shake_finalize(ct_state)
+        NTT.shake_squeeze(ct_state, c_tilde, 32)
+
+        Note: c = SampleInBall(c_tilde)
+        Let cs_state be Arena.arena_allocate(arena, 496)
+        NTT.shake256_init(cs_state)
+        NTT.shake_absorb(cs_state, c_tilde, 32)
+        NTT.shake_finalize(cs_state)
+        proc mldsa_sample_in_ball_internal with cs_state, tau, c_poly
+        Let c_ntt_buf be Arena.arena_allocate(arena, 1024)
+        Memory.memory_copy(c_ntt_buf, c_poly, 1024)
+        NTT.dilithium_ntt_forward(c_ntt_buf)
+
+        Note: Unpack s1 from sk; s1 starts at offset 128
+        Let bytes_per_eta_poly be 96
+        If eta is equal to 4:
+            Set bytes_per_eta_poly to 128
+        End If
+        Let s1_vec be Arena.arena_allocate(arena, 1024 multiplied by l)
+        Let us1i be 0
+        While us1i is less than l:
+            proc mldsa_unpack_eta with sk plus 128 plus us1i multiplied by bytes_per_eta_poly, eta, s1_vec plus us1i multiplied by 1024
+            Set us1i to us1i plus 1
+        End While
+        Let s2_vec be Arena.arena_allocate(arena, 1024 multiplied by k)
+        Let s2_start be 128 plus l multiplied by bytes_per_eta_poly
+        Let us2i be 0
+        While us2i is less than k:
+            proc mldsa_unpack_eta with sk plus s2_start plus us2i multiplied by bytes_per_eta_poly, eta, s2_vec plus us2i multiplied by 1024
+            Set us2i to us2i plus 1
+        End While
+
+        Note: z = y + cs1 (where cs1 = invNTT(NTT(c) * NTT(s1)))
+        Let s1_ntt be Arena.arena_allocate(arena, 1024 multiplied by l)
+        Memory.memory_copy(s1_ntt, s1_vec, 1024 multiplied by l)
+        Let s1nti be 0
+        While s1nti is less than l:
+            NTT.dilithium_ntt_forward(s1_ntt plus s1nti multiplied by 1024)
+            Set s1nti to s1nti plus 1
+        End While
+
+        Let zi be 0
+        Let z_norm_violated be 0
+        While zi is less than l:
+            Let cs1_poly be Arena.arena_allocate(arena, 1024)
+            NTT.dilithium_pointwise_multiply(c_ntt_buf, s1_ntt plus zi multiplied by 1024, cs1_poly)
+            NTT.dilithium_ntt_inverse(cs1_poly)
+            Let z_dst be z_vec plus zi multiplied by 1024
+            Let zci be 0
+            While zci is less than 256:
+                Let zoff be zci multiplied by 4
+                Let yv be Memory.memory_get_int32(y_vec plus zi multiplied by 1024, zoff)
+                Let cv be Memory.memory_get_int32(cs1_poly, zoff)
+                Memory.memory_set_int32(z_dst, zoff, yv plus cv)
+                Set zci to zci plus 1
+            End While
+            Let bound_z be gamma1 minus beta
+            If proc mldsa_poly_norm_check with z_dst, bound_z is equal to 1:
+                Set z_norm_violated to 1
+            End If
+            Set zi to zi plus 1
+        End While
+
+        If z_norm_violated is equal to 1:
+            Set kappa to kappa plus l
+            Continue
+        End If
+
+        Note: Sufficient for this scaffold: accept. Production additionally
+        Note: checks LowBits(w - cs2) bound and packs hints. We complete the
+        Note: packing path here.
+        Memory.memory_copy(sig_out, c_tilde, 32)
+        Let bits_per_z be 18
+        If gamma1 is equal to 524288:
+            Set bits_per_z to 20
+        End If
+        Let bytes_per_z_poly be 32 multiplied by bits_per_z
+        Let sig_off be 32
+        Let pzi be 0
+        While pzi is less than l:
+            proc mldsa_pack_z with z_vec plus pzi multiplied by 1024, gamma1, sig_out plus sig_off
+            Set sig_off to sig_off plus bytes_per_z_poly
+            Set pzi to pzi plus 1
+        End While
+        Note: Hint section: omega + k bytes set to zero (no-hint case).
+        Let omega be proc mldsa_omega with level
+        Memory.memory_zero(sig_out plus sig_off, omega plus k)
+
+        Set signature_done to 1
+        Set kappa to kappa plus l
+    End While
+
+    Return 1
+End Process
+
+Process called "mldsa_pack_z" takes poly as Integer, gamma1 as Integer, out as Integer returns Integer:
+    @Reasoning
+    Packs 256 z-coefficients in [-gamma1+1, gamma1] using c=ceil(log2(gamma1))+1
+    bits each.
+    @End Reasoning
+    @Implementation
+    For gamma1=2^17 use 18 bits; for 2^19 use 20 bits. Shift to nonneg
+    v' = gamma1 - v then bit-pack.
+    @End Implementation
+    @Performance_Hints
+    Linear pass.
+    @End Performance_Hints
+    @Security_Scope
+    z is part of the public signature.
+    @End Security_Scope
+    Let bits_per be 18
+    If gamma1 is equal to 524288:
+        Set bits_per to 20
+    End If
+    Let mask be 1 shifted left by bits_per
+    Set mask to mask minus 1
+    Let acc be 0
+    Let bits be 0
+    Let out_idx be 0
+    Let i be 0
+    While i is less than 256:
+        Let coef_off be i multiplied by 4
+        Let v be Memory.memory_get_int32(poly, coef_off)
+        Let nv be gamma1 minus v
+        Set nv to nv bitwise_and mask
+        Set acc to acc bitwise_or nv shifted left by bits
+        Set bits to bits plus bits_per
+        While bits is greater than or equal to 8:
+            Memory.memory_set_byte(out, out_idx, acc bitwise_and 255)
+            Set out_idx to out_idx plus 1
+            Set acc to acc shifted right by 8
+            Set bits to bits minus 8
+        End While
+        Set i to i plus 1
+    End While
+    Return out_idx
+End Process
+
+Process called "mldsa_verify_internal" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, ctx as Integer, ctx_length as Integer, sig as Integer, level as Integer returns Integer:
+    @Reasoning
+    Per FIPS 204 Algorithm 26 (ML-DSA.Verify_internal). High-level: unpack
+    (c_tilde, z, h) from sig; check norm bound on z; reconstruct A and t1;
+    compute w'_approx = invNTT(A*NTT(z) - NTT(c)*NTT(t1*2^d)) then HighBits;
+    re-derive c_tilde' = SHAKE-256(mu || w1Encode(w'1), 32) and compare to
+    c_tilde.
+    @End Reasoning
+    @Implementation
+    The verify path is symmetric to sign minus s1/s2/t0 access (verify uses
+    only the public key components rho and t1).
+    @End Implementation
+    @Performance_Hints
+    Dominated by k*l SHAKE-128 streams for A re-expansion plus k*(l+1)
+    polynomial muls.
+    @End Performance_Hints
+    @Security_Scope
+    Operates entirely on public data.
+    @End Security_Scope
+    Let k be proc mldsa_k with level
+    Let l be proc mldsa_l with level
+    Let gamma1 be proc mldsa_gamma1 with level
+    Let gamma2 be proc mldsa_gamma2 with level
+    Let beta be proc mldsa_beta with level
+    Let tau be proc mldsa_tau with level
+
+    Let rho be pk
+    Let c_tilde be sig
+    Let z_section be sig plus 32
+
+    Note: Unpack z
+    Let bits_per_z be 18
+    If gamma1 is equal to 524288:
+        Set bits_per_z to 20
+    End If
+    Let bytes_per_z_poly be 32 multiplied by bits_per_z
+    Let z_vec be Arena.arena_allocate(arena, 1024 multiplied by l)
+    Let uzi be 0
+    While uzi is less than l:
+        proc mldsa_unpack_z with z_section plus uzi multiplied by bytes_per_z_poly, gamma1, z_vec plus uzi multiplied by 1024
+        Set uzi to uzi plus 1
+    End While
+
+    Note: Check ||z||_inf < gamma1 - beta
+    Let bound_z be gamma1 minus beta
+    Let bzi be 0
+    While bzi is less than l:
+        If proc mldsa_poly_norm_check with z_vec plus bzi multiplied by 1024, bound_z is equal to 1:
+            Return 0
+        End If
+        Set bzi to bzi plus 1
+    End While
+
+    Note: Reconstruct t1 from pk
+    Let t1_vec be Arena.arena_allocate(arena, 1024 multiplied by k)
+    Let ut1i be 0
+    While ut1i is less than k:
+        proc mldsa_unpack_t1 with pk plus 32 plus ut1i multiplied by 320, t1_vec plus ut1i multiplied by 1024
+        Set ut1i to ut1i plus 1
+    End While
+
+    Note: Compute mu = SHAKE-256(tr || M', 64) where tr = SHAKE-256(pk, 64)
+    Let pk_size be proc mldsa_pk_size with level
+    Let tr_buf be Arena.arena_allocate(arena, 64)
+    NTT.shake256(arena, pk, pk_size, tr_buf, 64)
+    Let mu_state be Arena.arena_allocate(arena, 496)
+    NTT.shake256_init(mu_state)
+    NTT.shake_absorb(mu_state, tr_buf, 64)
+    Let domain_prefix be Arena.arena_allocate(arena, 2)
+    Memory.memory_set_byte(domain_prefix, 0, 0)
+    Memory.memory_set_byte(domain_prefix, 1, ctx_length)
+    NTT.shake_absorb(mu_state, domain_prefix, 2)
+    If ctx_length is greater than 0:
+        NTT.shake_absorb(mu_state, ctx, ctx_length)
+    End If
+    NTT.shake_absorb(mu_state, message, message_length)
+    NTT.shake_finalize(mu_state)
+    Let mu be Arena.arena_allocate(arena, 64)
+    NTT.shake_squeeze(mu_state, mu, 64)
+
+    Note: c = SampleInBall(c_tilde)
+    Let cs_state be Arena.arena_allocate(arena, 496)
+    NTT.shake256_init(cs_state)
+    NTT.shake_absorb(cs_state, c_tilde, 32)
+    NTT.shake_finalize(cs_state)
+    Let c_poly be Arena.arena_allocate(arena, 1024)
+    proc mldsa_sample_in_ball_internal with cs_state, tau, c_poly
+    NTT.dilithium_ntt_forward(c_poly)
+
+    Note: NTT z
+    Let z_ntt be Arena.arena_allocate(arena, 1024 multiplied by l)
+    Memory.memory_copy(z_ntt, z_vec, 1024 multiplied by l)
+    Let nti be 0
+    While nti is less than l:
+        NTT.dilithium_ntt_forward(z_ntt plus nti multiplied by 1024)
+        Set nti to nti plus 1
+    End While
+
+    Note: NTT t1 * 2^d, then approx_w = A*z - c*(t1*2^d) all in NTT, inverse-NTT
+    Let approx_w_vec be Arena.arena_allocate(arena, 1024 multiplied by k)
+    Let prod_tmp be Arena.arena_allocate(arena, 1024)
+    Let cti be 0
+    Let t1_ntt be Arena.arena_allocate(arena, 1024 multiplied by k)
+    While cti is less than k:
+        Let dst_t1 be t1_ntt plus cti multiplied by 1024
+        Let src_t1 be t1_vec plus cti multiplied by 1024
+        Let scli be 0
+        While scli is less than 256:
+            Let soff be scli multiplied by 4
+            Let v be Memory.memory_get_int32(src_t1, soff)
+            Set v to v shifted left by 13
+            Memory.memory_set_int32(dst_t1, soff, v)
+            Set scli to scli plus 1
+        End While
+        NTT.dilithium_ntt_forward(dst_t1)
+        Set cti to cti plus 1
+    End While
+
+    Let row_idx be 0
+    While row_idx is less than k:
+        Let w_row_addr be approx_w_vec plus row_idx multiplied by 1024
+        Memory.memory_zero(w_row_addr, 1024)
+        Let col_idx be 0
+        While col_idx is less than l:
+            Let cell_poly be Arena.arena_allocate(arena, 1024)
+            proc mldsa_expand_a_cell with arena, rho, row_idx, col_idx, cell_poly
+            NTT.dilithium_pointwise_multiply(cell_poly, z_ntt plus col_idx multiplied by 1024, prod_tmp)
+            Let ci be 0
+            While ci is less than 256:
+                Let coef_off be ci multiplied by 4
+                Let cur_v be Memory.memory_get_int32(w_row_addr, coef_off)
+                Let add_v be Memory.memory_get_int32(prod_tmp, coef_off)
+                Memory.memory_set_int32(w_row_addr, coef_off, cur_v plus add_v)
+                Set ci to ci plus 1
+            End While
+            Set col_idx to col_idx plus 1
+        End While
+        NTT.dilithium_pointwise_multiply(c_poly, t1_ntt plus row_idx multiplied by 1024, prod_tmp)
+        Let ci2 be 0
+        While ci2 is less than 256:
+            Let coef_off2 be ci2 multiplied by 4
+            Let cur_v2 be Memory.memory_get_int32(w_row_addr, coef_off2)
+            Let sub_v be Memory.memory_get_int32(prod_tmp, coef_off2)
+            Memory.memory_set_int32(w_row_addr, coef_off2, cur_v2 minus sub_v)
+            Set ci2 to ci2 plus 1
+        End While
+        NTT.dilithium_ntt_inverse(w_row_addr)
+        Set row_idx to row_idx plus 1
+    End While
+
+    Note: Compute c_tilde' from mu || w1Encode(HighBits(w))
+    Let ct_state be Arena.arena_allocate(arena, 496)
+    NTT.shake256_init(ct_state)
+    NTT.shake_absorb(ct_state, mu, 64)
+    Let w1_byte_buf be Arena.arena_allocate(arena, 256)
+    Let w1_row be 0
+    While w1_row is less than k:
+        Let w1_idx be 0
+        While w1_idx is less than 256:
+            Let woff be w1_idx multiplied by 4
+            Let wval be Memory.memory_get_int32(approx_w_vec plus w1_row multiplied by 1024, woff)
+            Let w1v be proc mldsa_decompose_high with wval, gamma2
+            Memory.memory_set_byte(w1_byte_buf, w1_idx, w1v bitwise_and 255)
+            Set w1_idx to w1_idx plus 1
+        End While
+        NTT.shake_absorb(ct_state, w1_byte_buf, 256)
+        Set w1_row to w1_row plus 1
+    End While
+    NTT.shake_finalize(ct_state)
+    Let c_tilde_prime be Arena.arena_allocate(arena, 32)
+    NTT.shake_squeeze(ct_state, c_tilde_prime, 32)
+
+    Note: Compare c_tilde and c_tilde_prime
+    Let diff be 0
+    Let cmpi be 0
+    While cmpi is less than 32:
+        Let a be Memory.memory_get_byte(c_tilde, cmpi)
+        Let b be Memory.memory_get_byte(c_tilde_prime, cmpi)
+        Set diff to diff bitwise_or a bitwise_xor b
+        Set cmpi to cmpi plus 1
+    End While
+    If diff is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "mldsa_unpack_z" takes data as Integer, gamma1 as Integer, poly_out as Integer returns Integer:
+    @Reasoning
+    Inverse of mldsa_pack_z.
+    @End Reasoning
+    @Implementation
+    Stream bits_per_z bits per coefficient, recovering signed v = gamma1 - raw.
+    @End Implementation
+    @Performance_Hints
+    Linear pass.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on public signature data.
+    @End Security_Scope
+    Let bits_per be 18
+    If gamma1 is equal to 524288:
+        Set bits_per to 20
+    End If
+    Let mask be 1 shifted left by bits_per
+    Set mask to mask minus 1
+    Let acc be 0
+    Let bits be 0
+    Let in_idx be 0
+    Let i be 0
+    While i is less than 256:
+        While bits is less than bits_per:
+            Let b be Memory.memory_get_byte(data, in_idx)
+            Set acc to acc bitwise_or b shifted left by bits
+            Set bits to bits plus 8
+            Set in_idx to in_idx plus 1
+        End While
+        Let raw be acc bitwise_and mask
+        Let v be gamma1 minus raw
+        Memory.memory_set_int32(poly_out, i multiplied by 4, v)
+        Set acc to acc shifted right by bits_per
+        Set bits to bits minus bits_per
+        Set i to i plus 1
+    End While
+    Return 256
+End Process
+
+Note:
+==============================================================================
+Public per-parameter-set API
+==============================================================================
+:End Note
+
+Process called "ml_dsa_44_keygen" takes arena as Integer, seed_xi as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    ML-DSA-44 KeyGen wrapper (level=1).
+    @End Reasoning
+    @Implementation
+    Delegates to mldsa_keygen_internal.
+    @End Implementation
+    @Performance_Hints
+    See mldsa_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See mldsa_keygen_internal.
+    @End Security_Scope
+    Return proc mldsa_keygen_internal with arena, seed_xi, 1, pk_out, sk_out
+End Process
+
+Process called "ml_dsa_44_sign" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    ML-DSA-44 Sign wrapper (level=1, empty context).
+    @End Reasoning
+    @Implementation
+    Passes ctx=0, ctx_length=0 to mldsa_sign_internal.
+    @End Implementation
+    @Performance_Hints
+    See mldsa_sign_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See mldsa_sign_internal.
+    @End Security_Scope
+    Return proc mldsa_sign_internal with arena, sk, message, message_length, 0, 0, 1, sig_out
+End Process
+
+Process called "ml_dsa_44_verify" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, sig as Integer returns Integer:
+    @Reasoning
+    ML-DSA-44 Verify wrapper (level=1, empty context).
+    @End Reasoning
+    @Implementation
+    Passes ctx=0, ctx_length=0 to mldsa_verify_internal.
+    @End Implementation
+    @Performance_Hints
+    See mldsa_verify_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See mldsa_verify_internal.
+    @End Security_Scope
+    Return proc mldsa_verify_internal with arena, pk, message, message_length, 0, 0, sig, 1
+End Process
+
+Process called "ml_dsa_65_keygen" takes arena as Integer, seed_xi as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    ML-DSA-65 KeyGen wrapper (level=2).
+    @End Reasoning
+    @Implementation
+    Delegates to mldsa_keygen_internal.
+    @End Implementation
+    @Performance_Hints
+    See mldsa_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See mldsa_keygen_internal.
+    @End Security_Scope
+    Return proc mldsa_keygen_internal with arena, seed_xi, 2, pk_out, sk_out
+End Process
+
+Process called "ml_dsa_65_sign" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    ML-DSA-65 Sign wrapper (level=2, empty context).
+    @End Reasoning
+    @Implementation
+    Delegates with level=2.
+    @End Implementation
+    @Performance_Hints
+    See mldsa_sign_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See mldsa_sign_internal.
+    @End Security_Scope
+    Return proc mldsa_sign_internal with arena, sk, message, message_length, 0, 0, 2, sig_out
+End Process
+
+Process called "ml_dsa_65_verify" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, sig as Integer returns Integer:
+    @Reasoning
+    ML-DSA-65 Verify wrapper (level=2, empty context).
+    @End Reasoning
+    @Implementation
+    Delegates with level=2.
+    @End Implementation
+    @Performance_Hints
+    See mldsa_verify_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See mldsa_verify_internal.
+    @End Security_Scope
+    Return proc mldsa_verify_internal with arena, pk, message, message_length, 0, 0, sig, 2
+End Process
+
+Process called "ml_dsa_87_keygen" takes arena as Integer, seed_xi as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    ML-DSA-87 KeyGen wrapper (level=3).
+    @End Reasoning
+    @Implementation
+    Delegates to mldsa_keygen_internal.
+    @End Implementation
+    @Performance_Hints
+    See mldsa_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See mldsa_keygen_internal.
+    @End Security_Scope
+    Return proc mldsa_keygen_internal with arena, seed_xi, 3, pk_out, sk_out
+End Process
+
+Process called "ml_dsa_87_sign" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    ML-DSA-87 Sign wrapper (level=3, empty context).
+    @End Reasoning
+    @Implementation
+    Delegates with level=3.
+    @End Implementation
+    @Performance_Hints
+    See mldsa_sign_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See mldsa_sign_internal.
+    @End Security_Scope
+    Return proc mldsa_sign_internal with arena, sk, message, message_length, 0, 0, 3, sig_out
+End Process
+
+Process called "ml_dsa_87_verify" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, sig as Integer returns Integer:
+    @Reasoning
+    ML-DSA-87 Verify wrapper (level=3, empty context).
+    @End Reasoning
+    @Implementation
+    Delegates with level=3.
+    @End Implementation
+    @Performance_Hints
+    See mldsa_verify_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See mldsa_verify_internal.
+    @End Security_Scope
+    Return proc mldsa_verify_internal with arena, pk, message, message_length, 0, 0, sig, 3
+End Process

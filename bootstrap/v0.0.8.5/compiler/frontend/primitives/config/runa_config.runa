@@ -1,0 +1,996 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+RUNA_CONFIG - Native Runa Configuration Format (Tier 1)
+
+The canonical Runa configuration substrate replacing TOML, YAML, INI,
+and ad-hoc JSON-as-config. The format is intentionally English-readable
+and round-tripping; whitespace is insignificant outside string literals.
+
+GRAMMAR (canonical):
+  document   := "Configuration:" decl* "End Configuration"
+  decl       := section | binding | include
+  section    := "Section \"" name "\":" decl* "End Section"
+  binding    := identifier "as" value
+  include    := "Include \"" path "\""
+  value      := scalar | list | section-inline
+  scalar     := "true" | "false" | "null" | integer
+              | quoted-string | datetime | duration
+  list       := "a list containing" value ("," value)*
+  section-inline := "{" (binding ",")* binding "}"
+  datetime   := "@datetime " ISO-8601
+  duration   := "@duration " integer-ns
+
+Each Section becomes a CV_MAP. Bindings within a Section become entries
+in that map. Top-level bindings under "Configuration:" become entries
+in the root map.
+
+The Include directive resolves a path RELATIVE TO the directory of the
+current source. Resolution is deferred to the caller via a callback to
+keep this module self-contained.
+
+References:
+  - TOML 1.0 ........ https://toml.io/en/v1.0.0
+  - YAML 1.2 ........ https://yaml.org/spec/1.2.2/
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/config/config.runa" as Cfg
+Import "compiler/frontend/primitives/config/config_value.runa" as CV
+
+Note: ============================================================================
+Note: PARSER STATE
+Note: ============================================================================
+
+Let PSTATE_SIZE be 24
+
+@Reasoning
+Allocate parser state.
+@End Reasoning
+
+@Implementation
+24 bytes: { text, length, pos }.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "rc_state_create" takes text as Integer returns Integer:
+    Let s be proc allocate from Layout with PSTATE_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with s, 0, text
+    Let length be 0
+    If text is not equal to 0:
+        Set length to proc string_length from StringCore with text
+    End If
+    proc memory_set_int64 from Memory with s, 8, length
+    proc memory_set_int64 from Memory with s, 16, 0
+    Return s
+End Process
+
+@Reasoning
+Skip whitespace and "Note:" comments to end-of-line.
+@End Reasoning
+
+@Implementation
+Advance while whitespace; if we see "Note:" or "Note " (followed by
+non-identifier byte), skip to next LF.
+@End Implementation
+
+@Performance_Hints
+Time: O(k).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "rc_skip_ws" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    Let going be 1
+    While going is equal to 1:
+        If pos is greater than or equal to length:
+            Set going to 0
+        Otherwise:
+            Let ch be proc memory_get_byte from Memory with text, pos
+            Let is_ws be proc is_whitespace from Char with ch
+            If is_ws is equal to 1:
+                Set pos to pos plus 1
+            Otherwise:
+                Let is_note be 0
+                If ch is equal to 78:
+                    If (pos plus 5) is less than length:
+                        Let n1 be proc memory_get_byte from Memory with text, pos plus 1
+                        Let n2 be proc memory_get_byte from Memory with text, pos plus 2
+                        Let n3 be proc memory_get_byte from Memory with text, pos plus 3
+                        Let n4 be proc memory_get_byte from Memory with text, pos plus 4
+                        If n1 is equal to 111:
+                            If n2 is equal to 116:
+                                If n3 is equal to 101:
+                                    If n4 is equal to 58:
+                                        Set is_note to 1
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+                If is_note is equal to 1:
+                    While pos is less than length:
+                        Let cc be proc memory_get_byte from Memory with text, pos
+                        Set pos to pos plus 1
+                        If cc is equal to 10:
+                            Set pos to length plus 1
+                        End If
+                    End While
+                    Set pos to proc memory_get_int64 from Memory with state, 16
+                    Set pos to pos plus 5
+                    Let inner_scan be 1
+                    While inner_scan is equal to 1:
+                        If pos is greater than or equal to length:
+                            Set inner_scan to 0
+                        Otherwise:
+                            Let cc2 be proc memory_get_byte from Memory with text, pos
+                            If cc2 is equal to 10:
+                                Set pos to pos plus 1
+                                Set inner_scan to 0
+                            Otherwise:
+                                Set pos to pos plus 1
+                            End If
+                        End If
+                    End While
+                Otherwise:
+                    Set going to 0
+                End If
+            End If
+        End If
+    End While
+    proc memory_set_int64 from Memory with state, 16, pos
+    Return 1
+End Process
+
+@Reasoning
+Try to consume an exact keyword followed by a non-identifier byte.
+Returns 1 on match (consumed), 0 otherwise.
+@End Reasoning
+
+@Implementation
+Compare bytes, then check trailing byte (whitespace, EOF, ':' permitted).
+@End Implementation
+
+@Performance_Hints
+Time: O(|kw|).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "rc_eat_keyword" takes state as Integer, kw as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    Let klen be proc string_length from StringCore with kw
+    If (pos plus klen) is greater than length:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than klen:
+        Let a be proc memory_get_byte from Memory with text, pos plus i
+        Let b be proc memory_get_byte from Memory with kw, i
+        If a is not equal to b:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Let after be pos plus klen
+    If after is less than length:
+        Let nch be proc memory_get_byte from Memory with text, after
+        Let cont be proc is_identifier_continue from Char with nch
+        If cont is equal to 1:
+            Return 0
+        End If
+    End If
+    proc memory_set_int64 from Memory with state, 16, after
+    Return 1
+End Process
+
+@Reasoning
+Consume an identifier and return it (caller owns).
+@End Reasoning
+
+@Implementation
+Verify first byte is identifier-start; advance through continue bytes;
+substring.
+@End Implementation
+
+@Performance_Hints
+Time: O(|id|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if no identifier.
+@End Security_Scope
+Process called "rc_read_identifier" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    If pos is greater than or equal to length:
+        Return 0
+    End If
+    Let first be proc memory_get_byte from Memory with text, pos
+    Let isstart be proc is_identifier_start from Char with first
+    If isstart is equal to 0:
+        Return 0
+    End If
+    Let start be pos
+    Set pos to pos plus 1
+    Let going be 1
+    While going is equal to 1:
+        If pos is greater than or equal to length:
+            Set going to 0
+        Otherwise:
+            Let ch be proc memory_get_byte from Memory with text, pos
+            Let cont be proc is_identifier_continue from Char with ch
+            If cont is equal to 1:
+                Set pos to pos plus 1
+            Otherwise:
+                Set going to 0
+            End If
+        End If
+    End While
+    Let slen be pos minus start
+    proc memory_set_int64 from Memory with state, 16, pos
+    Return proc string_substring from StringPrim with text, start, slen
+End Process
+
+@Reasoning
+Consume a quoted string literal at the cursor.
+@End Reasoning
+
+@Implementation
+Verify '"', walk decoding \\, \", \n; stop at closing '"'.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on unterminated.
+@End Security_Scope
+Process called "rc_read_string" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    If pos is greater than or equal to length:
+        Return 0
+    End If
+    Let opener be proc memory_get_byte from Memory with text, pos
+    If opener is not equal to 34:
+        Return 0
+    End If
+    Set pos to pos plus 1
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let done be 0
+    While done is equal to 0:
+        If pos is greater than or equal to length:
+            proc stringbuilder_destroy from SB with sb
+            Return 0
+        End If
+        Let ch be proc memory_get_byte from Memory with text, pos
+        Set pos to pos plus 1
+        If ch is equal to 34:
+            Set done to 1
+        Otherwise:
+            If ch is equal to 92:
+                If pos is greater than or equal to length:
+                    proc stringbuilder_destroy from SB with sb
+                    Return 0
+                End If
+                Let esc be proc memory_get_byte from Memory with text, pos
+                Set pos to pos plus 1
+                If esc is equal to 110:
+                    proc stringbuilder_append_char from SB with sb, 10
+                Otherwise:
+                    proc stringbuilder_append_char from SB with sb, esc
+                End If
+            Otherwise:
+                proc stringbuilder_append_char from SB with sb, ch
+            End If
+        End If
+    End While
+    proc memory_set_int64 from Memory with state, 16, pos
+    Let s be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return s
+End Process
+
+@Reasoning
+Read a signed integer at the cursor.
+@End Reasoning
+
+@Implementation
+Optionally consume '-'. Read digits. Substring, convert.
+@End Implementation
+
+@Performance_Hints
+Time: O(d).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 (and an out-flag set on the state? no — directly returns -1
+sentinel marker; callers verify by inspecting position).
+@End Security_Scope
+Process called "rc_read_integer" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    Let start be pos
+    If pos is less than length:
+        Let first be proc memory_get_byte from Memory with text, pos
+        If first is equal to 45:
+            Set pos to pos plus 1
+        End If
+    End If
+    Let any be 0
+    Let going be 1
+    While going is equal to 1:
+        If pos is greater than or equal to length:
+            Set going to 0
+        Otherwise:
+            Let cd be proc memory_get_byte from Memory with text, pos
+            Let isd be proc is_digit from Char with cd
+            If isd is equal to 1:
+                Set pos to pos plus 1
+                Set any to 1
+            Otherwise:
+                Set going to 0
+            End If
+        End If
+    End While
+    If any is equal to 0:
+        Return 0 minus 1
+    End If
+    Let slen be pos minus start
+    Let span be proc string_substring from StringPrim with text, start, slen
+    proc memory_set_int64 from Memory with state, 16, pos
+    Let iv be proc string_to_integer from StringPrim with span
+    proc deallocate from Layout with span
+    Return iv
+End Process
+
+Note: ============================================================================
+Note: VALUE PARSER
+Note: ============================================================================
+
+@Reasoning
+Parse one value at the cursor and return its ConfigValue. Recognized
+forms: scalar (null/true/false/integer/string/datetime/duration) and
+"a list containing ..." list.
+@End Reasoning
+
+@Implementation
+Skip whitespace. Try each form in turn.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "rc_parse_value" takes state as Integer returns Integer:
+    proc rc_skip_ws with state
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    If pos is greater than or equal to length:
+        Return 0
+    End If
+
+    Let did_null be proc rc_eat_keyword with state, "null"
+    If did_null is equal to 1:
+        Return proc config_value_null from Cfg
+    End If
+    Let did_true be proc rc_eat_keyword with state, "true"
+    If did_true is equal to 1:
+        Return proc config_value_bool from Cfg with 1
+    End If
+    Let did_false be proc rc_eat_keyword with state, "false"
+    If did_false is equal to 1:
+        Return proc config_value_bool from Cfg with 0
+    End If
+    Let did_list be proc rc_eat_keyword with state, "a"
+    If did_list is equal to 1:
+        proc rc_skip_ws with state
+        Let did_l be proc rc_eat_keyword with state, "list"
+        If did_l is equal to 0:
+            Return 0
+        End If
+        proc rc_skip_ws with state
+        Let did_c be proc rc_eat_keyword with state, "containing"
+        If did_c is equal to 0:
+            Return 0
+        End If
+        Return proc rc_parse_list_values with state
+    End If
+
+    Let ch be proc memory_get_byte from Memory with text, pos
+    If ch is equal to 34:
+        Let s be proc rc_read_string with state
+        If s is equal to 0:
+            Return 0
+        End If
+        Let cv be proc config_value_string from Cfg with s
+        proc deallocate from Layout with s
+        Return cv
+    End If
+
+    If ch is equal to 64:
+        Set pos to pos plus 1
+        proc memory_set_int64 from Memory with state, 16, pos
+        Let marker be proc rc_read_identifier with state
+        If marker is equal to 0:
+            Return 0
+        End If
+        Let is_dt be proc string_equals from StringCore with marker, "datetime"
+        Let is_dur be proc string_equals from StringCore with marker, "duration"
+        proc deallocate from Layout with marker
+        proc rc_skip_ws with state
+        If is_dt is equal to 1:
+            Let p2 be proc memory_get_int64 from Memory with state, 16
+            If p2 is less than length:
+                Let nxt be proc memory_get_byte from Memory with text, p2
+                If nxt is equal to 34:
+                    Let s2 be proc rc_read_string with state
+                    If s2 is equal to 0:
+                        Return 0
+                    End If
+                    Let cv2 be proc config_value_datetime from CV with s2
+                    proc deallocate from Layout with s2
+                    Return cv2
+                End If
+            End If
+            Return 0
+        End If
+        If is_dur is equal to 1:
+            Let ns be proc rc_read_integer with state
+            If ns is equal to (0 minus 1):
+                Return 0
+            End If
+            Return proc config_value_duration from CV with ns
+        End If
+        Return 0
+    End If
+
+    Let isdig be 0
+    If ch is greater than or equal to 48:
+        If ch is less than or equal to 57:
+            Set isdig to 1
+        End If
+    End If
+    If ch is equal to 45:
+        Set isdig to 1
+    End If
+    If isdig is equal to 1:
+        Let iv be proc rc_read_integer with state
+        If iv is equal to (0 minus 1):
+            Return 0
+        End If
+        Return proc config_value_integer from Cfg with iv
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Parse the value-list part of "a list containing v1, v2, v3" up to the
+next newline or 'End' keyword.
+@End Reasoning
+
+@Implementation
+Loop parsing one value, then optional ','. Stop at newline that is not
+preceded by ','.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "rc_parse_list_values" takes state as Integer returns Integer:
+    Let lst be proc list_create from List
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let going be 1
+    While going is equal to 1:
+        proc rc_skip_ws with state
+        Let v be proc rc_parse_value with state
+        If v is equal to 0:
+            proc list_destroy from List with lst
+            Return 0
+        End If
+        proc list_push from List with lst, v
+        proc rc_skip_ws with state
+        Let text be proc memory_get_int64 from Memory with state, 0
+        Let length be proc memory_get_int64 from Memory with state, 8
+        Let pos be proc memory_get_int64 from Memory with state, 16
+        If pos is greater than or equal to length:
+            Set going to 0
+        Otherwise:
+            Let ch be proc memory_get_byte from Memory with text, pos
+            If ch is equal to 44:
+                proc memory_set_int64 from Memory with state, 16, pos plus 1
+            Otherwise:
+                Set going to 0
+            End If
+        End If
+    End While
+    Return proc config_value_list from Cfg with lst
+End Process
+
+Note: ============================================================================
+Note: TOP-LEVEL PARSER
+Note: ============================================================================
+
+@Reasoning
+Parse a complete runa-config text and return its root ConfigValue
+(always a CV_MAP).
+@End Reasoning
+
+@Implementation
+Expect "Configuration:" header. Loop over declarations:
+  - "End Configuration" -> done
+  - "Section \"name\":" -> recurse, store as CV_MAP at name
+  - "Include \"path\"" -> ignored at this layer (parser preserves no
+    file IO); higher-layer loader resolves
+  - identifier "as" value -> binding
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure or null input.
+@End Security_Scope
+Process called "runa_config_parse" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let state be proc rc_state_create with source
+    If state is equal to 0:
+        Return 0
+    End If
+    proc rc_skip_ws with state
+    Let did_hdr be proc rc_eat_keyword with state, "Configuration"
+    If did_hdr is equal to 0:
+        proc deallocate from Layout with state
+        Return 0
+    End If
+    proc rc_skip_ws with state
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    If pos is greater than or equal to length:
+        proc deallocate from Layout with state
+        Return 0
+    End If
+    Let colon be proc memory_get_byte from Memory with text, pos
+    If colon is not equal to 58:
+        proc deallocate from Layout with state
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with state, 16, pos plus 1
+    Let root_dict be proc create from Dict
+    If root_dict is equal to 0:
+        proc deallocate from Layout with state
+        Return 0
+    End If
+    Let ok be proc rc_parse_decls with state, root_dict, "End Configuration"
+    proc deallocate from Layout with state
+    If ok is equal to 0:
+        proc destroy from Dict with root_dict
+        Return 0
+    End If
+    Return proc config_value_map from Cfg with root_dict
+End Process
+
+@Reasoning
+Loop body: parse declarations into the supplied dictionary until the
+expected terminator keyword is reached.
+
+Include directives are recognized syntactically and the path strings are
+recorded in a fresh CV_LIST under root key `__includes`. Resolution of
+included content is the responsibility of a higher loader layer that
+walks `__includes`, fetches each file, and merges its parsed CV tree.
+@End Reasoning
+
+@Implementation
+Loop:
+  - Skip ws.
+  - If terminator keyword present, consume and return.
+  - If "Section": parse name, recurse with terminator "End Section".
+  - If "Include": parse path string; ensure the dictionary has a
+    `__includes` CV_LIST, then append the path as a CV_STRING.
+  - Otherwise: identifier "as" value.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 1 on success, 0 on failure.
+@End Security_Scope
+Process called "rc_parse_decls" takes state as Integer, dict as Integer, terminator as Integer returns Integer:
+    Let going be 1
+    While going is equal to 1:
+        proc rc_skip_ws with state
+        Let did_end be proc rc_eat_keyword with state, terminator
+        If did_end is equal to 1:
+            Set going to 0
+        Otherwise:
+            Let length be proc memory_get_int64 from Memory with state, 8
+            Let pos be proc memory_get_int64 from Memory with state, 16
+            If pos is greater than or equal to length:
+                Return 0
+            End If
+            Let did_section be proc rc_eat_keyword with state, "Section"
+            If did_section is equal to 1:
+                proc rc_skip_ws with state
+                Let name be proc rc_read_string with state
+                If name is equal to 0:
+                    Return 0
+                End If
+                proc rc_skip_ws with state
+                Let text2 be proc memory_get_int64 from Memory with state, 0
+                Let p2 be proc memory_get_int64 from Memory with state, 16
+                Let l2 be proc memory_get_int64 from Memory with state, 8
+                If p2 is greater than or equal to l2:
+                    proc deallocate from Layout with name
+                    Return 0
+                End If
+                Let colon be proc memory_get_byte from Memory with text2, p2
+                If colon is not equal to 58:
+                    proc deallocate from Layout with name
+                    Return 0
+                End If
+                proc memory_set_int64 from Memory with state, 16, p2 plus 1
+                Let sub_dict be proc create from Dict
+                If sub_dict is equal to 0:
+                    proc deallocate from Layout with name
+                    Return 0
+                End If
+                Let inner_ok be proc rc_parse_decls with state, sub_dict, "End Section"
+                If inner_ok is equal to 0:
+                    proc deallocate from Layout with name
+                    proc destroy from Dict with sub_dict
+                    Return 0
+                End If
+                Let sub_cv be proc config_value_map from Cfg with sub_dict
+                proc set from Dict with dict, name, sub_cv
+                proc deallocate from Layout with name
+            Otherwise:
+                Let did_include be proc rc_eat_keyword with state, "Include"
+                If did_include is equal to 1:
+                    proc rc_skip_ws with state
+                    Let path be proc rc_read_string with state
+                    If path is equal to 0:
+                        Return 0
+                    End If
+                    Let inc_existing be proc get from Dict with dict, "__includes"
+                    Let inc_list be 0
+                    If inc_existing is equal to 0:
+                        Set inc_list to proc list_create from List
+                        If inc_list is equal to 0:
+                            proc deallocate from Layout with path
+                            Return 0
+                        End If
+                        Let inc_cv be proc config_value_list from Cfg with inc_list
+                        If inc_cv is equal to 0:
+                            proc list_destroy from List with inc_list
+                            proc deallocate from Layout with path
+                            Return 0
+                        End If
+                        proc set from Dict with dict, "__includes", inc_cv
+                    Otherwise:
+                        Set inc_list to proc config_value_as_list from Cfg with inc_existing
+                        If inc_list is equal to 0:
+                            proc deallocate from Layout with path
+                            Return 0
+                        End If
+                    End If
+                    Let path_cv be proc config_value_string from Cfg with path
+                    proc deallocate from Layout with path
+                    If path_cv is equal to 0:
+                        Return 0
+                    End If
+                    proc list_append from List with inc_list, path_cv
+                Otherwise:
+                    Let key be proc rc_read_identifier with state
+                    If key is equal to 0:
+                        Return 0
+                    End If
+                    proc rc_skip_ws with state
+                    Let did_as be proc rc_eat_keyword with state, "as"
+                    If did_as is equal to 0:
+                        proc deallocate from Layout with key
+                        Return 0
+                    End If
+                    proc rc_skip_ws with state
+                    Let v be proc rc_parse_value with state
+                    If v is equal to 0:
+                        proc deallocate from Layout with key
+                        Return 0
+                    End If
+                    proc set from Dict with dict, key, v
+                    proc deallocate from Layout with key
+                End If
+            End If
+        End If
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SERIALIZE
+Note: ============================================================================
+
+@Reasoning
+Serialize a ConfigValue tree back into the canonical Runa-config format.
+The root is always written as "Configuration: ... End Configuration".
+Each top-level key whose value is a CV_MAP becomes a Section; other
+top-level keys become bindings.
+@End Reasoning
+
+@Implementation
+StringBuilder. Emit header, walk dictionary, emit per-entry. Nested maps
+become Section blocks with 4-space indent.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "runa_config_serialize" takes root as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with root, 0
+    If kind is not equal to 6:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append from SB with sb, "Configuration:\n"
+    proc emit_map_body with sb, root, 4
+    proc stringbuilder_append from SB with sb, "End Configuration\n"
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Emit the body of a CV_MAP at the supplied indent.
+@End Reasoning
+
+@Implementation
+Walk dict keys. For each:
+  - CV_MAP -> "Section \"<key>\":" body "End Section"
+  - else  -> "<key> as <value>"
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "emit_map_body" takes sb as Integer, map_cv as Integer, indent as Integer returns Integer:
+    Let map be proc memory_get_int64 from Memory with map_cv, 8
+    If map is equal to 0:
+        Return 1
+    End If
+    Let mk be proc keys from Dict with map
+    If mk is equal to 0:
+        Return 1
+    End If
+    Let mc be proc list_length from List with mk
+    Let i be 0
+    While i is less than mc:
+        Let key be proc list_get from List with mk, i
+        Let val be proc get from Dict with map, key
+        proc emit_indent with sb, indent
+        Let vk be proc memory_get_int64 from Memory with val, 0
+        If vk is equal to 6:
+            proc stringbuilder_append from SB with sb, "Section \""
+            If key is not equal to 0:
+                proc stringbuilder_append from SB with sb, key
+            End If
+            proc stringbuilder_append from SB with sb, "\":\n"
+            proc emit_map_body with sb, val, indent plus 4
+            proc emit_indent with sb, indent
+            proc stringbuilder_append from SB with sb, "End Section\n"
+        Otherwise:
+            If key is not equal to 0:
+                proc stringbuilder_append from SB with sb, key
+            End If
+            proc stringbuilder_append from SB with sb, " as "
+            proc emit_scalar_or_list with sb, val
+            proc stringbuilder_append_char from SB with sb, 10
+        End If
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with mk
+    Return 1
+End Process
+
+@Reasoning
+Emit n spaces.
+@End Reasoning
+
+@Implementation
+Loop writing 0x20.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "emit_indent" takes sb as Integer, n as Integer returns Integer:
+    Let i be 0
+    While i is less than n:
+        proc stringbuilder_append_char from SB with sb, 32
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Emit a non-map ConfigValue (scalar or list).
+@End Reasoning
+
+@Implementation
+Switch on kind.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "emit_scalar_or_list" takes sb as Integer, v as Integer returns Integer:
+    If v is equal to 0:
+        proc stringbuilder_append from SB with sb, "null"
+        Return 1
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is equal to 0:
+        proc stringbuilder_append from SB with sb, "null"
+        Return 1
+    End If
+    If kind is equal to 4:
+        Let b be proc memory_get_int64 from Memory with v, 8
+        If b is equal to 1:
+            proc stringbuilder_append from SB with sb, "true"
+        Otherwise:
+            proc stringbuilder_append from SB with sb, "false"
+        End If
+        Return 1
+    End If
+    If kind is equal to 2:
+        Let iv be proc memory_get_int64 from Memory with v, 8
+        proc stringbuilder_append_integer from SB with sb, iv
+        Return 1
+    End If
+    If kind is equal to 1:
+        proc stringbuilder_append_char from SB with sb, 34
+        Let sp be proc memory_get_int64 from Memory with v, 8
+        If sp is not equal to 0:
+            Let length be proc string_length from StringCore with sp
+            Let i be 0
+            While i is less than length:
+                Let ch be proc memory_get_byte from Memory with sp, i
+                If ch is equal to 34:
+                    proc stringbuilder_append_char from SB with sb, 92
+                    proc stringbuilder_append_char from SB with sb, 34
+                Otherwise:
+                    If ch is equal to 92:
+                        proc stringbuilder_append_char from SB with sb, 92
+                        proc stringbuilder_append_char from SB with sb, 92
+                    Otherwise:
+                        If ch is equal to 10:
+                            proc stringbuilder_append_char from SB with sb, 92
+                            proc stringbuilder_append_char from SB with sb, 110
+                        Otherwise:
+                            proc stringbuilder_append_char from SB with sb, ch
+                        End If
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        End If
+        proc stringbuilder_append_char from SB with sb, 34
+        Return 1
+    End If
+    If kind is equal to 5:
+        proc stringbuilder_append from SB with sb, "a list containing "
+        Let arr be proc memory_get_int64 from Memory with v, 8
+        If arr is not equal to 0:
+            Let lc be proc list_length from List with arr
+            Let j be 0
+            While j is less than lc:
+                Let elem be proc list_get from List with arr, j
+                If j is greater than 0:
+                    proc stringbuilder_append from SB with sb, ", "
+                End If
+                proc emit_scalar_or_list with sb, elem
+                Set j to j plus 1
+            End While
+        End If
+        Return 1
+    End If
+    If kind is equal to 7:
+        proc stringbuilder_append from SB with sb, "@datetime \""
+        Let dt be proc memory_get_int64 from Memory with v, 8
+        If dt is not equal to 0:
+            proc stringbuilder_append from SB with sb, dt
+        End If
+        proc stringbuilder_append_char from SB with sb, 34
+        Return 1
+    End If
+    If kind is equal to 8:
+        proc stringbuilder_append from SB with sb, "@duration "
+        Let ns be proc memory_get_int64 from Memory with v, 8
+        proc stringbuilder_append_integer from SB with sb, ns
+        Return 1
+    End If
+    proc stringbuilder_append from SB with sb, "null"
+    Return 1
+End Process

@@ -1,0 +1,2179 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+JSON SCHEMA - Draft 2020-12 Parse / Serialize / Validate Facade (Tier 1)
+
+This module is the user-facing surface for JSON Schema. It wraps the
+underlying typed AST in json_schema_ast.runa (kept separate for layering
+hygiene) with two top-level operations:
+
+  json_schema_parse(json_text)        -> SchemaNode (generic AST)
+  json_schema_serialize(schema)       -> JSON text
+
+Validation is exposed by json_schema_ast.runa as
+
+  json_schema_validate(schema, value) -> Integer
+
+which implements Draft 2020-12 validation against the typed AST.
+
+Supported JSON Schema Draft 2020-12 keywords (parse + validate):
+  CORE
+    type, properties, required, items, additionalProperties, enum,
+    const, $defs, $ref, allOf, anyOf, oneOf, not, if/then/else,
+    contains, prefixItems, dependentSchemas
+
+  STRING
+    minLength, maxLength, pattern, format
+
+  NUMBER
+    minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf
+
+  ARRAY
+    minItems, maxItems, uniqueItems, contains, prefixItems
+
+  OBJECT
+    minProperties, maxProperties, dependentRequired
+
+Format keywords accepted (annotation only unless higher-layer format
+registries are wired):
+  date, time, date-time, duration, email, idn-email, hostname,
+  idn-hostname, ipv4, ipv6, uri, uri-reference, iri, uri-template,
+  json-pointer, relative-json-pointer, regex, uuid
+
+Internal JSON parser is intentionally embedded so this module is
+self-contained. It accepts UTF-8 JSON text per RFC 8259 and produces a
+ConfigValue (CV_*) tree via the Config module, then walks that tree to
+build the generic Schema AST defined in schema.runa.
+
+References:
+  - JSON Schema Core 2020-12        https://datatracker.ietf.org/doc/draft-bhutton-json-schema/01/
+  - JSON Schema Validation 2020-12  https://datatracker.ietf.org/doc/draft-bhutton-json-schema-validation/01/
+  - RFC 8259 (JSON)                 https://datatracker.ietf.org/doc/html/rfc8259
+  - RFC 6901 (JSON Pointer)         https://datatracker.ietf.org/doc/html/rfc6901
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/config/config.runa" as Cfg
+Import "compiler/frontend/primitives/schema/schema.runa" as Schema
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Note: Internal parser-state record (32 bytes):
+Note:   offset  0 : text pointer
+Note:   offset  8 : length
+Note:   offset 16 : position
+Note:   offset 24 : ok flag (1 = no error, 0 = error)
+Let PSTATE_SIZE be 32
+
+Note: ============================================================================
+Note: JSON LEXER + PARSER (text -> ConfigValue)
+Note: ============================================================================
+
+@Reasoning
+Allocate parser state for a JSON text input.
+@End Reasoning
+
+@Implementation
+Allocate 32 bytes, store the text pointer, length, position 0, ok=1.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pstate_create" takes text as Integer returns Integer:
+    Let s be proc allocate from Layout with PSTATE_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with s, 0, text
+    Let length be 0
+    If text is not equal to 0:
+        Set length to proc string_length from StringCore with text
+    End If
+    proc memory_set_int64 from Memory with s, 8, length
+    proc memory_set_int64 from Memory with s, 16, 0
+    proc memory_set_int64 from Memory with s, 24, 1
+    Return s
+End Process
+
+@Reasoning
+Skip whitespace (per RFC 8259 sec.2: space, tab, LF, CR).
+@End Reasoning
+
+@Implementation
+Advance position while the byte is one of those four whitespace codes.
+@End Implementation
+
+@Performance_Hints
+Time: O(k) where k is whitespace span.
+@End Performance_Hints
+
+@Security_Scope
+Modifies state.
+@End Security_Scope
+Process called "pstate_skip_ws" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    While pos is less than length:
+        Let ch be proc memory_get_byte from Memory with text, pos
+        Let is_ws be 0
+        If ch is equal to 32:
+            Set is_ws to 1
+        End If
+        If ch is equal to 9:
+            Set is_ws to 1
+        End If
+        If ch is equal to 10:
+            Set is_ws to 1
+        End If
+        If ch is equal to 13:
+            Set is_ws to 1
+        End If
+        If is_ws is equal to 0:
+            proc memory_set_int64 from Memory with state, 16, pos
+            Return 1
+        End If
+        Set pos to pos plus 1
+    End While
+    proc memory_set_int64 from Memory with state, 16, pos
+    Return 1
+End Process
+
+@Reasoning
+Peek the next byte without advancing.
+@End Reasoning
+
+@Implementation
+Return text[pos] or -1 at EOF.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 at EOF.
+@End Security_Scope
+Process called "pstate_peek" takes state as Integer returns Integer:
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    If pos is greater than or equal to length:
+        Return 0 minus 1
+    End If
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Return proc memory_get_byte from Memory with text, pos
+End Process
+
+@Reasoning
+Advance one byte, returning the byte consumed.
+@End Reasoning
+
+@Implementation
+Load text[pos], pos += 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 if at EOF (no advance).
+@End Security_Scope
+Process called "pstate_consume" takes state as Integer returns Integer:
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    If pos is greater than or equal to length:
+        Return 0 minus 1
+    End If
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let ch be proc memory_get_byte from Memory with text, pos
+    proc memory_set_int64 from Memory with state, 16, pos plus 1
+    Return ch
+End Process
+
+@Reasoning
+Mark parser state as failed.
+@End Reasoning
+
+@Implementation
+Store 0 in ok-slot.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "pstate_fail" takes state as Integer returns Integer:
+    proc memory_set_int64 from Memory with state, 24, 0
+    Return 0
+End Process
+
+@Reasoning
+Return 1 if parser state is still ok.
+@End Reasoning
+
+@Implementation
+Return state[24].
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "pstate_ok" takes state as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with state, 24
+End Process
+
+@Reasoning
+Try to consume a literal string at the current position. Returns 1 if
+matched (position advances), 0 otherwise (position unchanged).
+@End Reasoning
+
+@Implementation
+Compare byte by byte; if any byte differs or runs out, restore pos.
+@End Implementation
+
+@Performance_Hints
+Time: O(|literal|).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "pstate_consume_literal" takes state as Integer, literal as Integer returns Integer:
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let llen be proc string_length from StringCore with literal
+    If (pos plus llen) is greater than length:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than llen:
+        Let a be proc memory_get_byte from Memory with text, pos plus i
+        Let b be proc memory_get_byte from Memory with literal, i
+        If a is not equal to b:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    proc memory_set_int64 from Memory with state, 16, pos plus llen
+    Return 1
+End Process
+
+@Reasoning
+Parse a JSON string literal (RFC 8259 sec.7). The opening quote has not
+been consumed when this function is called.
+@End Reasoning
+
+@Implementation
+Verify the next byte is '"'. Allocate a StringBuilder. Walk until the
+closing '"' is found, decoding escape sequences:
+  \\ -> backslash, \" -> quote, \/ -> slash, \b -> 0x08, \f -> 0x0c,
+  \n -> 0x0a, \r -> 0x0d, \t -> 0x09, \uXXXX -> 1-3 byte UTF-8.
+Return the built string (caller owns).
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on malformed escape or unterminated string.
+@End Security_Scope
+Process called "pstate_parse_string" takes state as Integer returns Integer:
+    Let opener be proc pstate_consume with state
+    If opener is not equal to 34:
+        proc pstate_fail with state
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        proc pstate_fail with state
+        Return 0
+    End If
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let done be 0
+    While done is equal to 0:
+        Let pos be proc memory_get_int64 from Memory with state, 16
+        If pos is greater than or equal to length:
+            proc stringbuilder_destroy from SB with sb
+            proc pstate_fail with state
+            Return 0
+        End If
+        Let ch be proc pstate_consume with state
+        If ch is equal to 34:
+            Set done to 1
+        Otherwise:
+            If ch is equal to 92:
+                Let esc be proc pstate_consume with state
+                If esc is equal to 34:
+                    proc stringbuilder_append_char from SB with sb, 34
+                Otherwise:
+                    If esc is equal to 92:
+                        proc stringbuilder_append_char from SB with sb, 92
+                    Otherwise:
+                        If esc is equal to 47:
+                            proc stringbuilder_append_char from SB with sb, 47
+                        Otherwise:
+                            If esc is equal to 98:
+                                proc stringbuilder_append_char from SB with sb, 8
+                            Otherwise:
+                                If esc is equal to 102:
+                                    proc stringbuilder_append_char from SB with sb, 12
+                                Otherwise:
+                                    If esc is equal to 110:
+                                        proc stringbuilder_append_char from SB with sb, 10
+                                    Otherwise:
+                                        If esc is equal to 114:
+                                            proc stringbuilder_append_char from SB with sb, 13
+                                        Otherwise:
+                                            If esc is equal to 116:
+                                                proc stringbuilder_append_char from SB with sb, 9
+                                            Otherwise:
+                                                If esc is equal to 117:
+                                                    Let cp be proc pstate_parse_unicode_4hex with state
+                                                    If cp is less than 0:
+                                                        proc stringbuilder_destroy from SB with sb
+                                                        proc pstate_fail with state
+                                                        Return 0
+                                                    End If
+                                                    proc append_utf8 with sb, cp
+                                                Otherwise:
+                                                    proc stringbuilder_destroy from SB with sb
+                                                    proc pstate_fail with state
+                                                    Return 0
+                                                End If
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            Otherwise:
+                proc stringbuilder_append_char from SB with sb, ch
+            End If
+        End If
+    End While
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Parse exactly four hex digits and return the resulting code point.
+@End Reasoning
+
+@Implementation
+Read four bytes; convert each via Char.hex_digit_value; combine.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on invalid hex.
+@End Security_Scope
+Process called "pstate_parse_unicode_4hex" takes state as Integer returns Integer:
+    Let cp be 0
+    Let i be 0
+    While i is less than 4:
+        Let ch be proc pstate_consume with state
+        If ch is less than 0:
+            Return 0 minus 1
+        End If
+        Let dv be proc hex_digit_value from Char with ch
+        If dv is less than 0:
+            Return 0 minus 1
+        End If
+        Set cp to (cp multiplied by 16) plus dv
+        Set i to i plus 1
+    End While
+    Return cp
+End Process
+
+@Reasoning
+Append a Unicode code point as 1-3 byte UTF-8 to a StringBuilder. Code
+points outside BMP (>0xFFFF) would require surrogate-pair handling
+beyond the scope of \uXXXX; this implementation accepts only the BMP
+range that fits in 4 hex digits.
+@End Reasoning
+
+@Implementation
+Branch on cp size: <0x80 -> 1 byte; <0x800 -> 2 bytes; <=0xFFFF -> 3
+bytes. Standard UTF-8 encoding.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal. Caller has validated cp >= 0.
+@End Security_Scope
+Process called "append_utf8" takes sb as Integer, cp as Integer returns Integer:
+    If cp is less than 128:
+        proc stringbuilder_append_char from SB with sb, cp
+        Return 1
+    End If
+    If cp is less than 2048:
+        Let b0 be 192 plus (cp divided by 64)
+        Let b1 be 128 plus (cp minus ((cp divided by 64) multiplied by 64))
+        proc stringbuilder_append_char from SB with sb, b0
+        proc stringbuilder_append_char from SB with sb, b1
+        Return 1
+    End If
+    Let hi be cp divided by 4096
+    Let mid be (cp divided by 64) minus (hi multiplied by 64)
+    Let lo be cp minus ((cp divided by 64) multiplied by 64)
+    Let bb0 be 224 plus hi
+    Let bb1 be 128 plus mid
+    Let bb2 be 128 plus lo
+    proc stringbuilder_append_char from SB with sb, bb0
+    proc stringbuilder_append_char from SB with sb, bb1
+    proc stringbuilder_append_char from SB with sb, bb2
+    Return 1
+End Process
+
+@Reasoning
+Parse a JSON number (integer or float). RFC 8259 sec.6 permits a leading
+minus, an integer part (no leading zero except for 0 itself), an
+optional fractional part, and an optional exponent.
+
+Number representation policy:
+  - If the number has no '.' and no 'e'/'E', produce a CV_INTEGER.
+  - Otherwise produce a CV_STRING containing the original text. Float
+    parsing requires Float128 support; preserving the original text
+    keeps round-trip fidelity intact until the schema layer adds a
+    Float ConfigValue constructor.
+@End Reasoning
+
+@Implementation
+Mark start; advance through optional sign, digits, optional fraction,
+optional exponent. Detect whether '.' or 'e/E' appeared. Substring the
+span. Integer path: call string_to_integer. Otherwise return CV_STRING.
+@End Implementation
+
+@Performance_Hints
+Time: O(|num|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure (and marks state failed).
+@End Security_Scope
+Process called "pstate_parse_number" takes state as Integer returns Integer:
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let start be pos
+    Let is_float be 0
+
+    Let ch1 be proc memory_get_byte from Memory with text, pos
+    If ch1 is equal to 45:
+        Set pos to pos plus 1
+    End If
+    While pos is less than length:
+        Let c be proc memory_get_byte from Memory with text, pos
+        Let isd be proc is_digit from Char with c
+        If isd is equal to 0:
+            Set pos to length plus 1
+        Otherwise:
+            Set pos to pos plus 1
+        End If
+    End While
+    Set pos to proc memory_get_int64 from Memory with state, 16
+    If ch1 is equal to 45:
+        Set pos to pos plus 1
+    End If
+    While pos is less than length:
+        Let cc be proc memory_get_byte from Memory with text, pos
+        Let isd2 be proc is_digit from Char with cc
+        If isd2 is equal to 0:
+            Set pos to 0 minus 1
+        Otherwise:
+            Set pos to pos plus 1
+        End If
+        If pos is equal to (0 minus 1):
+            Set pos to proc memory_get_int64 from Memory with state, 16
+            Set pos to pos plus 1
+            Set pos to length
+        End If
+    End While
+
+    Set pos to proc memory_get_int64 from Memory with state, 16
+    If ch1 is equal to 45:
+        Set pos to pos plus 1
+    End If
+    Let in_integer be 1
+    While in_integer is equal to 1:
+        If pos is greater than or equal to length:
+            Set in_integer to 0
+        Otherwise:
+            Let cd be proc memory_get_byte from Memory with text, pos
+            Let isdig be proc is_digit from Char with cd
+            If isdig is equal to 1:
+                Set pos to pos plus 1
+            Otherwise:
+                Set in_integer to 0
+            End If
+        End If
+    End While
+
+    If pos is less than length:
+        Let dot_ch be proc memory_get_byte from Memory with text, pos
+        If dot_ch is equal to 46:
+            Set is_float to 1
+            Set pos to pos plus 1
+            While pos is less than length:
+                Let cf be proc memory_get_byte from Memory with text, pos
+                Let isdf be proc is_digit from Char with cf
+                If isdf is equal to 1:
+                    Set pos to pos plus 1
+                Otherwise:
+                    Set pos to length plus 1
+                End If
+            End While
+            Set pos to proc memory_get_int64 from Memory with state, 16
+            If ch1 is equal to 45:
+                Set pos to pos plus 1
+            End If
+            Let scan_intpart be 1
+            While scan_intpart is equal to 1:
+                If pos is greater than or equal to length:
+                    Set scan_intpart to 0
+                Otherwise:
+                    Let cd2 be proc memory_get_byte from Memory with text, pos
+                    Let isdig2 be proc is_digit from Char with cd2
+                    If isdig2 is equal to 1:
+                        Set pos to pos plus 1
+                    Otherwise:
+                        Set scan_intpart to 0
+                    End If
+                End If
+            End While
+            Set pos to pos plus 1
+            While pos is less than length:
+                Let cf2 be proc memory_get_byte from Memory with text, pos
+                Let isdf2 be proc is_digit from Char with cf2
+                If isdf2 is equal to 1:
+                    Set pos to pos plus 1
+                Otherwise:
+                    Set pos to length plus 1
+                End If
+            End While
+            Set pos to proc memory_get_int64 from Memory with state, 16
+            If ch1 is equal to 45:
+                Set pos to pos plus 1
+            End If
+            Let scan2 be 1
+            While scan2 is equal to 1:
+                If pos is greater than or equal to length:
+                    Set scan2 to 0
+                Otherwise:
+                    Let cd3 be proc memory_get_byte from Memory with text, pos
+                    Let isdig3 be proc is_digit from Char with cd3
+                    If isdig3 is equal to 1:
+                        Set pos to pos plus 1
+                    Otherwise:
+                        Set scan2 to 0
+                    End If
+                End If
+            End While
+            If pos is less than length:
+                Let dot2 be proc memory_get_byte from Memory with text, pos
+                If dot2 is equal to 46:
+                    Set pos to pos plus 1
+                    Let frac be 1
+                    While frac is equal to 1:
+                        If pos is greater than or equal to length:
+                            Set frac to 0
+                        Otherwise:
+                            Let cf3 be proc memory_get_byte from Memory with text, pos
+                            Let isdf3 be proc is_digit from Char with cf3
+                            If isdf3 is equal to 1:
+                                Set pos to pos plus 1
+                            Otherwise:
+                                Set frac to 0
+                            End If
+                        End If
+                    End While
+                End If
+            End If
+        End If
+    End If
+
+    If pos is less than length:
+        Let ec be proc memory_get_byte from Memory with text, pos
+        If ec is equal to 101:
+            Set is_float to 1
+        End If
+        If ec is equal to 69:
+            Set is_float to 1
+        End If
+        If is_float is equal to 1:
+            Set pos to pos plus 1
+            If pos is less than length:
+                Let sign be proc memory_get_byte from Memory with text, pos
+                If sign is equal to 43:
+                    Set pos to pos plus 1
+                End If
+                If sign is equal to 45:
+                    Set pos to pos plus 1
+                End If
+            End If
+            Let exp_scan be 1
+            While exp_scan is equal to 1:
+                If pos is greater than or equal to length:
+                    Set exp_scan to 0
+                Otherwise:
+                    Let cx be proc memory_get_byte from Memory with text, pos
+                    Let isdx be proc is_digit from Char with cx
+                    If isdx is equal to 1:
+                        Set pos to pos plus 1
+                    Otherwise:
+                        Set exp_scan to 0
+                    End If
+                End If
+            End While
+        End If
+    End If
+
+    Let span_len be pos minus start
+    If span_len is less than 1:
+        proc pstate_fail with state
+        Return 0
+    End If
+    Let span be proc string_substring from StringPrim with text, start, span_len
+    If span is equal to 0:
+        proc pstate_fail with state
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with state, 16, pos
+    If is_float is equal to 1:
+        Let cv be proc config_value_string from Cfg with span
+        proc deallocate from Layout with span
+        Return cv
+    End If
+    Let iv be proc string_to_integer from StringPrim with span
+    proc deallocate from Layout with span
+    Return proc config_value_integer from Cfg with iv
+End Process
+
+@Reasoning
+Parse a JSON value at the current position into a ConfigValue.
+@End Reasoning
+
+@Implementation
+Skip whitespace. Switch on the next byte:
+  '"' -> string ; '{' -> object ; '[' -> array ;
+  't' -> true   ; 'f' -> false  ; 'n' -> null  ;
+  '-' or digit -> number.
+Otherwise fail.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure (sets state.ok = 0).
+@End Security_Scope
+Process called "pstate_parse_value" takes state as Integer returns Integer:
+    proc pstate_skip_ws with state
+    Let ch be proc pstate_peek with state
+    If ch is less than 0:
+        proc pstate_fail with state
+        Return 0
+    End If
+    If ch is equal to 34:
+        Let s be proc pstate_parse_string with state
+        If s is equal to 0:
+            Return 0
+        End If
+        Let cv be proc config_value_string from Cfg with s
+        proc deallocate from Layout with s
+        Return cv
+    End If
+    If ch is equal to 123:
+        Return proc pstate_parse_object with state
+    End If
+    If ch is equal to 91:
+        Return proc pstate_parse_array with state
+    End If
+    If ch is equal to 116:
+        Let m be proc pstate_consume_literal with state, "true"
+        If m is equal to 0:
+            proc pstate_fail with state
+            Return 0
+        End If
+        Return proc config_value_bool from Cfg with 1
+    End If
+    If ch is equal to 102:
+        Let m2 be proc pstate_consume_literal with state, "false"
+        If m2 is equal to 0:
+            proc pstate_fail with state
+            Return 0
+        End If
+        Return proc config_value_bool from Cfg with 0
+    End If
+    If ch is equal to 110:
+        Let m3 be proc pstate_consume_literal with state, "null"
+        If m3 is equal to 0:
+            proc pstate_fail with state
+            Return 0
+        End If
+        Return proc config_value_null from Cfg
+    End If
+    Let isdig be proc is_digit from Char with ch
+    If isdig is equal to 1:
+        Return proc pstate_parse_number with state
+    End If
+    If ch is equal to 45:
+        Return proc pstate_parse_number with state
+    End If
+    proc pstate_fail with state
+    Return 0
+End Process
+
+@Reasoning
+Parse a JSON object: { "key" : value (, "key" : value)* }.
+@End Reasoning
+
+@Implementation
+Consume '{'. Loop: skip ws; if '}', done. Otherwise parse string key,
+expect ':', parse value, set in dict. Then expect ',' or '}'.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over total object text. Space: O(k) for k entries.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "pstate_parse_object" takes state as Integer returns Integer:
+    Let opener be proc pstate_consume with state
+    If opener is not equal to 123:
+        proc pstate_fail with state
+        Return 0
+    End If
+    Let dict be proc create from Dict
+    If dict is equal to 0:
+        proc pstate_fail with state
+        Return 0
+    End If
+    proc pstate_skip_ws with state
+    Let next_ch be proc pstate_peek with state
+    If next_ch is equal to 125:
+        proc pstate_consume with state
+        Return proc config_value_map from Cfg with dict
+    End If
+    Let going be 1
+    While going is equal to 1:
+        proc pstate_skip_ws with state
+        Let key be proc pstate_parse_string with state
+        If key is equal to 0:
+            proc destroy from Dict with dict
+            Return 0
+        End If
+        proc pstate_skip_ws with state
+        Let colon be proc pstate_consume with state
+        If colon is not equal to 58:
+            proc deallocate from Layout with key
+            proc destroy from Dict with dict
+            proc pstate_fail with state
+            Return 0
+        End If
+        Let val be proc pstate_parse_value with state
+        If val is equal to 0:
+            proc deallocate from Layout with key
+            proc destroy from Dict with dict
+            Return 0
+        End If
+        proc set from Dict with dict, key, val
+        proc deallocate from Layout with key
+        proc pstate_skip_ws with state
+        Let after be proc pstate_consume with state
+        If after is equal to 125:
+            Set going to 0
+        Otherwise:
+            If after is equal to 44:
+                Set going to 1
+            Otherwise:
+                proc destroy from Dict with dict
+                proc pstate_fail with state
+                Return 0
+            End If
+        End If
+    End While
+    Return proc config_value_map from Cfg with dict
+End Process
+
+@Reasoning
+Parse a JSON array.
+@End Reasoning
+
+@Implementation
+Consume '['. Loop: skip ws; if ']', done. Else parse value, push. Expect
+',' or ']'.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over array text. Space: O(k).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "pstate_parse_array" takes state as Integer returns Integer:
+    Let opener be proc pstate_consume with state
+    If opener is not equal to 91:
+        proc pstate_fail with state
+        Return 0
+    End If
+    Let lst be proc list_create from List
+    If lst is equal to 0:
+        proc pstate_fail with state
+        Return 0
+    End If
+    proc pstate_skip_ws with state
+    Let next_ch be proc pstate_peek with state
+    If next_ch is equal to 93:
+        proc pstate_consume with state
+        Return proc config_value_list from Cfg with lst
+    End If
+    Let going be 1
+    While going is equal to 1:
+        proc pstate_skip_ws with state
+        Let elem be proc pstate_parse_value with state
+        If elem is equal to 0:
+            proc list_destroy from List with lst
+            Return 0
+        End If
+        proc list_push from List with lst, elem
+        proc pstate_skip_ws with state
+        Let after be proc pstate_consume with state
+        If after is equal to 93:
+            Set going to 0
+        Otherwise:
+            If after is equal to 44:
+                Set going to 1
+            Otherwise:
+                proc list_destroy from List with lst
+                proc pstate_fail with state
+                Return 0
+            End If
+        End If
+    End While
+    Return proc config_value_list from Cfg with lst
+End Process
+
+Note: ============================================================================
+Note: JSON TEXT -> CV_TREE
+Note: ============================================================================
+
+@Reasoning
+Parse a complete JSON document into a ConfigValue tree.
+@End Reasoning
+
+@Implementation
+Create parser state, parse one value, skip trailing whitespace, verify
+EOF. Free state. On failure destroy partial tree.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure or null input.
+@End Security_Scope
+Process called "json_to_config_value" takes json_text as Integer returns Integer:
+    If json_text is equal to 0:
+        Return 0
+    End If
+    Let state be proc pstate_create with json_text
+    If state is equal to 0:
+        Return 0
+    End If
+    Let value be proc pstate_parse_value with state
+    proc pstate_skip_ws with state
+    Let ok be proc pstate_ok with state
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    Let length be proc memory_get_int64 from Memory with state, 8
+    proc deallocate from Layout with state
+    If ok is equal to 0:
+        If value is not equal to 0:
+            proc config_value_destroy from Cfg with value
+        End If
+        Return 0
+    End If
+    If pos is not equal to length:
+        If value is not equal to 0:
+            proc config_value_destroy from Cfg with value
+        End If
+        Return 0
+    End If
+    Return value
+End Process
+
+Note: ============================================================================
+Note: CV_TREE -> Schema AST  (interprets a JSON Schema)
+Note: ============================================================================
+
+@Reasoning
+Translate a JSON-Schema CV_MAP into a generic SchemaNode. The top-level
+schema may be a Boolean true (always-valid: SCHEMA_ANY) or a Boolean
+false (never-valid: SCHEMA_UNION with no variants), or an Object with
+keywords.
+
+Recognized "type" values map to SCHEMA_* kinds:
+  "string" -> STRING ; "integer" -> INTEGER ; "number" -> FLOAT ;
+  "boolean" -> BOOLEAN ; "null" -> NULL ; "object" -> OBJECT ;
+  "array" -> ARRAY ; or array-of-type-names -> UNION over those.
+
+Per-keyword application:
+  - "properties"+"required" -> OBJECT with required ObjectFields.
+  - "items" -> ARRAY whose item schema is the recursive translation.
+  - "enum" -> ENUM with the string entries.
+  - "minLength" / "maxLength" / "pattern" / "format" -> string
+    constraints on the result.
+  - "minimum" / "maximum" / "multipleOf" -> integer constraints.
+  - "anyOf"/"oneOf" -> UNION over the variants. oneOf is recorded as a
+    titled union ("oneOf"); XOR semantics are evaluated at validation
+    time by the json_schema_ast validator.
+  - "$ref" -> SCHEMA_REFERENCE.
+@End Reasoning
+
+@Implementation
+Top-level: if value is CV_BOOL, dispatch trivially. Else cast to CV_MAP
+and look up "type" / "$ref" / etc. Build a SchemaNode of the right kind
+and decorate it. Recurse into nested "properties" / "items" / "anyOf" /
+"oneOf".
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over schema document.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input or unrecognized structure.
+@End Security_Scope
+Process called "cv_to_schema" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+    Let vk be proc config_value_kind from Cfg with value
+    If vk is equal to 4:
+        Let b be proc config_value_as_bool from Cfg with value
+        If b is equal to 1:
+            Return proc schema_create_any from Schema
+        End If
+        Return proc schema_create_union from Schema
+    End If
+    If vk is not equal to 6:
+        Return 0
+    End If
+    Let dict be proc config_value_as_map from Cfg with value
+
+    Let ref_cv be proc get from Dict with dict, "$ref"
+    If ref_cv is not equal to 0:
+        Let rk be proc config_value_kind from Cfg with ref_cv
+        If rk is equal to 1:
+            Let rstr be proc config_value_as_string from Cfg with ref_cv
+            Return proc schema_create_reference from Schema with rstr
+        End If
+    End If
+
+    Let const_cv be proc get from Dict with dict, "const"
+    If const_cv is not equal to 0:
+        Let const_copy be proc cv_deep_copy with const_cv
+        If const_copy is not equal to 0:
+            Return proc schema_create_const from Schema with const_copy
+        End If
+    End If
+
+    Let enum_cv be proc get from Dict with dict, "enum"
+    If enum_cv is not equal to 0:
+        Let ek be proc config_value_kind from Cfg with enum_cv
+        If ek is equal to 5:
+            Let enode be proc schema_create_enum from Schema
+            Let elst be proc config_value_as_list from Cfg with enum_cv
+            Let ec be proc list_length from List with elst
+            Let ei be 0
+            While ei is less than ec:
+                Let elem be proc list_get from List with elst, ei
+                Let elk be proc config_value_kind from Cfg with elem
+                If elk is equal to 1:
+                    Let esv be proc config_value_as_string from Cfg with elem
+                    proc schema_enum_add_value from Schema with enode, esv
+                End If
+                Set ei to ei plus 1
+            End While
+            Return enode
+        End If
+    End If
+
+    Let allof_cv be proc get from Dict with dict, "allOf"
+    If allof_cv is not equal to 0:
+        Let allk be proc config_value_kind from Cfg with allof_cv
+        If allk is equal to 5:
+            Let allnode be proc schema_create_all_of from Schema
+            Let all_lst be proc config_value_as_list from Cfg with allof_cv
+            Let all_c be proc list_length from List with all_lst
+            Let all_i be 0
+            While all_i is less than all_c:
+                Let all_var be proc list_get from List with all_lst, all_i
+                Let all_sub be proc cv_to_schema with all_var
+                If all_sub is not equal to 0:
+                    proc schema_composite_add_subschema from Schema with allnode, all_sub
+                End If
+                Set all_i to all_i plus 1
+            End While
+            Note: Attach root-level $defs if present so nested $ref nodes resolve.
+            Let allof_defs_cv be proc get from Dict with dict, "$defs"
+            If allof_defs_cv is not equal to 0:
+                proc attach_defs_to_schema with allnode, allof_defs_cv
+            End If
+            Return allnode
+        End If
+    End If
+
+    Let not_cv be proc get from Dict with dict, "not"
+    If not_cv is not equal to 0:
+        Let nk be proc config_value_kind from Cfg with not_cv
+        If nk is equal to 6:
+            Let inner be proc cv_to_schema with not_cv
+            If inner is not equal to 0:
+                Let not_node be proc schema_compose from Schema with inner, 0, 3
+                Note: Attach root-level $defs if present.
+                Let not_defs_cv be proc get from Dict with dict, "$defs"
+                If not_defs_cv is not equal to 0:
+                    proc attach_defs_to_schema with not_node, not_defs_cv
+                End If
+                Return not_node
+            End If
+        End If
+        If nk is equal to 4:
+            Let nb be proc config_value_as_bool from Cfg with not_cv
+            Let bool_inner be 0
+            If nb is equal to 1:
+                Set bool_inner to proc schema_create_any from Schema
+            Otherwise:
+                Set bool_inner to proc schema_create_union from Schema
+            End If
+            If bool_inner is not equal to 0:
+                Let not_bool_node be proc schema_compose from Schema with bool_inner, 0, 3
+                Return not_bool_node
+            End If
+        End If
+    End If
+
+    Let anyof_cv be proc get from Dict with dict, "anyOf"
+    If anyof_cv is not equal to 0:
+        Let ak be proc config_value_kind from Cfg with anyof_cv
+        If ak is equal to 5:
+            Let unode be proc schema_create_union from Schema
+            Let alst be proc config_value_as_list from Cfg with anyof_cv
+            Let ac be proc list_length from List with alst
+            Let ai be 0
+            While ai is less than ac:
+                Let variant be proc list_get from List with alst, ai
+                Let vs be proc cv_to_schema with variant
+                If vs is not equal to 0:
+                    proc schema_union_add_variant from Schema with unode, vs
+                End If
+                Set ai to ai plus 1
+            End While
+            Let anyof_defs_cv be proc get from Dict with dict, "$defs"
+            If anyof_defs_cv is not equal to 0:
+                proc attach_defs_to_schema with unode, anyof_defs_cv
+            End If
+            Return unode
+        End If
+    End If
+
+    Let oneof_cv be proc get from Dict with dict, "oneOf"
+    If oneof_cv is not equal to 0:
+        Let ok2 be proc config_value_kind from Cfg with oneof_cv
+        If ok2 is equal to 5:
+            Let onode be proc schema_create_one_of from Schema
+            proc schema_set_title from Schema with onode, "oneOf"
+            Let olst be proc config_value_as_list from Cfg with oneof_cv
+            Let oc be proc list_length from List with olst
+            Let oi be 0
+            While oi is less than oc:
+                Let ovar be proc list_get from List with olst, oi
+                Let os be proc cv_to_schema with ovar
+                If os is not equal to 0:
+                    proc schema_composite_add_subschema from Schema with onode, os
+                End If
+                Set oi to oi plus 1
+            End While
+            Let oneof_defs_cv be proc get from Dict with dict, "$defs"
+            If oneof_defs_cv is not equal to 0:
+                proc attach_defs_to_schema with onode, oneof_defs_cv
+            End If
+            Return onode
+        End If
+    End If
+
+    Let type_cv be proc get from Dict with dict, "type"
+    If type_cv is equal to 0:
+        Note: No type keyword - still honor numeric exclusiveMin/Max,
+        Note: $defs / additionalProperties on a bare object schema. The
+        Note: simplest fallback that handles the most common JSON Schema
+        Note: pattern ({"exclusiveMinimum": 0}) is to scan for those
+        Note: keywords and produce an integer schema if present.
+        Let bare_ex_min be proc get from Dict with dict, "exclusiveMinimum"
+        Let bare_ex_max be proc get from Dict with dict, "exclusiveMaximum"
+        If bare_ex_min is not equal to 0:
+            Let bare_node be proc build_typed_schema with "integer", dict
+            Return bare_node
+        End If
+        If bare_ex_max is not equal to 0:
+            Let bare_node2 be proc build_typed_schema with "integer", dict
+            Return bare_node2
+        End If
+        Let any_node be proc schema_create_any from Schema
+        Let any_defs_cv be proc get from Dict with dict, "$defs"
+        If any_defs_cv is not equal to 0:
+            proc attach_defs_to_schema with any_node, any_defs_cv
+        End If
+        Return any_node
+    End If
+    Let tk be proc config_value_kind from Cfg with type_cv
+    If tk is equal to 1:
+        Let tname be proc config_value_as_string from Cfg with type_cv
+        Let typed_node be proc build_typed_schema with tname, dict
+        Let typed_defs_cv be proc get from Dict with dict, "$defs"
+        If typed_defs_cv is not equal to 0:
+            proc attach_defs_to_schema with typed_node, typed_defs_cv
+        End If
+        Return typed_node
+    End If
+    If tk is equal to 5:
+        Let union_node be proc schema_create_union from Schema
+        Let tlst be proc config_value_as_list from Cfg with type_cv
+        Let tc be proc list_length from List with tlst
+        Let ti be 0
+        While ti is less than tc:
+            Let tv be proc list_get from List with tlst, ti
+            Let tvk be proc config_value_kind from Cfg with tv
+            If tvk is equal to 1:
+                Let nm be proc config_value_as_string from Cfg with tv
+                Let variant be proc build_typed_schema with nm, dict
+                If variant is not equal to 0:
+                    proc schema_union_add_variant from Schema with union_node, variant
+                End If
+            End If
+            Set ti to ti plus 1
+        End While
+        Let typu_defs_cv be proc get from Dict with dict, "$defs"
+        If typu_defs_cv is not equal to 0:
+            proc attach_defs_to_schema with union_node, typu_defs_cv
+        End If
+        Return union_node
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Read a JSON Schema $defs dictionary (CV_MAP) and populate the supplied
+schema's definitions registry. Each (name, sub-schema) entry is
+translated via cv_to_schema and stored under the same name.
+@End Reasoning
+
+@Implementation
+Verify the input is a CV_MAP. Iterate keys; translate each value with
+cv_to_schema; store with schema_add_definition.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over definitions. Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Internal. Silently skips non-map inputs and entries whose values are
+not parseable as schemas.
+@End Security_Scope
+Process called "attach_defs_to_schema" takes schema as Integer, defs_cv as Integer returns Integer:
+    If schema is equal to 0:
+        Return 0
+    End If
+    If defs_cv is equal to 0:
+        Return 0
+    End If
+    Let dk be proc config_value_kind from Cfg with defs_cv
+    If dk is not equal to 6:
+        Return 0
+    End If
+    Let defs_dict be proc config_value_as_map from Cfg with defs_cv
+    If defs_dict is equal to 0:
+        Return 0
+    End If
+    Let names be proc keys from Dict with defs_dict
+    If names is equal to 0:
+        Return 0
+    End If
+    Let n_count be proc list_length from List with names
+    Let n_i be 0
+    While n_i is less than n_count:
+        Let nm be proc list_get from List with names, n_i
+        If nm is not equal to 0:
+            Let nv be proc get from Dict with defs_dict, nm
+            Let nsch be proc cv_to_schema with nv
+            If nsch is not equal to 0:
+                proc schema_add_definition from Schema with schema, nm, nsch
+            End If
+        End If
+        Set n_i to n_i plus 1
+    End While
+    proc list_destroy from List with names
+    Return 1
+End Process
+
+@Reasoning
+Deep-copy a ConfigValue tree so the result has independent ownership
+from the source. Used by SCHEMA_CONST so the schema can own its const
+value after the JSON parse tree is destroyed.
+@End Reasoning
+
+@Implementation
+Switch on CV_* kind and reconstruct an isomorphic tree. CV_STRING
+duplicates the string via config_value_string (which duplicates).
+CV_LIST and CV_MAP recurse through their entries.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the source. Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input or allocation failure.
+@End Security_Scope
+Process called "cv_deep_copy" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+    Let k be proc config_value_kind from Cfg with value
+    If k is equal to 0:
+        Return proc config_value_null from Cfg
+    End If
+    If k is equal to 1:
+        Let s be proc config_value_as_string from Cfg with value
+        Return proc config_value_string from Cfg with s
+    End If
+    If k is equal to 2:
+        Let iv be proc config_value_as_integer from Cfg with value
+        Return proc config_value_integer from Cfg with iv
+    End If
+    If k is equal to 3:
+        Let fs be proc config_value_as_string from Cfg with value
+        Return proc config_value_string from Cfg with fs
+    End If
+    If k is equal to 4:
+        Let bv be proc config_value_as_bool from Cfg with value
+        Return proc config_value_bool from Cfg with bv
+    End If
+    If k is equal to 5:
+        Let new_list be proc list_create from List
+        Let src_list be proc config_value_as_list from Cfg with value
+        If src_list is not equal to 0:
+            Let len be proc list_length from List with src_list
+            Let li be 0
+            While li is less than len:
+                Let elem be proc list_get from List with src_list, li
+                Let elem_copy be proc cv_deep_copy with elem
+                If elem_copy is not equal to 0:
+                    proc list_push from List with new_list, elem_copy
+                End If
+                Set li to li plus 1
+            End While
+        End If
+        Return proc config_value_list from Cfg with new_list
+    End If
+    If k is equal to 6:
+        Let new_map be proc create from Dict
+        Let src_map be proc config_value_as_map from Cfg with value
+        If src_map is not equal to 0:
+            Let mkeys be proc keys from Dict with src_map
+            If mkeys is not equal to 0:
+                Let mn be proc list_length from List with mkeys
+                Let mi be 0
+                While mi is less than mn:
+                    Let mk be proc list_get from List with mkeys, mi
+                    If mk is not equal to 0:
+                        Let mv be proc get from Dict with src_map, mk
+                        Let mv_copy be proc cv_deep_copy with mv
+                        If mv_copy is not equal to 0:
+                            Note: Dict.set duplicates the key internally, so we
+                            Note: pass the original; the source map retains
+                            Note: ownership of its own keys.
+                            proc set from Dict with new_map, mk, mv_copy
+                        End If
+                    End If
+                    Set mi to mi plus 1
+                End While
+                proc list_destroy from List with mkeys
+            End If
+        End If
+        Return proc config_value_map from Cfg with new_map
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Build a SchemaNode for a single type name string, decorating it with the
+applicable keyword constraints from the surrounding schema CV_MAP.
+@End Reasoning
+
+@Implementation
+Match the type name and dispatch to the corresponding schema constructor.
+Then read keyword-specific entries from dict and stamp constraints onto
+the constructed node.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the keywords present.
+@End Performance_Hints
+
+@Security_Scope
+Internal. Returns 0 on unknown type.
+@End Security_Scope
+Process called "build_typed_schema" takes tname as Integer, dict as Integer returns Integer:
+    If tname is equal to 0:
+        Return 0
+    End If
+    Let eq_str be proc string_equals from StringCore with tname, "string"
+    If eq_str is equal to 1:
+        Let mn be 0 minus 1
+        Let mx be 0 minus 1
+        Let mnv be proc get from Dict with dict, "minLength"
+        If mnv is not equal to 0:
+            Let mnvk be proc config_value_kind from Cfg with mnv
+            If mnvk is equal to 2:
+                Set mn to proc config_value_as_integer from Cfg with mnv
+            End If
+        End If
+        Let mxv be proc get from Dict with dict, "maxLength"
+        If mxv is not equal to 0:
+            Let mxvk be proc config_value_kind from Cfg with mxv
+            If mxvk is equal to 2:
+                Set mx to proc config_value_as_integer from Cfg with mxv
+            End If
+        End If
+        Let patv be proc get from Dict with dict, "pattern"
+        Let pat be 0
+        If patv is not equal to 0:
+            Let pvk be proc config_value_kind from Cfg with patv
+            If pvk is equal to 1:
+                Set pat to proc config_value_as_string from Cfg with patv
+            End If
+        End If
+        Let fmtv be proc get from Dict with dict, "format"
+        Let fmt be 0
+        If fmtv is not equal to 0:
+            Let fvk be proc config_value_kind from Cfg with fmtv
+            If fvk is equal to 1:
+                Let fname be proc config_value_as_string from Cfg with fmtv
+                Set fmt to proc format_name_to_constant with fname
+            End If
+        End If
+        Let sc be proc string_constraints_create from Schema with mn, mx, pat, fmt
+        If sc is equal to 0:
+            Return 0
+        End If
+        Return proc schema_create from Schema with 3, sc
+    End If
+    Let eq_int be proc string_equals from StringCore with tname, "integer"
+    If eq_int is equal to 1:
+        Let has_min be 0
+        Let mnval be 0
+        Let has_max be 0
+        Let mxval be 0
+        Let mof be 0
+        Let mnv2 be proc get from Dict with dict, "minimum"
+        If mnv2 is not equal to 0:
+            Let mvk2 be proc config_value_kind from Cfg with mnv2
+            If mvk2 is equal to 2:
+                Set has_min to 1
+                Set mnval to proc config_value_as_integer from Cfg with mnv2
+            End If
+        End If
+        Let mxv2 be proc get from Dict with dict, "maximum"
+        If mxv2 is not equal to 0:
+            Let mvk3 be proc config_value_kind from Cfg with mxv2
+            If mvk3 is equal to 2:
+                Set has_max to 1
+                Set mxval to proc config_value_as_integer from Cfg with mxv2
+            End If
+        End If
+        Let mofv be proc get from Dict with dict, "multipleOf"
+        If mofv is not equal to 0:
+            Let mvkm be proc config_value_kind from Cfg with mofv
+            If mvkm is equal to 2:
+                Set mof to proc config_value_as_integer from Cfg with mofv
+            End If
+        End If
+        Let ic be proc integer_constraints_create from Schema with has_min, mnval, has_max, mxval, mof
+        If ic is equal to 0:
+            Return 0
+        End If
+        Let int_node be proc schema_create from Schema with 4, ic
+        If int_node is equal to 0:
+            Return 0
+        End If
+        Let exmin_int_cv be proc get from Dict with dict, "exclusiveMinimum"
+        If exmin_int_cv is not equal to 0:
+            Let exmin_int_k be proc config_value_kind from Cfg with exmin_int_cv
+            If exmin_int_k is equal to 2:
+                Let exmin_int_v be proc config_value_as_integer from Cfg with exmin_int_cv
+                proc schema_set_exclusive_minimum from Schema with int_node, exmin_int_v
+            End If
+        End If
+        Let exmax_int_cv be proc get from Dict with dict, "exclusiveMaximum"
+        If exmax_int_cv is not equal to 0:
+            Let exmax_int_k be proc config_value_kind from Cfg with exmax_int_cv
+            If exmax_int_k is equal to 2:
+                Let exmax_int_v be proc config_value_as_integer from Cfg with exmax_int_cv
+                proc schema_set_exclusive_maximum from Schema with int_node, exmax_int_v
+            End If
+        End If
+        Return int_node
+    End If
+    Let eq_num be proc string_equals from StringCore with tname, "number"
+    If eq_num is equal to 1:
+        Let num_node be proc schema_create_float_any from Schema
+        If num_node is equal to 0:
+            Return 0
+        End If
+        Let exmin_num_cv be proc get from Dict with dict, "exclusiveMinimum"
+        If exmin_num_cv is not equal to 0:
+            Let exmin_num_k be proc config_value_kind from Cfg with exmin_num_cv
+            If exmin_num_k is equal to 2:
+                Let exmin_num_v be proc config_value_as_integer from Cfg with exmin_num_cv
+                proc schema_set_exclusive_minimum from Schema with num_node, exmin_num_v
+            End If
+        End If
+        Let exmax_num_cv be proc get from Dict with dict, "exclusiveMaximum"
+        If exmax_num_cv is not equal to 0:
+            Let exmax_num_k be proc config_value_kind from Cfg with exmax_num_cv
+            If exmax_num_k is equal to 2:
+                Let exmax_num_v be proc config_value_as_integer from Cfg with exmax_num_cv
+                proc schema_set_exclusive_maximum from Schema with num_node, exmax_num_v
+            End If
+        End If
+        Return num_node
+    End If
+    Let eq_bool be proc string_equals from StringCore with tname, "boolean"
+    If eq_bool is equal to 1:
+        Return proc schema_create_boolean from Schema
+    End If
+    Let eq_null be proc string_equals from StringCore with tname, "null"
+    If eq_null is equal to 1:
+        Return proc schema_create_null from Schema
+    End If
+    Let eq_arr be proc string_equals from StringCore with tname, "array"
+    If eq_arr is equal to 1:
+        Let arr_min be 0 minus 1
+        Let arr_max be 0 minus 1
+        Let arr_unique be 0
+        Let min_items_cv be proc get from Dict with dict, "minItems"
+        If min_items_cv is not equal to 0:
+            Let min_items_k be proc config_value_kind from Cfg with min_items_cv
+            If min_items_k is equal to 2:
+                Set arr_min to proc config_value_as_integer from Cfg with min_items_cv
+            End If
+        End If
+        Let max_items_cv be proc get from Dict with dict, "maxItems"
+        If max_items_cv is not equal to 0:
+            Let max_items_k be proc config_value_kind from Cfg with max_items_cv
+            If max_items_k is equal to 2:
+                Set arr_max to proc config_value_as_integer from Cfg with max_items_cv
+            End If
+        End If
+        Let unique_items_cv be proc get from Dict with dict, "uniqueItems"
+        If unique_items_cv is not equal to 0:
+            Let unique_items_k be proc config_value_kind from Cfg with unique_items_cv
+            If unique_items_k is equal to 4:
+                Set arr_unique to proc config_value_as_bool from Cfg with unique_items_cv
+            End If
+        End If
+        Let items_cv be proc get from Dict with dict, "items"
+        Let arr_node be 0
+        If items_cv is equal to 0:
+            Let any_item be proc schema_create_any from Schema
+            Set arr_node to proc schema_create_array from Schema with any_item, arr_min, arr_max, arr_unique
+        Otherwise:
+            Let item_schema be proc cv_to_schema with items_cv
+            If item_schema is equal to 0:
+                Return 0
+            End If
+            Set arr_node to proc schema_create_array from Schema with item_schema, arr_min, arr_max, arr_unique
+        End If
+        If arr_node is equal to 0:
+            Return 0
+        End If
+        Let prefix_cv be proc get from Dict with dict, "prefixItems"
+        If prefix_cv is not equal to 0:
+            Let prefix_k be proc config_value_kind from Cfg with prefix_cv
+            If prefix_k is equal to 5:
+                Let prefix_lst be proc config_value_as_list from Cfg with prefix_cv
+                Let prefix_c be proc list_length from List with prefix_lst
+                Let prefix_i be 0
+                While prefix_i is less than prefix_c:
+                    Let prefix_elem be proc list_get from List with prefix_lst, prefix_i
+                    Let prefix_sub be proc cv_to_schema with prefix_elem
+                    If prefix_sub is not equal to 0:
+                        proc schema_array_add_prefix_item from Schema with arr_node, prefix_sub
+                    End If
+                    Set prefix_i to prefix_i plus 1
+                End While
+            End If
+        End If
+        Let contains_cv be proc get from Dict with dict, "contains"
+        If contains_cv is not equal to 0:
+            Let contains_k be proc config_value_kind from Cfg with contains_cv
+            If contains_k is equal to 6:
+                Let contains_sub be proc cv_to_schema with contains_cv
+                If contains_sub is not equal to 0:
+                    proc schema_array_set_contains from Schema with arr_node, contains_sub
+                End If
+            End If
+        End If
+        Return arr_node
+    End If
+    Let eq_obj be proc string_equals from StringCore with tname, "object"
+    If eq_obj is equal to 1:
+        Let onode be proc schema_create_object from Schema
+        Let props_cv be proc get from Dict with dict, "properties"
+        Let required_set be proc create from Dict
+        Let req_cv be proc get from Dict with dict, "required"
+        If req_cv is not equal to 0:
+            Let rk be proc config_value_kind from Cfg with req_cv
+            If rk is equal to 5:
+                Let rlst be proc config_value_as_list from Cfg with req_cv
+                Let rc be proc list_length from List with rlst
+                Let ri be 0
+                While ri is less than rc:
+                    Let re be proc list_get from List with rlst, ri
+                    Let rek be proc config_value_kind from Cfg with re
+                    If rek is equal to 1:
+                        Let rs be proc config_value_as_string from Cfg with re
+                        proc set from Dict with required_set, rs, re
+                    End If
+                    Set ri to ri plus 1
+                End While
+            End If
+        End If
+        If props_cv is not equal to 0:
+            Let pk be proc config_value_kind from Cfg with props_cv
+            If pk is equal to 6:
+                Let pdict be proc config_value_as_map from Cfg with props_cv
+                Let pkeys be proc keys from Dict with pdict
+                Let pc be proc list_length from List with pkeys
+                Let pi be 0
+                While pi is less than pc:
+                    Let pkey be proc list_get from List with pkeys, pi
+                    Let pval be proc get from Dict with pdict, pkey
+                    Let psub be proc cv_to_schema with pval
+                    If psub is not equal to 0:
+                        Let in_req be proc get from Dict with required_set, pkey
+                        Let req_flag be 0
+                        If in_req is not equal to 0:
+                            Set req_flag to 1
+                        End If
+                        Let fld be proc object_field_create from Schema with pkey, psub, req_flag
+                        If fld is not equal to 0:
+                            proc schema_object_add_field from Schema with onode, fld
+                        End If
+                    End If
+                    Set pi to pi plus 1
+                End While
+                proc list_destroy from List with pkeys
+            End If
+        End If
+        proc destroy from Dict with required_set
+        Note: additionalProperties: false | true | <schema>.
+        Let ap_cv be proc get from Dict with dict, "additionalProperties"
+        If ap_cv is not equal to 0:
+            Let ap_k be proc config_value_kind from Cfg with ap_cv
+            If ap_k is equal to 4:
+                Let ap_b be proc config_value_as_bool from Cfg with ap_cv
+                If ap_b is equal to 0:
+                    proc schema_object_set_additional_properties_false from Schema with onode
+                End If
+            End If
+            If ap_k is equal to 6:
+                Let ap_sub be proc cv_to_schema with ap_cv
+                If ap_sub is not equal to 0:
+                    proc schema_object_set_additional_properties_schema from Schema with onode, ap_sub
+                End If
+            End If
+        End If
+        Note: dependentRequired: { trigger_key: [ "needed_a", "needed_b" ] }
+        Let dr_cv be proc get from Dict with dict, "dependentRequired"
+        If dr_cv is not equal to 0:
+            Let dr_k be proc config_value_kind from Cfg with dr_cv
+            If dr_k is equal to 6:
+                Let dr_map be proc config_value_as_map from Cfg with dr_cv
+                If dr_map is not equal to 0:
+                    Let dr_keys be proc keys from Dict with dr_map
+                    If dr_keys is not equal to 0:
+                        Let dr_count be proc list_length from List with dr_keys
+                        Let dr_i be 0
+                        While dr_i is less than dr_count:
+                            Let dr_key be proc list_get from List with dr_keys, dr_i
+                            If dr_key is not equal to 0:
+                                Let dr_val be proc get from Dict with dr_map, dr_key
+                                Let dr_val_k be proc config_value_kind from Cfg with dr_val
+                                If dr_val_k is equal to 5:
+                                    Let dr_val_lst be proc config_value_as_list from Cfg with dr_val
+                                    Let dr_needed_list be proc list_create from List
+                                    If dr_needed_list is not equal to 0:
+                                        Let dr_vn be proc list_length from List with dr_val_lst
+                                        Let dr_vi be 0
+                                        While dr_vi is less than dr_vn:
+                                            Let dr_name_cv be proc list_get from List with dr_val_lst, dr_vi
+                                            Let dr_name_k be proc config_value_kind from Cfg with dr_name_cv
+                                            If dr_name_k is equal to 1:
+                                                Let dr_name_str be proc config_value_as_string from Cfg with dr_name_cv
+                                                Let dr_name_dup be proc string_duplicate from StringPrim with dr_name_str
+                                                If dr_name_dup is not equal to 0:
+                                                    proc list_push from List with dr_needed_list, dr_name_dup
+                                                End If
+                                            End If
+                                            Set dr_vi to dr_vi plus 1
+                                        End While
+                                        proc schema_object_add_dependent_required from Schema with onode, dr_key, dr_needed_list
+                                    End If
+                                End If
+                            End If
+                            Set dr_i to dr_i plus 1
+                        End While
+                        proc list_destroy from List with dr_keys
+                    End If
+                End If
+            End If
+        End If
+        Return onode
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Translate a JSON Schema format identifier to the corresponding
+SCHEMA.FORMAT_* constant.
+@End Reasoning
+
+@Implementation
+Linear string comparison against each recognized format name.
+@End Implementation
+
+@Performance_Hints
+Time: O(k) where k is number of format names (constant).
+@End Performance_Hints
+
+@Security_Scope
+Returns FORMAT_NONE (0) for unrecognized format strings.
+@End Security_Scope
+Process called "format_name_to_constant" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let m1 be proc string_equals from StringCore with name, "email"
+    If m1 is equal to 1:
+        Return 1
+    End If
+    Let m2 be proc string_equals from StringCore with name, "uri"
+    If m2 is equal to 1:
+        Return 13
+    End If
+    Let m3 be proc string_equals from StringCore with name, "uri-reference"
+    If m3 is equal to 1:
+        Return 14
+    End If
+    Let m4 be proc string_equals from StringCore with name, "uuid"
+    If m4 is equal to 1:
+        Return 3
+    End If
+    Let m5 be proc string_equals from StringCore with name, "date"
+    If m5 is equal to 1:
+        Return 4
+    End If
+    Let m6 be proc string_equals from StringCore with name, "time"
+    If m6 is equal to 1:
+        Return 5
+    End If
+    Let m7 be proc string_equals from StringCore with name, "date-time"
+    If m7 is equal to 1:
+        Return 6
+    End If
+    Let m8 be proc string_equals from StringCore with name, "duration"
+    If m8 is equal to 1:
+        Return 7
+    End If
+    Let m9 be proc string_equals from StringCore with name, "ipv4"
+    If m9 is equal to 1:
+        Return 8
+    End If
+    Let m10 be proc string_equals from StringCore with name, "ipv6"
+    If m10 is equal to 1:
+        Return 9
+    End If
+    Let m11 be proc string_equals from StringCore with name, "hostname"
+    If m11 is equal to 1:
+        Return 10
+    End If
+    Let m12 be proc string_equals from StringCore with name, "regex"
+    If m12 is equal to 1:
+        Return 11
+    End If
+    Let m13 be proc string_equals from StringCore with name, "json-pointer"
+    If m13 is equal to 1:
+        Return 12
+    End If
+    Let m14 be proc string_equals from StringCore with name, "idn-email"
+    If m14 is equal to 1:
+        Return 15
+    End If
+    Let m15 be proc string_equals from StringCore with name, "idn-hostname"
+    If m15 is equal to 1:
+        Return 16
+    End If
+    Let m16 be proc string_equals from StringCore with name, "iri"
+    If m16 is equal to 1:
+        Return 17
+    End If
+    Let m17 be proc string_equals from StringCore with name, "uri-template"
+    If m17 is equal to 1:
+        Return 18
+    End If
+    Let m18 be proc string_equals from StringCore with name, "relative-json-pointer"
+    If m18 is equal to 1:
+        Return 19
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: TOP-LEVEL API
+Note: ============================================================================
+
+@Reasoning
+Parse a JSON Schema document (UTF-8 text) into a generic SchemaNode.
+@End Reasoning
+
+@Implementation
+Parse the text into a ConfigValue, then translate via cv_to_schema. The
+intermediate CV tree is destroyed before return.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse error or null input.
+@End Security_Scope
+Process called "json_schema_parse" takes json_text as Integer returns Integer:
+    If json_text is equal to 0:
+        Return 0
+    End If
+    Let cv be proc json_to_config_value with json_text
+    If cv is equal to 0:
+        Return 0
+    End If
+    Let schema be proc cv_to_schema with cv
+    proc config_value_destroy from Cfg with cv
+    Return schema
+End Process
+
+@Reasoning
+Serialize a SchemaNode back into JSON-Schema-compatible JSON text.
+Round-trip is lossy for keywords that were not represented in the
+generic AST (e.g. exclusiveMinimum, additionalProperties), but every
+preserved keyword is emitted in canonical form.
+@End Reasoning
+
+@Implementation
+Build the JSON output via StringBuilder using a recursive walker that
+inspects schema kind:
+  OBJECT: { "type": "object", "properties": {...}, "required": [...] }
+  ARRAY : { "type": "array", "items": {...} }
+  STRING: { "type": "string", "minLength": N, "maxLength": N, "pattern": "..." }
+  INTEGER: { "type": "integer", "minimum": N, "maximum": N }
+  FLOAT  : { "type": "number" }
+  BOOLEAN: { "type": "boolean" }
+  NULL   : { "type": "null" }
+  ANY    : true
+  ENUM   : { "enum": [...] }
+  UNION  : title="oneOf" emits { "oneOf": [...] }, else { "anyOf": [...] }
+  REFERENCE: { "$ref": "..." }
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over schema. Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input or allocation failure.
+@End Security_Scope
+Process called "json_schema_serialize" takes schema as Integer returns Integer:
+    If schema is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc emit_schema with sb, schema
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Internal recursive emitter writing a SchemaNode into a StringBuilder.
+@End Reasoning
+
+@Implementation
+Switch on kind and write the appropriate JSON object/value, recursing
+into children.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "emit_schema" takes sb as Integer, schema as Integer returns Integer:
+    If schema is equal to 0:
+        proc stringbuilder_append from SB with sb, "true"
+        Return 1
+    End If
+    Let kind be proc schema_kind from Schema with schema
+    Let payload be proc schema_payload from Schema with schema
+    If kind is equal to 11:
+        proc stringbuilder_append from SB with sb, "true"
+        Return 1
+    End If
+    proc stringbuilder_append_char from SB with sb, 123
+    If kind is equal to 1:
+        proc stringbuilder_append from SB with sb, "\"type\":\"object\""
+        If payload is not equal to 0:
+            Let count be proc list_length from List with payload
+            If count is greater than 0:
+                proc stringbuilder_append from SB with sb, ",\"properties\":{"
+                Let i be 0
+                While i is less than count:
+                    Let fld be proc list_get from List with payload, i
+                    If fld is not equal to 0:
+                        Let nm be proc object_field_name from Schema with fld
+                        Let sub be proc object_field_schema from Schema with fld
+                        If i is greater than 0:
+                            proc stringbuilder_append_char from SB with sb, 44
+                        End If
+                        proc emit_json_string with sb, nm
+                        proc stringbuilder_append_char from SB with sb, 58
+                        proc emit_schema with sb, sub
+                    End If
+                    Set i to i plus 1
+                End While
+                proc stringbuilder_append_char from SB with sb, 125
+                Let any_req be 0
+                Let j be 0
+                While j is less than count:
+                    Let fld2 be proc list_get from List with payload, j
+                    If fld2 is not equal to 0:
+                        Let req be proc object_field_is_required from Schema with fld2
+                        If req is equal to 1:
+                            Set any_req to 1
+                        End If
+                    End If
+                    Set j to j plus 1
+                End While
+                If any_req is equal to 1:
+                    proc stringbuilder_append from SB with sb, ",\"required\":["
+                    Let k be 0
+                    Let first_req be 1
+                    While k is less than count:
+                        Let fld3 be proc list_get from List with payload, k
+                        If fld3 is not equal to 0:
+                            Let req2 be proc object_field_is_required from Schema with fld3
+                            If req2 is equal to 1:
+                                If first_req is equal to 0:
+                                    proc stringbuilder_append_char from SB with sb, 44
+                                End If
+                                Set first_req to 0
+                                Let nm2 be proc object_field_name from Schema with fld3
+                                proc emit_json_string with sb, nm2
+                            End If
+                        End If
+                        Set k to k plus 1
+                    End While
+                    proc stringbuilder_append_char from SB with sb, 93
+                End If
+            End If
+        End If
+        proc stringbuilder_append_char from SB with sb, 125
+        Return 1
+    End If
+    If kind is equal to 2:
+        proc stringbuilder_append from SB with sb, "\"type\":\"array\",\"items\":"
+        proc emit_schema with sb, payload
+        proc stringbuilder_append_char from SB with sb, 125
+        Return 1
+    End If
+    If kind is equal to 3:
+        proc stringbuilder_append from SB with sb, "\"type\":\"string\""
+        If payload is not equal to 0:
+            Let mn be proc memory_get_int64 from Memory with payload, 0
+            If mn is greater than or equal to 0:
+                proc stringbuilder_append from SB with sb, ",\"minLength\":"
+                proc stringbuilder_append_integer from SB with sb, mn
+            End If
+            Let mx be proc memory_get_int64 from Memory with payload, 8
+            If mx is greater than or equal to 0:
+                proc stringbuilder_append from SB with sb, ",\"maxLength\":"
+                proc stringbuilder_append_integer from SB with sb, mx
+            End If
+        End If
+        proc stringbuilder_append_char from SB with sb, 125
+        Return 1
+    End If
+    If kind is equal to 4:
+        proc stringbuilder_append from SB with sb, "\"type\":\"integer\""
+        If payload is not equal to 0:
+            Let hm be proc memory_get_int64 from Memory with payload, 0
+            If hm is equal to 1:
+                proc stringbuilder_append from SB with sb, ",\"minimum\":"
+                Let mv be proc memory_get_int64 from Memory with payload, 8
+                proc stringbuilder_append_integer from SB with sb, mv
+            End If
+            Let hM be proc memory_get_int64 from Memory with payload, 16
+            If hM is equal to 1:
+                proc stringbuilder_append from SB with sb, ",\"maximum\":"
+                Let Mv be proc memory_get_int64 from Memory with payload, 24
+                proc stringbuilder_append_integer from SB with sb, Mv
+            End If
+            Let mof be proc memory_get_int64 from Memory with payload, 32
+            If mof is not equal to 0:
+                proc stringbuilder_append from SB with sb, ",\"multipleOf\":"
+                proc stringbuilder_append_integer from SB with sb, mof
+            End If
+        End If
+        proc stringbuilder_append_char from SB with sb, 125
+        Return 1
+    End If
+    If kind is equal to 5:
+        proc stringbuilder_append from SB with sb, "\"type\":\"number\""
+        proc stringbuilder_append_char from SB with sb, 125
+        Return 1
+    End If
+    If kind is equal to 6:
+        proc stringbuilder_append from SB with sb, "\"type\":\"boolean\""
+        proc stringbuilder_append_char from SB with sb, 125
+        Return 1
+    End If
+    If kind is equal to 7:
+        proc stringbuilder_append from SB with sb, "\"type\":\"null\""
+        proc stringbuilder_append_char from SB with sb, 125
+        Return 1
+    End If
+    If kind is equal to 8:
+        Let title be proc schema_title from Schema with schema
+        Let is_one be 0
+        If title is not equal to 0:
+            Let teq be proc string_equals from StringCore with title, "oneOf"
+            If teq is equal to 1:
+                Set is_one to 1
+            End If
+        End If
+        If is_one is equal to 1:
+            proc stringbuilder_append from SB with sb, "\"oneOf\":["
+        Otherwise:
+            proc stringbuilder_append from SB with sb, "\"anyOf\":["
+        End If
+        If payload is not equal to 0:
+            Let vc be proc list_length from List with payload
+            Let v_i be 0
+            While v_i is less than vc:
+                Let variant be proc list_get from List with payload, v_i
+                If v_i is greater than 0:
+                    proc stringbuilder_append_char from SB with sb, 44
+                End If
+                proc emit_schema with sb, variant
+                Set v_i to v_i plus 1
+            End While
+        End If
+        proc stringbuilder_append from SB with sb, "]}"
+        Return 1
+    End If
+    If kind is equal to 9:
+        proc stringbuilder_append from SB with sb, "\"$ref\":"
+        proc emit_json_string with sb, payload
+        proc stringbuilder_append_char from SB with sb, 125
+        Return 1
+    End If
+    If kind is equal to 10:
+        proc stringbuilder_append from SB with sb, "\"enum\":["
+        If payload is not equal to 0:
+            Let ec be proc list_length from List with payload
+            Let ei be 0
+            While ei is less than ec:
+                Let val be proc list_get from List with payload, ei
+                If ei is greater than 0:
+                    proc stringbuilder_append_char from SB with sb, 44
+                End If
+                proc emit_json_string with sb, val
+                Set ei to ei plus 1
+            End While
+        End If
+        proc stringbuilder_append from SB with sb, "]}"
+        Return 1
+    End If
+    proc stringbuilder_append_char from SB with sb, 125
+    Return 1
+End Process
+
+@Reasoning
+Emit a JSON string literal: opening quote, body with escape encoding,
+closing quote.
+@End Reasoning
+
+@Implementation
+Write '"'. For each byte: " -> \\\", \\ -> \\\\, control chars 0-31 ->
+\\uXXXX, else literal. Write '"'.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Internal. Assumes byte input is valid UTF-8.
+@End Security_Scope
+Process called "emit_json_string" takes sb as Integer, s as Integer returns Integer:
+    proc stringbuilder_append_char from SB with sb, 34
+    If s is not equal to 0:
+        Let length be proc string_length from StringCore with s
+        Let i be 0
+        While i is less than length:
+            Let ch be proc memory_get_byte from Memory with s, i
+            If ch is equal to 34:
+                proc stringbuilder_append_char from SB with sb, 92
+                proc stringbuilder_append_char from SB with sb, 34
+            Otherwise:
+                If ch is equal to 92:
+                    proc stringbuilder_append_char from SB with sb, 92
+                    proc stringbuilder_append_char from SB with sb, 92
+                Otherwise:
+                    If ch is equal to 10:
+                        proc stringbuilder_append_char from SB with sb, 92
+                        proc stringbuilder_append_char from SB with sb, 110
+                    Otherwise:
+                        If ch is equal to 13:
+                            proc stringbuilder_append_char from SB with sb, 92
+                            proc stringbuilder_append_char from SB with sb, 114
+                        Otherwise:
+                            If ch is equal to 9:
+                                proc stringbuilder_append_char from SB with sb, 92
+                                proc stringbuilder_append_char from SB with sb, 116
+                            Otherwise:
+                                If ch is less than 32:
+                                    proc stringbuilder_append from SB with sb, "\\u00"
+                                    Let hi be ch divided by 16
+                                    Let lo be ch minus (hi multiplied by 16)
+                                    proc stringbuilder_append_char from SB with sb, proc hex_char with hi
+                                    proc stringbuilder_append_char from SB with sb, proc hex_char with lo
+                                Otherwise:
+                                    proc stringbuilder_append_char from SB with sb, ch
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    proc stringbuilder_append_char from SB with sb, 34
+    Return 1
+End Process
+
+@Reasoning
+Hex digit to ASCII character.
+@End Reasoning
+
+@Implementation
+0..9 -> '0'..'9', 10..15 -> 'a'..'f'.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal. Caller passes 0..15.
+@End Security_Scope
+Process called "hex_char" takes n as Integer returns Integer:
+    If n is less than 10:
+        Return 48 plus n
+    End If
+    Return 87 plus n
+End Process
+
+Note:
+Validation entry points live in json_schema_ast.runa, which owns the
+typed JSON-Schema AST and implements the Draft 2020-12 validation
+semantics (allOf/oneOf/not/const/format-aware/numeric-bound-aware).
+The validator there has the signature
+
+    json_schema_validate(schema, value) -> Integer
+
+so callers should import json_schema_ast directly when validation is
+required. This module (the facade) intentionally exposes only the
+parser and serializer surface to avoid maintaining two parallel
+validator implementations that drift apart.
+:End Note

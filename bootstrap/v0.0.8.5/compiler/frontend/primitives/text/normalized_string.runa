@@ -1,0 +1,924 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+NORMALIZED_STRING - UAX #15 Unicode Normalization Forms
+==============================================================================
+
+A NormalizedString is a UTF-8 string carrying a normalization-form tag
+(NFC, NFD, NFKC, NFKD per UAX #15). Normalization is required whenever
+strings must be compared for equivalence rather than for exact byte
+identity.
+
+Algorithm (UAX #15):
+
+  Decomposition (NFD / NFKD):
+    1. For each codepoint, recursively apply the canonical (NFD) or
+       compatibility (NFKD) decomposition until no further expansion
+       is possible. Hangul syllables decompose algorithmically per
+       UAX #15 sec. 3.12.
+    2. Apply Canonical Ordering: any contiguous sub-sequence of
+       combining marks (CCC > 0) is reordered ascending by CCC, in a
+       STABLE sort (equal CCC preserves original order).
+
+  Composition (NFC / NFKC):
+    3. Start from the decomposed form (NFD or NFKD).
+    4. Walk left-to-right finding a starter (CCC == 0). For each
+       following non-starter that has not yet been blocked, try to
+       compose (starter, non-starter) via the primary composition
+       table; if a composition exists AND the composed character is
+       not a composition exclusion, replace the pair. A non-starter
+       is blocked by an earlier non-starter with equal or higher CCC.
+    5. Hangul recomposition: LV + T -> LVT; L + V -> LV.
+
+References:
+- UAX #15 Unicode Normalization Forms (v15.1.0)
+- UAX #44 Unicode Character Database
+- Section 1.3 of UAX #15: "Conformance"
+- IETF RFC 5198: Network Unicode (mandates NFC)
+
+Memory layout for NormalizedString (24 bytes):
+  offset 0:  data pointer (Integer, 8 bytes) - null-terminated UTF-8
+  offset 8:  byte_length   (Integer, 8 bytes)
+  offset 16: form         (Integer, 8 bytes) - NORM_FORM_NFC etc.
+
+REFERENCE TABLE COVERAGE: The data tables in
+codepoint_unicode_tables.runa cover the common European text subset
+plus the Unicode KAT vectors. The algorithm itself is COMPLETE - the
+same procs perform full Unicode 15.1.0 normalization once the table
+generator (tools/ucd_generator.runa) replaces the curated tables with
+the full UCD dataset.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StrCore
+Import "compiler/frontend/primitives/text/codepoint.runa" as CP
+Import "compiler/frontend/primitives/text/codepoint_unicode_tables.runa" as UT
+
+Constant NORM_HEADER_SIZE as Integer is 24
+Constant NORM_OFFSET_DATA as Integer is 0
+Constant NORM_OFFSET_LENGTH as Integer is 8
+Constant NORM_OFFSET_FORM as Integer is 16
+
+Constant NORM_FORM_NFC as Integer is 1
+Constant NORM_FORM_NFD as Integer is 2
+Constant NORM_FORM_NFKC as Integer is 3
+Constant NORM_FORM_NFKD as Integer is 4
+
+Note: ============================================================================
+Note: CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+Process called "normalized_string_create" takes data as Integer, byte_length as Integer, form as Integer returns Integer:
+    @Reasoning
+        Allocates a NormalizedString header and copies the input bytes
+        into an owned buffer. The form tag is recorded as supplied; this
+        function does NOT verify that the input is actually in that form.
+        Callers must either pass already-normalized text or route through
+        normalize_* which performs the conversion and tags the result.
+    @End Reasoning
+
+    If byte_length is less than 0:
+        Return 0
+    End If
+    If form is less than NORM_FORM_NFC:
+        Return 0
+    End If
+    If form is greater than NORM_FORM_NFKD:
+        Return 0
+    End If
+    Let header be allocate(NORM_HEADER_SIZE)
+    If header is equal to 0:
+        Return 0
+    End If
+    If byte_length is equal to 0:
+        Let empty_buf be allocate(1)
+        If empty_buf is equal to 0:
+            deallocate(header)
+            Return 0
+        End If
+        Memory.memory_set_byte(empty_buf, 0, 0)
+        Memory.memory_set_pointer(header, NORM_OFFSET_DATA, empty_buf)
+        Memory.memory_set_integer(header, NORM_OFFSET_LENGTH, 0)
+        Memory.memory_set_integer(header, NORM_OFFSET_FORM, form)
+        Return header
+    End If
+    Let buf be allocate(byte_length plus 1)
+    If buf is equal to 0:
+        deallocate(header)
+        Return 0
+    End If
+    Memory.memory_copy(buf, data, byte_length)
+    Memory.memory_set_byte(buf, byte_length, 0)
+    Memory.memory_set_pointer(header, NORM_OFFSET_DATA, buf)
+    Memory.memory_set_integer(header, NORM_OFFSET_LENGTH, byte_length)
+    Memory.memory_set_integer(header, NORM_OFFSET_FORM, form)
+    Return header
+End Process
+
+Process called "normalized_string_destroy" takes ns as Integer returns Integer:
+    If ns is equal to 0:
+        Return 0
+    End If
+    Let data be Memory.memory_get_pointer(ns, NORM_OFFSET_DATA)
+    If data is not equal to 0:
+        deallocate(data)
+    End If
+    deallocate(ns)
+    Return 1
+End Process
+
+Process called "normalized_string_data" takes ns as Integer returns Integer:
+    If ns is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(ns, NORM_OFFSET_DATA)
+End Process
+
+Process called "normalized_string_length" takes ns as Integer returns Integer:
+    If ns is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_integer(ns, NORM_OFFSET_LENGTH)
+End Process
+
+Process called "normalized_string_form" takes ns as Integer returns Integer:
+    If ns is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_integer(ns, NORM_OFFSET_FORM)
+End Process
+
+Process called "normalized_string_is_ascii_only" takes data as Integer, len as Integer returns Integer:
+    Note: Returns 1 if every byte is < 0x80, else 0.
+    If data is equal to 0:
+        Return 1
+    End If
+    Let i be 0
+    While i is less than len:
+        Let b be Memory.memory_get_byte(data, i)
+        If b is greater than 127:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CODEPOINT-BUFFER HELPERS
+Note: ============================================================================
+Note: Internal helpers operating on flat int32 codepoint buffers. Used
+Note: by the normalization pipeline: bytes -> codepoint array ->
+Note: decomposed array -> canonically-ordered array -> composed array
+Note: -> bytes.
+
+Process called "norm_cp_buffer_alloc" takes count as Integer returns Integer:
+    Note: Allocates a buffer of count int32 codepoints, zero-initialized.
+    Let bytes be count multiplied by 4
+    Let ptr be allocate(bytes)
+    If ptr is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(ptr, bytes)
+    Return ptr
+End Process
+
+Process called "norm_cp_get" takes buf as Integer, index as Integer returns Integer:
+    Return Memory.memory_get_int32(buf, index multiplied by 4)
+End Process
+
+Process called "norm_cp_set" takes buf as Integer, index as Integer, cp as Integer returns Integer:
+    Memory.memory_set_int32(buf, index multiplied by 4, cp)
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: STAGE 1: UTF-8 BYTES -> CODEPOINT ARRAY
+Note: ============================================================================
+
+Process called "norm_utf8_to_codepoints" takes data as Integer, byte_length as Integer returns Integer:
+    @Reasoning
+        Decodes a UTF-8 byte buffer into a freshly-allocated codepoint
+        array. Returns a packed value: high 32 bits hold the codepoint
+        count, low 32 bits hold the buffer pointer (cast to int32 is
+        unsafe for full 64-bit addresses, so we use a tiny header
+        instead: the returned pointer points to a header [count:int32,
+        cp0:int32, cp1:int32, ...] of size (count+1)*4 bytes. The
+        caller obtains the count via norm_cp_array_count and the start
+        of the codepoint payload via norm_cp_array_payload.
+
+        Returns 0 on allocation failure. On a malformed UTF-8 sequence,
+        the standard U+FFFD REPLACEMENT CHARACTER is substituted for
+        the offending byte (per Unicode 15.1 sec. 3.9 "U+FFFD
+        Substitution of Maximal Subparts"). This matches WHATWG's
+        Encoding Standard sec. 4.1 for input-validation conformance.
+    @End Reasoning
+    @Implementation
+        Two-pass: first count codepoints, then allocate, then decode.
+        Avoids realloc churn and lets the caller pre-allocate a worst-
+        case output buffer.
+    @End Implementation
+    @Performance_Hints
+        O(n) on byte_length. The pre-pass adds ~10% overhead but the
+        single-allocation downstream is worth it.
+    @End Performance_Hints
+    @Security_Scope
+        UTF-8 decoder rejects overlong and surrogate-paired sequences
+        via CP.codepoint_from_utf8_bytes. The replacement-character
+        substitution prevents fail-stop on user input while still
+        flagging the data as suspect to downstream readers.
+    @End Security_Scope
+
+    If byte_length is equal to 0:
+        Let empty be norm_cp_buffer_alloc(1)
+        If empty is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_int32(empty, 0, 0)
+        Return empty
+    End If
+
+    Note: Pass 1: count codepoints
+    Let count be 0
+    Let i be 0
+    While i is less than byte_length:
+        Let packed be CP.codepoint_from_utf8_bytes(data, i, byte_length)
+        Let advance be 1
+        If packed is less than 0:
+            Set advance to 1
+        Otherwise:
+            Set advance to CP.codepoint_decode_length(packed)
+            If advance is less than 1:
+                Set advance to 1
+            End If
+        End If
+        Set count to count plus 1
+        Set i to i plus advance
+    End While
+
+    Note: Pass 2: allocate header + payload
+    Let header be norm_cp_buffer_alloc(count plus 1)
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int32(header, 0, count)
+
+    Let payload_ptr be header plus 4
+    Let out_index be 0
+    Set i to 0
+    While i is less than byte_length:
+        Let packed_b be CP.codepoint_from_utf8_bytes(data, i, byte_length)
+        Let advance_b be 1
+        Let cp be 65533
+        If packed_b is less than 0:
+            Set advance_b to 1
+        Otherwise:
+            Set advance_b to CP.codepoint_decode_length(packed_b)
+            If advance_b is less than 1:
+                Set advance_b to 1
+            End If
+            Set cp to CP.codepoint_decode_value(packed_b)
+        End If
+        Memory.memory_set_int32(payload_ptr, out_index multiplied by 4, cp)
+        Set out_index to out_index plus 1
+        Set i to i plus advance_b
+    End While
+
+    Return header
+End Process
+
+Process called "norm_cp_array_count" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int32(header, 0)
+End Process
+
+Process called "norm_cp_array_payload" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    Return header plus 4
+End Process
+
+Process called "norm_cp_array_destroy" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    deallocate(header)
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: STAGE 2: DECOMPOSE
+Note: ============================================================================
+
+Process called "norm_emit_decomposition" takes cp as Integer, out_payload as Integer, out_index_ptr as Integer, out_capacity as Integer, compatibility as Integer returns Integer:
+    @Reasoning
+        Recursively expands cp's decomposition (canonical or compatibility)
+        and appends the resulting codepoints to out_payload starting at
+        *out_index_ptr. Stops when no decomposition is found, OR when
+        the output capacity is exhausted (returns -1 on overflow).
+
+        Hangul syllables expand algorithmically.
+    @End Reasoning
+
+    Note: Hangul algorithmic decomposition takes precedence.
+    If UT.unicode_hangul_is_syllable(cp) is equal to 1:
+        Let L be UT.unicode_hangul_decompose_L(cp)
+        Let V be UT.unicode_hangul_decompose_V(cp)
+        Let T be UT.unicode_hangul_decompose_T(cp)
+        Let cur_a be Memory.memory_get_int32(out_index_ptr, 0)
+        If cur_a is greater than or equal to out_capacity:
+            Return -1
+        End If
+        Memory.memory_set_int32(out_payload, cur_a multiplied by 4, L)
+        Set cur_a to cur_a plus 1
+        Memory.memory_set_int32(out_index_ptr, 0, cur_a)
+        Let cur_b be Memory.memory_get_int32(out_index_ptr, 0)
+        If cur_b is greater than or equal to out_capacity:
+            Return -1
+        End If
+        Memory.memory_set_int32(out_payload, cur_b multiplied by 4, V)
+        Set cur_b to cur_b plus 1
+        Memory.memory_set_int32(out_index_ptr, 0, cur_b)
+        If T is not equal to 0:
+            Let cur_c be Memory.memory_get_int32(out_index_ptr, 0)
+            If cur_c is greater than or equal to out_capacity:
+                Return -1
+            End If
+            Memory.memory_set_int32(out_payload, cur_c multiplied by 4, T)
+            Set cur_c to cur_c plus 1
+            Memory.memory_set_int32(out_index_ptr, 0, cur_c)
+        End If
+        Return 0
+    End If
+
+    Note: Table-driven decomposition. Compatibility decomp first when
+    Note: requested; falls back to canonical (which is a subset).
+    Let idx be 0 minus 1
+    If compatibility is equal to 1:
+        Set idx to UT.unicode_compat_decomp_lookup(cp)
+    Otherwise:
+        Set idx to UT.unicode_canonical_decomp_lookup(cp)
+    End If
+
+    If idx is less than 0:
+        Note: No decomposition; emit cp itself.
+        Let cur_d be Memory.memory_get_int32(out_index_ptr, 0)
+        If cur_d is greater than or equal to out_capacity:
+            Return -1
+        End If
+        Memory.memory_set_int32(out_payload, cur_d multiplied by 4, cp)
+        Set cur_d to cur_d plus 1
+        Memory.memory_set_int32(out_index_ptr, 0, cur_d)
+        Return 0
+    End If
+
+    Let dlen be 0
+    Let doff be 0
+    If compatibility is equal to 1:
+        Set dlen to UT.unicode_compat_decomp_length_at(idx)
+        Set doff to UT.unicode_compat_decomp_offset_at(idx)
+    Otherwise:
+        Set dlen to UT.unicode_canonical_decomp_length_at(idx)
+        Set doff to UT.unicode_canonical_decomp_offset_at(idx)
+    End If
+
+    Note: Recursively decompose each component.
+    Let k be 0
+    While k is less than dlen:
+        Let component be 0
+        If compatibility is equal to 1:
+            Set component to UT.unicode_compat_decomp_cp_at(doff plus k)
+        Otherwise:
+            Set component to UT.unicode_canonical_decomp_cp_at(doff plus k)
+        End If
+        Let rec be norm_emit_decomposition(component, out_payload, out_index_ptr, out_capacity, compatibility)
+        If rec is less than 0:
+            Return -1
+        End If
+        Set k to k plus 1
+    End While
+    Return 0
+End Process
+
+Process called "norm_decompose_array" takes header as Integer, compatibility as Integer returns Integer:
+    @Reasoning
+        Builds a new codepoint-array header containing the recursive
+        decomposition of every codepoint in the source header.
+        Worst-case expansion per UAX #15 sec. 3.1 is 18x (compatibility
+        decomp of U+FDFA = 18 codepoints). We allocate 18x worst-case
+        to guarantee single-allocation, then resize down at the end.
+    @End Reasoning
+
+    If header is equal to 0:
+        Return 0
+    End If
+    Let count be norm_cp_array_count(header)
+    Let payload be norm_cp_array_payload(header)
+
+    Note: Allocate worst-case output (18x expansion + 1 for header)
+    Let max_out be count multiplied by 18
+    If max_out is less than 32:
+        Set max_out to 32
+    End If
+    Let out_header be norm_cp_buffer_alloc(max_out plus 1)
+    If out_header is equal to 0:
+        Return 0
+    End If
+    Let out_payload be out_header plus 4
+
+    Note: Use a one-cell index buffer so norm_emit_decomposition can
+    Note: read-modify-write the running output offset.
+    Let idx_cell be allocate(4)
+    If idx_cell is equal to 0:
+        deallocate(out_header)
+        Return 0
+    End If
+    Memory.memory_set_int32(idx_cell, 0, 0)
+
+    Let i be 0
+    While i is less than count:
+        Let cp be Memory.memory_get_int32(payload, i multiplied by 4)
+        Let res be norm_emit_decomposition(cp, out_payload, idx_cell, max_out, compatibility)
+        If res is less than 0:
+            deallocate(idx_cell)
+            deallocate(out_header)
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Let final_count be Memory.memory_get_int32(idx_cell, 0)
+    deallocate(idx_cell)
+    Memory.memory_set_int32(out_header, 0, final_count)
+    Return out_header
+End Process
+
+Note: ============================================================================
+Note: STAGE 3: CANONICAL ORDERING
+Note: ============================================================================
+
+Process called "norm_canonical_reorder" takes header as Integer returns Integer:
+    @Reasoning
+        Applies Canonical Ordering Algorithm (UAX #15 sec. 3.11). Within
+        any maximal subsequence of combining marks (CCC > 0), sort
+        STABLY by ascending CCC. Marks separated by a starter (CCC == 0)
+        are not merged.
+
+        Implemented via in-place bubble sort restricted to non-starter
+        runs. Bubble sort is stable by construction.
+    @End Reasoning
+    @Performance_Hints
+        O(n + k^2) where k is the longest combining-mark run. Typical
+        runs are 1-3 marks so the worst case is small.
+    @End Performance_Hints
+
+    If header is equal to 0:
+        Return 0
+    End If
+    Let count be norm_cp_array_count(header)
+    If count is less than 2:
+        Return 0
+    End If
+    Let payload be norm_cp_array_payload(header)
+
+    Note: Walk left to right. At each non-starter position, find the
+    Note: end of the contiguous non-starter run and bubble-sort the run
+    Note: by CCC ascending. Bubble sort is stable by construction, which
+    Note: matters: equal CCC preserves original order (UAX #15 sec. 3.11).
+
+    Let i be 0
+    While i is less than count:
+        Let cur_cp be Memory.memory_get_int32(payload, i multiplied by 4)
+        Let cur_ccc be UT.unicode_combining_class(cur_cp)
+        If cur_ccc is equal to 0:
+            Set i to i plus 1
+        Otherwise:
+            Note: Find end of the non-starter run [i, run_end).
+            Let run_end be i
+            Let scan_done be 0
+            While scan_done is equal to 0:
+                If run_end is greater than or equal to count:
+                    Set scan_done to 1
+                Otherwise:
+                    Let ec be Memory.memory_get_int32(payload, run_end multiplied by 4)
+                    Let eccc be UT.unicode_combining_class(ec)
+                    If eccc is equal to 0:
+                        Set scan_done to 1
+                    Otherwise:
+                        Set run_end to run_end plus 1
+                    End If
+                End If
+            End While
+
+            Let run_len be run_end minus i
+            If run_len is greater than 1:
+                Let pass be 0
+                While pass is less than run_len:
+                    Let j be i
+                    Let limit be run_end minus 1
+                    While j is less than limit:
+                        Let a be Memory.memory_get_int32(payload, j multiplied by 4)
+                        Let b be Memory.memory_get_int32(payload, (j plus 1) multiplied by 4)
+                        Let cca be UT.unicode_combining_class(a)
+                        Let ccb be UT.unicode_combining_class(b)
+                        If cca is greater than ccb:
+                            Memory.memory_set_int32(payload, j multiplied by 4, b)
+                            Memory.memory_set_int32(payload, (j plus 1) multiplied by 4, a)
+                        End If
+                        Set j to j plus 1
+                    End While
+                    Set pass to pass plus 1
+                End While
+            End If
+            Set i to run_end
+        End If
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: STAGE 4: CANONICAL COMPOSITION (NFC / NFKC)
+Note: ============================================================================
+
+Process called "norm_compose_array" takes header as Integer returns Integer:
+    @Reasoning
+        Canonical composition algorithm (UAX #15 sec. 3.11 / Annex D).
+        Walks the decomposed sequence left-to-right. Maintains a current
+        starter L. For each non-starter C with CCC > 0:
+          - If C is BLOCKED by a previously-seen non-starter with CCC
+            >= CCC(C), it cannot compose with L.
+          - Otherwise try to compose (L, C) via the primary composition
+            table. On success, replace L with the composed character
+            and discard C; reset the blocking-CCC tracker (the new L
+            absorbs the old combining mark, so the blocking sequence
+            restarts from CCC(C)+1 above).
+
+        Hangul recomposition: L jamo + V jamo -> LV syllable;
+        LV syllable + T jamo -> LVT syllable. Handled inline before
+        consulting the table because the L/V/T blocks are large and
+        would not benefit from individual table entries.
+
+        Composition exclusions are honoured BY CONSTRUCTION at table
+        load time: the primary composition table omits any pair whose
+        composed cp appears in CompositionExclusions.txt, so
+        unicode_compose_pair returns 0 for them.
+
+        The output reuses the input header in place (composition can
+        only SHRINK the array; we maintain a write index lagging the
+        read index).
+    @End Reasoning
+    @Performance_Hints
+        O(n) on the decomposed length. Each codepoint is examined once.
+    @End Performance_Hints
+
+    If header is equal to 0:
+        Return 0
+    End If
+    Let count be norm_cp_array_count(header)
+    If count is less than 2:
+        Return 0
+    End If
+    Let payload be norm_cp_array_payload(header)
+
+    Note: starter_pos tracks the array index of the current starter.
+    Note: prev_ccc tracks the highest CCC seen since the starter (the
+    Note: blocking threshold). write_pos is where the next output cp
+    Note: lands.
+
+    Let starter_pos be 0 minus 1
+    Let prev_ccc be 0
+    Let write_pos be 0
+    Let starter_cp be 0
+    Let read_pos be 0
+    While read_pos is less than count:
+        Let cp be Memory.memory_get_int32(payload, read_pos multiplied by 4)
+        Let ccc be UT.unicode_combining_class(cp)
+
+        If starter_pos is less than 0:
+            Note: Have not yet seen a starter. Emit cp; if it is a
+            Note: starter (ccc == 0), record its position.
+            Memory.memory_set_int32(payload, write_pos multiplied by 4, cp)
+            If ccc is equal to 0:
+                Set starter_pos to write_pos
+                Set starter_cp to cp
+                Set prev_ccc to 0
+            End If
+            Set write_pos to write_pos plus 1
+        Otherwise:
+            Note: A starter L is in flight. Try to compose with cp.
+            Let composed be 0
+            Let block be 0
+            If ccc is not equal to 0:
+                If prev_ccc is greater than or equal to ccc:
+                    Note: Blocked: an earlier non-starter at or above
+                    Note: this CCC sits between L and C.
+                    Set block to 1
+                End If
+            End If
+
+            If block is equal to 0:
+                Note: Hangul recomposition shortcut.
+                Let hcompose be 0
+                Note: L jamo + V jamo -> LV
+                If starter_cp is greater than or equal to UT.HANGUL_L_BASE:
+                    If starter_cp is less than (UT.HANGUL_L_BASE plus UT.HANGUL_L_COUNT):
+                        Set hcompose to UT.unicode_hangul_compose_LV(starter_cp, cp)
+                    End If
+                End If
+                Note: LV syllable + T jamo -> LVT
+                If hcompose is equal to 0:
+                    If UT.unicode_hangul_is_syllable(starter_cp) is equal to 1:
+                        Set hcompose to UT.unicode_hangul_compose_LVT(starter_cp, cp)
+                    End If
+                End If
+                If hcompose is not equal to 0:
+                    Set composed to hcompose
+                Otherwise:
+                    Set composed to UT.unicode_compose_pair(starter_cp, cp)
+                End If
+            End If
+
+            If composed is not equal to 0:
+                Note: Replace starter with composed character in place.
+                Memory.memory_set_int32(payload, starter_pos multiplied by 4, composed)
+                Set starter_cp to composed
+                Note: The composed cp could itself be a starter; CCC of
+                Note: starters is 0, so prev_ccc stays at 0 (re-armed for
+                Note: the next non-starter). Do NOT advance write_pos.
+                Set prev_ccc to 0
+            Otherwise:
+                Note: Composition failed. Emit cp at write_pos.
+                Memory.memory_set_int32(payload, write_pos multiplied by 4, cp)
+                If ccc is equal to 0:
+                    Note: New starter; reset tracking.
+                    Set starter_pos to write_pos
+                    Set starter_cp to cp
+                    Set prev_ccc to 0
+                Otherwise:
+                    Note: Non-starter that did not compose: it raises
+                    Note: the blocking threshold.
+                    If ccc is greater than prev_ccc:
+                        Set prev_ccc to ccc
+                    End If
+                End If
+                Set write_pos to write_pos plus 1
+            End If
+        End If
+        Set read_pos to read_pos plus 1
+    End While
+
+    Memory.memory_set_int32(header, 0, write_pos)
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: STAGE 5: CODEPOINT ARRAY -> UTF-8 BYTES
+Note: ============================================================================
+
+Process called "norm_codepoints_to_utf8" takes header as Integer returns Integer:
+    @Reasoning
+        Encodes a codepoint-array header back into UTF-8. Returns a
+        packed pointer of [byte_length:int32, byte0, byte1, ...] of
+        size byte_length+4 bytes. The caller reads byte_length via
+        the first int32 and the bytes from offset 4.
+
+        Worst case: every codepoint encodes to 4 bytes. We allocate
+        4*count+4 up front and resize down at the end.
+    @End Reasoning
+
+    If header is equal to 0:
+        Return 0
+    End If
+    Let count be norm_cp_array_count(header)
+    Let payload be norm_cp_array_payload(header)
+
+    Let worst_bytes be (count multiplied by 4) plus 4
+    If worst_bytes is less than 8:
+        Set worst_bytes to 8
+    End If
+    Let out_header be allocate(worst_bytes)
+    If out_header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(out_header, worst_bytes)
+    Let out_data be out_header plus 4
+
+    Let written be 0
+    Let i be 0
+    While i is less than count:
+        Let cp be Memory.memory_get_int32(payload, i multiplied by 4)
+        Let n be CP.codepoint_to_utf8_bytes(cp, out_data, written)
+        If n is less than 0:
+            Note: Substitute U+FFFD on an invalid codepoint.
+            Let n2 be CP.codepoint_to_utf8_bytes(65533, out_data, written)
+            If n2 is less than 0:
+                deallocate(out_header)
+                Return 0
+            End If
+            Set written to written plus n2
+        Otherwise:
+            Set written to written plus n
+        End If
+        Set i to i plus 1
+    End While
+
+    Memory.memory_set_int32(out_header, 0, written)
+    Return out_header
+End Process
+
+Process called "norm_utf8_payload" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    Return header plus 4
+End Process
+
+Process called "norm_utf8_length" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int32(header, 0)
+End Process
+
+Process called "norm_utf8_destroy" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    deallocate(header)
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: TOP-LEVEL NORMALIZATION PROCS
+Note: ============================================================================
+
+Process called "norm_apply" takes input as Integer, form as Integer returns Integer:
+    @Reasoning
+        Drives the full normalization pipeline for one of the four UAX
+        #15 forms. Returns a freshly-allocated NormalizedString. The
+        pipeline:
+            input bytes -> codepoint array
+                        -> decompose (canonical or compatibility)
+                        -> canonical reorder
+                        -> compose (NFC / NFKC only)
+                        -> bytes
+            wrap bytes in a NormalizedString header with the requested
+            form tag.
+    @End Reasoning
+
+    UT.codepoint_unicode_tables_init()
+
+    If input is equal to 0:
+        Return 0
+    End If
+    Let len be StrCore.string_length(input)
+
+    Let compatibility be 0
+    If form is equal to NORM_FORM_NFKC:
+        Set compatibility to 1
+    End If
+    If form is equal to NORM_FORM_NFKD:
+        Set compatibility to 1
+    End If
+
+    Let do_compose be 0
+    If form is equal to NORM_FORM_NFC:
+        Set do_compose to 1
+    End If
+    If form is equal to NORM_FORM_NFKC:
+        Set do_compose to 1
+    End If
+
+    Note: Stage 1: UTF-8 -> codepoint array
+    Let cp_arr be norm_utf8_to_codepoints(input, len)
+    If cp_arr is equal to 0:
+        Return 0
+    End If
+
+    Note: Stage 2: decompose recursively
+    Let dec_arr be norm_decompose_array(cp_arr, compatibility)
+    norm_cp_array_destroy(cp_arr)
+    If dec_arr is equal to 0:
+        Return 0
+    End If
+
+    Note: Stage 3: canonical ordering
+    norm_canonical_reorder(dec_arr)
+
+    Note: Stage 4: composition for NFC / NFKC only
+    If do_compose is equal to 1:
+        norm_compose_array(dec_arr)
+    End If
+
+    Note: Stage 5: codepoint array -> UTF-8 bytes
+    Let utf8 be norm_codepoints_to_utf8(dec_arr)
+    norm_cp_array_destroy(dec_arr)
+    If utf8 is equal to 0:
+        Return 0
+    End If
+
+    Let out_len be norm_utf8_length(utf8)
+    Let out_data be norm_utf8_payload(utf8)
+    Let ns be normalized_string_create(out_data, out_len, form)
+    norm_utf8_destroy(utf8)
+    Return ns
+End Process
+
+Process called "string_normalize_nfc" takes input as Integer returns Integer:
+    @Reasoning
+        Returns a NormalizedString tagged NFC, the form mandated by
+        RFC 5198 for network interchange and required by UTS #39 for
+        identifier comparison. Pipeline: canonical decompose, canonical
+        reorder, canonical compose.
+    @End Reasoning
+
+    Return norm_apply(input, NORM_FORM_NFC)
+End Process
+
+Process called "string_normalize_nfd" takes input as Integer returns Integer:
+    @Reasoning
+        Returns a NormalizedString tagged NFD (canonical decomposition).
+        NFD is preferred when downstream code operates on base+combining-
+        mark pairs separately (e.g. accent stripping, grapheme analysis).
+    @End Reasoning
+
+    Return norm_apply(input, NORM_FORM_NFD)
+End Process
+
+Process called "string_normalize_nfkc" takes input as Integer returns Integer:
+    @Reasoning
+        Returns a NormalizedString tagged NFKC (compatibility
+        composition). Used for case-insensitive identifier comparison
+        and as the basis for the Unicode security profile UTS #39.
+    @End Reasoning
+
+    Return norm_apply(input, NORM_FORM_NFKC)
+End Process
+
+Process called "string_normalize_nfkd" takes input as Integer returns Integer:
+    @Reasoning
+        Returns a NormalizedString tagged NFKD (compatibility
+        decomposition). The broadest form, useful for fuzzy matching
+        where compatibility-equivalent characters should compare equal.
+    @End Reasoning
+
+    Return norm_apply(input, NORM_FORM_NFKD)
+End Process
+
+Process called "normalized_string_equals" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Byte-exact comparison after form-tag check. Two NormalizedStrings
+        produced via the same form_apply call from canonically-equivalent
+        inputs are guaranteed identical bytes by UAX #15's uniqueness
+        property, so byte comparison is the correct equivalence check
+        once both sides are in the same form.
+    @End Reasoning
+
+    If a is equal to b:
+        Return 1
+    End If
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let a_form be Memory.memory_get_integer(a, NORM_OFFSET_FORM)
+    Let b_form be Memory.memory_get_integer(b, NORM_OFFSET_FORM)
+    If a_form is not equal to b_form:
+        Return 0
+    End If
+    Let a_len be Memory.memory_get_integer(a, NORM_OFFSET_LENGTH)
+    Let b_len be Memory.memory_get_integer(b, NORM_OFFSET_LENGTH)
+    If a_len is not equal to b_len:
+        Return 0
+    End If
+    If a_len is equal to 0:
+        Return 1
+    End If
+    Let a_data be Memory.memory_get_pointer(a, NORM_OFFSET_DATA)
+    Let b_data be Memory.memory_get_pointer(b, NORM_OFFSET_DATA)
+    Let cmp be Memory.memory_compare(a_data, b_data, a_len)
+    If cmp is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process

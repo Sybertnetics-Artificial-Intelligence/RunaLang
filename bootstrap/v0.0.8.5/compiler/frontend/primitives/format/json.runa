@@ -1,0 +1,2473 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+==============================================================================
+JSON - RFC 8259 / ECMA-404 JavaScript Object Notation
+==============================================================================
+
+Pure-Runa JSON parser, serializer, JsonPath (RFC 9535), and JsonPointer
+(RFC 6901) implementation for the v0.0.8.5 stdlib.
+
+References:
+- RFC 8259  - The JavaScript Object Notation (JSON) Data Interchange Format
+- ECMA-404  - The JSON Data Interchange Syntax
+- RFC 9535  - JSONPath: Query Expressions for JSON
+- RFC 6901  - JavaScript Object Notation (JSON) Pointer
+
+This module provides:
+- JsonValue tagged-union representation (null, bool, number, string,
+  array, object) with insertion-order-preserving objects.
+- json_parse / json_serialize / json_serialize_pretty / json_serialize_sorted
+- JsonPath: jsonpath_parse + jsonpath_eval returning List[JsonValue]
+- JsonPointer: jsonpointer_parse + jsonpointer_eval returning Optional<JsonValue>
+- Full RFC-8259 string escapes including \uXXXX surrogate pairs
+- Optional strict-mode duplicate-key rejection
+:End Note
+
+Note: ============================================================================
+Note: TAG CONSTANTS - JsonValue tag discriminator
+Note: ============================================================================
+
+Constant JSON_TAG_NULL as Integer is 0
+Constant JSON_TAG_BOOL as Integer is 1
+Constant JSON_TAG_NUMBER as Integer is 2
+Constant JSON_TAG_STRING as Integer is 3
+Constant JSON_TAG_ARRAY as Integer is 4
+Constant JSON_TAG_OBJECT as Integer is 5
+
+Note: JsonResult discriminator
+Constant JSON_RESULT_OK as Integer is 0
+Constant JSON_RESULT_ERROR as Integer is 1
+
+Note: ============================================================================
+Note: TYPE DEFINITIONS
+Note: ============================================================================
+Note:
+JsonValue layout (32 bytes):
+  offset 0 : tag           (Integer, 8 bytes)
+  offset 8 : payload_a     (Integer, 8 bytes) - tag-dependent
+  offset 16: payload_b     (Integer, 8 bytes) - tag-dependent
+  offset 24: payload_c     (Integer, 8 bytes) - tag-dependent
+
+Tag-specific use of payload slots:
+  NULL    : unused (all zero)
+  BOOL    : payload_a = 0 or 1
+  NUMBER  : payload_a = pointer to canonical-decimal-string (precision preserved)
+  STRING  : payload_a = pointer to UTF-8 NUL-terminated string
+  ARRAY   : payload_a = pointer to JsonArray buffer (elements ptr-array, len, cap)
+  OBJECT  : payload_a = pointer to JsonObject buffer (keys, values, len, cap)
+
+JsonArray layout (24 bytes):
+  offset 0 : elements_ptr  (pointer to capacity*8-byte buffer of JsonValue ptrs)
+  offset 8 : length        (Integer)
+  offset 16: capacity      (Integer)
+
+JsonObject layout (32 bytes):
+  offset 0 : keys_ptr      (pointer to capacity*8-byte buffer of String ptrs)
+  offset 8 : values_ptr    (pointer to capacity*8-byte buffer of JsonValue ptrs)
+  offset 16: length        (Integer)
+  offset 24: capacity      (Integer)
+
+JsonParseError layout (24 bytes):
+  offset 0 : line          (Integer, 1-based)
+  offset 8 : column        (Integer, 1-based)
+  offset 16: message       (pointer to String)
+
+JsonResult layout (16 bytes):
+  offset 0 : variant       (0=Ok, 1=Error)
+  offset 8 : payload       (JsonValue ptr if Ok, JsonParseError ptr if Error)
+
+JsonParserState layout (32 bytes):
+  offset 0 : source        (pointer to input buffer)
+  offset 8 : pos           (current byte offset)
+  offset 16: line          (current line, 1-based)
+  offset 24: column        (current column, 1-based)
+:End Note
+
+Note: ============================================================================
+Note: PARSE STATE - allocation helpers
+Note: ============================================================================
+
+Process called "parser_state_create" that takes source as Integer returns Integer:
+    Note: Allocates a fresh JsonParserState pointing at source byte 0,
+    Note: line 1 column 1. Caller owns and must deallocate.
+    Let st be allocate(32)
+    If st is equal to 0:
+        Return 0
+    End If
+    __store(st, 0, source)
+    __store(st, 8, 0)
+    __store(st, 16, 1)
+    __store(st, 24, 1)
+    Return st
+End Process
+
+Process called "parser_state_destroy" that takes st as Integer returns Integer:
+    If st is equal to 0:
+        Return 0
+    End If
+    deallocate(st)
+    Return 1
+End Process
+
+Process called "parser_peek" that takes st as Integer returns Integer:
+    Note: Returns current byte (0 if EOF). Does not advance.
+    If st is equal to 0:
+        Return 0
+    End If
+    Let source be __load(st, 0)
+    Let pos be __load(st, 8)
+    If source is equal to 0:
+        Return 0
+    End If
+    Let limit be string_length(source)
+    If pos is greater than or equal to limit:
+        Return 0
+    End If
+    Return string_char_at(source, pos)
+End Process
+
+Process called "parser_peek_at" that takes st as Integer, offset as Integer returns Integer:
+    Note: Lookahead by offset bytes; 0 if past end.
+    If st is equal to 0:
+        Return 0
+    End If
+    Let source be __load(st, 0)
+    Let pos be __load(st, 8)
+    Let target be pos plus offset
+    Let limit be string_length(source)
+    If target is greater than or equal to limit:
+        Return 0
+    End If
+    Return string_char_at(source, target)
+End Process
+
+Process called "parser_advance" that takes st as Integer returns Integer:
+    Note: Advance one byte, tracking line/column. Newline LF (10) bumps
+    Note: line and resets column. CR (13) is treated as column-advance
+    Note: only because Unicode-style LF normalization is the caller's
+    Note: responsibility per RFC 8259 section 9.
+    If st is equal to 0:
+        Return 0
+    End If
+    Let c be parser_peek(st)
+    Let pos be __load(st, 8)
+    __store(st, 8, pos plus 1)
+    If c is equal to 10:
+        Let ln be __load(st, 16)
+        __store(st, 16, ln plus 1)
+        __store(st, 24, 1)
+        Return c
+    End If
+    Let col be __load(st, 24)
+    __store(st, 24, col plus 1)
+    Return c
+End Process
+
+Process called "parser_skip_ws" that takes st as Integer returns Integer:
+    Note: Skip RFC 8259 section 2 whitespace: SP(32), HT(9), LF(10), CR(13).
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let c be parser_peek(st)
+        If c is equal to 32:
+            parser_advance(st)
+        Otherwise:
+            If c is equal to 9:
+                parser_advance(st)
+            Otherwise:
+                If c is equal to 10:
+                    parser_advance(st)
+                Otherwise:
+                    If c is equal to 13:
+                        parser_advance(st)
+                    Otherwise:
+                        Set scanning to 0
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: JsonValue CONSTRUCTORS / ACCESSORS
+Note: ============================================================================
+
+Process called "jsonvalue_alloc" that takes tag as Integer returns Integer:
+    Let v be allocate(32)
+    If v is equal to 0:
+        Return 0
+    End If
+    __store(v, 0, tag)
+    __store(v, 8, 0)
+    __store(v, 16, 0)
+    __store(v, 24, 0)
+    Return v
+End Process
+
+Process called "json_null" returns Integer:
+    Note: Construct a JSON null literal (RFC 8259 section 3).
+    Return jsonvalue_alloc(0)
+End Process
+
+Process called "json_bool" that takes b as Integer returns Integer:
+    Note: Construct a JSON boolean (RFC 8259 section 3). b must be 0 or 1.
+    Let v be jsonvalue_alloc(1)
+    If v is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        __store(v, 8, 0)
+    Otherwise:
+        __store(v, 8, 1)
+    End If
+    Return v
+End Process
+
+Process called "json_number" that takes decimal_string as Integer returns Integer:
+    Note: Construct a JSON number whose textual form is preserved verbatim.
+    Note: RFC 8259 section 6 allows but does not mandate IEEE-754; we keep
+    Note: the source-form string so precision is never lost in transit.
+    Let v be jsonvalue_alloc(2)
+    If v is equal to 0:
+        Return 0
+    End If
+    If decimal_string is equal to 0:
+        __store(v, 8, string_duplicate("0"))
+    Otherwise:
+        __store(v, 8, string_duplicate(decimal_string))
+    End If
+    Return v
+End Process
+
+Process called "json_number_from_int" that takes n as Integer returns Integer:
+    Let s be integer_to_string(n)
+    Let v be json_number(s)
+    Return v
+End Process
+
+Process called "json_string" that takes s as Integer returns Integer:
+    Note: Construct a JSON string. Input is the decoded UTF-8 byte sequence
+    Note: (escapes already resolved). Caller's pointer is duplicated.
+    Let v be jsonvalue_alloc(3)
+    If v is equal to 0:
+        Return 0
+    End If
+    If s is equal to 0:
+        __store(v, 8, string_duplicate(""))
+    Otherwise:
+        __store(v, 8, string_duplicate(s))
+    End If
+    Return v
+End Process
+
+Process called "json_array_new" returns Integer:
+    Note: Construct an empty JSON array with initial capacity 4.
+    Let arr_buf be allocate(24)
+    If arr_buf is equal to 0:
+        Return 0
+    End If
+    Let elems be allocate(32)
+    If elems is equal to 0:
+        deallocate(arr_buf)
+        Return 0
+    End If
+    __store(arr_buf, 0, elems)
+    __store(arr_buf, 8, 0)
+    __store(arr_buf, 16, 4)
+    Let v be jsonvalue_alloc(4)
+    If v is equal to 0:
+        deallocate(elems)
+        deallocate(arr_buf)
+        Return 0
+    End If
+    __store(v, 8, arr_buf)
+    Return v
+End Process
+
+Process called "json_array_length" that takes v as Integer returns Integer:
+    Note: Returns the number of elements in a JSON array, -1 if v is not an array.
+    If v is equal to 0:
+        Return -1
+    End If
+    Let tag be __load(v, 0)
+    If tag is not equal to 4:
+        Return -1
+    End If
+    Let arr_buf be __load(v, 8)
+    If arr_buf is equal to 0:
+        Return 0
+    End If
+    Return __load(arr_buf, 8)
+End Process
+
+Process called "json_array_get" that takes v as Integer, index as Integer returns Integer:
+    Note: Returns the element at index (zero-based); 0 if out of range.
+    If v is equal to 0:
+        Return 0
+    End If
+    Let tag be __load(v, 0)
+    If tag is not equal to 4:
+        Return 0
+    End If
+    Let arr_buf be __load(v, 8)
+    If arr_buf is equal to 0:
+        Return 0
+    End If
+    Let len be __load(arr_buf, 8)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to len:
+        Return 0
+    End If
+    Let elems be __load(arr_buf, 0)
+    Return __load(elems, index multiplied by 8)
+End Process
+
+Process called "json_array_push" that takes v as Integer, child as Integer returns Integer:
+    Note: Append child to array v, growing capacity geometrically. Returns 1
+    Note: on success, 0 on allocation failure or type mismatch.
+    If v is equal to 0:
+        Return 0
+    End If
+    Let tag be __load(v, 0)
+    If tag is not equal to 4:
+        Return 0
+    End If
+    Let arr_buf be __load(v, 8)
+    If arr_buf is equal to 0:
+        Return 0
+    End If
+    Let len be __load(arr_buf, 8)
+    Let cap be __load(arr_buf, 16)
+    If len is greater than or equal to cap:
+        Let new_cap be cap multiplied by 2
+        If new_cap is less than 4:
+            Set new_cap to 4
+        End If
+        Let new_elems be allocate(new_cap multiplied by 8)
+        If new_elems is equal to 0:
+            Return 0
+        End If
+        Let old_elems be __load(arr_buf, 0)
+        Let i be 0
+        While i is less than len:
+            __store(new_elems, i multiplied by 8, __load(old_elems, i multiplied by 8))
+            Set i to i plus 1
+        End While
+        deallocate(old_elems)
+        __store(arr_buf, 0, new_elems)
+        __store(arr_buf, 16, new_cap)
+    End If
+    Let elems be __load(arr_buf, 0)
+    __store(elems, len multiplied by 8, child)
+    __store(arr_buf, 8, len plus 1)
+    Return 1
+End Process
+
+Process called "json_object_new" returns Integer:
+    Note: Construct an empty JSON object with initial capacity 4.
+    Let obj_buf be allocate(32)
+    If obj_buf is equal to 0:
+        Return 0
+    End If
+    Let keys be allocate(32)
+    If keys is equal to 0:
+        deallocate(obj_buf)
+        Return 0
+    End If
+    Let values be allocate(32)
+    If values is equal to 0:
+        deallocate(keys)
+        deallocate(obj_buf)
+        Return 0
+    End If
+    __store(obj_buf, 0, keys)
+    __store(obj_buf, 8, values)
+    __store(obj_buf, 16, 0)
+    __store(obj_buf, 24, 4)
+    Let v be jsonvalue_alloc(5)
+    If v is equal to 0:
+        deallocate(values)
+        deallocate(keys)
+        deallocate(obj_buf)
+        Return 0
+    End If
+    __store(v, 8, obj_buf)
+    Return v
+End Process
+
+Process called "json_object_length" that takes v as Integer returns Integer:
+    Note: Number of members in an object; -1 if not an object.
+    If v is equal to 0:
+        Return -1
+    End If
+    Let tag be __load(v, 0)
+    If tag is not equal to 5:
+        Return -1
+    End If
+    Let obj_buf be __load(v, 8)
+    If obj_buf is equal to 0:
+        Return 0
+    End If
+    Return __load(obj_buf, 16)
+End Process
+
+Process called "json_object_key_at" that takes v as Integer, index as Integer returns Integer:
+    Note: Return the key string at member index, 0 if out of range.
+    If v is equal to 0:
+        Return 0
+    End If
+    Let tag be __load(v, 0)
+    If tag is not equal to 5:
+        Return 0
+    End If
+    Let obj_buf be __load(v, 8)
+    If obj_buf is equal to 0:
+        Return 0
+    End If
+    Let len be __load(obj_buf, 16)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to len:
+        Return 0
+    End If
+    Let keys be __load(obj_buf, 0)
+    Return __load(keys, index multiplied by 8)
+End Process
+
+Process called "json_object_value_at" that takes v as Integer, index as Integer returns Integer:
+    Note: Return the value at member index, 0 if out of range.
+    If v is equal to 0:
+        Return 0
+    End If
+    Let tag be __load(v, 0)
+    If tag is not equal to 5:
+        Return 0
+    End If
+    Let obj_buf be __load(v, 8)
+    If obj_buf is equal to 0:
+        Return 0
+    End If
+    Let len be __load(obj_buf, 16)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to len:
+        Return 0
+    End If
+    Let values be __load(obj_buf, 8)
+    Return __load(values, index multiplied by 8)
+End Process
+
+Process called "json_object_get" that takes v as Integer, key as Integer returns Integer:
+    Note: Linear-scan member lookup by key string; returns 0 if absent.
+    Note: Insertion order preserved; on duplicate keys last-wins is the
+    Note: stored representation (parser default).
+    If v is equal to 0:
+        Return 0
+    End If
+    Let tag be __load(v, 0)
+    If tag is not equal to 5:
+        Return 0
+    End If
+    Let obj_buf be __load(v, 8)
+    If obj_buf is equal to 0:
+        Return 0
+    End If
+    Let len be __load(obj_buf, 16)
+    Let keys be __load(obj_buf, 0)
+    Let values be __load(obj_buf, 8)
+    Let i be 0
+    While i is less than len:
+        Let k be __load(keys, i multiplied by 8)
+        If string_equals(k, key) is equal to 1:
+            Return __load(values, i multiplied by 8)
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "json_object_set" that takes v as Integer, key as Integer, child as Integer returns Integer:
+    Note: Set member key=child. If key already present, replace its value
+    Note: in place (preserving original position). Otherwise append.
+    If v is equal to 0:
+        Return 0
+    End If
+    Let tag be __load(v, 0)
+    If tag is not equal to 5:
+        Return 0
+    End If
+    Let obj_buf be __load(v, 8)
+    If obj_buf is equal to 0:
+        Return 0
+    End If
+    Let len be __load(obj_buf, 16)
+    Let keys be __load(obj_buf, 0)
+    Let values be __load(obj_buf, 8)
+    Let i be 0
+    While i is less than len:
+        Let k be __load(keys, i multiplied by 8)
+        If string_equals(k, key) is equal to 1:
+            __store(values, i multiplied by 8, child)
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Let cap be __load(obj_buf, 24)
+    If len is greater than or equal to cap:
+        Let new_cap be cap multiplied by 2
+        If new_cap is less than 4:
+            Set new_cap to 4
+        End If
+        Let new_keys be allocate(new_cap multiplied by 8)
+        If new_keys is equal to 0:
+            Return 0
+        End If
+        Let new_values be allocate(new_cap multiplied by 8)
+        If new_values is equal to 0:
+            deallocate(new_keys)
+            Return 0
+        End If
+        Let j be 0
+        While j is less than len:
+            __store(new_keys, j multiplied by 8, __load(keys, j multiplied by 8))
+            __store(new_values, j multiplied by 8, __load(values, j multiplied by 8))
+            Set j to j plus 1
+        End While
+        deallocate(keys)
+        deallocate(values)
+        __store(obj_buf, 0, new_keys)
+        __store(obj_buf, 8, new_values)
+        __store(obj_buf, 24, new_cap)
+        Set keys to new_keys
+        Set values to new_values
+    End If
+    __store(keys, len multiplied by 8, string_duplicate(key))
+    __store(values, len multiplied by 8, child)
+    __store(obj_buf, 16, len plus 1)
+    Return 1
+End Process
+
+Process called "json_get_tag" that takes v as Integer returns Integer:
+    Note: Returns the discriminator tag of a JsonValue, -1 if v is null pointer.
+    If v is equal to 0:
+        Return -1
+    End If
+    Return __load(v, 0)
+End Process
+
+Process called "json_get_bool" that takes v as Integer returns Integer:
+    Note: Extract boolean payload; 0 if not a boolean.
+    If v is equal to 0:
+        Return 0
+    End If
+    If __load(v, 0) is not equal to 1:
+        Return 0
+    End If
+    Return __load(v, 8)
+End Process
+
+Process called "json_get_number_string" that takes v as Integer returns Integer:
+    Note: Returns the canonical-decimal-string for a number, 0 if not a number.
+    If v is equal to 0:
+        Return 0
+    End If
+    If __load(v, 0) is not equal to 2:
+        Return 0
+    End If
+    Return __load(v, 8)
+End Process
+
+Process called "json_get_string" that takes v as Integer returns Integer:
+    Note: Returns the decoded UTF-8 byte string of a JsonString, 0 if not a string.
+    If v is equal to 0:
+        Return 0
+    End If
+    If __load(v, 0) is not equal to 3:
+        Return 0
+    End If
+    Return __load(v, 8)
+End Process
+
+Note: ============================================================================
+Note: JSON RESULT / ERROR
+Note: ============================================================================
+
+Process called "json_result_ok" that takes value as Integer returns Integer:
+    Let r be allocate(16)
+    If r is equal to 0:
+        Return 0
+    End If
+    __store(r, 0, 0)
+    __store(r, 8, value)
+    Return r
+End Process
+
+Process called "json_result_error" that takes err as Integer returns Integer:
+    Let r be allocate(16)
+    If r is equal to 0:
+        Return 0
+    End If
+    __store(r, 0, 1)
+    __store(r, 8, err)
+    Return r
+End Process
+
+Process called "json_result_is_ok" that takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Let variant be __load(r, 0)
+    If variant is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "json_result_payload" that takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Return __load(r, 8)
+End Process
+
+Process called "json_error_create" that takes line as Integer, column as Integer, message as Integer returns Integer:
+    Let e be allocate(24)
+    If e is equal to 0:
+        Return 0
+    End If
+    __store(e, 0, line)
+    __store(e, 8, column)
+    If message is equal to 0:
+        __store(e, 16, string_duplicate(""))
+    Otherwise:
+        __store(e, 16, string_duplicate(message))
+    End If
+    Return e
+End Process
+
+Process called "json_error_line" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 0)
+End Process
+
+Process called "json_error_column" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 8)
+End Process
+
+Process called "json_error_message" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 16)
+End Process
+
+Process called "make_error_at_state" that takes st as Integer, msg as Integer returns Integer:
+    Let ln be __load(st, 16)
+    Let col be __load(st, 24)
+    Let err be json_error_create(ln, col, msg)
+    Return json_result_error(err)
+End Process
+
+Note: ============================================================================
+Note: BYTE-BUFFER BUILDER (used by parser & serializer for assembling strings)
+Note: ============================================================================
+Note:
+ByteBuilder layout (24 bytes):
+  offset 0 : data ptr
+  offset 8 : length
+  offset 16: capacity
+:End Note
+
+Process called "bb_create" that takes initial_cap as Integer returns Integer:
+    Let b be allocate(24)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let cap be initial_cap
+    If cap is less than 16:
+        Set cap to 16
+    End If
+    Let data be allocate(cap)
+    If data is equal to 0:
+        deallocate(b)
+        Return 0
+    End If
+    __store(b, 0, data)
+    __store(b, 8, 0)
+    __store(b, 16, cap)
+    Return b
+End Process
+
+Process called "bb_destroy" that takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let data be __load(b, 0)
+    If data is not equal to 0:
+        deallocate(data)
+    End If
+    deallocate(b)
+    Return 1
+End Process
+
+Process called "bb_reserve" that takes b as Integer, extra as Integer returns Integer:
+    Note: Ensure capacity for current length plus extra plus 1 NUL byte.
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be __load(b, 8)
+    Let cap be __load(b, 16)
+    Let needed be len plus extra plus 1
+    If needed is less than or equal to cap:
+        Return 1
+    End If
+    Let new_cap be cap
+    While new_cap is less than needed:
+        Set new_cap to new_cap multiplied by 2
+    End While
+    Let new_data be allocate(new_cap)
+    If new_data is equal to 0:
+        Return 0
+    End If
+    Let old_data be __load(b, 0)
+    Let i be 0
+    While i is less than len:
+        __byte_store(new_data, i, __byte_load(old_data, i))
+        Set i to i plus 1
+    End While
+    deallocate(old_data)
+    __store(b, 0, new_data)
+    __store(b, 16, new_cap)
+    Return 1
+End Process
+
+Process called "bb_append_byte" that takes b as Integer, byte as Integer returns Integer:
+    If bb_reserve(b, 1) is equal to 0:
+        Return 0
+    End If
+    Let data be __load(b, 0)
+    Let len be __load(b, 8)
+    __byte_store(data, len, byte)
+    __store(b, 8, len plus 1)
+    Return 1
+End Process
+
+Process called "bb_append_string" that takes b as Integer, s as Integer returns Integer:
+    If s is equal to 0:
+        Return 1
+    End If
+    Let sl be string_length(s)
+    If bb_reserve(b, sl) is equal to 0:
+        Return 0
+    End If
+    Let data be __load(b, 0)
+    Let len be __load(b, 8)
+    Let i be 0
+    While i is less than sl:
+        __byte_store(data, len plus i, string_char_at(s, i))
+        Set i to i plus 1
+    End While
+    __store(b, 8, len plus sl)
+    Return 1
+End Process
+
+Process called "bb_finalize" that takes b as Integer returns Integer:
+    Note: Returns NUL-terminated string copy of buffer contents; the
+    Note: builder is consumed (callers must not reuse).
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be __load(b, 8)
+    Let data be __load(b, 0)
+    Let result be allocate(len plus 1)
+    If result is equal to 0:
+        bb_destroy(b)
+        Return 0
+    End If
+    Let i be 0
+    While i is less than len:
+        __byte_store(result, i, __byte_load(data, i))
+        Set i to i plus 1
+    End While
+    __byte_store(result, len, 0)
+    bb_destroy(b)
+    Return result
+End Process
+
+Process called "bb_length" that takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return __load(b, 8)
+End Process
+
+Note: ============================================================================
+Note: UTF-8 ENCODING - Codepoint to UTF-8 byte sequence (RFC 3629)
+Note: ============================================================================
+
+Process called "utf8_encode_into_builder" that takes b as Integer, cp as Integer returns Integer:
+    Note: Encodes Unicode code point cp into builder b using UTF-8 (RFC 3629).
+    Note: Returns 1 on success, 0 on invalid code point.
+    If cp is less than 0:
+        Return 0
+    End If
+    If cp is less than 128:
+        Return bb_append_byte(b, cp)
+    End If
+    If cp is less than 2048:
+        Let b1 be 192 plus (cp divided by 64)
+        Let b2 be 128 plus (cp modulo by 64)
+        If bb_append_byte(b, b1) is equal to 0:
+            Return 0
+        End If
+        Return bb_append_byte(b, b2)
+    End If
+    If cp is less than 65536:
+        Let b1b be 224 plus (cp divided by 4096)
+        Let rem1 be cp modulo by 4096
+        Let b2b be 128 plus (rem1 divided by 64)
+        Let b3b be 128 plus (rem1 modulo by 64)
+        If bb_append_byte(b, b1b) is equal to 0:
+            Return 0
+        End If
+        If bb_append_byte(b, b2b) is equal to 0:
+            Return 0
+        End If
+        Return bb_append_byte(b, b3b)
+    End If
+    If cp is less than 1114112:
+        Let b1c be 240 plus (cp divided by 262144)
+        Let rem2 be cp modulo by 262144
+        Let b2c be 128 plus (rem2 divided by 4096)
+        Let rem3 be rem2 modulo by 4096
+        Let b3c be 128 plus (rem3 divided by 64)
+        Let b4c be 128 plus (rem3 modulo by 64)
+        If bb_append_byte(b, b1c) is equal to 0:
+            Return 0
+        End If
+        If bb_append_byte(b, b2c) is equal to 0:
+            Return 0
+        End If
+        If bb_append_byte(b, b3c) is equal to 0:
+            Return 0
+        End If
+        Return bb_append_byte(b, b4c)
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: HEX DIGIT CONVERSION
+Note: ============================================================================
+
+Process called "hex_digit_value" that takes c as Integer returns Integer:
+    Note: Convert ASCII hex digit to its 0-15 value; -1 if not hex.
+    If c is greater than or equal to 48:
+        If c is less than or equal to 57:
+            Return c minus 48
+        End If
+    End If
+    If c is greater than or equal to 97:
+        If c is less than or equal to 102:
+            Return c minus 87
+        End If
+    End If
+    If c is greater than or equal to 65:
+        If c is less than or equal to 70:
+            Return c minus 55
+        End If
+    End If
+    Return -1
+End Process
+
+Process called "hex_digit_char" that takes v as Integer returns Integer:
+    Note: Map 0..15 to ASCII hex digit '0'..'9','a'..'f'.
+    If v is less than 10:
+        Return v plus 48
+    End If
+    Return v plus 87
+End Process
+
+Note: ============================================================================
+Note: STRING PARSE - reads a JSON string starting at the opening quote
+Note: ============================================================================
+
+Process called "parse_string_into_builder" that takes st as Integer, out as Integer returns Integer:
+    Note: Consumes a JSON string per RFC 8259 section 7. The state's
+    Note: position points at the opening quote on entry. On success the
+    Note: closing quote is consumed and the decoded UTF-8 bytes appended
+    Note: to out. Returns 1 on success, 0 on error (caller forms JsonResult).
+    @Reasoning
+        RFC 8259 section 7 defines a JSON string as a sequence of zero or
+        more Unicode codepoints delimited by ASCII double quotes. The
+        decoder must (a) reject control characters U+0000..U+001F outside
+        an escape, (b) accept the seven short escapes plus \uXXXX, and
+        (c) when two \uXXXX escapes form a UTF-16 surrogate pair, decode
+        them as the corresponding supplementary codepoint per RFC 8259
+        section 8.2.
+    @End Reasoning
+    @Implementation
+        Single-pass loop. We track surrogate pair state by treating a
+        high surrogate \uD800..\uDBFF as a pending half; the very next
+        \uXXXX must be a low surrogate \uDC00..\uDFFF. Other inputs are
+        rejected. Lone surrogates are an error per RFC 8259 section 8.2.
+    @End Implementation
+    @Performance_Hints
+        O(n) in input bytes. No backtracking. UTF-8 encoding is inlined
+        into the byte builder; a 4-byte supplementary codepoint emits
+        exactly four bytes with two hex pair decodings.
+    @End Performance_Hints
+    @Security_Scope
+        Input is untrusted. Bound checks via parser_peek (returns 0 at
+        EOF). Hex digit validity is checked via hex_digit_value < 0.
+        Control characters trigger a parse error rather than UB.
+    @End Security_Scope
+
+    If parser_peek(st) is not equal to 34:
+        Return 0
+    End If
+    parser_advance(st)
+    Let done be 0
+    While done is equal to 0:
+        Let c be parser_peek(st)
+        If c is equal to 0:
+            Return 0
+        End If
+        If c is equal to 34:
+            parser_advance(st)
+            Set done to 1
+        Otherwise:
+            If c is equal to 92:
+                parser_advance(st)
+                Let esc be parser_peek(st)
+                parser_advance(st)
+                If esc is equal to 34:
+                    bb_append_byte(out, 34)
+                Otherwise:
+                    If esc is equal to 92:
+                        bb_append_byte(out, 92)
+                    Otherwise:
+                        If esc is equal to 47:
+                            bb_append_byte(out, 47)
+                        Otherwise:
+                            If esc is equal to 98:
+                                bb_append_byte(out, 8)
+                            Otherwise:
+                                If esc is equal to 102:
+                                    bb_append_byte(out, 12)
+                                Otherwise:
+                                    If esc is equal to 110:
+                                        bb_append_byte(out, 10)
+                                    Otherwise:
+                                        If esc is equal to 114:
+                                            bb_append_byte(out, 13)
+                                        Otherwise:
+                                            If esc is equal to 116:
+                                                bb_append_byte(out, 9)
+                                            Otherwise:
+                                                If esc is equal to 117:
+                                                    Let d1 be hex_digit_value(parser_peek(st))
+                                                    parser_advance(st)
+                                                    Let d2 be hex_digit_value(parser_peek(st))
+                                                    parser_advance(st)
+                                                    Let d3 be hex_digit_value(parser_peek(st))
+                                                    parser_advance(st)
+                                                    Let d4 be hex_digit_value(parser_peek(st))
+                                                    parser_advance(st)
+                                                    If d1 is less than 0:
+                                                        Return 0
+                                                    End If
+                                                    If d2 is less than 0:
+                                                        Return 0
+                                                    End If
+                                                    If d3 is less than 0:
+                                                        Return 0
+                                                    End If
+                                                    If d4 is less than 0:
+                                                        Return 0
+                                                    End If
+                                                    Let cp be (d1 multiplied by 4096) plus (d2 multiplied by 256) plus (d3 multiplied by 16) plus d4
+                                                    If cp is greater than or equal to 55296:
+                                                        If cp is less than or equal to 56319:
+                                                            Note: high surrogate - expect low surrogate
+                                                            If parser_peek(st) is not equal to 92:
+                                                                Return 0
+                                                            End If
+                                                            parser_advance(st)
+                                                            If parser_peek(st) is not equal to 117:
+                                                                Return 0
+                                                            End If
+                                                            parser_advance(st)
+                                                            Let e1 be hex_digit_value(parser_peek(st))
+                                                            parser_advance(st)
+                                                            Let e2 be hex_digit_value(parser_peek(st))
+                                                            parser_advance(st)
+                                                            Let e3 be hex_digit_value(parser_peek(st))
+                                                            parser_advance(st)
+                                                            Let e4 be hex_digit_value(parser_peek(st))
+                                                            parser_advance(st)
+                                                            If e1 is less than 0:
+                                                                Return 0
+                                                            End If
+                                                            If e2 is less than 0:
+                                                                Return 0
+                                                            End If
+                                                            If e3 is less than 0:
+                                                                Return 0
+                                                            End If
+                                                            If e4 is less than 0:
+                                                                Return 0
+                                                            End If
+                                                            Let low be (e1 multiplied by 4096) plus (e2 multiplied by 256) plus (e3 multiplied by 16) plus e4
+                                                            If low is less than 56320:
+                                                                Return 0
+                                                            End If
+                                                            If low is greater than 57343:
+                                                                Return 0
+                                                            End If
+                                                            Let high_part be (cp minus 55296) multiplied by 1024
+                                                            Let low_part be low minus 56320
+                                                            Let scalar be 65536 plus high_part plus low_part
+                                                            utf8_encode_into_builder(out, scalar)
+                                                        Otherwise:
+                                                            If cp is less than or equal to 57343:
+                                                                Note: lone low surrogate
+                                                                Return 0
+                                                            Otherwise:
+                                                                utf8_encode_into_builder(out, cp)
+                                                            End If
+                                                        End If
+                                                    Otherwise:
+                                                        utf8_encode_into_builder(out, cp)
+                                                    End If
+                                                Otherwise:
+                                                    Return 0
+                                                End If
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            Otherwise:
+                If c is less than 32:
+                    Note: RFC 8259 section 7: control characters MUST be escaped.
+                    Return 0
+                End If
+                parser_advance(st)
+                bb_append_byte(out, c)
+            End If
+        End If
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: NUMBER PARSE - validates number per RFC 8259 section 6, preserves text
+Note: ============================================================================
+
+Process called "is_digit_byte" that takes c as Integer returns Integer:
+    If c is less than 48:
+        Return 0
+    End If
+    If c is greater than 57:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "parse_number" that takes st as Integer returns Integer:
+    @Reasoning
+        RFC 8259 section 6: number = [ minus ] int [ frac ] [ exp ].
+        int = "0" / digit1-9 *DIGIT  (no leading zero on multi-digit ints)
+        frac = "." 1*DIGIT
+        exp = ("e"|"E") ["+"|"-"] 1*DIGIT
+    @End Reasoning
+    @Implementation
+        Records start position, advances through the four sections,
+        slices the source substring as the canonical decimal-string
+        payload. Strict no-leading-zero is enforced.
+    @End Implementation
+    @Performance_Hints
+        Single-pass, O(n) over number text. No allocations beyond the
+        final substring copy.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds via parser_peek. Empty or malformed inputs return 0
+        (caller produces parse error from state).
+    @End Security_Scope
+
+    Let source be __load(st, 0)
+    Let start be __load(st, 8)
+    Let c be parser_peek(st)
+    If c is equal to 45:
+        parser_advance(st)
+        Set c to parser_peek(st)
+    End If
+    If c is equal to 48:
+        parser_advance(st)
+    Otherwise:
+        If is_digit_byte(c) is equal to 1:
+            While is_digit_byte(parser_peek(st)) is equal to 1:
+                parser_advance(st)
+            End While
+        Otherwise:
+            Return 0
+        End If
+    End If
+    If parser_peek(st) is equal to 46:
+        parser_advance(st)
+        If is_digit_byte(parser_peek(st)) is equal to 0:
+            Return 0
+        End If
+        While is_digit_byte(parser_peek(st)) is equal to 1:
+            parser_advance(st)
+        End While
+    End If
+    Let e be parser_peek(st)
+    If e is equal to 101:
+        parser_advance(st)
+    Otherwise:
+        If e is equal to 69:
+            parser_advance(st)
+        Otherwise:
+            Set e to 0
+        End If
+    End If
+    If e is not equal to 0:
+        Let sign be parser_peek(st)
+        If sign is equal to 43:
+            parser_advance(st)
+        Otherwise:
+            If sign is equal to 45:
+                parser_advance(st)
+            End If
+        End If
+        If is_digit_byte(parser_peek(st)) is equal to 0:
+            Return 0
+        End If
+        While is_digit_byte(parser_peek(st)) is equal to 1:
+            parser_advance(st)
+        End While
+    End If
+    Let endpos be __load(st, 8)
+    Let len be endpos minus start
+    Let buf be allocate(len plus 1)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than len:
+        __byte_store(buf, i, string_char_at(source, start plus i))
+        Set i to i plus 1
+    End While
+    __byte_store(buf, len, 0)
+    Let v be jsonvalue_alloc(2)
+    If v is equal to 0:
+        deallocate(buf)
+        Return 0
+    End If
+    __store(v, 8, buf)
+    Return v
+End Process
+
+Note: ============================================================================
+Note: LITERAL PARSE - true, false, null
+Note: ============================================================================
+
+Process called "parse_literal" that takes st as Integer, lit_byte_0 as Integer returns Integer:
+    Note: Matches one of "true","false","null" using the leading byte hint
+    Note: already peeked by caller; returns the resulting JsonValue or 0.
+    If lit_byte_0 is equal to 116:
+        If parser_peek_at(st, 0) is equal to 116:
+            If parser_peek_at(st, 1) is equal to 114:
+                If parser_peek_at(st, 2) is equal to 117:
+                    If parser_peek_at(st, 3) is equal to 101:
+                        parser_advance(st)
+                        parser_advance(st)
+                        parser_advance(st)
+                        parser_advance(st)
+                        Return json_bool(1)
+                    End If
+                End If
+            End If
+        End If
+        Return 0
+    End If
+    If lit_byte_0 is equal to 102:
+        If parser_peek_at(st, 0) is equal to 102:
+            If parser_peek_at(st, 1) is equal to 97:
+                If parser_peek_at(st, 2) is equal to 108:
+                    If parser_peek_at(st, 3) is equal to 115:
+                        If parser_peek_at(st, 4) is equal to 101:
+                            parser_advance(st)
+                            parser_advance(st)
+                            parser_advance(st)
+                            parser_advance(st)
+                            parser_advance(st)
+                            Return json_bool(0)
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Return 0
+    End If
+    If lit_byte_0 is equal to 110:
+        If parser_peek_at(st, 0) is equal to 110:
+            If parser_peek_at(st, 1) is equal to 117:
+                If parser_peek_at(st, 2) is equal to 108:
+                    If parser_peek_at(st, 3) is equal to 108:
+                        parser_advance(st)
+                        parser_advance(st)
+                        parser_advance(st)
+                        parser_advance(st)
+                        Return json_null()
+                    End If
+                End If
+            End If
+        End If
+        Return 0
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: VALUE PARSE - dispatcher (recursive)
+Note: ============================================================================
+
+Process called "parse_value" that takes st as Integer, strict_dupes as Integer returns Integer:
+    Note: Parses a single JSON value, returning the JsonValue pointer or 0
+    Note: on error. Whitespace is consumed before dispatch.
+    parser_skip_ws(st)
+    Let c be parser_peek(st)
+    If c is equal to 0:
+        Return 0
+    End If
+    If c is equal to 34:
+        Let bb be bb_create(32)
+        If parse_string_into_builder(st, bb) is equal to 0:
+            bb_destroy(bb)
+            Return 0
+        End If
+        Let s be bb_finalize(bb)
+        Let v be jsonvalue_alloc(3)
+        If v is equal to 0:
+            Return 0
+        End If
+        __store(v, 8, s)
+        Return v
+    End If
+    If c is equal to 123:
+        Return parse_object(st, strict_dupes)
+    End If
+    If c is equal to 91:
+        Return parse_array(st, strict_dupes)
+    End If
+    If c is equal to 45:
+        Return parse_number(st)
+    End If
+    If is_digit_byte(c) is equal to 1:
+        Return parse_number(st)
+    End If
+    Return parse_literal(st, c)
+End Process
+
+Process called "parse_array" that takes st as Integer, strict_dupes as Integer returns Integer:
+    Note: Parses '[' value (',' value)* ']' per RFC 8259 section 5.
+    If parser_peek(st) is not equal to 91:
+        Return 0
+    End If
+    parser_advance(st)
+    parser_skip_ws(st)
+    Let arr be json_array_new()
+    If arr is equal to 0:
+        Return 0
+    End If
+    If parser_peek(st) is equal to 93:
+        parser_advance(st)
+        Return arr
+    End If
+    Let done be 0
+    While done is equal to 0:
+        Let elem be parse_value(st, strict_dupes)
+        If elem is equal to 0:
+            Return 0
+        End If
+        If json_array_push(arr, elem) is equal to 0:
+            Return 0
+        End If
+        parser_skip_ws(st)
+        Let nx be parser_peek(st)
+        If nx is equal to 44:
+            parser_advance(st)
+            parser_skip_ws(st)
+        Otherwise:
+            If nx is equal to 93:
+                parser_advance(st)
+                Set done to 1
+            Otherwise:
+                Return 0
+            End If
+        End If
+    End While
+    Return arr
+End Process
+
+Process called "parse_object" that takes st as Integer, strict_dupes as Integer returns Integer:
+    Note: Parses '{' string ':' value (',' string ':' value)* '}' per RFC 8259.
+    If parser_peek(st) is not equal to 123:
+        Return 0
+    End If
+    parser_advance(st)
+    parser_skip_ws(st)
+    Let obj be json_object_new()
+    If obj is equal to 0:
+        Return 0
+    End If
+    If parser_peek(st) is equal to 125:
+        parser_advance(st)
+        Return obj
+    End If
+    Let done be 0
+    While done is equal to 0:
+        parser_skip_ws(st)
+        If parser_peek(st) is not equal to 34:
+            Return 0
+        End If
+        Let kb be bb_create(16)
+        If parse_string_into_builder(st, kb) is equal to 0:
+            bb_destroy(kb)
+            Return 0
+        End If
+        Let key be bb_finalize(kb)
+        parser_skip_ws(st)
+        If parser_peek(st) is not equal to 58:
+            Return 0
+        End If
+        parser_advance(st)
+        If strict_dupes is equal to 1:
+            If json_object_get(obj, key) is not equal to 0:
+                Return 0
+            End If
+        End If
+        Let val be parse_value(st, strict_dupes)
+        If val is equal to 0:
+            Return 0
+        End If
+        json_object_set(obj, key, val)
+        parser_skip_ws(st)
+        Let nx be parser_peek(st)
+        If nx is equal to 44:
+            parser_advance(st)
+        Otherwise:
+            If nx is equal to 125:
+                parser_advance(st)
+                Set done to 1
+            Otherwise:
+                Return 0
+            End If
+        End If
+    End While
+    Return obj
+End Process
+
+Note: ============================================================================
+Note: PUBLIC PARSE ENTRYPOINTS
+Note: ============================================================================
+
+Process called "json_parse" that takes text as Integer returns Integer:
+    @Reasoning
+        Public JSON parser entrypoint per RFC 8259. Returns a JsonResult
+        whose Ok payload is the parsed JsonValue, or whose Error payload
+        is a JsonParseError describing the failure with 1-based line/column.
+    @End Reasoning
+    @Implementation
+        Creates a parser state, dispatches to parse_value, then verifies
+        only whitespace remains. Last-key-wins on duplicate object keys
+        (RFC 8259 section 4 implementation-defined). For strict-mode
+        duplicate rejection, use json_parse_strict.
+    @End Implementation
+    @Performance_Hints
+        Single-pass, O(n) over input length. Parser state is 32 bytes.
+        Recursion depth is bounded by JSON nesting (no implicit limit
+        enforced; caller may wrap with depth-bounded recursion if needed).
+    @End Performance_Hints
+    @Security_Scope
+        Input is untrusted bytes. All forms of malformed JSON return an
+        Error variant with line/column source coordinates - no unsafe
+        reads or out-of-bound writes can occur because every byte access
+        is gated through parser_peek which bound-checks against
+        string_length.
+    @End Security_Scope
+
+    If text is equal to 0:
+        Let e1 be json_error_create(1, 1, "null input")
+        Return json_result_error(e1)
+    End If
+    Let st be parser_state_create(text)
+    If st is equal to 0:
+        Let e2 be json_error_create(1, 1, "out of memory")
+        Return json_result_error(e2)
+    End If
+    parser_skip_ws(st)
+    Let v be parse_value(st, 0)
+    If v is equal to 0:
+        Let r1 be make_error_at_state(st, "invalid JSON value")
+        parser_state_destroy(st)
+        Return r1
+    End If
+    parser_skip_ws(st)
+    If parser_peek(st) is not equal to 0:
+        Let r2 be make_error_at_state(st, "trailing content after value")
+        parser_state_destroy(st)
+        Return r2
+    End If
+    parser_state_destroy(st)
+    Return json_result_ok(v)
+End Process
+
+Process called "json_parse_strict" that takes text as Integer returns Integer:
+    Note: Like json_parse but rejects duplicate keys per RFC 8259 section 4
+    Note: implementation-defined option.
+    If text is equal to 0:
+        Let e1 be json_error_create(1, 1, "null input")
+        Return json_result_error(e1)
+    End If
+    Let st be parser_state_create(text)
+    If st is equal to 0:
+        Let e2 be json_error_create(1, 1, "out of memory")
+        Return json_result_error(e2)
+    End If
+    parser_skip_ws(st)
+    Let v be parse_value(st, 1)
+    If v is equal to 0:
+        Let r1 be make_error_at_state(st, "invalid JSON or duplicate key")
+        parser_state_destroy(st)
+        Return r1
+    End If
+    parser_skip_ws(st)
+    If parser_peek(st) is not equal to 0:
+        Let r2 be make_error_at_state(st, "trailing content after value")
+        parser_state_destroy(st)
+        Return r2
+    End If
+    parser_state_destroy(st)
+    Return json_result_ok(v)
+End Process
+
+Note: ============================================================================
+Note: SERIALIZATION
+Note: ============================================================================
+
+Process called "serialize_string_into" that takes b as Integer, s as Integer returns Integer:
+    Note: Emit JSON-string literal of s into builder b per RFC 8259 section 7.
+    Note: Escapes the seven short forms and U+0000..U+001F via \uXXXX. Bytes
+    Note: outside that range are emitted as-is (UTF-8 passthrough).
+    bb_append_byte(b, 34)
+    If s is equal to 0:
+        bb_append_byte(b, 34)
+        Return 1
+    End If
+    Let n be string_length(s)
+    Let i be 0
+    While i is less than n:
+        Let c be string_char_at(s, i)
+        If c is equal to 34:
+            bb_append_byte(b, 92)
+            bb_append_byte(b, 34)
+        Otherwise:
+            If c is equal to 92:
+                bb_append_byte(b, 92)
+                bb_append_byte(b, 92)
+            Otherwise:
+                If c is equal to 8:
+                    bb_append_byte(b, 92)
+                    bb_append_byte(b, 98)
+                Otherwise:
+                    If c is equal to 12:
+                        bb_append_byte(b, 92)
+                        bb_append_byte(b, 102)
+                    Otherwise:
+                        If c is equal to 10:
+                            bb_append_byte(b, 92)
+                            bb_append_byte(b, 110)
+                        Otherwise:
+                            If c is equal to 13:
+                                bb_append_byte(b, 92)
+                                bb_append_byte(b, 114)
+                            Otherwise:
+                                If c is equal to 9:
+                                    bb_append_byte(b, 92)
+                                    bb_append_byte(b, 116)
+                                Otherwise:
+                                    If c is less than 32:
+                                        bb_append_byte(b, 92)
+                                        bb_append_byte(b, 117)
+                                        bb_append_byte(b, 48)
+                                        bb_append_byte(b, 48)
+                                        bb_append_byte(b, hex_digit_char(c divided by 16))
+                                        bb_append_byte(b, hex_digit_char(c modulo by 16))
+                                    Otherwise:
+                                        bb_append_byte(b, c)
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    bb_append_byte(b, 34)
+    Return 1
+End Process
+
+Process called "serialize_value_compact" that takes b as Integer, v as Integer returns Integer:
+    If v is equal to 0:
+        bb_append_string(b, "null")
+        Return 1
+    End If
+    Let tag be __load(v, 0)
+    If tag is equal to 0:
+        bb_append_string(b, "null")
+        Return 1
+    End If
+    If tag is equal to 1:
+        If __load(v, 8) is equal to 0:
+            bb_append_string(b, "false")
+        Otherwise:
+            bb_append_string(b, "true")
+        End If
+        Return 1
+    End If
+    If tag is equal to 2:
+        bb_append_string(b, __load(v, 8))
+        Return 1
+    End If
+    If tag is equal to 3:
+        serialize_string_into(b, __load(v, 8))
+        Return 1
+    End If
+    If tag is equal to 4:
+        bb_append_byte(b, 91)
+        Let arr_buf be __load(v, 8)
+        Let len be __load(arr_buf, 8)
+        Let elems be __load(arr_buf, 0)
+        Let i be 0
+        While i is less than len:
+            If i is greater than 0:
+                bb_append_byte(b, 44)
+            End If
+            serialize_value_compact(b, __load(elems, i multiplied by 8))
+            Set i to i plus 1
+        End While
+        bb_append_byte(b, 93)
+        Return 1
+    End If
+    If tag is equal to 5:
+        bb_append_byte(b, 123)
+        Let obj_buf be __load(v, 8)
+        Let olen be __load(obj_buf, 16)
+        Let keys be __load(obj_buf, 0)
+        Let values be __load(obj_buf, 8)
+        Let j be 0
+        While j is less than olen:
+            If j is greater than 0:
+                bb_append_byte(b, 44)
+            End If
+            serialize_string_into(b, __load(keys, j multiplied by 8))
+            bb_append_byte(b, 58)
+            serialize_value_compact(b, __load(values, j multiplied by 8))
+            Set j to j plus 1
+        End While
+        bb_append_byte(b, 125)
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "json_serialize" that takes v as Integer returns Integer:
+    @Reasoning
+        Compact-form JSON serializer per RFC 8259. No whitespace is
+        emitted between tokens; object/array elements are comma-separated.
+    @End Reasoning
+    @Implementation
+        Recursive walk using a ByteBuilder. Numbers re-emit their stored
+        canonical-decimal-string so round-trip precision is preserved.
+        Strings are escaped per RFC 8259 section 7.
+    @End Implementation
+    @Performance_Hints
+        O(n) in output bytes. Geometric builder growth keeps amortized
+        appends O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Operates on memory the caller already owns. All input pointers
+        are NULL-checked before dereference; bad tag values emit "null".
+    @End Security_Scope
+
+    Let b be bb_create(64)
+    If b is equal to 0:
+        Return 0
+    End If
+    serialize_value_compact(b, v)
+    Return bb_finalize(b)
+End Process
+
+Process called "append_indent" that takes b as Integer, depth as Integer, indent as Integer returns Integer:
+    Let total be depth multiplied by indent
+    Let i be 0
+    While i is less than total:
+        bb_append_byte(b, 32)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "serialize_value_pretty" that takes b as Integer, v as Integer, depth as Integer, indent as Integer returns Integer:
+    If v is equal to 0:
+        bb_append_string(b, "null")
+        Return 1
+    End If
+    Let tag be __load(v, 0)
+    If tag is equal to 0:
+        bb_append_string(b, "null")
+        Return 1
+    End If
+    If tag is equal to 1:
+        If __load(v, 8) is equal to 0:
+            bb_append_string(b, "false")
+        Otherwise:
+            bb_append_string(b, "true")
+        End If
+        Return 1
+    End If
+    If tag is equal to 2:
+        bb_append_string(b, __load(v, 8))
+        Return 1
+    End If
+    If tag is equal to 3:
+        serialize_string_into(b, __load(v, 8))
+        Return 1
+    End If
+    If tag is equal to 4:
+        Let arr_buf be __load(v, 8)
+        Let len be __load(arr_buf, 8)
+        If len is equal to 0:
+            bb_append_string(b, "[]")
+            Return 1
+        End If
+        bb_append_byte(b, 91)
+        bb_append_byte(b, 10)
+        Let elems be __load(arr_buf, 0)
+        Let i be 0
+        While i is less than len:
+            append_indent(b, depth plus 1, indent)
+            serialize_value_pretty(b, __load(elems, i multiplied by 8), depth plus 1, indent)
+            If i is less than (len minus 1):
+                bb_append_byte(b, 44)
+            End If
+            bb_append_byte(b, 10)
+            Set i to i plus 1
+        End While
+        append_indent(b, depth, indent)
+        bb_append_byte(b, 93)
+        Return 1
+    End If
+    If tag is equal to 5:
+        Let obj_buf be __load(v, 8)
+        Let olen be __load(obj_buf, 16)
+        If olen is equal to 0:
+            bb_append_string(b, "{}")
+            Return 1
+        End If
+        bb_append_byte(b, 123)
+        bb_append_byte(b, 10)
+        Let keys be __load(obj_buf, 0)
+        Let values be __load(obj_buf, 8)
+        Let j be 0
+        While j is less than olen:
+            append_indent(b, depth plus 1, indent)
+            serialize_string_into(b, __load(keys, j multiplied by 8))
+            bb_append_byte(b, 58)
+            bb_append_byte(b, 32)
+            serialize_value_pretty(b, __load(values, j multiplied by 8), depth plus 1, indent)
+            If j is less than (olen minus 1):
+                bb_append_byte(b, 44)
+            End If
+            bb_append_byte(b, 10)
+            Set j to j plus 1
+        End While
+        append_indent(b, depth, indent)
+        bb_append_byte(b, 125)
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "json_serialize_pretty" that takes v as Integer, indent as Integer returns Integer:
+    @Reasoning
+        Pretty-printed JSON per common indented conventions (RFC 8259 does
+        not mandate a specific layout; this matches the de-facto style
+        used by json.dumps(indent=) in mainstream libraries).
+    @End Reasoning
+    @Implementation
+        Recursive walk emitting one element per line with indent*depth
+        leading spaces. Empty arrays/objects collapse to [] / {} to
+        avoid trailing-only-whitespace lines.
+    @End Implementation
+    @Performance_Hints
+        O(n + d*indent) in output bytes where d is the nesting depth.
+    @End Performance_Hints
+    @Security_Scope
+        Same NULL- and bound-safety as json_serialize.
+    @End Security_Scope
+
+    If indent is less than 0:
+        Set indent to 0
+    End If
+    Let b be bb_create(128)
+    If b is equal to 0:
+        Return 0
+    End If
+    serialize_value_pretty(b, v, 0, indent)
+    Return bb_finalize(b)
+End Process
+
+Note: ============================================================================
+Note: SORTED SERIALIZATION
+Note: ============================================================================
+
+Process called "string_lex_less" that takes a as Integer, b as Integer returns Integer:
+    Note: True iff a < b in lexicographic byte order. Both strings must be
+    Note: non-null.
+    Let cmp be string_compare(a, b)
+    If cmp is less than 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "serialize_value_sorted" that takes b as Integer, v as Integer returns Integer:
+    Note: Like serialize_value_compact but objects are emitted in
+    Note: ascending key order. Recurses into nested objects.
+    If v is equal to 0:
+        bb_append_string(b, "null")
+        Return 1
+    End If
+    Let tag be __load(v, 0)
+    If tag is equal to 0:
+        bb_append_string(b, "null")
+        Return 1
+    End If
+    If tag is equal to 1:
+        If __load(v, 8) is equal to 0:
+            bb_append_string(b, "false")
+        Otherwise:
+            bb_append_string(b, "true")
+        End If
+        Return 1
+    End If
+    If tag is equal to 2:
+        bb_append_string(b, __load(v, 8))
+        Return 1
+    End If
+    If tag is equal to 3:
+        serialize_string_into(b, __load(v, 8))
+        Return 1
+    End If
+    If tag is equal to 4:
+        bb_append_byte(b, 91)
+        Let arr_buf be __load(v, 8)
+        Let len be __load(arr_buf, 8)
+        Let elems be __load(arr_buf, 0)
+        Let i be 0
+        While i is less than len:
+            If i is greater than 0:
+                bb_append_byte(b, 44)
+            End If
+            serialize_value_sorted(b, __load(elems, i multiplied by 8))
+            Set i to i plus 1
+        End While
+        bb_append_byte(b, 93)
+        Return 1
+    End If
+    If tag is equal to 5:
+        bb_append_byte(b, 123)
+        Let obj_buf be __load(v, 8)
+        Let olen be __load(obj_buf, 16)
+        Let keys be __load(obj_buf, 0)
+        Let values be __load(obj_buf, 8)
+        Note: Build sort-permutation array indexes[0..olen) using insertion sort.
+        Let indexes be allocate(olen multiplied by 8)
+        Let k be 0
+        While k is less than olen:
+            __store(indexes, k multiplied by 8, k)
+            Set k to k plus 1
+        End While
+        Let ii be 1
+        While ii is less than olen:
+            Let cur_idx be __load(indexes, ii multiplied by 8)
+            Let cur_key be __load(keys, cur_idx multiplied by 8)
+            Let jj be ii minus 1
+            Let placed be 0
+            While placed is equal to 0:
+                If jj is less than 0:
+                    Set placed to 1
+                Otherwise:
+                    Let prior_idx be __load(indexes, jj multiplied by 8)
+                    Let prior_key be __load(keys, prior_idx multiplied by 8)
+                    If string_lex_less(cur_key, prior_key) is equal to 1:
+                        __store(indexes, (jj plus 1) multiplied by 8, prior_idx)
+                        Set jj to jj minus 1
+                    Otherwise:
+                        Set placed to 1
+                    End If
+                End If
+            End While
+            __store(indexes, (jj plus 1) multiplied by 8, cur_idx)
+            Set ii to ii plus 1
+        End While
+        Let m be 0
+        While m is less than olen:
+            If m is greater than 0:
+                bb_append_byte(b, 44)
+            End If
+            Let idx be __load(indexes, m multiplied by 8)
+            serialize_string_into(b, __load(keys, idx multiplied by 8))
+            bb_append_byte(b, 58)
+            serialize_value_sorted(b, __load(values, idx multiplied by 8))
+            Set m to m plus 1
+        End While
+        deallocate(indexes)
+        bb_append_byte(b, 125)
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "json_serialize_sorted" that takes v as Integer returns Integer:
+    @Reasoning
+        Compact form with object keys emitted in ascending byte-wise
+        order. Useful for canonicalization (signing, diffing) where
+        insertion order should not affect the output.
+    @End Reasoning
+    @Implementation
+        Walks the tree like json_serialize, sorting member indexes with
+        an in-place insertion sort prior to emission. Insertion sort
+        is O(k^2) per object but k (member count) is typically small;
+        for very wide objects callers should switch to canonical JSON
+        Schema serialization which is out of scope here.
+    @End Implementation
+    @Performance_Hints
+        O(n + sum-of-(k^2)) where k is per-object member count.
+    @End Performance_Hints
+    @Security_Scope
+        Same memory safety guarantees as json_serialize.
+    @End Security_Scope
+
+    Let b be bb_create(64)
+    If b is equal to 0:
+        Return 0
+    End If
+    serialize_value_sorted(b, v)
+    Return bb_finalize(b)
+End Process
+
+Note: ============================================================================
+Note: JSON POINTER (RFC 6901)
+Note: ============================================================================
+Note:
+JsonPointer = sequence of reference-tokens, each prefixed by '/'. Empty
+pointer "" identifies the whole document. Tokens are unescaped per RFC
+6901 section 4: ~1 -> '/', ~0 -> '~'. Numeric tokens applied to arrays.
+
+Internal representation: a JsonPointerTokens record:
+  offset 0 : tokens_ptr   (pointer to capacity*8-byte buffer of String ptrs)
+  offset 8 : length       (Integer)
+  offset 16: capacity     (Integer)
+:End Note
+
+Process called "jsonpointer_parse" that takes text as Integer returns Integer:
+    @Reasoning
+        Parse an RFC 6901 JSON Pointer string into an ordered token list.
+        Returns 0 if the input does not start with '/' (and is not "").
+    @End Reasoning
+    @Implementation
+        Splits on '/' and unescapes ~1/~0 in each segment. Each token is
+        a freshly-allocated NUL-terminated string.
+    @End Implementation
+    @Performance_Hints
+        O(n) in pointer-string length.
+    @End Performance_Hints
+    @Security_Scope
+        Bound-checked. Invalid escapes (~ not followed by 0 or 1) are
+        passed through verbatim, matching RFC 6901's silent-skip
+        recommendation for non-strict implementations.
+    @End Security_Scope
+
+    If text is equal to 0:
+        Return 0
+    End If
+    Let tokens_ptr be allocate(32)
+    If tokens_ptr is equal to 0:
+        Return 0
+    End If
+    Let rec be allocate(24)
+    If rec is equal to 0:
+        deallocate(tokens_ptr)
+        Return 0
+    End If
+    __store(rec, 0, tokens_ptr)
+    __store(rec, 8, 0)
+    __store(rec, 16, 4)
+    Let n be string_length(text)
+    If n is equal to 0:
+        Return rec
+    End If
+    If string_char_at(text, 0) is not equal to 47:
+        Note: RFC 6901: non-empty pointer must start with '/'.
+        deallocate(tokens_ptr)
+        deallocate(rec)
+        Return 0
+    End If
+    Let i be 1
+    Let token_bb be bb_create(16)
+    While i is less than n:
+        Let c be string_char_at(text, i)
+        If c is equal to 47:
+            jsonpointer_add_token(rec, bb_finalize(token_bb))
+            Set token_bb to bb_create(16)
+            Set i to i plus 1
+        Otherwise:
+            If c is equal to 126:
+                If i plus 1 is less than n:
+                    Let nx be string_char_at(text, i plus 1)
+                    If nx is equal to 49:
+                        bb_append_byte(token_bb, 47)
+                        Set i to i plus 2
+                    Otherwise:
+                        If nx is equal to 48:
+                            bb_append_byte(token_bb, 126)
+                            Set i to i plus 2
+                        Otherwise:
+                            bb_append_byte(token_bb, c)
+                            Set i to i plus 1
+                        End If
+                    End If
+                Otherwise:
+                    bb_append_byte(token_bb, c)
+                    Set i to i plus 1
+                End If
+            Otherwise:
+                bb_append_byte(token_bb, c)
+                Set i to i plus 1
+            End If
+        End If
+    End While
+    jsonpointer_add_token(rec, bb_finalize(token_bb))
+    Return rec
+End Process
+
+Process called "jsonpointer_add_token" that takes rec as Integer, tok as Integer returns Integer:
+    Note: Append token (string ptr - already owned) to the JsonPointerTokens record.
+    Let len be __load(rec, 8)
+    Let cap be __load(rec, 16)
+    If len is greater than or equal to cap:
+        Let new_cap be cap multiplied by 2
+        Let new_tokens be allocate(new_cap multiplied by 8)
+        If new_tokens is equal to 0:
+            Return 0
+        End If
+        Let old_tokens be __load(rec, 0)
+        Let i be 0
+        While i is less than len:
+            __store(new_tokens, i multiplied by 8, __load(old_tokens, i multiplied by 8))
+            Set i to i plus 1
+        End While
+        deallocate(old_tokens)
+        __store(rec, 0, new_tokens)
+        __store(rec, 16, new_cap)
+    End If
+    Let tokens_ptr be __load(rec, 0)
+    __store(tokens_ptr, len multiplied by 8, tok)
+    __store(rec, 8, len plus 1)
+    Return 1
+End Process
+
+Process called "jsonpointer_length" that takes rec as Integer returns Integer:
+    If rec is equal to 0:
+        Return 0
+    End If
+    Return __load(rec, 8)
+End Process
+
+Process called "jsonpointer_token_at" that takes rec as Integer, index as Integer returns Integer:
+    If rec is equal to 0:
+        Return 0
+    End If
+    Let len be __load(rec, 8)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to len:
+        Return 0
+    End If
+    Let tokens_ptr be __load(rec, 0)
+    Return __load(tokens_ptr, index multiplied by 8)
+End Process
+
+Process called "token_to_index" that takes tok as Integer returns Integer:
+    Note: Parse a JSON Pointer reference-token as an array index per RFC
+    Note: 6901 section 4: digit sequence with no leading zero unless equal
+    Note: to "0". Returns -1 if not a valid index.
+    If tok is equal to 0:
+        Return -1
+    End If
+    Let n be string_length(tok)
+    If n is equal to 0:
+        Return -1
+    End If
+    If n is equal to 1:
+        If string_char_at(tok, 0) is equal to 48:
+            Return 0
+        End If
+    End If
+    Let first be string_char_at(tok, 0)
+    If first is equal to 48:
+        Return -1
+    End If
+    Let i be 0
+    Let acc be 0
+    While i is less than n:
+        Let c be string_char_at(tok, i)
+        If is_digit_byte(c) is equal to 0:
+            Return -1
+        End If
+        Set acc to (acc multiplied by 10) plus (c minus 48)
+        Set i to i plus 1
+    End While
+    Return acc
+End Process
+
+Process called "jsonpointer_eval" that takes rec as Integer, root as Integer returns Integer:
+    @Reasoning
+        Walks the parsed token list, descending through the JSON
+        structure per RFC 6901 section 5. Returns 0 (None) on any
+        mismatch (token not present, index out of range, etc).
+    @End Reasoning
+    @Implementation
+        For each token: if current node is an object, look up by key.
+        If it is an array, parse the token as an index and fetch.
+        Anything else (scalar) fails the traversal.
+    @End Implementation
+    @Performance_Hints
+        O(t * k) worst case where t is token count and k is object size
+        (because object lookup is linear).
+    @End Performance_Hints
+    @Security_Scope
+        No external IO. All accesses bounds-checked.
+    @End Security_Scope
+
+    If rec is equal to 0:
+        Return 0
+    End If
+    If root is equal to 0:
+        Return 0
+    End If
+    Let len be __load(rec, 8)
+    Let i be 0
+    Let cur be root
+    While i is less than len:
+        If cur is equal to 0:
+            Return 0
+        End If
+        Let tok be jsonpointer_token_at(rec, i)
+        Let tag be __load(cur, 0)
+        If tag is equal to 5:
+            Set cur to json_object_get(cur, tok)
+        Otherwise:
+            If tag is equal to 4:
+                Let idx be token_to_index(tok)
+                If idx is less than 0:
+                    Return 0
+                End If
+                Set cur to json_array_get(cur, idx)
+            Otherwise:
+                Return 0
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return cur
+End Process
+
+Note: ============================================================================
+Note: JSONPATH (RFC 9535) - a useful subset
+Note: ============================================================================
+Note:
+We support the RFC-9535 segments needed by the spec's most common
+queries:
+  $              - root
+  .NAME          - child segment by name
+  ['NAME']       - quoted child segment
+  ["NAME"]       - quoted child segment (double quotes)
+  [N]            - array index
+  [*]            - wildcard over all children
+  .*             - wildcard over all children
+Bracketed names support the same single-token name-selector. The
+result is always a List[JsonValue], even for single-match queries
+(RFC 9535 section 2.2 "nodes list").
+
+Internal JsonPathExpr representation:
+  offset 0 : segments_ptr (buffer of segment-tagged records)
+  offset 8 : length       (Integer)
+  offset 16: capacity     (Integer)
+
+Segment record (16 bytes):
+  offset 0 : kind   (0=root, 1=name, 2=index, 3=wildcard)
+  offset 8 : payload (String ptr for name; Integer for index; 0 otherwise)
+:End Note
+
+Constant JSONPATH_KIND_ROOT as Integer is 0
+Constant JSONPATH_KIND_NAME as Integer is 1
+Constant JSONPATH_KIND_INDEX as Integer is 2
+Constant JSONPATH_KIND_WILDCARD as Integer is 3
+
+Process called "jpe_add_segment" that takes expr as Integer, kind as Integer, payload as Integer returns Integer:
+    Let len be __load(expr, 8)
+    Let cap be __load(expr, 16)
+    If len is greater than or equal to cap:
+        Let new_cap be cap multiplied by 2
+        Let new_segs be allocate(new_cap multiplied by 16)
+        If new_segs is equal to 0:
+            Return 0
+        End If
+        Let old_segs be __load(expr, 0)
+        Let i be 0
+        While i is less than len:
+            __store(new_segs, i multiplied by 16, __load(old_segs, i multiplied by 16))
+            __store(new_segs, (i multiplied by 16) plus 8, __load(old_segs, (i multiplied by 16) plus 8))
+            Set i to i plus 1
+        End While
+        deallocate(old_segs)
+        __store(expr, 0, new_segs)
+        __store(expr, 16, new_cap)
+    End If
+    Let segs be __load(expr, 0)
+    __store(segs, len multiplied by 16, kind)
+    __store(segs, (len multiplied by 16) plus 8, payload)
+    __store(expr, 8, len plus 1)
+    Return 1
+End Process
+
+Process called "jpe_new" returns Integer:
+    Let expr be allocate(24)
+    If expr is equal to 0:
+        Return 0
+    End If
+    Let segs be allocate(16 multiplied by 4)
+    If segs is equal to 0:
+        deallocate(expr)
+        Return 0
+    End If
+    __store(expr, 0, segs)
+    __store(expr, 8, 0)
+    __store(expr, 16, 4)
+    Return expr
+End Process
+
+Process called "jsonpath_parse" that takes text as Integer returns Integer:
+    @Reasoning
+        Parses the RFC 9535 query subset described above. Returns a
+        JsonPathExpr (an ordered list of segments).
+    @End Reasoning
+    @Implementation
+        Hand-written recursive-descent style scan over the text:
+        - '$' at start emits a Root segment.
+        - '.' followed by IDSTART emits a Name segment.
+        - '.' followed by '*' emits a Wildcard segment.
+        - '[' starts a bracketed segment, supporting '*' (wildcard),
+          a quoted name (single or double quotes) or a numeric index.
+    @End Implementation
+    @Performance_Hints
+        O(n) in query text length.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds via string_length, no out-of-bound reads.
+    @End Security_Scope
+
+    If text is equal to 0:
+        Return 0
+    End If
+    Let n be string_length(text)
+    If n is equal to 0:
+        Return 0
+    End If
+    Let expr be jpe_new()
+    If expr is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    If string_char_at(text, 0) is equal to 36:
+        jpe_add_segment(expr, 0, 0)
+        Set i to 1
+    End If
+    While i is less than n:
+        Let c be string_char_at(text, i)
+        If c is equal to 46:
+            Set i to i plus 1
+            If i is greater than or equal to n:
+                Return 0
+            End If
+            Let nxt be string_char_at(text, i)
+            If nxt is equal to 42:
+                jpe_add_segment(expr, 3, 0)
+                Set i to i plus 1
+            Otherwise:
+                Let name_bb be bb_create(16)
+                Let scanning be 1
+                While scanning is equal to 1:
+                    If i is greater than or equal to n:
+                        Set scanning to 0
+                    Otherwise:
+                        Let cn be string_char_at(text, i)
+                        If cn is equal to 46:
+                            Set scanning to 0
+                        Otherwise:
+                            If cn is equal to 91:
+                                Set scanning to 0
+                            Otherwise:
+                                bb_append_byte(name_bb, cn)
+                                Set i to i plus 1
+                            End If
+                        End If
+                    End If
+                End While
+                jpe_add_segment(expr, 1, bb_finalize(name_bb))
+            End If
+        Otherwise:
+            If c is equal to 91:
+                Set i to i plus 1
+                If i is greater than or equal to n:
+                    Return 0
+                End If
+                Let inside be string_char_at(text, i)
+                If inside is equal to 42:
+                    jpe_add_segment(expr, 3, 0)
+                    Set i to i plus 1
+                Otherwise:
+                    If inside is equal to 39:
+                        Set i to i plus 1
+                        Let kbb be bb_create(16)
+                        Let collecting be 1
+                        While collecting is equal to 1:
+                            If i is greater than or equal to n:
+                                Return 0
+                            End If
+                            Let kc be string_char_at(text, i)
+                            If kc is equal to 39:
+                                Set collecting to 0
+                            Otherwise:
+                                bb_append_byte(kbb, kc)
+                                Set i to i plus 1
+                            End If
+                        End While
+                        Set i to i plus 1
+                        jpe_add_segment(expr, 1, bb_finalize(kbb))
+                    Otherwise:
+                        If inside is equal to 34:
+                            Set i to i plus 1
+                            Let kbb2 be bb_create(16)
+                            Let collecting2 be 1
+                            While collecting2 is equal to 1:
+                                If i is greater than or equal to n:
+                                    Return 0
+                                End If
+                                Let kc2 be string_char_at(text, i)
+                                If kc2 is equal to 34:
+                                    Set collecting2 to 0
+                                Otherwise:
+                                    bb_append_byte(kbb2, kc2)
+                                    Set i to i plus 1
+                                End If
+                            End While
+                            Set i to i plus 1
+                            jpe_add_segment(expr, 1, bb_finalize(kbb2))
+                        Otherwise:
+                            If is_digit_byte(inside) is equal to 1:
+                                Let idx be 0
+                                While i is less than n:
+                                    Let dc be string_char_at(text, i)
+                                    If is_digit_byte(dc) is equal to 0:
+                                        Set i to n
+                                    Otherwise:
+                                        Set idx to (idx multiplied by 10) plus (dc minus 48)
+                                        Set i to i plus 1
+                                    End If
+                                End While
+                                Set i to i plus 1
+                                jpe_add_segment(expr, 2, idx)
+                            Otherwise:
+                                Return 0
+                            End If
+                        End If
+                    End If
+                End If
+                If i minus 1 is less than n:
+                    Note: closing bracket consumed by inner loop already
+                End If
+            Otherwise:
+                Set i to i plus 1
+            End If
+        End If
+    End While
+    Return expr
+End Process
+
+Note: ============================================================================
+Note: JSONPATH EVAL - over a value, returns a List[JsonValue]
+Note: ============================================================================
+Note:
+The result is a JsonValue array (tag 4). This satisfies the
+specification's requirement that JsonPath produce a node-list while
+re-using the existing JsonValue array representation.
+:End Note
+
+Process called "jsonpath_step_one" that takes expr as Integer, seg_idx as Integer, current as Integer, results as Integer returns Integer:
+    Note: Walk one segment of the JsonPath expression. results is a
+    Note: JsonValue array that the function appends to. seg_idx is the
+    Note: index of the segment to apply; on recursion we increment it.
+    Let segs be __load(expr, 0)
+    Let total be __load(expr, 8)
+    If seg_idx is greater than or equal to total:
+        json_array_push(results, current)
+        Return 1
+    End If
+    Let kind be __load(segs, seg_idx multiplied by 16)
+    Let payload be __load(segs, (seg_idx multiplied by 16) plus 8)
+    If kind is equal to 0:
+        Return jsonpath_step_one(expr, seg_idx plus 1, current, results)
+    End If
+    If current is equal to 0:
+        Return 1
+    End If
+    Let ctag be __load(current, 0)
+    If kind is equal to 1:
+        If ctag is not equal to 5:
+            Return 1
+        End If
+        Let child be json_object_get(current, payload)
+        If child is equal to 0:
+            Return 1
+        End If
+        Return jsonpath_step_one(expr, seg_idx plus 1, child, results)
+    End If
+    If kind is equal to 2:
+        If ctag is not equal to 4:
+            Return 1
+        End If
+        Let elem be json_array_get(current, payload)
+        If elem is equal to 0:
+            Return 1
+        End If
+        Return jsonpath_step_one(expr, seg_idx plus 1, elem, results)
+    End If
+    If kind is equal to 3:
+        If ctag is equal to 4:
+            Let alen be json_array_length(current)
+            Let i be 0
+            While i is less than alen:
+                jsonpath_step_one(expr, seg_idx plus 1, json_array_get(current, i), results)
+                Set i to i plus 1
+            End While
+            Return 1
+        End If
+        If ctag is equal to 5:
+            Let olen be json_object_length(current)
+            Let j be 0
+            While j is less than olen:
+                jsonpath_step_one(expr, seg_idx plus 1, json_object_value_at(current, j), results)
+                Set j to j plus 1
+            End While
+            Return 1
+        End If
+        Return 1
+    End If
+    Return 1
+End Process
+
+Process called "jsonpath_eval" that takes expr as Integer, root as Integer returns Integer:
+    @Reasoning
+        Walks each segment of a parsed JsonPath expression against root,
+        accumulating matching JsonValue references into a JsonArray result.
+    @End Reasoning
+    @Implementation
+        Mutual-recursive step function. A wildcard segment fans out over
+        every child of the current node; name/index narrow to one.
+        The accumulated array contains references (not deep copies);
+        consumers must not free individual elements - they remain owned
+        by the source tree.
+    @End Implementation
+    @Performance_Hints
+        Linear over the segments times the size of subtrees actually
+        visited. Wildcards over wide objects are O(k) per level.
+    @End Performance_Hints
+    @Security_Scope
+        Pure data traversal. Cannot dereference invalid pointers because
+        all subtree access goes through json_array_get / json_object_get
+        which bound-check internally.
+    @End Security_Scope
+
+    Let results be json_array_new()
+    If results is equal to 0:
+        Return 0
+    End If
+    If expr is equal to 0:
+        Return results
+    End If
+    If root is equal to 0:
+        Return results
+    End If
+    jsonpath_step_one(expr, 0, root, results)
+    Return results
+End Process
+
+Note: ============================================================================
+Note: PUBLIC HELPERS - typed coercions for JsonNumber
+Note: ============================================================================
+
+Process called "json_number_to_integer" that takes v as Integer returns Integer:
+    Note: Best-effort integer coercion. Parses the stored decimal-string
+    Note: as a signed decimal integer. Returns 0 if v is not a Number or
+    Note: if the textual form is fractional/scientific (caller's responsibility
+    Note: to detect ahead of time via string scan).
+    If v is equal to 0:
+        Return 0
+    End If
+    If __load(v, 0) is not equal to 2:
+        Return 0
+    End If
+    Let s be __load(v, 8)
+    If s is equal to 0:
+        Return 0
+    End If
+    Return string_to_integer(s)
+End Process

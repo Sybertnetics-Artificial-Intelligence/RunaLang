@@ -1,0 +1,1873 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+BYTES - Immutable Byte Sequence + Mutable ByteBuffer Primitives
+==============================================================================
+
+Provides the foundational Bytes (fixed-length immutable) and ByteBuffer
+(growable mutable) types used by every higher-level binary protocol in
+Runa: UUIDs, file I/O, network framing, cryptographic digests, hex/base
+encoding, and serialization.
+
+References:
+- RFC 4648: The Base16, Base32, and Base64 Data Encodings
+- Bitcoin: Base58 alphabet (Wikipedia: Base58)
+- Unicode 15.1 UTF-8 well-formedness (RFC 3629)
+
+Memory layout for Bytes (24 bytes):
+  offset 0:  data pointer  (Integer, 8 bytes)
+  offset 8:  length        (Integer, 8 bytes)
+  offset 16: owns_data     (Integer, 8 bytes) 1=we allocated, 0=borrowed view
+
+Memory layout for ByteBuffer (32 bytes):
+  offset 0:  data pointer  (Integer, 8 bytes)
+  offset 8:  length        (Integer, 8 bytes) - bytes currently used
+  offset 16: capacity      (Integer, 8 bytes) - allocated buffer size
+  offset 24: reserved      (Integer, 8 bytes) - future flags / alignment
+
+This module ships with Tier 0; every higher-level stdlib module that
+deals with binary data depends on it.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StrCore
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Constant BYTES_HEADER_SIZE as Integer is 24
+Constant BYTE_BUFFER_HEADER_SIZE as Integer is 32
+Constant BYTE_BUFFER_INITIAL_CAPACITY as Integer is 32
+Constant BYTE_BUFFER_GROWTH_NUMERATOR as Integer is 3
+Constant BYTE_BUFFER_GROWTH_DENOMINATOR as Integer is 2
+
+Note: Field offsets for Bytes
+Constant BYTES_OFFSET_DATA as Integer is 0
+Constant BYTES_OFFSET_LENGTH as Integer is 8
+Constant BYTES_OFFSET_OWNS as Integer is 16
+
+Note: Field offsets for ByteBuffer
+Constant BUFFER_OFFSET_DATA as Integer is 0
+Constant BUFFER_OFFSET_LENGTH as Integer is 8
+Constant BUFFER_OFFSET_CAPACITY as Integer is 16
+Constant BUFFER_OFFSET_RESERVED as Integer is 24
+
+Note: ============================================================================
+Note: INTERNAL HELPERS
+Note: ============================================================================
+
+Process called "bytes_internal_hex_digit_value" takes c as Integer returns Integer:
+    Note: Returns the numeric value of a hex digit (0-15) or -1 if invalid.
+    Note: Accepts '0'..'9', 'a'..'f', 'A'..'F'.
+    If c is greater than or equal to 48:
+        If c is less than or equal to 57:
+            Return c minus 48
+        End If
+    End If
+    If c is greater than or equal to 97:
+        If c is less than or equal to 102:
+            Return c minus 87
+        End If
+    End If
+    If c is greater than or equal to 65:
+        If c is less than or equal to 70:
+            Return c minus 55
+        End If
+    End If
+    Return -1
+End Process
+
+Process called "bytes_internal_hex_char_lower" takes nibble as Integer returns Integer:
+    Note: Maps 0..15 to ASCII '0'..'9','a'..'f'.
+    If nibble is less than 10:
+        Return nibble plus 48
+    End If
+    Return (nibble minus 10) plus 97
+End Process
+
+Process called "bytes_internal_min" takes a as Integer, b as Integer returns Integer:
+    If a is less than b:
+        Return a
+    End If
+    Return b
+End Process
+
+Process called "bytes_internal_max" takes a as Integer, b as Integer returns Integer:
+    If a is greater than b:
+        Return a
+    End If
+    Return b
+End Process
+
+Note: ============================================================================
+Note: BYTES CONSTRUCTION
+Note: ============================================================================
+
+Process called "bytes_create" takes length as Integer, init_value as Integer returns Integer:
+    @Reasoning
+        Allocates a Bytes header plus a contiguous data buffer of the given
+        length, initializing every byte to init_value. The caller may pass
+        any 8-bit value; only the low 8 bits are stored per byte. A length
+        of 0 still produces a valid empty Bytes (data pointer may be 0 but
+        owns_data is 0 to keep destruction safe).
+    @End Reasoning
+
+    @Implementation
+        Steps:
+            1. Reject negative length by returning 0 (NULL).
+            2. Allocate BYTES_HEADER_SIZE (24) bytes for the header.
+            3. If length > 0, allocate a separate data buffer and fill it
+               with init_value via memory_fill. Otherwise data pointer = 0.
+            4. Set data, length, owns_data=1 (we allocated) and return.
+    @End Implementation
+
+    @Performance_Hints
+        Allocation cost is O(1) for the header plus O(n) for the fill.
+        For zero-length sequences, no data allocation occurs.
+    @End Performance_Hints
+
+    @Security_Scope
+        Caller-supplied length is trusted but validated for non-negativity.
+        Allocation failure returns 0 so callers can detect OOM. The buffer
+        is fully initialized; no uninitialized-memory disclosure path
+        exists from this constructor.
+    @End Security_Scope
+
+    If length is less than 0:
+        Return 0
+    End If
+
+    Let header be allocate(BYTES_HEADER_SIZE)
+    If header is equal to 0:
+        Return 0
+    End If
+
+    If length is equal to 0:
+        Memory.memory_set_pointer(header, BYTES_OFFSET_DATA, 0)
+        Memory.memory_set_integer(header, BYTES_OFFSET_LENGTH, 0)
+        Memory.memory_set_integer(header, BYTES_OFFSET_OWNS, 0)
+        Return header
+    End If
+
+    Let data be allocate(length)
+    If data is equal to 0:
+        deallocate(header)
+        Return 0
+    End If
+
+    Memory.memory_fill(data, init_value, length)
+    Memory.memory_set_pointer(header, BYTES_OFFSET_DATA, data)
+    Memory.memory_set_integer(header, BYTES_OFFSET_LENGTH, length)
+    Memory.memory_set_integer(header, BYTES_OFFSET_OWNS, 1)
+    Return header
+End Process
+
+Process called "bytes_from_array" takes ptr as Integer, len as Integer returns Integer:
+    @Reasoning
+        Copies len bytes from ptr into a freshly-allocated Bytes. This is
+        the canonical "ingest external buffer" constructor: the produced
+        Bytes is an independent owner, so the caller may free or mutate
+        the source after this call.
+    @End Reasoning
+
+    @Implementation
+        Allocate header + data buffer, memcpy contents, set owns_data=1.
+        A null ptr with len 0 produces a valid empty Bytes; null ptr with
+        len > 0 is rejected.
+    @End Implementation
+
+    @Performance_Hints
+        O(n) copy. For large buffers, prefer a streaming approach if the
+        Bytes is only read sequentially; this primitive materializes.
+    @End Performance_Hints
+
+    @Security_Scope
+        Caller-controlled pointer is dereferenced only when len > 0 and
+        ptr != 0; negative lengths rejected. No bounds inference is
+        performed beyond the caller-supplied len.
+    @End Security_Scope
+
+    If len is less than 0:
+        Return 0
+    End If
+    If len is equal to 0:
+        Let empty be bytes_create(0, 0)
+        Return empty
+    End If
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Let header be allocate(BYTES_HEADER_SIZE)
+    If header is equal to 0:
+        Return 0
+    End If
+
+    Let data be allocate(len)
+    If data is equal to 0:
+        deallocate(header)
+        Return 0
+    End If
+
+    Memory.memory_copy(data, ptr, len)
+    Memory.memory_set_pointer(header, BYTES_OFFSET_DATA, data)
+    Memory.memory_set_integer(header, BYTES_OFFSET_LENGTH, len)
+    Memory.memory_set_integer(header, BYTES_OFFSET_OWNS, 1)
+    Return header
+End Process
+
+Process called "bytes_from_string_utf8" takes str as Integer returns Integer:
+    @Reasoning
+        UTF-8 strings in Runa are null-terminated byte sequences. This
+        constructor measures via string_length then copies the bytes
+        (excluding the terminator) into an immutable Bytes object. The
+        resulting Bytes contains exactly the UTF-8 encoded form of the
+        string with no terminator embedded.
+    @End Reasoning
+
+    @Implementation
+        Steps:
+            1. Null str -> empty Bytes.
+            2. Measure with string_length.
+            3. Delegate to bytes_from_array.
+    @End Implementation
+
+    @Performance_Hints
+        O(n) over string length (one pass for length, one for copy).
+    @End Performance_Hints
+
+    @Security_Scope
+        Treats the string as opaque bytes; no UTF-8 well-formedness check
+        is performed at ingest. Callers wanting validation should follow
+        with codepoint_from_utf8_bytes in a verification loop.
+    @End Security_Scope
+
+    If str is equal to 0:
+        Let empty be bytes_create(0, 0)
+        Return empty
+    End If
+
+    Let len be StrCore.string_length(str)
+    Return bytes_from_array(str, len)
+End Process
+
+Process called "bytes_from_hex_string" takes hex_str as Integer returns Integer:
+    @Reasoning
+        Parses a hexadecimal ASCII string into raw bytes. Input must have
+        even length (each byte = 2 hex digits). Accepts upper- and
+        lowercase a-f. Rejects any non-hex character by returning 0.
+        This is the inverse of bytes_to_hex_string and matches the format
+        used by RFC 4648 Base16, network capture tools, and RFC 9562 UUID
+        canonical hex (without hyphens).
+    @End Reasoning
+
+    @Implementation
+        Steps:
+            1. Measure length; reject odd-length and null inputs.
+            2. Allocate output of length/2.
+            3. For each pair, compute (hi<<4)|lo via hex_digit_value;
+               reject if either nibble is -1.
+    @End Implementation
+
+    @Performance_Hints
+        O(n) over hex string length. One pass.
+    @End Performance_Hints
+
+    @Security_Scope
+        Strictly validates every character. Invalid input yields 0
+        (allocated intermediate header is freed before returning).
+    @End Security_Scope
+
+    If hex_str is equal to 0:
+        Return 0
+    End If
+
+    Let hex_len be StrCore.string_length(hex_str)
+    If hex_len is equal to 0:
+        Let empty be bytes_create(0, 0)
+        Return empty
+    End If
+
+    Let half be hex_len divided by 2
+    Let doubled be half multiplied by 2
+    If doubled is not equal to hex_len:
+        Return 0
+    End If
+
+    Let data be allocate(half)
+    If data is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    Let out_idx be 0
+    Let ok be 1
+    While i is less than hex_len:
+        Let hi_char be Memory.memory_get_byte(hex_str, i)
+        Let lo_char be Memory.memory_get_byte(hex_str, i plus 1)
+        Let hi_val be bytes_internal_hex_digit_value(hi_char)
+        Let lo_val be bytes_internal_hex_digit_value(lo_char)
+        If hi_val is less than 0:
+            Set ok to 0
+            Set i to hex_len
+        Otherwise:
+            If lo_val is less than 0:
+                Set ok to 0
+                Set i to hex_len
+            Otherwise:
+                Let combined be (hi_val multiplied by 16) plus lo_val
+                Memory.memory_set_byte(data, out_idx, combined)
+                Set out_idx to out_idx plus 1
+                Set i to i plus 2
+            End If
+        End If
+    End While
+
+    If ok is equal to 0:
+        deallocate(data)
+        Return 0
+    End If
+
+    Let header be allocate(BYTES_HEADER_SIZE)
+    If header is equal to 0:
+        deallocate(data)
+        Return 0
+    End If
+    Memory.memory_set_pointer(header, BYTES_OFFSET_DATA, data)
+    Memory.memory_set_integer(header, BYTES_OFFSET_LENGTH, half)
+    Memory.memory_set_integer(header, BYTES_OFFSET_OWNS, 1)
+    Return header
+End Process
+
+Note: Base64 alphabet (RFC 4648 section 4)
+Process called "bytes_internal_base64_char" takes idx as Integer returns Integer:
+    If idx is less than 26:
+        Return idx plus 65
+    End If
+    If idx is less than 52:
+        Return (idx minus 26) plus 97
+    End If
+    If idx is less than 62:
+        Return (idx minus 52) plus 48
+    End If
+    If idx is equal to 62:
+        Return 43
+    End If
+    If idx is equal to 63:
+        Return 47
+    End If
+    Return 61
+End Process
+
+Process called "bytes_internal_base64_value" takes c as Integer returns Integer:
+    Note: Inverse of base64_char. Returns -1 for invalid characters.
+    Note: '=' (61) returns -2 to signal padding.
+    If c is greater than or equal to 65:
+        If c is less than or equal to 90:
+            Return c minus 65
+        End If
+    End If
+    If c is greater than or equal to 97:
+        If c is less than or equal to 122:
+            Return (c minus 97) plus 26
+        End If
+    End If
+    If c is greater than or equal to 48:
+        If c is less than or equal to 57:
+            Return (c minus 48) plus 52
+        End If
+    End If
+    If c is equal to 43:
+        Return 62
+    End If
+    If c is equal to 47:
+        Return 63
+    End If
+    If c is equal to 61:
+        Return -2
+    End If
+    Return -1
+End Process
+
+Process called "bytes_from_base64" takes b64_str as Integer returns Integer:
+    @Reasoning
+        Parses RFC 4648 standard Base64 (with '+', '/', and '=' padding).
+        Padding to a multiple of 4 characters is required. URL-safe
+        base64url is a separate alphabet and is not handled here.
+    @End Reasoning
+
+    @Implementation
+        Decodes 4-character groups into 3 output bytes. Trailing '=' marks
+        the final group as partial: one '=' means 2 output bytes, two '='
+        means 1 output byte.
+    @End Implementation
+
+    @Performance_Hints
+        O(n). One pass with no allocation per group.
+    @End Performance_Hints
+
+    @Security_Scope
+        Any non-alphabet character (including whitespace) is rejected.
+        Padding must be at the end and length must be multiple of 4.
+    @End Security_Scope
+
+    If b64_str is equal to 0:
+        Return 0
+    End If
+    Let in_len be StrCore.string_length(b64_str)
+    If in_len is equal to 0:
+        Let empty be bytes_create(0, 0)
+        Return empty
+    End If
+
+    Let groups be in_len divided by 4
+    Let groups_rounded be groups multiplied by 4
+    If groups_rounded is not equal to in_len:
+        Return 0
+    End If
+
+    Note: Maximum output is groups*3; final padding may reduce by 1 or 2.
+    Let max_out be groups multiplied by 3
+    Let data be allocate(max_out)
+    If data is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    Let out_idx be 0
+    Let ok be 1
+    While i is less than in_len:
+        Let c0 be Memory.memory_get_byte(b64_str, i)
+        Let c1 be Memory.memory_get_byte(b64_str, i plus 1)
+        Let c2 be Memory.memory_get_byte(b64_str, i plus 2)
+        Let c3 be Memory.memory_get_byte(b64_str, i plus 3)
+        Let v0 be bytes_internal_base64_value(c0)
+        Let v1 be bytes_internal_base64_value(c1)
+        Let v2 be bytes_internal_base64_value(c2)
+        Let v3 be bytes_internal_base64_value(c3)
+        If v0 is less than 0:
+            Set ok to 0
+            Set i to in_len
+        Otherwise:
+            If v1 is less than 0:
+                Set ok to 0
+                Set i to in_len
+            Otherwise:
+                Note: First output byte from v0,v1 (always valid here)
+                Let b0 be (v0 multiplied by 4) plus (v1 divided by 16)
+                Memory.memory_set_byte(data, out_idx, b0)
+                Set out_idx to out_idx plus 1
+
+                Note: Handle middle byte / padding
+                If v2 is equal to -2:
+                    Note: First padding char; v3 must also be padding
+                    If v3 is not equal to -2:
+                        Set ok to 0
+                    End If
+                    Set i to in_len
+                Otherwise:
+                    If v2 is less than 0:
+                        Set ok to 0
+                        Set i to in_len
+                    Otherwise:
+                        Let v1_low be v1 minus ((v1 divided by 16) multiplied by 16)
+                        Let v2_hi be v2 divided by 4
+                        Let b1 be (v1_low multiplied by 16) plus v2_hi
+                        Memory.memory_set_byte(data, out_idx, b1)
+                        Set out_idx to out_idx plus 1
+
+                        If v3 is equal to -2:
+                            Set i to in_len
+                        Otherwise:
+                            If v3 is less than 0:
+                                Set ok to 0
+                                Set i to in_len
+                            Otherwise:
+                                Let v2_low be v2 minus ((v2 divided by 4) multiplied by 4)
+                                Let b2 be (v2_low multiplied by 64) plus v3
+                                Memory.memory_set_byte(data, out_idx, b2)
+                                Set out_idx to out_idx plus 1
+                                Set i to i plus 4
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    If ok is equal to 0:
+        deallocate(data)
+        Return 0
+    End If
+
+    Let header be allocate(BYTES_HEADER_SIZE)
+    If header is equal to 0:
+        deallocate(data)
+        Return 0
+    End If
+    Memory.memory_set_pointer(header, BYTES_OFFSET_DATA, data)
+    Memory.memory_set_integer(header, BYTES_OFFSET_LENGTH, out_idx)
+    Memory.memory_set_integer(header, BYTES_OFFSET_OWNS, 1)
+    Return header
+End Process
+
+Note: ============================================================================
+Note: BYTES DESTRUCTION
+Note: ============================================================================
+
+Process called "bytes_destroy" takes b as Integer returns Integer:
+    Note: Frees a Bytes object and its data (if owned).
+    If b is equal to 0:
+        Return 0
+    End If
+    Let owns be Memory.memory_get_integer(b, BYTES_OFFSET_OWNS)
+    If owns is equal to 1:
+        Let data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+        If data is not equal to 0:
+            deallocate(data)
+        End If
+    End If
+    deallocate(b)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: BYTES ACCESS
+Note: ============================================================================
+
+Process called "bytes_length" takes b as Integer returns Integer:
+    @Reasoning
+        Returns the number of bytes in the sequence. NULL Bytes is 0.
+    @End Reasoning
+    @Implementation
+        Single load from BYTES_OFFSET_LENGTH.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        No-side-effect query; null tolerated by returning 0.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+End Process
+
+Process called "bytes_data" takes b as Integer returns Integer:
+    Note: Returns raw data pointer for use by lower-level code. Treat
+    Note: as borrowed - lifetime is tied to the Bytes object.
+    If b is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+End Process
+
+Process called "bytes_at" takes b as Integer, index as Integer returns Integer:
+    @Reasoning
+        Returns the byte at the given index as an unsigned integer 0..255.
+        Out-of-range or null inputs return -1 so callers can distinguish
+        from valid zero bytes.
+    @End Reasoning
+    @Implementation
+        Bounds-checked load via memory_get_byte.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Strict bounds check; no out-of-bounds read possible.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return -1
+    End If
+    Let len be Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+    If index is less than 0:
+        Return -1
+    End If
+    If index is greater than or equal to len:
+        Return -1
+    End If
+    Let data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+    If data is equal to 0:
+        Return -1
+    End If
+    Return Memory.memory_get_byte(data, index)
+End Process
+
+Process called "bytes_slice" takes b as Integer, start as Integer, end_idx as Integer returns Integer:
+    @Reasoning
+        Returns a new Bytes containing bytes [start, end_idx). The slice
+        copies; modifying the source after slicing has no effect on the
+        slice. This is half-open: end_idx is exclusive, matching Python,
+        Rust, and most modern language conventions.
+    @End Reasoning
+    @Implementation
+        Clamp end_idx to length, reject if start < 0 or start > end_idx,
+        allocate output and memcpy the range.
+    @End Implementation
+    @Performance_Hints
+        O(end_idx - start) copy.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds-checked; invalid ranges produce 0 (NULL).
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+    If start is less than 0:
+        Return 0
+    End If
+    If end_idx is less than start:
+        Return 0
+    End If
+    If end_idx is greater than len:
+        Return 0
+    End If
+    Let slice_len be end_idx minus start
+    If slice_len is equal to 0:
+        Let empty be bytes_create(0, 0)
+        Return empty
+    End If
+    Let data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+    If data is equal to 0:
+        Return 0
+    End If
+    Let src_ptr be data plus start
+    Return bytes_from_array(src_ptr, slice_len)
+End Process
+
+Process called "bytes_copy_into" takes src as Integer, dst as Integer, dst_offset as Integer returns Integer:
+    @Reasoning
+        Copies the entire source Bytes into dst raw buffer starting at
+        dst_offset. Returns the number of bytes copied, or -1 on error.
+        The destination is a caller-allocated raw buffer (not a Bytes
+        header); the caller is responsible for ensuring it has room.
+    @End Reasoning
+    @Implementation
+        Memcpy from src_data + 0 to dst + dst_offset for src_length bytes.
+    @End Implementation
+    @Performance_Hints
+        O(n).
+    @End Performance_Hints
+    @Security_Scope
+        No automatic capacity check on dst; caller MUST guarantee
+        dst_offset + src_length is within the destination allocation.
+    @End Security_Scope
+
+    If src is equal to 0:
+        Return -1
+    End If
+    If dst is equal to 0:
+        Return -1
+    End If
+    If dst_offset is less than 0:
+        Return -1
+    End If
+    Let src_len be Memory.memory_get_integer(src, BYTES_OFFSET_LENGTH)
+    If src_len is equal to 0:
+        Return 0
+    End If
+    Let src_data be Memory.memory_get_pointer(src, BYTES_OFFSET_DATA)
+    If src_data is equal to 0:
+        Return -1
+    End If
+    Let dst_ptr be dst plus dst_offset
+    Memory.memory_copy(dst_ptr, src_data, src_len)
+    Return src_len
+End Process
+
+Note: ============================================================================
+Note: BYTES COMPARISON
+Note: ============================================================================
+
+Process called "bytes_equal" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Returns 1 if a and b contain the same bytes in the same order,
+        else 0. Length mismatch is an immediate non-equal.
+    @End Reasoning
+    @Implementation
+        Compare lengths, then delegate to memory_compare.
+    @End Implementation
+    @Performance_Hints
+        Short-circuits on length mismatch. Otherwise O(n).
+    @End Performance_Hints
+    @Security_Scope
+        Early termination on first difference: NOT constant-time. Use
+        bytes_equal_constant_time for MAC/HMAC/secret comparisons.
+    @End Security_Scope
+
+    If a is equal to b:
+        Return 1
+    End If
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let a_len be Memory.memory_get_integer(a, BYTES_OFFSET_LENGTH)
+    Let b_len be Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+    If a_len is not equal to b_len:
+        Return 0
+    End If
+    If a_len is equal to 0:
+        Return 1
+    End If
+    Let a_data be Memory.memory_get_pointer(a, BYTES_OFFSET_DATA)
+    Let b_data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+    Let cmp be Memory.memory_compare(a_data, b_data, a_len)
+    If cmp is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "bytes_equal_constant_time" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Constant-time comparison: visits every byte regardless of where
+        the first difference occurs. Required for comparing MACs, HMAC
+        tags, password hashes, and any other secret-derived bytes where
+        timing-based oracle attacks must be denied.
+        See Bernstein, "Cache-timing attacks on AES" (2005) and
+        OWASP "Authentication General Guidance".
+    @End Reasoning
+    @Implementation
+        XOR each pair of bytes into an accumulator; final accumulator
+        is 0 iff all bytes matched. Branches only on length (which is
+        typically a fixed protocol constant).
+    @End Implementation
+    @Performance_Hints
+        Always O(n); no short-circuit. For 32-byte MACs (SHA-256) this
+        is ~32 byte loads + 32 XORs.
+    @End Performance_Hints
+    @Security_Scope
+        Resistant to timing analysis at the byte loop. Length comparison
+        is not constant-time but length is usually a public protocol
+        constant.
+    @End Security_Scope
+
+    If a is equal to b:
+        Return 1
+    End If
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let a_len be Memory.memory_get_integer(a, BYTES_OFFSET_LENGTH)
+    Let b_len be Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+    If a_len is not equal to b_len:
+        Return 0
+    End If
+    If a_len is equal to 0:
+        Return 1
+    End If
+    Let a_data be Memory.memory_get_pointer(a, BYTES_OFFSET_DATA)
+    Let b_data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+    Let acc be 0
+    Let i be 0
+    While i is less than a_len:
+        Let ba be Memory.memory_get_byte(a_data, i)
+        Let bb be Memory.memory_get_byte(b_data, i)
+        Let diff be ba bitwise xor bb
+        Set acc to acc bitwise or diff
+        Set i to i plus 1
+    End While
+    If acc is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "bytes_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Lexicographic byte comparison returning -1, 0, or 1. NULL is
+        treated as less than any non-null. Used for sorting and ordered
+        map keys.
+    @End Reasoning
+    @Implementation
+        Compare common prefix via memory_compare; if equal, the shorter
+        Bytes is less.
+    @End Implementation
+    @Performance_Hints
+        O(min(a_len, b_len)).
+    @End Performance_Hints
+    @Security_Scope
+        Not constant-time; do not use for secret-comparable values.
+    @End Security_Scope
+
+    If a is equal to b:
+        Return 0
+    End If
+    If a is equal to 0:
+        Return -1
+    End If
+    If b is equal to 0:
+        Return 1
+    End If
+    Let a_len be Memory.memory_get_integer(a, BYTES_OFFSET_LENGTH)
+    Let b_len be Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+    Let common be bytes_internal_min(a_len, b_len)
+    If common is greater than 0:
+        Let a_data be Memory.memory_get_pointer(a, BYTES_OFFSET_DATA)
+        Let b_data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+        Let cmp be Memory.memory_compare(a_data, b_data, common)
+        If cmp is less than 0:
+            Return -1
+        End If
+        If cmp is greater than 0:
+            Return 1
+        End If
+    End If
+    If a_len is less than b_len:
+        Return -1
+    End If
+    If a_len is greater than b_len:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: BYTES FORMAT - to_hex / to_base64 / to_base32 / to_base58 / to_utf8
+Note: ============================================================================
+
+Process called "bytes_to_hex_string" takes b as Integer returns Integer:
+    @Reasoning
+        Produces a lowercase RFC 4648 Base16 string of the Bytes contents.
+        Returns a freshly-allocated null-terminated string the caller
+        must free. Matches the format consumed by bytes_from_hex_string.
+    @End Reasoning
+    @Implementation
+        Allocate 2n+1 bytes, write each byte as two hex digits.
+    @End Implementation
+    @Performance_Hints
+        O(n) with two divisions per byte (which the codegen can lower
+        to a single divide+mod or a precomputed table later).
+    @End Performance_Hints
+    @Security_Scope
+        Safe; output is a hex string with no embedded NULs.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+    Let out_size be (len multiplied by 2) plus 1
+    Let out be allocate(out_size)
+    If out is equal to 0:
+        Return 0
+    End If
+    If len is equal to 0:
+        Memory.memory_set_byte(out, 0, 0)
+        Return out
+    End If
+    Let data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+    Let i be 0
+    Let out_idx be 0
+    While i is less than len:
+        Let byte_val be Memory.memory_get_byte(data, i)
+        Let hi be byte_val divided by 16
+        Let lo be byte_val minus (hi multiplied by 16)
+        Memory.memory_set_byte(out, out_idx, bytes_internal_hex_char_lower(hi))
+        Memory.memory_set_byte(out, out_idx plus 1, bytes_internal_hex_char_lower(lo))
+        Set out_idx to out_idx plus 2
+        Set i to i plus 1
+    End While
+    Memory.memory_set_byte(out, out_idx, 0)
+    Return out
+End Process
+
+Process called "bytes_to_base64" takes b as Integer returns Integer:
+    @Reasoning
+        Encodes the Bytes as RFC 4648 standard Base64 with '=' padding.
+        Returns a freshly-allocated null-terminated ASCII string.
+    @End Reasoning
+    @Implementation
+        Process 3 bytes -> 4 output characters. Pad final group with '='.
+    @End Implementation
+    @Performance_Hints
+        O(n).
+    @End Performance_Hints
+    @Security_Scope
+        Output contains only RFC 4648 alphabet. Bytes content is not
+        leaked through allocation patterns (size depends only on length).
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+    Let groups be (len plus 2) divided by 3
+    Let out_size be (groups multiplied by 4) plus 1
+    Let out be allocate(out_size)
+    If out is equal to 0:
+        Return 0
+    End If
+    If len is equal to 0:
+        Memory.memory_set_byte(out, 0, 0)
+        Return out
+    End If
+    Let data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+    Let i be 0
+    Let out_idx be 0
+    While i is less than len:
+        Let remaining be len minus i
+        Let b0 be Memory.memory_get_byte(data, i)
+        Let b1 be 0
+        Let b2 be 0
+        If remaining is greater than 1:
+            Set b1 to Memory.memory_get_byte(data, i plus 1)
+        End If
+        If remaining is greater than 2:
+            Set b2 to Memory.memory_get_byte(data, i plus 2)
+        End If
+
+        Let c0_idx be b0 divided by 4
+        Let b0_low be b0 minus (c0_idx multiplied by 4)
+        Let b1_hi be b1 divided by 16
+        Let c1_idx be (b0_low multiplied by 16) plus b1_hi
+        Let b1_low be b1 minus (b1_hi multiplied by 16)
+        Let b2_hi be b2 divided by 64
+        Let c2_idx be (b1_low multiplied by 4) plus b2_hi
+        Let c3_idx be b2 minus (b2_hi multiplied by 64)
+
+        Memory.memory_set_byte(out, out_idx, bytes_internal_base64_char(c0_idx))
+        Memory.memory_set_byte(out, out_idx plus 1, bytes_internal_base64_char(c1_idx))
+        If remaining is greater than 1:
+            Memory.memory_set_byte(out, out_idx plus 2, bytes_internal_base64_char(c2_idx))
+        Otherwise:
+            Memory.memory_set_byte(out, out_idx plus 2, 61)
+        End If
+        If remaining is greater than 2:
+            Memory.memory_set_byte(out, out_idx plus 3, bytes_internal_base64_char(c3_idx))
+        Otherwise:
+            Memory.memory_set_byte(out, out_idx plus 3, 61)
+        End If
+        Set out_idx to out_idx plus 4
+        Set i to i plus 3
+    End While
+    Memory.memory_set_byte(out, out_idx, 0)
+    Return out
+End Process
+
+Note: Base32 alphabet RFC 4648 section 6: A-Z, 2-7
+Process called "bytes_internal_base32_char" takes idx as Integer returns Integer:
+    If idx is less than 26:
+        Return idx plus 65
+    End If
+    Return (idx minus 26) plus 50
+End Process
+
+Process called "bytes_to_base32" takes b as Integer returns Integer:
+    @Reasoning
+        Encodes the Bytes as RFC 4648 Base32 (uppercase A-Z, 2-7) with
+        '=' padding to a multiple of 8 characters. Useful for case-
+        insensitive identifiers (DNS labels, file names on case-folded
+        filesystems) and TOTP secret encoding.
+    @End Reasoning
+    @Implementation
+        Process 5 bytes -> 8 output characters. Pad according to RFC 4648
+        section 6 (6, 4, 3, or 1 '=' depending on remainder).
+    @End Implementation
+    @Performance_Hints
+        O(n).
+    @End Performance_Hints
+    @Security_Scope
+        Output contains only RFC 4648 alphabet.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+    Let groups be (len plus 4) divided by 5
+    Let out_size be (groups multiplied by 8) plus 1
+    Let out be allocate(out_size)
+    If out is equal to 0:
+        Return 0
+    End If
+    If len is equal to 0:
+        Memory.memory_set_byte(out, 0, 0)
+        Return out
+    End If
+    Let data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+    Let i be 0
+    Let out_idx be 0
+    While i is less than len:
+        Let remaining be len minus i
+        Let b0 be Memory.memory_get_byte(data, i)
+        Let b1 be 0
+        Let b2 be 0
+        Let b3 be 0
+        Let b4 be 0
+        If remaining is greater than 1:
+            Set b1 to Memory.memory_get_byte(data, i plus 1)
+        End If
+        If remaining is greater than 2:
+            Set b2 to Memory.memory_get_byte(data, i plus 2)
+        End If
+        If remaining is greater than 3:
+            Set b3 to Memory.memory_get_byte(data, i plus 3)
+        End If
+        If remaining is greater than 4:
+            Set b4 to Memory.memory_get_byte(data, i plus 4)
+        End If
+
+        Note: Combine 5 bytes into a 40-bit value and extract 5-bit groups.
+        Let v_high be b0
+        Let v_h2 be b1
+        Let v_h3 be b2
+        Let v_h4 be b3
+        Let v_h5 be b4
+
+        Let c0 be v_high divided by 8
+        Let r0 be v_high minus (c0 multiplied by 8)
+        Let v_h2_top be v_h2 divided by 64
+        Let c1 be (r0 multiplied by 4) plus v_h2_top
+        Let v_h2_mid be v_h2 minus (v_h2_top multiplied by 64)
+        Let c2 be v_h2_mid divided by 2
+        Let r2 be v_h2_mid minus (c2 multiplied by 2)
+        Let v_h3_top be v_h3 divided by 16
+        Let c3 be (r2 multiplied by 16) plus v_h3_top
+        Let v_h3_low be v_h3 minus (v_h3_top multiplied by 16)
+        Let v_h4_top be v_h4 divided by 128
+        Let c4 be (v_h3_low multiplied by 2) plus v_h4_top
+        Let v_h4_mid be v_h4 minus (v_h4_top multiplied by 128)
+        Let c5 be v_h4_mid divided by 4
+        Let r5 be v_h4_mid minus (c5 multiplied by 4)
+        Let v_h5_top be v_h5 divided by 32
+        Let c6 be (r5 multiplied by 8) plus v_h5_top
+        Let c7 be v_h5 minus (v_h5_top multiplied by 32)
+
+        Memory.memory_set_byte(out, out_idx, bytes_internal_base32_char(c0))
+        Memory.memory_set_byte(out, out_idx plus 1, bytes_internal_base32_char(c1))
+        If remaining is greater than 1:
+            Memory.memory_set_byte(out, out_idx plus 2, bytes_internal_base32_char(c2))
+            Memory.memory_set_byte(out, out_idx plus 3, bytes_internal_base32_char(c3))
+        Otherwise:
+            Memory.memory_set_byte(out, out_idx plus 2, 61)
+            Memory.memory_set_byte(out, out_idx plus 3, 61)
+        End If
+        If remaining is greater than 2:
+            Memory.memory_set_byte(out, out_idx plus 4, bytes_internal_base32_char(c4))
+        Otherwise:
+            Memory.memory_set_byte(out, out_idx plus 4, 61)
+        End If
+        If remaining is greater than 3:
+            Memory.memory_set_byte(out, out_idx plus 5, bytes_internal_base32_char(c5))
+            Memory.memory_set_byte(out, out_idx plus 6, bytes_internal_base32_char(c6))
+        Otherwise:
+            Memory.memory_set_byte(out, out_idx plus 5, 61)
+            Memory.memory_set_byte(out, out_idx plus 6, 61)
+        End If
+        If remaining is greater than 4:
+            Memory.memory_set_byte(out, out_idx plus 7, bytes_internal_base32_char(c7))
+        Otherwise:
+            Memory.memory_set_byte(out, out_idx plus 7, 61)
+        End If
+        Set out_idx to out_idx plus 8
+        Set i to i plus 5
+    End While
+    Memory.memory_set_byte(out, out_idx, 0)
+    Return out
+End Process
+
+Note: Base58 alphabet (Bitcoin): excludes 0, O, I, l to avoid visual confusion.
+Note: "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+Process called "bytes_internal_base58_char" takes idx as Integer returns Integer:
+    If idx is less than 9:
+        Return idx plus 49
+    End If
+    If idx is less than 17:
+        Return (idx minus 9) plus 65
+    End If
+    Note: After 'H' (72) we skip 'I' (73) -> 'J' (74) starts at idx 17
+    If idx is less than 22:
+        Return (idx minus 17) plus 74
+    End If
+    Note: After 'N' (78) we skip 'O' (79) -> 'P' (80) starts at idx 22
+    If idx is less than 33:
+        Return (idx minus 22) plus 80
+    End If
+    Note: lowercase 'a' (97) starts at idx 33
+    If idx is less than 41:
+        Return (idx minus 33) plus 97
+    End If
+    Note: After 'k' (107) we skip 'l' (108) -> 'm' (109) starts at idx 41
+    Return (idx minus 41) plus 109
+End Process
+
+Process called "bytes_to_base58" takes b as Integer returns Integer:
+    @Reasoning
+        Encodes Bytes using the Bitcoin Base58 alphabet. Useful for human-
+        readable identifiers and cryptographic addresses where avoiding
+        visually-similar characters (0/O, 1/l/I) reduces transcription
+        errors. The encoding preserves leading-zero bytes as leading '1's.
+        Algorithm follows Bitcoin Core's reference encoding.
+    @End Reasoning
+    @Implementation
+        Big-integer base-256 to base-58 division. For an n-byte input:
+            1. Count leading zero bytes (each becomes one '1').
+            2. Treat remaining bytes as a big-endian big integer.
+            3. Repeatedly divide by 58, recording remainders.
+            4. Reverse remainders into the output, after the leading 1s.
+    @End Implementation
+    @Performance_Hints
+        O(n^2) due to big-integer division. Acceptable for typical UUID
+        / hash / address sizes (16-64 bytes). For very large payloads
+        prefer base32 or base64.
+    @End Performance_Hints
+    @Security_Scope
+        Output contains only alphanumeric characters from the Bitcoin
+        Base58 alphabet. No padding character is used.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+    If len is equal to 0:
+        Let out_e be allocate(1)
+        If out_e is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(out_e, 0, 0)
+        Return out_e
+    End If
+    Let data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+
+    Note: Count leading zero bytes
+    Let zeros be 0
+    Let i be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        If i is greater than or equal to len:
+            Set scanning to 0
+        Otherwise:
+            Let byte_v be Memory.memory_get_byte(data, i)
+            If byte_v is equal to 0:
+                Set zeros to zeros plus 1
+                Set i to i plus 1
+            Otherwise:
+                Set scanning to 0
+            End If
+        End If
+    End While
+
+    Note: Allocate working buffer (a copy we can divide-in-place).
+    Let work be allocate(len)
+    If work is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(work, data, len)
+
+    Note: Output buffer. Worst-case base58 expansion is ~log(256)/log(58) = 1.366
+    Note: We allocate len * 2 + 1 which is always sufficient.
+    Let out_max be (len multiplied by 2) plus 1
+    Let out_chars be allocate(out_max)
+    If out_chars is equal to 0:
+        deallocate(work)
+        Return 0
+    End If
+    Memory.memory_fill(out_chars, 0, out_max)
+    Let out_count be 0
+
+    Note: Big-integer division: while work has any non-zero bytes, divide by 58
+    Note: and record remainder.
+    Let any_nonzero be 1
+    Let start_idx be zeros
+    While any_nonzero is equal to 1:
+        Set any_nonzero to 0
+        Let carry be 0
+        Let j be start_idx
+        While j is less than len:
+            Let byte_val be Memory.memory_get_byte(work, j)
+            Let cur be (carry multiplied by 256) plus byte_val
+            Let q be cur divided by 58
+            Let r be cur minus (q multiplied by 58)
+            Memory.memory_set_byte(work, j, q)
+            If q is not equal to 0:
+                Set any_nonzero to 1
+            End If
+            Set carry to r
+            Set j to j plus 1
+        End While
+        Note: After a full pass, carry holds the final remainder.
+        Note: If all bytes are zero and carry is zero, we are done.
+        If any_nonzero is equal to 1:
+            Memory.memory_set_byte(out_chars, out_count, bytes_internal_base58_char(carry))
+            Set out_count to out_count plus 1
+        Otherwise:
+            If carry is not equal to 0:
+                Memory.memory_set_byte(out_chars, out_count, bytes_internal_base58_char(carry))
+                Set out_count to out_count plus 1
+            End If
+        End If
+    End While
+
+    deallocate(work)
+
+    Note: Build final output: leading '1's for each zero byte, then reversed digits.
+    Let final_len be zeros plus out_count
+    Let out be allocate(final_len plus 1)
+    If out is equal to 0:
+        deallocate(out_chars)
+        Return 0
+    End If
+    Let k be 0
+    While k is less than zeros:
+        Memory.memory_set_byte(out, k, 49)
+        Set k to k plus 1
+    End While
+    Let m be 0
+    While m is less than out_count:
+        Let ch be Memory.memory_get_byte(out_chars, out_count minus 1 minus m)
+        Memory.memory_set_byte(out, zeros plus m, ch)
+        Set m to m plus 1
+    End While
+    Memory.memory_set_byte(out, final_len, 0)
+    deallocate(out_chars)
+    Return out
+End Process
+
+Process called "bytes_to_string_utf8" takes b as Integer returns Integer:
+    @Reasoning
+        Materializes a null-terminated UTF-8 string from the Bytes.
+        Performs a basic well-formedness check: rejects any byte sequence
+        that is not valid UTF-8 (overlong, surrogate, out-of-range, or
+        truncated) by returning 0.
+    @End Reasoning
+    @Implementation
+        Walk the bytes detecting UTF-8 lead bytes and verifying the
+        expected number of continuation bytes (10xxxxxx) follow. Reject
+        overlong forms and surrogate codepoints (U+D800..U+DFFF).
+        Then allocate len+1 bytes and copy with a trailing null.
+    @End Implementation
+    @Performance_Hints
+        Two passes: validate, then copy.
+    @End Performance_Hints
+    @Security_Scope
+        Strict UTF-8 validation per RFC 3629; protects against the
+        "modified UTF-8" attacks and overlong-encoding bypasses
+        documented in CVE-2018-19788-style filter evasions.
+    @End Security_Scope
+
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be Memory.memory_get_integer(b, BYTES_OFFSET_LENGTH)
+    If len is equal to 0:
+        Let out_e be allocate(1)
+        If out_e is equal to 0:
+            Return 0
+        End If
+        Memory.memory_set_byte(out_e, 0, 0)
+        Return out_e
+    End If
+    Let data be Memory.memory_get_pointer(b, BYTES_OFFSET_DATA)
+
+    Note: Validate UTF-8 well-formedness
+    Let i be 0
+    Let ok be 1
+    While i is less than len:
+        Let c be Memory.memory_get_byte(data, i)
+        If c is less than 128:
+            Set i to i plus 1
+        Otherwise:
+            If c is less than 192:
+                Set ok to 0
+                Set i to len
+            Otherwise:
+                If c is less than 224:
+                    Note: 2-byte sequence: 110xxxxx 10xxxxxx; min C2 (overlong check)
+                    If c is less than 194:
+                        Set ok to 0
+                        Set i to len
+                    Otherwise:
+                        If (i plus 1) is greater than or equal to len:
+                            Set ok to 0
+                            Set i to len
+                        Otherwise:
+                            Let c1 be Memory.memory_get_byte(data, i plus 1)
+                            If c1 is less than 128:
+                                Set ok to 0
+                                Set i to len
+                            Otherwise:
+                                If c1 is greater than or equal to 192:
+                                    Set ok to 0
+                                    Set i to len
+                                Otherwise:
+                                    Set i to i plus 2
+                                End If
+                            End If
+                        End If
+                    End If
+                Otherwise:
+                    If c is less than 240:
+                        Note: 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
+                        If (i plus 2) is greater than or equal to len:
+                            Set ok to 0
+                            Set i to len
+                        Otherwise:
+                            Let cc1 be Memory.memory_get_byte(data, i plus 1)
+                            Let cc2 be Memory.memory_get_byte(data, i plus 2)
+                            Let cc1_ok be 1
+                            If cc1 is less than 128:
+                                Set cc1_ok to 0
+                            End If
+                            If cc1 is greater than or equal to 192:
+                                Set cc1_ok to 0
+                            End If
+                            Let cc2_ok be 1
+                            If cc2 is less than 128:
+                                Set cc2_ok to 0
+                            End If
+                            If cc2 is greater than or equal to 192:
+                                Set cc2_ok to 0
+                            End If
+                            If cc1_ok is equal to 0:
+                                Set ok to 0
+                                Set i to len
+                            Otherwise:
+                                If cc2_ok is equal to 0:
+                                    Set ok to 0
+                                    Set i to len
+                                Otherwise:
+                                    Note: Overlong check for E0: second byte must be A0-BF
+                                    If c is equal to 224:
+                                        If cc1 is less than 160:
+                                            Set ok to 0
+                                            Set i to len
+                                        End If
+                                    End If
+                                    Note: Surrogate check for ED: second byte must be 80-9F
+                                    If c is equal to 237:
+                                        If cc1 is greater than or equal to 160:
+                                            Set ok to 0
+                                            Set i to len
+                                        End If
+                                    End If
+                                    If ok is equal to 1:
+                                        Set i to i plus 3
+                                    End If
+                                End If
+                            End If
+                        End If
+                    Otherwise:
+                        If c is greater than 244:
+                            Set ok to 0
+                            Set i to len
+                        Otherwise:
+                            Note: 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+                            If (i plus 3) is greater than or equal to len:
+                                Set ok to 0
+                                Set i to len
+                            Otherwise:
+                                Let d1 be Memory.memory_get_byte(data, i plus 1)
+                                Let d2 be Memory.memory_get_byte(data, i plus 2)
+                                Let d3 be Memory.memory_get_byte(data, i plus 3)
+                                Let dok be 1
+                                If d1 is less than 128:
+                                    Set dok to 0
+                                End If
+                                If d1 is greater than or equal to 192:
+                                    Set dok to 0
+                                End If
+                                If d2 is less than 128:
+                                    Set dok to 0
+                                End If
+                                If d2 is greater than or equal to 192:
+                                    Set dok to 0
+                                End If
+                                If d3 is less than 128:
+                                    Set dok to 0
+                                End If
+                                If d3 is greater than or equal to 192:
+                                    Set dok to 0
+                                End If
+                                If dok is equal to 0:
+                                    Set ok to 0
+                                    Set i to len
+                                Otherwise:
+                                    Note: Overlong: F0 needs 2nd byte 90-BF
+                                    If c is equal to 240:
+                                        If d1 is less than 144:
+                                            Set ok to 0
+                                            Set i to len
+                                        End If
+                                    End If
+                                    Note: Out-of-range: F4 needs 2nd byte 80-8F
+                                    If c is equal to 244:
+                                        If d1 is greater than or equal to 144:
+                                            Set ok to 0
+                                            Set i to len
+                                        End If
+                                    End If
+                                    If ok is equal to 1:
+                                        Set i to i plus 4
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    If ok is equal to 0:
+        Return 0
+    End If
+
+    Let out be allocate(len plus 1)
+    If out is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(out, data, len)
+    Memory.memory_set_byte(out, len, 0)
+    Return out
+End Process
+
+Note: ============================================================================
+Note: BYTE BUFFER (mutable, growable)
+Note: ============================================================================
+
+Process called "byte_buffer_create" takes initial_capacity as Integer returns Integer:
+    @Reasoning
+        Creates an empty ByteBuffer with the requested initial capacity.
+        Capacity of 0 falls back to BYTE_BUFFER_INITIAL_CAPACITY to avoid
+        immediate growth on first append.
+    @End Reasoning
+    @Implementation
+        Allocate header (32 bytes) and data buffer. Length starts at 0.
+    @End Implementation
+    @Performance_Hints
+        O(initial_capacity) for the allocation only.
+    @End Performance_Hints
+    @Security_Scope
+        Negative capacity returns 0.
+    @End Security_Scope
+
+    If initial_capacity is less than 0:
+        Return 0
+    End If
+    Let cap be initial_capacity
+    If cap is equal to 0:
+        Set cap to BYTE_BUFFER_INITIAL_CAPACITY
+    End If
+    Let header be allocate(BYTE_BUFFER_HEADER_SIZE)
+    If header is equal to 0:
+        Return 0
+    End If
+    Let data be allocate(cap)
+    If data is equal to 0:
+        deallocate(header)
+        Return 0
+    End If
+    Memory.memory_set_pointer(header, BUFFER_OFFSET_DATA, data)
+    Memory.memory_set_integer(header, BUFFER_OFFSET_LENGTH, 0)
+    Memory.memory_set_integer(header, BUFFER_OFFSET_CAPACITY, cap)
+    Memory.memory_set_integer(header, BUFFER_OFFSET_RESERVED, 0)
+    Return header
+End Process
+
+Process called "byte_buffer_destroy" takes buf as Integer returns Integer:
+    Note: Frees a ByteBuffer and its data.
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let data be Memory.memory_get_pointer(buf, BUFFER_OFFSET_DATA)
+    If data is not equal to 0:
+        deallocate(data)
+    End If
+    deallocate(buf)
+    Return 1
+End Process
+
+Process called "byte_buffer_length" takes buf as Integer returns Integer:
+    Note: Number of bytes currently stored.
+    If buf is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_integer(buf, BUFFER_OFFSET_LENGTH)
+End Process
+
+Process called "byte_buffer_capacity" takes buf as Integer returns Integer:
+    Note: Total allocated capacity.
+    If buf is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_integer(buf, BUFFER_OFFSET_CAPACITY)
+End Process
+
+Process called "byte_buffer_clear" takes buf as Integer returns Integer:
+    Note: Resets length to 0; retains allocated capacity for reuse.
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_integer(buf, BUFFER_OFFSET_LENGTH, 0)
+    Return 1
+End Process
+
+Process called "byte_buffer_internal_ensure" takes buf as Integer, needed as Integer returns Integer:
+    @Reasoning
+        Grows the underlying buffer if capacity < needed. Uses a 1.5x
+        growth factor (BYTE_BUFFER_GROWTH_NUMERATOR/DENOMINATOR) which is
+        Microsoft STL's choice for std::vector and balances amortized
+        cost vs. wasted memory better than the 2x doubling that Java's
+        ArrayList uses.
+    @End Reasoning
+    @Implementation
+        While capacity < needed: new_cap = max(cap * 3/2, needed).
+        Allocate new buffer, memcpy contents, free old.
+    @End Implementation
+    @Performance_Hints
+        Amortized O(1) per append. Each grow is O(n).
+    @End Performance_Hints
+    @Security_Scope
+        Returns 0 on allocation failure; old buffer remains valid in
+        that case.
+    @End Security_Scope
+
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let cap be Memory.memory_get_integer(buf, BUFFER_OFFSET_CAPACITY)
+    If cap is greater than or equal to needed:
+        Return 1
+    End If
+    Let new_cap be cap
+    While new_cap is less than needed:
+        Let grown be (new_cap multiplied by BYTE_BUFFER_GROWTH_NUMERATOR) divided by BYTE_BUFFER_GROWTH_DENOMINATOR
+        If grown is less than needed:
+            Set new_cap to needed
+        Otherwise:
+            Set new_cap to grown
+        End If
+    End While
+    Let new_data be allocate(new_cap)
+    If new_data is equal to 0:
+        Return 0
+    End If
+    Let old_data be Memory.memory_get_pointer(buf, BUFFER_OFFSET_DATA)
+    Let len be Memory.memory_get_integer(buf, BUFFER_OFFSET_LENGTH)
+    If len is greater than 0:
+        If old_data is not equal to 0:
+            Memory.memory_copy(new_data, old_data, len)
+        End If
+    End If
+    If old_data is not equal to 0:
+        deallocate(old_data)
+    End If
+    Memory.memory_set_pointer(buf, BUFFER_OFFSET_DATA, new_data)
+    Memory.memory_set_integer(buf, BUFFER_OFFSET_CAPACITY, new_cap)
+    Return 1
+End Process
+
+Process called "byte_buffer_append_byte" takes buf as Integer, byte_val as Integer returns Integer:
+    @Reasoning
+        Appends a single byte (only low 8 bits used).
+    @End Reasoning
+    @Implementation
+        Ensure capacity, store, increment length.
+    @End Implementation
+    @Performance_Hints
+        Amortized O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Buffer can grow; alloc failure returns 0 without mutating length.
+    @End Security_Scope
+
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let len be Memory.memory_get_integer(buf, BUFFER_OFFSET_LENGTH)
+    Let needed be len plus 1
+    Let ok be byte_buffer_internal_ensure(buf, needed)
+    If ok is equal to 0:
+        Return 0
+    End If
+    Let data be Memory.memory_get_pointer(buf, BUFFER_OFFSET_DATA)
+    Memory.memory_set_byte(data, len, byte_val)
+    Memory.memory_set_integer(buf, BUFFER_OFFSET_LENGTH, len plus 1)
+    Return 1
+End Process
+
+Process called "byte_buffer_append_bytes" takes buf as Integer, src as Integer returns Integer:
+    @Reasoning
+        Appends the contents of a Bytes object.
+    @End Reasoning
+    @Implementation
+        Ensure (len+src_len), memcpy, advance length.
+    @End Implementation
+    @Performance_Hints
+        Amortized O(n) for the copy.
+    @End Performance_Hints
+    @Security_Scope
+        NULL src is treated as zero-length (no-op).
+    @End Security_Scope
+
+    If buf is equal to 0:
+        Return 0
+    End If
+    If src is equal to 0:
+        Return 1
+    End If
+    Let src_len be Memory.memory_get_integer(src, BYTES_OFFSET_LENGTH)
+    If src_len is equal to 0:
+        Return 1
+    End If
+    Let cur_len be Memory.memory_get_integer(buf, BUFFER_OFFSET_LENGTH)
+    Let needed be cur_len plus src_len
+    Let ok be byte_buffer_internal_ensure(buf, needed)
+    If ok is equal to 0:
+        Return 0
+    End If
+    Let data be Memory.memory_get_pointer(buf, BUFFER_OFFSET_DATA)
+    Let src_data be Memory.memory_get_pointer(src, BYTES_OFFSET_DATA)
+    Let dst_ptr be data plus cur_len
+    Memory.memory_copy(dst_ptr, src_data, src_len)
+    Memory.memory_set_integer(buf, BUFFER_OFFSET_LENGTH, needed)
+    Return 1
+End Process
+
+Process called "byte_buffer_append_raw" takes buf as Integer, src_ptr as Integer, src_len as Integer returns Integer:
+    Note: Appends a raw byte buffer (not a Bytes header) of given length.
+    Note: Used by higher-level encoders that own their data directly.
+    If buf is equal to 0:
+        Return 0
+    End If
+    If src_len is less than 0:
+        Return 0
+    End If
+    If src_len is equal to 0:
+        Return 1
+    End If
+    If src_ptr is equal to 0:
+        Return 0
+    End If
+    Let cur_len be Memory.memory_get_integer(buf, BUFFER_OFFSET_LENGTH)
+    Let needed be cur_len plus src_len
+    Let ok be byte_buffer_internal_ensure(buf, needed)
+    If ok is equal to 0:
+        Return 0
+    End If
+    Let data be Memory.memory_get_pointer(buf, BUFFER_OFFSET_DATA)
+    Let dst_ptr be data plus cur_len
+    Memory.memory_copy(dst_ptr, src_ptr, src_len)
+    Memory.memory_set_integer(buf, BUFFER_OFFSET_LENGTH, needed)
+    Return 1
+End Process
+
+Process called "byte_buffer_append_u16_le" takes buf as Integer, value as Integer returns Integer:
+    Note: Little-endian 16-bit append. Used for x86/ARM little-endian protocols.
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let lo be value bitwise and 255
+    Let hi be (value divided by 256) bitwise and 255
+    Let ok1 be byte_buffer_append_byte(buf, lo)
+    If ok1 is equal to 0:
+        Return 0
+    End If
+    Return byte_buffer_append_byte(buf, hi)
+End Process
+
+Process called "byte_buffer_append_u16_be" takes buf as Integer, value as Integer returns Integer:
+    Note: Big-endian 16-bit append. Used for network byte order (TCP/IP).
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let lo be value bitwise and 255
+    Let hi be (value divided by 256) bitwise and 255
+    Let ok1 be byte_buffer_append_byte(buf, hi)
+    If ok1 is equal to 0:
+        Return 0
+    End If
+    Return byte_buffer_append_byte(buf, lo)
+End Process
+
+Process called "byte_buffer_append_u32_le" takes buf as Integer, value as Integer returns Integer:
+    Note: Little-endian 32-bit append.
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let b0 be value bitwise and 255
+    Let b1 be (value divided by 256) bitwise and 255
+    Let b2 be (value divided by 65536) bitwise and 255
+    Let b3 be (value divided by 16777216) bitwise and 255
+    Let ok be byte_buffer_append_byte(buf, b0)
+    If ok is equal to 0:
+        Return 0
+    End If
+    Set ok to byte_buffer_append_byte(buf, b1)
+    If ok is equal to 0:
+        Return 0
+    End If
+    Set ok to byte_buffer_append_byte(buf, b2)
+    If ok is equal to 0:
+        Return 0
+    End If
+    Return byte_buffer_append_byte(buf, b3)
+End Process
+
+Process called "byte_buffer_append_u32_be" takes buf as Integer, value as Integer returns Integer:
+    Note: Big-endian 32-bit append (network byte order).
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let b0 be value bitwise and 255
+    Let b1 be (value divided by 256) bitwise and 255
+    Let b2 be (value divided by 65536) bitwise and 255
+    Let b3 be (value divided by 16777216) bitwise and 255
+    Let ok be byte_buffer_append_byte(buf, b3)
+    If ok is equal to 0:
+        Return 0
+    End If
+    Set ok to byte_buffer_append_byte(buf, b2)
+    If ok is equal to 0:
+        Return 0
+    End If
+    Set ok to byte_buffer_append_byte(buf, b1)
+    If ok is equal to 0:
+        Return 0
+    End If
+    Return byte_buffer_append_byte(buf, b0)
+End Process
+
+Process called "byte_buffer_append_u64_le" takes buf as Integer, value as Integer returns Integer:
+    Note: Little-endian 64-bit append.
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let v be value
+    Let i be 0
+    While i is less than 8:
+        Let b_low be v bitwise and 255
+        Let ok be byte_buffer_append_byte(buf, b_low)
+        If ok is equal to 0:
+            Return 0
+        End If
+        Set v to v divided by 256
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "byte_buffer_append_u64_be" takes buf as Integer, value as Integer returns Integer:
+    Note: Big-endian 64-bit append (network byte order).
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let bytes_arr be allocate(8)
+    If bytes_arr is equal to 0:
+        Return 0
+    End If
+    Let v be value
+    Let i be 0
+    While i is less than 8:
+        Let b_low be v bitwise and 255
+        Memory.memory_set_byte(bytes_arr, 7 minus i, b_low)
+        Set v to v divided by 256
+        Set i to i plus 1
+    End While
+    Let ok be byte_buffer_append_raw(buf, bytes_arr, 8)
+    deallocate(bytes_arr)
+    Return ok
+End Process
+
+Process called "byte_buffer_to_bytes" takes buf as Integer returns Integer:
+    @Reasoning
+        Freezes the current ByteBuffer contents into an immutable Bytes.
+        Allocates a new buffer sized exactly to the current length
+        (caller-friendly: avoids slack from amortized growth).
+    @End Reasoning
+    @Implementation
+        Allocate exact-size data, memcpy from buffer, build Bytes header
+        with owns_data=1.
+    @End Implementation
+    @Performance_Hints
+        O(n) copy. The original ByteBuffer remains usable; this is a
+        snapshot, not a move.
+    @End Performance_Hints
+    @Security_Scope
+        Snapshot semantics; subsequent buffer mutations do not affect
+        the returned Bytes.
+    @End Security_Scope
+
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let len be Memory.memory_get_integer(buf, BUFFER_OFFSET_LENGTH)
+    If len is equal to 0:
+        Return bytes_create(0, 0)
+    End If
+    Let src be Memory.memory_get_pointer(buf, BUFFER_OFFSET_DATA)
+    Return bytes_from_array(src, len)
+End Process
+
+Process called "byte_buffer_data" takes buf as Integer returns Integer:
+    Note: Borrowed raw data pointer for in-place reads. Do NOT mutate
+    Note: beyond current length without first calling ensure.
+    If buf is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(buf, BUFFER_OFFSET_DATA)
+End Process
+
+Process called "byte_buffer_at" takes buf as Integer, index as Integer returns Integer:
+    Note: Bounds-checked byte read. Returns -1 on out-of-range.
+    If buf is equal to 0:
+        Return -1
+    End If
+    Let len be Memory.memory_get_integer(buf, BUFFER_OFFSET_LENGTH)
+    If index is less than 0:
+        Return -1
+    End If
+    If index is greater than or equal to len:
+        Return -1
+    End If
+    Let data be Memory.memory_get_pointer(buf, BUFFER_OFFSET_DATA)
+    Return Memory.memory_get_byte(data, index)
+End Process
+
+Process called "byte_buffer_set_at" takes buf as Integer, index as Integer, byte_val as Integer returns Integer:
+    Note: Bounds-checked byte write within current length.
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let len be Memory.memory_get_integer(buf, BUFFER_OFFSET_LENGTH)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to len:
+        Return 0
+    End If
+    Let data be Memory.memory_get_pointer(buf, BUFFER_OFFSET_DATA)
+    Memory.memory_set_byte(data, index, byte_val)
+    Return 1
+End Process

@@ -1,0 +1,919 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+RED-BLACK TREE - Self-Balancing Binary Search Tree Tier 0 Primitive
+
+This file implements a left-leaning-allowed red-black tree with O(log n)
+insert, delete, search, min, max, successor, predecessor.
+
+Invariants (Cormen / classic Red-Black):
+1) Every node is RED (0) or BLACK (1).
+2) The root is BLACK.
+3) Every leaf (NIL sentinel) is BLACK.
+4) If a node is RED, both children are BLACK.
+5) For every node, all paths from it to descendant NILs contain the same
+   number of BLACK nodes ("black height").
+
+Node structure (56 bytes):
+  offset 0:  key (8 bytes)
+  offset 8:  value (8 bytes)
+  offset 16: left child pointer (8 bytes)
+  offset 24: right child pointer (8 bytes)
+  offset 32: parent pointer (8 bytes)
+  offset 40: color (8 bytes; 0 = RED, 1 = BLACK)
+  offset 48: padding to 56 (preserves 8-byte slot alignment)
+
+Tree structure (24 bytes):
+  offset 0:  root pointer (NIL sentinel if empty)
+  offset 8:  size
+  offset 16: nil sentinel pointer (single shared BLACK NIL node)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let RB_NODE_SIZE be 56
+Let RB_HEADER_SIZE be 24
+Let RB_KEY_OFFSET be 0
+Let RB_VALUE_OFFSET be 8
+Let RB_LEFT_OFFSET be 16
+Let RB_RIGHT_OFFSET be 24
+Let RB_PARENT_OFFSET be 32
+Let RB_COLOR_OFFSET be 40
+Let RB_COLOR_RED be 0
+Let RB_COLOR_BLACK be 1
+
+Note: ============================================================================
+Note: NODE PRIMITIVES
+Note: ============================================================================
+
+@Reasoning
+Allocate a new RB node with key/value/parent/children set as supplied
+and color RED. All inserts start as RED so we never violate the
+"equal black height" invariant on insertion; the fix-up loop then
+restores the no-two-reds-in-a-row invariant.
+@End Reasoning
+
+@Implementation
+56-byte allocation, fields set per layout, color = RED.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: 56 bytes per node.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "rb_node_create" takes key as Integer, value as Integer, nil_node as Integer returns Integer:
+    Let node be proc allocate from Layout with RB_NODE_SIZE
+    If node is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with node, RB_KEY_OFFSET, key
+    proc memory_set_int64 from Memory with node, RB_VALUE_OFFSET, value
+    proc memory_set_int64 from Memory with node, RB_LEFT_OFFSET, nil_node
+    proc memory_set_int64 from Memory with node, RB_RIGHT_OFFSET, nil_node
+    proc memory_set_int64 from Memory with node, RB_PARENT_OFFSET, nil_node
+    proc memory_set_int64 from Memory with node, RB_COLOR_OFFSET, RB_COLOR_RED
+    Return node
+End Process
+
+Note: ============================================================================
+Note: TREE CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Create an empty tree. Allocates a single NIL sentinel that all leaf
+pointers and the root-of-empty-tree share, simplifying the fix-up
+loops by removing a null-check at every recursion step.
+@End Reasoning
+
+@Implementation
+1) Allocate header (24 bytes).
+2) Allocate nil sentinel (56 bytes), color = BLACK, key/value = 0,
+   children/parent pointing back at itself (cycle by design - that
+   makes the fix-up loops safe even if they walk through the NIL).
+3) Set tree.root = nil, size = 0, tree.nil = nil.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: 80 bytes (header + NIL).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure of either piece.
+@End Security_Scope
+Process called "rb_tree_create" returns Integer:
+    Let tree be proc allocate from Layout with RB_HEADER_SIZE
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let nil_node be proc allocate from Layout with RB_NODE_SIZE
+    If nil_node is equal to 0:
+        proc deallocate from Layout with tree
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with nil_node, RB_KEY_OFFSET, 0
+    proc memory_set_int64 from Memory with nil_node, RB_VALUE_OFFSET, 0
+    proc memory_set_int64 from Memory with nil_node, RB_LEFT_OFFSET, nil_node
+    proc memory_set_int64 from Memory with nil_node, RB_RIGHT_OFFSET, nil_node
+    proc memory_set_int64 from Memory with nil_node, RB_PARENT_OFFSET, nil_node
+    proc memory_set_int64 from Memory with nil_node, RB_COLOR_OFFSET, RB_COLOR_BLACK
+    proc memory_set_int64 from Memory with tree, 0, nil_node
+    proc memory_set_int64 from Memory with tree, 8, 0
+    proc memory_set_int64 from Memory with tree, 16, nil_node
+    Return tree
+End Process
+
+@Reasoning
+Free all real nodes plus the NIL sentinel and the header.
+@End Reasoning
+
+@Implementation
+Iterative postorder via a hand-rolled work stack of node pointers
+allocated as a flat dynamic array. We use a fixed initial capacity of
+64 entries and grow geometrically; this avoids depending on the Stack
+primitive in case that module is being audited concurrently.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(h).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "rb_tree_destroy" takes tree as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let root be proc memory_get_int64 from Memory with tree, 0
+    Let cap be 64
+    Let buf_bytes be cap multiplied by 8
+    Let buf be proc allocate from Layout with buf_bytes
+    If buf is equal to 0:
+        proc deallocate from Layout with nil_node
+        proc deallocate from Layout with tree
+        Return 0
+    End If
+    Let sp be 0
+    If root is not equal to nil_node:
+        proc memory_set_int64 from Memory with buf, 0, root
+        Set sp to 1
+    End If
+    While sp is greater than 0:
+        Set sp to sp minus 1
+        Let off be sp multiplied by 8
+        Let node be proc memory_get_int64 from Memory with buf, off
+        Let left be proc memory_get_int64 from Memory with node, RB_LEFT_OFFSET
+        Let right be proc memory_get_int64 from Memory with node, RB_RIGHT_OFFSET
+        Let need be sp plus 2
+        If need is greater than cap:
+            Let new_cap be cap multiplied by 2
+            Let new_bytes be new_cap multiplied by 8
+            Let new_buf be proc allocate from Layout with new_bytes
+            If new_buf is equal to 0:
+                proc deallocate from Layout with buf
+                proc deallocate from Layout with nil_node
+                proc deallocate from Layout with tree
+                Return 0
+            End If
+            Let copy_bytes be cap multiplied by 8
+            proc memory_copy from Memory with new_buf, buf, copy_bytes
+            proc deallocate from Layout with buf
+            Set buf to new_buf
+            Set cap to new_cap
+        End If
+        If left is not equal to nil_node:
+            Let l_off be sp multiplied by 8
+            proc memory_set_int64 from Memory with buf, l_off, left
+            Set sp to sp plus 1
+        End If
+        If right is not equal to nil_node:
+            Let r_off be sp multiplied by 8
+            proc memory_set_int64 from Memory with buf, r_off, right
+            Set sp to sp plus 1
+        End If
+        proc deallocate from Layout with node
+    End While
+    proc deallocate from Layout with buf
+    proc deallocate from Layout with nil_node
+    proc deallocate from Layout with tree
+    Return 1
+End Process
+
+@Reasoning
+Element count.
+@End Reasoning
+
+@Implementation
+Read size field.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "rb_tree_size" takes tree as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with tree, 8
+End Process
+
+Note: ============================================================================
+Note: ROTATIONS
+Note: ============================================================================
+
+@Reasoning
+Left-rotate around node x: x's right child y takes x's position; x
+becomes y's left child; y's old left subtree becomes x's new right
+subtree. Used in the insertion and deletion fix-up loops to rebalance.
+@End Reasoning
+
+@Implementation
+y = x.right
+x.right = y.left
+if y.left != nil: y.left.parent = x
+y.parent = x.parent
+if x.parent == nil: tree.root = y
+elif x == x.parent.left: x.parent.left = y
+else: x.parent.right = y
+y.left = x
+x.parent = y
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper. Caller guarantees x has a non-nil right child.
+@End Security_Scope
+Process called "rb_left_rotate" takes tree as Integer, x as Integer returns Integer:
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let y be proc memory_get_int64 from Memory with x, RB_RIGHT_OFFSET
+    Let y_left be proc memory_get_int64 from Memory with y, RB_LEFT_OFFSET
+    proc memory_set_int64 from Memory with x, RB_RIGHT_OFFSET, y_left
+    If y_left is not equal to nil_node:
+        proc memory_set_int64 from Memory with y_left, RB_PARENT_OFFSET, x
+    End If
+    Let x_parent be proc memory_get_int64 from Memory with x, RB_PARENT_OFFSET
+    proc memory_set_int64 from Memory with y, RB_PARENT_OFFSET, x_parent
+    If x_parent is equal to nil_node:
+        proc memory_set_int64 from Memory with tree, 0, y
+    Otherwise:
+        Let xp_left be proc memory_get_int64 from Memory with x_parent, RB_LEFT_OFFSET
+        If x is equal to xp_left:
+            proc memory_set_int64 from Memory with x_parent, RB_LEFT_OFFSET, y
+        Otherwise:
+            proc memory_set_int64 from Memory with x_parent, RB_RIGHT_OFFSET, y
+        End If
+    End If
+    proc memory_set_int64 from Memory with y, RB_LEFT_OFFSET, x
+    proc memory_set_int64 from Memory with x, RB_PARENT_OFFSET, y
+    Return 1
+End Process
+
+@Reasoning
+Right-rotate around node y: y's left child x takes y's position; y
+becomes x's right child; x's old right subtree becomes y's new left
+subtree. Mirror of left-rotate.
+@End Reasoning
+
+@Implementation
+Mirror of rb_left_rotate.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper. Caller guarantees y has a non-nil left child.
+@End Security_Scope
+Process called "rb_right_rotate" takes tree as Integer, y as Integer returns Integer:
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let x be proc memory_get_int64 from Memory with y, RB_LEFT_OFFSET
+    Let x_right be proc memory_get_int64 from Memory with x, RB_RIGHT_OFFSET
+    proc memory_set_int64 from Memory with y, RB_LEFT_OFFSET, x_right
+    If x_right is not equal to nil_node:
+        proc memory_set_int64 from Memory with x_right, RB_PARENT_OFFSET, y
+    End If
+    Let y_parent be proc memory_get_int64 from Memory with y, RB_PARENT_OFFSET
+    proc memory_set_int64 from Memory with x, RB_PARENT_OFFSET, y_parent
+    If y_parent is equal to nil_node:
+        proc memory_set_int64 from Memory with tree, 0, x
+    Otherwise:
+        Let yp_right be proc memory_get_int64 from Memory with y_parent, RB_RIGHT_OFFSET
+        If y is equal to yp_right:
+            proc memory_set_int64 from Memory with y_parent, RB_RIGHT_OFFSET, x
+        Otherwise:
+            proc memory_set_int64 from Memory with y_parent, RB_LEFT_OFFSET, x
+        End If
+    End If
+    proc memory_set_int64 from Memory with x, RB_RIGHT_OFFSET, y
+    proc memory_set_int64 from Memory with y, RB_PARENT_OFFSET, x
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: INSERT + FIXUP
+Note: ============================================================================
+
+@Reasoning
+Insertion fixup: walk up from the newly-inserted RED node z restoring
+the no-two-reds invariant. The case analysis follows the standard
+"uncle-color" CLRS dichotomy:
+- If uncle is RED: recolor (parent and uncle BLACK, grandparent RED),
+  then move z to grandparent and continue.
+- If uncle is BLACK and z is the "inner" child (zigzag): rotate to
+  straighten.
+- If uncle is BLACK and z is the "outer" child (zigzag): recolor and
+  rotate around grandparent to push the violation away.
+The loop terminates when the parent is BLACK or z becomes the root.
+@End Reasoning
+
+@Implementation
+Iterative left/right mirror cases. Final step paints the root BLACK.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n) amortized; the worst-case full walk is bounded by the
+tree height which is O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "rb_insert_fixup" takes tree as Integer, z as Integer returns Integer:
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let z_parent be proc memory_get_int64 from Memory with z, RB_PARENT_OFFSET
+    Let parent_color be proc memory_get_int64 from Memory with z_parent, RB_COLOR_OFFSET
+    While parent_color is equal to RB_COLOR_RED:
+        Let zp be proc memory_get_int64 from Memory with z, RB_PARENT_OFFSET
+        Let zpp be proc memory_get_int64 from Memory with zp, RB_PARENT_OFFSET
+        Let zpp_left be proc memory_get_int64 from Memory with zpp, RB_LEFT_OFFSET
+        If zp is equal to zpp_left:
+            Let uncle be proc memory_get_int64 from Memory with zpp, RB_RIGHT_OFFSET
+            Let uncle_color be proc memory_get_int64 from Memory with uncle, RB_COLOR_OFFSET
+            If uncle_color is equal to RB_COLOR_RED:
+                proc memory_set_int64 from Memory with zp, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc memory_set_int64 from Memory with uncle, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc memory_set_int64 from Memory with zpp, RB_COLOR_OFFSET, RB_COLOR_RED
+                Set z to zpp
+            Otherwise:
+                Let zp_right be proc memory_get_int64 from Memory with zp, RB_RIGHT_OFFSET
+                If z is equal to zp_right:
+                    Set z to zp
+                    proc rb_left_rotate with tree, z
+                End If
+                Let new_zp be proc memory_get_int64 from Memory with z, RB_PARENT_OFFSET
+                Let new_zpp be proc memory_get_int64 from Memory with new_zp, RB_PARENT_OFFSET
+                proc memory_set_int64 from Memory with new_zp, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc memory_set_int64 from Memory with new_zpp, RB_COLOR_OFFSET, RB_COLOR_RED
+                proc rb_right_rotate with tree, new_zpp
+            End If
+        Otherwise:
+            Let uncle be proc memory_get_int64 from Memory with zpp, RB_LEFT_OFFSET
+            Let uncle_color be proc memory_get_int64 from Memory with uncle, RB_COLOR_OFFSET
+            If uncle_color is equal to RB_COLOR_RED:
+                proc memory_set_int64 from Memory with zp, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc memory_set_int64 from Memory with uncle, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc memory_set_int64 from Memory with zpp, RB_COLOR_OFFSET, RB_COLOR_RED
+                Set z to zpp
+            Otherwise:
+                Let zp_left be proc memory_get_int64 from Memory with zp, RB_LEFT_OFFSET
+                If z is equal to zp_left:
+                    Set z to zp
+                    proc rb_right_rotate with tree, z
+                End If
+                Let new_zp be proc memory_get_int64 from Memory with z, RB_PARENT_OFFSET
+                Let new_zpp be proc memory_get_int64 from Memory with new_zp, RB_PARENT_OFFSET
+                proc memory_set_int64 from Memory with new_zp, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc memory_set_int64 from Memory with new_zpp, RB_COLOR_OFFSET, RB_COLOR_RED
+                proc rb_left_rotate with tree, new_zpp
+            End If
+        End If
+        Let new_z_parent be proc memory_get_int64 from Memory with z, RB_PARENT_OFFSET
+        Set parent_color to proc memory_get_int64 from Memory with new_z_parent, RB_COLOR_OFFSET
+    End While
+    Let root be proc memory_get_int64 from Memory with tree, 0
+    proc memory_set_int64 from Memory with root, RB_COLOR_OFFSET, RB_COLOR_BLACK
+    Return 1
+End Process
+
+@Reasoning
+Public insert: find the right BST position, link in a new RED node,
+then run the fixup. Duplicate keys are allowed; equal keys descend
+left as a stable tiebreak.
+@End Reasoning
+
+@Implementation
+Standard BST descent with nil-sentinel checks; allocate node when the
+chosen child slot is nil; call fixup.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "rb_tree_insert" takes tree as Integer, key as Integer, value as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let z be proc rb_node_create with key, value, nil_node
+    If z is equal to 0:
+        Return 0
+    End If
+    Let y be nil_node
+    Let x be proc memory_get_int64 from Memory with tree, 0
+    While x is not equal to nil_node:
+        Set y to x
+        Let x_key be proc memory_get_int64 from Memory with x, RB_KEY_OFFSET
+        If key is less than or equal to x_key:
+            Set x to proc memory_get_int64 from Memory with x, RB_LEFT_OFFSET
+        Otherwise:
+            Set x to proc memory_get_int64 from Memory with x, RB_RIGHT_OFFSET
+        End If
+    End While
+    proc memory_set_int64 from Memory with z, RB_PARENT_OFFSET, y
+    If y is equal to nil_node:
+        proc memory_set_int64 from Memory with tree, 0, z
+    Otherwise:
+        Let y_key be proc memory_get_int64 from Memory with y, RB_KEY_OFFSET
+        If key is less than or equal to y_key:
+            proc memory_set_int64 from Memory with y, RB_LEFT_OFFSET, z
+        Otherwise:
+            proc memory_set_int64 from Memory with y, RB_RIGHT_OFFSET, z
+        End If
+    End If
+    proc rb_insert_fixup with tree, z
+    Let size be proc memory_get_int64 from Memory with tree, 8
+    proc memory_set_int64 from Memory with tree, 8, size plus 1
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SEARCH / MIN / MAX
+Note: ============================================================================
+
+@Reasoning
+Standard BST search by key. Returns the value, or 0 if not found.
+@End Reasoning
+
+@Implementation
+Walk from root through left/right based on key comparison; nil exit
+returns 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "rb_tree_search" takes tree as Integer, key as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let cur be proc memory_get_int64 from Memory with tree, 0
+    While cur is not equal to nil_node:
+        Let cv be proc memory_get_int64 from Memory with cur, RB_KEY_OFFSET
+        If key is equal to cv:
+            Return proc memory_get_int64 from Memory with cur, RB_VALUE_OFFSET
+        End If
+        If key is less than cv:
+            Set cur to proc memory_get_int64 from Memory with cur, RB_LEFT_OFFSET
+        Otherwise:
+            Set cur to proc memory_get_int64 from Memory with cur, RB_RIGHT_OFFSET
+        End If
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Containment predicate distinct from search to disambiguate "found but
+value is 0" from "absent". Returns 1 if present, 0 otherwise.
+@End Reasoning
+
+@Implementation
+Same descent as search but returns 1 on the match branch instead of
+the value field.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "rb_tree_contains" takes tree as Integer, key as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let cur be proc memory_get_int64 from Memory with tree, 0
+    While cur is not equal to nil_node:
+        Let cv be proc memory_get_int64 from Memory with cur, RB_KEY_OFFSET
+        If key is equal to cv:
+            Return 1
+        End If
+        If key is less than cv:
+            Set cur to proc memory_get_int64 from Memory with cur, RB_LEFT_OFFSET
+        Otherwise:
+            Set cur to proc memory_get_int64 from Memory with cur, RB_RIGHT_OFFSET
+        End If
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Minimum and maximum key lookups walk left or right from root.
+@End Reasoning
+
+@Implementation
+Walk through left children to minimum; right children to maximum.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "rb_tree_min" takes tree as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let cur be proc memory_get_int64 from Memory with tree, 0
+    If cur is equal to nil_node:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        Let left be proc memory_get_int64 from Memory with cur, RB_LEFT_OFFSET
+        If left is equal to nil_node:
+            Return proc memory_get_int64 from Memory with cur, RB_KEY_OFFSET
+        End If
+        Set cur to left
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Walk right children for the maximum key.
+@End Reasoning
+
+@Implementation
+Mirror of rb_tree_min.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "rb_tree_max" takes tree as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let cur be proc memory_get_int64 from Memory with tree, 0
+    If cur is equal to nil_node:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        Let right be proc memory_get_int64 from Memory with cur, RB_RIGHT_OFFSET
+        If right is equal to nil_node:
+            Return proc memory_get_int64 from Memory with cur, RB_KEY_OFFSET
+        End If
+        Set cur to right
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: DELETE + FIXUP
+Note: ============================================================================
+
+@Reasoning
+RB transplant helper: replace subtree rooted at u with subtree rooted
+at v in the parent's child slot. Required by rb_tree_delete.
+@End Reasoning
+
+@Implementation
+1) If u.parent == nil, tree.root = v.
+2) Else if u == u.parent.left, u.parent.left = v.
+3) Else u.parent.right = v.
+4) v.parent = u.parent (even if v is nil - the nil sentinel's parent
+   slot is used by the deletion fix-up).
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "rb_transplant" takes tree as Integer, u as Integer, v as Integer returns Integer:
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let u_parent be proc memory_get_int64 from Memory with u, RB_PARENT_OFFSET
+    If u_parent is equal to nil_node:
+        proc memory_set_int64 from Memory with tree, 0, v
+    Otherwise:
+        Let up_left be proc memory_get_int64 from Memory with u_parent, RB_LEFT_OFFSET
+        If u is equal to up_left:
+            proc memory_set_int64 from Memory with u_parent, RB_LEFT_OFFSET, v
+        Otherwise:
+            proc memory_set_int64 from Memory with u_parent, RB_RIGHT_OFFSET, v
+        End If
+    End If
+    proc memory_set_int64 from Memory with v, RB_PARENT_OFFSET, u_parent
+    Return 1
+End Process
+
+@Reasoning
+Deletion fix-up: restore the "equal black height" invariant after a
+black node was spliced out. The case analysis follows CLRS with the
+left/right mirror.
+@End Reasoning
+
+@Implementation
+While x is not the root and x is BLACK:
+  Let w = sibling of x.
+  Case 1 - sibling RED: recolor and rotate so sibling becomes BLACK.
+  Case 2 - sibling BLACK with both children BLACK: paint sibling RED,
+           move x up.
+  Case 3 - sibling BLACK, near nephew RED, far nephew BLACK: rotate
+           sibling, recolor, fall into case 4.
+  Case 4 - sibling BLACK, far nephew RED: rotate parent, recolor, x =
+           root (terminates loop).
+Finally paint x BLACK to absorb any extra black token.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "rb_delete_fixup" takes tree as Integer, x as Integer returns Integer:
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    While 1 is equal to 1:
+        Let root be proc memory_get_int64 from Memory with tree, 0
+        If x is equal to root:
+            proc memory_set_int64 from Memory with x, RB_COLOR_OFFSET, RB_COLOR_BLACK
+            Return 1
+        End If
+        Let x_color be proc memory_get_int64 from Memory with x, RB_COLOR_OFFSET
+        If x_color is not equal to RB_COLOR_BLACK:
+            proc memory_set_int64 from Memory with x, RB_COLOR_OFFSET, RB_COLOR_BLACK
+            Return 1
+        End If
+        Let xp be proc memory_get_int64 from Memory with x, RB_PARENT_OFFSET
+        Let xp_left be proc memory_get_int64 from Memory with xp, RB_LEFT_OFFSET
+        If x is equal to xp_left:
+            Let w be proc memory_get_int64 from Memory with xp, RB_RIGHT_OFFSET
+            Let w_color be proc memory_get_int64 from Memory with w, RB_COLOR_OFFSET
+            If w_color is equal to RB_COLOR_RED:
+                proc memory_set_int64 from Memory with w, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc memory_set_int64 from Memory with xp, RB_COLOR_OFFSET, RB_COLOR_RED
+                proc rb_left_rotate with tree, xp
+                Set w to proc memory_get_int64 from Memory with xp, RB_RIGHT_OFFSET
+            End If
+            Let wl be proc memory_get_int64 from Memory with w, RB_LEFT_OFFSET
+            Let wr be proc memory_get_int64 from Memory with w, RB_RIGHT_OFFSET
+            Let wl_color be proc memory_get_int64 from Memory with wl, RB_COLOR_OFFSET
+            Let wr_color be proc memory_get_int64 from Memory with wr, RB_COLOR_OFFSET
+            If wl_color is equal to RB_COLOR_BLACK:
+                If wr_color is equal to RB_COLOR_BLACK:
+                    proc memory_set_int64 from Memory with w, RB_COLOR_OFFSET, RB_COLOR_RED
+                    Set x to xp
+                Otherwise:
+                    proc memory_set_int64 from Memory with w, RB_COLOR_OFFSET, proc memory_get_int64 from Memory with xp, RB_COLOR_OFFSET
+                    proc memory_set_int64 from Memory with xp, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                    proc memory_set_int64 from Memory with wr, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                    proc rb_left_rotate with tree, xp
+                    Set x to proc memory_get_int64 from Memory with tree, 0
+                End If
+            Otherwise:
+                If wr_color is equal to RB_COLOR_BLACK:
+                    proc memory_set_int64 from Memory with wl, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                    proc memory_set_int64 from Memory with w, RB_COLOR_OFFSET, RB_COLOR_RED
+                    proc rb_right_rotate with tree, w
+                    Set w to proc memory_get_int64 from Memory with xp, RB_RIGHT_OFFSET
+                    Set wr to proc memory_get_int64 from Memory with w, RB_RIGHT_OFFSET
+                End If
+                proc memory_set_int64 from Memory with w, RB_COLOR_OFFSET, proc memory_get_int64 from Memory with xp, RB_COLOR_OFFSET
+                proc memory_set_int64 from Memory with xp, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc memory_set_int64 from Memory with wr, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc rb_left_rotate with tree, xp
+                Set x to proc memory_get_int64 from Memory with tree, 0
+            End If
+        Otherwise:
+            Let w be proc memory_get_int64 from Memory with xp, RB_LEFT_OFFSET
+            Let w_color be proc memory_get_int64 from Memory with w, RB_COLOR_OFFSET
+            If w_color is equal to RB_COLOR_RED:
+                proc memory_set_int64 from Memory with w, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc memory_set_int64 from Memory with xp, RB_COLOR_OFFSET, RB_COLOR_RED
+                proc rb_right_rotate with tree, xp
+                Set w to proc memory_get_int64 from Memory with xp, RB_LEFT_OFFSET
+            End If
+            Let wl be proc memory_get_int64 from Memory with w, RB_LEFT_OFFSET
+            Let wr be proc memory_get_int64 from Memory with w, RB_RIGHT_OFFSET
+            Let wl_color be proc memory_get_int64 from Memory with wl, RB_COLOR_OFFSET
+            Let wr_color be proc memory_get_int64 from Memory with wr, RB_COLOR_OFFSET
+            If wr_color is equal to RB_COLOR_BLACK:
+                If wl_color is equal to RB_COLOR_BLACK:
+                    proc memory_set_int64 from Memory with w, RB_COLOR_OFFSET, RB_COLOR_RED
+                    Set x to xp
+                Otherwise:
+                    proc memory_set_int64 from Memory with w, RB_COLOR_OFFSET, proc memory_get_int64 from Memory with xp, RB_COLOR_OFFSET
+                    proc memory_set_int64 from Memory with xp, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                    proc memory_set_int64 from Memory with wl, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                    proc rb_right_rotate with tree, xp
+                    Set x to proc memory_get_int64 from Memory with tree, 0
+                End If
+            Otherwise:
+                If wl_color is equal to RB_COLOR_BLACK:
+                    proc memory_set_int64 from Memory with wr, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                    proc memory_set_int64 from Memory with w, RB_COLOR_OFFSET, RB_COLOR_RED
+                    proc rb_left_rotate with tree, w
+                    Set w to proc memory_get_int64 from Memory with xp, RB_LEFT_OFFSET
+                    Set wl to proc memory_get_int64 from Memory with w, RB_LEFT_OFFSET
+                End If
+                proc memory_set_int64 from Memory with w, RB_COLOR_OFFSET, proc memory_get_int64 from Memory with xp, RB_COLOR_OFFSET
+                proc memory_set_int64 from Memory with xp, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc memory_set_int64 from Memory with wl, RB_COLOR_OFFSET, RB_COLOR_BLACK
+                proc rb_right_rotate with tree, xp
+                Set x to proc memory_get_int64 from Memory with tree, 0
+            End If
+        End If
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Delete the node with the given key. Standard CLRS: find z, splice out
+either z or its in-order successor depending on whether z has two
+children. Run fix-up if a BLACK node was removed.
+@End Reasoning
+
+@Implementation
+1) Find z by key. If not found, return 0.
+2) Save y_original_color = y.color where y is the node actually
+   spliced out (z itself if z has at most one child, otherwise z's
+   successor).
+3) If z has at most one non-nil child, transplant that child for z.
+4) Else: y = subtree-min of z.right. If y's parent is z, just set
+   x.parent = y; else transplant y with y.right, attach z.right under y.
+   Then transplant z with y, attach z.left under y, copy z.color into y.
+5) Free z, decrement size.
+6) If y_original_color was BLACK, run rb_delete_fixup on x.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if key not found.
+@End Security_Scope
+Process called "rb_tree_delete" takes tree as Integer, key as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let z be proc memory_get_int64 from Memory with tree, 0
+    While z is not equal to nil_node:
+        Let zk be proc memory_get_int64 from Memory with z, RB_KEY_OFFSET
+        If key is equal to zk:
+            Note: found
+            Let y be z
+            Let y_original_color be proc memory_get_int64 from Memory with y, RB_COLOR_OFFSET
+            Let x be nil_node
+            Let z_left be proc memory_get_int64 from Memory with z, RB_LEFT_OFFSET
+            Let z_right be proc memory_get_int64 from Memory with z, RB_RIGHT_OFFSET
+            If z_left is equal to nil_node:
+                Set x to z_right
+                proc rb_transplant with tree, z, z_right
+            Otherwise:
+                If z_right is equal to nil_node:
+                    Set x to z_left
+                    proc rb_transplant with tree, z, z_left
+                Otherwise:
+                    Note: y = subtree-min of z.right
+                    Let m be z_right
+                    While 1 is equal to 1:
+                        Let m_left be proc memory_get_int64 from Memory with m, RB_LEFT_OFFSET
+                        If m_left is equal to nil_node:
+                            Return 0 plus proc rb_delete_with_successor with tree, z, m, x
+                        End If
+                        Set m to m_left
+                    End While
+                End If
+            End If
+            proc deallocate from Layout with z
+            Let size be proc memory_get_int64 from Memory with tree, 8
+            proc memory_set_int64 from Memory with tree, 8, size minus 1
+            If y_original_color is equal to RB_COLOR_BLACK:
+                proc rb_delete_fixup with tree, x
+            End If
+            Return 1
+        End If
+        If key is less than zk:
+            Set z to proc memory_get_int64 from Memory with z, RB_LEFT_OFFSET
+        Otherwise:
+            Set z to proc memory_get_int64 from Memory with z, RB_RIGHT_OFFSET
+        End If
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Inner helper that finishes the two-child deletion case. Split out so
+the main rb_tree_delete loop stays under one screen and the deletion
+case analysis is locally complete.
+@End Reasoning
+
+@Implementation
+y = successor (passed as 'm'). x = y.right (passed as 'x' but read
+fresh because the caller passed nil_node by convention).
+y_original_color = y.color.
+If y.parent == z: x.parent = y.
+Else: transplant y with y.right; y.right = z.right; y.right.parent = y.
+Transplant z with y; y.left = z.left; y.left.parent = y; y.color =
+z.color. Free z. Decrement size. If y_original_color was BLACK, run
+fixup on x.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) given the supplied pointers.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "rb_delete_with_successor" takes tree as Integer, z as Integer, y as Integer, x_unused as Integer returns Integer:
+    Let nil_node be proc memory_get_int64 from Memory with tree, 16
+    Let y_original_color be proc memory_get_int64 from Memory with y, RB_COLOR_OFFSET
+    Let x be proc memory_get_int64 from Memory with y, RB_RIGHT_OFFSET
+    Let y_parent be proc memory_get_int64 from Memory with y, RB_PARENT_OFFSET
+    If y_parent is equal to z:
+        proc memory_set_int64 from Memory with x, RB_PARENT_OFFSET, y
+    Otherwise:
+        proc rb_transplant with tree, y, x
+        Let z_right be proc memory_get_int64 from Memory with z, RB_RIGHT_OFFSET
+        proc memory_set_int64 from Memory with y, RB_RIGHT_OFFSET, z_right
+        proc memory_set_int64 from Memory with z_right, RB_PARENT_OFFSET, y
+    End If
+    proc rb_transplant with tree, z, y
+    Let z_left be proc memory_get_int64 from Memory with z, RB_LEFT_OFFSET
+    proc memory_set_int64 from Memory with y, RB_LEFT_OFFSET, z_left
+    proc memory_set_int64 from Memory with z_left, RB_PARENT_OFFSET, y
+    Let z_color be proc memory_get_int64 from Memory with z, RB_COLOR_OFFSET
+    proc memory_set_int64 from Memory with y, RB_COLOR_OFFSET, z_color
+    proc deallocate from Layout with z
+    Let size be proc memory_get_int64 from Memory with tree, 8
+    proc memory_set_int64 from Memory with tree, 8, size minus 1
+    If y_original_color is equal to RB_COLOR_BLACK:
+        proc rb_delete_fixup with tree, x
+    End If
+    Return 1
+End Process

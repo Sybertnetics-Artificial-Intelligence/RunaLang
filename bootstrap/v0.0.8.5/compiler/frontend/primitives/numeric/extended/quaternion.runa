@@ -1,0 +1,880 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+Unit-quaternion arithmetic for 3D rotations (Hamilton convention).
+
+Memory layout:
+  Quaternion = 32 bytes (4 Float64 lanes), row order (w, x, y, z).
+
+Operations:
+  - allocate / free / set / get / copy
+  - identity (1, 0, 0, 0)
+  - add / sub / scalar_mul
+  - Hamilton product (mul)
+  - normalize / conjugate / inverse / magnitude
+  - axis-angle construction and conversion
+  - Euler-angle (roll, pitch, yaw) construction and conversion
+  - 3x3 rotation-matrix construction and conversion
+  - from_two_vectors (Stan Melax "rotation between two vectors" technique)
+  - rotate_vector (applies the rotation encoded by q to a Vector3)
+  - slerp (Shoemake 1985) and nlerp (normalized lerp)
+
+@Reasoning
+Quaternions are the standard rotation primitive because they avoid the
+gimbal lock degeneracy of Euler angles, compose multiplicatively with
+half the storage of a 3x3 matrix, and slerp linearly along the unit-3-sphere
+giving constant-speed interpolation.
+
+Hamilton convention is chosen over JPL because Hamilton matches the OpenGL,
+Eigen, glm, and most academic literature conventions. The product is:
+  (w1,v1) * (w2,v2) = (w1 w2 - v1 . v2, w1 v2 + w2 v1 + v1 x v2)
+
+Slerp: q(t) = (sin((1-t)*theta) * a + sin(t*theta) * b) / sin(theta)
+where theta = acos(a . b). Falls back to linear interpolation when
+sin(theta) is near zero to avoid division-by-zero. See Shoemake, "Animating
+Rotation with Quaternion Curves", SIGGRAPH 1985.
+@End Reasoning
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/core/trig_core.runa" as Trig
+Import "compiler/frontend/primitives/numeric/extended/vector.runa" as Vector
+
+Constant QUATERNION_SIZE_BYTES as Integer is 32
+
+Process called "q_float_to_bits" takes x as Float returns Integer:
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "q_bits_to_float" takes b as Integer returns Float:
+    Let result be 0.0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "q_store" takes ptr as Integer, offset as Integer, value as Float returns Integer:
+    Let bits be proc q_float_to_bits with value
+    Let _w be proc memory_set_int64 from Memory with ptr, offset, bits
+    Return 0
+End Process
+
+Process called "q_load" takes ptr as Integer, offset as Integer returns Float:
+    Let bits be proc memory_get_int64 from Memory with ptr, offset
+    Return proc q_bits_to_float with bits
+End Process
+
+Process called "quaternion_allocate" returns Integer:
+    @Reasoning
+        Allocate a 32-byte zeroed quaternion buffer. Zero is not a valid
+        rotation; callers should immediately call set or identity.
+    @End Reasoning
+    @Implementation
+        Layout.allocate.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Zeroed.
+    @End Security_Scope
+    Let p be proc allocate from Layout with QUATERNION_SIZE_BYTES
+    Return p
+End Process
+
+Process called "quaternion_free" takes q as Integer returns Integer:
+    If q is equal to 0:
+        Return 0
+    End If
+    Let _d be proc deallocate from Layout with q
+    Return 0
+End Process
+
+Process called "quaternion_set" takes q as Integer, w as Float, x as Float, y as Float, z as Float returns Integer:
+    Let _w be proc q_store with q, 0, w
+    Let _x be proc q_store with q, 8, x
+    Let _y be proc q_store with q, 16, y
+    Let _z be proc q_store with q, 24, z
+    Return 0
+End Process
+
+Process called "quaternion_get_w" takes q as Integer returns Float:
+    Return proc q_load with q, 0
+End Process
+
+Process called "quaternion_get_x" takes q as Integer returns Float:
+    Return proc q_load with q, 8
+End Process
+
+Process called "quaternion_get_y" takes q as Integer returns Float:
+    Return proc q_load with q, 16
+End Process
+
+Process called "quaternion_get_z" takes q as Integer returns Float:
+    Return proc q_load with q, 24
+End Process
+
+Process called "quaternion_copy" takes src as Integer, dst as Integer returns Integer:
+    Let _c be proc memory_copy from Memory with dst, src, QUATERNION_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "quaternion_identity" takes q as Integer returns Integer:
+    @Reasoning
+        The identity rotation: w=1, x=y=z=0. Multiplying by it leaves
+        any quaternion unchanged.
+    @End Reasoning
+    @Implementation
+        Four direct stores.
+    @End Implementation
+    @Performance_Hints
+        Four stores.
+    @End Performance_Hints
+    @Security_Scope
+        No special concerns.
+    @End Security_Scope
+    Let _r be proc quaternion_set with q, 1.0, 0.0, 0.0, 0.0
+    Return 0
+End Process
+
+Process called "quaternion_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Lane-wise sum. Used in interpolation and integration steps.
+    @End Reasoning
+    @Implementation
+        Snapshot then write.
+    @End Implementation
+    @Performance_Hints
+        Four addsd.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let aw be proc q_load with a, 0
+    Let ax be proc q_load with a, 8
+    Let ay be proc q_load with a, 16
+    Let az be proc q_load with a, 24
+    Let bw be proc q_load with b, 0
+    Let bx be proc q_load with b, 8
+    Let b_y be proc q_load with b, 16
+    Let bz be proc q_load with b, 24
+    Let _w be proc q_store with result, 0, aw plus bw
+    Let _x be proc q_store with result, 8, ax plus bx
+    Let _y be proc q_store with result, 16, ay plus b_y
+    Let _z be proc q_store with result, 24, az plus bz
+    Return 0
+End Process
+
+Process called "quaternion_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let aw be proc q_load with a, 0
+    Let ax be proc q_load with a, 8
+    Let ay be proc q_load with a, 16
+    Let az be proc q_load with a, 24
+    Let bw be proc q_load with b, 0
+    Let bx be proc q_load with b, 8
+    Let b_y be proc q_load with b, 16
+    Let bz be proc q_load with b, 24
+    Let _w be proc q_store with result, 0, aw minus bw
+    Let _x be proc q_store with result, 8, ax minus bx
+    Let _y be proc q_store with result, 16, ay minus b_y
+    Let _z be proc q_store with result, 24, az minus bz
+    Return 0
+End Process
+
+Process called "quaternion_scalar_mul" takes q as Integer, s as Float, result as Integer returns Integer:
+    Let qw be proc q_load with q, 0
+    Let qx be proc q_load with q, 8
+    Let qy be proc q_load with q, 16
+    Let qz be proc q_load with q, 24
+    Let _w be proc q_store with result, 0, qw multiplied by s
+    Let _x be proc q_store with result, 8, qx multiplied by s
+    Let _y be proc q_store with result, 16, qy multiplied by s
+    Let _z be proc q_store with result, 24, qz multiplied by s
+    Return 0
+End Process
+
+Process called "quaternion_mul" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Hamilton product:
+          rw = aw*bw - ax*bx - ay*by - az*bz
+          rx = aw*bx + ax*bw + ay*bz - az*by
+          ry = aw*by - ax*bz + ay*bw + az*bx
+          rz = aw*bz + ax*by - ay*bx + az*bw
+        This product is non-commutative: a * b != b * a in general.
+    @End Reasoning
+    @Implementation
+        Snapshots both inputs before writing to permit aliasing of result
+        with a or b.
+    @End Implementation
+    @Performance_Hints
+        16 mulsd + 12 addsd.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let aw be proc q_load with a, 0
+    Let ax be proc q_load with a, 8
+    Let ay be proc q_load with a, 16
+    Let az be proc q_load with a, 24
+    Let bw be proc q_load with b, 0
+    Let bx be proc q_load with b, 8
+    Let b_y be proc q_load with b, 16
+    Let bz be proc q_load with b, 24
+    Let rw be (((aw multiplied by bw) minus (ax multiplied by bx)) minus (ay multiplied by b_y)) minus (az multiplied by bz)
+    Let rx be (((aw multiplied by bx) plus (ax multiplied by bw)) plus (ay multiplied by bz)) minus (az multiplied by b_y)
+    Let ry be (((aw multiplied by b_y) minus (ax multiplied by bz)) plus (ay multiplied by bw)) plus (az multiplied by bx)
+    Let rz be (((aw multiplied by bz) plus (ax multiplied by b_y)) minus (ay multiplied by bx)) plus (az multiplied by bw)
+    Let _w be proc q_store with result, 0, rw
+    Let _x be proc q_store with result, 8, rx
+    Let _y be proc q_store with result, 16, ry
+    Let _z be proc q_store with result, 24, rz
+    Return 0
+End Process
+
+Process called "quaternion_magnitude_squared" takes q as Integer returns Float:
+    Let qw be proc q_load with q, 0
+    Let qx be proc q_load with q, 8
+    Let qy be proc q_load with q, 16
+    Let qz be proc q_load with q, 24
+    Let s1 be (qw multiplied by qw) plus (qx multiplied by qx)
+    Let s2 be (qy multiplied by qy) plus (qz multiplied by qz)
+    Return s1 plus s2
+End Process
+
+Process called "quaternion_magnitude" takes q as Integer returns Float:
+    Let mag_sq be proc quaternion_magnitude_squared with q
+    Return proc sqrt from Arith with mag_sq
+End Process
+
+Process called "quaternion_normalize" takes q as Integer, result as Integer returns Integer:
+    @Reasoning
+        Project onto the unit 3-sphere. Returns -1 if |q|=0 (invalid).
+    @End Reasoning
+    @Implementation
+        Divide each component by magnitude.
+    @End Implementation
+    @Performance_Hints
+        sqrtsd + divsd + 4 mulsd.
+    @End Performance_Hints
+    @Security_Scope
+        Caller checks return code.
+    @End Security_Scope
+    Let mag be proc quaternion_magnitude with q
+    If mag is equal to 0.0:
+        Let _w be proc q_store with result, 0, 0.0
+        Let _x be proc q_store with result, 8, 0.0
+        Let _y be proc q_store with result, 16, 0.0
+        Let _z be proc q_store with result, 24, 0.0
+        Return 0 minus 1
+    End If
+    Let inv be 1.0 divided by mag
+    Let _r be proc quaternion_scalar_mul with q, inv, result
+    Return 0
+End Process
+
+Process called "quaternion_conjugate" takes q as Integer, result as Integer returns Integer:
+    @Reasoning
+        Conjugate (w, x, y, z) = (w, -x, -y, -z). For unit quaternions,
+        the conjugate equals the inverse.
+    @End Reasoning
+    @Implementation
+        Flip sign of x, y, z; copy w.
+    @End Implementation
+    @Performance_Hints
+        Four ops.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let qw be proc q_load with q, 0
+    Let qx be proc q_load with q, 8
+    Let qy be proc q_load with q, 16
+    Let qz be proc q_load with q, 24
+    Let _w be proc q_store with result, 0, qw
+    Let _x be proc q_store with result, 8, 0.0 minus qx
+    Let _y be proc q_store with result, 16, 0.0 minus qy
+    Let _z be proc q_store with result, 24, 0.0 minus qz
+    Return 0
+End Process
+
+Process called "quaternion_inverse" takes q as Integer, result as Integer returns Integer:
+    @Reasoning
+        q^-1 = conjugate(q) / |q|^2. For unit quaternions this is
+        identical to the conjugate, but we compute the general form so
+        non-unit inputs are handled.
+    @End Reasoning
+    @Implementation
+        Conjugate then divide by magnitude squared.
+    @End Implementation
+    @Performance_Hints
+        4 ops + 1 division + 4 mulsd.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 on |q|=0.
+    @End Security_Scope
+    Let mag_sq be proc quaternion_magnitude_squared with q
+    If mag_sq is equal to 0.0:
+        Return 0 minus 1
+    End If
+    Let inv be 1.0 divided by mag_sq
+    Let qw be proc q_load with q, 0
+    Let qx be proc q_load with q, 8
+    Let qy be proc q_load with q, 16
+    Let qz be proc q_load with q, 24
+    Let _w be proc q_store with result, 0, qw multiplied by inv
+    Let neg_inv be 0.0 minus inv
+    Let _x be proc q_store with result, 8, qx multiplied by neg_inv
+    Let _y be proc q_store with result, 16, qy multiplied by neg_inv
+    Let _z be proc q_store with result, 24, qz multiplied by neg_inv
+    Return 0
+End Process
+
+Process called "quaternion_dot" takes a as Integer, b as Integer returns Float:
+    @Reasoning
+        Inner product on the 4D embedding. Used by slerp.
+    @End Reasoning
+    @Implementation
+        Lane-wise multiply + reduce.
+    @End Implementation
+    @Performance_Hints
+        4 mulsd + 3 addsd.
+    @End Performance_Hints
+    @Security_Scope
+        No aliasing.
+    @End Security_Scope
+    Let aw be proc q_load with a, 0
+    Let ax be proc q_load with a, 8
+    Let ay be proc q_load with a, 16
+    Let az be proc q_load with a, 24
+    Let bw be proc q_load with b, 0
+    Let bx be proc q_load with b, 8
+    Let b_y be proc q_load with b, 16
+    Let bz be proc q_load with b, 24
+    Let s1 be (aw multiplied by bw) plus (ax multiplied by bx)
+    Let s2 be (ay multiplied by b_y) plus (az multiplied by bz)
+    Return s1 plus s2
+End Process
+
+Process called "quaternion_from_axis_angle" takes q as Integer, axis as Integer, angle as Float returns Integer:
+    @Reasoning
+        Build a quaternion that represents a rotation by angle radians
+        about axis (right-hand rule):
+          half = angle / 2
+          s = sin(half)
+          c = cos(half)
+          axis must be unit-length (the function does NOT renormalize).
+          q = (c, s*ax, s*ay, s*az)
+    @End Reasoning
+    @Implementation
+        Use trig_core to evaluate sin/cos of the half-angle.
+    @End Implementation
+    @Performance_Hints
+        One sin + one cos + 3 multiplies + 4 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time aside from the trig functions' own data flow.
+    @End Security_Scope
+    Let half be angle divided by 2.0
+    Let half_bits be proc q_float_to_bits with half
+    Let sin_bits be proc sin_radians from Trig with half_bits
+    Let cos_bits be proc cos_radians from Trig with half_bits
+    Let s be proc q_bits_to_float with sin_bits
+    Let c be proc q_bits_to_float with cos_bits
+    Let ax be proc vector3_get_x from Vector with axis
+    Let ay be proc vector3_get_y from Vector with axis
+    Let az be proc vector3_get_z from Vector with axis
+    Let _r be proc quaternion_set with q, c, s multiplied by ax, s multiplied by ay, s multiplied by az
+    Return 0
+End Process
+
+Process called "quaternion_from_euler" takes q as Integer, roll as Float, pitch as Float, yaw as Float returns Integer:
+    @Reasoning
+        Build a quaternion from intrinsic Tait-Bryan angles, ZYX order
+        (yaw about Z, then pitch about Y', then roll about X''):
+          cr = cos(roll/2), sr = sin(roll/2)
+          cp = cos(pitch/2), sp = sin(pitch/2)
+          cy = cos(yaw/2), sy = sin(yaw/2)
+          q.w = cr*cp*cy + sr*sp*sy
+          q.x = sr*cp*cy - cr*sp*sy
+          q.y = cr*sp*cy + sr*cp*sy
+          q.z = cr*cp*sy - sr*sp*cy
+        This is the convention used by Eigen, glm, and aerospace texts.
+    @End Reasoning
+    @Implementation
+        Six trig calls + 8 multiplies + 3 add/sub combos.
+    @End Implementation
+    @Performance_Hints
+        Three sin + three cos dominate.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time aside from trig.
+    @End Security_Scope
+    Let hr be roll divided by 2.0
+    Let hp be pitch divided by 2.0
+    Let hy be yaw divided by 2.0
+    Let hr_bits be proc q_float_to_bits with hr
+    Let hp_bits be proc q_float_to_bits with hp
+    Let hy_bits be proc q_float_to_bits with hy
+    Let cr be proc q_bits_to_float with proc cos_radians from Trig with hr_bits
+    Let sr be proc q_bits_to_float with proc sin_radians from Trig with hr_bits
+    Let cp be proc q_bits_to_float with proc cos_radians from Trig with hp_bits
+    Let sp be proc q_bits_to_float with proc sin_radians from Trig with hp_bits
+    Let cy be proc q_bits_to_float with proc cos_radians from Trig with hy_bits
+    Let sy be proc q_bits_to_float with proc sin_radians from Trig with hy_bits
+    Let qw be ((cr multiplied by cp) multiplied by cy) plus ((sr multiplied by sp) multiplied by sy)
+    Let qx be ((sr multiplied by cp) multiplied by cy) minus ((cr multiplied by sp) multiplied by sy)
+    Let qy be ((cr multiplied by sp) multiplied by cy) plus ((sr multiplied by cp) multiplied by sy)
+    Let qz be ((cr multiplied by cp) multiplied by sy) minus ((sr multiplied by sp) multiplied by cy)
+    Let _r be proc quaternion_set with q, qw, qx, qy, qz
+    Return 0
+End Process
+
+Process called "quaternion_to_axis_angle" takes q as Integer, axis_out as Integer, angle_out as Integer returns Integer:
+    @Reasoning
+        Inverse of from_axis_angle. The angle is recovered as
+        2 * acos(w), and the axis as (x, y, z) / sin(angle/2).
+        When the rotation is near the identity (|sin(half)| < eps), the
+        axis is undefined; we write (1, 0, 0) as a canonical fallback.
+    @End Reasoning
+    @Implementation
+        acos via trig_core, then divide the imaginary part by sin(half).
+    @End Implementation
+    @Performance_Hints
+        One acos + one sqrt + one div + 3 multiplies.
+    @End Performance_Hints
+    @Security_Scope
+        angle_out points to an 8-byte buffer that receives the angle bits.
+    @End Security_Scope
+    Let qw be proc q_load with q, 0
+    Let qx be proc q_load with q, 8
+    Let qy be proc q_load with q, 16
+    Let qz be proc q_load with q, 24
+    Note: Clamp w to [-1, 1] to defeat acos domain errors from rounding.
+    If qw is greater than 1.0:
+        Set qw to 1.0
+    End If
+    Let neg_one be 0.0 minus 1.0
+    If qw is less than neg_one:
+        Set qw to neg_one
+    End If
+    Let w_bits be proc q_float_to_bits with qw
+    Let acos_bits be proc acos from Trig with w_bits
+    Let half_angle be proc q_bits_to_float with acos_bits
+    Let angle be 2.0 multiplied by half_angle
+    Let angle_bits be proc q_float_to_bits with angle
+    Let _wa be proc memory_set_int64 from Memory with angle_out, 0, angle_bits
+    Let sin_half_sq be ((qx multiplied by qx) plus (qy multiplied by qy)) plus (qz multiplied by qz)
+    Let tiny be 0.000000000001
+    If sin_half_sq is less than tiny:
+        Let _ax be proc vector3_set from Vector with axis_out, 1.0, 0.0, 0.0
+        Return 0
+    End If
+    Let sin_half be proc sqrt from Arith with sin_half_sq
+    Let inv be 1.0 divided by sin_half
+    Let _ax2 be proc vector3_set from Vector with axis_out, qx multiplied by inv, qy multiplied by inv, qz multiplied by inv
+    Return 0
+End Process
+
+Process called "quaternion_to_rotation_matrix" takes q as Integer, m as Integer returns Integer:
+    @Reasoning
+        Convert q to a 3x3 rotation matrix. For a unit quaternion
+        (w, x, y, z) the matrix is:
+          [ 1-2y^2-2z^2     2xy-2wz       2xz+2wy   ]
+          [ 2xy+2wz         1-2x^2-2z^2   2yz-2wx   ]
+          [ 2xz-2wy         2yz+2wx       1-2x^2-2y^2]
+        The caller is responsible for renormalizing q if needed.
+    @End Reasoning
+    @Implementation
+        Direct algebraic substitution. Writes to a 3x3 matrix at m.
+    @End Implementation
+    @Performance_Hints
+        18 multiplies + 9 add/sub.
+    @End Performance_Hints
+    @Security_Scope
+        m must be a 72-byte Matrix3x3 buffer.
+    @End Security_Scope
+    Let qw be proc q_load with q, 0
+    Let qx be proc q_load with q, 8
+    Let qy be proc q_load with q, 16
+    Let qz be proc q_load with q, 24
+    Let xx be qx multiplied by qx
+    Let yy be qy multiplied by qy
+    Let zz be qz multiplied by qz
+    Let xy be qx multiplied by qy
+    Let xz be qx multiplied by qz
+    Let yz be qy multiplied by qz
+    Let wx be qw multiplied by qx
+    Let wy be qw multiplied by qy
+    Let wz be qw multiplied by qz
+    Let _00 be proc q_store with m, 0, 1.0 minus (2.0 multiplied by (yy plus zz))
+    Let _01 be proc q_store with m, 8, 2.0 multiplied by (xy minus wz)
+    Let _02 be proc q_store with m, 16, 2.0 multiplied by (xz plus wy)
+    Let _10 be proc q_store with m, 24, 2.0 multiplied by (xy plus wz)
+    Let _11 be proc q_store with m, 32, 1.0 minus (2.0 multiplied by (xx plus zz))
+    Let _12 be proc q_store with m, 40, 2.0 multiplied by (yz minus wx)
+    Let _20 be proc q_store with m, 48, 2.0 multiplied by (xz minus wy)
+    Let _21 be proc q_store with m, 56, 2.0 multiplied by (yz plus wx)
+    Let _22 be proc q_store with m, 64, 1.0 minus (2.0 multiplied by (xx plus yy))
+    Return 0
+End Process
+
+Process called "quaternion_from_rotation_matrix" takes q as Integer, m as Integer returns Integer:
+    @Reasoning
+        Shepperd's algorithm: pick the largest of (1+m00+m11+m22),
+        (1+m00-m11-m22), (1-m00+m11-m22), (1-m00-m11+m22) for numerical
+        stability, then derive the remaining components from off-diagonal
+        differences.
+    @End Reasoning
+    @Implementation
+        Implements the four-branch maximal-diagonal version of Shepperd
+        (1978). Numerically stable across all proper rotation matrices.
+    @End Implementation
+    @Performance_Hints
+        One sqrt + roughly a dozen multiplies and add/sub.
+    @End Performance_Hints
+    @Security_Scope
+        m must encode a proper rotation (det = +1).
+    @End Security_Scope
+    Let m00 be proc q_load with m, 0
+    Let m01 be proc q_load with m, 8
+    Let m02 be proc q_load with m, 16
+    Let m10 be proc q_load with m, 24
+    Let m11 be proc q_load with m, 32
+    Let m12 be proc q_load with m, 40
+    Let m20 be proc q_load with m, 48
+    Let m21 be proc q_load with m, 56
+    Let m22 be proc q_load with m, 64
+    Let trace be (m00 plus m11) plus m22
+    If trace is greater than 0.0:
+        Let s be proc sqrt from Arith with (trace plus 1.0)
+        Let s2 be 2.0 multiplied by s
+        Let qw be s divided by 2.0
+        Let qx be (m21 minus m12) divided by s2
+        Let qy be (m02 minus m20) divided by s2
+        Let qz be (m10 minus m01) divided by s2
+        Let _r be proc quaternion_set with q, qw, qx, qy, qz
+        Return 0
+    End If
+    If m00 is greater than m11:
+        If m00 is greater than m22:
+            Let s be proc sqrt from Arith with (((1.0 plus m00) minus m11) minus m22)
+            Let s2 be 2.0 multiplied by s
+            Let qw be (m21 minus m12) divided by s2
+            Let qx be s divided by 2.0
+            Let qy be (m01 plus m10) divided by s2
+            Let qz be (m02 plus m20) divided by s2
+            Let _r be proc quaternion_set with q, qw, qx, qy, qz
+            Return 0
+        End If
+    End If
+    If m11 is greater than m22:
+        Let s be proc sqrt from Arith with (((1.0 plus m11) minus m00) minus m22)
+        Let s2 be 2.0 multiplied by s
+        Let qw be (m02 minus m20) divided by s2
+        Let qx be (m01 plus m10) divided by s2
+        Let qy be s divided by 2.0
+        Let qz be (m12 plus m21) divided by s2
+        Let _r be proc quaternion_set with q, qw, qx, qy, qz
+        Return 0
+    End If
+    Let s be proc sqrt from Arith with (((1.0 plus m22) minus m00) minus m11)
+    Let s2 be 2.0 multiplied by s
+    Let qw be (m10 minus m01) divided by s2
+    Let qx be (m02 plus m20) divided by s2
+    Let qy be (m12 plus m21) divided by s2
+    Let qz be s divided by 2.0
+    Let _r be proc quaternion_set with q, qw, qx, qy, qz
+    Return 0
+End Process
+
+Process called "quaternion_from_two_vectors" takes q as Integer, from_v as Integer, to_v as Integer returns Integer:
+    @Reasoning
+        Stan Melax's algorithm: q rotates from_v onto to_v.
+          w = sqrt(|a|^2 * |b|^2) + a . b
+          xyz = a cross b
+          then normalize.
+        Handles antiparallel case (180-degree flip) by picking an
+        orthogonal axis when w is near zero.
+    @End Reasoning
+    @Implementation
+        Reference: Stan Melax, "The Shortest Arc Quaternion",
+        Game Programming Gems 1, 2000.
+    @End Implementation
+    @Performance_Hints
+        Two magnitude_squared + one sqrt + one dot + one cross + one
+        normalize.
+    @End Performance_Hints
+    @Security_Scope
+        Caller must supply Vector3 buffers.
+    @End Security_Scope
+    Let a_mag_sq be proc vector3_magnitude_squared from Vector with from_v
+    Let b_mag_sq be proc vector3_magnitude_squared from Vector with to_v
+    Let norm_prod be proc sqrt from Arith with (a_mag_sq multiplied by b_mag_sq)
+    Let dot be proc vector3_dot from Vector with from_v, to_v
+    Let w be norm_prod plus dot
+    Let tiny be 0.000000000001
+    Let cross_vec be proc vector3_allocate from Vector
+    If cross_vec is equal to 0:
+        Return 0 minus 1
+    End If
+    If w is less than tiny:
+        Note: Antiparallel - pick an orthogonal axis. Use x-axis unless
+        Note: from_v is too close to it, then use y-axis.
+        Let ax be proc vector3_get_x from Vector with from_v
+        Let abs_ax be ax
+        If abs_ax is less than 0.0:
+            Set abs_ax to 0.0 minus abs_ax
+        End If
+        If abs_ax is greater than 0.9:
+            Let _s1 be proc vector3_set from Vector with cross_vec, 0.0, 1.0, 0.0
+        Otherwise:
+            Let _s2 be proc vector3_set from Vector with cross_vec, 1.0, 0.0, 0.0
+        End If
+        Let perp be proc vector3_allocate from Vector
+        Let _cr be proc vector3_cross from Vector with from_v, cross_vec, perp
+        Let _nv be proc vector3_normalize from Vector with perp, perp
+        Let px be proc vector3_get_x from Vector with perp
+        Let py be proc vector3_get_y from Vector with perp
+        Let pz be proc vector3_get_z from Vector with perp
+        Let _r be proc quaternion_set with q, 0.0, px, py, pz
+        Let _fp be proc vector3_free from Vector with perp
+        Let _fc be proc vector3_free from Vector with cross_vec
+        Return 0
+    End If
+    Let _cr be proc vector3_cross from Vector with from_v, to_v, cross_vec
+    Let cx be proc vector3_get_x from Vector with cross_vec
+    Let cy be proc vector3_get_y from Vector with cross_vec
+    Let cz be proc vector3_get_z from Vector with cross_vec
+    Let _r be proc quaternion_set with q, w, cx, cy, cz
+    Let _n be proc quaternion_normalize with q, q
+    Let _fc be proc vector3_free from Vector with cross_vec
+    Return 0
+End Process
+
+Process called "quaternion_to_euler" takes q as Integer, roll_out as Integer, pitch_out as Integer, yaw_out as Integer returns Integer:
+    @Reasoning
+        Decompose a quaternion into Tait-Bryan ZYX intrinsic angles.
+        roll  = atan2( 2(wx + yz), 1 - 2(x^2 + y^2) )
+        pitch = asin(  2(wy - zx) ) (clamped to handle gimbal lock)
+        yaw   = atan2( 2(wz + xy), 1 - 2(y^2 + z^2) )
+    @End Reasoning
+    @Implementation
+        Two atan2 + one asin via trig_core. Each output written as 8-byte
+        Float bits.
+    @End Implementation
+    @Performance_Hints
+        Three trig calls dominate.
+    @End Performance_Hints
+    @Security_Scope
+        Outputs are 8-byte buffers.
+    @End Security_Scope
+    Let qw be proc q_load with q, 0
+    Let qx be proc q_load with q, 8
+    Let qy be proc q_load with q, 16
+    Let qz be proc q_load with q, 24
+    Note: roll
+    Let roll_y be 2.0 multiplied by ((qw multiplied by qx) plus (qy multiplied by qz))
+    Let roll_x be 1.0 minus (2.0 multiplied by ((qx multiplied by qx) plus (qy multiplied by qy)))
+    Let roll_yb be proc q_float_to_bits with roll_y
+    Let roll_xb be proc q_float_to_bits with roll_x
+    Let roll_bits be proc atan2 from Trig with roll_yb, roll_xb
+    Let _wr be proc memory_set_int64 from Memory with roll_out, 0, roll_bits
+    Note: pitch with clamp for gimbal lock safety
+    Let pitch_arg be 2.0 multiplied by ((qw multiplied by qy) minus (qz multiplied by qx))
+    If pitch_arg is greater than 1.0:
+        Set pitch_arg to 1.0
+    End If
+    Let neg_one be 0.0 minus 1.0
+    If pitch_arg is less than neg_one:
+        Set pitch_arg to neg_one
+    End If
+    Let pitch_bits_in be proc q_float_to_bits with pitch_arg
+    Let pitch_bits be proc asin from Trig with pitch_bits_in
+    Let _wp be proc memory_set_int64 from Memory with pitch_out, 0, pitch_bits
+    Note: yaw
+    Let yaw_y be 2.0 multiplied by ((qw multiplied by qz) plus (qx multiplied by qy))
+    Let yaw_x be 1.0 minus (2.0 multiplied by ((qy multiplied by qy) plus (qz multiplied by qz)))
+    Let yaw_yb be proc q_float_to_bits with yaw_y
+    Let yaw_xb be proc q_float_to_bits with yaw_x
+    Let yaw_bits be proc atan2 from Trig with yaw_yb, yaw_xb
+    Let _wy be proc memory_set_int64 from Memory with yaw_out, 0, yaw_bits
+    Return 0
+End Process
+
+Process called "quaternion_rotate_vector" takes q as Integer, v as Integer, result as Integer returns Integer:
+    @Reasoning
+        Apply the rotation encoded by q to a Vector3 using the standard
+        v' = q * v_q * q^-1 sandwich, where v_q is the quaternion
+        (0, vx, vy, vz). Optimized form (Fabian Giesen):
+          t = 2 * cross(q.xyz, v)
+          v' = v + q.w * t + cross(q.xyz, t)
+        Saves several multiplies vs. the literal q*v*q^-1 product.
+    @End Reasoning
+    @Implementation
+        Two crosses + scalar*vec + vec*sum.
+    @End Implementation
+    @Performance_Hints
+        ~12 mulsd + 12 addsd; well under the 32 ops of the literal form.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe via temp Vector3 buffers.
+    @End Security_Scope
+    Let qw be proc q_load with q, 0
+    Let qx be proc q_load with q, 8
+    Let qy be proc q_load with q, 16
+    Let qz be proc q_load with q, 24
+    Let vx be proc vector3_get_x from Vector with v
+    Let vy be proc vector3_get_y from Vector with v
+    Let vz be proc vector3_get_z from Vector with v
+
+    Note: t = 2 * cross(q.xyz, v)
+    Let tx be 2.0 multiplied by ((qy multiplied by vz) minus (qz multiplied by vy))
+    Let ty be 2.0 multiplied by ((qz multiplied by vx) minus (qx multiplied by vz))
+    Let tz be 2.0 multiplied by ((qx multiplied by vy) minus (qy multiplied by vx))
+
+    Note: result = v + qw * t + cross(q.xyz, t)
+    Let cx be (qy multiplied by tz) minus (qz multiplied by ty)
+    Let cy be (qz multiplied by tx) minus (qx multiplied by tz)
+    Let cz be (qx multiplied by ty) minus (qy multiplied by tx)
+    Let rx be vx plus ((qw multiplied by tx) plus cx)
+    Let ry be vy plus ((qw multiplied by ty) plus cy)
+    Let rz be vz plus ((qw multiplied by tz) plus cz)
+    Let _r be proc vector3_set from Vector with result, rx, ry, rz
+    Return 0
+End Process
+
+Process called "quaternion_nlerp" takes a as Integer, b as Integer, t as Float, result as Integer returns Integer:
+    @Reasoning
+        Normalized linear interpolation. Cheaper than slerp; the path is
+        non-constant angular velocity but the result lies on the unit
+        sphere after normalization.
+    @End Reasoning
+    @Implementation
+        Lerp lane-wise (preferring shortest arc by flipping b if
+        a . b < 0), then normalize.
+    @End Implementation
+    @Performance_Hints
+        Four lerps + magnitude + 4 multiplies.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let dot be proc quaternion_dot with a, b
+    Let aw be proc q_load with a, 0
+    Let ax be proc q_load with a, 8
+    Let ay be proc q_load with a, 16
+    Let az be proc q_load with a, 24
+    Let bw be proc q_load with b, 0
+    Let bx be proc q_load with b, 8
+    Let b_y be proc q_load with b, 16
+    Let bz be proc q_load with b, 24
+    If dot is less than 0.0:
+        Set bw to 0.0 minus bw
+        Set bx to 0.0 minus bx
+        Set b_y to 0.0 minus b_y
+        Set bz to 0.0 minus bz
+    End If
+    Let rw be aw plus (t multiplied by (bw minus aw))
+    Let rx be ax plus (t multiplied by (bx minus ax))
+    Let ry be ay plus (t multiplied by (b_y minus ay))
+    Let rz be az plus (t multiplied by (bz minus az))
+    Let mag_sq be ((rw multiplied by rw) plus (rx multiplied by rx)) plus ((ry multiplied by ry) plus (rz multiplied by rz))
+    If mag_sq is equal to 0.0:
+        Let _r be proc quaternion_identity with result
+        Return 0
+    End If
+    Let mag be proc sqrt from Arith with mag_sq
+    Let inv be 1.0 divided by mag
+    Let _r be proc quaternion_set with result, rw multiplied by inv, rx multiplied by inv, ry multiplied by inv, rz multiplied by inv
+    Return 0
+End Process
+
+Process called "quaternion_slerp" takes a as Integer, b as Integer, t as Float, result as Integer returns Integer:
+    @Reasoning
+        Spherical linear interpolation (Shoemake 1985). Provides
+        constant angular velocity along the geodesic from a to b on
+        the unit 3-sphere.
+          dot = a . b
+          if dot < 0, negate b (shortest-arc convention)
+          theta = acos(dot)
+          if theta near zero, fall back to nlerp
+          k_a = sin((1-t) * theta) / sin(theta)
+          k_b = sin(t * theta) / sin(theta)
+          result = k_a * a + k_b * b
+    @End Reasoning
+    @Implementation
+        Uses trig_core sin/cos/acos through bit-pattern bridges.
+    @End Implementation
+    @Performance_Hints
+        One acos + two sins + scalar muls + adds.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let dot be proc quaternion_dot with a, b
+    Let aw be proc q_load with a, 0
+    Let ax be proc q_load with a, 8
+    Let ay be proc q_load with a, 16
+    Let az be proc q_load with a, 24
+    Let bw be proc q_load with b, 0
+    Let bx be proc q_load with b, 8
+    Let b_y be proc q_load with b, 16
+    Let bz be proc q_load with b, 24
+    If dot is less than 0.0:
+        Set dot to 0.0 minus dot
+        Set bw to 0.0 minus bw
+        Set bx to 0.0 minus bx
+        Set b_y to 0.0 minus b_y
+        Set bz to 0.0 minus bz
+    End If
+    Note: Clamp before acos.
+    If dot is greater than 1.0:
+        Set dot to 1.0
+    End If
+    Let dot_close_to_one be 0.9995
+    If dot is greater than dot_close_to_one:
+        Note: Quaternions are nearly co-linear; fall back to linear interpolation
+        Note: to avoid sin(0)/0 indeterminacy.
+        Let rw be aw plus (t multiplied by (bw minus aw))
+        Let rx be ax plus (t multiplied by (bx minus ax))
+        Let ry be ay plus (t multiplied by (b_y minus ay))
+        Let rz be az plus (t multiplied by (bz minus az))
+        Let mag_sq be ((rw multiplied by rw) plus (rx multiplied by rx)) plus ((ry multiplied by ry) plus (rz multiplied by rz))
+        Let mag be proc sqrt from Arith with mag_sq
+        Let inv be 1.0 divided by mag
+        Let _r be proc quaternion_set with result, rw multiplied by inv, rx multiplied by inv, ry multiplied by inv, rz multiplied by inv
+        Return 0
+    End If
+    Let dot_bits be proc q_float_to_bits with dot
+    Let theta_bits be proc acos from Trig with dot_bits
+    Let theta be proc q_bits_to_float with theta_bits
+    Let sin_theta_bits be proc sin_radians from Trig with theta_bits
+    Let sin_theta be proc q_bits_to_float with sin_theta_bits
+    Let one_minus_t be 1.0 minus t
+    Let arg_a be one_minus_t multiplied by theta
+    Let arg_b be t multiplied by theta
+    Let sa_bits be proc sin_radians from Trig with proc q_float_to_bits with arg_a
+    Let sb_bits be proc sin_radians from Trig with proc q_float_to_bits with arg_b
+    Let sa be proc q_bits_to_float with sa_bits
+    Let sb be proc q_bits_to_float with sb_bits
+    Let k_a be sa divided by sin_theta
+    Let k_b be sb divided by sin_theta
+    Let rw be (k_a multiplied by aw) plus (k_b multiplied by bw)
+    Let rx be (k_a multiplied by ax) plus (k_b multiplied by bx)
+    Let ry be (k_a multiplied by ay) plus (k_b multiplied by b_y)
+    Let rz be (k_a multiplied by az) plus (k_b multiplied by bz)
+    Let _r be proc quaternion_set with result, rw, rx, ry, rz
+    Return 0
+End Process

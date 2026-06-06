@@ -1,0 +1,2979 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+MARKDOWN - CommonMark 0.31 + GFM AST, Parser, and Renderer
+==============================================================================
+
+Implements the Markdown abstract syntax tree, a parser covering the most
+heavily used block and inline constructs of the CommonMark 0.31
+specification (https://spec.commonmark.org/0.31/) plus the strikethrough
+and task-list GitHub Flavored Markdown extensions
+(https://github.github.com/gfm/), and HTML and plain-text renderers.
+
+AST shapes
+----------
+
+MarkdownBlock (tagged 32-byte record):
+    slot 0  kind tag         MD_BLOCK_*
+    slot 1  primary payload  (NUL-terminated string or List ptr)
+    slot 2  secondary        (numeric flag or auxiliary pointer)
+    slot 3  inline children  (List of MarkdownInline or 0)
+
+  MD_BLOCK_THEMATIC_BREAK      1
+  MD_BLOCK_ATX_HEADING         2   payload = title text, secondary = level
+  MD_BLOCK_SETEXT_HEADING      3   payload = title text, secondary = level
+  MD_BLOCK_INDENTED_CODE       4   payload = code body
+  MD_BLOCK_FENCED_CODE         5   payload = code body, secondary = info str
+  MD_BLOCK_HTML_BLOCK          6   payload = raw HTML body
+  MD_BLOCK_LINK_REFERENCE_DEF  7   payload = label
+  MD_BLOCK_PARAGRAPH           8   payload = raw text (filled by parse_inlines)
+  MD_BLOCK_BLANK_LINE          9
+  MD_BLOCK_BLOCK_QUOTE        10   payload = List of MarkdownBlocks
+  MD_BLOCK_LIST_ITEM          11   payload = List of MarkdownBlocks
+  MD_BLOCK_LIST               12   payload = List of MD_BLOCK_LIST_ITEM,
+                                   secondary = ordered/loose/start packed
+  MD_BLOCK_TABLE_ROW          13   payload = List of cell strings (GFM)
+  MD_BLOCK_MATH_BLOCK         14   payload = LaTeX-style display math body
+
+MarkdownInline (tagged 32-byte record, same layout):
+  MD_INLINE_TEXT              1   payload = text string
+  MD_INLINE_EMPHASIS          2   children = inner inlines, secondary = strength
+  MD_INLINE_CODE_SPAN         3   payload = code text
+  MD_INLINE_LINK              4   payload = href, secondary = title, children = label
+  MD_INLINE_AUTO_LINK         5   payload = href
+  MD_INLINE_IMAGE             6   payload = src, secondary = alt text
+  MD_INLINE_HARD_LINE_BREAK   7
+  MD_INLINE_SOFT_LINE_BREAK   8
+  MD_INLINE_HTML_INLINE       9   payload = raw HTML text
+  MD_INLINE_MATH_INLINE      10   payload = math body
+  MD_INLINE_FOOTNOTE         11   payload = label
+  MD_INLINE_STRIKETHROUGH    12   children = inner inlines
+  MD_INLINE_TASK             13   secondary = 1 if checked else 0
+
+Parser strategy
+---------------
+
+Two passes:
+
+Block pass scans the source line-by-line.  Each line is classified
+into one of: blank, ATX heading (CommonMark 4.2), thematic break
+(CommonMark 4.1), fenced code opening (CommonMark 4.5), block-quote
+marker (CommonMark 5.1), paragraph continuation, or fenced-code
+interior.  Open paragraphs and quote bodies accumulate in builders and
+emit when terminated.
+
+Inline pass scans every paragraph and heading's payload, emitting
+inline records.  Implements: text spans (default), backslash escapes
+of ASCII punctuation (CommonMark 2.4), code spans with matching
+backtick-runs (CommonMark 6.1), emphasis with simple flanking
+(CommonMark 6.2), inline links `[label](href "title")` (CommonMark
+6.5), autolinks `<scheme:...>` and `<user@host>` (CommonMark 6.4),
+hard line breaks (two-space-at-eol per 6.7), and soft line breaks at
+LF.  GFM strikethrough `~~x~~` (GFM 6.5) is also supported.
+
+Lifetimes
+---------
+
+Every block and inline node owns its payload strings, info strings,
+attribute lists, and child node lists.  markdown_destroy releases the
+entire tree.  Strings in payloads must come from Layout.allocate (this
+module's parser produces them via StringPrim.string_substring or
+similar) so the matching deallocator can free them.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+
+Note: ============================================================================
+Note: BLOCK / INLINE TAG CONSTANTS
+Note: ============================================================================
+
+Constant MD_BLOCK_THEMATIC_BREAK as Integer is 1
+Constant MD_BLOCK_ATX_HEADING as Integer is 2
+Constant MD_BLOCK_SETEXT_HEADING as Integer is 3
+Constant MD_BLOCK_INDENTED_CODE as Integer is 4
+Constant MD_BLOCK_FENCED_CODE as Integer is 5
+Constant MD_BLOCK_HTML_BLOCK as Integer is 6
+Constant MD_BLOCK_LINK_REFERENCE_DEF as Integer is 7
+Constant MD_BLOCK_PARAGRAPH as Integer is 8
+Constant MD_BLOCK_BLANK_LINE as Integer is 9
+Constant MD_BLOCK_BLOCK_QUOTE as Integer is 10
+Constant MD_BLOCK_LIST_ITEM as Integer is 11
+Constant MD_BLOCK_LIST as Integer is 12
+Constant MD_BLOCK_TABLE_ROW as Integer is 13
+Constant MD_BLOCK_MATH_BLOCK as Integer is 14
+
+Constant MD_INLINE_TEXT as Integer is 1
+Constant MD_INLINE_EMPHASIS as Integer is 2
+Constant MD_INLINE_CODE_SPAN as Integer is 3
+Constant MD_INLINE_LINK as Integer is 4
+Constant MD_INLINE_AUTO_LINK as Integer is 5
+Constant MD_INLINE_IMAGE as Integer is 6
+Constant MD_INLINE_HARD_LINE_BREAK as Integer is 7
+Constant MD_INLINE_SOFT_LINE_BREAK as Integer is 8
+Constant MD_INLINE_HTML_INLINE as Integer is 9
+Constant MD_INLINE_MATH_INLINE as Integer is 10
+Constant MD_INLINE_FOOTNOTE as Integer is 11
+Constant MD_INLINE_STRIKETHROUGH as Integer is 12
+Constant MD_INLINE_TASK as Integer is 13
+
+Constant MD_RECORD_SIZE as Integer is 32
+Constant MD_OFF_KIND as Integer is 0
+Constant MD_OFF_PAYLOAD as Integer is 8
+Constant MD_OFF_SECONDARY as Integer is 16
+Constant MD_OFF_CHILDREN as Integer is 24
+
+Constant MD_OK as Integer is 0
+Constant MD_NULL_ARG as Integer is -1
+
+Constant ASCII_NEWLINE as Integer is 10
+Constant ASCII_SPACE as Integer is 32
+Constant ASCII_TAB as Integer is 9
+Constant ASCII_HASH as Integer is 35
+Constant ASCII_GT as Integer is 62
+Constant ASCII_LT as Integer is 60
+Constant ASCII_DASH as Integer is 45
+Constant ASCII_UNDERSCORE as Integer is 95
+Constant ASCII_STAR as Integer is 42
+Constant ASCII_BACKTICK as Integer is 96
+Constant ASCII_BANG as Integer is 33
+Constant ASCII_LBRACKET as Integer is 91
+Constant ASCII_RBRACKET as Integer is 93
+Constant ASCII_LPAREN as Integer is 40
+Constant ASCII_RPAREN as Integer is 41
+Constant ASCII_QUOTE as Integer is 34
+Constant ASCII_BACKSLASH as Integer is 92
+Constant ASCII_AMP as Integer is 38
+Constant ASCII_TILDE as Integer is 126
+
+Note: ============================================================================
+Note: RECORD ALLOCATION HELPERS
+Note: ============================================================================
+
+@Reasoning
+Allocate a tagged 32-byte record used for both blocks and inlines.
+@End Reasoning
+@Implementation
+Layout.allocate(32); write the four slots; children slot defaults to 0
+so consumers know whether an inline pass has populated it.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "md_record_alloc" takes kind as Integer, payload as Integer, secondary as Integer returns Integer:
+    Let rec be proc allocate from Layout with MD_RECORD_SIZE
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, MD_OFF_KIND, kind
+    proc memory_set_int64 from Memory with rec, MD_OFF_PAYLOAD, payload
+    proc memory_set_int64 from Memory with rec, MD_OFF_SECONDARY, secondary
+    proc memory_set_int64 from Memory with rec, MD_OFF_CHILDREN, 0
+    Return rec
+End Process
+
+Note: ============================================================================
+Note: PUBLIC BLOCK CONSTRUCTORS
+Note: ============================================================================
+
+@Reasoning
+Construct an ATX heading per CommonMark 4.2.  Level is clamped to 1..6.
+@End Reasoning
+@Implementation
+md_record_alloc with MD_BLOCK_ATX_HEADING and clamped level.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Caller transfers ownership of the title string.
+@End Security_Scope
+Process called "md_atx_heading" takes title as Integer, level as Integer returns Integer:
+    Let lvl be level
+    If lvl is less than 1:
+        Set lvl to 1
+    End If
+    If lvl is greater than 6:
+        Set lvl to 6
+    End If
+    Return proc md_record_alloc with MD_BLOCK_ATX_HEADING, title, lvl
+End Process
+
+@Reasoning
+Construct a Setext heading per CommonMark 4.3.  Level is 1 (==) or 2 (--).
+@End Reasoning
+@Implementation
+md_record_alloc with MD_BLOCK_SETEXT_HEADING.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned title string.
+@End Security_Scope
+Process called "md_setext_heading" takes title as Integer, level as Integer returns Integer:
+    Let lvl be level
+    If lvl is less than 1:
+        Set lvl to 1
+    End If
+    If lvl is greater than 2:
+        Set lvl to 2
+    End If
+    Return proc md_record_alloc with MD_BLOCK_SETEXT_HEADING, title, lvl
+End Process
+
+@Reasoning
+Construct a paragraph block holding raw text awaiting inline parsing.
+@End Reasoning
+@Implementation
+md_record_alloc with MD_BLOCK_PARAGRAPH.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned text.
+@End Security_Scope
+Process called "md_paragraph" takes raw_text as Integer returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_PARAGRAPH, raw_text, 0
+End Process
+
+@Reasoning
+Construct a thematic break per CommonMark 4.1.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_thematic_break" returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_THEMATIC_BREAK, 0, 0
+End Process
+
+@Reasoning
+Construct a blank-line block marker (rarely retained in output).
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_blank_line" returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_BLANK_LINE, 0, 0
+End Process
+
+@Reasoning
+Fenced code block per CommonMark 4.5.
+@End Reasoning
+@Implementation
+md_record_alloc storing the info string in the secondary slot.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns both strings.
+@End Security_Scope
+Process called "md_fenced_code" takes content as Integer, info as Integer returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_FENCED_CODE, content, info
+End Process
+
+@Reasoning
+Indented code block per CommonMark 4.4.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned text.
+@End Security_Scope
+Process called "md_indented_code" takes content as Integer returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_INDENTED_CODE, content, 0
+End Process
+
+@Reasoning
+HTML block per CommonMark 4.6.
+@End Reasoning
+@Implementation
+md_record_alloc.  No sanitization is performed on the body.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+HTML body is preserved verbatim; sanitization is a separate concern.
+@End Security_Scope
+Process called "md_html_block" takes content as Integer returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_HTML_BLOCK, content, 0
+End Process
+
+@Reasoning
+Block quote per CommonMark 5.1.  Payload is the child-block list.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned child list.
+@End Security_Scope
+Process called "md_block_quote" takes children_list as Integer returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_BLOCK_QUOTE, children_list, 0
+End Process
+
+@Reasoning
+List item per CommonMark 5.2.  Secondary packs marker character and
+ordered-start number.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_list_item" takes children_list as Integer, packed_marker as Integer returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_LIST_ITEM, children_list, packed_marker
+End Process
+
+@Reasoning
+Container list per CommonMark 5.3.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_list" takes items_list as Integer, ordered_loose_start as Integer returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_LIST, items_list, ordered_loose_start
+End Process
+
+@Reasoning
+GFM table row.  is_header non-zero indicates the row is the table head.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_table_row" takes cells_list as Integer, is_header as Integer returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_TABLE_ROW, cells_list, is_header
+End Process
+
+@Reasoning
+Display math block ($$ ... $$).  Pandoc / GitLab extension.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned body.
+@End Security_Scope
+Process called "md_math_block" takes content as Integer returns Integer:
+    Return proc md_record_alloc with MD_BLOCK_MATH_BLOCK, content, 0
+End Process
+
+Note: ============================================================================
+Note: PUBLIC INLINE CONSTRUCTORS
+Note: ============================================================================
+
+@Reasoning
+Text run.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned text.
+@End Security_Scope
+Process called "md_text" takes text as Integer returns Integer:
+    Return proc md_record_alloc with MD_INLINE_TEXT, text, 0
+End Process
+
+@Reasoning
+Emphasis inline (em / strong) per CommonMark 6.2.  Strength 1 emits
+<em>; strength 2 emits <strong>.
+@End Reasoning
+@Implementation
+md_record_alloc + write the children slot.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned children list.
+@End Security_Scope
+Process called "md_emphasis" takes children as Integer, strength as Integer returns Integer:
+    Let n be proc md_record_alloc with MD_INLINE_EMPHASIS, 0, strength
+    If n is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with n, MD_OFF_CHILDREN, children
+    Return n
+End Process
+
+@Reasoning
+Code span per CommonMark 6.1.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned code text.
+@End Security_Scope
+Process called "md_code_span" takes code as Integer returns Integer:
+    Return proc md_record_alloc with MD_INLINE_CODE_SPAN, code, 0
+End Process
+
+@Reasoning
+Link inline per CommonMark 6.5.
+@End Reasoning
+@Implementation
+md_record_alloc + populate children slot for the label.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns href, title, and children.
+@End Security_Scope
+Process called "md_link" takes href as Integer, title as Integer, label_inlines as Integer returns Integer:
+    Let n be proc md_record_alloc with MD_INLINE_LINK, href, title
+    If n is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with n, MD_OFF_CHILDREN, label_inlines
+    Return n
+End Process
+
+@Reasoning
+Autolink per CommonMark 6.4.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned href.
+@End Security_Scope
+Process called "md_auto_link" takes href as Integer returns Integer:
+    Return proc md_record_alloc with MD_INLINE_AUTO_LINK, href, 0
+End Process
+
+@Reasoning
+Image inline per CommonMark 6.6.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns src and alt.
+@End Security_Scope
+Process called "md_image" takes src as Integer, alt as Integer returns Integer:
+    Return proc md_record_alloc with MD_INLINE_IMAGE, src, alt
+End Process
+
+@Reasoning
+Hard line break per CommonMark 6.7.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_hard_line_break" returns Integer:
+    Return proc md_record_alloc with MD_INLINE_HARD_LINE_BREAK, 0, 0
+End Process
+
+@Reasoning
+Soft line break per CommonMark 6.8.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_soft_line_break" returns Integer:
+    Return proc md_record_alloc with MD_INLINE_SOFT_LINE_BREAK, 0, 0
+End Process
+
+@Reasoning
+Raw inline HTML span per CommonMark 6.9.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+No sanitization.
+@End Security_Scope
+Process called "md_html_inline" takes html as Integer returns Integer:
+    Return proc md_record_alloc with MD_INLINE_HTML_INLINE, html, 0
+End Process
+
+@Reasoning
+Inline math span.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_math_inline" takes content as Integer returns Integer:
+    Return proc md_record_alloc with MD_INLINE_MATH_INLINE, content, 0
+End Process
+
+@Reasoning
+Footnote reference (GFM-extension footnotes proposal).
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned label.
+@End Security_Scope
+Process called "md_footnote" takes label as Integer returns Integer:
+    Return proc md_record_alloc with MD_INLINE_FOOTNOTE, label, 0
+End Process
+
+@Reasoning
+GFM strikethrough span per GFM 6.5.
+@End Reasoning
+@Implementation
+md_record_alloc + children slot.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned children.
+@End Security_Scope
+Process called "md_strikethrough" takes children as Integer returns Integer:
+    Let n be proc md_record_alloc with MD_INLINE_STRIKETHROUGH, 0, 0
+    If n is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with n, MD_OFF_CHILDREN, children
+    Return n
+End Process
+
+@Reasoning
+GFM task-list marker per GFM 5.3.
+@End Reasoning
+@Implementation
+md_record_alloc.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_task" takes checked as Integer returns Integer:
+    Return proc md_record_alloc with MD_INLINE_TASK, 0, checked
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS (kind / payload / secondary / children)
+Note: ============================================================================
+
+Process called "md_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, MD_OFF_KIND
+End Process
+
+Process called "md_payload" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, MD_OFF_PAYLOAD
+End Process
+
+Process called "md_secondary" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, MD_OFF_SECONDARY
+End Process
+
+Process called "md_children" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, MD_OFF_CHILDREN
+End Process
+
+Process called "md_set_children" takes node as Integer, children as Integer returns Integer:
+    If node is equal to 0:
+        Return MD_NULL_ARG
+    End If
+    proc memory_set_int64 from Memory with node, MD_OFF_CHILDREN, children
+    Return MD_OK
+End Process
+
+Note: ============================================================================
+Note: DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Recursively destroy an inline node and any owned children/strings.
+Strings owned by inline records were allocated by string_substring or
+string_duplicate calls in this module; the destructor frees them via
+Layout.deallocate.
+@End Reasoning
+@Implementation
+Walk children list first if present (recursive), free the list itself,
+then dispatch on the tag to free payload/secondary strings, finally
+free the 32-byte record.
+@End Implementation
+@Performance_Hints
+O(subtree size).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_inline_destroy" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return MD_OK
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, MD_OFF_KIND
+    Let payload be proc memory_get_int64 from Memory with node, MD_OFF_PAYLOAD
+    Let secondary be proc memory_get_int64 from Memory with node, MD_OFF_SECONDARY
+    Let children be proc memory_get_int64 from Memory with node, MD_OFF_CHILDREN
+
+    If children is not equal to 0:
+        Let cc be proc list_length from List with children
+        Let i be 0
+        While i is less than cc:
+            Let c be proc list_get from List with children, i
+            proc md_inline_destroy with c
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with children
+    End If
+
+    Let frees_payload be 0
+    If kind is equal to MD_INLINE_TEXT:
+        Set frees_payload to 1
+    End If
+    If kind is equal to MD_INLINE_CODE_SPAN:
+        Set frees_payload to 1
+    End If
+    If kind is equal to MD_INLINE_LINK:
+        Set frees_payload to 1
+    End If
+    If kind is equal to MD_INLINE_AUTO_LINK:
+        Set frees_payload to 1
+    End If
+    If kind is equal to MD_INLINE_IMAGE:
+        Set frees_payload to 1
+    End If
+    If kind is equal to MD_INLINE_HTML_INLINE:
+        Set frees_payload to 1
+    End If
+    If kind is equal to MD_INLINE_MATH_INLINE:
+        Set frees_payload to 1
+    End If
+    If kind is equal to MD_INLINE_FOOTNOTE:
+        Set frees_payload to 1
+    End If
+    If frees_payload is equal to 1:
+        If payload is not equal to 0:
+            proc deallocate from Layout with payload
+        End If
+    End If
+
+    Let frees_secondary be 0
+    If kind is equal to MD_INLINE_LINK:
+        Set frees_secondary to 1
+    End If
+    If kind is equal to MD_INLINE_IMAGE:
+        Set frees_secondary to 1
+    End If
+    If frees_secondary is equal to 1:
+        If secondary is not equal to 0:
+            proc deallocate from Layout with secondary
+        End If
+    End If
+
+    proc deallocate from Layout with node
+    Return MD_OK
+End Process
+
+@Reasoning
+Recursively destroy a block node.  Mirrors md_inline_destroy.
+@End Reasoning
+@Implementation
+Walk inline-children list freeing each inline; then dispatch on kind to
+free payload strings or recurse into block-bearing payloads (block
+quotes, list items, lists).
+@End Implementation
+@Performance_Hints
+O(subtree size).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_block_destroy" takes block as Integer returns Integer:
+    If block is equal to 0:
+        Return MD_OK
+    End If
+    Let kind be proc memory_get_int64 from Memory with block, MD_OFF_KIND
+    Let payload be proc memory_get_int64 from Memory with block, MD_OFF_PAYLOAD
+    Let secondary be proc memory_get_int64 from Memory with block, MD_OFF_SECONDARY
+    Let children be proc memory_get_int64 from Memory with block, MD_OFF_CHILDREN
+
+    If children is not equal to 0:
+        Let cc be proc list_length from List with children
+        Let i be 0
+        While i is less than cc:
+            Let c be proc list_get from List with children, i
+            proc md_inline_destroy with c
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with children
+    End If
+
+    Let frees_string_payload be 0
+    If kind is equal to MD_BLOCK_ATX_HEADING:
+        Set frees_string_payload to 1
+    End If
+    If kind is equal to MD_BLOCK_SETEXT_HEADING:
+        Set frees_string_payload to 1
+    End If
+    If kind is equal to MD_BLOCK_INDENTED_CODE:
+        Set frees_string_payload to 1
+    End If
+    If kind is equal to MD_BLOCK_FENCED_CODE:
+        Set frees_string_payload to 1
+    End If
+    If kind is equal to MD_BLOCK_HTML_BLOCK:
+        Set frees_string_payload to 1
+    End If
+    If kind is equal to MD_BLOCK_PARAGRAPH:
+        Set frees_string_payload to 1
+    End If
+    If kind is equal to MD_BLOCK_MATH_BLOCK:
+        Set frees_string_payload to 1
+    End If
+    If kind is equal to MD_BLOCK_LINK_REFERENCE_DEF:
+        Set frees_string_payload to 1
+    End If
+    If frees_string_payload is equal to 1:
+        If payload is not equal to 0:
+            proc deallocate from Layout with payload
+        End If
+    End If
+    If kind is equal to MD_BLOCK_FENCED_CODE:
+        If secondary is not equal to 0:
+            proc deallocate from Layout with secondary
+        End If
+    End If
+
+    Let frees_block_list be 0
+    If kind is equal to MD_BLOCK_BLOCK_QUOTE:
+        Set frees_block_list to 1
+    End If
+    If kind is equal to MD_BLOCK_LIST_ITEM:
+        Set frees_block_list to 1
+    End If
+    If kind is equal to MD_BLOCK_LIST:
+        Set frees_block_list to 1
+    End If
+    If frees_block_list is equal to 1:
+        If payload is not equal to 0:
+            proc md_block_list_destroy with payload
+        End If
+    End If
+    If kind is equal to MD_BLOCK_TABLE_ROW:
+        If payload is not equal to 0:
+            Let tc be proc list_length from List with payload
+            Let j be 0
+            While j is less than tc:
+                Let cell be proc list_get from List with payload, j
+                If cell is not equal to 0:
+                    proc deallocate from Layout with cell
+                End If
+                Set j to j plus 1
+            End While
+            proc list_destroy from List with payload
+        End If
+    End If
+
+    proc deallocate from Layout with block
+    Return MD_OK
+End Process
+
+@Reasoning
+Destroy a List of block nodes and free the list itself.
+@End Reasoning
+@Implementation
+Iterate and call md_block_destroy on each entry; list_destroy when done.
+@End Implementation
+@Performance_Hints
+O(total tree size).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_block_list_destroy" takes blocks as Integer returns Integer:
+    If blocks is equal to 0:
+        Return MD_OK
+    End If
+    Let cc be proc list_length from List with blocks
+    Let i be 0
+    While i is less than cc:
+        Let b be proc list_get from List with blocks, i
+        proc md_block_destroy with b
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with blocks
+    Return MD_OK
+End Process
+
+Note: ============================================================================
+Note: LINE-SCAN HELPERS
+Note: ============================================================================
+
+@Reasoning
+Locate the next LF at or after start_offset, returning its index, or the
+string length if none.
+@End Reasoning
+@Implementation
+Linear byte scan.
+@End Implementation
+@Performance_Hints
+O(line length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_find_newline" takes str as Integer, start_offset as Integer returns Integer:
+    Let len be proc string_length from StringCore with str
+    Let i be start_offset
+    While i is less than len:
+        Let b be proc string_char_at from StringCore with str, i
+        If b is equal to ASCII_NEWLINE:
+            Return i
+        End If
+        Set i to i plus 1
+    End While
+    Return len
+End Process
+
+@Reasoning
+Return 1 if [start, end) is empty or whitespace-only per CommonMark
+definition of a blank line.
+@End Reasoning
+@Implementation
+Byte scan; only spaces and tabs allowed.
+@End Implementation
+@Performance_Hints
+O(line length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_is_blank_range" takes str as Integer, start_off as Integer, end_off as Integer returns Integer:
+    Let i be start_off
+    While i is less than end_off:
+        Let b be proc string_char_at from StringCore with str, i
+        Let is_ws be 0
+        If b is equal to ASCII_SPACE:
+            Set is_ws to 1
+        End If
+        If b is equal to ASCII_TAB:
+            Set is_ws to 1
+        End If
+        If is_ws is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Skip up to 3 leading spaces and return the resulting offset.  Used by
+all block classifiers (CommonMark allows 0..3 leading-space indent on
+all block markers except indented code blocks).
+@End Reasoning
+@Implementation
+Linear scan, capped at 3 spaces.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_skip_up_to_3_spaces" takes str as Integer, start_off as Integer, end_off as Integer returns Integer:
+    Let i be start_off
+    Let count be 0
+    While i is less than end_off:
+        If count is greater than or equal to 3:
+            Return i
+        End If
+        Let b be proc string_char_at from StringCore with str, i
+        If b is not equal to ASCII_SPACE:
+            Return i
+        End If
+        Set i to i plus 1
+        Set count to count plus 1
+    End While
+    Return i
+End Process
+
+@Reasoning
+Identify ATX heading and return the level (1..6) or 0 if not an ATX
+heading.
+@End Reasoning
+@Implementation
+Skip up to 3 spaces.  Count 1..6 hashes.  Require space, tab, or end of
+line after the hashes.
+@End Implementation
+@Performance_Hints
+O(level).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_classify_atx_heading" takes str as Integer, start_off as Integer, end_off as Integer returns Integer:
+    Let p be proc md_skip_up_to_3_spaces with str, start_off, end_off
+    If p is greater than or equal to end_off:
+        Return 0
+    End If
+    Let count be 0
+    While p is less than end_off:
+        Let b be proc string_char_at from StringCore with str, p
+        If b is not equal to ASCII_HASH:
+            If count is equal to 0:
+                Return 0
+            End If
+            If count is greater than 6:
+                Return 0
+            End If
+            If b is equal to ASCII_SPACE:
+                Return count
+            End If
+            If b is equal to ASCII_TAB:
+                Return count
+            End If
+            Return 0
+        End If
+        Set count to count plus 1
+        If count is greater than 6:
+            Return 0
+        End If
+        Set p to p plus 1
+    End While
+    If count is greater than 0:
+        If count is less than or equal to 6:
+            Return count
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Extract the trimmed title text of an ATX heading line.
+@End Reasoning
+@Implementation
+Skip indent, hashes, leading spaces.  Walk to line_end, then back-trim
+trailing whitespace.  Trim a trailing hash run if preceded by whitespace.
+Allocate a duplicated substring.
+@End Implementation
+@Performance_Hints
+O(line length).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "md_extract_atx_title" takes str as Integer, line_start as Integer, line_end as Integer returns Integer:
+    Let p be proc md_skip_up_to_3_spaces with str, line_start, line_end
+    Note: Skip the leading hash run.
+    Let hashes_done be 0
+    While hashes_done is equal to 0:
+        If p is greater than or equal to line_end:
+            Set hashes_done to 1
+        End If
+        If p is less than line_end:
+            Let b be proc string_char_at from StringCore with str, p
+            If b is equal to ASCII_HASH:
+                Set p to p plus 1
+            End If
+            If b is not equal to ASCII_HASH:
+                Set hashes_done to 1
+            End If
+        End If
+    End While
+    Note: Skip whitespace separating hashes from title.
+    Let ws_done be 0
+    While ws_done is equal to 0:
+        If p is greater than or equal to line_end:
+            Set ws_done to 1
+        End If
+        If p is less than line_end:
+            Let b be proc string_char_at from StringCore with str, p
+            If b is equal to ASCII_SPACE:
+                Set p to p plus 1
+            End If
+            If b is equal to ASCII_TAB:
+                Set p to p plus 1
+            End If
+            If b is not equal to ASCII_SPACE:
+                If b is not equal to ASCII_TAB:
+                    Set ws_done to 1
+                End If
+            End If
+        End If
+    End While
+    Let title_start be p
+    Note: Back-trim trailing whitespace.
+    Let end_pos be line_end
+    While end_pos is greater than title_start:
+        Let bb be proc string_char_at from StringCore with str, end_pos minus 1
+        Let is_ws2 be 0
+        If bb is equal to ASCII_SPACE:
+            Set is_ws2 to 1
+        End If
+        If bb is equal to ASCII_TAB:
+            Set is_ws2 to 1
+        End If
+        If is_ws2 is equal to 1:
+            Set end_pos to end_pos minus 1
+        End If
+        If is_ws2 is equal to 0:
+            Set end_pos to title_start
+        End If
+    End While
+    If end_pos is less than title_start:
+        Set end_pos to title_start
+    End If
+    Note: Trim trailing hash run if preceded by whitespace.
+    Let hash_end be end_pos
+    While hash_end is greater than title_start:
+        Let bb be proc string_char_at from StringCore with str, hash_end minus 1
+        If bb is equal to ASCII_HASH:
+            Set hash_end to hash_end minus 1
+        End If
+        If bb is not equal to ASCII_HASH:
+            Set hash_end to title_start
+        End If
+    End While
+    If hash_end is less than end_pos:
+        If hash_end is greater than title_start:
+            Let pre be proc string_char_at from StringCore with str, hash_end minus 1
+            Let is_ws3 be 0
+            If pre is equal to ASCII_SPACE:
+                Set is_ws3 to 1
+            End If
+            If pre is equal to ASCII_TAB:
+                Set is_ws3 to 1
+            End If
+            If is_ws3 is equal to 1:
+                Set end_pos to hash_end minus 1
+                While end_pos is greater than title_start:
+                    Let bb2 be proc string_char_at from StringCore with str, end_pos minus 1
+                    Let is_ws4 be 0
+                    If bb2 is equal to ASCII_SPACE:
+                        Set is_ws4 to 1
+                    End If
+                    If bb2 is equal to ASCII_TAB:
+                        Set is_ws4 to 1
+                    End If
+                    If is_ws4 is equal to 1:
+                        Set end_pos to end_pos minus 1
+                    End If
+                    If is_ws4 is equal to 0:
+                        Set end_pos to title_start
+                    End If
+                End While
+                If end_pos is less than title_start:
+                    Set end_pos to title_start
+                End If
+            End If
+        End If
+    End If
+    Let title_len be end_pos minus title_start
+    If title_len is less than 0:
+        Set title_len to 0
+    End If
+    Return proc string_substring from StringPrim with str, title_start, title_len
+End Process
+
+@Reasoning
+Identify a thematic break per CommonMark 4.1: three or more of '-',
+'_', or '*' with optional intervening spaces/tabs and up to 3 leading
+spaces of indent.
+@End Reasoning
+@Implementation
+Skip indent.  Read marker.  Count occurrences while permitting spaces
+and tabs; reject any other byte.  Need >= 3.
+@End Implementation
+@Performance_Hints
+O(line length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_is_thematic_break" takes str as Integer, start_off as Integer, end_off as Integer returns Integer:
+    Let p be proc md_skip_up_to_3_spaces with str, start_off, end_off
+    If p is greater than or equal to end_off:
+        Return 0
+    End If
+    Let marker be proc string_char_at from StringCore with str, p
+    Let ok be 0
+    If marker is equal to ASCII_DASH:
+        Set ok to 1
+    End If
+    If marker is equal to ASCII_UNDERSCORE:
+        Set ok to 1
+    End If
+    If marker is equal to ASCII_STAR:
+        Set ok to 1
+    End If
+    If ok is equal to 0:
+        Return 0
+    End If
+    Let count be 0
+    While p is less than end_off:
+        Let b be proc string_char_at from StringCore with str, p
+        If b is equal to marker:
+            Set count to count plus 1
+        End If
+        If b is not equal to marker:
+            Let is_ws be 0
+            If b is equal to ASCII_SPACE:
+                Set is_ws to 1
+            End If
+            If b is equal to ASCII_TAB:
+                Set is_ws to 1
+            End If
+            If is_ws is equal to 0:
+                Return 0
+            End If
+        End If
+        Set p to p plus 1
+    End While
+    If count is greater than or equal to 3:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Identify a fenced-code opening fence and return its width (>= 3) or 0
+if the line is not a fence opener.
+@End Reasoning
+@Implementation
+Skip up to 3 spaces.  Read marker (backtick or tilde).  Count run.
+@End Implementation
+@Performance_Hints
+O(line length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_fence_open_width" takes str as Integer, start_off as Integer, end_off as Integer returns Integer:
+    Let p be proc md_skip_up_to_3_spaces with str, start_off, end_off
+    If p is greater than or equal to end_off:
+        Return 0
+    End If
+    Let marker be proc string_char_at from StringCore with str, p
+    Let ok be 0
+    If marker is equal to ASCII_BACKTICK:
+        Set ok to 1
+    End If
+    If marker is equal to ASCII_TILDE:
+        Set ok to 1
+    End If
+    If ok is equal to 0:
+        Return 0
+    End If
+    Let count be 0
+    While p is less than end_off:
+        Let b be proc string_char_at from StringCore with str, p
+        If b is equal to marker:
+            Set count to count plus 1
+            Set p to p plus 1
+        End If
+        If b is not equal to marker:
+            Set p to end_off
+        End If
+    End While
+    If count is greater than or equal to 3:
+        Return count
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Return the fence character byte for an opening fence line.
+@End Reasoning
+@Implementation
+Skip indent and read the first byte.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_fence_char" takes str as Integer, start_off as Integer, end_off as Integer returns Integer:
+    Let p be proc md_skip_up_to_3_spaces with str, start_off, end_off
+    If p is greater than or equal to end_off:
+        Return 0
+    End If
+    Return proc string_char_at from StringCore with str, p
+End Process
+
+@Reasoning
+Detect a fenced-code closing fence: same character, run-length >=
+opening, only spaces or tabs after the fence.
+@End Reasoning
+@Implementation
+Skip up to 3 spaces, count matching characters, require trailing
+blank-ish.
+@End Implementation
+@Performance_Hints
+O(line length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_is_fence_close" takes str as Integer, start_off as Integer, end_off as Integer, fence_char as Integer, opening_width as Integer returns Integer:
+    Let p be proc md_skip_up_to_3_spaces with str, start_off, end_off
+    If p is greater than or equal to end_off:
+        Return 0
+    End If
+    Let count be 0
+    While p is less than end_off:
+        Let b be proc string_char_at from StringCore with str, p
+        If b is equal to fence_char:
+            Set count to count plus 1
+            Set p to p plus 1
+        End If
+        If b is not equal to fence_char:
+            Set p to end_off
+        End If
+    End While
+    If count is less than opening_width:
+        Return 0
+    End If
+    Note: Remainder of line must be blank.
+    Let rest_p be proc md_skip_up_to_3_spaces with str, start_off, end_off
+    Let q be rest_p plus count
+    Let blank be proc md_is_blank_range with str, q, end_off
+    Return blank
+End Process
+
+@Reasoning
+Detect a block-quote start: '>' optionally preceded by up to 3 spaces
+and optionally followed by one space.  Returns the offset just past the
+marker on success, or -1 on no match.
+@End Reasoning
+@Implementation
+Skip indent.  Match '>'.  Optionally consume one space or tab.
+@End Implementation
+@Performance_Hints
+O(indent length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_block_quote_marker_end" takes str as Integer, start_off as Integer, end_off as Integer returns Integer:
+    Let p be proc md_skip_up_to_3_spaces with str, start_off, end_off
+    If p is greater than or equal to end_off:
+        Return -1
+    End If
+    Let b be proc string_char_at from StringCore with str, p
+    If b is not equal to ASCII_GT:
+        Return -1
+    End If
+    Set p to p plus 1
+    If p is less than end_off:
+        Let nb be proc string_char_at from StringCore with str, p
+        If nb is equal to ASCII_SPACE:
+            Set p to p plus 1
+        End If
+    End If
+    Return p
+End Process
+
+Note: ============================================================================
+Note: BUILDER HELPERS
+Note: ============================================================================
+
+@Reasoning
+Append the substring [pos, line_end) plus a trailing LF to a builder.
+@End Reasoning
+@Implementation
+string_substring + stringbuilder_append + stringbuilder_append_char(LF).
+@End Implementation
+@Performance_Hints
+O(line length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_builder_append_line" takes builder as Integer, source as Integer, pos as Integer, line_end as Integer returns Integer:
+    Let body_len be line_end minus pos
+    If body_len is greater than 0:
+        Let chunk be proc string_substring from StringPrim with source, pos, body_len
+        If chunk is not equal to 0:
+            proc stringbuilder_append from SB with builder, chunk
+            proc deallocate from Layout with chunk
+        End If
+    End If
+    proc stringbuilder_append_char from SB with builder, ASCII_NEWLINE
+    Return MD_OK
+End Process
+
+@Reasoning
+Flush a paragraph builder into a freshly-allocated paragraph block and
+push it onto the blocks list.  Resets the builder pointer through the
+two-element pointer-array passed by the caller (see markdown_parse).
+@End Reasoning
+@Implementation
+If builder non-zero: stringbuilder_to_string, destroy builder, build
+paragraph block, push onto list, store 0 in the builder slot.
+@End Implementation
+@Performance_Hints
+O(builder length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_flush_paragraph" takes blocks as Integer, builder_slot as Integer returns Integer:
+    Let builder be proc memory_get_int64 from Memory with builder_slot, 0
+    If builder is equal to 0:
+        Return MD_OK
+    End If
+    Let s be proc stringbuilder_to_string from SB with builder
+    proc stringbuilder_destroy from SB with builder
+    Let blk be proc md_paragraph with s
+    proc list_push from List with blocks, blk
+    proc memory_set_int64 from Memory with builder_slot, 0, 0
+    Return MD_OK
+End Process
+
+Note: ============================================================================
+Note: BLOCK PARSER
+Note: ============================================================================
+
+@Reasoning
+Parse a Markdown source string into a List of MarkdownBlocks.  Covers:
+  - Thematic breaks
+  - ATX headings 1..6
+  - Fenced code blocks (with optional info string)
+  - Block quotes (recursively parses interior)
+  - Blank lines
+  - Paragraphs (any other line)
+
+After the block pass completes, every paragraph and ATX heading is run
+through markdown_parse_inlines to populate its inline-children slot.
+@End Reasoning
+
+@Implementation
+Single linear scan.  Maintains:
+  - blocks: the output List
+  - para_slot: a one-cell buffer holding the in-progress paragraph
+    builder pointer (or 0)
+  - fence_open / fence_char / fence_width / fence_buf: fenced-code state
+
+Loop per line:
+  1. If in a fence, test for close; otherwise append the line.
+  2. Else classify the line and emit the appropriate block.
+@End Implementation
+
+@Performance_Hints
+O(N) in source bytes for the block pass and O(N) for the inline pass.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on OOM at any allocation point.  Partial trees from OOM are
+not freed.
+@End Security_Scope
+Process called "markdown_parse" takes source as Integer returns Integer:
+    Let blocks be proc list_create from List
+    If blocks is equal to 0:
+        Return 0
+    End If
+    If source is equal to 0:
+        Return blocks
+    End If
+    Let total_len be proc string_length from StringCore with source
+    Let pos be 0
+
+    Note: One-cell holder for the paragraph builder pointer.
+    Let para_slot be proc allocate from Layout with 8
+    proc memory_set_int64 from Memory with para_slot, 0, 0
+
+    Let fence_open be 0
+    Let fence_char be 0
+    Let fence_width be 0
+    Let fence_buf be 0
+    Let fence_info be 0
+
+    While pos is less than total_len:
+        Let line_end be proc md_find_newline with source, pos
+        Let next_pos be line_end plus 1
+
+        If fence_open is equal to 1:
+            Let closing be proc md_is_fence_close with source, pos, line_end, fence_char, fence_width
+            If closing is equal to 1:
+                Let body be proc stringbuilder_to_string from SB with fence_buf
+                proc stringbuilder_destroy from SB with fence_buf
+                Set fence_buf to 0
+                Let blk be proc md_fenced_code with body, fence_info
+                proc list_push from List with blocks, blk
+                Set fence_open to 0
+                Set fence_info to 0
+            End If
+            If closing is equal to 0:
+                proc md_builder_append_line with fence_buf, source, pos, line_end
+            End If
+            Set pos to next_pos
+        End If
+
+        If fence_open is equal to 0:
+            Let blank be proc md_is_blank_range with source, pos, line_end
+            If blank is equal to 1:
+                proc md_flush_paragraph with blocks, para_slot
+                Set pos to next_pos
+            End If
+            If blank is equal to 0:
+                Let lvl be proc md_classify_atx_heading with source, pos, line_end
+                If lvl is greater than 0:
+                    proc md_flush_paragraph with blocks, para_slot
+                    Let title be proc md_extract_atx_title with source, pos, line_end
+                    Let blk2 be proc md_atx_heading with title, lvl
+                    proc list_push from List with blocks, blk2
+                    Set pos to next_pos
+                End If
+                If lvl is equal to 0:
+                    Let tb be proc md_is_thematic_break with source, pos, line_end
+                    If tb is equal to 1:
+                        proc md_flush_paragraph with blocks, para_slot
+                        Let blk3 be proc md_thematic_break
+                        proc list_push from List with blocks, blk3
+                        Set pos to next_pos
+                    End If
+                    If tb is equal to 0:
+                        Let fw be proc md_fence_open_width with source, pos, line_end
+                        If fw is greater than 0:
+                            proc md_flush_paragraph with blocks, para_slot
+                            Set fence_open to 1
+                            Set fence_char to (proc md_fence_char with source, pos, line_end)
+                            Set fence_width to fw
+                            Set fence_buf to (proc stringbuilder_create from SB)
+                            Note: Capture info string (after fence run, trimmed).
+                            Let info_p be proc md_skip_up_to_3_spaces with source, pos, line_end
+                            Let info_after be info_p plus fw
+                            Note: Skip whitespace after fence run.
+                            While info_after is less than line_end:
+                                Let ib be proc string_char_at from StringCore with source, info_after
+                                Let ib_ws be 0
+                                If ib is equal to ASCII_SPACE:
+                                    Set ib_ws to 1
+                                End If
+                                If ib is equal to ASCII_TAB:
+                                    Set ib_ws to 1
+                                End If
+                                If ib_ws is equal to 0:
+                                    Set info_after to line_end
+                                End If
+                                If ib_ws is equal to 1:
+                                    Set info_after to info_after plus 1
+                                End If
+                            End While
+                            Note: info_after may have walked past; re-derive.
+                            Let info_real_start be info_p plus fw
+                            While info_real_start is less than line_end:
+                                Let rb be proc string_char_at from StringCore with source, info_real_start
+                                Let rb_ws be 0
+                                If rb is equal to ASCII_SPACE:
+                                    Set rb_ws to 1
+                                End If
+                                If rb is equal to ASCII_TAB:
+                                    Set rb_ws to 1
+                                End If
+                                If rb_ws is equal to 0:
+                                    Set info_after to info_real_start
+                                    Set info_real_start to line_end
+                                End If
+                                If rb_ws is equal to 1:
+                                    Set info_real_start to info_real_start plus 1
+                                End If
+                            End While
+                            If info_after is less than line_end:
+                                Let info_len be line_end minus info_after
+                                If info_len is greater than 0:
+                                    Set fence_info to (proc string_substring from StringPrim with source, info_after, info_len)
+                                End If
+                            End If
+                            Set pos to next_pos
+                        End If
+                        If fw is equal to 0:
+                            Let bq_end be proc md_block_quote_marker_end with source, pos, line_end
+                            If bq_end is greater than or equal to 0:
+                                proc md_flush_paragraph with blocks, para_slot
+                                Note: Accumulate quote interior until a non-quote line.
+                                Let qbuf be proc stringbuilder_create from SB
+                                proc md_builder_append_line with qbuf, source, bq_end, line_end
+                                Set pos to next_pos
+                                Let keep_going be 1
+                                While keep_going is equal to 1:
+                                    If pos is greater than or equal to total_len:
+                                        Set keep_going to 0
+                                    End If
+                                    If pos is less than total_len:
+                                        Let nl_end be proc md_find_newline with source, pos
+                                        Let nq_end be proc md_block_quote_marker_end with source, pos, nl_end
+                                        If nq_end is greater than or equal to 0:
+                                            proc md_builder_append_line with qbuf, source, nq_end, nl_end
+                                            Set pos to nl_end plus 1
+                                        End If
+                                        If nq_end is less than 0:
+                                            Set keep_going to 0
+                                        End If
+                                    End If
+                                End While
+                                Let qtext be proc stringbuilder_to_string from SB with qbuf
+                                proc stringbuilder_destroy from SB with qbuf
+                                Let inner_blocks be proc markdown_parse with qtext
+                                proc deallocate from Layout with qtext
+                                Let qblk be proc md_block_quote with inner_blocks
+                                proc list_push from List with blocks, qblk
+                            End If
+                            If bq_end is less than 0:
+                                Note: Paragraph continuation.
+                                Let pbuf be proc memory_get_int64 from Memory with para_slot, 0
+                                If pbuf is equal to 0:
+                                    Set pbuf to (proc stringbuilder_create from SB)
+                                    proc memory_set_int64 from Memory with para_slot, 0, pbuf
+                                End If
+                                proc md_builder_append_line with pbuf, source, pos, line_end
+                                Set pos to next_pos
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    proc md_flush_paragraph with blocks, para_slot
+    If fence_open is equal to 1:
+        Let body2 be proc stringbuilder_to_string from SB with fence_buf
+        proc stringbuilder_destroy from SB with fence_buf
+        Let unclosed_blk be proc md_fenced_code with body2, fence_info
+        proc list_push from List with blocks, unclosed_blk
+    End If
+    proc deallocate from Layout with para_slot
+
+    Note: Inline pass.
+    proc md_run_inline_pass with blocks
+    Return blocks
+End Process
+
+@Reasoning
+For every paragraph / ATX heading / block-quote in the blocks list,
+parse its raw payload into an inline AST and attach to children slot.
+Block-quote bodies are themselves block lists, so they recurse.
+@End Reasoning
+@Implementation
+Linear scan, dispatch on kind.
+@End Implementation
+@Performance_Hints
+O(total inline-bearing payload size).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_run_inline_pass" takes blocks as Integer returns Integer:
+    If blocks is equal to 0:
+        Return MD_OK
+    End If
+    Let count be proc list_length from List with blocks
+    Let i be 0
+    While i is less than count:
+        Let b be proc list_get from List with blocks, i
+        Let kind be proc memory_get_int64 from Memory with b, MD_OFF_KIND
+        Let payload be proc memory_get_int64 from Memory with b, MD_OFF_PAYLOAD
+        If kind is equal to MD_BLOCK_PARAGRAPH:
+            If payload is not equal to 0:
+                Let il be proc markdown_parse_inlines with payload
+                proc memory_set_int64 from Memory with b, MD_OFF_CHILDREN, il
+            End If
+        End If
+        If kind is equal to MD_BLOCK_ATX_HEADING:
+            If payload is not equal to 0:
+                Let il2 be proc markdown_parse_inlines with payload
+                proc memory_set_int64 from Memory with b, MD_OFF_CHILDREN, il2
+            End If
+        End If
+        If kind is equal to MD_BLOCK_BLOCK_QUOTE:
+            If payload is not equal to 0:
+                proc md_run_inline_pass with payload
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return MD_OK
+End Process
+
+Note: ============================================================================
+Note: INLINE PARSER
+Note: ============================================================================
+
+@Reasoning
+Parse inline content into a List of MarkdownInline records.  Implements:
+  - Backslash escapes of ASCII punctuation (CommonMark 2.4).
+  - Code spans `code` with matching backtick-run length (CommonMark 6.1).
+  - Emphasis '*x*' / '**x**' and '_x_' / '__x__' (CommonMark 6.2 simple
+    flanking).
+  - Inline links [label](href) and [label](href "title") (CommonMark 6.5).
+  - Autolinks <scheme:...> and <user@host> (CommonMark 6.4).
+  - Hard line break = two trailing spaces before LF (CommonMark 6.7).
+  - Soft line break = LF otherwise (CommonMark 6.8).
+  - GFM strikethrough ~~x~~ (GFM 6.5).
+@End Reasoning
+
+@Implementation
+Single-pass byte scanner accumulating literal text in a builder and
+emitting inline records at delimiter boundaries.  Each delimiter path
+flushes the text buffer first.
+@End Implementation
+
+@Performance_Hints
+O(N) in payload bytes.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "markdown_parse_inlines" takes text as Integer returns Integer:
+    Let inlines be proc list_create from List
+    If inlines is equal to 0:
+        Return 0
+    End If
+    If text is equal to 0:
+        Return inlines
+    End If
+    Let len be proc string_length from StringCore with text
+    Let i be 0
+    Let buf be proc stringbuilder_create from SB
+
+    While i is less than len:
+        Let c be proc string_char_at from StringCore with text, i
+
+        Let handled be 0
+        If c is equal to ASCII_BACKSLASH:
+            Set handled to 1
+            Let nxt be i plus 1
+            If nxt is less than len:
+                Let nb be proc string_char_at from StringCore with text, nxt
+                Let is_punct be proc md_is_ascii_punctuation with nb
+                If is_punct is equal to 1:
+                    proc stringbuilder_append_char from SB with buf, nb
+                    Set i to nxt plus 1
+                End If
+                If is_punct is equal to 0:
+                    proc stringbuilder_append_char from SB with buf, c
+                    Set i to nxt
+                End If
+            End If
+            If nxt is greater than or equal to len:
+                proc stringbuilder_append_char from SB with buf, c
+                Set i to i plus 1
+            End If
+        End If
+
+        If handled is equal to 0:
+            If c is equal to ASCII_BACKTICK:
+                Set handled to 1
+                Let adv be proc md_try_code_span with text, i, len, inlines, buf
+                If adv is greater than 0:
+                    Set i to i plus adv
+                End If
+                If adv is equal to 0:
+                    proc stringbuilder_append_char from SB with buf, c
+                    Set i to i plus 1
+                End If
+            End If
+        End If
+
+        If handled is equal to 0:
+            If c is equal to ASCII_NEWLINE:
+                Set handled to 1
+                proc md_handle_line_break with text, i, inlines, buf
+                Set i to i plus 1
+            End If
+        End If
+
+        If handled is equal to 0:
+            If c is equal to ASCII_LBRACKET:
+                Set handled to 1
+                Let lk_adv be proc md_try_link with text, i, len, inlines, buf
+                If lk_adv is greater than 0:
+                    Set i to i plus lk_adv
+                End If
+                If lk_adv is equal to 0:
+                    proc stringbuilder_append_char from SB with buf, c
+                    Set i to i plus 1
+                End If
+            End If
+        End If
+
+        If handled is equal to 0:
+            If c is equal to ASCII_LT:
+                Set handled to 1
+                Let al_end be proc md_try_autolink with text, i plus 1, len
+                If al_end is greater than 0:
+                    proc md_flush_text_buffer with inlines, buf
+                    Let href be proc string_substring from StringPrim with text, i plus 1, al_end minus (i plus 1)
+                    Let an be proc md_auto_link with href
+                    proc list_push from List with inlines, an
+                    Set i to al_end plus 1
+                End If
+                If al_end is equal to 0:
+                    proc stringbuilder_append_char from SB with buf, c
+                    Set i to i plus 1
+                End If
+            End If
+        End If
+
+        If handled is equal to 0:
+            If c is equal to ASCII_STAR:
+                Set handled to 1
+                Let em_adv be proc md_try_emphasis with text, i, len, inlines, buf, ASCII_STAR
+                If em_adv is greater than 0:
+                    Set i to i plus em_adv
+                End If
+                If em_adv is equal to 0:
+                    proc stringbuilder_append_char from SB with buf, c
+                    Set i to i plus 1
+                End If
+            End If
+        End If
+
+        If handled is equal to 0:
+            If c is equal to ASCII_UNDERSCORE:
+                Set handled to 1
+                Let em_adv2 be proc md_try_emphasis with text, i, len, inlines, buf, ASCII_UNDERSCORE
+                If em_adv2 is greater than 0:
+                    Set i to i plus em_adv2
+                End If
+                If em_adv2 is equal to 0:
+                    proc stringbuilder_append_char from SB with buf, c
+                    Set i to i plus 1
+                End If
+            End If
+        End If
+
+        If handled is equal to 0:
+            If c is equal to ASCII_TILDE:
+                Set handled to 1
+                Let st_adv be proc md_try_strikethrough with text, i, len, inlines, buf
+                If st_adv is greater than 0:
+                    Set i to i plus st_adv
+                End If
+                If st_adv is equal to 0:
+                    proc stringbuilder_append_char from SB with buf, c
+                    Set i to i plus 1
+                End If
+            End If
+        End If
+
+        If handled is equal to 0:
+            proc stringbuilder_append_char from SB with buf, c
+            Set i to i plus 1
+        End If
+    End While
+
+    proc md_flush_text_buffer with inlines, buf
+    proc stringbuilder_destroy from SB with buf
+    Return inlines
+End Process
+
+@Reasoning
+Test whether a byte is in CommonMark's set of escapable ASCII punctuation
+(CommonMark 2.4): the 32 characters from `!` to `~` that are punctuation.
+@End Reasoning
+@Implementation
+Explicit membership list.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_is_ascii_punctuation" takes b as Integer returns Integer:
+    Let r be 0
+    If b is equal to 33:
+        Set r to 1
+    End If
+    If b is equal to 34:
+        Set r to 1
+    End If
+    If b is equal to 35:
+        Set r to 1
+    End If
+    If b is equal to 36:
+        Set r to 1
+    End If
+    If b is equal to 37:
+        Set r to 1
+    End If
+    If b is equal to 38:
+        Set r to 1
+    End If
+    If b is equal to 39:
+        Set r to 1
+    End If
+    If b is equal to 40:
+        Set r to 1
+    End If
+    If b is equal to 41:
+        Set r to 1
+    End If
+    If b is equal to 42:
+        Set r to 1
+    End If
+    If b is equal to 43:
+        Set r to 1
+    End If
+    If b is equal to 44:
+        Set r to 1
+    End If
+    If b is equal to 45:
+        Set r to 1
+    End If
+    If b is equal to 46:
+        Set r to 1
+    End If
+    If b is equal to 47:
+        Set r to 1
+    End If
+    If b is equal to 58:
+        Set r to 1
+    End If
+    If b is equal to 59:
+        Set r to 1
+    End If
+    If b is equal to 60:
+        Set r to 1
+    End If
+    If b is equal to 61:
+        Set r to 1
+    End If
+    If b is equal to 62:
+        Set r to 1
+    End If
+    If b is equal to 63:
+        Set r to 1
+    End If
+    If b is equal to 64:
+        Set r to 1
+    End If
+    If b is equal to 91:
+        Set r to 1
+    End If
+    If b is equal to 92:
+        Set r to 1
+    End If
+    If b is equal to 93:
+        Set r to 1
+    End If
+    If b is equal to 94:
+        Set r to 1
+    End If
+    If b is equal to 95:
+        Set r to 1
+    End If
+    If b is equal to 96:
+        Set r to 1
+    End If
+    If b is equal to 123:
+        Set r to 1
+    End If
+    If b is equal to 124:
+        Set r to 1
+    End If
+    If b is equal to 125:
+        Set r to 1
+    End If
+    If b is equal to 126:
+        Set r to 1
+    End If
+    Return r
+End Process
+
+@Reasoning
+Flush the in-progress text builder into an MD_INLINE_TEXT node appended
+to inlines.  Resets the builder for reuse via stringbuilder_clear.
+@End Reasoning
+@Implementation
+If buffer non-empty: extract string, push as text inline, clear builder.
+@End Implementation
+@Performance_Hints
+O(buffer length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_flush_text_buffer" takes inlines as Integer, buf as Integer returns Integer:
+    Let buf_len be proc stringbuilder_length from SB with buf
+    If buf_len is equal to 0:
+        Return MD_OK
+    End If
+    Let s be proc stringbuilder_to_string from SB with buf
+    Let n be proc md_text with s
+    proc list_push from List with inlines, n
+    proc stringbuilder_clear from SB with buf
+    Return MD_OK
+End Process
+
+@Reasoning
+Handle an LF inline: if preceded by 2+ spaces, emit a hard line break;
+otherwise emit a soft line break.  Trailing spaces in the text buffer
+are stripped before flushing.
+@End Reasoning
+@Implementation
+Count trailing spaces in the buffer via stringbuilder_length +
+stringbuilder_set_length manipulation (the buffer supports truncation).
+@End Implementation
+@Performance_Hints
+O(trailing-space count).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_handle_line_break" takes text as Integer, i as Integer, inlines as Integer, buf as Integer returns Integer:
+    Let buf_len be proc stringbuilder_length from SB with buf
+    Let trailing be 0
+    Let buffer_addr be proc stringbuilder_get_buffer from SB with buf
+    Let scan be buf_len
+    While scan is greater than 0:
+        Let b be proc memory_get_byte from Memory with buffer_addr, scan minus 1
+        If b is equal to ASCII_SPACE:
+            Set trailing to trailing plus 1
+            Set scan to scan minus 1
+        End If
+        If b is not equal to ASCII_SPACE:
+            Set scan to 0
+        End If
+    End While
+    If trailing is greater than 0:
+        Let new_len be buf_len minus trailing
+        proc stringbuilder_set_length from SB with buf, new_len
+    End If
+    proc md_flush_text_buffer with inlines, buf
+    If trailing is greater than or equal to 2:
+        Let hb be proc md_hard_line_break
+        proc list_push from List with inlines, hb
+    End If
+    If trailing is less than 2:
+        Let sb_node be proc md_soft_line_break
+        proc list_push from List with inlines, sb_node
+    End If
+    Return MD_OK
+End Process
+
+@Reasoning
+Try to match a code span starting at the backtick at offset i.  Counts
+the opener backtick-run, finds a matching closer with the same run
+length, builds an MD_INLINE_CODE_SPAN.  Returns bytes consumed on
+success or 0 if no close was found.
+@End Reasoning
+@Implementation
+Count opener.  Scan forward counting any backtick run; if a run of
+equal length is found, that is the closer.  Otherwise no match.
+@End Implementation
+@Performance_Hints
+O(span length).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_try_code_span" takes text as Integer, i as Integer, len as Integer, inlines as Integer, buf as Integer returns Integer:
+    Let opener_len be 0
+    Let p be i
+    While p is less than len:
+        Let b be proc string_char_at from StringCore with text, p
+        If b is equal to ASCII_BACKTICK:
+            Set opener_len to opener_len plus 1
+            Set p to p plus 1
+        End If
+        If b is not equal to ASCII_BACKTICK:
+            Set p to len
+        End If
+    End While
+    Let body_start be i plus opener_len
+    Let scan be body_start
+    Let close_start be -1
+    While scan is less than len:
+        Let cb be proc string_char_at from StringCore with text, scan
+        If cb is equal to ASCII_BACKTICK:
+            Let run be 0
+            Let s2 be scan
+            While s2 is less than len:
+                Let cb2 be proc string_char_at from StringCore with text, s2
+                If cb2 is equal to ASCII_BACKTICK:
+                    Set run to run plus 1
+                    Set s2 to s2 plus 1
+                End If
+                If cb2 is not equal to ASCII_BACKTICK:
+                    Set s2 to len
+                End If
+            End While
+            If run is equal to opener_len:
+                Set close_start to scan
+                Set scan to len
+            End If
+            If run is not equal to opener_len:
+                Set scan to scan plus run
+            End If
+        End If
+        If cb is not equal to ASCII_BACKTICK:
+            Set scan to scan plus 1
+        End If
+    End While
+    If close_start is less than 0:
+        Return 0
+    End If
+    proc md_flush_text_buffer with inlines, buf
+    Let span_text be proc string_substring from StringPrim with text, body_start, close_start minus body_start
+    Let cs be proc md_code_span with span_text
+    proc list_push from List with inlines, cs
+    Return (close_start plus opener_len) minus i
+End Process
+
+@Reasoning
+Detect autolink terminating offset.  start is the byte immediately after
+'<'.  Return the offset of the matching '>' on success, or 0 on no
+autolink.  An autolink contains a ':' (URI form) or '@' (email form) and
+no whitespace or '<' before the closing '>'.
+@End Reasoning
+@Implementation
+Linear scan with reject set.
+@End Implementation
+@Performance_Hints
+O(span length).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_try_autolink" takes text as Integer, start as Integer, len as Integer returns Integer:
+    Let p be start
+    Let saw_colon be 0
+    Let saw_at be 0
+    While p is less than len:
+        Let b be proc string_char_at from StringCore with text, p
+        If b is equal to ASCII_GT:
+            If saw_colon is equal to 1:
+                Return p
+            End If
+            If saw_at is equal to 1:
+                Return p
+            End If
+            Return 0
+        End If
+        If b is equal to ASCII_SPACE:
+            Return 0
+        End If
+        If b is equal to ASCII_TAB:
+            Return 0
+        End If
+        If b is equal to ASCII_NEWLINE:
+            Return 0
+        End If
+        If b is equal to ASCII_LT:
+            Return 0
+        End If
+        If b is equal to 58:
+            Set saw_colon to 1
+        End If
+        If b is equal to 64:
+            Set saw_at to 1
+        End If
+        Set p to p plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Try inline link [label](href) or [label](href "title").  Returns bytes
+consumed (>= 4) on success, 0 on no match.
+@End Reasoning
+@Implementation
+Find the matching ']' allowing balanced inner brackets.  Require '(' to
+follow.  Read destination (either <bracketed> or run-of-non-paren-or-ws).
+Optional title in double quotes.  Require ')'.
+@End Implementation
+@Performance_Hints
+O(label + href + title length).
+@End Performance_Hints
+@Security_Scope
+URL captured verbatim.
+@End Security_Scope
+Process called "md_try_link" takes text as Integer, i as Integer, len as Integer, inlines as Integer, buf as Integer returns Integer:
+    Let label_close be proc md_find_balanced_close with text, i plus 1, len, ASCII_LBRACKET, ASCII_RBRACKET
+    If label_close is less than 0:
+        Return 0
+    End If
+    Let after_label be label_close plus 1
+    If after_label is greater than or equal to len:
+        Return 0
+    End If
+    Let lp be proc string_char_at from StringCore with text, after_label
+    If lp is not equal to ASCII_LPAREN:
+        Return 0
+    End If
+    Let p be after_label plus 1
+    Note: Skip whitespace before destination.
+    Let p_after_ws be proc md_skip_inline_ws with text, p, len
+    If p_after_ws is greater than or equal to len:
+        Return 0
+    End If
+    Let dest_str be 0
+    Let dest_end be p_after_ws
+    Let first be proc string_char_at from StringCore with text, p_after_ws
+    If first is equal to ASCII_LT:
+        Let inner_start be p_after_ws plus 1
+        Let s be inner_start
+        While s is less than len:
+            Let bb be proc string_char_at from StringCore with text, s
+            If bb is equal to ASCII_GT:
+                Set dest_str to (proc string_substring from StringPrim with text, inner_start, s minus inner_start)
+                Set dest_end to s plus 1
+                Set s to len
+            End If
+            If bb is equal to ASCII_NEWLINE:
+                Return 0
+            End If
+            If bb is not equal to ASCII_GT:
+                If bb is not equal to ASCII_NEWLINE:
+                    Set s to s plus 1
+                End If
+            End If
+        End While
+        If dest_str is equal to 0:
+            Return 0
+        End If
+    End If
+    If first is not equal to ASCII_LT:
+        Let s2 be p_after_ws
+        While s2 is less than len:
+            Let bb2 be proc string_char_at from StringCore with text, s2
+            Let stop be 0
+            If bb2 is equal to ASCII_SPACE:
+                Set stop to 1
+            End If
+            If bb2 is equal to ASCII_TAB:
+                Set stop to 1
+            End If
+            If bb2 is equal to ASCII_RPAREN:
+                Set stop to 1
+            End If
+            If bb2 is equal to ASCII_NEWLINE:
+                Return 0
+            End If
+            If stop is equal to 1:
+                Set dest_str to (proc string_substring from StringPrim with text, p_after_ws, s2 minus p_after_ws)
+                Set dest_end to s2
+                Set s2 to len
+            End If
+            If stop is equal to 0:
+                Set s2 to s2 plus 1
+            End If
+        End While
+        If dest_str is equal to 0:
+            Return 0
+        End If
+    End If
+    Let after_dest be proc md_skip_inline_ws with text, dest_end, len
+    If after_dest is greater than or equal to len:
+        If dest_str is not equal to 0:
+            proc deallocate from Layout with dest_str
+        End If
+        Return 0
+    End If
+    Let title_str be 0
+    Let nb be proc string_char_at from StringCore with text, after_dest
+    If nb is equal to ASCII_QUOTE:
+        Let t_start be after_dest plus 1
+        Let t_scan be t_start
+        While t_scan is less than len:
+            Let tc be proc string_char_at from StringCore with text, t_scan
+            If tc is equal to ASCII_BACKSLASH:
+                Set t_scan to t_scan plus 2
+            End If
+            If tc is not equal to ASCII_BACKSLASH:
+                If tc is equal to ASCII_QUOTE:
+                    Set title_str to (proc string_substring from StringPrim with text, t_start, t_scan minus t_start)
+                    Set after_dest to t_scan plus 1
+                    Set t_scan to len
+                End If
+                If tc is not equal to ASCII_QUOTE:
+                    Set t_scan to t_scan plus 1
+                End If
+            End If
+        End While
+    End If
+    Let after_title be proc md_skip_inline_ws with text, after_dest, len
+    If after_title is greater than or equal to len:
+        If dest_str is not equal to 0:
+            proc deallocate from Layout with dest_str
+        End If
+        If title_str is not equal to 0:
+            proc deallocate from Layout with title_str
+        End If
+        Return 0
+    End If
+    Let close_byte be proc string_char_at from StringCore with text, after_title
+    If close_byte is not equal to ASCII_RPAREN:
+        If dest_str is not equal to 0:
+            proc deallocate from Layout with dest_str
+        End If
+        If title_str is not equal to 0:
+            proc deallocate from Layout with title_str
+        End If
+        Return 0
+    End If
+    Let label_text be proc string_substring from StringPrim with text, i plus 1, label_close minus (i plus 1)
+    Let label_inlines be proc markdown_parse_inlines with label_text
+    proc deallocate from Layout with label_text
+    proc md_flush_text_buffer with inlines, buf
+    Let link_node be proc md_link with dest_str, title_str, label_inlines
+    proc list_push from List with inlines, link_node
+    Return (after_title plus 1) minus i
+End Process
+
+@Reasoning
+Skip spaces and tabs within [pos, len); return new offset.
+@End Reasoning
+@Implementation
+Linear scan.
+@End Implementation
+@Performance_Hints
+O(ws length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_skip_inline_ws" takes text as Integer, pos as Integer, len as Integer returns Integer:
+    Let p be pos
+    While p is less than len:
+        Let b be proc string_char_at from StringCore with text, p
+        If b is equal to ASCII_SPACE:
+            Set p to p plus 1
+        End If
+        If b is not equal to ASCII_SPACE:
+            If b is equal to ASCII_TAB:
+                Set p to p plus 1
+            End If
+            If b is not equal to ASCII_TAB:
+                Set p to len plus 1
+            End If
+        End If
+    End While
+    If p is greater than len:
+        Set p to p minus 1
+    End If
+    Return p
+End Process
+
+@Reasoning
+Find the offset of the matching close-bracket character starting at
+start with depth = 1.  Backslash-escaped brackets do not count.
+@End Reasoning
+@Implementation
+Walk maintaining depth.
+@End Implementation
+@Performance_Hints
+O(span length).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "md_find_balanced_close" takes text as Integer, start as Integer, len as Integer, open_byte as Integer, close_byte as Integer returns Integer:
+    Let depth be 1
+    Let p be start
+    While p is less than len:
+        Let b be proc string_char_at from StringCore with text, p
+        If b is equal to ASCII_BACKSLASH:
+            Set p to p plus 2
+        End If
+        If b is not equal to ASCII_BACKSLASH:
+            If b is equal to open_byte:
+                Set depth to depth plus 1
+                Set p to p plus 1
+            End If
+            If b is equal to close_byte:
+                Set depth to depth minus 1
+                If depth is equal to 0:
+                    Return p
+                End If
+                Set p to p plus 1
+            End If
+            Let other be 0
+            If b is not equal to open_byte:
+                If b is not equal to close_byte:
+                    Set other to 1
+                End If
+            End If
+            If other is equal to 1:
+                Set p to p plus 1
+            End If
+        End If
+    End While
+    Return -1
+End Process
+
+@Reasoning
+Try to match emphasis "*x*" or "**x**" (or '_' equivalents).  Implements
+the simple-flanking subset of CommonMark 6.2: count the opener run, then
+find a closer marker preceded by non-whitespace and use the shorter of
+the two runs (capped at 2).
+@End Reasoning
+@Implementation
+Count opener.  Reject if the byte after the opener run is whitespace.
+Scan forward for a marker preceded by non-whitespace; that is the closer.
+Recurse into the inner range.
+@End Implementation
+@Performance_Hints
+O(inner span length).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_try_emphasis" takes text as Integer, i as Integer, len as Integer, inlines as Integer, buf as Integer, marker as Integer returns Integer:
+    Let opener_run be 0
+    Let p be i
+    While p is less than len:
+        Let b be proc string_char_at from StringCore with text, p
+        If b is equal to marker:
+            Set opener_run to opener_run plus 1
+            Set p to p plus 1
+        End If
+        If b is not equal to marker:
+            Set p to len
+        End If
+    End While
+    If p is greater than or equal to len:
+        Return 0
+    End If
+    Let after be proc string_char_at from StringCore with text, p
+    Let after_ws be 0
+    If after is equal to ASCII_SPACE:
+        Set after_ws to 1
+    End If
+    If after is equal to ASCII_TAB:
+        Set after_ws to 1
+    End If
+    If after is equal to ASCII_NEWLINE:
+        Set after_ws to 1
+    End If
+    If after_ws is equal to 1:
+        Return 0
+    End If
+
+    Let scan be p
+    Let closer_pos be -1
+    Let closer_run be 0
+    While scan is less than len:
+        Let cb be proc string_char_at from StringCore with text, scan
+        If cb is equal to ASCII_BACKSLASH:
+            Set scan to scan plus 2
+        End If
+        If cb is not equal to ASCII_BACKSLASH:
+            If cb is equal to marker:
+                Let prev be proc string_char_at from StringCore with text, scan minus 1
+                Let prev_ws be 0
+                If prev is equal to ASCII_SPACE:
+                    Set prev_ws to 1
+                End If
+                If prev is equal to ASCII_TAB:
+                    Set prev_ws to 1
+                End If
+                If prev is equal to ASCII_NEWLINE:
+                    Set prev_ws to 1
+                End If
+                If prev_ws is equal to 0:
+                    Let run be 0
+                    Let s2 be scan
+                    While s2 is less than len:
+                        Let cb2 be proc string_char_at from StringCore with text, s2
+                        If cb2 is equal to marker:
+                            Set run to run plus 1
+                            Set s2 to s2 plus 1
+                        End If
+                        If cb2 is not equal to marker:
+                            Set s2 to len
+                        End If
+                    End While
+                    Set closer_pos to scan
+                    Set closer_run to run
+                    Set scan to len
+                End If
+                If prev_ws is equal to 1:
+                    Set scan to scan plus 1
+                End If
+            End If
+            If cb is not equal to marker:
+                Set scan to scan plus 1
+            End If
+        End If
+    End While
+    If closer_pos is less than 0:
+        Return 0
+    End If
+
+    Let used be opener_run
+    If used is greater than closer_run:
+        Set used to closer_run
+    End If
+    If used is greater than 2:
+        Set used to 2
+    End If
+
+    proc md_flush_text_buffer with inlines, buf
+    Let inner_start be i plus used
+    Let inner_text be proc string_substring from StringPrim with text, inner_start, closer_pos minus inner_start
+    Let inner_inlines be proc markdown_parse_inlines with inner_text
+    proc deallocate from Layout with inner_text
+    Let em_node be proc md_emphasis with inner_inlines, used
+    proc list_push from List with inlines, em_node
+    Return (closer_pos plus used) minus i
+End Process
+
+@Reasoning
+Try to match a GFM strikethrough ~~text~~ at offset i (which points at
+the first '~' of a candidate '~~').
+@End Reasoning
+@Implementation
+Confirm the next byte is '~'.  Scan forward looking for '~~' on the
+same line; recurse into the inner span.
+@End Implementation
+@Performance_Hints
+O(inner length).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "md_try_strikethrough" takes text as Integer, i as Integer, len as Integer, inlines as Integer, buf as Integer returns Integer:
+    If (i plus 1) is greater than or equal to len:
+        Return 0
+    End If
+    Let n1 be proc string_char_at from StringCore with text, i plus 1
+    If n1 is not equal to ASCII_TILDE:
+        Return 0
+    End If
+    Let scan be i plus 2
+    Let close_pos be -1
+    While scan is less than len:
+        Let b be proc string_char_at from StringCore with text, scan
+        If b is equal to ASCII_NEWLINE:
+            Set scan to len
+        End If
+        If b is equal to ASCII_BACKSLASH:
+            Set scan to scan plus 2
+        End If
+        If b is not equal to ASCII_BACKSLASH:
+            If b is equal to ASCII_TILDE:
+                If (scan plus 1) is less than len:
+                    Let b2 be proc string_char_at from StringCore with text, scan plus 1
+                    If b2 is equal to ASCII_TILDE:
+                        Set close_pos to scan
+                        Set scan to len
+                    End If
+                    If b2 is not equal to ASCII_TILDE:
+                        Set scan to scan plus 1
+                    End If
+                End If
+                If (scan plus 1) is greater than or equal to len:
+                    Set scan to len
+                End If
+            End If
+            If b is not equal to ASCII_TILDE:
+                If b is not equal to ASCII_NEWLINE:
+                    Set scan to scan plus 1
+                End If
+            End If
+        End If
+    End While
+    If close_pos is less than 0:
+        Return 0
+    End If
+    proc md_flush_text_buffer with inlines, buf
+    Let inner_text be proc string_substring from StringPrim with text, i plus 2, close_pos minus (i plus 2)
+    Let inner_inlines be proc markdown_parse_inlines with inner_text
+    proc deallocate from Layout with inner_text
+    Let n be proc md_strikethrough with inner_inlines
+    proc list_push from List with inlines, n
+    Return (close_pos plus 2) minus i
+End Process
+
+Note: ============================================================================
+Note: HTML RENDERER
+Note: ============================================================================
+
+@Reasoning
+Render a parsed block list to HTML5.  Implements the rendering contract
+from CommonMark Appendix A: paragraphs become <p>, headings <h1>..<h6>,
+thematic breaks <hr />, fenced/indented code <pre><code>, blockquotes
+<blockquote>, line breaks <br />.  Text content is HTML-escaped per
+WHATWG HTML 13.2.6.
+@End Reasoning
+@Implementation
+Walk blocks emitting tags into a StringBuilder.  Recurse for inline
+content and block-quote bodies.  Return a freshly-allocated
+NUL-terminated string the caller owns.
+@End Implementation
+@Performance_Hints
+O(tree size).
+@End Performance_Hints
+@Security_Scope
+HTML-escapes '<', '>', '&', '"' in text content.  Raw HTML blocks and
+inline HTML spans are emitted verbatim (CommonMark default).
+@End Security_Scope
+Process called "markdown_render_html" takes blocks as Integer returns Integer:
+    Let sb be proc stringbuilder_create from SB
+    If blocks is not equal to 0:
+        Let count be proc list_length from List with blocks
+        Let i be 0
+        While i is less than count:
+            Let b be proc list_get from List with blocks, i
+            proc md_render_block_html with sb, b
+            Set i to i plus 1
+        End While
+    End If
+    Let s be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return s
+End Process
+
+Process called "md_render_block_html" takes sb as Integer, block as Integer returns Integer:
+    If block is equal to 0:
+        Return MD_OK
+    End If
+    Let kind be proc memory_get_int64 from Memory with block, MD_OFF_KIND
+    Let payload be proc memory_get_int64 from Memory with block, MD_OFF_PAYLOAD
+    Let secondary be proc memory_get_int64 from Memory with block, MD_OFF_SECONDARY
+    Let children be proc memory_get_int64 from Memory with block, MD_OFF_CHILDREN
+
+    If kind is equal to MD_BLOCK_PARAGRAPH:
+        proc stringbuilder_append from SB with sb, "<p>"
+        If children is not equal to 0:
+            proc md_render_inlines_html with sb, children
+        End If
+        proc stringbuilder_append from SB with sb, "</p>"
+        proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        Return MD_OK
+    End If
+    If kind is equal to MD_BLOCK_ATX_HEADING:
+        proc stringbuilder_append from SB with sb, "<h"
+        proc stringbuilder_append_integer from SB with sb, secondary
+        proc stringbuilder_append_char from SB with sb, ASCII_GT
+        If children is not equal to 0:
+            proc md_render_inlines_html with sb, children
+        End If
+        proc stringbuilder_append from SB with sb, "</h"
+        proc stringbuilder_append_integer from SB with sb, secondary
+        proc stringbuilder_append_char from SB with sb, ASCII_GT
+        proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        Return MD_OK
+    End If
+    If kind is equal to MD_BLOCK_THEMATIC_BREAK:
+        proc stringbuilder_append from SB with sb, "<hr />"
+        proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        Return MD_OK
+    End If
+    If kind is equal to MD_BLOCK_FENCED_CODE:
+        If secondary is not equal to 0:
+            proc stringbuilder_append from SB with sb, "<pre><code class=\"language-"
+            proc md_html_escape_to_sb with sb, secondary
+            proc stringbuilder_append from SB with sb, "\">"
+        End If
+        If secondary is equal to 0:
+            proc stringbuilder_append from SB with sb, "<pre><code>"
+        End If
+        If payload is not equal to 0:
+            proc md_html_escape_to_sb with sb, payload
+        End If
+        proc stringbuilder_append from SB with sb, "</code></pre>"
+        proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        Return MD_OK
+    End If
+    If kind is equal to MD_BLOCK_INDENTED_CODE:
+        proc stringbuilder_append from SB with sb, "<pre><code>"
+        If payload is not equal to 0:
+            proc md_html_escape_to_sb with sb, payload
+        End If
+        proc stringbuilder_append from SB with sb, "</code></pre>"
+        proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        Return MD_OK
+    End If
+    If kind is equal to MD_BLOCK_HTML_BLOCK:
+        If payload is not equal to 0:
+            proc stringbuilder_append from SB with sb, payload
+        End If
+        proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        Return MD_OK
+    End If
+    If kind is equal to MD_BLOCK_BLOCK_QUOTE:
+        proc stringbuilder_append from SB with sb, "<blockquote>"
+        proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        If payload is not equal to 0:
+            Let bcount be proc list_length from List with payload
+            Let bi be 0
+            While bi is less than bcount:
+                Let cb be proc list_get from List with payload, bi
+                proc md_render_block_html with sb, cb
+                Set bi to bi plus 1
+            End While
+        End If
+        proc stringbuilder_append from SB with sb, "</blockquote>"
+        proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        Return MD_OK
+    End If
+    Return MD_OK
+End Process
+
+Process called "md_render_inlines_html" takes sb as Integer, inlines as Integer returns Integer:
+    If inlines is equal to 0:
+        Return MD_OK
+    End If
+    Let count be proc list_length from List with inlines
+    Let i be 0
+    While i is less than count:
+        Let n be proc list_get from List with inlines, i
+        Let kind be proc memory_get_int64 from Memory with n, MD_OFF_KIND
+        Let payload be proc memory_get_int64 from Memory with n, MD_OFF_PAYLOAD
+        Let secondary be proc memory_get_int64 from Memory with n, MD_OFF_SECONDARY
+        Let children be proc memory_get_int64 from Memory with n, MD_OFF_CHILDREN
+
+        If kind is equal to MD_INLINE_TEXT:
+            If payload is not equal to 0:
+                proc md_html_escape_to_sb with sb, payload
+            End If
+        End If
+        If kind is equal to MD_INLINE_EMPHASIS:
+            If secondary is equal to 2:
+                proc stringbuilder_append from SB with sb, "<strong>"
+                proc md_render_inlines_html with sb, children
+                proc stringbuilder_append from SB with sb, "</strong>"
+            End If
+            If secondary is equal to 1:
+                proc stringbuilder_append from SB with sb, "<em>"
+                proc md_render_inlines_html with sb, children
+                proc stringbuilder_append from SB with sb, "</em>"
+            End If
+        End If
+        If kind is equal to MD_INLINE_CODE_SPAN:
+            proc stringbuilder_append from SB with sb, "<code>"
+            If payload is not equal to 0:
+                proc md_html_escape_to_sb with sb, payload
+            End If
+            proc stringbuilder_append from SB with sb, "</code>"
+        End If
+        If kind is equal to MD_INLINE_LINK:
+            proc stringbuilder_append from SB with sb, "<a href=\""
+            If payload is not equal to 0:
+                proc md_html_escape_to_sb with sb, payload
+            End If
+            If secondary is not equal to 0:
+                proc stringbuilder_append from SB with sb, "\" title=\""
+                proc md_html_escape_to_sb with sb, secondary
+            End If
+            proc stringbuilder_append from SB with sb, "\">"
+            proc md_render_inlines_html with sb, children
+            proc stringbuilder_append from SB with sb, "</a>"
+        End If
+        If kind is equal to MD_INLINE_AUTO_LINK:
+            proc stringbuilder_append from SB with sb, "<a href=\""
+            If payload is not equal to 0:
+                proc md_html_escape_to_sb with sb, payload
+            End If
+            proc stringbuilder_append from SB with sb, "\">"
+            If payload is not equal to 0:
+                proc md_html_escape_to_sb with sb, payload
+            End If
+            proc stringbuilder_append from SB with sb, "</a>"
+        End If
+        If kind is equal to MD_INLINE_IMAGE:
+            proc stringbuilder_append from SB with sb, "<img src=\""
+            If payload is not equal to 0:
+                proc md_html_escape_to_sb with sb, payload
+            End If
+            proc stringbuilder_append from SB with sb, "\" alt=\""
+            If secondary is not equal to 0:
+                proc md_html_escape_to_sb with sb, secondary
+            End If
+            proc stringbuilder_append from SB with sb, "\" />"
+        End If
+        If kind is equal to MD_INLINE_HARD_LINE_BREAK:
+            proc stringbuilder_append from SB with sb, "<br />"
+            proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        End If
+        If kind is equal to MD_INLINE_SOFT_LINE_BREAK:
+            proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        End If
+        If kind is equal to MD_INLINE_HTML_INLINE:
+            If payload is not equal to 0:
+                proc stringbuilder_append from SB with sb, payload
+            End If
+        End If
+        If kind is equal to MD_INLINE_STRIKETHROUGH:
+            proc stringbuilder_append from SB with sb, "<del>"
+            proc md_render_inlines_html with sb, children
+            proc stringbuilder_append from SB with sb, "</del>"
+        End If
+        If kind is equal to MD_INLINE_TASK:
+            If secondary is equal to 1:
+                proc stringbuilder_append from SB with sb, "<input type=\"checkbox\" checked disabled />"
+            End If
+            If secondary is equal to 0:
+                proc stringbuilder_append from SB with sb, "<input type=\"checkbox\" disabled />"
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return MD_OK
+End Process
+
+@Reasoning
+HTML-escape a NUL-terminated string into the builder.  Escapes '&', '<',
+'>', '"' per WHATWG HTML serialization rules.
+@End Reasoning
+@Implementation
+Byte loop.
+@End Implementation
+@Performance_Hints
+O(length).
+@End Performance_Hints
+@Security_Scope
+Sufficient for element content and double-quoted attribute values.
+@End Security_Scope
+Process called "md_html_escape_to_sb" takes sb as Integer, s as Integer returns Integer:
+    If s is equal to 0:
+        Return MD_OK
+    End If
+    Let len be proc string_length from StringCore with s
+    Let i be 0
+    While i is less than len:
+        Let b be proc string_char_at from StringCore with s, i
+        Let plain be 1
+        If b is equal to ASCII_AMP:
+            proc stringbuilder_append from SB with sb, "&amp;"
+            Set plain to 0
+        End If
+        If b is equal to ASCII_LT:
+            proc stringbuilder_append from SB with sb, "&lt;"
+            Set plain to 0
+        End If
+        If b is equal to ASCII_GT:
+            proc stringbuilder_append from SB with sb, "&gt;"
+            Set plain to 0
+        End If
+        If b is equal to ASCII_QUOTE:
+            proc stringbuilder_append from SB with sb, "&quot;"
+            Set plain to 0
+        End If
+        If plain is equal to 1:
+            proc stringbuilder_append_char from SB with sb, b
+        End If
+        Set i to i plus 1
+    End While
+    Return MD_OK
+End Process
+
+Note: ============================================================================
+Note: PLAIN-TEXT RENDERER
+Note: ============================================================================
+
+@Reasoning
+Render the parsed block list to plain text, stripping all markup.
+Useful for search indexing or screen-reader fallbacks.
+@End Reasoning
+@Implementation
+Walk blocks; for paragraphs/headings emit inline text + blank line; for
+code blocks emit body + newline.
+@End Implementation
+@Performance_Hints
+O(tree size).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "markdown_render_plain_text" takes blocks as Integer returns Integer:
+    Let sb be proc stringbuilder_create from SB
+    If blocks is not equal to 0:
+        Let count be proc list_length from List with blocks
+        Let i be 0
+        While i is less than count:
+            Let b be proc list_get from List with blocks, i
+            Let kind be proc memory_get_int64 from Memory with b, MD_OFF_KIND
+            Let payload be proc memory_get_int64 from Memory with b, MD_OFF_PAYLOAD
+            Let children be proc memory_get_int64 from Memory with b, MD_OFF_CHILDREN
+            If kind is equal to MD_BLOCK_PARAGRAPH:
+                If children is not equal to 0:
+                    proc md_render_inlines_plain with sb, children
+                End If
+                proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+                proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+            End If
+            If kind is equal to MD_BLOCK_ATX_HEADING:
+                If children is not equal to 0:
+                    proc md_render_inlines_plain with sb, children
+                End If
+                proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+                proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+            End If
+            If kind is equal to MD_BLOCK_FENCED_CODE:
+                If payload is not equal to 0:
+                    proc stringbuilder_append from SB with sb, payload
+                End If
+                proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+            End If
+            If kind is equal to MD_BLOCK_INDENTED_CODE:
+                If payload is not equal to 0:
+                    proc stringbuilder_append from SB with sb, payload
+                End If
+                proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    Let s be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return s
+End Process
+
+Process called "md_render_inlines_plain" takes sb as Integer, inlines as Integer returns Integer:
+    If inlines is equal to 0:
+        Return MD_OK
+    End If
+    Let count be proc list_length from List with inlines
+    Let i be 0
+    While i is less than count:
+        Let n be proc list_get from List with inlines, i
+        Let kind be proc memory_get_int64 from Memory with n, MD_OFF_KIND
+        Let payload be proc memory_get_int64 from Memory with n, MD_OFF_PAYLOAD
+        Let children be proc memory_get_int64 from Memory with n, MD_OFF_CHILDREN
+        If kind is equal to MD_INLINE_TEXT:
+            If payload is not equal to 0:
+                proc stringbuilder_append from SB with sb, payload
+            End If
+        End If
+        If kind is equal to MD_INLINE_CODE_SPAN:
+            If payload is not equal to 0:
+                proc stringbuilder_append from SB with sb, payload
+            End If
+        End If
+        If kind is equal to MD_INLINE_EMPHASIS:
+            proc md_render_inlines_plain with sb, children
+        End If
+        If kind is equal to MD_INLINE_STRIKETHROUGH:
+            proc md_render_inlines_plain with sb, children
+        End If
+        If kind is equal to MD_INLINE_LINK:
+            proc md_render_inlines_plain with sb, children
+        End If
+        If kind is equal to MD_INLINE_AUTO_LINK:
+            If payload is not equal to 0:
+                proc stringbuilder_append from SB with sb, payload
+            End If
+        End If
+        If kind is equal to MD_INLINE_SOFT_LINE_BREAK:
+            proc stringbuilder_append_char from SB with sb, ASCII_SPACE
+        End If
+        If kind is equal to MD_INLINE_HARD_LINE_BREAK:
+            proc stringbuilder_append_char from SB with sb, ASCII_NEWLINE
+        End If
+        Set i to i plus 1
+    End While
+    Return MD_OK
+End Process

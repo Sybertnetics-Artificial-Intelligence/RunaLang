@@ -1,0 +1,1283 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+CONFIG_VALUE - Generic configuration value tree (Tier 1)
+
+Builds on top of config.runa to add operations beyond the base CV_* API:
+  - DateTime (CV_DATETIME) and Duration (CV_DURATION) variants for
+    typed config (covers TOML 1.0 date/time and duration scalars).
+  - Path-aware get/set helpers across CV_MAP-CV_LIST hierarchies.
+  - Deep merge with override semantics (used by configuration layer
+    overlays).
+  - Native Runa-format round-trip (config_value_to_runa_native /
+    config_value_from_runa_native).
+
+The kind tag layout reuses CV_* constants where available (0..6) and
+introduces CV_DATETIME=7 and CV_DURATION=8 here. DateTime values are
+stored as ISO-8601 UTC strings; Duration values are stored as Integer
+nanoseconds. These representations are loss-free for the relevant
+TOML/YAML scalars and avoid pulling in the time module at this tier.
+
+References:
+  - TOML 1.0 ........ https://toml.io/en/v1.0.0
+  - YAML 1.2 ........ https://yaml.org/spec/1.2.2/
+  - INI (de facto) .. https://en.wikipedia.org/wiki/INI_file
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/config/config.runa" as Cfg
+
+Note: ============================================================================
+Note: CONSTANTS - extended kinds
+Note: ============================================================================
+
+Note: CV_NULL ... CV_MAP live in config.runa (0..6).
+Let CV_DATETIME be 7
+Let CV_DURATION be 8
+
+Note: Reuse the same 24-byte ConfigValue layout. The extended kinds use
+Note: the existing data and len_or_flags slots.
+
+Let CV_SIZE be 24
+
+Note: ============================================================================
+Note: EXTENDED CONSTRUCTORS
+Note: ============================================================================
+
+@Reasoning
+Construct a CV_DATETIME wrapping an ISO-8601 string. The string is
+duplicated so the value owns it. Validation of the input format is the
+caller's responsibility (or the TOML/YAML parser's).
+@End Reasoning
+
+@Implementation
+Duplicate string, allocate 24-byte record, store kind/pointer/length.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input or allocation failure.
+@End Security_Scope
+Process called "config_value_datetime" takes iso_text as Integer returns Integer:
+    If iso_text is equal to 0:
+        Return 0
+    End If
+    Let copy be proc string_duplicate from StringPrim with iso_text
+    If copy is equal to 0:
+        Return 0
+    End If
+    Let v be proc allocate from Layout with CV_SIZE
+    If v is equal to 0:
+        proc deallocate from Layout with copy
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with copy
+    proc memory_set_int64 from Memory with v, 0, CV_DATETIME
+    proc memory_set_int64 from Memory with v, 8, copy
+    proc memory_set_int64 from Memory with v, 16, length
+    Return v
+End Process
+
+@Reasoning
+Construct a CV_DURATION storing nanoseconds inline.
+@End Reasoning
+
+@Implementation
+Allocate 24-byte record; store kind and ns value inline.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Accepts any 64-bit signed integer ns.
+@End Security_Scope
+Process called "config_value_duration" takes nanoseconds as Integer returns Integer:
+    Let v be proc allocate from Layout with CV_SIZE
+    If v is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with v, 0, CV_DURATION
+    proc memory_set_int64 from Memory with v, 8, nanoseconds
+    proc memory_set_int64 from Memory with v, 16, 0
+    Return v
+End Process
+
+@Reasoning
+Extract the ISO-8601 string from a CV_DATETIME value.
+@End Reasoning
+
+@Implementation
+Verify kind, load data pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch.
+@End Security_Scope
+Process called "config_value_as_datetime" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is not equal to CV_DATETIME:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+@Reasoning
+Extract the nanoseconds from a CV_DURATION.
+@End Reasoning
+
+@Implementation
+Verify kind, load inline data.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on type mismatch.
+@End Security_Scope
+Process called "config_value_as_duration" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is not equal to CV_DURATION:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with v, 8
+End Process
+
+Note: ============================================================================
+Note: PATH-AWARE GET / SET
+Note: ============================================================================
+
+@Reasoning
+Resolve a dotted path against a ConfigValue tree where intermediate
+nodes may be CV_MAP or CV_LIST (the latter using zero-based numeric
+indexes as path segments). Returns the value at the path, or 0 if any
+segment is missing or has a wrong kind.
+@End Reasoning
+
+@Implementation
+Walk the path segment by segment. At each step:
+  - Find the next dot delimiter; substring the segment.
+  - If current value is CV_MAP, dictionary lookup by segment.
+  - Else if CV_LIST and segment is all-digits, list_get by integer
+    index.
+  - Else fail.
+At end of path, return the current value.
+@End Implementation
+
+@Performance_Hints
+Time: O(|path|). Space: O(|segment|) for the per-step substring (freed
+each iteration).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on any missing segment, type mismatch, or empty path.
+@End Security_Scope
+Process called "config_value_get" takes root as Integer, dotted_path as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    If dotted_path is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with dotted_path
+    If length is equal to 0:
+        Return 0
+    End If
+    Let current be root
+    Let seg_start be 0
+    Let i be 0
+    Let going be 1
+    While going is equal to 1:
+        Let at_dot be 0
+        Let at_end be 0
+        If i is greater than or equal to length:
+            Set at_end to 1
+        Otherwise:
+            Let ch be proc memory_get_byte from Memory with dotted_path, i
+            If ch is equal to 46:
+                Set at_dot to 1
+            End If
+        End If
+        If at_end is equal to 1:
+            Let seg_len be i minus seg_start
+            If seg_len is less than 1:
+                Return 0
+            End If
+            Let seg be proc string_substring from StringPrim with dotted_path, seg_start, seg_len
+            If seg is equal to 0:
+                Return 0
+            End If
+            Set current to proc lookup_segment with current, seg
+            proc deallocate from Layout with seg
+            Set going to 0
+        Otherwise:
+            If at_dot is equal to 1:
+                Let seg_len2 be i minus seg_start
+                If seg_len2 is less than 1:
+                    Return 0
+                End If
+                Let seg2 be proc string_substring from StringPrim with dotted_path, seg_start, seg_len2
+                If seg2 is equal to 0:
+                    Return 0
+                End If
+                Set current to proc lookup_segment with current, seg2
+                proc deallocate from Layout with seg2
+                If current is equal to 0:
+                    Return 0
+                End If
+                Set seg_start to i plus 1
+                Set i to i plus 1
+            Otherwise:
+                Set i to i plus 1
+            End If
+        End If
+    End While
+    Return current
+End Process
+
+@Reasoning
+Look up a single segment against a value. Dispatches based on kind: map
+key for CV_MAP, integer index for CV_LIST.
+@End Reasoning
+
+@Implementation
+Inspect kind. CV_MAP: dict_get. CV_LIST: parse seg as integer, list_get.
+Otherwise return 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) for map, O(1) for list.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on mismatch.
+@End Security_Scope
+Process called "lookup_segment" takes value as Integer, segment as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with value, 0
+    If kind is equal to 6:
+        Let map be proc memory_get_int64 from Memory with value, 8
+        Return proc get from Dict with map, segment
+    End If
+    If kind is equal to 5:
+        Let arr be proc memory_get_int64 from Memory with value, 8
+        Let idx be proc string_to_integer from StringPrim with segment
+        If idx is less than 0:
+            Return 0
+        End If
+        Let len_arr be proc list_length from List with arr
+        If idx is greater than or equal to len_arr:
+            Return 0
+        End If
+        Return proc list_get from List with arr, idx
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Set a value at a dotted path. Intermediate CV_MAP nodes are created on
+demand; intermediate CV_LIST nodes must already exist with sufficient
+length. Returns 1 on success, 0 if the path cannot be created (e.g. an
+intermediate is a non-map scalar that would have to be replaced).
+@End Reasoning
+
+@Implementation
+Split the path. At each step except the last, ensure the current value
+is a CV_MAP; if not present, create a new one and attach. Step into it.
+At the last step, replace any existing value.
+@End Implementation
+
+@Performance_Hints
+Time: O(|path|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if intermediate kinds collide.
+@End Security_Scope
+Process called "config_value_set" takes root as Integer, dotted_path as Integer, value as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    If dotted_path is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Return 0
+    End If
+    Let root_kind be proc memory_get_int64 from Memory with root, 0
+    If root_kind is not equal to 6:
+        Return 0
+    End If
+    Let current_map be proc memory_get_int64 from Memory with root, 8
+    Let length be proc string_length from StringCore with dotted_path
+    Let i be 0
+    Let seg_start be 0
+    Let going be 1
+    While going is equal to 1:
+        Let at_end be 0
+        If i is greater than or equal to length:
+            Set at_end to 1
+        End If
+        Let is_dot be 0
+        If at_end is equal to 0:
+            Let ch be proc memory_get_byte from Memory with dotted_path, i
+            If ch is equal to 46:
+                Set is_dot to 1
+            End If
+        End If
+        If at_end is equal to 1:
+            Let seg_len be i minus seg_start
+            If seg_len is less than 1:
+                Return 0
+            End If
+            Let seg be proc string_substring from StringPrim with dotted_path, seg_start, seg_len
+            If seg is equal to 0:
+                Return 0
+            End If
+            Let prior be proc get from Dict with current_map, seg
+            If prior is not equal to 0:
+                proc config_value_destroy from Cfg with prior
+            End If
+            proc set from Dict with current_map, seg, value
+            proc deallocate from Layout with seg
+            Set going to 0
+        Otherwise:
+            If is_dot is equal to 1:
+                Let seg_len2 be i minus seg_start
+                If seg_len2 is less than 1:
+                    Return 0
+                End If
+                Let seg2 be proc string_substring from StringPrim with dotted_path, seg_start, seg_len2
+                If seg2 is equal to 0:
+                    Return 0
+                End If
+                Let existing be proc get from Dict with current_map, seg2
+                If existing is equal to 0:
+                    Let new_dict be proc create from Dict
+                    If new_dict is equal to 0:
+                        proc deallocate from Layout with seg2
+                        Return 0
+                    End If
+                    Let new_map_value be proc config_value_map from Cfg with new_dict
+                    If new_map_value is equal to 0:
+                        proc destroy from Dict with new_dict
+                        proc deallocate from Layout with seg2
+                        Return 0
+                    End If
+                    proc set from Dict with current_map, seg2, new_map_value
+                    Set current_map to new_dict
+                Otherwise:
+                    Let existing_kind be proc memory_get_int64 from Memory with existing, 0
+                    If existing_kind is not equal to 6:
+                        proc deallocate from Layout with seg2
+                        Return 0
+                    End If
+                    Set current_map to proc memory_get_int64 from Memory with existing, 8
+                End If
+                proc deallocate from Layout with seg2
+                Set seg_start to i plus 1
+                Set i to i plus 1
+            Otherwise:
+                Set i to i plus 1
+            End If
+        End If
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: DEEP MERGE
+Note: ============================================================================
+
+@Reasoning
+Deep-merge two ConfigValue trees. The result becomes the union of the
+base and overlay, where overlay wins for any colliding key. CV_MAP
+values recursively merge; CV_LIST and scalar values from overlay replace
+the base value. The base tree is mutated in place and now owns any
+adopted overlay subtrees; the overlay scaffolding (dictionary headers,
+list headers, value-records that were merged into) is freed.
+
+This is the semantics used by 12-factor config overlays and by Cargo /
+npm dependency resolution.
+@End Reasoning
+
+@Implementation
+If base or overlay is null, do nothing or transfer ownership. If either
+is non-map, replace base with overlay (caller owns the result). For map
++ map, iterate overlay keys; for each, if base has it and both are
+maps, recurse. Otherwise destroy the base value and adopt overlay's
+value pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over overlay subtree.
+@End Performance_Hints
+
+@Security_Scope
+Returns 1 on success; 0 if base is null or kinds incompatible.
+@End Security_Scope
+Process called "config_value_merge" takes base as Integer, overlay as Integer returns Integer:
+    If base is equal to 0:
+        Return 0
+    End If
+    If overlay is equal to 0:
+        Return 1
+    End If
+    Let bk be proc memory_get_int64 from Memory with base, 0
+    Let ok2 be proc memory_get_int64 from Memory with overlay, 0
+    If bk is not equal to 6:
+        Return 0
+    End If
+    If ok2 is not equal to 6:
+        Return 0
+    End If
+    Let bd be proc memory_get_int64 from Memory with base, 8
+    Let od be proc memory_get_int64 from Memory with overlay, 8
+    Let okeys be proc keys from Dict with od
+    If okeys is equal to 0:
+        Return 1
+    End If
+    Let oc be proc list_length from List with okeys
+    Let i be 0
+    While i is less than oc:
+        Let okey be proc list_get from List with okeys, i
+        Let oval be proc get from Dict with od, okey
+        Let bval be proc get from Dict with bd, okey
+        If bval is equal to 0:
+            proc set from Dict with bd, okey, oval
+            proc set from Dict with od, okey, 0
+        Otherwise:
+            Let bvk be proc memory_get_int64 from Memory with bval, 0
+            Let ovk be proc memory_get_int64 from Memory with oval, 0
+            If bvk is equal to 6:
+                If ovk is equal to 6:
+                    proc config_value_merge with bval, oval
+                Otherwise:
+                    proc config_value_destroy from Cfg with bval
+                    proc set from Dict with bd, okey, oval
+                    proc set from Dict with od, okey, 0
+                End If
+            Otherwise:
+                proc config_value_destroy from Cfg with bval
+                proc set from Dict with bd, okey, oval
+                proc set from Dict with od, okey, 0
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with okeys
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: RUNA-NATIVE FORMAT
+Note: ============================================================================
+
+@Reasoning
+Serialize a ConfigValue tree into the Runa-native config-value textual
+format. The format is human-readable and round-trips via
+config_value_from_runa_native.
+
+Grammar:
+  value     := scalar | "[" list "]" | "{" map "}"
+  scalar    := "null" | "true" | "false" | integer | string-literal
+             | "@datetime " ISO-string | "@duration " integer-ns
+  list      := value ("," value)*
+  map       := key " : " value ("," key " : " value)*
+  key       := identifier | string-literal
+@End Reasoning
+
+@Implementation
+Recursive emitter using a StringBuilder. Map iteration order follows the
+underlying dictionary keys.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "config_value_to_runa_native" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc emit_value with sb, value
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Recursive emitter for one value.
+@End Reasoning
+
+@Implementation
+Switch on kind. CV_NULL/CV_BOOL/CV_INTEGER emit scalar tokens. CV_STRING
+emits quoted form. CV_LIST emits "[a,b,c]". CV_MAP emits "{k:v,k:v}".
+CV_DATETIME emits "@datetime <iso>". CV_DURATION emits "@duration <ns>".
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "emit_value" takes sb as Integer, v as Integer returns Integer:
+    If v is equal to 0:
+        proc stringbuilder_append from SB with sb, "null"
+        Return 1
+    End If
+    Let kind be proc memory_get_int64 from Memory with v, 0
+    If kind is equal to 0:
+        proc stringbuilder_append from SB with sb, "null"
+        Return 1
+    End If
+    If kind is equal to 4:
+        Let b be proc memory_get_int64 from Memory with v, 8
+        If b is equal to 1:
+            proc stringbuilder_append from SB with sb, "true"
+        Otherwise:
+            proc stringbuilder_append from SB with sb, "false"
+        End If
+        Return 1
+    End If
+    If kind is equal to 2:
+        Let iv be proc memory_get_int64 from Memory with v, 8
+        proc stringbuilder_append_integer from SB with sb, iv
+        Return 1
+    End If
+    If kind is equal to 1:
+        proc stringbuilder_append_char from SB with sb, 34
+        Let sp be proc memory_get_int64 from Memory with v, 8
+        If sp is not equal to 0:
+            Let length be proc string_length from StringCore with sp
+            Let i be 0
+            While i is less than length:
+                Let ch be proc memory_get_byte from Memory with sp, i
+                If ch is equal to 34:
+                    proc stringbuilder_append_char from SB with sb, 92
+                    proc stringbuilder_append_char from SB with sb, 34
+                Otherwise:
+                    If ch is equal to 92:
+                        proc stringbuilder_append_char from SB with sb, 92
+                        proc stringbuilder_append_char from SB with sb, 92
+                    Otherwise:
+                        If ch is equal to 10:
+                            proc stringbuilder_append_char from SB with sb, 92
+                            proc stringbuilder_append_char from SB with sb, 110
+                        Otherwise:
+                            proc stringbuilder_append_char from SB with sb, ch
+                        End If
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        End If
+        proc stringbuilder_append_char from SB with sb, 34
+        Return 1
+    End If
+    If kind is equal to 5:
+        proc stringbuilder_append_char from SB with sb, 91
+        Let arr be proc memory_get_int64 from Memory with v, 8
+        If arr is not equal to 0:
+            Let lc be proc list_length from List with arr
+            Let j be 0
+            While j is less than lc:
+                Let elem be proc list_get from List with arr, j
+                If j is greater than 0:
+                    proc stringbuilder_append_char from SB with sb, 44
+                End If
+                proc emit_value with sb, elem
+                Set j to j plus 1
+            End While
+        End If
+        proc stringbuilder_append_char from SB with sb, 93
+        Return 1
+    End If
+    If kind is equal to 6:
+        proc stringbuilder_append_char from SB with sb, 123
+        Let map be proc memory_get_int64 from Memory with v, 8
+        If map is not equal to 0:
+            Let mk be proc keys from Dict with map
+            If mk is not equal to 0:
+                Let mc be proc list_length from List with mk
+                Let k be 0
+                While k is less than mc:
+                    Let key be proc list_get from List with mk, k
+                    Let val be proc get from Dict with map, key
+                    If k is greater than 0:
+                        proc stringbuilder_append_char from SB with sb, 44
+                    End If
+                    proc stringbuilder_append_char from SB with sb, 34
+                    If key is not equal to 0:
+                        proc stringbuilder_append from SB with sb, key
+                    End If
+                    proc stringbuilder_append_char from SB with sb, 34
+                    proc stringbuilder_append_char from SB with sb, 58
+                    proc emit_value with sb, val
+                    Set k to k plus 1
+                End While
+                proc list_destroy from List with mk
+            End If
+        End If
+        proc stringbuilder_append_char from SB with sb, 125
+        Return 1
+    End If
+    If kind is equal to CV_DATETIME:
+        proc stringbuilder_append from SB with sb, "@datetime "
+        Let dt be proc memory_get_int64 from Memory with v, 8
+        If dt is not equal to 0:
+            proc stringbuilder_append from SB with sb, dt
+        End If
+        Return 1
+    End If
+    If kind is equal to CV_DURATION:
+        proc stringbuilder_append from SB with sb, "@duration "
+        Let ns be proc memory_get_int64 from Memory with v, 8
+        proc stringbuilder_append_integer from SB with sb, ns
+        Return 1
+    End If
+    proc stringbuilder_append from SB with sb, "null"
+    Return 1
+End Process
+
+@Reasoning
+Parse a Runa-native config-value textual representation into a
+ConfigValue tree. The format produced by config_value_to_runa_native is
+the canonical input.
+@End Reasoning
+
+@Implementation
+Recursive descent over the input bytes. The parser tracks position in a
+small state record and dispatches on the next non-whitespace byte:
+  'n'  -> "null"
+  't'  -> "true"
+  'f'  -> "false"
+  '"'  -> string literal
+  '['  -> list
+  '{'  -> map
+  '@'  -> typed marker (@datetime / @duration)
+  digit / '-' -> integer
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "config_value_from_runa_native" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let state be proc allocate from Layout with 24
+    If state is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with state, 0, text
+    Let length be proc string_length from StringCore with text
+    proc memory_set_int64 from Memory with state, 8, length
+    proc memory_set_int64 from Memory with state, 16, 0
+    Let value be proc rv_parse_value with state
+    proc deallocate from Layout with state
+    Return value
+End Process
+
+@Reasoning
+Skip ASCII whitespace at the current cursor position.
+@End Reasoning
+
+@Implementation
+Advance while byte is space/tab/LF/CR.
+@End Implementation
+
+@Performance_Hints
+Time: O(k).
+@End Performance_Hints
+
+@Security_Scope
+Internal.
+@End Security_Scope
+Process called "rv_skip_ws" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    While pos is less than length:
+        Let ch be proc memory_get_byte from Memory with text, pos
+        Let is_ws be 0
+        If ch is equal to 32:
+            Set is_ws to 1
+        End If
+        If ch is equal to 9:
+            Set is_ws to 1
+        End If
+        If ch is equal to 10:
+            Set is_ws to 1
+        End If
+        If ch is equal to 13:
+            Set is_ws to 1
+        End If
+        If is_ws is equal to 0:
+            proc memory_set_int64 from Memory with state, 16, pos
+            Return 1
+        End If
+        Set pos to pos plus 1
+    End While
+    proc memory_set_int64 from Memory with state, 16, pos
+    Return 1
+End Process
+
+@Reasoning
+Parse one value at the cursor.
+@End Reasoning
+
+@Implementation
+Dispatch on first byte.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on failure.
+@End Security_Scope
+Process called "rv_parse_value" takes state as Integer returns Integer:
+    proc rv_skip_ws with state
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    If pos is greater than or equal to length:
+        Return 0
+    End If
+    Let ch be proc memory_get_byte from Memory with text, pos
+    If ch is equal to 110:
+        Return proc rv_parse_literal_value with state, "null", 0
+    End If
+    If ch is equal to 116:
+        Return proc rv_parse_literal_value with state, "true", 1
+    End If
+    If ch is equal to 102:
+        Return proc rv_parse_literal_value with state, "false", 2
+    End If
+    If ch is equal to 34:
+        Let s be proc rv_parse_string with state
+        If s is equal to 0:
+            Return 0
+        End If
+        Let cv be proc config_value_string from Cfg with s
+        proc deallocate from Layout with s
+        Return cv
+    End If
+    If ch is equal to 91:
+        Return proc rv_parse_list with state
+    End If
+    If ch is equal to 123:
+        Return proc rv_parse_map with state
+    End If
+    If ch is equal to 64:
+        Return proc rv_parse_typed_marker with state
+    End If
+    Let isdig be 0
+    If ch is greater than or equal to 48:
+        If ch is less than or equal to 57:
+            Set isdig to 1
+        End If
+    End If
+    If ch is equal to 45:
+        Set isdig to 1
+    End If
+    If isdig is equal to 1:
+        Return proc rv_parse_integer with state
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Match a literal keyword and produce the corresponding ConfigValue.
+@End Reasoning
+
+@Implementation
+Verify next |literal| bytes match; on success advance and produce the
+specified value:
+  flag=0 -> null
+  flag=1 -> true
+  flag=2 -> false
+@End Implementation
+
+@Performance_Hints
+Time: O(|literal|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on mismatch.
+@End Security_Scope
+Process called "rv_parse_literal_value" takes state as Integer, literal as Integer, flag as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    Let llen be proc string_length from StringCore with literal
+    If (pos plus llen) is greater than length:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than llen:
+        Let a be proc memory_get_byte from Memory with text, pos plus i
+        Let b be proc memory_get_byte from Memory with literal, i
+        If a is not equal to b:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    proc memory_set_int64 from Memory with state, 16, pos plus llen
+    If flag is equal to 0:
+        Return proc config_value_null from Cfg
+    End If
+    If flag is equal to 1:
+        Return proc config_value_bool from Cfg with 1
+    End If
+    Return proc config_value_bool from Cfg with 0
+End Process
+
+@Reasoning
+Parse a quoted string literal at the cursor.
+@End Reasoning
+
+@Implementation
+Consume opening '"'. Walk bytes decoding \\, \", \n. Stop at closing '"'.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on unterminated.
+@End Security_Scope
+Process called "rv_parse_string" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    If pos is greater than or equal to length:
+        Return 0
+    End If
+    Let opener be proc memory_get_byte from Memory with text, pos
+    If opener is not equal to 34:
+        Return 0
+    End If
+    Set pos to pos plus 1
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    Let done be 0
+    While done is equal to 0:
+        If pos is greater than or equal to length:
+            proc stringbuilder_destroy from SB with sb
+            Return 0
+        End If
+        Let ch be proc memory_get_byte from Memory with text, pos
+        Set pos to pos plus 1
+        If ch is equal to 34:
+            Set done to 1
+        Otherwise:
+            If ch is equal to 92:
+                If pos is greater than or equal to length:
+                    proc stringbuilder_destroy from SB with sb
+                    Return 0
+                End If
+                Let esc be proc memory_get_byte from Memory with text, pos
+                Set pos to pos plus 1
+                If esc is equal to 110:
+                    proc stringbuilder_append_char from SB with sb, 10
+                Otherwise:
+                    proc stringbuilder_append_char from SB with sb, esc
+                End If
+            Otherwise:
+                proc stringbuilder_append_char from SB with sb, ch
+            End If
+        End If
+    End While
+    proc memory_set_int64 from Memory with state, 16, pos
+    Let s be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return s
+End Process
+
+@Reasoning
+Parse a "[...]" list of values.
+@End Reasoning
+
+@Implementation
+Consume '['. Skip ws. If ']', done. Else loop parsing values separated
+by ','.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "rv_parse_list" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    If pos is greater than or equal to length:
+        Return 0
+    End If
+    Let opener be proc memory_get_byte from Memory with text, pos
+    If opener is not equal to 91:
+        Return 0
+    End If
+    Set pos to pos plus 1
+    proc memory_set_int64 from Memory with state, 16, pos
+    Let lst be proc list_create from List
+    If lst is equal to 0:
+        Return 0
+    End If
+    proc rv_skip_ws with state
+    Let new_pos be proc memory_get_int64 from Memory with state, 16
+    If new_pos is less than length:
+        Let ch be proc memory_get_byte from Memory with text, new_pos
+        If ch is equal to 93:
+            proc memory_set_int64 from Memory with state, 16, new_pos plus 1
+            Return proc config_value_list from Cfg with lst
+        End If
+    End If
+    Let going be 1
+    While going is equal to 1:
+        proc rv_skip_ws with state
+        Let elem be proc rv_parse_value with state
+        If elem is equal to 0:
+            proc list_destroy from List with lst
+            Return 0
+        End If
+        proc list_push from List with lst, elem
+        proc rv_skip_ws with state
+        Let cur be proc memory_get_int64 from Memory with state, 16
+        If cur is greater than or equal to length:
+            proc list_destroy from List with lst
+            Return 0
+        End If
+        Let nch be proc memory_get_byte from Memory with text, cur
+        proc memory_set_int64 from Memory with state, 16, cur plus 1
+        If nch is equal to 93:
+            Set going to 0
+        Otherwise:
+            If nch is not equal to 44:
+                proc list_destroy from List with lst
+                Return 0
+            End If
+        End If
+    End While
+    Return proc config_value_list from Cfg with lst
+End Process
+
+@Reasoning
+Parse a "{key:value,...}" map.
+@End Reasoning
+
+@Implementation
+Consume '{', loop parsing string-quoted keys and values separated by
+':' and ','.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "rv_parse_map" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    If pos is greater than or equal to length:
+        Return 0
+    End If
+    Let opener be proc memory_get_byte from Memory with text, pos
+    If opener is not equal to 123:
+        Return 0
+    End If
+    Set pos to pos plus 1
+    proc memory_set_int64 from Memory with state, 16, pos
+    Let map be proc create from Dict
+    If map is equal to 0:
+        Return 0
+    End If
+    proc rv_skip_ws with state
+    Let cur be proc memory_get_int64 from Memory with state, 16
+    If cur is less than length:
+        Let ch be proc memory_get_byte from Memory with text, cur
+        If ch is equal to 125:
+            proc memory_set_int64 from Memory with state, 16, cur plus 1
+            Return proc config_value_map from Cfg with map
+        End If
+    End If
+    Let going be 1
+    While going is equal to 1:
+        proc rv_skip_ws with state
+        Let key be proc rv_parse_string with state
+        If key is equal to 0:
+            proc destroy from Dict with map
+            Return 0
+        End If
+        proc rv_skip_ws with state
+        Let cpos be proc memory_get_int64 from Memory with state, 16
+        If cpos is greater than or equal to length:
+            proc deallocate from Layout with key
+            proc destroy from Dict with map
+            Return 0
+        End If
+        Let colon be proc memory_get_byte from Memory with text, cpos
+        If colon is not equal to 58:
+            proc deallocate from Layout with key
+            proc destroy from Dict with map
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with state, 16, cpos plus 1
+        Let val be proc rv_parse_value with state
+        If val is equal to 0:
+            proc deallocate from Layout with key
+            proc destroy from Dict with map
+            Return 0
+        End If
+        proc set from Dict with map, key, val
+        proc deallocate from Layout with key
+        proc rv_skip_ws with state
+        Let after be proc memory_get_int64 from Memory with state, 16
+        If after is greater than or equal to length:
+            proc destroy from Dict with map
+            Return 0
+        End If
+        Let nch be proc memory_get_byte from Memory with text, after
+        proc memory_set_int64 from Memory with state, 16, after plus 1
+        If nch is equal to 125:
+            Set going to 0
+        Otherwise:
+            If nch is not equal to 44:
+                proc destroy from Dict with map
+                Return 0
+            End If
+        End If
+    End While
+    Return proc config_value_map from Cfg with map
+End Process
+
+@Reasoning
+Parse "@datetime <iso>" or "@duration <ns>" typed-marker values.
+@End Reasoning
+
+@Implementation
+Consume '@'. Read identifier. Skip whitespace. For datetime parse a
+non-whitespace token. For duration parse an integer.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on unknown marker.
+@End Security_Scope
+Process called "rv_parse_typed_marker" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    Set pos to pos plus 1
+    Let marker_start be pos
+    While pos is less than length:
+        Let ch be proc memory_get_byte from Memory with text, pos
+        Let is_ws be 0
+        If ch is equal to 32:
+            Set is_ws to 1
+        End If
+        If is_ws is equal to 1:
+            Set pos to length plus 1
+        Otherwise:
+            Set pos to pos plus 1
+        End If
+    End While
+    Let marker_end be marker_start
+    Let scan be 1
+    While scan is equal to 1:
+        If marker_end is greater than or equal to length:
+            Set scan to 0
+        Otherwise:
+            Let ch2 be proc memory_get_byte from Memory with text, marker_end
+            If ch2 is equal to 32:
+                Set scan to 0
+            Otherwise:
+                Set marker_end to marker_end plus 1
+            End If
+        End If
+    End While
+    Let mlen be marker_end minus marker_start
+    Let marker be proc string_substring from StringPrim with text, marker_start, mlen
+    proc memory_set_int64 from Memory with state, 16, marker_end
+    proc rv_skip_ws with state
+    Let is_dt be proc string_equals from StringCore with marker, "datetime"
+    Let is_dur be proc string_equals from StringCore with marker, "duration"
+    proc deallocate from Layout with marker
+    Let cur be proc memory_get_int64 from Memory with state, 16
+    Let arg_start be cur
+    Let scan2 be 1
+    While scan2 is equal to 1:
+        If cur is greater than or equal to length:
+            Set scan2 to 0
+        Otherwise:
+            Let ch3 be proc memory_get_byte from Memory with text, cur
+            Let is_ws3 be 0
+            If ch3 is equal to 32:
+                Set is_ws3 to 1
+            End If
+            If ch3 is equal to 9:
+                Set is_ws3 to 1
+            End If
+            If ch3 is equal to 10:
+                Set is_ws3 to 1
+            End If
+            If ch3 is equal to 13:
+                Set is_ws3 to 1
+            End If
+            If ch3 is equal to 44:
+                Set is_ws3 to 1
+            End If
+            If ch3 is equal to 125:
+                Set is_ws3 to 1
+            End If
+            If ch3 is equal to 93:
+                Set is_ws3 to 1
+            End If
+            If is_ws3 is equal to 1:
+                Set scan2 to 0
+            Otherwise:
+                Set cur to cur plus 1
+            End If
+        End If
+    End While
+    Let alen be cur minus arg_start
+    Let arg be proc string_substring from StringPrim with text, arg_start, alen
+    proc memory_set_int64 from Memory with state, 16, cur
+    If is_dt is equal to 1:
+        Let v be proc config_value_datetime with arg
+        proc deallocate from Layout with arg
+        Return v
+    End If
+    If is_dur is equal to 1:
+        Let ns be proc string_to_integer from StringPrim with arg
+        proc deallocate from Layout with arg
+        Return proc config_value_duration with ns
+    End If
+    proc deallocate from Layout with arg
+    Return 0
+End Process
+
+@Reasoning
+Parse a signed decimal integer at the cursor.
+@End Reasoning
+
+@Implementation
+Optionally consume '-'. Read digits until non-digit. Substring, convert,
+wrap as CV_INTEGER.
+@End Implementation
+
+@Performance_Hints
+Time: O(d) digits.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on parse failure.
+@End Security_Scope
+Process called "rv_parse_integer" takes state as Integer returns Integer:
+    Let text be proc memory_get_int64 from Memory with state, 0
+    Let length be proc memory_get_int64 from Memory with state, 8
+    Let pos be proc memory_get_int64 from Memory with state, 16
+    Let start be pos
+    If pos is less than length:
+        Let ch be proc memory_get_byte from Memory with text, pos
+        If ch is equal to 45:
+            Set pos to pos plus 1
+        End If
+    End If
+    Let any_digit be 0
+    Let going be 1
+    While going is equal to 1:
+        If pos is greater than or equal to length:
+            Set going to 0
+        Otherwise:
+            Let cd be proc memory_get_byte from Memory with text, pos
+            Let isd be 0
+            If cd is greater than or equal to 48:
+                If cd is less than or equal to 57:
+                    Set isd to 1
+                End If
+            End If
+            If isd is equal to 1:
+                Set pos to pos plus 1
+                Set any_digit to 1
+            Otherwise:
+                Set going to 0
+            End If
+        End If
+    End While
+    If any_digit is equal to 0:
+        Return 0
+    End If
+    Let slen be pos minus start
+    Let span be proc string_substring from StringPrim with text, start, slen
+    proc memory_set_int64 from Memory with state, 16, pos
+    Let iv be proc string_to_integer from StringPrim with span
+    proc deallocate from Layout with span
+    Return proc config_value_integer from Cfg with iv
+End Process

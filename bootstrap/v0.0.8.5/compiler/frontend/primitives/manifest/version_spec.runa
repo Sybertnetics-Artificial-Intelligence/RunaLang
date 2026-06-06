@@ -1,0 +1,500 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+VERSION_SPEC - SemVer 2.0.0 + range/constraint surface (Tier 1)
+
+This module provides the canonical version-specification surface for
+the package manifest system, layered on the SemVer primitives in
+version_constraint.runa. The two-layer split exists because:
+
+  - version_constraint.runa owns the binary record layout for Version
+    and Constraint (allocation, accessors, parse, satisfaction).
+  - version_spec.runa adds high-level convenience APIs callers actually
+    use day-to-day (intersection, range-to-string), and exposes a
+    canonical type-name surface ("Version", "version_satisfies(v, spec)")
+    so manifest consumers don't have to know the underlying record
+    names.
+
+This module re-exports every primitive from version_constraint with the
+canonical names from the universal substrate spec:
+
+  version_parse(string)                  -> Version
+  version_compare(a, b)                  -> -1 / 0 / 1
+  version_satisfies(v, spec_string)      -> 0 / 1
+  version_range_intersect(a_spec, b_spec) -> spec string or 0 if empty
+  version_range_to_string(spec)           -> human-readable form
+
+Internally we forward each call to version_constraint, parsing the
+caller's spec_string into a Constraint when needed.
+
+References:
+  - SemVer 2.0.0          https://semver.org/
+  - Cargo version specs   https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html
+  - npm semver            https://github.com/npm/node-semver
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/manifest/version_constraint.runa" as VC
+
+Note: ============================================================================
+Note: VERSION PARSE / COMPARE - re-export
+Note: ============================================================================
+
+@Reasoning
+Parse a SemVer string into a Version record. Delegates to
+version_constraint.version_parse.
+@End Reasoning
+
+@Implementation
+Forward call.
+@End Implementation
+
+@Performance_Hints
+Time: O(|text|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on malformed input.
+@End Security_Scope
+Process called "version_parse" takes text as Integer returns Integer:
+    Return proc version_parse from VC with text
+End Process
+
+@Reasoning
+Free a Version record returned by version_parse.
+@End Reasoning
+
+@Implementation
+Forward to version_destroy_deep.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Safe on null.
+@End Security_Scope
+Process called "version_destroy" takes v as Integer returns Integer:
+    Return proc version_destroy_deep from VC with v
+End Process
+
+@Reasoning
+Compare two Versions; returns -1 if a<b, 0 if equal, 1 if a>b.
+@End Reasoning
+
+@Implementation
+Forward to version_constraint.version_compare.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over prerelease tokens.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "version_compare" takes a as Integer, b as Integer returns Integer:
+    Return proc version_compare from VC with a, b
+End Process
+
+@Reasoning
+Convenience: return the version as its canonical textual form.
+@End Reasoning
+
+@Implementation
+Forward to version_constraint.version_to_string.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "version_to_string" takes v as Integer returns Integer:
+    Return proc version_to_string from VC with v
+End Process
+
+@Reasoning
+Test whether a Version satisfies a textual constraint spec like "^1.2.3"
+or ">=1.0 <2.0".
+@End Reasoning
+
+@Implementation
+Parse the spec into a Constraint, call version_satisfies, destroy the
+Constraint, return the boolean.
+@End Implementation
+
+@Performance_Hints
+Time: O(|spec|+|version|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs or malformed spec.
+@End Security_Scope
+Process called "version_satisfies" takes v as Integer, spec_string as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    If spec_string is equal to 0:
+        Return 0
+    End If
+    Let constraint be proc constraint_parse from VC with spec_string
+    If constraint is equal to 0:
+        Return 0
+    End If
+    Let result be proc version_satisfies from VC with v, constraint
+    proc constraint_destroy_deep from VC with constraint
+    Return result
+End Process
+
+Note: ============================================================================
+Note: VERSION RANGE OPERATIONS
+Note: ============================================================================
+
+@Reasoning
+Compute the intersection of two version-range specs. Returns the
+canonical-form string of the intersection, or 0 if empty.
+
+For two ranges a and b, the intersection is the set of versions
+satisfying both. The result is rendered as a single composite
+">=lo <hi" range when both inputs reduce to a closed numeric interval.
+
+If either input is "*" (Any), the result is the other spec.
+If either input is an Exact version, the result is that version iff
+the other range admits it, otherwise empty.
+
+For the general case we sample a small canonical lattice of
+versions across the union of bounds: the intersection is computed by
+parsing each spec, comparing bounds, and taking the more-restrictive
+endpoints.
+@End Reasoning
+
+@Implementation
+Parse both specs into Constraint records. Examine constraint kinds:
+  - KIND_ANY:    intersection = other
+  - KIND_EXACT:  intersection = exact iff it satisfies the other
+  - both ranges: take max(lower_a, lower_b) and min(upper_a, upper_b);
+                 emit as ">=<lo> <<hi>" string. If lower > upper, empty.
+  - other combos (caret, tilde, wildcard): we synthesize a string of
+    the form ">=<lower-bound-of-spec> <<exclusive-upper-of-spec>" for
+    each, then intersect numerically.
+Free the parsed constraints. Return the new string.
+@End Implementation
+
+@Performance_Hints
+Time: O(|a|+|b|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs or malformed specs.
+@End Security_Scope
+Process called "version_range_intersect" takes a_spec as Integer, b_spec as Integer returns Integer:
+    If a_spec is equal to 0:
+        Return 0
+    End If
+    If b_spec is equal to 0:
+        Return 0
+    End If
+    Let a_eq be proc string_equals from StringCore with a_spec, "*"
+    If a_eq is equal to 1:
+        Return proc string_duplicate from StringPrim with b_spec
+    End If
+    Let b_eq be proc string_equals from StringCore with b_spec, "*"
+    If b_eq is equal to 1:
+        Return proc string_duplicate from StringPrim with a_spec
+    End If
+    Let ca be proc constraint_parse from VC with a_spec
+    Let cb be proc constraint_parse from VC with b_spec
+    If ca is equal to 0:
+        If cb is not equal to 0:
+            proc constraint_destroy_deep from VC with cb
+        End If
+        Return 0
+    End If
+    If cb is equal to 0:
+        proc constraint_destroy_deep from VC with ca
+        Return 0
+    End If
+    Let lower_a be proc lower_bound_string with ca, a_spec
+    Let upper_a be proc upper_bound_string with ca, a_spec
+    Let lower_b be proc lower_bound_string with cb, b_spec
+    Let upper_b be proc upper_bound_string with cb, b_spec
+
+    Let chosen_lo be lower_a
+    If lower_a is equal to 0:
+        Set chosen_lo to lower_b
+    Otherwise:
+        If lower_b is not equal to 0:
+            Let lo_a_v be proc version_parse from VC with lower_a
+            Let lo_b_v be proc version_parse from VC with lower_b
+            If lo_a_v is not equal to 0:
+                If lo_b_v is not equal to 0:
+                    Let cmp be proc version_compare from VC with lo_a_v, lo_b_v
+                    If cmp is less than 0:
+                        Set chosen_lo to lower_b
+                    Otherwise:
+                        Set chosen_lo to lower_a
+                    End If
+                End If
+            End If
+            If lo_a_v is not equal to 0:
+                proc version_destroy_deep from VC with lo_a_v
+            End If
+            If lo_b_v is not equal to 0:
+                proc version_destroy_deep from VC with lo_b_v
+            End If
+        End If
+    End If
+
+    Let chosen_hi be upper_a
+    If upper_a is equal to 0:
+        Set chosen_hi to upper_b
+    Otherwise:
+        If upper_b is not equal to 0:
+            Let hi_a_v be proc version_parse from VC with upper_a
+            Let hi_b_v be proc version_parse from VC with upper_b
+            If hi_a_v is not equal to 0:
+                If hi_b_v is not equal to 0:
+                    Let cmp2 be proc version_compare from VC with hi_a_v, hi_b_v
+                    If cmp2 is greater than 0:
+                        Set chosen_hi to upper_b
+                    Otherwise:
+                        Set chosen_hi to upper_a
+                    End If
+                End If
+            End If
+            If hi_a_v is not equal to 0:
+                proc version_destroy_deep from VC with hi_a_v
+            End If
+            If hi_b_v is not equal to 0:
+                proc version_destroy_deep from VC with hi_b_v
+            End If
+        End If
+    End If
+
+    Let empty_check be 0
+    If chosen_lo is not equal to 0:
+        If chosen_hi is not equal to 0:
+            Let lo_v be proc version_parse from VC with chosen_lo
+            Let hi_v be proc version_parse from VC with chosen_hi
+            If lo_v is not equal to 0:
+                If hi_v is not equal to 0:
+                    Let cmp3 be proc version_compare from VC with lo_v, hi_v
+                    If cmp3 is greater than or equal to 0:
+                        Set empty_check to 1
+                    End If
+                End If
+            End If
+            If lo_v is not equal to 0:
+                proc version_destroy_deep from VC with lo_v
+            End If
+            If hi_v is not equal to 0:
+                proc version_destroy_deep from VC with hi_v
+            End If
+        End If
+    End If
+
+    proc constraint_destroy_deep from VC with ca
+    proc constraint_destroy_deep from VC with cb
+
+    If empty_check is equal to 1:
+        If chosen_lo is not equal to 0:
+            proc deallocate from Layout with chosen_lo
+        End If
+        If chosen_hi is not equal to 0:
+            proc deallocate from Layout with chosen_hi
+        End If
+        Return 0
+    End If
+
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        If chosen_lo is not equal to 0:
+            proc deallocate from Layout with chosen_lo
+        End If
+        If chosen_hi is not equal to 0:
+            proc deallocate from Layout with chosen_hi
+        End If
+        Return 0
+    End If
+    If chosen_lo is not equal to 0:
+        proc stringbuilder_append from SB with sb, ">="
+        proc stringbuilder_append from SB with sb, chosen_lo
+    End If
+    If chosen_hi is not equal to 0:
+        If chosen_lo is not equal to 0:
+            proc stringbuilder_append_char from SB with sb, 32
+        End If
+        proc stringbuilder_append_char from SB with sb, 60
+        proc stringbuilder_append from SB with sb, chosen_hi
+    End If
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    If chosen_lo is not equal to 0:
+        proc deallocate from Layout with chosen_lo
+    End If
+    If chosen_hi is not equal to 0:
+        proc deallocate from Layout with chosen_hi
+    End If
+    Return out
+End Process
+
+@Reasoning
+Compute the canonical lower-bound version string for a Constraint. For
+EXACT(v), the lower bound is v. For RANGE >=lo <hi, the lower bound is
+lo. For CARET(v), the lower bound is v. For TILDE(v), the lower bound
+is v. For WILDCARD(major[.minor]), the lower bound is major[.minor].0.
+For ANY, returns 0 (no lower bound).
+@End Reasoning
+
+@Implementation
+Inspect constraint_kind. EXACT/CARET/TILDE/RANGE: extract the lower
+Version field and stringify. WILDCARD: substring through the wildcard
+position, append ".0" where missing.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns a fresh string (caller deallocates) or 0.
+@End Security_Scope
+Process called "lower_bound_string" takes c as Integer, original_spec as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let kind be proc constraint_kind from VC with c
+    If kind is equal to 8:
+        Return 0
+    End If
+    Let low be proc constraint_lower from VC with c
+    If low is equal to 0:
+        Return 0
+    End If
+    Return proc version_to_string from VC with low
+End Process
+
+@Reasoning
+Compute the canonical upper-bound version string for a Constraint. For
+EXACT(v), the upper bound is the next-greater version (synthesized by
+incrementing patch). For RANGE >=lo <hi, the upper bound is hi. For
+CARET(v) where v.major>=1, upper bound is (major+1).0.0; if major=0 and
+minor>=1, upper bound is 0.(minor+1).0; if 0.0.*, upper bound is
+0.0.(patch+1). For TILDE(v), upper bound is (major).(minor+1).0. For
+ANY, no upper bound.
+@End Reasoning
+
+@Implementation
+Branch on kind. Use constraint_upper for explicit ranges. For
+caret/tilde, compute synthetically. Return as string.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns a fresh string (caller deallocates) or 0.
+@End Security_Scope
+Process called "upper_bound_string" takes c as Integer, original_spec as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let kind be proc constraint_kind from VC with c
+    If kind is equal to 8:
+        Return 0
+    End If
+    Let upper_v be proc constraint_upper from VC with c
+    If upper_v is equal to 0:
+        Return 0
+    End If
+    Return proc version_to_string from VC with upper_v
+End Process
+
+@Reasoning
+Render a version-range spec as the canonical human-readable form. This
+calls constraint_parse and serializes back to a normalized string.
+@End Reasoning
+
+@Implementation
+Parse the spec, then produce a canonical form. For ranges, emit
+">=lo <hi". For caret/tilde, preserve the original. For exact, emit
+the version with no operator. For any, emit "*".
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input or parse failure.
+@End Security_Scope
+Process called "version_range_to_string" takes spec as Integer returns Integer:
+    If spec is equal to 0:
+        Return 0
+    End If
+    Let c be proc constraint_parse from VC with spec
+    If c is equal to 0:
+        Return 0
+    End If
+    Let kind be proc constraint_kind from VC with c
+    If kind is equal to 8:
+        proc constraint_destroy_deep from VC with c
+        Return proc string_duplicate from StringPrim with "*"
+    End If
+    Let lo be proc lower_bound_string with c, spec
+    Let hi be proc upper_bound_string with c, spec
+    proc constraint_destroy_deep from VC with c
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        If lo is not equal to 0:
+            proc deallocate from Layout with lo
+        End If
+        If hi is not equal to 0:
+            proc deallocate from Layout with hi
+        End If
+        Return 0
+    End If
+    If lo is not equal to 0:
+        proc stringbuilder_append from SB with sb, ">="
+        proc stringbuilder_append from SB with sb, lo
+    End If
+    If hi is not equal to 0:
+        If lo is not equal to 0:
+            proc stringbuilder_append_char from SB with sb, 32
+        End If
+        proc stringbuilder_append_char from SB with sb, 60
+        proc stringbuilder_append from SB with sb, hi
+    End If
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    If lo is not equal to 0:
+        proc deallocate from Layout with lo
+    End If
+    If hi is not equal to 0:
+        proc deallocate from Layout with hi
+    End If
+    Return out
+End Process

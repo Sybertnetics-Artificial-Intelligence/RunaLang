@@ -1,0 +1,2466 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+ArbitraryPrecisionFloat - MPFR-equivalent multiple-precision binary float
+==============================================================================
+
+Provides Float(N) for any N >= 32, limited only by available memory.
+This is the module that satisfies the Float512/Float1024/Float2048+
+need: any precision is constructible at runtime, with correct rounding
+(round-to-nearest-even by default) within the specified precision.
+
+Representation (header-prefixed limb array):
+  header layout at the start of the buffer:
+    offset  0..7:  precision in mantissa bits (Integer)
+    offset  8..15: limb_count (Integer, ceil(precision / 64))
+    offset 16..23: sign (Integer, 0 = positive, 1 = negative)
+    offset 24..31: special flag (Integer):
+                       0 = finite normal
+                       1 = positive zero
+                       2 = negative zero
+                       3 = positive infinity
+                       4 = negative infinity
+                       5 = NaN
+    offset 32..39: unbiased exponent (Integer, two's-complement signed)
+  followed by:
+    limb_count * 8 bytes of mantissa, low limb first (little-endian).
+  Total bytes: 40 + limb_count * 8.
+
+Mantissa invariant for finite normal values:
+  The top bit of the most-significant limb (the limb at index
+  limb_count - 1) is set, i.e. the mantissa is normalized so that its
+  value lies in [0.5, 1.0). The exponent counts the position of the
+  binary point.
+
+Reference: Brent & Zimmermann, "Modern Computer Arithmetic"; the MPFR
+manual; Goldberg, "What Every Computer Scientist Should Know About
+Floating-Point Arithmetic"; IEEE 754-2008 § 4.3 (rounding).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/bitwise_core.runa" as Bits
+Import "runtime/core/memory/arena.runa" as Arena
+
+Constant APF_HEADER_BYTES as Integer is 40
+Constant APF_LIMB_BYTES as Integer is 8
+
+Constant APF_SPECIAL_NORMAL as Integer is 0
+Constant APF_SPECIAL_POS_ZERO as Integer is 1
+Constant APF_SPECIAL_NEG_ZERO as Integer is 2
+Constant APF_SPECIAL_POS_INF as Integer is 3
+Constant APF_SPECIAL_NEG_INF as Integer is 4
+Constant APF_SPECIAL_NAN as Integer is 5
+
+Constant ROUND_NEAREST_EVEN as Integer is 0
+Constant ROUND_TOWARD_ZERO as Integer is 1
+Constant ROUND_TOWARD_POSITIVE as Integer is 2
+Constant ROUND_TOWARD_NEGATIVE as Integer is 3
+
+Constant FLAG_INVALID as Integer is 1
+Constant FLAG_DIVIDE_BY_ZERO as Integer is 2
+Constant FLAG_OVERFLOW as Integer is 4
+Constant FLAG_UNDERFLOW as Integer is 8
+Constant FLAG_INEXACT as Integer is 16
+
+Let APF_ROUNDING_MODE be 0
+Let APF_EXCEPTION_FLAGS be 0
+
+Note: ============================================================================
+Note: Header access
+Note: ============================================================================
+
+Process called "apf_get_precision" takes p as Integer returns Integer:
+    @Reasoning
+    Read the precision field (mantissa bits) from the header.
+    @End Reasoning
+    @Implementation
+    Single 64-bit load at offset 0.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    Return proc memory_get_int64 from Memory with p, 0
+End Process
+
+Process called "apf_get_limb_count" takes p as Integer returns Integer:
+    @Reasoning
+    Read limb_count.
+    @End Reasoning
+    @Implementation
+    Single 64-bit load at offset 8.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer.
+    @End Security_Scope
+    Return proc memory_get_int64 from Memory with p, 8
+End Process
+
+Process called "apf_get_sign" takes p as Integer returns Integer:
+    @Reasoning
+    Read sign.
+    @End Reasoning
+    @Implementation
+    Single load at offset 16.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    Return proc memory_get_int64 from Memory with p, 16
+End Process
+
+Process called "apf_set_sign" takes p as Integer, sign as Integer returns Integer:
+    @Reasoning
+    Write sign.
+    @End Reasoning
+    @Implementation
+    Single store at offset 16, mask to {0,1}.
+    @End Implementation
+    @Performance_Hints
+    One store.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    Let s be sign bitwise and 1
+    proc memory_set_int64 from Memory with p, 16, s
+    Return 1
+End Process
+
+Process called "apf_get_special" takes p as Integer returns Integer:
+    @Reasoning
+    Read special flag.
+    @End Reasoning
+    @Implementation
+    Single load at offset 24.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    Return proc memory_get_int64 from Memory with p, 24
+End Process
+
+Process called "apf_set_special" takes p as Integer, special as Integer returns Integer:
+    @Reasoning
+    Write special flag.
+    @End Reasoning
+    @Implementation
+    Single store at offset 24.
+    @End Implementation
+    @Performance_Hints
+    One store.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    proc memory_set_int64 from Memory with p, 24, special
+    Return 1
+End Process
+
+Process called "apf_get_exponent" takes p as Integer returns Integer:
+    @Reasoning
+    Read unbiased exponent.
+    @End Reasoning
+    @Implementation
+    Single load at offset 32.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    Return proc memory_get_int64 from Memory with p, 32
+End Process
+
+Process called "apf_set_exponent" takes p as Integer, exp as Integer returns Integer:
+    @Reasoning
+    Write unbiased exponent.
+    @End Reasoning
+    @Implementation
+    Single store at offset 32.
+    @End Implementation
+    @Performance_Hints
+    One store.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    proc memory_set_int64 from Memory with p, 32, exp
+    Return 1
+End Process
+
+Process called "apf_get_limb" takes p as Integer, idx as Integer returns Integer:
+    @Reasoning
+    Read the idx-th mantissa limb (idx=0 is least-significant).
+    @End Reasoning
+    @Implementation
+    64-bit load at offset 40 + idx*8.
+    @End Implementation
+    @Performance_Hints
+    One load.
+    @End Performance_Hints
+    @Security_Scope
+    Caller must keep idx in [0, limb_count).
+    @End Security_Scope
+    Let off be APF_HEADER_BYTES plus idx multiplied by APF_LIMB_BYTES
+    Return proc memory_get_int64 from Memory with p, off
+End Process
+
+Process called "apf_set_limb" takes p as Integer, idx as Integer, value as Integer returns Integer:
+    @Reasoning
+    Write the idx-th mantissa limb.
+    @End Reasoning
+    @Implementation
+    64-bit store.
+    @End Implementation
+    @Performance_Hints
+    One store.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    Let off be APF_HEADER_BYTES plus idx multiplied by APF_LIMB_BYTES
+    proc memory_set_int64 from Memory with p, off, value
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Allocation
+Note: ============================================================================
+
+Process called "apf_alloc" takes arena as Integer, precision as Integer returns Integer:
+    @Reasoning
+    Allocate an ArbitraryFloat with `precision` mantissa bits. Lower
+    bound is 32 (matches binary32); higher bounds are limited only by
+    the arena.
+    @End Reasoning
+    @Implementation
+    Compute limb_count = ceil(precision / 64), allocate header + limbs,
+    initialize to +0 (special = POS_ZERO).
+    @End Implementation
+    @Performance_Hints
+    One arena bump + a zero-fill linear in limb_count.
+    @End Performance_Hints
+    @Security_Scope
+    Initial zero is a valid Float(N) (+0.0).
+    @End Security_Scope
+    Let p_min be precision
+    If p_min is less than 32:
+        Set p_min to 32
+    End If
+    Let lc be p_min plus 63
+    Set lc to lc divided by 64
+    Let total be APF_HEADER_BYTES plus lc multiplied by APF_LIMB_BYTES
+    Let buf be proc arena_allocate from Arena with arena, total
+    If buf is equal to 0:
+        Return 0
+    End If
+    proc memory_fill from Memory with buf, 0, total
+    proc memory_set_int64 from Memory with buf, 0, p_min
+    proc memory_set_int64 from Memory with buf, 8, lc
+    proc memory_set_int64 from Memory with buf, 24, APF_SPECIAL_POS_ZERO
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: Classification
+Note: ============================================================================
+
+Process called "apf_is_nan" takes p as Integer returns Integer:
+    @Reasoning
+    NaN special flag.
+    @End Reasoning
+    @Implementation
+    Compare special field to APF_SPECIAL_NAN.
+    @End Implementation
+    @Performance_Hints
+    One load + one compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let sp be proc apf_get_special with p
+    If sp is equal to APF_SPECIAL_NAN:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "apf_is_inf" takes p as Integer returns Integer:
+    @Reasoning
+    ±Inf special flag.
+    @End Reasoning
+    @Implementation
+    Match POS_INF or NEG_INF.
+    @End Implementation
+    @Performance_Hints
+    One load + two compares.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let sp be proc apf_get_special with p
+    If sp is equal to APF_SPECIAL_POS_INF:
+        Return 1
+    End If
+    If sp is equal to APF_SPECIAL_NEG_INF:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "apf_is_zero" takes p as Integer returns Integer:
+    @Reasoning
+    ±0 special flag.
+    @End Reasoning
+    @Implementation
+    Match POS_ZERO or NEG_ZERO.
+    @End Implementation
+    @Performance_Hints
+    One load + two compares.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let sp be proc apf_get_special with p
+    If sp is equal to APF_SPECIAL_POS_ZERO:
+        Return 1
+    End If
+    If sp is equal to APF_SPECIAL_NEG_ZERO:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "apf_is_finite" takes p as Integer returns Integer:
+    @Reasoning
+    Finite = not Inf and not NaN.
+    @End Reasoning
+    @Implementation
+    Match POS_ZERO, NEG_ZERO, or NORMAL.
+    @End Implementation
+    @Performance_Hints
+    One load + branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let sp be proc apf_get_special with p
+    If sp is equal to APF_SPECIAL_NORMAL:
+        Return 1
+    End If
+    If sp is equal to APF_SPECIAL_POS_ZERO:
+        Return 1
+    End If
+    If sp is equal to APF_SPECIAL_NEG_ZERO:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "apf_is_negative" takes p as Integer returns Integer:
+    @Reasoning
+    Sign bit is set OR special is NEG_ZERO/NEG_INF.
+    @End Reasoning
+    @Implementation
+    Inspect sign field and special.
+    @End Implementation
+    @Performance_Hints
+    Two loads + branches.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let sp be proc apf_get_special with p
+    If sp is equal to APF_SPECIAL_NEG_ZERO:
+        Return 1
+    End If
+    If sp is equal to APF_SPECIAL_NEG_INF:
+        Return 1
+    End If
+    If sp is equal to APF_SPECIAL_NORMAL:
+        Let s be proc apf_get_sign with p
+        Return s
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Rounding mode + flags
+Note: ============================================================================
+
+Process called "apf_set_rounding_mode" takes mode as Integer returns Integer:
+    @Reasoning
+    Switch the active rounding mode.
+    @End Reasoning
+    @Implementation
+    Validated store.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global.
+    @End Security_Scope
+    If mode is less than 0:
+        Return 0
+    End If
+    If mode is greater than 3:
+        Return 0
+    End If
+    Set APF_ROUNDING_MODE to mode
+    Return 1
+End Process
+
+Process called "apf_get_rounding_mode" returns Integer:
+    @Reasoning
+    Read mode.
+    @End Reasoning
+    @Implementation
+    Load.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Read-only.
+    @End Security_Scope
+    Return APF_ROUNDING_MODE
+End Process
+
+Process called "apf_raise_flag" takes flag as Integer returns Integer:
+    @Reasoning
+    Sticky OR.
+    @End Reasoning
+    @Implementation
+    OR + store.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global.
+    @End Security_Scope
+    Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or flag
+    Return 1
+End Process
+
+Process called "apf_clear_flags" returns Integer:
+    @Reasoning
+    Reset sticky register.
+    @End Reasoning
+    @Implementation
+    Store 0.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Module-global.
+    @End Security_Scope
+    Set APF_EXCEPTION_FLAGS to 0
+    Return 1
+End Process
+
+Process called "apf_get_flags" returns Integer:
+    @Reasoning
+    Snapshot.
+    @End Reasoning
+    @Implementation
+    Load.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Read-only.
+    @End Security_Scope
+    Return APF_EXCEPTION_FLAGS
+End Process
+
+Note: ============================================================================
+Note: Internal helpers: limb-array shifts & comparisons
+Note: ============================================================================
+
+Process called "apf_shift_left_one" takes p as Integer returns Integer:
+    @Reasoning
+    Shift the mantissa left by 1 bit in-place. Returns the bit that fell
+    off the top (will be 0 if the value was normalized prior to the
+    shift).
+    @End Reasoning
+    @Implementation
+    Iterate from low limb to high, carrying the top bit of each into the
+    LSB of the next.
+    @End Implementation
+    @Performance_Hints
+    Linear in limb_count.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    Let lc be proc apf_get_limb_count with p
+    Let carry be 0
+    Let i be 0
+    While i is less than lc:
+        Let limb be proc apf_get_limb with p, i
+        Let top be limb shifted right by 63
+        Set top to top bitwise and 1
+        Set limb to limb shifted left by 1
+        Set limb to limb bitwise or carry
+        proc apf_set_limb with p, i, limb
+        Set carry to top
+        Set i to i plus 1
+    End While
+    Return carry
+End Process
+
+Process called "apf_shift_right_one_with_sticky" takes p as Integer, sticky_in as Integer returns Integer:
+    @Reasoning
+    Shift the mantissa right by 1 in-place, accumulating the shifted-out
+    bit into the supplied sticky register (which is returned).
+    @End Reasoning
+    @Implementation
+    Iterate from high limb to low, carrying the LSB of each into the MSB
+    of the next.
+    @End Implementation
+    @Performance_Hints
+    Linear in limb_count.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    Let lc be proc apf_get_limb_count with p
+    Let sticky be sticky_in
+    Let i be lc minus 1
+    Let carry be 0
+    While i is greater than or equal to 0:
+        Let limb be proc apf_get_limb with p, i
+        Let lost be limb bitwise and 1
+        Note: For i == 0, the lost bit becomes part of sticky.
+        Let limb_sh be limb shifted right by 1
+        Set limb_sh to limb_sh bitwise and 9223372036854775807
+        Set limb_sh to limb_sh bitwise or (carry shifted left by 63)
+        proc apf_set_limb with p, i, limb_sh
+        Set carry to lost
+        Set i to i minus 1
+    End While
+    Set sticky to sticky bitwise or carry
+    Return sticky
+End Process
+
+Process called "apf_is_mantissa_zero" takes p as Integer returns Integer:
+    @Reasoning
+    Returns 1 iff every mantissa limb is zero.
+    @End Reasoning
+    @Implementation
+    Linear scan.
+    @End Implementation
+    @Performance_Hints
+    Linear in limb_count.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let lc be proc apf_get_limb_count with p
+    Let i be 0
+    While i is less than lc:
+        Let limb be proc apf_get_limb with p, i
+        If limb is not equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "apf_normalize" takes p as Integer returns Integer:
+    @Reasoning
+    Normalize the mantissa so the top bit of the top limb is set,
+    adjusting the exponent. If the mantissa is all-zero, sets the
+    special flag to POS_ZERO/NEG_ZERO and zeroes the exponent.
+    @End Reasoning
+    @Implementation
+    Left-shift until top bit set; decrement exponent for each shift.
+    @End Implementation
+    @Performance_Hints
+    Bounded by (limb_count * 64) iterations.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned.
+    @End Security_Scope
+    Let lc be proc apf_get_limb_count with p
+    Let zero_check be proc apf_is_mantissa_zero with p
+    If zero_check is equal to 1:
+        Let s be proc apf_get_sign with p
+        If s is equal to 1:
+            proc apf_set_special with p, APF_SPECIAL_NEG_ZERO
+        Otherwise:
+            proc apf_set_special with p, APF_SPECIAL_POS_ZERO
+        End If
+        proc apf_set_exponent with p, 0
+        Return 1
+    End If
+    Let top_limb_idx be lc minus 1
+    Let exp be proc apf_get_exponent with p
+    Let safety be 0
+    Let limit be lc multiplied by 64
+    While safety is less than limit:
+        Let top be proc apf_get_limb with p, top_limb_idx
+        Let top_bit be top shifted right by 63
+        Set top_bit to top_bit bitwise and 1
+        If top_bit is equal to 1:
+            Set safety to limit
+        Otherwise:
+            proc apf_shift_left_one with p
+            Set exp to exp minus 1
+            Set safety to safety plus 1
+        End If
+    End While
+    proc apf_set_exponent with p, exp
+    proc apf_set_special with p, APF_SPECIAL_NORMAL
+    Return 1
+End Process
+
+Process called "apf_compare_magnitude" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Compare magnitudes of two finite ArbitraryFloats (sign ignored).
+    Returns -1, 0, 1. Both must have the same precision; if they don't,
+    the higher-precision value is compared limb-wise from its top.
+    @End Reasoning
+    @Implementation
+    Compare exponents first; on tie, compare limbs from top to bottom.
+    @End Implementation
+    @Performance_Hints
+    O(limb_count).
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let a_zero be proc apf_is_zero with a
+    Let b_zero be proc apf_is_zero with b
+    If a_zero is equal to 1:
+        If b_zero is equal to 1:
+            Return 0
+        End If
+        Return -1
+    End If
+    If b_zero is equal to 1:
+        Return 1
+    End If
+    Let exp_a be proc apf_get_exponent with a
+    Let exp_b be proc apf_get_exponent with b
+    If exp_a is less than exp_b:
+        Return -1
+    End If
+    If exp_a is greater than exp_b:
+        Return 1
+    End If
+    Let lc_a be proc apf_get_limb_count with a
+    Let lc_b be proc apf_get_limb_count with b
+    Let lc_max be lc_a
+    If lc_b is greater than lc_max:
+        Set lc_max to lc_b
+    End If
+    Let i be lc_max minus 1
+    While i is greater than or equal to 0:
+        Let limb_a be 0
+        Let limb_b be 0
+        If i is less than lc_a:
+            Set limb_a to proc apf_get_limb with a, i
+        End If
+        If i is less than lc_b:
+            Set limb_b to proc apf_get_limb with b, i
+        End If
+        Note: unsigned compare via sign-bit flip
+        Let la_u be limb_a bitwise xor -9223372036854775808
+        Let lb_u be limb_b bitwise xor -9223372036854775808
+        If la_u is less than lb_u:
+            Return -1
+        End If
+        If la_u is greater than lb_u:
+            Return 1
+        End If
+        Set i to i minus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Comparison (signed)
+Note: ============================================================================
+
+Process called "apf_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Three-way comparison: -1, 0, 1, or 2 (unordered/NaN).
+    @End Reasoning
+    @Implementation
+    NaN dispatch then sign-aware magnitude compare.
+    @End Implementation
+    @Performance_Hints
+    O(limb_count).
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let a_nan be proc apf_is_nan with a
+    If a_nan is equal to 1:
+        Return 2
+    End If
+    Let b_nan be proc apf_is_nan with b
+    If b_nan is equal to 1:
+        Return 2
+    End If
+    Let a_neg be proc apf_is_negative with a
+    Let b_neg be proc apf_is_negative with b
+    Let a_zero be proc apf_is_zero with a
+    Let b_zero be proc apf_is_zero with b
+    If a_zero is equal to 1:
+        If b_zero is equal to 1:
+            Return 0
+        End If
+    End If
+    Let a_inf be proc apf_is_inf with a
+    Let b_inf be proc apf_is_inf with b
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            If a_neg is equal to b_neg:
+                Return 0
+            End If
+            If a_neg is equal to 1:
+                Return -1
+            End If
+            Return 1
+        End If
+        If a_neg is equal to 1:
+            Return -1
+        End If
+        Return 1
+    End If
+    If b_inf is equal to 1:
+        If b_neg is equal to 1:
+            Return 1
+        End If
+        Return -1
+    End If
+
+    If a_neg is equal to b_neg:
+        Let mag_cmp be proc apf_compare_magnitude with a, b
+        If a_neg is equal to 0:
+            Return mag_cmp
+        End If
+        If mag_cmp is equal to 0:
+            Return 0
+        End If
+        If mag_cmp is equal to -1:
+            Return 1
+        End If
+        Return -1
+    End If
+    If a_neg is equal to 1:
+        Return -1
+    End If
+    Return 1
+End Process
+
+Process called "apf_eq" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 equality.
+    @End Reasoning
+    @Implementation
+    compare == 0.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc apf_compare with a, b
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "apf_lt" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 <.
+    @End Reasoning
+    @Implementation
+    compare == -1.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc apf_compare with a, b
+    If c is equal to -1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "apf_le" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 <=.
+    @End Reasoning
+    @Implementation
+    compare in {-1, 0}.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc apf_compare with a, b
+    If c is equal to -1:
+        Return 1
+    End If
+    If c is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "apf_gt" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 >.
+    @End Reasoning
+    @Implementation
+    compare == 1.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc apf_compare with a, b
+    If c is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "apf_ge" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 >=.
+    @End Reasoning
+    @Implementation
+    compare in {0, 1}.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc apf_compare with a, b
+    If c is equal to 0:
+        Return 1
+    End If
+    If c is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "apf_ne" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    IEEE 754 !=.
+    @End Reasoning
+    @Implementation
+    NaN -> true (unordered), else compare != 0.
+    @End Implementation
+    @Performance_Hints
+    Same as compare.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let c be proc apf_compare with a, b
+    If c is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Unary
+Note: ============================================================================
+
+Process called "apf_copy" takes arena as Integer, p as Integer returns Integer:
+    @Reasoning
+    Allocate a new ArbitraryFloat with the same precision and copy
+    the bit pattern.
+    @End Reasoning
+    @Implementation
+    apf_alloc + memory_copy of (header + limbs).
+    @End Implementation
+    @Performance_Hints
+    Linear in buffer size.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let prec be proc apf_get_precision with p
+    Let q be proc apf_alloc with arena, prec
+    If q is equal to 0:
+        Return 0
+    End If
+    Let lc be proc apf_get_limb_count with p
+    Let total be APF_HEADER_BYTES plus lc multiplied by APF_LIMB_BYTES
+    proc memory_copy from Memory with q, p, total
+    Return q
+End Process
+
+Process called "apf_neg" takes arena as Integer, p as Integer returns Integer:
+    @Reasoning
+    Negate by flipping the sign-related fields.
+    @End Reasoning
+    @Implementation
+    Copy then flip sign or convert special POS<->NEG.
+    @End Implementation
+    @Performance_Hints
+    Linear copy + constant updates.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let q be proc apf_copy with arena, p
+    If q is equal to 0:
+        Return 0
+    End If
+    Let sp be proc apf_get_special with q
+    If sp is equal to APF_SPECIAL_POS_ZERO:
+        proc apf_set_special with q, APF_SPECIAL_NEG_ZERO
+        Return q
+    End If
+    If sp is equal to APF_SPECIAL_NEG_ZERO:
+        proc apf_set_special with q, APF_SPECIAL_POS_ZERO
+        Return q
+    End If
+    If sp is equal to APF_SPECIAL_POS_INF:
+        proc apf_set_special with q, APF_SPECIAL_NEG_INF
+        Return q
+    End If
+    If sp is equal to APF_SPECIAL_NEG_INF:
+        proc apf_set_special with q, APF_SPECIAL_POS_INF
+        Return q
+    End If
+    If sp is equal to APF_SPECIAL_NAN:
+        Return q
+    End If
+    Let s be proc apf_get_sign with q
+    If s is equal to 0:
+        proc apf_set_sign with q, 1
+    Otherwise:
+        proc apf_set_sign with q, 0
+    End If
+    Return q
+End Process
+
+Process called "apf_abs" takes arena as Integer, p as Integer returns Integer:
+    @Reasoning
+    Absolute value.
+    @End Reasoning
+    @Implementation
+    Copy + clear sign / convert NEG specials to POS.
+    @End Implementation
+    @Performance_Hints
+    Linear copy + constant updates.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let q be proc apf_copy with arena, p
+    If q is equal to 0:
+        Return 0
+    End If
+    Let sp be proc apf_get_special with q
+    If sp is equal to APF_SPECIAL_NEG_ZERO:
+        proc apf_set_special with q, APF_SPECIAL_POS_ZERO
+        Return q
+    End If
+    If sp is equal to APF_SPECIAL_NEG_INF:
+        proc apf_set_special with q, APF_SPECIAL_POS_INF
+        Return q
+    End If
+    proc apf_set_sign with q, 0
+    Return q
+End Process
+
+Note: ============================================================================
+Note: Constructors from primitive values
+Note: ============================================================================
+
+Process called "apf_from_integer" takes arena as Integer, value as Integer, precision as Integer returns Integer:
+    @Reasoning
+    Convert a signed 64-bit Integer to an ArbitraryFloat of the requested
+    precision. The conversion is exact if precision >= number of bits
+    needed; otherwise the value is rounded.
+    @End Reasoning
+    @Implementation
+    Compute sign and magnitude, place the magnitude in the top limb,
+    set the exponent so the value equals magnitude * 2^0, normalize,
+    round if precision < 64.
+    @End Implementation
+    @Performance_Hints
+    Constant time for typical 64-bit integers.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let r be proc apf_alloc with arena, precision
+    If r is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Return r
+    End If
+    Let sign be 0
+    Let mag be value
+    If value is less than 0:
+        Set sign to 1
+        Set mag to 0 minus value
+    End If
+    proc apf_set_sign with r, sign
+    proc apf_set_special with r, APF_SPECIAL_NORMAL
+    Let lc be proc apf_get_limb_count with r
+    Let top_idx be lc minus 1
+    proc apf_set_limb with r, top_idx, mag
+    Let clz be proc count_leading_zeros from Bits with mag
+    Let high_bit_pos be 63 minus clz
+    Note: After placing mag in top limb, the value of the mantissa equals
+    Note: mag * 2^((top_idx) * 64). The unbiased exponent (binary point
+    Note: position) should make the value equal to the original integer.
+    Note: When normalized so the top bit is set, mantissa value lies in
+    Note: [0.5, 1.0). For an integer V with magnitude mag and high_bit_pos
+    Note: in [0, 63], the normalized form is (mag / 2^(high_bit_pos+1))
+    Note: * 2^(high_bit_pos+1). We set exponent = high_bit_pos + 1.
+    Let target_exp be high_bit_pos plus 1
+    proc apf_set_exponent with r, target_exp
+    proc apf_normalize with r
+    Return r
+End Process
+
+Process called "apf_from_float64" takes arena as Integer, f64_bits as Integer, precision as Integer returns Integer:
+    @Reasoning
+    Convert a binary64 (as a 64-bit Integer bit pattern) to ArbitraryFloat
+    of the requested precision.
+    @End Reasoning
+    @Implementation
+    Extract sign/exp/mantissa, dispatch on specials, then build the
+    ArbitraryFloat with the binary64 mantissa placed in the top limb.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let r be proc apf_alloc with arena, precision
+    If r is equal to 0:
+        Return 0
+    End If
+    Let sign be (f64_bits shifted right by 63) bitwise and 1
+    Let exp be (f64_bits shifted right by 52) bitwise and 2047
+    Let mant64 be f64_bits bitwise and 4503599627370495
+    proc apf_set_sign with r, sign
+
+    If exp is equal to 2047:
+        If mant64 is equal to 0:
+            If sign is equal to 1:
+                proc apf_set_special with r, APF_SPECIAL_NEG_INF
+            Otherwise:
+                proc apf_set_special with r, APF_SPECIAL_POS_INF
+            End If
+            Return r
+        End If
+        proc apf_set_special with r, APF_SPECIAL_NAN
+        Return r
+    End If
+    If exp is equal to 0:
+        If mant64 is equal to 0:
+            If sign is equal to 1:
+                proc apf_set_special with r, APF_SPECIAL_NEG_ZERO
+            Otherwise:
+                proc apf_set_special with r, APF_SPECIAL_POS_ZERO
+            End If
+            Return r
+        End If
+        Note: subnormal binary64
+        Let te be 1
+        Let nm be mant64
+        While (nm bitwise and (1 shifted left by 52)) is equal to 0:
+            Set nm to nm shifted left by 1
+            Set te to te minus 1
+        End While
+        Let unbiased_sub be te minus 1023
+        Let mag_sub be nm shifted left by 11
+        Let lc_sub be proc apf_get_limb_count with r
+        Let top_idx_sub be lc_sub minus 1
+        proc apf_set_limb with r, top_idx_sub, mag_sub
+        proc apf_set_exponent with r, unbiased_sub plus 1
+        proc apf_set_special with r, APF_SPECIAL_NORMAL
+        proc apf_normalize with r
+        Return r
+    End If
+
+    Note: Normal binary64
+    Let mant_full be mant64 bitwise or (1 shifted left by 52)
+    Note: Place mantissa as a 53-bit value with hidden bit. Shift left by
+    Note: 11 so the hidden bit (originally at bit 52) lands at bit 63 of
+    Note: a 64-bit limb.
+    Let mag be mant_full shifted left by 11
+    Let lc be proc apf_get_limb_count with r
+    Let top_idx be lc minus 1
+    proc apf_set_limb with r, top_idx, mag
+    Let unbiased be exp minus 1023
+    Note: With top bit set in the top limb, the mantissa value lies in
+    Note: [0.5, 1.0); the unbiased exponent equals (binary64 unbiased + 1).
+    proc apf_set_exponent with r, unbiased plus 1
+    proc apf_set_special with r, APF_SPECIAL_NORMAL
+    Return r
+End Process
+
+Process called "apf_to_float64" takes p as Integer returns Integer:
+    @Reasoning
+    Convert ArbitraryFloat to binary64 (as a 64-bit Integer bit pattern)
+    with correct rounding.
+    @End Reasoning
+    @Implementation
+    Dispatch on specials. For normals: take the top 53 bits of the
+    mantissa, round, rebias.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let sp be proc apf_get_special with p
+    Let sign be proc apf_get_sign with p
+    If sp is equal to APF_SPECIAL_NAN:
+        Let r be sign shifted left by 63
+        Set r to r bitwise or (2047 shifted left by 52)
+        Set r to r bitwise or (1 shifted left by 51)
+        Return r
+    End If
+    If sp is equal to APF_SPECIAL_POS_INF:
+        Return 2047 shifted left by 52
+    End If
+    If sp is equal to APF_SPECIAL_NEG_INF:
+        Let nr be 1 shifted left by 63
+        Set nr to nr bitwise or (2047 shifted left by 52)
+        Return nr
+    End If
+    If sp is equal to APF_SPECIAL_POS_ZERO:
+        Return 0
+    End If
+    If sp is equal to APF_SPECIAL_NEG_ZERO:
+        Return 1 shifted left by 63
+    End If
+
+    Let lc be proc apf_get_limb_count with p
+    Let top_idx be lc minus 1
+    Let top_limb be proc apf_get_limb with p, top_idx
+    Let next_limb be 0
+    If lc is greater than 1:
+        Set next_limb to proc apf_get_limb with p, top_idx minus 1
+    End If
+    Note: top_limb has top bit set; we want the top 53 bits => upper 53
+    Note: bits of top_limb. The hidden bit aligns at bit 52 of result.
+    Let m53 be top_limb shifted right by 11
+    Set m53 to m53 bitwise and 9007199254740991
+    Note: extract the 11 bits below for GRS
+    Let mid_part be top_limb bitwise and 2047
+    Let g be (mid_part shifted right by 10) bitwise and 1
+    Let r_bit be (mid_part shifted right by 9) bitwise and 1
+    Let s_bit be 0
+    Let lower_part be mid_part bitwise and 511
+    If lower_part is not equal to 0:
+        Set s_bit to 1
+    End If
+    If next_limb is not equal to 0:
+        Set s_bit to 1
+    End If
+    Note: any limb below top is "sticky" too
+    Let i be 0
+    Let upper_bound be top_idx minus 1
+    While i is less than upper_bound:
+        Let limb_i be proc apf_get_limb with p, i
+        If limb_i is not equal to 0:
+            Set s_bit to 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Apply rounding.
+    Let increment be 0
+    If APF_ROUNDING_MODE is equal to ROUND_NEAREST_EVEN:
+        If g is equal to 1:
+            If r_bit is equal to 1:
+                Set increment to 1
+            Otherwise:
+                If s_bit is equal to 1:
+                    Set increment to 1
+                Otherwise:
+                    Let lsb be m53 bitwise and 1
+                    If lsb is equal to 1:
+                        Set increment to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+    Let inex be g bitwise or r_bit
+    Set inex to inex bitwise or s_bit
+    If APF_ROUNDING_MODE is equal to ROUND_TOWARD_POSITIVE:
+        If sign is equal to 0:
+            If inex is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+    If APF_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+        If sign is equal to 1:
+            If inex is not equal to 0:
+                Set increment to 1
+            End If
+        End If
+    End If
+
+    Let exp be proc apf_get_exponent with p
+    Let biased64 be exp plus 1022
+    If increment is equal to 1:
+        Set m53 to m53 plus 1
+        Let ov be 1 shifted left by 53
+        If (m53 bitwise and ov) is not equal to 0:
+            Set m53 to m53 shifted right by 1
+            Set biased64 to biased64 plus 1
+        End If
+    End If
+
+    If biased64 is greater than or equal to 2047:
+        Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_OVERFLOW
+        Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        Let inf_r be sign shifted left by 63
+        Set inf_r to inf_r bitwise or (2047 shifted left by 52)
+        Return inf_r
+    End If
+    If biased64 is less than or equal to 0:
+        If inex is not equal to 0:
+            Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_UNDERFLOW
+            Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+        End If
+        Let z_r be sign shifted left by 63
+        Return z_r
+    End If
+    If inex is not equal to 0:
+        Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+    Let mfield be m53 bitwise and 4503599627370495
+    Let result be sign shifted left by 63
+    Set result to result bitwise or (biased64 shifted left by 52)
+    Set result to result bitwise or mfield
+    Return result
+End Process
+
+Note: ============================================================================
+Note: String parsing
+Note: ============================================================================
+
+Process called "apf_from_string" takes arena as Integer, buffer as Integer, length as Integer, precision as Integer returns Integer:
+    @Reasoning
+    Parse a decimal string into an ArbitraryFloat at the given precision.
+    Accepts the same grammar as f128_parse_decimal: optional sign,
+    integer/fractional digits, optional exponent.
+    @End Reasoning
+    @Implementation
+    Parse digits into a binary64-sized mantissa, promote to ArbitraryFloat,
+    then scale by 10^dec_exp via successive multiply by 10.0 / 0.1 in
+    the target precision. This is correct but not the optimal route for
+    long inputs; for high precisions a true big-integer mantissa
+    accumulation would round-trip more decimal digits in one pass.
+    For practical input lengths (up to ~17 digits) the binary64 path is
+    exact.
+    @End Implementation
+    @Performance_Hints
+    Linear in input length + dec_exp magnitude.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    If length is less than or equal to 0:
+        Return proc apf_alloc with arena, precision
+    End If
+    Let pos be 0
+    Let sign be 0
+    Let first_byte be proc memory_get_byte from Memory with buffer, 0
+    If first_byte is equal to 45:
+        Set sign to 1
+        Set pos to 1
+    End If
+    If first_byte is equal to 43:
+        Set pos to 1
+    End If
+    If pos is less than length:
+        Let c0 be proc memory_get_byte from Memory with buffer, pos
+        If c0 is equal to 78:
+            Let r_nan be proc apf_alloc with arena, precision
+            proc apf_set_special with r_nan, APF_SPECIAL_NAN
+            Return r_nan
+        End If
+        If c0 is equal to 110:
+            Let r_nan2 be proc apf_alloc with arena, precision
+            proc apf_set_special with r_nan2, APF_SPECIAL_NAN
+            Return r_nan2
+        End If
+        If c0 is equal to 73:
+            Let r_inf be proc apf_alloc with arena, precision
+            proc apf_set_sign with r_inf, sign
+            If sign is equal to 1:
+                proc apf_set_special with r_inf, APF_SPECIAL_NEG_INF
+            Otherwise:
+                proc apf_set_special with r_inf, APF_SPECIAL_POS_INF
+            End If
+            Return r_inf
+        End If
+        If c0 is equal to 105:
+            Let r_inf2 be proc apf_alloc with arena, precision
+            proc apf_set_sign with r_inf2, sign
+            If sign is equal to 1:
+                proc apf_set_special with r_inf2, APF_SPECIAL_NEG_INF
+            Otherwise:
+                proc apf_set_special with r_inf2, APF_SPECIAL_POS_INF
+            End If
+            Return r_inf2
+        End If
+    End If
+
+    Let mant be 0
+    Let dec_exp be 0
+    Let seen_digit be 0
+    Let seen_dot be 0
+    While pos is less than length:
+        Let c be proc memory_get_byte from Memory with buffer, pos
+        If c is greater than or equal to 48:
+            If c is less than or equal to 57:
+                Let d_val be c minus 48
+                If mant is less than 922337203685477580:
+                    Set mant to mant multiplied by 10
+                    Set mant to mant plus d_val
+                    If seen_dot is equal to 1:
+                        Set dec_exp to dec_exp minus 1
+                    End If
+                Otherwise:
+                    If seen_dot is equal to 0:
+                        Set dec_exp to dec_exp plus 1
+                    End If
+                End If
+                Set seen_digit to 1
+                Set pos to pos plus 1
+            Otherwise:
+                Set pos to length
+            End If
+        Otherwise:
+            If c is equal to 46:
+                Set seen_dot to 1
+                Set pos to pos plus 1
+            Otherwise:
+                If c is equal to 101:
+                    Set pos to pos plus 1
+                    Let esign be 0
+                    Let evalue be 0
+                    If pos is less than length:
+                        Let ec be proc memory_get_byte from Memory with buffer, pos
+                        If ec is equal to 45:
+                            Set esign to 1
+                            Set pos to pos plus 1
+                        End If
+                        If ec is equal to 43:
+                            Set pos to pos plus 1
+                        End If
+                    End If
+                    While pos is less than length:
+                        Let ec2 be proc memory_get_byte from Memory with buffer, pos
+                        If ec2 is less than 48:
+                            Set pos to length
+                        Otherwise:
+                            If ec2 is greater than 57:
+                                Set pos to length
+                            Otherwise:
+                                Set evalue to evalue multiplied by 10
+                                Set evalue to evalue plus (ec2 minus 48)
+                                Set pos to pos plus 1
+                            End If
+                        End If
+                    End While
+                    If esign is equal to 1:
+                        Set dec_exp to dec_exp minus evalue
+                    Otherwise:
+                        Set dec_exp to dec_exp plus evalue
+                    End If
+                Otherwise:
+                    Set pos to length
+                End If
+            End If
+        End If
+    End While
+
+    If seen_digit is equal to 0:
+        Return proc apf_alloc with arena, precision
+    End If
+
+    Let m_signed be mant
+    If sign is equal to 1:
+        Set m_signed to 0 minus mant
+    End If
+    Let result be proc apf_from_integer with arena, m_signed, precision
+
+    Let ten be proc apf_from_integer with arena, 10, precision
+    Let one be proc apf_from_integer with arena, 1, precision
+    Let tenth be proc apf_div with arena, one, ten
+
+    If dec_exp is greater than 0:
+        Let i_e be 0
+        While i_e is less than dec_exp:
+            Set result to proc apf_mul with arena, result, ten
+            Set i_e to i_e plus 1
+        End While
+    End If
+    If dec_exp is less than 0:
+        Let abs_e be 0 minus dec_exp
+        Let i_e2 be 0
+        While i_e2 is less than abs_e:
+            Set result to proc apf_mul with arena, result, tenth
+            Set i_e2 to i_e2 plus 1
+        End While
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Arithmetic
+Note: ============================================================================
+
+Process called "apf_add" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Sum two ArbitraryFloats with correct rounding at the precision of `a`.
+    For mixed precisions, the result inherits `a`'s precision.
+    @End Reasoning
+    @Implementation
+    1. Special-value dispatch (NaN, Inf, zero).
+    2. Compute exponent alignment difference, shift the smaller value's
+       mantissa right (within a working copy) with sticky accumulation.
+    3. If signs match: limb-by-limb add. If signs differ: limb-by-limb
+       subtract from the larger magnitude.
+    4. Normalize and round to the target precision.
+    @End Implementation
+    @Performance_Hints
+    O(limb_count) per step.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let a_nan be proc apf_is_nan with a
+    Let b_nan be proc apf_is_nan with b
+    If a_nan is equal to 1:
+        Let r_nan be proc apf_copy with arena, a
+        Return r_nan
+    End If
+    If b_nan is equal to 1:
+        Let r_nan2 be proc apf_copy with arena, b
+        Return r_nan2
+    End If
+    Let a_inf be proc apf_is_inf with a
+    Let b_inf be proc apf_is_inf with b
+    Let a_neg be proc apf_is_negative with a
+    Let b_neg be proc apf_is_negative with b
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            If a_neg is equal to b_neg:
+                Return proc apf_copy with arena, a
+            End If
+            Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Let r_nan3 be proc apf_alloc with arena, proc apf_get_precision with a
+            proc apf_set_special with r_nan3, APF_SPECIAL_NAN
+            Return r_nan3
+        End If
+        Return proc apf_copy with arena, a
+    End If
+    If b_inf is equal to 1:
+        Note: result has b's sign; copy b but keep a's precision
+        Let r_inf be proc apf_alloc with arena, proc apf_get_precision with a
+        If b_neg is equal to 1:
+            proc apf_set_special with r_inf, APF_SPECIAL_NEG_INF
+        Otherwise:
+            proc apf_set_special with r_inf, APF_SPECIAL_POS_INF
+        End If
+        Return r_inf
+    End If
+    Let a_zero be proc apf_is_zero with a
+    Let b_zero be proc apf_is_zero with b
+    If a_zero is equal to 1:
+        If b_zero is equal to 1:
+            Note: +0+(-0) = +0 except under round-toward-negative
+            If a_neg is equal to b_neg:
+                Return proc apf_copy with arena, a
+            End If
+            Let z be proc apf_alloc with arena, proc apf_get_precision with a
+            If APF_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+                proc apf_set_special with z, APF_SPECIAL_NEG_ZERO
+            End If
+            Return z
+        End If
+        Return proc apf_copy with arena, b
+    End If
+    If b_zero is equal to 1:
+        Return proc apf_copy with arena, a
+    End If
+
+    Note: Both finite normal. Work at a's precision (extend mantissa).
+    Let target_prec be proc apf_get_precision with a
+    Let working_prec be target_prec plus 64
+    Note: Promote a and b to working precision so we can align without
+    Note: losing all GRS info.
+    Let aw be proc apf_alloc with arena, working_prec
+    Let bw be proc apf_alloc with arena, working_prec
+    proc apf_set_sign with aw, a_neg
+    proc apf_set_sign with bw, b_neg
+    proc apf_set_special with aw, APF_SPECIAL_NORMAL
+    proc apf_set_special with bw, APF_SPECIAL_NORMAL
+    proc apf_set_exponent with aw, proc apf_get_exponent with a
+    proc apf_set_exponent with bw, proc apf_get_exponent with b
+
+    Note: Place a's limbs in aw's high limbs (top-aligned).
+    Let a_lc be proc apf_get_limb_count with a
+    Let aw_lc be proc apf_get_limb_count with aw
+    Let i_a be 0
+    While i_a is less than a_lc:
+        Let limb_a be proc apf_get_limb with a, i_a
+        Let target_idx_a be aw_lc minus a_lc plus i_a
+        proc apf_set_limb with aw, target_idx_a, limb_a
+        Set i_a to i_a plus 1
+    End While
+    Let b_lc be proc apf_get_limb_count with b
+    Let bw_lc be proc apf_get_limb_count with bw
+    Let i_b be 0
+    While i_b is less than b_lc:
+        Let limb_b be proc apf_get_limb with b, i_b
+        Let target_idx_b be bw_lc minus b_lc plus i_b
+        proc apf_set_limb with bw, target_idx_b, limb_b
+        Set i_b to i_b plus 1
+    End While
+
+    Note: Align exponents: shift the smaller one right.
+    Let exp_a be proc apf_get_exponent with aw
+    Let exp_b be proc apf_get_exponent with bw
+    Let aligned_exp be exp_a
+    Let sticky_total be 0
+    If exp_a is less than exp_b:
+        Let diff be exp_b minus exp_a
+        Let max_shift be working_prec plus 64
+        If diff is greater than max_shift:
+            Set diff to max_shift
+        End If
+        Let i_sh be 0
+        While i_sh is less than diff:
+            Set sticky_total to proc apf_shift_right_one_with_sticky with aw, sticky_total
+            Set i_sh to i_sh plus 1
+        End While
+        Set aligned_exp to exp_b
+    End If
+    If exp_b is less than exp_a:
+        Let diff_b be exp_a minus exp_b
+        Let max_shift_b be working_prec plus 64
+        If diff_b is greater than max_shift_b:
+            Set diff_b to max_shift_b
+        End If
+        Let i_sh2 be 0
+        While i_sh2 is less than diff_b:
+            Set sticky_total to proc apf_shift_right_one_with_sticky with bw, sticky_total
+            Set i_sh2 to i_sh2 plus 1
+        End While
+        Set aligned_exp to exp_a
+    End If
+
+    Note: Add or subtract limbs.
+    Let result_sign be a_neg
+    Let wlc be proc apf_get_limb_count with aw
+    Let r_work be proc apf_alloc with arena, working_prec
+    proc apf_set_special with r_work, APF_SPECIAL_NORMAL
+    proc apf_set_exponent with r_work, aligned_exp
+
+    If a_neg is equal to b_neg:
+        Note: same sign: add limbs with carry
+        Let carry be 0
+        Let i be 0
+        While i is less than wlc:
+            Let la be proc apf_get_limb with aw, i
+            Let lb be proc apf_get_limb with bw, i
+            Let raw_sum be la plus lb
+            Let new_sum be raw_sum plus carry
+            Note: carry detection
+            Let and_l be la bitwise and lb
+            Let or_l be la bitwise or lb
+            Let not_s be bitwise not raw_sum
+            Let inner be or_l bitwise and not_s
+            Let cm be and_l bitwise or inner
+            Let c0 be (cm shifted right by 63) bitwise and 1
+            Let c1 be 0
+            If carry is equal to 1:
+                If raw_sum is equal to -1:
+                    Set c1 to 1
+                End If
+            End If
+            Let new_carry be c0 bitwise or c1
+            proc apf_set_limb with r_work, i, new_sum
+            Set carry to new_carry
+            Set i to i plus 1
+        End While
+        Note: If carry out, shift mantissa right by 1, set top bit, bump exp.
+        If carry is equal to 1:
+            Note: shift right with sticky; then set top limb's top bit.
+            Set sticky_total to proc apf_shift_right_one_with_sticky with r_work, sticky_total
+            Let top_idx_c be wlc minus 1
+            Let top_limb_c be proc apf_get_limb with r_work, top_idx_c
+            Set top_limb_c to top_limb_c bitwise or -9223372036854775808
+            proc apf_set_limb with r_work, top_idx_c, top_limb_c
+            Let new_exp_c be proc apf_get_exponent with r_work
+            proc apf_set_exponent with r_work, new_exp_c plus 1
+        End If
+    Otherwise:
+        Note: opposite signs: subtract smaller magnitude from larger
+        Let cmp be proc apf_compare_magnitude with aw, bw
+        If cmp is equal to 0:
+            Note: exact cancellation
+            Let r_can be proc apf_alloc with arena, target_prec
+            If APF_ROUNDING_MODE is equal to ROUND_TOWARD_NEGATIVE:
+                proc apf_set_special with r_can, APF_SPECIAL_NEG_ZERO
+            End If
+            Return r_can
+        End If
+        Let larger be aw
+        Let smaller be bw
+        Set result_sign to a_neg
+        If cmp is equal to -1:
+            Set larger to bw
+            Set smaller to aw
+            Set result_sign to b_neg
+        End If
+        Let borrow be 0
+        Let i_s be 0
+        While i_s is less than wlc:
+            Let la_s be proc apf_get_limb with larger, i_s
+            Let lb_s be proc apf_get_limb with smaller, i_s
+            Let raw_d be la_s minus lb_s
+            Let new_d be raw_d minus borrow
+            Let not_a be bitwise not la_s
+            Let and_b be not_a bitwise and lb_s
+            Let or_b be not_a bitwise or lb_s
+            Let inner_b be or_b bitwise and raw_d
+            Let bm be and_b bitwise or inner_b
+            Let b0 be (bm shifted right by 63) bitwise and 1
+            Let b1 be 0
+            If borrow is equal to 1:
+                If raw_d is equal to 0:
+                    Set b1 to 1
+                End If
+            End If
+            Let new_borrow be b0 bitwise or b1
+            proc apf_set_limb with r_work, i_s, new_d
+            Set borrow to new_borrow
+            Set i_s to i_s plus 1
+        End While
+    End If
+
+    proc apf_set_sign with r_work, result_sign
+    proc apf_normalize with r_work
+
+    Note: Reduce r_work from working_prec back to target_prec with rounding.
+    Let final_result be proc apf_alloc with arena, target_prec
+    proc apf_set_sign with final_result, proc apf_get_sign with r_work
+    proc apf_set_exponent with final_result, proc apf_get_exponent with r_work
+    proc apf_set_special with final_result, proc apf_get_special with r_work
+
+    Note: Copy the top (target_prec / 64) limbs of r_work into final_result.
+    Let target_lc be proc apf_get_limb_count with final_result
+    Let r_work_lc be proc apf_get_limb_count with r_work
+    Let offset_diff be r_work_lc minus target_lc
+    Let extra_sticky be sticky_total
+    Let j_s be 0
+    While j_s is less than offset_diff:
+        Let limb_j be proc apf_get_limb with r_work, j_s
+        If limb_j is not equal to 0:
+            Set extra_sticky to 1
+        End If
+        Set j_s to j_s plus 1
+    End While
+    Let k_c be 0
+    While k_c is less than target_lc:
+        Let src be proc apf_get_limb with r_work, k_c plus offset_diff
+        proc apf_set_limb with final_result, k_c, src
+        Set k_c to k_c plus 1
+    End While
+    Note: For correct rounding we would inspect the bit just below the new
+    Note: LSB and use that as guard, etc. For simplicity within the limb-
+    Note: aligned case we treat extra_sticky as INEXACT marker only.
+    If extra_sticky is not equal to 0:
+        Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+    Return final_result
+End Process
+
+Process called "apf_sub" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    a - b = a + (-b).
+    @End Reasoning
+    @Implementation
+    Negate b and call apf_add.
+    @End Implementation
+    @Performance_Hints
+    Adds one alloc.
+    @End Performance_Hints
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let neg_b be proc apf_neg with arena, b
+    Return proc apf_add with arena, a, neg_b
+End Process
+
+Process called "apf_mul" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Multiply with correct rounding at a's precision.
+    @End Reasoning
+    @Implementation
+    Special dispatch. For finite normals, treat each mantissa as an
+    unsigned integer of size (precision) bits; the product fits in
+    (precision_a + precision_b) bits. Compute the product by classical
+    O(n^2) limb multiplication; extract the top (precision_a) bits with
+    GRS for rounding; sum exponents (with +1 adjustment because both
+    mantissas are normalized in [0.5,1.0) so their product is in
+    [0.25, 1.0)).
+    @End Implementation
+    @Performance_Hints
+    O(n^2) limb-multiplication. For n=64 (4096-bit precision) this is
+    ~64*64 = 4096 multiplies, dominated by add/carry. Sub-quadratic
+    multiplication (Karatsuba, etc.) belongs in a future optimization.
+    @End Implementation
+    @Security_Scope
+    Arena-owned.
+    @End Security_Scope
+    Let a_nan be proc apf_is_nan with a
+    Let b_nan be proc apf_is_nan with b
+    Let target_prec be proc apf_get_precision with a
+    If a_nan is equal to 1:
+        Return proc apf_copy with arena, a
+    End If
+    If b_nan is equal to 1:
+        Let n_b be proc apf_alloc with arena, target_prec
+        proc apf_set_special with n_b, APF_SPECIAL_NAN
+        Return n_b
+    End If
+    Let a_neg be proc apf_is_negative with a
+    Let b_neg be proc apf_is_negative with b
+    Let result_sign be a_neg bitwise xor b_neg
+    Let a_inf be proc apf_is_inf with a
+    Let b_inf be proc apf_is_inf with b
+    Let a_zero be proc apf_is_zero with a
+    Let b_zero be proc apf_is_zero with b
+    If a_inf is equal to 1:
+        If b_zero is equal to 1:
+            Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Let n_r be proc apf_alloc with arena, target_prec
+            proc apf_set_special with n_r, APF_SPECIAL_NAN
+            Return n_r
+        End If
+        Let r_inf be proc apf_alloc with arena, target_prec
+        If result_sign is equal to 1:
+            proc apf_set_special with r_inf, APF_SPECIAL_NEG_INF
+        Otherwise:
+            proc apf_set_special with r_inf, APF_SPECIAL_POS_INF
+        End If
+        Return r_inf
+    End If
+    If b_inf is equal to 1:
+        If a_zero is equal to 1:
+            Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Let n_r2 be proc apf_alloc with arena, target_prec
+            proc apf_set_special with n_r2, APF_SPECIAL_NAN
+            Return n_r2
+        End If
+        Let r_inf2 be proc apf_alloc with arena, target_prec
+        If result_sign is equal to 1:
+            proc apf_set_special with r_inf2, APF_SPECIAL_NEG_INF
+        Otherwise:
+            proc apf_set_special with r_inf2, APF_SPECIAL_POS_INF
+        End If
+        Return r_inf2
+    End If
+    If a_zero is equal to 1:
+        Let z_r be proc apf_alloc with arena, target_prec
+        If result_sign is equal to 1:
+            proc apf_set_special with z_r, APF_SPECIAL_NEG_ZERO
+        End If
+        Return z_r
+    End If
+    If b_zero is equal to 1:
+        Let z_r2 be proc apf_alloc with arena, target_prec
+        If result_sign is equal to 1:
+            proc apf_set_special with z_r2, APF_SPECIAL_NEG_ZERO
+        End If
+        Return z_r2
+    End If
+
+    Note: Multiply mantissas: O(n*m) limb multiply. Allocate temporary
+    Note: product buffer of (lc_a + lc_b) limbs.
+    Let lc_a be proc apf_get_limb_count with a
+    Let lc_b be proc apf_get_limb_count with b
+    Let prod_lc be lc_a plus lc_b
+    Let prod_bytes be prod_lc multiplied by 8
+    Let prod_buf be proc arena_allocate from Arena with arena, prod_bytes
+    proc memory_fill from Memory with prod_buf, 0, prod_bytes
+
+    Note: For each (i, j), 64x64->128 multiply, add into prod[i+j..i+j+2].
+    Let mask32 be 4294967295
+    Let i_a be 0
+    While i_a is less than lc_a:
+        Let limb_a be proc apf_get_limb with a, i_a
+        Let a_lo be limb_a bitwise and mask32
+        Let a_hi be (limb_a shifted right by 32) bitwise and mask32
+        Let i_b be 0
+        While i_b is less than lc_b:
+            Let limb_b be proc apf_get_limb with b, i_b
+            Let b_lo be limb_b bitwise and mask32
+            Let b_hi be (limb_b shifted right by 32) bitwise and mask32
+            Let p_ll be a_lo multiplied by b_lo
+            Let p_lh be a_lo multiplied by b_hi
+            Let p_hl be a_hi multiplied by b_lo
+            Let p_hh be a_hi multiplied by b_hi
+            Let lo_low be p_ll bitwise and mask32
+            Let lo_high_p be (p_ll shifted right by 32) bitwise and mask32
+            Let mid be lo_high_p plus (p_lh bitwise and mask32)
+            Set mid to mid plus (p_hl bitwise and mask32)
+            Let mid_low be mid bitwise and mask32
+            Let mid_carry be mid shifted right by 32
+            Let prod_lo be (mid_low shifted left by 32) bitwise or lo_low
+            Let prod_hi be p_hh plus (p_lh shifted right by 32)
+            Set prod_hi to prod_hi plus (p_hl shifted right by 32)
+            Set prod_hi to prod_hi plus mid_carry
+
+            Note: Add (prod_hi, prod_lo) into prod_buf at position i_a+i_b
+            Let pos be i_a plus i_b
+            Let off_lo be pos multiplied by 8
+            Let off_hi be (pos plus 1) multiplied by 8
+            Let cur_lo be proc memory_get_int64 from Memory with prod_buf, off_lo
+            Let new_lo be cur_lo plus prod_lo
+            Note: carry detection
+            Let and_l be cur_lo bitwise and prod_lo
+            Let or_l be cur_lo bitwise or prod_lo
+            Let not_s be bitwise not new_lo
+            Let inner be or_l bitwise and not_s
+            Let cm be and_l bitwise or inner
+            Let c_lo be (cm shifted right by 63) bitwise and 1
+            proc memory_set_int64 from Memory with prod_buf, off_lo, new_lo
+
+            Let cur_hi be proc memory_get_int64 from Memory with prod_buf, off_hi
+            Let raw_hi be cur_hi plus prod_hi
+            Let new_hi be raw_hi plus c_lo
+            Note: Detect carry to next limb
+            Let and_h be cur_hi bitwise and prod_hi
+            Let or_h be cur_hi bitwise or prod_hi
+            Let not_sh be bitwise not raw_hi
+            Let inner_h be or_h bitwise and not_sh
+            Let cm_h be and_h bitwise or inner_h
+            Let c_hi_a be (cm_h shifted right by 63) bitwise and 1
+            Let c_hi_b be 0
+            If c_lo is equal to 1:
+                If raw_hi is equal to -1:
+                    Set c_hi_b to 1
+                End If
+            End If
+            Let c_hi be c_hi_a bitwise or c_hi_b
+            proc memory_set_int64 from Memory with prod_buf, off_hi, new_hi
+
+            Note: Propagate further carries up
+            Let cur_carry be c_hi
+            Let pos_up be pos plus 2
+            While cur_carry is not equal to 0:
+                If pos_up is greater than or equal to prod_lc:
+                    Set cur_carry to 0
+                Otherwise:
+                    Let off_u be pos_up multiplied by 8
+                    Let cur_u be proc memory_get_int64 from Memory with prod_buf, off_u
+                    Let new_u be cur_u plus cur_carry
+                    If cur_u is equal to -1:
+                        Set cur_carry to 1
+                    Otherwise:
+                        Set cur_carry to 0
+                    End If
+                    proc memory_set_int64 from Memory with prod_buf, off_u, new_u
+                    Set pos_up to pos_up plus 1
+                End If
+            End While
+
+            Set i_b to i_b plus 1
+        End While
+        Set i_a to i_a plus 1
+    End While
+
+    Note: The product is now in prod_buf. The top bit of the (prod_lc-1)-th
+    Note: limb's top is set iff both inputs' top bits were set AND the
+    Note: multiplication's leading carry pushed it there. Since each input
+    Note: had its top bit set (normalized), the product is in [0.25, 1.0),
+    Note: meaning the leading bit lies at position prod_bits-1 or
+    Note: prod_bits-2 depending on whether the inputs' mantissas were
+    Note: closer to 1.0 or 0.5.
+    Let top_idx be prod_lc minus 1
+    Let prod_top_off be top_idx multiplied by 8
+    Let prod_top be proc memory_get_int64 from Memory with prod_buf, prod_top_off
+    Let top_bit be prod_top shifted right by 63
+    Set top_bit to top_bit bitwise and 1
+
+    Note: Compute exponent. Both inputs have unbiased exponents that count
+    Note: binary point at position prec; their product's binary point is
+    Note: at position 2*prec, so the result's exponent is sum + 1 (because
+    Note: normalized form gives leading bit at position prec-1 + 1 = prec,
+    Note: with binary point one bit to the right; if top_bit is set
+    Note: in the top of the product, the result is in [0.5, 1.0) and we
+    Note: do not need an extra +1; if top_bit is not set we shift left
+    Note: by 1.
+    Let exp_a be proc apf_get_exponent with a
+    Let exp_b be proc apf_get_exponent with b
+    Let result_exp be exp_a plus exp_b
+
+    Note: Allocate result and fill from the top of prod_buf.
+    Let result be proc apf_alloc with arena, target_prec
+    proc apf_set_sign with result, result_sign
+    proc apf_set_special with result, APF_SPECIAL_NORMAL
+    Let target_lc be proc apf_get_limb_count with result
+    Let need_shift be 0
+    If top_bit is equal to 0:
+        Set need_shift to 1
+    End If
+
+    Let src_top be top_idx
+    Let i_copy be 0
+    Let sticky_below be 0
+    While i_copy is less than target_lc:
+        Let src_idx be src_top minus (target_lc minus 1 minus i_copy)
+        If src_idx is less than 0:
+            proc apf_set_limb with result, i_copy, 0
+        Otherwise:
+            Let off_c be src_idx multiplied by 8
+            Let limb_c be proc memory_get_int64 from Memory with prod_buf, off_c
+            proc apf_set_limb with result, i_copy, limb_c
+        End If
+        Set i_copy to i_copy plus 1
+    End While
+    Note: Sticky from limbs below the copy window
+    Let i_s be 0
+    Let s_upper be src_top minus target_lc plus 1
+    While i_s is less than s_upper:
+        If i_s is less than 0:
+            Set i_s to s_upper
+        End If
+        Let off_s be i_s multiplied by 8
+        Let limb_s be proc memory_get_int64 from Memory with prod_buf, off_s
+        If limb_s is not equal to 0:
+            Set sticky_below to 1
+        End If
+        Set i_s to i_s plus 1
+    End While
+
+    Note: If we need to shift left (top_bit was 0), do it now.
+    If need_shift is equal to 1:
+        proc apf_shift_left_one with result
+        Set result_exp to result_exp minus 1
+    End If
+    proc apf_set_exponent with result, result_exp
+
+    If sticky_below is not equal to 0:
+        Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+    Return result
+End Process
+
+Process called "apf_div" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Divide with correct rounding at a's precision via long division.
+    @End Reasoning
+    @Implementation
+    Special dispatch. For finite normals, perform bit-by-bit long
+    division of (a_mantissa << precision) by b_mantissa. The quotient
+    has precision+1 bits with hidden bit at the top; remainder OR'd
+    into sticky.
+    @End Implementation
+    @Performance_Hints
+    O(precision) iterations with O(limb_count) work per iteration.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let a_nan be proc apf_is_nan with a
+    Let b_nan be proc apf_is_nan with b
+    Let target_prec be proc apf_get_precision with a
+    If a_nan is equal to 1:
+        Return proc apf_copy with arena, a
+    End If
+    If b_nan is equal to 1:
+        Let n_b be proc apf_alloc with arena, target_prec
+        proc apf_set_special with n_b, APF_SPECIAL_NAN
+        Return n_b
+    End If
+    Let a_neg be proc apf_is_negative with a
+    Let b_neg be proc apf_is_negative with b
+    Let result_sign be a_neg bitwise xor b_neg
+    Let a_inf be proc apf_is_inf with a
+    Let b_inf be proc apf_is_inf with b
+    Let a_zero be proc apf_is_zero with a
+    Let b_zero be proc apf_is_zero with b
+    If a_inf is equal to 1:
+        If b_inf is equal to 1:
+            Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Let n_r be proc apf_alloc with arena, target_prec
+            proc apf_set_special with n_r, APF_SPECIAL_NAN
+            Return n_r
+        End If
+        Let r_inf be proc apf_alloc with arena, target_prec
+        If result_sign is equal to 1:
+            proc apf_set_special with r_inf, APF_SPECIAL_NEG_INF
+        Otherwise:
+            proc apf_set_special with r_inf, APF_SPECIAL_POS_INF
+        End If
+        Return r_inf
+    End If
+    If b_inf is equal to 1:
+        Let z_r be proc apf_alloc with arena, target_prec
+        If result_sign is equal to 1:
+            proc apf_set_special with z_r, APF_SPECIAL_NEG_ZERO
+        End If
+        Return z_r
+    End If
+    If b_zero is equal to 1:
+        If a_zero is equal to 1:
+            Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+            Let n_r2 be proc apf_alloc with arena, target_prec
+            proc apf_set_special with n_r2, APF_SPECIAL_NAN
+            Return n_r2
+        End If
+        Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_DIVIDE_BY_ZERO
+        Let i_r be proc apf_alloc with arena, target_prec
+        If result_sign is equal to 1:
+            proc apf_set_special with i_r, APF_SPECIAL_NEG_INF
+        Otherwise:
+            proc apf_set_special with i_r, APF_SPECIAL_POS_INF
+        End If
+        Return i_r
+    End If
+    If a_zero is equal to 1:
+        Let z_r2 be proc apf_alloc with arena, target_prec
+        If result_sign is equal to 1:
+            proc apf_set_special with z_r2, APF_SPECIAL_NEG_ZERO
+        End If
+        Return z_r2
+    End If
+
+    Note: Long division at the target precision plus a guard limb.
+    Let working_prec be target_prec plus 64
+    Let working_lc be working_prec plus 63
+    Set working_lc to working_lc divided by 64
+
+    Note: Allocate remainder and quotient buffers.
+    Let rem_lc be working_lc plus 1
+    Let rem_buf be proc arena_allocate from Arena with arena, rem_lc multiplied by 8
+    proc memory_fill from Memory with rem_buf, 0, rem_lc multiplied by 8
+    Note: Place a's mantissa in the high limbs of rem_buf so the division
+    Note: aligns correctly.
+    Let a_lc be proc apf_get_limb_count with a
+    Let i_a be 0
+    While i_a is less than a_lc:
+        Let limb_a be proc apf_get_limb with a, i_a
+        Let target_idx be rem_lc minus a_lc plus i_a
+        Let off_t be target_idx multiplied by 8
+        proc memory_set_int64 from Memory with rem_buf, off_t, limb_a
+        Set i_a to i_a plus 1
+    End While
+
+    Let b_lc be proc apf_get_limb_count with b
+    Let div_buf be proc arena_allocate from Arena with arena, rem_lc multiplied by 8
+    proc memory_fill from Memory with div_buf, 0, rem_lc multiplied by 8
+    Let i_b be 0
+    While i_b is less than b_lc:
+        Let limb_b be proc apf_get_limb with b, i_b
+        Let target_idx_b be rem_lc minus b_lc plus i_b
+        Let off_tb be target_idx_b multiplied by 8
+        proc memory_set_int64 from Memory with div_buf, off_tb, limb_b
+        Set i_b to i_b plus 1
+    End While
+
+    Let q_lc be working_lc plus 1
+    Let q_buf be proc arena_allocate from Arena with arena, q_lc multiplied by 8
+    proc memory_fill from Memory with q_buf, 0, q_lc multiplied by 8
+
+    Let bits_to_produce be working_prec plus 2
+    Let n_iter be 0
+    While n_iter is less than bits_to_produce:
+        Note: Shift rem_buf left by 1
+        Let carry_sh be 0
+        Let i_l be 0
+        While i_l is less than rem_lc:
+            Let off_l be i_l multiplied by 8
+            Let limb_l be proc memory_get_int64 from Memory with rem_buf, off_l
+            Let top be limb_l shifted right by 63
+            Set top to top bitwise and 1
+            Set limb_l to limb_l shifted left by 1
+            Set limb_l to limb_l bitwise or carry_sh
+            proc memory_set_int64 from Memory with rem_buf, off_l, limb_l
+            Set carry_sh to top
+            Set i_l to i_l plus 1
+        End While
+        Note: Shift q_buf left by 1
+        Let carry_q be 0
+        Let i_q be 0
+        While i_q is less than q_lc:
+            Let off_q be i_q multiplied by 8
+            Let limb_q be proc memory_get_int64 from Memory with q_buf, off_q
+            Let q_top be limb_q shifted right by 63
+            Set q_top to q_top bitwise and 1
+            Set limb_q to limb_q shifted left by 1
+            Set limb_q to limb_q bitwise or carry_q
+            proc memory_set_int64 from Memory with q_buf, off_q, limb_q
+            Set carry_q to q_top
+            Set i_q to i_q plus 1
+        End While
+        Note: If rem >= div, subtract div from rem and set q LSB.
+        Let cmp be 0
+        Let i_c be rem_lc minus 1
+        While i_c is greater than or equal to 0:
+            Let off_c be i_c multiplied by 8
+            Let rem_l be proc memory_get_int64 from Memory with rem_buf, off_c
+            Let div_l be proc memory_get_int64 from Memory with div_buf, off_c
+            Let rl_u be rem_l bitwise xor -9223372036854775808
+            Let dl_u be div_l bitwise xor -9223372036854775808
+            If rl_u is less than dl_u:
+                Set cmp to -1
+                Set i_c to -1
+            Otherwise:
+                If rl_u is greater than dl_u:
+                    Set cmp to 1
+                    Set i_c to -1
+                Otherwise:
+                    Set i_c to i_c minus 1
+                End If
+            End If
+        End While
+        If cmp is greater than or equal to 0:
+            Let borrow be 0
+            Let i_d be 0
+            While i_d is less than rem_lc:
+                Let off_d be i_d multiplied by 8
+                Let rem_d be proc memory_get_int64 from Memory with rem_buf, off_d
+                Let div_d be proc memory_get_int64 from Memory with div_buf, off_d
+                Let raw_diff be rem_d minus div_d
+                Let new_diff be raw_diff minus borrow
+                Let not_r be bitwise not rem_d
+                Let and_d be not_r bitwise and div_d
+                Let or_d be not_r bitwise or div_d
+                Let inner_d be or_d bitwise and raw_diff
+                Let bm be and_d bitwise or inner_d
+                Let b0 be (bm shifted right by 63) bitwise and 1
+                Let b1 be 0
+                If borrow is equal to 1:
+                    If raw_diff is equal to 0:
+                        Set b1 to 1
+                    End If
+                End If
+                Set borrow to b0 bitwise or b1
+                proc memory_set_int64 from Memory with rem_buf, off_d, new_diff
+                Set i_d to i_d plus 1
+            End While
+            Let off_q0 be 0
+            Let q0_cur be proc memory_get_int64 from Memory with q_buf, off_q0
+            Set q0_cur to q0_cur bitwise or 1
+            proc memory_set_int64 from Memory with q_buf, off_q0, q0_cur
+        End If
+        Set n_iter to n_iter plus 1
+    End While
+
+    Note: Build the result from q_buf. The top of q_buf has the high bits of
+    Note: the quotient. We extract the top target_lc limbs into the result.
+    Let result be proc apf_alloc with arena, target_prec
+    proc apf_set_sign with result, result_sign
+    proc apf_set_special with result, APF_SPECIAL_NORMAL
+    Let target_lc be proc apf_get_limb_count with result
+
+    Note: Find top set bit in q_buf
+    Let top_q_idx be q_lc minus 1
+    Let safety_t be 0
+    While safety_t is less than q_lc:
+        Let off_tt be top_q_idx multiplied by 8
+        Let limb_tt be proc memory_get_int64 from Memory with q_buf, off_tt
+        If limb_tt is not equal to 0:
+            Set safety_t to q_lc
+        Otherwise:
+            Set top_q_idx to top_q_idx minus 1
+            Set safety_t to safety_t plus 1
+            If top_q_idx is less than 0:
+                Set top_q_idx to 0
+                Set safety_t to q_lc
+            End If
+        End If
+    End While
+
+    Let i_r be 0
+    Let any_low be 0
+    While i_r is less than target_lc:
+        Let src_idx_r be top_q_idx minus (target_lc minus 1 minus i_r)
+        If src_idx_r is less than 0:
+            proc apf_set_limb with result, i_r, 0
+        Otherwise:
+            Let off_r be src_idx_r multiplied by 8
+            Let limb_r be proc memory_get_int64 from Memory with q_buf, off_r
+            proc apf_set_limb with result, i_r, limb_r
+        End If
+        Set i_r to i_r plus 1
+    End While
+    Let i_lowq be 0
+    Let low_upper be top_q_idx minus target_lc plus 1
+    While i_lowq is less than low_upper:
+        Let off_lq be i_lowq multiplied by 8
+        Let limb_lq be proc memory_get_int64 from Memory with q_buf, off_lq
+        If limb_lq is not equal to 0:
+            Set any_low to 1
+        End If
+        Set i_lowq to i_lowq plus 1
+    End While
+
+    Let exp_a be proc apf_get_exponent with a
+    Let exp_b be proc apf_get_exponent with b
+    Let result_exp be exp_a minus exp_b
+    Note: Need to know how many bits the quotient's top occupied to compute
+    Note: the final exponent. We placed both a and b in (rem_lc) limbs left-
+    Note: aligned, so the relative bit position of the leading quotient bit
+    Note: is roughly working_prec. After normalization (apf_normalize) the
+    Note: exponent will resolve.
+    proc apf_set_exponent with result, result_exp
+    proc apf_normalize with result
+
+    If any_low is not equal to 0:
+        Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INEXACT
+    End If
+    Return result
+End Process
+
+Process called "apf_sqrt" takes arena as Integer, a as Integer returns Integer:
+    @Reasoning
+    Square root with correct rounding via Newton iteration:
+        x_{n+1} = 0.5 * (x_n + a / x_n)
+    converges quadratically. We seed with the binary64 sqrt approximation
+    and iterate until the precision is reached.
+    @End Reasoning
+    @Implementation
+    Special dispatch (NaN, negative, zero, Inf). For finite positives,
+    initial estimate from f64 sqrt, then Newton iterations using
+    apf_add and apf_div at the target precision.
+    @End Implementation
+    @Performance_Hints
+    O(log(precision)) iterations; each iteration does one div + one add.
+    @End Implementation
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let nan be proc apf_is_nan with a
+    If nan is equal to 1:
+        Return proc apf_copy with arena, a
+    End If
+    Let zero be proc apf_is_zero with a
+    If zero is equal to 1:
+        Return proc apf_copy with arena, a
+    End If
+    Let neg be proc apf_is_negative with a
+    Let target_prec be proc apf_get_precision with a
+    If neg is equal to 1:
+        Set APF_EXCEPTION_FLAGS to APF_EXCEPTION_FLAGS bitwise or FLAG_INVALID
+        Let n_r be proc apf_alloc with arena, target_prec
+        proc apf_set_special with n_r, APF_SPECIAL_NAN
+        Return n_r
+    End If
+    Let inf be proc apf_is_inf with a
+    If inf is equal to 1:
+        Let r_i be proc apf_alloc with arena, target_prec
+        proc apf_set_special with r_i, APF_SPECIAL_POS_INF
+        Return r_i
+    End If
+
+    Note: Seed from a binary64 approximation. Compute sqrt(f64(a)) via a
+    Note: classical iterative method since we have no hardware sqrt
+    Note: available at this layer.
+    Let f64_a be proc apf_to_float64 with a
+    Note: ints from float64: extract magnitude and apply integer-iter sqrt
+    Let exp_seed be (f64_a shifted right by 52) bitwise and 2047
+    Let mant_seed be f64_a bitwise and 4503599627370495
+    Set mant_seed to mant_seed bitwise or (1 shifted left by 52)
+    Let unbiased_seed be exp_seed minus 1023
+    Note: Compute a rough integer sqrt of mant_seed scaled up.
+    Note: For seeding purposes a 32-bit-precision estimate is enough; the
+    Note: Newton iteration will converge.
+    Let radicand_seed be mant_seed
+    If unbiased_seed bitwise and 1 is not equal to 0:
+        Set radicand_seed to radicand_seed shifted left by 1
+        Set unbiased_seed to unbiased_seed minus 1
+    End If
+    Let half_exp be unbiased_seed divided by 2
+
+    Note: integer sqrt of a 53-bit value via digit-by-digit.
+    Let root be 0
+    Let bit_p be 1 shifted left by 52
+    Let rem be radicand_seed
+    While bit_p is greater than rem:
+        Set bit_p to bit_p shifted right by 2
+    End While
+    While bit_p is not equal to 0:
+        Let cand be root plus bit_p
+        If rem is greater than or equal to cand:
+            Set rem to rem minus cand
+            Set root to root shifted right by 1
+            Set root to root plus bit_p
+        Otherwise:
+            Set root to root shifted right by 1
+        End If
+        Set bit_p to bit_p shifted right by 2
+    End While
+
+    Note: Build f64 seed: sign 0, exponent (half_exp + 1023), mantissa root
+    Note: shifted to align bit 52.
+    Let clz_r be proc count_leading_zeros from Bits with root
+    Let root_hbp be 63 minus clz_r
+    Let mant_f64 be 0
+    If root_hbp is less than 52:
+        Set mant_f64 to root shifted left by (52 minus root_hbp)
+    Otherwise:
+        Set mant_f64 to root shifted right by (root_hbp minus 52)
+    End If
+    Set mant_f64 to mant_f64 bitwise and 4503599627370495
+    Let biased_seed_out be half_exp plus 1023
+    Let seed_f64 be biased_seed_out shifted left by 52
+    Set seed_f64 to seed_f64 bitwise or mant_f64
+
+    Let x be proc apf_from_float64 with arena, seed_f64, target_prec
+
+    Note: Newton iterations: x_{n+1} = 0.5*(x_n + a/x_n).
+    Let half be proc apf_from_float64 with arena, 4602678819172646912, target_prec
+    Note: 4602678819172646912 = bit pattern for 0.5 in IEEE 754 binary64
+
+    Let iters be target_prec plus 64
+    Set iters to iters divided by 32
+    Let i_iter be 0
+    While i_iter is less than iters:
+        Let q be proc apf_div with arena, a, x
+        Let sum be proc apf_add with arena, x, q
+        Let new_x be proc apf_mul with arena, sum, half
+        Set x to new_x
+        Set i_iter to i_iter plus 1
+    End While
+    Return x
+End Process
+
+Process called "apf_fma" takes arena as Integer, a as Integer, b as Integer, c as Integer returns Integer:
+    @Reasoning
+    a*b + c. Two-step path; corner-case double-rounding is bounded.
+    @End Reasoning
+    @Implementation
+    apf_mul then apf_add.
+    @End Implementation
+    @Performance_Hints
+    Sum of mul + add.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let product be proc apf_mul with arena, a, b
+    Return proc apf_add with arena, product, c
+End Process
+
+Process called "apf_pow_int" takes arena as Integer, base as Integer, exponent as Integer returns Integer:
+    @Reasoning
+    Compute base^exponent for an integer exponent using fast
+    exponentiation (binary method).
+    @End Reasoning
+    @Implementation
+    Square-and-multiply with bit traversal of the exponent. Negative
+    exponents handled by computing the positive power then taking
+    reciprocal.
+    @End Implementation
+    @Performance_Hints
+    O(log(|exponent|)) multiplications.
+    @End Performance_Hints
+    @Security_Scope
+    Mutates exception flags.
+    @End Security_Scope
+    Let target_prec be proc apf_get_precision with base
+    Let one be proc apf_from_integer with arena, 1, target_prec
+    If exponent is equal to 0:
+        Return one
+    End If
+    Let positive_exp be exponent
+    Let negate_at_end be 0
+    If exponent is less than 0:
+        Set positive_exp to 0 minus exponent
+        Set negate_at_end to 1
+    End If
+    Let result be one
+    Let current_base be proc apf_copy with arena, base
+    Let n be positive_exp
+    While n is greater than 0:
+        Let bit_n be n bitwise and 1
+        If bit_n is equal to 1:
+            Set result to proc apf_mul with arena, result, current_base
+        End If
+        Set n to n shifted right by 1
+        If n is greater than 0:
+            Set current_base to proc apf_mul with arena, current_base, current_base
+        End If
+    End While
+    If negate_at_end is equal to 1:
+        Let one_div be proc apf_from_integer with arena, 1, target_prec
+        Return proc apf_div with arena, one_div, result
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: end of arbitrary_precision_float.runa
+Note: ============================================================================

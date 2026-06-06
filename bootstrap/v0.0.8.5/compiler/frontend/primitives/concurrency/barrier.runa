@@ -1,0 +1,169 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+BARRIER - N-thread synchronization barrier.
+
+A barrier blocks N threads at barrier_wait() until all N have arrived.
+After all N arrive the barrier resets and can be reused (cyclic barrier
+semantics).
+
+Barrier layout (40 bytes):
+  offset 0:  mutex_ptr   (8 bytes)
+  offset 8:  cv_ptr      (8 bytes)
+  offset 16: total       (8 bytes) - N
+  offset 24: arrived     (8 bytes) - current arrivals
+  offset 32: generation  (8 bytes) - cycle counter (released waiters use this)
+
+Dependencies:
+- threading/sync_core.runa
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant BAR_OFF_MUTEX as Integer is 0
+Constant BAR_OFF_CV as Integer is 8
+Constant BAR_OFF_TOTAL as Integer is 16
+Constant BAR_OFF_ARRIVED as Integer is 24
+Constant BAR_OFF_GENERATION as Integer is 32
+Constant BAR_STRUCT_SIZE as Integer is 40
+
+Constant BAR_OK as Integer is 1
+Constant BAR_LAST_PARTY as Integer is 2
+Constant BAR_ERR_INVALID as Integer is 0
+
+@Reasoning
+Construct a barrier for N parties. N must be > 0. The barrier is reusable
+across multiple sync rounds.
+@End Reasoning
+
+@Implementation
+Allocate the record, create the mutex and condvar, initialize counters.
+@End Implementation
+
+@Performance_Hints
+One alloc + one mutex_create + one condvar_create.
+@End Performance_Hints
+
+@Security_Scope
+Caller must ensure exactly N threads call barrier_wait per cycle.
+@End Security_Scope
+
+Process called "barrier_create" takes total_parties as Integer returns Integer:
+    If total_parties is less than or equal to 0:
+        Return 0
+    End If
+    Let b be proc allocate from Memory with BAR_STRUCT_SIZE
+    If b is equal to 0:
+        Return 0
+    End If
+    Let mutex_ptr be proc mutex_create from Sync
+    If mutex_ptr is equal to 0:
+        proc deallocate from Memory with b
+        Return 0
+    End If
+    Let cv_ptr be proc condvar_create from Sync
+    If cv_ptr is equal to 0:
+        proc mutex_destroy from Sync with mutex_ptr
+        proc deallocate from Memory with b
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with b, BAR_OFF_MUTEX, mutex_ptr
+    proc memory_set_int64 from Mem with b, BAR_OFF_CV, cv_ptr
+    proc memory_set_int64 from Mem with b, BAR_OFF_TOTAL, total_parties
+    proc memory_set_int64 from Mem with b, BAR_OFF_ARRIVED, 0
+    proc memory_set_int64 from Mem with b, BAR_OFF_GENERATION, 0
+    Return b
+End Process
+
+Process called "barrier_destroy" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return BAR_ERR_INVALID
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with b, BAR_OFF_MUTEX
+    Let cv_ptr be proc memory_get_int64 from Mem with b, BAR_OFF_CV
+    proc condvar_destroy from Sync with cv_ptr
+    proc mutex_destroy from Sync with mutex_ptr
+    proc deallocate from Memory with b
+    Return BAR_OK
+End Process
+
+@Reasoning
+Wait at the barrier. Blocks until N threads have called wait. The last
+arriving thread returns BAR_LAST_PARTY; other threads return BAR_OK.
+@End Reasoning
+
+@Implementation
+Lock, increment arrived. If arrived reaches total, increment generation,
+reset arrived to 0, broadcast, return BAR_LAST_PARTY. Otherwise wait on
+the condvar until the generation changes.
+@End Implementation
+
+@Performance_Hints
+The last arriver pays the broadcast cost; others pay only the wait cost.
+@End Performance_Hints
+
+@Security_Scope
+Calling more than total times per cycle is undefined behavior.
+@End Security_Scope
+
+Process called "barrier_wait" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return BAR_ERR_INVALID
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with b, BAR_OFF_MUTEX
+    Let cv_ptr be proc memory_get_int64 from Mem with b, BAR_OFF_CV
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let my_gen be proc memory_get_int64 from Mem with b, BAR_OFF_GENERATION
+    Let arrived be proc memory_get_int64 from Mem with b, BAR_OFF_ARRIVED
+    Let new_arrived be arrived plus 1
+    proc memory_set_int64 from Mem with b, BAR_OFF_ARRIVED, new_arrived
+
+    Let total be proc memory_get_int64 from Mem with b, BAR_OFF_TOTAL
+    If new_arrived is greater than or equal to total:
+        Note: Last party - flip generation and broadcast
+        proc memory_set_int64 from Mem with b, BAR_OFF_ARRIVED, 0
+        proc memory_set_int64 from Mem with b, BAR_OFF_GENERATION, (my_gen plus 1)
+        proc condvar_broadcast from Sync with cv_ptr
+        proc mutex_unlock from Sync with mutex_ptr
+        Return BAR_LAST_PARTY
+    End If
+
+    Note: Wait while still on the same generation
+    Let waiting be 1
+    While waiting is equal to 1:
+        Let cur_gen be proc memory_get_int64 from Mem with b, BAR_OFF_GENERATION
+        If cur_gen is not equal to my_gen:
+            Set waiting to 0
+        Otherwise:
+            proc condvar_wait from Sync with cv_ptr, mutex_ptr
+        End If
+    End While
+
+    proc mutex_unlock from Sync with mutex_ptr
+    Return BAR_OK
+End Process
+
+Process called "barrier_total" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with b, BAR_OFF_TOTAL
+End Process
+
+Process called "barrier_arrived" takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with b, BAR_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    Let arrived be proc memory_get_int64 from Mem with b, BAR_OFF_ARRIVED
+    proc mutex_unlock from Sync with mutex_ptr
+    Return arrived
+End Process

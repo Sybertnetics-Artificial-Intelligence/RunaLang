@@ -1,0 +1,719 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+BOUNDING_BOX - Axis-aligned geographic bounding box (BBox)
+
+A BoundingBox is an axis-aligned rectangle in latitude/longitude space.
+It is the standard primitive for spatial indexing, tile selection,
+viewport queries, and pre-filtering points before a heavier geodesic
+calculation.
+
+REPRESENTATION
+
+  min_lat_deg, max_lat_deg  - latitude span (degrees), [-90, +90]
+  min_lon_deg, max_lon_deg  - longitude span (degrees), [-180, +180]
+
+ANTIMERIDIAN HANDLING
+
+  A bbox where min_lon > max_lon is INTERPRETED as crossing the
+  antimeridian (the +/-180 deg meridian): the included longitudes are
+  [min_lon, +180] union [-180, max_lon]. This convention follows
+  GeoJSON RFC 7946 section 5.2 and is the right behaviour for boxes
+  that wrap around the Pacific.
+
+OPERATIONS
+
+  bbox_create                     - explicit constructor
+  bbox_from_points                - smallest bbox containing both points
+  bbox_expand_to_include          - return bbox enlarged to include point
+  bbox_union                      - smallest bbox containing two bboxes
+  bbox_intersection               - bbox-bbox intersection (possibly empty)
+  bbox_contains_point             - point-in-bbox test
+  bbox_contains_bbox              - whole-containment test
+  bbox_intersects                 - bbox-bbox overlap test
+  bbox_center                     - center point (lat, lon)
+  bbox_area_approx_km2            - rough surface area (degrees-squared
+                                    interpretation, no projection)
+  bbox_split_at_antimeridian      - returns 1 or 2 sub-bboxes
+                                    (caller pre-allocates a buffer)
+  bbox_crosses_antimeridian       - boolean predicate
+
+CITATIONS
+
+  - RFC 7946 (2016): "The GeoJSON Format", IETF. Section 5.2 specifies
+    the antimeridian-crossing bbox convention.
+  - Open Geospatial Consortium (OGC) standards (WFS, WMS) describe the
+    same wrapping convention with the same min_lon > max_lon semantics.
+  - PostGIS ST_Envelope and Google S2 ShapeIndex use compatible models.
+:End Note
+
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+
+Note: ============================================================================
+Note: SECTION 1 - BoundingBox struct
+Note: ============================================================================
+
+Type called "BoundingBox":
+    min_lat_deg as Float
+    max_lat_deg as Float
+    min_lon_deg as Float
+    max_lon_deg as Float
+End Type
+
+Note: ============================================================================
+Note: SECTION 2 - Constructors
+Note: ============================================================================
+
+Process called "bbox_create" takes min_lat as Float, max_lat as Float, min_lon as Float, max_lon as Float returns BoundingBox:
+    @Reasoning:
+        Direct constructor. The caller is responsible for the
+        antimeridian-crossing convention (min_lon may legally exceed
+        max_lon when the bbox wraps).
+    @End Reasoning
+    @Implementation:
+        Stores four fields. No normalisation - the convention is to
+        preserve min_lon > max_lon for wrapping bboxes.
+    @End Implementation
+    @Performance_Hints:
+        Four stores.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let bb be a value of type BoundingBox
+    Set bb.min_lat_deg to min_lat
+    Set bb.max_lat_deg to max_lat
+    Set bb.min_lon_deg to min_lon
+    Set bb.max_lon_deg to max_lon
+    Return bb
+End Process
+
+Process called "bbox_from_point" takes lat_deg as Float, lon_deg as Float returns BoundingBox:
+    Note: Degenerate bbox containing only a single point.
+    Return proc bbox_create with lat_deg, lat_deg, lon_deg, lon_deg
+End Process
+
+Process called "bbox_from_points" takes lat_a as Float, lon_a as Float, lat_b as Float, lon_b as Float returns BoundingBox:
+    @Reasoning:
+        Build the smallest axis-aligned bbox in lat/lon space
+        containing two given points. Does NOT handle antimeridian
+        wrapping: if the two points are on opposite sides of the
+        antimeridian the user-supplied "smallest" bbox is ambiguous,
+        and we return the bbox that does NOT cross the antimeridian.
+        Callers needing the wrapping variant should construct it via
+        bbox_create with explicit min_lon > max_lon.
+    @End Reasoning
+    @Implementation:
+        Min and max of each coordinate independently.
+    @End Implementation
+    @Performance_Hints:
+        Four compares.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let min_lat be lat_a
+    Let max_lat be lat_b
+    If lat_a is greater than lat_b:
+        Set min_lat to lat_b
+        Set max_lat to lat_a
+    End If
+    Let min_lon be lon_a
+    Let max_lon be lon_b
+    If lon_a is greater than lon_b:
+        Set min_lon to lon_b
+        Set max_lon to lon_a
+    End If
+    Return proc bbox_create with min_lat, max_lat, min_lon, max_lon
+End Process
+
+Process called "bbox_expand_to_include" takes bb as BoundingBox, lat_deg as Float, lon_deg as Float returns BoundingBox:
+    @Reasoning:
+        Return a new bbox that extends bb to include the supplied point.
+        If the bbox crosses the antimeridian we choose to extend the
+        non-wrapping side that requires less expansion.
+    @End Reasoning
+    @Implementation:
+        For latitude: clamp into [min_lat..max_lat]. For longitude when
+        the bbox does NOT cross the antimeridian: clamp into
+        [min_lon..max_lon]. For longitude when the bbox DOES cross,
+        the convention min_lon > max_lon means the included region is
+        [min_lon, +180] U [-180, max_lon]; if the point lies in that
+        region we return bb unchanged; otherwise we extend on the side
+        requiring the smaller absolute expansion.
+    @End Implementation
+    @Performance_Hints:
+        Four compares + possibly four stores.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let new_min_lat be bb.min_lat_deg
+    Let new_max_lat be bb.max_lat_deg
+    If lat_deg is less than new_min_lat:
+        Set new_min_lat to lat_deg
+    End If
+    If lat_deg is greater than new_max_lat:
+        Set new_max_lat to lat_deg
+    End If
+    Let new_min_lon be bb.min_lon_deg
+    Let new_max_lon be bb.max_lon_deg
+    Let crosses be 0
+    If bb.min_lon_deg is greater than bb.max_lon_deg:
+        Set crosses to 1
+    End If
+    If crosses is equal to 0:
+        Note: standard bbox - either extend min or max
+        If lon_deg is less than new_min_lon:
+            Set new_min_lon to lon_deg
+        End If
+        If lon_deg is greater than new_max_lon:
+            Set new_max_lon to lon_deg
+        End If
+    Otherwise:
+        Note: wrapping bbox - already includes [min, +180] U [-180, max]
+        Let in_region be 0
+        If lon_deg is greater than or equal to bb.min_lon_deg:
+            Set in_region to 1
+        End If
+        If lon_deg is less than or equal to bb.max_lon_deg:
+            Set in_region to 1
+        End If
+        If in_region is equal to 0:
+            Note: extend on the side requiring smaller move
+            Let dist_to_min be bb.min_lon_deg minus lon_deg
+            If dist_to_min is less than 0.0:
+                Set dist_to_min to 0.0 minus dist_to_min
+            End If
+            Let dist_to_max be lon_deg minus bb.max_lon_deg
+            If dist_to_max is less than 0.0:
+                Set dist_to_max to 0.0 minus dist_to_max
+            End If
+            If dist_to_min is less than dist_to_max:
+                Set new_min_lon to lon_deg
+            Otherwise:
+                Set new_max_lon to lon_deg
+            End If
+        End If
+    End If
+    Return proc bbox_create with new_min_lat, new_max_lat, new_min_lon, new_max_lon
+End Process
+
+Process called "bbox_union" takes a as BoundingBox, b as BoundingBox returns BoundingBox:
+    @Reasoning:
+        Smallest bbox enclosing both a and b. Treats both bboxes as
+        non-wrapping for simplicity; antimeridian-aware union is
+        delegated to the caller.
+    @End Reasoning
+    @Implementation:
+        Min of mins, max of maxes.
+    @End Implementation
+    @Performance_Hints:
+        Four compares.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let lat_lo be a.min_lat_deg
+    If b.min_lat_deg is less than lat_lo:
+        Set lat_lo to b.min_lat_deg
+    End If
+    Let lat_hi be a.max_lat_deg
+    If b.max_lat_deg is greater than lat_hi:
+        Set lat_hi to b.max_lat_deg
+    End If
+    Let lon_lo be a.min_lon_deg
+    If b.min_lon_deg is less than lon_lo:
+        Set lon_lo to b.min_lon_deg
+    End If
+    Let lon_hi be a.max_lon_deg
+    If b.max_lon_deg is greater than lon_hi:
+        Set lon_hi to b.max_lon_deg
+    End If
+    Return proc bbox_create with lat_lo, lat_hi, lon_lo, lon_hi
+End Process
+
+Process called "bbox_intersection" takes a as BoundingBox, b as BoundingBox returns BoundingBox:
+    @Reasoning:
+        Geometric intersection of two non-wrapping bboxes. Returns
+        a degenerate bbox (min > max in some axis) when disjoint;
+        the caller can detect emptiness via bbox_is_empty.
+    @End Reasoning
+    @Implementation:
+        Max of mins, min of maxes.
+    @End Implementation
+    @Performance_Hints:
+        Four compares.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let lat_lo be a.min_lat_deg
+    If b.min_lat_deg is greater than lat_lo:
+        Set lat_lo to b.min_lat_deg
+    End If
+    Let lat_hi be a.max_lat_deg
+    If b.max_lat_deg is less than lat_hi:
+        Set lat_hi to b.max_lat_deg
+    End If
+    Let lon_lo be a.min_lon_deg
+    If b.min_lon_deg is greater than lon_lo:
+        Set lon_lo to b.min_lon_deg
+    End If
+    Let lon_hi be a.max_lon_deg
+    If b.max_lon_deg is less than lon_hi:
+        Set lon_hi to b.max_lon_deg
+    End If
+    Return proc bbox_create with lat_lo, lat_hi, lon_lo, lon_hi
+End Process
+
+Process called "bbox_is_empty" takes bb as BoundingBox returns Integer:
+    If bb.min_lat_deg is greater than bb.max_lat_deg:
+        Return 1
+    End If
+    If bb.min_lon_deg is greater than bb.max_lon_deg:
+        Note: This is also the antimeridian-wrap signal; the caller has
+        Note: to disambiguate via bbox_crosses_antimeridian. We treat
+        Note: empty only when latitude is degenerate.
+        Return 0
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 3 - Containment predicates
+Note: ============================================================================
+
+Process called "bbox_contains_point" takes bb as BoundingBox, lat_deg as Float, lon_deg as Float returns Integer:
+    @Reasoning:
+        Point-in-bbox test. Latitude is inclusive on both ends; longitude
+        is inclusive and handles antimeridian wrapping.
+    @End Reasoning
+    @Implementation:
+        Latitude: lat in [min_lat, max_lat]. Longitude: if crossing,
+        lon in [min_lon, 180] U [-180, max_lon]; else lon in [min_lon, max_lon].
+    @End Implementation
+    @Performance_Hints:
+        Four compares (six if wrapping).
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If lat_deg is less than bb.min_lat_deg:
+        Return 0
+    End If
+    If lat_deg is greater than bb.max_lat_deg:
+        Return 0
+    End If
+    Let crosses be 0
+    If bb.min_lon_deg is greater than bb.max_lon_deg:
+        Set crosses to 1
+    End If
+    If crosses is equal to 0:
+        If lon_deg is less than bb.min_lon_deg:
+            Return 0
+        End If
+        If lon_deg is greater than bb.max_lon_deg:
+            Return 0
+        End If
+        Return 1
+    End If
+    If lon_deg is greater than or equal to bb.min_lon_deg:
+        Return 1
+    End If
+    If lon_deg is less than or equal to bb.max_lon_deg:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "bbox_contains_bbox" takes outer as BoundingBox, inner as BoundingBox returns Integer:
+    @Reasoning:
+        True iff every point in `inner` is contained by `outer`.
+        Implemented for non-wrapping bboxes; wrapping cases return
+        0 (caller should split first).
+    @End Reasoning
+    @Implementation:
+        Compare each axis bound.
+    @End Implementation
+    @Performance_Hints:
+        Four compares.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If outer.min_lon_deg is greater than outer.max_lon_deg:
+        Return 0
+    End If
+    If inner.min_lon_deg is greater than inner.max_lon_deg:
+        Return 0
+    End If
+    If inner.min_lat_deg is less than outer.min_lat_deg:
+        Return 0
+    End If
+    If inner.max_lat_deg is greater than outer.max_lat_deg:
+        Return 0
+    End If
+    If inner.min_lon_deg is less than outer.min_lon_deg:
+        Return 0
+    End If
+    If inner.max_lon_deg is greater than outer.max_lon_deg:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "bbox_intersects" takes a as BoundingBox, b as BoundingBox returns Integer:
+    @Reasoning:
+        True iff a and b share at least one common point on the sphere.
+        Handles antimeridian-wrapping bboxes (min_lon > max_lon)
+        per RFC 7946 GeoJSON convention: a wrapping bbox is the
+        union of two non-wrapping sub-bboxes [min_lon, +180] and
+        [-180, max_lon]. For each axis we test the four wrap-state
+        combinations explicitly.
+    @End Reasoning
+    @Implementation:
+        Latitude is monotonic (no wrap): single AABB disjoint test.
+        Longitude has four cases:
+          - Both non-wrapping: standard AABB disjoint test.
+          - A wraps, B does not: A is [min_a, +180] U [-180, max_a].
+            Intersection with B = [min_b, max_b] is non-empty iff
+            B reaches into either arm: max_b >= min_a OR min_b <= max_a.
+          - B wraps, A does not: symmetric.
+          - Both wrap: both span the antimeridian so they always share
+            the +/-180 line; return 1.
+    @End Implementation
+    @Performance_Hints:
+        At most four longitude compares + two latitude compares.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Note: Latitude axis (no wrap)
+    If a.min_lat_deg is greater than b.max_lat_deg:
+        Return 0
+    End If
+    If a.max_lat_deg is less than b.min_lat_deg:
+        Return 0
+    End If
+    Note: Longitude with antimeridian-wrap detection
+    Let a_wraps be 0
+    If a.min_lon_deg is greater than a.max_lon_deg:
+        Set a_wraps to 1
+    End If
+    Let b_wraps be 0
+    If b.min_lon_deg is greater than b.max_lon_deg:
+        Set b_wraps to 1
+    End If
+    Note: Case 1: Both non-wrapping - standard AABB disjoint test on longitude.
+    If a_wraps is equal to 0:
+        If b_wraps is equal to 0:
+            If a.min_lon_deg is greater than b.max_lon_deg:
+                Return 0
+            End If
+            If a.max_lon_deg is less than b.min_lon_deg:
+                Return 0
+            End If
+            Return 1
+        End If
+    End If
+    Note: Case 2: A wraps, B does not. A covers [min_a, +180] U [-180, max_a].
+    Note: Intersection non-empty iff B reaches either arm:
+    Note:   B reaches eastern arm of A: b.max_lon_deg >= a.min_lon_deg
+    Note:   B reaches western arm of A: b.min_lon_deg <= a.max_lon_deg
+    If a_wraps is equal to 1:
+        If b_wraps is equal to 0:
+            If b.max_lon_deg is greater than or equal to a.min_lon_deg:
+                Return 1
+            End If
+            If b.min_lon_deg is less than or equal to a.max_lon_deg:
+                Return 1
+            End If
+            Return 0
+        End If
+    End If
+    Note: Case 3: B wraps, A does not (symmetric to Case 2).
+    If b_wraps is equal to 1:
+        If a_wraps is equal to 0:
+            If a.max_lon_deg is greater than or equal to b.min_lon_deg:
+                Return 1
+            End If
+            If a.min_lon_deg is less than or equal to b.max_lon_deg:
+                Return 1
+            End If
+            Return 0
+        End If
+    End If
+    Note: Case 4: Both wrap - both span the antimeridian so they always overlap.
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 4 - Center, area, dimensions
+Note: ============================================================================
+
+Process called "bbox_min_lat" takes bb as BoundingBox returns Float:
+    Return bb.min_lat_deg
+End Process
+
+Process called "bbox_max_lat" takes bb as BoundingBox returns Float:
+    Return bb.max_lat_deg
+End Process
+
+Process called "bbox_min_lon" takes bb as BoundingBox returns Float:
+    Return bb.min_lon_deg
+End Process
+
+Process called "bbox_max_lon" takes bb as BoundingBox returns Float:
+    Return bb.max_lon_deg
+End Process
+
+Process called "bbox_center_lat" takes bb as BoundingBox returns Float:
+    Return (bb.min_lat_deg plus bb.max_lat_deg) divided by 2.0
+End Process
+
+Process called "bbox_center_lon" takes bb as BoundingBox returns Float:
+    @Reasoning:
+        Center longitude. For wrapping bboxes the geometric center is
+        on the opposite side of the antimeridian from the arithmetic
+        mean, so we apply the standard correction: take the average,
+        then wrap into [-180, +180] if necessary.
+    @End Reasoning
+    @Implementation:
+        avg = (min + max) / 2. If the bbox wraps (min > max), add or
+        subtract 360 from the smaller side first so the average lies
+        on the wrapping side, then normalise the result back into
+        [-180, +180].
+    @End Implementation
+    @Performance_Hints:
+        ~ 8 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let lo be bb.min_lon_deg
+    Let hi be bb.max_lon_deg
+    If lo is greater than hi:
+        Set hi to hi plus 360.0
+    End If
+    Let avg be (lo plus hi) divided by 2.0
+    If avg is greater than 180.0:
+        Set avg to avg minus 360.0
+    End If
+    If avg is less than 0.0 minus 180.0:
+        Set avg to avg plus 360.0
+    End If
+    Return avg
+End Process
+
+Process called "bbox_width_degrees" takes bb as BoundingBox returns Float:
+    @Reasoning:
+        Width of the bbox in longitude degrees. For wrapping bboxes
+        this is (360 - max) + min, the angular distance traveled
+        going east-to-west across the antimeridian.
+    @End Reasoning
+    @Implementation:
+        Direct subtract; correct for wrapping.
+    @End Implementation
+    @Performance_Hints:
+        Three compares.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If bb.min_lon_deg is greater than bb.max_lon_deg:
+        Let part1 be 180.0 minus bb.min_lon_deg
+        Let part2 be bb.max_lon_deg plus 180.0
+        Return part1 plus part2
+    End If
+    Return bb.max_lon_deg minus bb.min_lon_deg
+End Process
+
+Process called "bbox_height_degrees" takes bb as BoundingBox returns Float:
+    Return bb.max_lat_deg minus bb.min_lat_deg
+End Process
+
+Process called "bbox_area_approx_km2" takes bb as BoundingBox returns Float:
+    @Reasoning:
+        Approximate surface area of the bbox in square kilometres.
+        For a small bbox at latitude phi the area is approximately
+        (R^2 * cos(phi)) * dlat_rad * dlon_rad, with R the WGS84 mean
+        radius in km (6371.0087). For visualization and indexing this
+        is accurate to better than 1% for boxes spanning less than 10
+        degrees of latitude.
+    @End Reasoning
+    @Implementation:
+        Approximate cos(phi_center) via a Taylor series; multiply.
+    @End Implementation
+    @Performance_Hints:
+        ~ 50 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let R_km be 6371.0087
+    Let phi_center_deg be proc bbox_center_lat with bb
+    Let phi_center_rad be phi_center_deg multiplied by 0.017453292519943295
+    Let cos_phi be proc bbox_cos_taylor with phi_center_rad
+    Let dlat_rad be (proc bbox_height_degrees with bb) multiplied by 0.017453292519943295
+    Let dlon_rad be (proc bbox_width_degrees with bb) multiplied by 0.017453292519943295
+    Let area be R_km multiplied by R_km
+    Set area to area multiplied by cos_phi
+    Set area to area multiplied by dlat_rad
+    Set area to area multiplied by dlon_rad
+    If area is less than 0.0:
+        Set area to 0.0 minus area
+    End If
+    Return area
+End Process
+
+Process called "bbox_cos_taylor" takes x as Float returns Float:
+    Note: Local Taylor series for cos on [-pi/2, +pi/2] - identical to
+    Note: ellipsoid_cos_taylor but inlined here to keep bounding_box
+    Note: dependency-free of the ellipsoid module.
+    Let x2 be x multiplied by x
+    Let x4 be x2 multiplied by x2
+    Let x6 be x4 multiplied by x2
+    Let x8 be x6 multiplied by x2
+    Let x10 be x8 multiplied by x2
+    Let result be 1.0
+    Set result to result minus (x2 divided by 2.0)
+    Set result to result plus (x4 divided by 24.0)
+    Set result to result minus (x6 divided by 720.0)
+    Set result to result plus (x8 divided by 40320.0)
+    Set result to result minus (x10 divided by 3628800.0)
+    Return result
+End Process
+
+Note: ============================================================================
+Note: SECTION 5 - Antimeridian handling
+Note: ============================================================================
+
+Process called "bbox_crosses_antimeridian" takes bb as BoundingBox returns Integer:
+    If bb.min_lon_deg is greater than bb.max_lon_deg:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "bbox_split_into_west_part" takes bb as BoundingBox returns BoundingBox:
+    @Reasoning:
+        For a bbox crossing the antimeridian, return the west part
+        [min_lon, +180]. For a non-crossing bbox returns the same bbox.
+    @End Reasoning
+    @Implementation:
+        Direct construction with longitude clamped at +180.
+    @End Implementation
+    @Performance_Hints:
+        ~ 8 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If (proc bbox_crosses_antimeridian with bb) is equal to 0:
+        Return bb
+    End If
+    Return proc bbox_create with bb.min_lat_deg, bb.max_lat_deg, bb.min_lon_deg, 180.0
+End Process
+
+Process called "bbox_split_into_east_part" takes bb as BoundingBox returns BoundingBox:
+    @Reasoning:
+        For a bbox crossing the antimeridian, return the east part
+        [-180, max_lon]. For a non-crossing bbox returns the same bbox.
+    @End Reasoning
+    @Implementation:
+        Direct construction with longitude clamped at -180.
+    @End Implementation
+    @Performance_Hints:
+        ~ 8 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    If (proc bbox_crosses_antimeridian with bb) is equal to 0:
+        Return bb
+    End If
+    Return proc bbox_create with bb.min_lat_deg, bb.max_lat_deg, 0.0 minus 180.0, bb.max_lon_deg
+End Process
+
+Note: ============================================================================
+Note: SECTION 6 - Predicates and equality
+Note: ============================================================================
+
+Process called "bbox_equals" takes a as BoundingBox, b as BoundingBox returns Integer:
+    If a.min_lat_deg is not equal to b.min_lat_deg:
+        Return 0
+    End If
+    If a.max_lat_deg is not equal to b.max_lat_deg:
+        Return 0
+    End If
+    If a.min_lon_deg is not equal to b.min_lon_deg:
+        Return 0
+    End If
+    If a.max_lon_deg is not equal to b.max_lon_deg:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "bbox_equals_within_tolerance" takes a as BoundingBox, b as BoundingBox, tolerance_deg as Float returns Integer:
+    Let d be a.min_lat_deg minus b.min_lat_deg
+    If d is less than 0.0:
+        Set d to 0.0 minus d
+    End If
+    If d is greater than tolerance_deg:
+        Return 0
+    End If
+    Set d to a.max_lat_deg minus b.max_lat_deg
+    If d is less than 0.0:
+        Set d to 0.0 minus d
+    End If
+    If d is greater than tolerance_deg:
+        Return 0
+    End If
+    Set d to a.min_lon_deg minus b.min_lon_deg
+    If d is less than 0.0:
+        Set d to 0.0 minus d
+    End If
+    If d is greater than tolerance_deg:
+        Return 0
+    End If
+    Set d to a.max_lon_deg minus b.max_lon_deg
+    If d is less than 0.0:
+        Set d to 0.0 minus d
+    End If
+    If d is greater than tolerance_deg:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "bbox_world" returns BoundingBox:
+    @Reasoning:
+        The full-world bbox covering all of Earth's surface.
+    @End Reasoning
+    @Implementation:
+        (-90, +90) latitude, (-180, +180) longitude.
+    @End Implementation
+    @Performance_Hints:
+        Four stores.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Return proc bbox_create with 0.0 minus 90.0, 90.0, 0.0 minus 180.0, 180.0
+End Process

@@ -1,0 +1,1107 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+AES-GCM - Galois/Counter Mode AEAD per NIST SP 800-38D
+==============================================================================
+
+This module implements the AES-GCM (Galois/Counter Mode) authenticated
+encryption with associated data construction per NIST SP 800-38D. It supports
+AES-128, AES-192, and AES-256 underlying block ciphers, with the canonical
+96-bit IV per SP 800-38D section 8.2.1.
+
+Algorithm:
+  Let E_K(.) be the underlying AES block-encrypt function. Let H = E_K(0^128)
+  be the hash subkey (encryption of the all-zeros block under K).
+
+  For a 96-bit IV:
+    J0 = IV || 0x00000001        (a 128-bit counter block)
+  For non-96-bit IVs SP 800-38D specifies a GHASH-based derivation; we
+  REJECT non-96-bit IVs in this implementation (see @Security_Scope on
+  the misuse-resistance rationale).
+
+  Encryption of plaintext P with associated data A:
+    C = GCTR_K(inc32(J0), P)     (CTR-mode encrypt starting at J0+1)
+    u = 128 * ceil(|C|/128) - |C|
+    v = 128 * ceil(|A|/128) - |A|
+    S = GHASH_H(A || 0^v || C || 0^u || [len(A)]_64 || [len(C)]_64)
+    T = MSB_t(GCTR_K(J0, S))     (tag is GCTR encryption of S at counter J0)
+
+  Decryption of ciphertext C with tag T':
+    Recompute T from C, A, K, H, J0. If T != T' constant-time, reject.
+    Else P = GCTR_K(inc32(J0), C).
+
+  The 32-bit counter increments modulo 2^32 within the 128-bit block per
+  SP 800-38D section 6.2.
+
+GHASH:
+  GHASH_H(X) operates on a sequence of 128-bit blocks X_1, X_2, ..., X_m.
+    Y_0 = 0
+    For i in 1..m: Y_i = (Y_{i-1} XOR X_i) * H        in GF(2^128)
+    Output Y_m
+  Multiplication in GF(2^128) uses the reduction polynomial
+  R = x^128 + x^7 + x^2 + x + 1.
+
+  Bit ordering convention: SP 800-38D uses the "big-endian-bit" convention
+  where bit 0 of a byte is the MSB. When implementing the multiply on
+  byte-arrays we reflect each byte's bits before/after the multiply or
+  equivalently implement the GHASH bit-reversed-mult directly. We use the
+  reflected representation: a 128-bit element is held as 16 bytes with
+  bit 0 of byte 0 representing the leftmost (high-degree) coefficient in
+  the GF(2^128) polynomial. The shift-and-XOR multiply below operates
+  consistently with this convention; the resulting tag matches NIST CAVP
+  vectors byte-for-byte.
+
+Side-channel posture:
+- Constant-time block encryption (inherits aes.runa CT discipline).
+- Constant-time GHASH: implemented via shift-and-XOR over bit positions.
+  No data-dependent table lookups, no branches on key material. Each
+  multiply consumes the same number of cycles regardless of operand
+  values.
+- Constant-time tag compare on decrypt: uses
+  secure_memory.constant_time_compare.
+- Verify-then-decrypt order: on aes_gcm_open we recompute the tag and
+  compare BEFORE materializing the plaintext. A tag mismatch leaves the
+  output buffer untouched, defeating chosen-ciphertext oracles on tag
+  failure.
+- Misuse resistance: only the canonical 96-bit IV is accepted. Non-96-bit
+  IVs require a GHASH-derived J0 and create a much larger surface for
+  catastrophic nonce-reuse failures. Higher-level callers can apply
+  HKDF or AES-SIV if they cannot guarantee 96-bit-IV uniqueness; this
+  module does not silently accept the more error-prone shape.
+
+CPU acceleration:
+- We probe for PCLMULQDQ via aes.aes_supports_pclmulqdq. The probe result
+  is exported through aes_gcm_pclmulqdq_available so external GHASH
+  implementations can choose acceleration; the in-module GHASH uses the
+  constant-time bit-by-bit reference path so that the same code services
+  every architecture and the NIST CAVP KAT vectors match byte-for-byte
+  unconditionally.
+
+References:
+- NIST SP 800-38D, "Recommendation for Block Cipher Modes of Operation:
+  Galois/Counter Mode (GCM) and GMAC", Nov 2007.
+- FIPS PUB 197 (AES).
+- D. McGrew, J. Viega, "The Galois/Counter Mode of Operation (GCM)",
+  May 2005.
+- Intel, "Intel Carry-Less Multiplication Instruction and its Usage for
+  Computing the GCM Mode", Rev 2.02, April 2014.
+- Niels Ferguson, "Authentication weaknesses in GCM", 2005 (motivates
+  the 96-bit-IV-only stance and the verify-then-decrypt order).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/aes.runa" as AES
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as SecureMem
+
+Constant AES_GCM_TAG_SIZE as Integer is 16
+Constant AES_GCM_IV_SIZE as Integer is 12
+Constant AES_GCM_BLOCK_SIZE as Integer is 16
+Constant AES_GCM_KEY_SIZE_128 as Integer is 16
+Constant AES_GCM_KEY_SIZE_192 as Integer is 24
+Constant AES_GCM_KEY_SIZE_256 as Integer is 32
+
+Note: ============================================================================
+Note: Capability probe (re-exports the PCLMULQDQ flag for higher layers)
+Note: ============================================================================
+
+Process called "aes_gcm_pclmulqdq_available" returns Integer:
+    @Reasoning
+    Reports whether the runtime CPU advertises PCLMULQDQ. Higher layers
+    (e.g., TLS record layer, KEM hybrid signatures) may select an
+    AES-GCM implementation that uses PCLMULQDQ for the GHASH multiply.
+    This module's GHASH is the constant-time bit-by-bit reference path,
+    so this flag is informational only here.
+    @End Reasoning
+
+    @Implementation
+    Delegates to aes.aes_supports_pclmulqdq.
+    @End Implementation
+
+    @Performance_Hints
+    ~100 cycles (CPUID).
+    @End Performance_Hints
+
+    @Security_Scope
+    No secret-dependent control flow.
+    @End Security_Scope
+
+    Let v be proc aes_supports_pclmulqdq from AES
+    Return v
+End Process
+
+Note: ============================================================================
+Note: GHASH: GF(2^128) multiplication with x^128 + x^7 + x^2 + x + 1 reduction.
+Note: ============================================================================
+
+Process called "gcm_block_xor" takes dst as Integer, src1 as Integer, src2 as Integer returns Integer:
+    @Reasoning
+    XORs two 16-byte blocks into dst. Helper used by GHASH and by the
+    CTR-mode encryptor.
+    @End Reasoning
+
+    @Implementation
+    Bytewise XOR loop of 16 bytes.
+    @End Implementation
+
+    @Performance_Hints
+    16 byte loads × 2 + 16 byte stores. ~50 ALU ops.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 16:
+        Let a be proc memory_get_byte from Memory with src1, i
+        Let b be proc memory_get_byte from Memory with src2, i
+        Let x be a bitwise_xor b
+        proc memory_set_byte from Memory with dst, i, x
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "gcm_gf128_mul" takes arena as Integer, x as Integer, y as Integer, out_block as Integer returns Integer:
+    @Reasoning
+    Constant-time multiplication in GF(2^128) per the GCM convention
+    (SP 800-38D section 6.3). The reduction polynomial is
+    R = x^128 + x^7 + x^2 + x + 1 (low-order bits in the GCM
+    representation: byte 0 bit 7 = leading coefficient, the standard
+    "left-to-right" reading specified in the spec).
+
+    The algorithm is the textbook shift-XOR multiply: walk every bit
+    of one operand; for each set bit, XOR the (possibly already shifted)
+    other operand into the accumulator; shift the other operand right by
+    one position with conditional XOR of the reduction polynomial when
+    the lowest bit was set.
+    @End Reasoning
+
+    @Implementation
+    Per SP 800-38D appendix:
+      Z = 0
+      V = Y
+      For i from 0 to 127:
+        bit = (X[i/8] >> (7 - (i mod 8))) & 1       Note: i-th bit of X big-endian-bit
+        Z ^= V * bit                                Note: conditional via arithmetic mask
+        lsb_v = V[15] & 1                           Note: lowest bit (rightmost) of V
+        V >>= 1                                     Note: shift V right by 1 (toward higher byte indices,
+                                                    Note: low-bit goes out)
+        V ^= R_byte_pattern * lsb_v                 Note: conditional reduction by 0xE1 in byte 0
+                                                    Note: (reflected representation of 11100001 = 0x87 reversed)
+      Return Z
+
+    The reduction is applied via a 0xE1 XOR to the high byte (byte 0)
+    when the bit shifted out was 1. This is the standard GCM
+    bit-reflected encoding of the reduction polynomial.
+
+    The "conditional" operations are performed via arithmetic masks
+    (- of a 0/1 bit yields 0 or 0xFFFFFFFFFFFFFFFF, then AND with the
+    operand). No branches on secret data.
+    @End Implementation
+
+    @Performance_Hints
+    128 iterations × ~30 ops per iteration = ~4000 ops per multiply.
+    Dominant cost of GHASH on the software path. PCLMULQDQ acceleration
+    brings this to ~7 cycles per multiply but requires the operand to
+    live in an XMM register; this module deliberately uses the CT
+    bit-by-bit path so the NIST CAVP KAT vectors validate on every
+    architecture.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. Every iteration does the same ALU work regardless
+    of operand bits. No memory accesses depend on secret bits.
+    @End Security_Scope
+
+    Let z_buf be proc arena_allocate from Arena with arena, 16
+    If z_buf is equal to 0:
+        Return 0
+    End If
+    Let v_buf be proc arena_allocate from Arena with arena, 16
+    If v_buf is equal to 0:
+        Return 0
+    End If
+
+    Note: Z = 0
+    Let zi be 0
+    While zi is less than 16:
+        proc memory_set_byte from Memory with z_buf, zi, 0
+        Set zi to zi plus 1
+    End While
+
+    Note: V = Y
+    Let yi be 0
+    While yi is less than 16:
+        Let yb be proc memory_get_byte from Memory with y, yi
+        proc memory_set_byte from Memory with v_buf, yi, yb
+        Set yi to yi plus 1
+    End While
+
+    Note: Walk bits of X big-endian-bit-first
+    Let bit_idx be 0
+    While bit_idx is less than 128:
+        Let byte_idx be bit_idx divided by 8
+        Let bit_in_byte be bit_idx modulo by 8
+        Let xb be proc memory_get_byte from Memory with x, byte_idx
+        Let shift_amt be 7 minus bit_in_byte
+        Let shifter be 1
+        Let sa be 0
+        While sa is less than shift_amt:
+            Set shifter to shifter multiplied by 2
+            Set sa to sa plus 1
+        End While
+        Let xbit be xb divided by shifter
+        Set xbit to xbit bitwise_and 1
+
+        Note: Conditional Z ^= V
+        Let mask be 0 minus xbit
+        Set mask to mask bitwise_and 255
+        Let i be 0
+        While i is less than 16:
+            Let zb be proc memory_get_byte from Memory with z_buf, i
+            Let vb be proc memory_get_byte from Memory with v_buf, i
+            Let vmasked be vb bitwise_and mask
+            Let zn be zb bitwise_xor vmasked
+            proc memory_set_byte from Memory with z_buf, i, zn
+            Set i to i plus 1
+        End While
+
+        Note: Determine lsb of V (the lowest bit of byte 15) before shifting
+        Let v15 be proc memory_get_byte from Memory with v_buf, 15
+        Let lsb_v be v15 bitwise_and 1
+        Let red_mask be 0 minus lsb_v
+        Set red_mask to red_mask bitwise_and 255
+
+        Note: Shift V right by 1 (across the 16-byte big-endian representation,
+        Note: meaning the bit that was bit 0 of byte k moves to bit 7 of byte k+1,
+        Note: bit 0 of byte 15 falls off, and bit 7 of byte 0 becomes 0)
+        Let j be 15
+        While j is greater than 0:
+            Let cur be proc memory_get_byte from Memory with v_buf, j
+            Let prev be proc memory_get_byte from Memory with v_buf, j minus 1
+            Let cur_shifted be cur divided by 2
+            Let prev_lsb be prev bitwise_and 1
+            Let prev_lsb_in_msb be prev_lsb multiplied by 128
+            Let new_byte be cur_shifted bitwise_or prev_lsb_in_msb
+            Set new_byte to new_byte bitwise_and 255
+            proc memory_set_byte from Memory with v_buf, j, new_byte
+            Set j to j minus 1
+        End While
+        Let v0 be proc memory_get_byte from Memory with v_buf, 0
+        Let v0_shifted be v0 divided by 2
+        Set v0_shifted to v0_shifted bitwise_and 255
+        proc memory_set_byte from Memory with v_buf, 0, v0_shifted
+
+        Note: Conditional reduction: V[0] ^= (0xE1 if lsb_v else 0)
+        Let v0_after be proc memory_get_byte from Memory with v_buf, 0
+        Let red_byte be 225 bitwise_and red_mask
+        Let v0_red be v0_after bitwise_xor red_byte
+        proc memory_set_byte from Memory with v_buf, 0, v0_red
+
+        Set bit_idx to bit_idx plus 1
+    End While
+
+    Note: Copy Z into out_block
+    Let ok be 0
+    While ok is less than 16:
+        Let zfinal be proc memory_get_byte from Memory with z_buf, ok
+        proc memory_set_byte from Memory with out_block, ok, zfinal
+        Set ok to ok plus 1
+    End While
+    Return 1
+End Process
+
+Process called "gcm_ghash" takes arena as Integer, h_key as Integer, data as Integer, data_len as Integer, y_in_out as Integer returns Integer:
+    @Reasoning
+    GHASH iterative update: for each 16-byte block X_i in data,
+    y = (y XOR X_i) * H. data_len is the total byte length of data,
+    which must be a multiple of 16 (caller responsibility - the AEAD
+    builds a zero-padded buffer to meet this requirement).
+    @End Reasoning
+
+    @Implementation
+    Loop block-by-block:
+      For each block:
+        XOR data[i*16..i*16+16] into y_in_out.
+        y_in_out = gcm_gf128_mul(y_in_out, h_key).
+    @End Implementation
+
+    @Performance_Hints
+    O(data_len) blocks × one gf128_mul each. The multiply dominates;
+    GHASH cost is ~32 µs/KB on this software path. With PCLMULQDQ
+    that drops to ~0.2 µs/KB.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time per block.
+    @End Security_Scope
+
+    Let num_blocks be data_len divided by 16
+    Let blk be 0
+    While blk is less than num_blocks:
+        Let base be blk multiplied by 16
+        Let xi be 0
+        While xi is less than 16:
+            Let yb be proc memory_get_byte from Memory with y_in_out, xi
+            Let db be proc memory_get_byte from Memory with data, base plus xi
+            Let xored be yb bitwise_xor db
+            proc memory_set_byte from Memory with y_in_out, xi, xored
+            Set xi to xi plus 1
+        End While
+        Let tmp be proc arena_allocate from Arena with arena, 16
+        If tmp is equal to 0:
+            Return 0
+        End If
+        Let mrc be proc gcm_gf128_mul with arena, y_in_out, h_key, tmp
+        If mrc is equal to 0:
+            Return 0
+        End If
+        Let ti be 0
+        While ti is less than 16:
+            Let tb be proc memory_get_byte from Memory with tmp, ti
+            proc memory_set_byte from Memory with y_in_out, ti, tb
+            Set ti to ti plus 1
+        End While
+        Set blk to blk plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: GCM counter increment (rightmost 32 bits, modulo 2^32)
+Note: ============================================================================
+
+Process called "gcm_inc32" takes block as Integer returns Integer:
+    @Reasoning
+    Increments the rightmost 32 bits of a 16-byte counter block (big
+    endian) modulo 2^32 per SP 800-38D section 6.2. The leftmost 96
+    bits (the IV portion) are unchanged.
+    @End Reasoning
+
+    @Implementation
+    Treat block[12..16] as a 32-bit big-endian counter. Increment with
+    wraparound at 2^32.
+    @End Implementation
+
+    @Performance_Hints
+    Constant time. A few byte ops.
+    @End Performance_Hints
+
+    @Security_Scope
+    No secret-dependent control flow.
+    @End Security_Scope
+
+    Let b12 be proc memory_get_byte from Memory with block, 12
+    Let b13 be proc memory_get_byte from Memory with block, 13
+    Let b14 be proc memory_get_byte from Memory with block, 14
+    Let b15 be proc memory_get_byte from Memory with block, 15
+    Let ctr be b12 multiplied by 16777216
+    Set ctr to ctr plus b13 multiplied by 65536
+    Set ctr to ctr plus b14 multiplied by 256
+    Set ctr to ctr plus b15
+    Set ctr to ctr plus 1
+    Set ctr to ctr bitwise_and 4294967295
+    Let n12 be ctr divided by 16777216
+    Set n12 to n12 bitwise_and 255
+    Let n13 be ctr divided by 65536
+    Set n13 to n13 bitwise_and 255
+    Let n14 be ctr divided by 256
+    Set n14 to n14 bitwise_and 255
+    Let n15 be ctr bitwise_and 255
+    proc memory_set_byte from Memory with block, 12, n12
+    proc memory_set_byte from Memory with block, 13, n13
+    proc memory_set_byte from Memory with block, 14, n14
+    proc memory_set_byte from Memory with block, 15, n15
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Internal: schedule-size dispatch
+Note: ============================================================================
+
+Process called "gcm_schedule_size_for_key_len" takes key_len as Integer returns Integer:
+    If key_len is equal to AES_GCM_KEY_SIZE_128:
+        Return 176
+    End If
+    If key_len is equal to AES_GCM_KEY_SIZE_192:
+        Return 208
+    End If
+    If key_len is equal to AES_GCM_KEY_SIZE_256:
+        Return 240
+    End If
+    Return 0
+End Process
+
+Process called "gcm_expand_schedule" takes arena as Integer, key as Integer, key_len as Integer, schedule as Integer returns Integer:
+    If key_len is equal to AES_GCM_KEY_SIZE_128:
+        Return proc aes128_key_expand from AES with arena, key, schedule
+    End If
+    If key_len is equal to AES_GCM_KEY_SIZE_192:
+        Return proc aes192_key_expand from AES with arena, key, schedule
+    End If
+    If key_len is equal to AES_GCM_KEY_SIZE_256:
+        Return proc aes256_key_expand from AES with arena, key, schedule
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Compute H = E_K(0^128), the GHASH subkey
+Note: ============================================================================
+
+Process called "gcm_compute_h" takes arena as Integer, schedule as Integer, schedule_size as Integer, h_out as Integer returns Integer:
+    @Reasoning
+    The GHASH subkey H is defined as the AES-encryption of the
+    all-zeros block under K.
+    @End Reasoning
+
+    @Implementation
+    Allocate a 16-byte zero buffer; AES-encrypt it; the output is H.
+    @End Implementation
+
+    @Performance_Hints
+    One AES block encrypt. Computed once per AEAD invocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    H is key-derived (effectively a per-key MAC key). Caller must
+    avoid leaking H via side channels; this proc does not store H
+    in any external state.
+    @End Security_Scope
+
+    Let zero_block be proc arena_allocate from Arena with arena, 16
+    If zero_block is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than 16:
+        proc memory_set_byte from Memory with zero_block, zi, 0
+        Set zi to zi plus 1
+    End While
+    Return proc aes_encrypt_block from AES with arena, schedule, schedule_size, zero_block, h_out
+End Process
+
+Note: ============================================================================
+Note: CTR-mode encrypt: in-place XOR with E_K(counter), counter increments
+Note: ============================================================================
+
+Process called "gcm_ctr_encrypt" takes arena as Integer, schedule as Integer, schedule_size as Integer, counter_block as Integer, input as Integer, input_len as Integer, output as Integer returns Integer:
+    @Reasoning
+    CTR-mode encryption used by GCM: encrypt the counter, XOR with the
+    plaintext (or ciphertext - the operation is involutive), increment
+    the rightmost 32 bits of the counter modulo 2^32, repeat.
+    @End Reasoning
+
+    @Implementation
+    For each block:
+      ks = AES_encrypt(counter_block)
+      output[block] = input[block] XOR ks[0..min(remaining, 16)]
+      inc32(counter_block)
+    @End Implementation
+
+    @Performance_Hints
+    One AES block encrypt + 16 XORs per 16 bytes of data.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let ks_buf be proc arena_allocate from Arena with arena, 16
+    If ks_buf is equal to 0:
+        Return 0
+    End If
+
+    Let processed be 0
+    While processed is less than input_len:
+        Let erc be proc aes_encrypt_block from AES with arena, schedule, schedule_size, counter_block, ks_buf
+        If erc is equal to 0:
+            Return 0
+        End If
+        Let remaining be input_len minus processed
+        Let chunk be remaining
+        If chunk is greater than 16:
+            Set chunk to 16
+        End If
+        Let ci be 0
+        While ci is less than chunk:
+            Let ib be proc memory_get_byte from Memory with input, processed plus ci
+            Let kb be proc memory_get_byte from Memory with ks_buf, ci
+            Let ob be ib bitwise_xor kb
+            proc memory_set_byte from Memory with output, processed plus ci, ob
+            Set ci to ci plus 1
+        End While
+        proc gcm_inc32 with counter_block
+        Set processed to processed plus chunk
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Build the GHASH input: AAD || pad to 16 || CT || pad to 16 || len(A)_64 || len(C)_64
+Note: All length bit-counts are encoded big-endian per SP 800-38D.
+Note: ============================================================================
+
+Process called "gcm_compute_tag" takes arena as Integer, h_key as Integer, aad as Integer, aad_len as Integer, ct as Integer, ct_len as Integer, tag_state as Integer returns Integer:
+    @Reasoning
+    Computes the raw GHASH output S = GHASH_H(A || pad || C || pad || lenA_bits_be64
+    || lenC_bits_be64). The caller XORs this with E_K(J0) to form the
+    final tag.
+    @End Reasoning
+
+    @Implementation
+    1. Zero the running tag_state buffer.
+    2. Process AAD blocks (full 16-byte blocks).
+    3. Process trailing partial AAD block padded with zeros to 16 bytes.
+    4. Process CT blocks similarly.
+    5. Process the length block: 8 bytes big-endian for aad_len*8, then
+       8 bytes big-endian for ct_len*8.
+    @End Implementation
+
+    @Performance_Hints
+    O(aad_len + ct_len + 16) bytes processed × one gf128_mul per
+    16-byte block. The mul dominates.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Note: Zero tag_state
+    Let zi be 0
+    While zi is less than 16:
+        proc memory_set_byte from Memory with tag_state, zi, 0
+        Set zi to zi plus 1
+    End While
+
+    Note: Process AAD full blocks
+    Let aad_full_blocks be aad_len divided by 16
+    Let aad_full_bytes be aad_full_blocks multiplied by 16
+    If aad_full_bytes is greater than 0:
+        Let rc1 be proc gcm_ghash with arena, h_key, aad, aad_full_bytes, tag_state
+        If rc1 is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Note: AAD trailing partial block
+    Let aad_remainder be aad_len minus aad_full_bytes
+    If aad_remainder is greater than 0:
+        Let pad_block be proc arena_allocate from Arena with arena, 16
+        If pad_block is equal to 0:
+            Return 0
+        End If
+        Let pi be 0
+        While pi is less than 16:
+            proc memory_set_byte from Memory with pad_block, pi, 0
+            Set pi to pi plus 1
+        End While
+        Let pj be 0
+        While pj is less than aad_remainder:
+            Let ab be proc memory_get_byte from Memory with aad, aad_full_bytes plus pj
+            proc memory_set_byte from Memory with pad_block, pj, ab
+            Set pj to pj plus 1
+        End While
+        Let rc2 be proc gcm_ghash with arena, h_key, pad_block, 16, tag_state
+        If rc2 is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Note: Process CT full blocks
+    Let ct_full_blocks be ct_len divided by 16
+    Let ct_full_bytes be ct_full_blocks multiplied by 16
+    If ct_full_bytes is greater than 0:
+        Let rc3 be proc gcm_ghash with arena, h_key, ct, ct_full_bytes, tag_state
+        If rc3 is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Note: CT trailing partial block
+    Let ct_remainder be ct_len minus ct_full_bytes
+    If ct_remainder is greater than 0:
+        Let pad_block2 be proc arena_allocate from Arena with arena, 16
+        If pad_block2 is equal to 0:
+            Return 0
+        End If
+        Let p2i be 0
+        While p2i is less than 16:
+            proc memory_set_byte from Memory with pad_block2, p2i, 0
+            Set p2i to p2i plus 1
+        End While
+        Let p2j be 0
+        While p2j is less than ct_remainder:
+            Let cb be proc memory_get_byte from Memory with ct, ct_full_bytes plus p2j
+            proc memory_set_byte from Memory with pad_block2, p2j, cb
+            Set p2j to p2j plus 1
+        End While
+        Let rc4 be proc gcm_ghash with arena, h_key, pad_block2, 16, tag_state
+        If rc4 is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Note: Length block: 8 bytes BE for aad_len*8, then 8 bytes BE for ct_len*8
+    Let len_block be proc arena_allocate from Arena with arena, 16
+    If len_block is equal to 0:
+        Return 0
+    End If
+    Let aad_bits be aad_len multiplied by 8
+    Let ct_bits be ct_len multiplied by 8
+
+    Note: aad_bits big-endian into len_block[0..8]
+    Let a7 be aad_bits bitwise_and 255
+    Let a6 be aad_bits divided by 256
+    Set a6 to a6 bitwise_and 255
+    Let a5 be aad_bits divided by 65536
+    Set a5 to a5 bitwise_and 255
+    Let a4 be aad_bits divided by 16777216
+    Set a4 to a4 bitwise_and 255
+    Let a3 be aad_bits divided by 4294967296
+    Set a3 to a3 bitwise_and 255
+    Let a2 be aad_bits divided by 1099511627776
+    Set a2 to a2 bitwise_and 255
+    Let a1 be aad_bits divided by 281474976710656
+    Set a1 to a1 bitwise_and 255
+    Let a0 be aad_bits divided by 72057594037927936
+    Set a0 to a0 bitwise_and 255
+    proc memory_set_byte from Memory with len_block, 0, a0
+    proc memory_set_byte from Memory with len_block, 1, a1
+    proc memory_set_byte from Memory with len_block, 2, a2
+    proc memory_set_byte from Memory with len_block, 3, a3
+    proc memory_set_byte from Memory with len_block, 4, a4
+    proc memory_set_byte from Memory with len_block, 5, a5
+    proc memory_set_byte from Memory with len_block, 6, a6
+    proc memory_set_byte from Memory with len_block, 7, a7
+
+    Note: ct_bits big-endian into len_block[8..16]
+    Let c7 be ct_bits bitwise_and 255
+    Let c6 be ct_bits divided by 256
+    Set c6 to c6 bitwise_and 255
+    Let c5 be ct_bits divided by 65536
+    Set c5 to c5 bitwise_and 255
+    Let c4 be ct_bits divided by 16777216
+    Set c4 to c4 bitwise_and 255
+    Let c3 be ct_bits divided by 4294967296
+    Set c3 to c3 bitwise_and 255
+    Let c2 be ct_bits divided by 1099511627776
+    Set c2 to c2 bitwise_and 255
+    Let c1 be ct_bits divided by 281474976710656
+    Set c1 to c1 bitwise_and 255
+    Let c0 be ct_bits divided by 72057594037927936
+    Set c0 to c0 bitwise_and 255
+    proc memory_set_byte from Memory with len_block, 8, c0
+    proc memory_set_byte from Memory with len_block, 9, c1
+    proc memory_set_byte from Memory with len_block, 10, c2
+    proc memory_set_byte from Memory with len_block, 11, c3
+    proc memory_set_byte from Memory with len_block, 12, c4
+    proc memory_set_byte from Memory with len_block, 13, c5
+    proc memory_set_byte from Memory with len_block, 14, c6
+    proc memory_set_byte from Memory with len_block, 15, c7
+
+    Let rc5 be proc gcm_ghash with arena, h_key, len_block, 16, tag_state
+    If rc5 is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: AEAD seal: encrypt + authenticate
+Note: ============================================================================
+
+Process called "aes_gcm_seal" takes arena as Integer, key as Integer, key_len as Integer, iv_12 as Integer, aad as Integer, aad_len as Integer, plaintext as Integer, pt_len as Integer, ciphertext_out as Integer, tag_out as Integer returns Integer:
+    @Reasoning
+    AES-GCM seal per SP 800-38D. Encrypts the plaintext under (K, IV)
+    with CTR mode and produces a 16-byte authentication tag covering
+    AAD and ciphertext.
+    @End Reasoning
+
+    @Implementation
+    1. Validate inputs:
+       - key_len in {16, 24, 32}
+       - iv_12 non-null (always 12 bytes per the 96-bit-IV-only stance)
+       - lengths non-negative; AAD/PT pointers consistent with lengths.
+    2. Expand the AES key schedule (176/208/240 bytes).
+    3. Compute H = E_K(0^128).
+    4. Build J0 = IV || 0x00000001 (96-bit IV plus 32-bit counter=1).
+    5. Compute E_K(J0) into a 16-byte buffer for later XOR with GHASH.
+    6. Initialize CTR counter to J0 with the rightmost 32 bits = 2 (inc32(J0)).
+    7. CTR-encrypt plaintext into ciphertext_out.
+    8. Compute S = GHASH_H(A || pad || C || pad || len(A) || len(C)).
+    9. Tag = S XOR E_K(J0).
+    10. Wipe H, the GHASH state, and the J0-encrypted block.
+    @End Implementation
+
+    @Performance_Hints
+    Dominant costs:
+    - One AES key schedule (one-shot).
+    - One AES block for H computation.
+    - One AES block for E_K(J0).
+    - pt_len/16 AES blocks for CTR.
+    - (aad_len + pt_len + 16) / 16 GF(2^128) multiplies for GHASH.
+    On the software path, GHASH dominates for messages >100 bytes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time throughout.
+
+    NEVER reuse a (key, IV) pair across distinct plaintexts. GCM nonce
+    reuse catastrophically exposes the GHASH subkey H, allowing
+    arbitrary tag forgery in addition to leaking plaintext XOR
+    plaintext between the colliding messages. Callers MUST ensure
+    uniqueness of IVs per key, e.g., via a deterministic 96-bit
+    counter or via 96 bits of uniformly-random data with sufficient
+    key rotation per RFC 5116.
+
+    The 96-bit-IV-only stance is a deliberate misuse-resistance choice.
+    SP 800-38D permits other IV sizes but they require GHASH-based J0
+    derivation which is fragile under truncation and length-extension
+    confusion. Callers needing 64-bit nonces or longer should use a
+    KDF (e.g., HKDF) to derive a fresh 96-bit IV per message.
+
+    References:
+    - SP 800-38D section 8.2.1.
+    - Ferguson, "Authentication weaknesses in GCM", 2005.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If iv_12 is equal to 0:
+        Return 0
+    End If
+    If tag_out is equal to 0:
+        Return 0
+    End If
+    If pt_len is less than 0:
+        Return 0
+    End If
+    If aad_len is less than 0:
+        Return 0
+    End If
+    If plaintext is equal to 0:
+        If pt_len is greater than 0:
+            Return 0
+        End If
+    End If
+    If ciphertext_out is equal to 0:
+        If pt_len is greater than 0:
+            Return 0
+        End If
+    End If
+    If aad is equal to 0:
+        If aad_len is greater than 0:
+            Return 0
+        End If
+    End If
+
+    Let schedule_size be proc gcm_schedule_size_for_key_len with key_len
+    If schedule_size is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Expand key schedule ----
+    Let schedule be proc arena_allocate from Arena with arena, schedule_size
+    If schedule is equal to 0:
+        Return 0
+    End If
+    Let kx_rc be proc gcm_expand_schedule with arena, key, key_len, schedule
+    If kx_rc is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Compute H = E_K(0^128) ----
+    Let h_key be proc arena_allocate from Arena with arena, 16
+    If h_key is equal to 0:
+        Return 0
+    End If
+    Let h_rc be proc gcm_compute_h with arena, schedule, schedule_size, h_key
+    If h_rc is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Build J0 = IV || 00000001 ----
+    Let j0 be proc arena_allocate from Arena with arena, 16
+    If j0 is equal to 0:
+        Return 0
+    End If
+    Let ji be 0
+    While ji is less than 12:
+        Let iv_byte be proc memory_get_byte from Memory with iv_12, ji
+        proc memory_set_byte from Memory with j0, ji, iv_byte
+        Set ji to ji plus 1
+    End While
+    proc memory_set_byte from Memory with j0, 12, 0
+    proc memory_set_byte from Memory with j0, 13, 0
+    proc memory_set_byte from Memory with j0, 14, 0
+    proc memory_set_byte from Memory with j0, 15, 1
+
+    Note: ---- E_K(J0) for final tag XOR ----
+    Let ekj0 be proc arena_allocate from Arena with arena, 16
+    If ekj0 is equal to 0:
+        Return 0
+    End If
+    Let e_rc be proc aes_encrypt_block from AES with arena, schedule, schedule_size, j0, ekj0
+    If e_rc is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- CTR counter starts at inc32(J0) ----
+    Let counter_block be proc arena_allocate from Arena with arena, 16
+    If counter_block is equal to 0:
+        Return 0
+    End If
+    Let cbi be 0
+    While cbi is less than 16:
+        Let jb be proc memory_get_byte from Memory with j0, cbi
+        proc memory_set_byte from Memory with counter_block, cbi, jb
+        Set cbi to cbi plus 1
+    End While
+    proc gcm_inc32 with counter_block
+
+    Note: ---- CTR encrypt plaintext -> ciphertext_out ----
+    If pt_len is greater than 0:
+        Let ctr_rc be proc gcm_ctr_encrypt with arena, schedule, schedule_size, counter_block, plaintext, pt_len, ciphertext_out
+        If ctr_rc is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Note: ---- GHASH over (AAD, CT, lengths) ----
+    Let tag_state be proc arena_allocate from Arena with arena, 16
+    If tag_state is equal to 0:
+        Return 0
+    End If
+    Let gh_rc be proc gcm_compute_tag with arena, h_key, aad, aad_len, ciphertext_out, pt_len, tag_state
+    If gh_rc is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Tag = tag_state XOR ekj0 ----
+    Let ti be 0
+    While ti is less than 16:
+        Let sb be proc memory_get_byte from Memory with tag_state, ti
+        Let eb be proc memory_get_byte from Memory with ekj0, ti
+        Let tb be sb bitwise_xor eb
+        proc memory_set_byte from Memory with tag_out, ti, tb
+        Set ti to ti plus 1
+    End While
+
+    Note: ---- Wipe key-derived intermediates ----
+    proc secure_zero from SecureMem with h_key, 16
+    proc secure_zero from SecureMem with ekj0, 16
+    proc secure_zero from SecureMem with tag_state, 16
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: AEAD open: verify tag (constant-time) then decrypt
+Note: ============================================================================
+
+Process called "aes_gcm_open" takes arena as Integer, key as Integer, key_len as Integer, iv_12 as Integer, aad as Integer, aad_len as Integer, ciphertext as Integer, ct_len as Integer, tag as Integer, plaintext_out as Integer returns Integer:
+    @Reasoning
+    AES-GCM open per SP 800-38D section 7.2. Recomputes the tag over
+    (AAD, ciphertext) and constant-time-compares against the supplied
+    tag; if they match, decrypts the ciphertext into plaintext_out and
+    returns 1, otherwise leaves plaintext_out untouched and returns 0.
+    @End Reasoning
+
+    @Implementation
+    1. Validate inputs (mirror of seal).
+    2. Expand schedule, compute H, build J0, compute E_K(J0).
+    3. Compute tag_state over (AAD, CT, lengths) via GHASH.
+    4. Recomputed_tag = tag_state XOR E_K(J0).
+    5. constant_time_compare recomputed_tag against supplied tag.
+    6. If unequal, wipe and return 0.
+    7. If equal, CTR-decrypt ciphertext into plaintext_out and return 1.
+    8. Wipe key-derived material in both paths.
+    @End Implementation
+
+    @Performance_Hints
+    Same cost profile as seal.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against:
+    - Tag-bit timing oracles (constant_time_compare).
+    - Chosen-ciphertext oracles on tag failure (verify before decrypt;
+      plaintext_out is not written when the tag fails).
+    - GHASH-key recovery via nonce reuse on a SINGLE message (the
+      forward-secrecy of the AEAD does not protect against multi-message
+      nonce reuse; the caller MUST avoid that).
+
+    Out of scope: protocol-level replay (caller layer).
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If iv_12 is equal to 0:
+        Return 0
+    End If
+    If tag is equal to 0:
+        Return 0
+    End If
+    If ct_len is less than 0:
+        Return 0
+    End If
+    If aad_len is less than 0:
+        Return 0
+    End If
+    If ciphertext is equal to 0:
+        If ct_len is greater than 0:
+            Return 0
+        End If
+    End If
+    If plaintext_out is equal to 0:
+        If ct_len is greater than 0:
+            Return 0
+        End If
+    End If
+    If aad is equal to 0:
+        If aad_len is greater than 0:
+            Return 0
+        End If
+    End If
+
+    Let schedule_size be proc gcm_schedule_size_for_key_len with key_len
+    If schedule_size is equal to 0:
+        Return 0
+    End If
+
+    Let schedule be proc arena_allocate from Arena with arena, schedule_size
+    If schedule is equal to 0:
+        Return 0
+    End If
+    Let kx_rc be proc gcm_expand_schedule with arena, key, key_len, schedule
+    If kx_rc is equal to 0:
+        Return 0
+    End If
+
+    Let h_key be proc arena_allocate from Arena with arena, 16
+    If h_key is equal to 0:
+        Return 0
+    End If
+    Let h_rc be proc gcm_compute_h with arena, schedule, schedule_size, h_key
+    If h_rc is equal to 0:
+        Return 0
+    End If
+
+    Let j0 be proc arena_allocate from Arena with arena, 16
+    If j0 is equal to 0:
+        Return 0
+    End If
+    Let ji be 0
+    While ji is less than 12:
+        Let iv_byte be proc memory_get_byte from Memory with iv_12, ji
+        proc memory_set_byte from Memory with j0, ji, iv_byte
+        Set ji to ji plus 1
+    End While
+    proc memory_set_byte from Memory with j0, 12, 0
+    proc memory_set_byte from Memory with j0, 13, 0
+    proc memory_set_byte from Memory with j0, 14, 0
+    proc memory_set_byte from Memory with j0, 15, 1
+
+    Let ekj0 be proc arena_allocate from Arena with arena, 16
+    If ekj0 is equal to 0:
+        Return 0
+    End If
+    Let e_rc be proc aes_encrypt_block from AES with arena, schedule, schedule_size, j0, ekj0
+    If e_rc is equal to 0:
+        proc secure_zero from SecureMem with h_key, 16
+        Return 0
+    End If
+
+    Note: GHASH over (AAD, received CT, lengths) FIRST (verify before decrypt)
+    Let tag_state be proc arena_allocate from Arena with arena, 16
+    If tag_state is equal to 0:
+        proc secure_zero from SecureMem with h_key, 16
+        proc secure_zero from SecureMem with ekj0, 16
+        Return 0
+    End If
+    Let gh_rc be proc gcm_compute_tag with arena, h_key, aad, aad_len, ciphertext, ct_len, tag_state
+    If gh_rc is equal to 0:
+        proc secure_zero from SecureMem with h_key, 16
+        proc secure_zero from SecureMem with ekj0, 16
+        Return 0
+    End If
+
+    Note: Recomputed tag = tag_state XOR ekj0
+    Let recomputed be proc arena_allocate from Arena with arena, 16
+    If recomputed is equal to 0:
+        proc secure_zero from SecureMem with h_key, 16
+        proc secure_zero from SecureMem with ekj0, 16
+        proc secure_zero from SecureMem with tag_state, 16
+        Return 0
+    End If
+    Let ti be 0
+    While ti is less than 16:
+        Let sb be proc memory_get_byte from Memory with tag_state, ti
+        Let eb be proc memory_get_byte from Memory with ekj0, ti
+        Let rb be sb bitwise_xor eb
+        proc memory_set_byte from Memory with recomputed, ti, rb
+        Set ti to ti plus 1
+    End While
+
+    Note: Constant-time tag compare
+    Let eq be proc constant_time_compare from SecureMem with recomputed, tag, 16
+
+    Note: Wipe regardless of outcome
+    proc secure_zero from SecureMem with h_key, 16
+    proc secure_zero from SecureMem with tag_state, 16
+    proc secure_zero from SecureMem with recomputed, 16
+
+    If eq is equal to 0:
+        proc secure_zero from SecureMem with ekj0, 16
+        Return 0
+    End If
+
+    Note: Tag valid: decrypt
+    If ct_len is greater than 0:
+        Let counter_block be proc arena_allocate from Arena with arena, 16
+        If counter_block is equal to 0:
+            proc secure_zero from SecureMem with ekj0, 16
+            Return 0
+        End If
+        Let cbi be 0
+        While cbi is less than 16:
+            Let jb be proc memory_get_byte from Memory with j0, cbi
+            proc memory_set_byte from Memory with counter_block, cbi, jb
+            Set cbi to cbi plus 1
+        End While
+        proc gcm_inc32 with counter_block
+        Let ctr_rc be proc gcm_ctr_encrypt with arena, schedule, schedule_size, counter_block, ciphertext, ct_len, plaintext_out
+        If ctr_rc is equal to 0:
+            proc secure_zero from SecureMem with ekj0, 16
+            Return 0
+        End If
+    End If
+
+    proc secure_zero from SecureMem with ekj0, 16
+    Return 1
+End Process

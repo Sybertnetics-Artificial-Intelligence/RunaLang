@@ -1,0 +1,577 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+STREAM<T> - Async stream of values with combinators.
+
+A Stream<T> is a pull-based async sequence. Producers push (or emit
+errors / complete). Consumers pull via stream_next which returns a future
+that resolves to:
+   tag = 0 -> EOF
+   tag = 1 -> Value (in value_ptr)
+   tag = 2 -> Error (in error_code)
+
+Stream layout (56 bytes):
+  offset 0:  channel_ptr      (8 bytes) - underlying channel of emit records
+  offset 8:  state_flag       (8 bytes) - 0 = open, 1 = completed, 2 = errored
+  offset 16: error_code       (8 bytes)
+  offset 24: parent_ptr       (8 bytes) - upstream stream (for combinators)
+  offset 32: op_kind          (8 bytes) - combinator type (see OP_*)
+  offset 40: op_data_ptr      (8 bytes) - per-op state pointer
+  offset 48: pending_count    (8 bytes) - reserved for buffer combinators
+
+Emit record (16 bytes):
+  offset 0: tag       (8 bytes)
+  offset 8: value_ptr (8 bytes) (or error_code for error tag)
+
+Dependencies:
+- concurrency/channel.runa
+- concurrency/future_promise.runa
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/concurrency/channel.runa" as Chan
+Import "compiler/frontend/primitives/concurrency/future_promise.runa" as FP
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant STREAM_OFF_CHANNEL as Integer is 0
+Constant STREAM_OFF_STATE as Integer is 8
+Constant STREAM_OFF_ERROR as Integer is 16
+Constant STREAM_OFF_PARENT as Integer is 24
+Constant STREAM_OFF_OP_KIND as Integer is 32
+Constant STREAM_OFF_OP_DATA as Integer is 40
+Constant STREAM_OFF_PENDING as Integer is 48
+Constant STREAM_STRUCT_SIZE as Integer is 56
+
+Constant EMIT_TAG as Integer is 0
+Constant EMIT_VALUE_OR_ERR as Integer is 8
+Constant EMIT_RECORD_SIZE as Integer is 16
+
+Constant TAG_EOF as Integer is 0
+Constant TAG_VALUE as Integer is 1
+Constant TAG_ERROR as Integer is 2
+
+Constant STREAM_STATE_OPEN as Integer is 0
+Constant STREAM_STATE_COMPLETED as Integer is 1
+Constant STREAM_STATE_ERRORED as Integer is 2
+
+Constant OP_NONE as Integer is 0
+Constant OP_MAP as Integer is 1
+Constant OP_FILTER as Integer is 2
+Constant OP_TAKE as Integer is 3
+Constant OP_BUFFER as Integer is 4
+Constant OP_THROTTLE as Integer is 5
+Constant OP_FLATMAP as Integer is 6
+
+Constant STREAM_OK as Integer is 1
+Constant STREAM_ERR_INVALID as Integer is 0
+Constant STREAM_ERR_CLOSED as Integer is -1
+
+Note: ============================================================================
+Note: Base stream construction
+Note: ============================================================================
+
+@Reasoning
+Create an empty stream backed by an unbounded channel. Producers call
+stream_emit to push values; consumers call stream_next to pull.
+@End Reasoning
+
+@Implementation
+Allocate the stream struct, create an unbounded channel, store fields.
+@End Implementation
+
+@Performance_Hints
+One alloc + one channel create.
+@End Performance_Hints
+
+@Security_Scope
+Producers must call stream_complete or stream_error to terminate; otherwise
+consumers block indefinitely.
+@End Security_Scope
+
+Process called "stream_create" returns Integer:
+    Let s be proc allocate from Memory with STREAM_STRUCT_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+    Let ch be proc channel_create from Chan with 0
+    If ch is equal to 0:
+        proc deallocate from Memory with s
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with s, STREAM_OFF_CHANNEL, ch
+    proc memory_set_int64 from Mem with s, STREAM_OFF_STATE, STREAM_STATE_OPEN
+    proc memory_set_int64 from Mem with s, STREAM_OFF_ERROR, 0
+    proc memory_set_int64 from Mem with s, STREAM_OFF_PARENT, 0
+    proc memory_set_int64 from Mem with s, STREAM_OFF_OP_KIND, OP_NONE
+    proc memory_set_int64 from Mem with s, STREAM_OFF_OP_DATA, 0
+    proc memory_set_int64 from Mem with s, STREAM_OFF_PENDING, 0
+    Return s
+End Process
+
+Process called "stream_destroy" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    Let ch be proc memory_get_int64 from Mem with s, STREAM_OFF_CHANNEL
+    If ch is not equal to 0:
+        proc channel_close from Chan with ch
+        proc channel_destroy from Chan with ch
+    End If
+    Let op_data be proc memory_get_int64 from Mem with s, STREAM_OFF_OP_DATA
+    If op_data is not equal to 0:
+        proc deallocate from Memory with op_data
+    End If
+    proc deallocate from Memory with s
+    Return STREAM_OK
+End Process
+
+Note: ============================================================================
+Note: Producer-side API
+Note: ============================================================================
+
+@Reasoning
+Emit a value on the stream. Allocates an emit record and sends it down the
+channel.
+@End Reasoning
+
+@Implementation
+Check state, allocate a value-tagged emit record, channel_send it.
+@End Implementation
+
+@Performance_Hints
+One alloc + one channel_send.
+@End Performance_Hints
+
+@Security_Scope
+Caller retains ownership of the value pointer if it points to heap data.
+@End Security_Scope
+
+Process called "stream_emit" takes s as Integer, value_ptr as Integer returns Integer:
+    If s is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with s, STREAM_OFF_STATE
+    If state is not equal to STREAM_STATE_OPEN:
+        Return STREAM_ERR_CLOSED
+    End If
+    Let rec be proc allocate from Memory with EMIT_RECORD_SIZE
+    If rec is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with rec, EMIT_TAG, TAG_VALUE
+    proc memory_set_int64 from Mem with rec, EMIT_VALUE_OR_ERR, value_ptr
+    Let ch be proc memory_get_int64 from Mem with s, STREAM_OFF_CHANNEL
+    Let rc be proc channel_send from Chan with ch, rec
+    If rc is not equal to 1:
+        proc deallocate from Memory with rec
+        Return STREAM_ERR_CLOSED
+    End If
+    Return STREAM_OK
+End Process
+
+@Reasoning
+Signal end-of-stream. Emits an EOF marker and closes the underlying
+channel.
+@End Reasoning
+
+@Implementation
+Send an EOF record, then channel_close to wake any blocked receivers.
+@End Implementation
+
+@Performance_Hints
+Two sync operations.
+@End Performance_Hints
+
+@Security_Scope
+After completion, further emits return STREAM_ERR_CLOSED.
+@End Security_Scope
+
+Process called "stream_complete" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with s, STREAM_OFF_STATE
+    If state is not equal to STREAM_STATE_OPEN:
+        Return STREAM_ERR_CLOSED
+    End If
+    Let rec be proc allocate from Memory with EMIT_RECORD_SIZE
+    If rec is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with rec, EMIT_TAG, TAG_EOF
+    proc memory_set_int64 from Mem with rec, EMIT_VALUE_OR_ERR, 0
+    Let ch be proc memory_get_int64 from Mem with s, STREAM_OFF_CHANNEL
+    Let rc be proc channel_send from Chan with ch, rec
+    If rc is not equal to 1:
+        proc deallocate from Memory with rec
+    End If
+    proc memory_set_int64 from Mem with s, STREAM_OFF_STATE, STREAM_STATE_COMPLETED
+    proc channel_close from Chan with ch
+    Return STREAM_OK
+End Process
+
+@Reasoning
+Signal an error and terminate the stream.
+@End Reasoning
+
+@Implementation
+Send an error record carrying the error code, mark state, close channel.
+@End Implementation
+
+@Performance_Hints
+Same as stream_complete.
+@End Performance_Hints
+
+@Security_Scope
+After error, further emits return STREAM_ERR_CLOSED.
+@End Security_Scope
+
+Process called "stream_error" takes s as Integer, error_code as Integer returns Integer:
+    If s is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with s, STREAM_OFF_STATE
+    If state is not equal to STREAM_STATE_OPEN:
+        Return STREAM_ERR_CLOSED
+    End If
+    Let rec be proc allocate from Memory with EMIT_RECORD_SIZE
+    If rec is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with rec, EMIT_TAG, TAG_ERROR
+    proc memory_set_int64 from Mem with rec, EMIT_VALUE_OR_ERR, error_code
+    Let ch be proc memory_get_int64 from Mem with s, STREAM_OFF_CHANNEL
+    proc channel_send from Chan with ch, rec
+
+    proc memory_set_int64 from Mem with s, STREAM_OFF_STATE, STREAM_STATE_ERRORED
+    proc memory_set_int64 from Mem with s, STREAM_OFF_ERROR, error_code
+    proc channel_close from Chan with ch
+    Return STREAM_OK
+End Process
+
+Note: ============================================================================
+Note: Consumer-side API
+Note: ============================================================================
+
+@Reasoning
+Pull the next item from the stream. Returns a triple via out parameters:
+  *out_tag = 0/1/2  (EOF / Value / Error)
+  *out_value_ptr = value (when tag = 1) or error_code (when tag = 2)
+@End Reasoning
+
+@Implementation
+For base streams: receive from underlying channel. For combinator streams:
+delegate to the per-op dispatcher.
+@End Implementation
+
+@Performance_Hints
+Hot path is one channel_receive + record decode.
+@End Performance_Hints
+
+@Security_Scope
+out_tag_holder and out_value_holder must point to writable 8-byte storage.
+@End Security_Scope
+
+Process called "stream_next" takes s as Integer, out_tag_holder as Integer, out_value_holder as Integer returns Integer:
+    If s is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    If out_tag_holder is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+    If out_value_holder is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+
+    Let op_kind be proc memory_get_int64 from Mem with s, STREAM_OFF_OP_KIND
+    If op_kind is not equal to OP_NONE:
+        Return proc stream_next_via_op with s, out_tag_holder, out_value_holder
+    End If
+
+    Let ch be proc memory_get_int64 from Mem with s, STREAM_OFF_CHANNEL
+    Let rec_holder be proc allocate from Memory with 8
+    If rec_holder is equal to 0:
+        Return STREAM_ERR_INVALID
+    End If
+
+    Let rc be proc channel_receive from Chan with ch, rec_holder
+    If rc is not equal to 1:
+        Note: Channel closed and drained -> EOF
+        proc memory_set_int64 from Mem with out_tag_holder, 0, TAG_EOF
+        proc memory_set_int64 from Mem with out_value_holder, 0, 0
+        proc deallocate from Memory with rec_holder
+        Return STREAM_OK
+    End If
+    Let rec be proc memory_get_int64 from Mem with rec_holder, 0
+    proc deallocate from Memory with rec_holder
+
+    If rec is equal to 0:
+        proc memory_set_int64 from Mem with out_tag_holder, 0, TAG_EOF
+        proc memory_set_int64 from Mem with out_value_holder, 0, 0
+        Return STREAM_OK
+    End If
+
+    Let tag be proc memory_get_int64 from Mem with rec, EMIT_TAG
+    Let payload be proc memory_get_int64 from Mem with rec, EMIT_VALUE_OR_ERR
+    proc deallocate from Memory with rec
+
+    proc memory_set_int64 from Mem with out_tag_holder, 0, tag
+    proc memory_set_int64 from Mem with out_value_holder, 0, payload
+    Return STREAM_OK
+End Process
+
+Note: ============================================================================
+Note: Combinators (forward declarations)
+Note: ============================================================================
+
+@Reasoning
+Indirect dispatcher for combinator-style streams. Each op_kind has a
+specialized pull strategy.
+@End Reasoning
+
+@Implementation
+Switch on op_kind and call the per-op pull routine. Each combinator pulls
+from its parent stream and applies its transform.
+@End Implementation
+
+@Performance_Hints
+One indirect branch dispatch.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "stream_next_via_op" takes s as Integer, out_tag_holder as Integer, out_value_holder as Integer returns Integer:
+    Let op_kind be proc memory_get_int64 from Mem with s, STREAM_OFF_OP_KIND
+    If op_kind is equal to OP_MAP:
+        Return proc stream_op_map_next with s, out_tag_holder, out_value_holder
+    End If
+    If op_kind is equal to OP_FILTER:
+        Return proc stream_op_filter_next with s, out_tag_holder, out_value_holder
+    End If
+    If op_kind is equal to OP_TAKE:
+        Return proc stream_op_take_next with s, out_tag_holder, out_value_holder
+    End If
+    Note: Buffer / throttle / flatmap fall through to a base pull until
+    Note: their producer-side runtime drains them; emit pass-through.
+    Let parent be proc memory_get_int64 from Mem with s, STREAM_OFF_PARENT
+    If parent is not equal to 0:
+        Return proc stream_next with parent, out_tag_holder, out_value_holder
+    End If
+    proc memory_set_int64 from Mem with out_tag_holder, 0, TAG_EOF
+    proc memory_set_int64 from Mem with out_value_holder, 0, 0
+    Return STREAM_OK
+End Process
+
+@Reasoning
+Apply a function (op_data interpreted as function pointer) to each
+upstream value. EOF and error pass through unchanged.
+@End Reasoning
+
+@Implementation
+Pull from parent. If value, dispatch through fp_runtime_call_indirect_3
+(parent's runtime closure invoker) using the cached function pointer.
+@End Implementation
+
+@Performance_Hints
+One parent pull + one indirect call per value.
+@End Performance_Hints
+
+@Security_Scope
+op_data must be a valid function pointer at registration time.
+@End Security_Scope
+
+Process called "stream_op_map_next" takes s as Integer, out_tag_holder as Integer, out_value_holder as Integer returns Integer:
+    Let parent be proc memory_get_int64 from Mem with s, STREAM_OFF_PARENT
+    If parent is equal to 0:
+        proc memory_set_int64 from Mem with out_tag_holder, 0, TAG_EOF
+        proc memory_set_int64 from Mem with out_value_holder, 0, 0
+        Return STREAM_OK
+    End If
+    Let rc be proc stream_next with parent, out_tag_holder, out_value_holder
+    If rc is not equal to STREAM_OK:
+        Return rc
+    End If
+    Let tag be proc memory_get_int64 from Mem with out_tag_holder, 0
+    If tag is equal to TAG_VALUE:
+        Let v be proc memory_get_int64 from Mem with out_value_holder, 0
+        Let map_fn be proc memory_get_int64 from Mem with s, STREAM_OFF_OP_DATA
+        Note: Map function signature: takes (value_ptr) returns Integer.
+        Note: We borrow the closure dispatcher from future_promise.
+        Let mapped be proc fp_runtime_call_indirect_3 from FP with map_fn, v, 0, 0
+        proc memory_set_int64 from Mem with out_value_holder, 0, mapped
+    End If
+    Return STREAM_OK
+End Process
+
+@Reasoning
+Filter: pull values from parent until predicate(value) != 0. EOF and
+error pass through.
+@End Reasoning
+
+@Implementation
+Loop: pull from parent. If EOF or error, propagate. If value, invoke the
+predicate; if non-zero return the value, otherwise loop.
+@End Implementation
+
+@Performance_Hints
+O(skipped_values) per accepted output.
+@End Performance_Hints
+
+@Security_Scope
+predicate fn must remain valid.
+@End Security_Scope
+
+Process called "stream_op_filter_next" takes s as Integer, out_tag_holder as Integer, out_value_holder as Integer returns Integer:
+    Let parent be proc memory_get_int64 from Mem with s, STREAM_OFF_PARENT
+    If parent is equal to 0:
+        proc memory_set_int64 from Mem with out_tag_holder, 0, TAG_EOF
+        proc memory_set_int64 from Mem with out_value_holder, 0, 0
+        Return STREAM_OK
+    End If
+    Let pred_fn be proc memory_get_int64 from Mem with s, STREAM_OFF_OP_DATA
+
+    Let looping be 1
+    While looping is equal to 1:
+        Let rc be proc stream_next with parent, out_tag_holder, out_value_holder
+        If rc is not equal to STREAM_OK:
+            Return rc
+        End If
+        Let tag be proc memory_get_int64 from Mem with out_tag_holder, 0
+        If tag is not equal to TAG_VALUE:
+            Set looping to 0
+        Otherwise:
+            Let v be proc memory_get_int64 from Mem with out_value_holder, 0
+            Let keep be proc fp_runtime_call_indirect_3 from FP with pred_fn, v, 0, 0
+            If keep is not equal to 0:
+                Set looping to 0
+            End If
+        End If
+    End While
+    Return STREAM_OK
+End Process
+
+@Reasoning
+Take: emit at most N values from the parent then EOF. op_data stores the
+remaining count.
+@End Reasoning
+
+@Implementation
+If counter > 0, decrement and pass through one parent pull. If counter
+hits 0 emit EOF.
+@End Implementation
+
+@Performance_Hints
+Constant overhead per emit.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "stream_op_take_next" takes s as Integer, out_tag_holder as Integer, out_value_holder as Integer returns Integer:
+    Let parent be proc memory_get_int64 from Mem with s, STREAM_OFF_PARENT
+    If parent is equal to 0:
+        proc memory_set_int64 from Mem with out_tag_holder, 0, TAG_EOF
+        proc memory_set_int64 from Mem with out_value_holder, 0, 0
+        Return STREAM_OK
+    End If
+    Let counter_ptr be proc memory_get_int64 from Mem with s, STREAM_OFF_OP_DATA
+    If counter_ptr is equal to 0:
+        proc memory_set_int64 from Mem with out_tag_holder, 0, TAG_EOF
+        proc memory_set_int64 from Mem with out_value_holder, 0, 0
+        Return STREAM_OK
+    End If
+    Let remaining be proc memory_get_int64 from Mem with counter_ptr, 0
+    If remaining is less than or equal to 0:
+        proc memory_set_int64 from Mem with out_tag_holder, 0, TAG_EOF
+        proc memory_set_int64 from Mem with out_value_holder, 0, 0
+        Return STREAM_OK
+    End If
+    Let rc be proc stream_next with parent, out_tag_holder, out_value_holder
+    If rc is not equal to STREAM_OK:
+        Return rc
+    End If
+    Let tag be proc memory_get_int64 from Mem with out_tag_holder, 0
+    If tag is equal to TAG_VALUE:
+        proc memory_set_int64 from Mem with counter_ptr, 0, (remaining minus 1)
+    End If
+    Return STREAM_OK
+End Process
+
+Note: ============================================================================
+Note: Combinator constructors
+Note: ============================================================================
+
+Process called "stream_make_op_stream" takes parent as Integer, op_kind as Integer, op_data as Integer returns Integer:
+    Let s be proc allocate from Memory with STREAM_STRUCT_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with s, STREAM_OFF_CHANNEL, 0
+    proc memory_set_int64 from Mem with s, STREAM_OFF_STATE, STREAM_STATE_OPEN
+    proc memory_set_int64 from Mem with s, STREAM_OFF_ERROR, 0
+    proc memory_set_int64 from Mem with s, STREAM_OFF_PARENT, parent
+    proc memory_set_int64 from Mem with s, STREAM_OFF_OP_KIND, op_kind
+    proc memory_set_int64 from Mem with s, STREAM_OFF_OP_DATA, op_data
+    proc memory_set_int64 from Mem with s, STREAM_OFF_PENDING, 0
+    Return s
+End Process
+
+Process called "stream_map" takes parent as Integer, map_fn as Integer returns Integer:
+    Return proc stream_make_op_stream with parent, OP_MAP, map_fn
+End Process
+
+Process called "stream_filter" takes parent as Integer, pred_fn as Integer returns Integer:
+    Return proc stream_make_op_stream with parent, OP_FILTER, pred_fn
+End Process
+
+Process called "stream_take" takes parent as Integer, count as Integer returns Integer:
+    Let counter be proc allocate from Memory with 8
+    If counter is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with counter, 0, count
+    Return proc stream_make_op_stream with parent, OP_TAKE, counter
+End Process
+
+Process called "stream_flatmap" takes parent as Integer, flatmap_fn as Integer returns Integer:
+    Return proc stream_make_op_stream with parent, OP_FLATMAP, flatmap_fn
+End Process
+
+Process called "stream_buffer" takes parent as Integer, buffer_size as Integer returns Integer:
+    Let counter be proc allocate from Memory with 8
+    If counter is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with counter, 0, buffer_size
+    Return proc stream_make_op_stream with parent, OP_BUFFER, counter
+End Process
+
+Process called "stream_throttle" takes parent as Integer, duration_us as Integer returns Integer:
+    Let counter be proc allocate from Memory with 8
+    If counter is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with counter, 0, duration_us
+    Return proc stream_make_op_stream with parent, OP_THROTTLE, counter
+End Process
+
+Process called "stream_state" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return STREAM_STATE_ERRORED
+    End If
+    Return proc memory_get_int64 from Mem with s, STREAM_OFF_STATE
+End Process
+
+Process called "stream_error_code" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with s, STREAM_OFF_ERROR
+End Process

@@ -1,0 +1,253 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+ASN.1 DER decoder for X.509 certificates and PKCS#1 signature blocks
+==============================================================================
+
+Implements the subset of Distinguished Encoding Rules (DER) needed to parse
+X.509 certificates per RFC 5280 and PKCS#1 RSASSA-PKCS1-v1_5 signature
+blocks per RFC 8017. Each parser returns the consumed byte count and yields
+the parsed value into caller-provided output slots.
+
+Tags supported (with their class/PC/number byte):
+- 0x02: INTEGER (universal, primitive, 2)
+- 0x03: BIT STRING (universal, primitive, 3)
+- 0x04: OCTET STRING (universal, primitive, 4)
+- 0x05: NULL (universal, primitive, 5)
+- 0x06: OBJECT IDENTIFIER (universal, primitive, 6)
+- 0x13: PrintableString (universal, primitive, 19)
+- 0x17: UTCTime (universal, primitive, 23)
+- 0x18: GeneralizedTime (universal, primitive, 24)
+- 0x30: SEQUENCE (universal, constructed, 16)
+- 0x31: SET (universal, constructed, 17)
+- 0xA0, 0xA1, 0xA2, 0xA3: context-specific tagged [0], [1], [2], [3]
+
+Length encoding: short form (length < 128) is one byte; long form is
+(0x80 | n) followed by n bytes of length, big-endian. Indefinite-length
+form (0x80) is not supported (forbidden by DER anyway).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+
+Note: TLV slot layout (40 bytes):
+Note:   offset 0  : tag byte (Integer)
+Note:   offset 8  : content offset within the parent buffer (Integer)
+Note:   offset 16 : content length in bytes (Integer)
+Note:   offset 24 : total bytes consumed by tag+length+content (Integer)
+Note:   offset 32 : parent buffer base pointer (Integer)
+Constant ASN1_TLV_SIZE as Integer is 40
+
+Process called "asn1_tlv_alloc" takes arena as Integer returns Integer:
+    Let tlv be proc arena_allocate from Arena with arena, ASN1_TLV_SIZE
+    If tlv is equal to 0:
+        Return 0
+    End If
+    proc memory_set_qword from Memory with tlv, 0, 0
+    proc memory_set_qword from Memory with tlv, 8, 0
+    proc memory_set_qword from Memory with tlv, 16, 0
+    proc memory_set_qword from Memory with tlv, 24, 0
+    proc memory_set_qword from Memory with tlv, 32, 0
+    Return tlv
+End Process
+
+Process called "asn1_tlv_get_tag" takes tlv as Integer returns Integer:
+    Return proc memory_get_qword from Memory with tlv, 0
+End Process
+
+Process called "asn1_tlv_get_content_offset" takes tlv as Integer returns Integer:
+    Return proc memory_get_qword from Memory with tlv, 8
+End Process
+
+Process called "asn1_tlv_get_content_length" takes tlv as Integer returns Integer:
+    Return proc memory_get_qword from Memory with tlv, 16
+End Process
+
+Process called "asn1_tlv_get_total_size" takes tlv as Integer returns Integer:
+    Return proc memory_get_qword from Memory with tlv, 24
+End Process
+
+Process called "asn1_tlv_get_buffer" takes tlv as Integer returns Integer:
+    Return proc memory_get_qword from Memory with tlv, 32
+End Process
+
+Process called "asn1_tlv_content_ptr" takes tlv as Integer returns Integer:
+    Let buffer be proc memory_get_qword from Memory with tlv, 32
+    Let offset be proc memory_get_qword from Memory with tlv, 8
+    Return buffer plus offset
+End Process
+
+Process called "asn1_parse_tlv" takes arena as Integer, buffer as Integer, buffer_offset as Integer, buffer_limit as Integer returns Integer:
+    @Reasoning
+    Parses one DER TLV header at buffer[buffer_offset..buffer_limit). Returns
+    a TLV slot pointer or 0 on parse failure (insufficient bytes, indefinite
+    length, length overflow).
+    @End Reasoning
+
+    @Implementation
+    1. Read tag byte at buffer_offset.
+    2. Read length byte at buffer_offset+1.
+       - If length < 0x80: short form, length is that byte.
+       - If length == 0x80: indefinite form, not allowed in DER, fail.
+       - If length > 0x80: long form, low 7 bits give the number of length
+         bytes (n); read n big-endian bytes following.
+    3. Content starts at buffer_offset + 1 + length_header_size.
+    4. Total size = 1 + length_header_size + content_length.
+    @End Implementation
+
+    If buffer_offset plus 2 is greater than buffer_limit:
+        Return 0
+    End If
+
+    Let tag_byte be proc memory_get_byte from Memory with buffer, buffer_offset
+    Let length_byte be proc memory_get_byte from Memory with buffer, buffer_offset plus 1
+
+    Let content_length be 0
+    Let length_header_size be 1
+
+    If length_byte is less than 128:
+        Set content_length to length_byte
+    Otherwise:
+        If length_byte is equal to 128:
+            Return 0
+        End If
+        Let length_byte_count be length_byte minus 128
+        If length_byte_count is greater than 8:
+            Return 0
+        End If
+        Set length_header_size to 1 plus length_byte_count
+        If buffer_offset plus 1 plus length_header_size is greater than buffer_limit:
+            Return 0
+        End If
+        Let li be 0
+        While li is less than length_byte_count:
+            Let length_byte_v be proc memory_get_byte from Memory with buffer, buffer_offset plus 2 plus li
+            Set content_length to content_length multiplied by 256
+            Set content_length to content_length plus length_byte_v
+            Set li to li plus 1
+        End While
+    End If
+
+    Let total_size be 1 plus length_header_size plus content_length
+    If buffer_offset plus total_size is greater than buffer_limit:
+        Return 0
+    End If
+
+    Let tlv be proc asn1_tlv_alloc with arena
+    If tlv is equal to 0:
+        Return 0
+    End If
+    proc memory_set_qword from Memory with tlv, 0, tag_byte
+    proc memory_set_qword from Memory with tlv, 8, buffer_offset plus 1 plus length_header_size
+    proc memory_set_qword from Memory with tlv, 16, content_length
+    proc memory_set_qword from Memory with tlv, 24, total_size
+    proc memory_set_qword from Memory with tlv, 32, buffer
+    Return tlv
+End Process
+
+Process called "asn1_iter_first_child" takes arena as Integer, parent_tlv as Integer returns Integer:
+    @Reasoning
+    Parses the first child TLV inside a constructed parent (SEQUENCE, SET,
+    or context-specific tagged constructed). Returns 0 if the parent has no
+    children or is not constructed.
+    @End Reasoning
+
+    If parent_tlv is equal to 0:
+        Return 0
+    End If
+    Let tag be proc memory_get_qword from Memory with parent_tlv, 0
+    Note: constructed tag bit = bit 5 (0x20). Check.
+    Let constructed_bit be tag bitwise_and 32
+    If constructed_bit is equal to 0:
+        Return 0
+    End If
+
+    Let buffer be proc memory_get_qword from Memory with parent_tlv, 32
+    Let child_offset be proc memory_get_qword from Memory with parent_tlv, 8
+    Let parent_length be proc memory_get_qword from Memory with parent_tlv, 16
+
+    If parent_length is equal to 0:
+        Return 0
+    End If
+
+    Return proc asn1_parse_tlv with arena, buffer, child_offset, child_offset plus parent_length
+End Process
+
+Process called "asn1_iter_next_sibling" takes arena as Integer, parent_tlv as Integer, prev_child as Integer returns Integer:
+    If parent_tlv is equal to 0:
+        Return 0
+    End If
+    If prev_child is equal to 0:
+        Return 0
+    End If
+    Let buffer be proc memory_get_qword from Memory with parent_tlv, 32
+    Let parent_content_offset be proc memory_get_qword from Memory with parent_tlv, 8
+    Let parent_length be proc memory_get_qword from Memory with parent_tlv, 16
+    Let parent_end be parent_content_offset plus parent_length
+
+    Let prev_content_offset be proc memory_get_qword from Memory with prev_child, 8
+    Let prev_content_length be proc memory_get_qword from Memory with prev_child, 16
+    Let prev_total_size be proc memory_get_qword from Memory with prev_child, 24
+    Let prev_start be prev_content_offset minus 0
+    Note: prev_start = prev_content_offset minus (prev_total_size minus prev_content_length)
+    Let header_size be prev_total_size minus prev_content_length
+    Let prev_tlv_start be prev_content_offset minus header_size
+    Let next_offset be prev_tlv_start plus prev_total_size
+
+    If next_offset is greater than parent_end minus 1:
+        Return 0
+    End If
+    If next_offset is equal to parent_end:
+        Return 0
+    End If
+
+    Return proc asn1_parse_tlv with arena, buffer, next_offset, parent_end
+End Process
+
+Process called "asn1_oid_equals" takes tlv as Integer, oid_bytes as Integer, oid_length as Integer returns Integer:
+    @Reasoning
+    Byte-compares an OID TLV's content against a caller-supplied DER-encoded
+    OID body. Used to identify algorithm OIDs (RSA-SHA-256, ECDSA-SHA-384,
+    etc.) and certificate extension OIDs.
+    @End Reasoning
+
+    If tlv is equal to 0:
+        Return 0
+    End If
+    Let tlv_tag be proc memory_get_qword from Memory with tlv, 0
+    If tlv_tag is not equal to 6:
+        Return 0
+    End If
+    Let tlv_content_length be proc memory_get_qword from Memory with tlv, 16
+    If tlv_content_length is not equal to oid_length:
+        Return 0
+    End If
+    Let tlv_buffer be proc memory_get_qword from Memory with tlv, 32
+    Let tlv_offset be proc memory_get_qword from Memory with tlv, 8
+
+    Let i be 0
+    While i is less than oid_length:
+        Let a be proc memory_get_byte from Memory with tlv_buffer, tlv_offset plus i
+        Let b be proc memory_get_byte from Memory with oid_bytes, i
+        If a is not equal to b:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process

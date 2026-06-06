@@ -1,0 +1,1293 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+SQL - SQL AST (Statements, Expressions, Joins, Window) (Tier 1)
+==============================================================================
+
+Implements the SQL substrate per ISO/IEC 9075-2:2016 (Foundation), with
+dialect-tagged extension points for PostgreSQL, MySQL, SQLite, Oracle,
+SQL Server, BigQuery, Snowflake, Redshift, and Spark SQL.  The AST
+covers the union of constructs found in those dialects' real-world
+usage; per-dialect lowering is the responsibility of the serializer
+(future work).
+
+Statement kinds (SQL/Foundation 4.34, "Statements"):
+
+  SQL_STMT_SELECT      1   SELECT statement
+  SQL_STMT_INSERT      2   INSERT statement
+  SQL_STMT_UPDATE      3   UPDATE statement
+  SQL_STMT_DELETE      4   DELETE statement
+  SQL_STMT_CREATE_TABLE   5
+  SQL_STMT_ALTER_TABLE    6
+  SQL_STMT_DROP_TABLE     7
+  SQL_STMT_CREATE_INDEX   8
+  SQL_STMT_CREATE_VIEW    9
+  SQL_STMT_BEGIN          10
+  SQL_STMT_COMMIT         11
+  SQL_STMT_ROLLBACK       12
+  SQL_STMT_GRANT          13
+  SQL_STMT_REVOKE         14
+
+Expression kinds:
+
+  SQL_EXPR_COLUMN_REF       1
+  SQL_EXPR_LITERAL          2
+  SQL_EXPR_BINARY_OP        3
+  SQL_EXPR_UNARY_OP         4
+  SQL_EXPR_FUNCTION_CALL    5
+  SQL_EXPR_CASE_WHEN        6
+  SQL_EXPR_SUBQUERY         7
+  SQL_EXPR_CAST             8
+  SQL_EXPR_COLLATE          9
+  SQL_EXPR_WINDOW_FUNCTION  10
+  SQL_EXPR_AGGREGATE        11
+
+Join kinds (SQL/Foundation 7.10):
+
+  SQL_JOIN_INNER       1
+  SQL_JOIN_LEFT_OUTER  2
+  SQL_JOIN_RIGHT_OUTER 3
+  SQL_JOIN_FULL_OUTER  4
+  SQL_JOIN_CROSS       5
+  SQL_JOIN_LATERAL     6
+
+Dialect tags:
+
+  SQL_DIALECT_STANDARD     0   ISO/IEC 9075 baseline
+  SQL_DIALECT_POSTGRESQL   1
+  SQL_DIALECT_MYSQL        2
+  SQL_DIALECT_SQLITE       3
+  SQL_DIALECT_ORACLE       4
+  SQL_DIALECT_MSSQL        5
+  SQL_DIALECT_BIGQUERY     6
+  SQL_DIALECT_SNOWFLAKE    7
+  SQL_DIALECT_REDSHIFT     8
+  SQL_DIALECT_SPARK        9
+
+Statement record layout (48 bytes):
+  off  0  statement kind tag
+  off  8  payload 0  (interpretation per kind)
+  off 16  payload 1
+  off 24  payload 2
+  off 32  payload 3
+  off 40  dialect tag
+
+Expression record layout (48 bytes):
+  off  0  expr kind tag
+  off  8  payload 0
+  off 16  payload 1
+  off 24  payload 2
+  off 32  payload 3
+  off 40  reserved
+
+SELECT statement payloads:
+  payload 0: WITH clause (List of CTE records) or 0
+  payload 1: select list (List of select-item records)
+  payload 2: FROM/JOIN tree (List of join-spec records) or 0
+  payload 3: pointer to "rest" record holding WHERE/GROUP/HAVING/WINDOW/
+             ORDER/LIMIT/OFFSET fields (allocated only when used)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: TAG CONSTANTS
+Note: ============================================================================
+
+Constant SQL_STMT_SELECT as Integer is 1
+Constant SQL_STMT_INSERT as Integer is 2
+Constant SQL_STMT_UPDATE as Integer is 3
+Constant SQL_STMT_DELETE as Integer is 4
+Constant SQL_STMT_CREATE_TABLE as Integer is 5
+Constant SQL_STMT_ALTER_TABLE as Integer is 6
+Constant SQL_STMT_DROP_TABLE as Integer is 7
+Constant SQL_STMT_CREATE_INDEX as Integer is 8
+Constant SQL_STMT_CREATE_VIEW as Integer is 9
+Constant SQL_STMT_BEGIN as Integer is 10
+Constant SQL_STMT_COMMIT as Integer is 11
+Constant SQL_STMT_ROLLBACK as Integer is 12
+Constant SQL_STMT_GRANT as Integer is 13
+Constant SQL_STMT_REVOKE as Integer is 14
+
+Constant SQL_EXPR_COLUMN_REF as Integer is 1
+Constant SQL_EXPR_LITERAL as Integer is 2
+Constant SQL_EXPR_BINARY_OP as Integer is 3
+Constant SQL_EXPR_UNARY_OP as Integer is 4
+Constant SQL_EXPR_FUNCTION_CALL as Integer is 5
+Constant SQL_EXPR_CASE_WHEN as Integer is 6
+Constant SQL_EXPR_SUBQUERY as Integer is 7
+Constant SQL_EXPR_CAST as Integer is 8
+Constant SQL_EXPR_COLLATE as Integer is 9
+Constant SQL_EXPR_WINDOW_FUNCTION as Integer is 10
+Constant SQL_EXPR_AGGREGATE as Integer is 11
+
+Constant SQL_JOIN_INNER as Integer is 1
+Constant SQL_JOIN_LEFT_OUTER as Integer is 2
+Constant SQL_JOIN_RIGHT_OUTER as Integer is 3
+Constant SQL_JOIN_FULL_OUTER as Integer is 4
+Constant SQL_JOIN_CROSS as Integer is 5
+Constant SQL_JOIN_LATERAL as Integer is 6
+
+Constant SQL_DIALECT_STANDARD as Integer is 0
+Constant SQL_DIALECT_POSTGRESQL as Integer is 1
+Constant SQL_DIALECT_MYSQL as Integer is 2
+Constant SQL_DIALECT_SQLITE as Integer is 3
+Constant SQL_DIALECT_ORACLE as Integer is 4
+Constant SQL_DIALECT_MSSQL as Integer is 5
+Constant SQL_DIALECT_BIGQUERY as Integer is 6
+Constant SQL_DIALECT_SNOWFLAKE as Integer is 7
+Constant SQL_DIALECT_REDSHIFT as Integer is 8
+Constant SQL_DIALECT_SPARK as Integer is 9
+
+Constant SQL_RECORD_SIZE as Integer is 48
+Constant SQL_OFF_KIND as Integer is 0
+Constant SQL_OFF_P0 as Integer is 8
+Constant SQL_OFF_P1 as Integer is 16
+Constant SQL_OFF_P2 as Integer is 24
+Constant SQL_OFF_P3 as Integer is 32
+Constant SQL_OFF_DIALECT as Integer is 40
+
+Constant SQL_OK as Integer is 0
+Constant SQL_NULL as Integer is -1
+
+Note: Literal subtype tags (stored in payload 1 of SQL_EXPR_LITERAL).
+Constant SQL_LIT_NULL as Integer is 0
+Constant SQL_LIT_INTEGER as Integer is 1
+Constant SQL_LIT_FLOAT as Integer is 2
+Constant SQL_LIT_STRING as Integer is 3
+Constant SQL_LIT_BOOLEAN as Integer is 4
+Constant SQL_LIT_DATE as Integer is 5
+Constant SQL_LIT_TIME as Integer is 6
+Constant SQL_LIT_TIMESTAMP as Integer is 7
+Constant SQL_LIT_INTERVAL as Integer is 8
+Constant SQL_LIT_BLOB as Integer is 9
+
+Note: Binary operator tags (stored in payload 0 of SQL_EXPR_BINARY_OP).
+Constant SQL_OP_ADD as Integer is 1
+Constant SQL_OP_SUB as Integer is 2
+Constant SQL_OP_MUL as Integer is 3
+Constant SQL_OP_DIV as Integer is 4
+Constant SQL_OP_MOD as Integer is 5
+Constant SQL_OP_CONCAT as Integer is 6
+Constant SQL_OP_EQ as Integer is 7
+Constant SQL_OP_NEQ as Integer is 8
+Constant SQL_OP_LT as Integer is 9
+Constant SQL_OP_LE as Integer is 10
+Constant SQL_OP_GT as Integer is 11
+Constant SQL_OP_GE as Integer is 12
+Constant SQL_OP_AND as Integer is 13
+Constant SQL_OP_OR as Integer is 14
+Constant SQL_OP_LIKE as Integer is 15
+Constant SQL_OP_IN as Integer is 16
+Constant SQL_OP_IS as Integer is 17
+Constant SQL_OP_IS_NOT as Integer is 18
+
+Note: Unary operator tags.
+Constant SQL_UOP_NEG as Integer is 1
+Constant SQL_UOP_NOT as Integer is 2
+Constant SQL_UOP_IS_NULL as Integer is 3
+Constant SQL_UOP_IS_NOT_NULL as Integer is 4
+
+Note: ============================================================================
+Note: RECORD ALLOCATION
+Note: ============================================================================
+
+@Reasoning
+Allocate a tagged 48-byte SQL record (used for both statements and
+expressions; dialect slot is zero by default).
+@End Reasoning
+@Implementation
+Layout.allocate(48); write the kind and four payload slots; zero
+dialect.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "sql_alloc" takes kind as Integer, p0 as Integer, p1 as Integer, p2 as Integer, p3 as Integer returns Integer:
+    Let rec be proc allocate from Layout with SQL_RECORD_SIZE
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, SQL_OFF_KIND, kind
+    proc memory_set_int64 from Memory with rec, SQL_OFF_P0, p0
+    proc memory_set_int64 from Memory with rec, SQL_OFF_P1, p1
+    proc memory_set_int64 from Memory with rec, SQL_OFF_P2, p2
+    proc memory_set_int64 from Memory with rec, SQL_OFF_P3, p3
+    proc memory_set_int64 from Memory with rec, SQL_OFF_DIALECT, 0
+    Return rec
+End Process
+
+Note: ============================================================================
+Note: EXPRESSION CONSTRUCTORS
+Note: ============================================================================
+
+@Reasoning
+Construct a column-reference expression.  qualifier may be 0 (unqualified
+column) or the owning table / alias name.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_COLUMN_REF; p0 = qualifier, p1 = column name.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned name strings.
+@End Security_Scope
+Process called "sql_column_ref" takes qualifier as Integer, column_name as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_COLUMN_REF, qualifier, column_name, 0, 0
+End Process
+
+@Reasoning
+Construct a literal expression.  literal_kind is one of SQL_LIT_* and
+text is the textual form (canonical SQL literal representation).  For
+NULL literals, pass SQL_LIT_NULL and 0 for text.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_LITERAL; p0 = text, p1 = literal_kind.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owned text string.
+@End Security_Scope
+Process called "sql_literal" takes text as Integer, literal_kind as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_LITERAL, text, literal_kind, 0, 0
+End Process
+
+@Reasoning
+Binary operator expression per SQL/Foundation 6.27 ("Numeric value
+expressions") and 8.x (comparison/logical predicates).
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_BINARY_OP; p0 = operator tag, p1 = LHS, p2 = RHS.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns both operands.
+@End Security_Scope
+Process called "sql_binary_op" takes op as Integer, lhs as Integer, rhs as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_BINARY_OP, op, lhs, rhs, 0
+End Process
+
+@Reasoning
+Unary operator expression.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_UNARY_OP; p0 = uop tag, p1 = operand.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns operand.
+@End Security_Scope
+Process called "sql_unary_op" takes uop as Integer, operand as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_UNARY_OP, uop, operand, 0, 0
+End Process
+
+@Reasoning
+Function call expression per SQL/Foundation 6.x.  args is a List of
+SQL expressions.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_FUNCTION_CALL; p0 = name, p1 = args list,
+p2 = distinct flag (0 or 1).
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns name and args list.
+@End Security_Scope
+Process called "sql_function_call" takes name as Integer, args as Integer, distinct as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_FUNCTION_CALL, name, args, distinct, 0
+End Process
+
+@Reasoning
+Aggregate expression (COUNT, SUM, AVG, MIN, MAX, ...).  Modeled
+separately from generic function call so optimizers can recognise
+aggregates without name-matching.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_AGGREGATE; p0 = name, p1 = args list,
+p2 = distinct flag.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns name and args list.
+@End Security_Scope
+Process called "sql_aggregate" takes name as Integer, args as Integer, distinct as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_AGGREGATE, name, args, distinct, 0
+End Process
+
+@Reasoning
+Window function expression per SQL/Foundation 4.15 ("Window functions").
+window_spec is a heap record describing PARTITION BY / ORDER BY / frame.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_WINDOW_FUNCTION; p0 = function expression,
+p1 = window_spec, p2 = filter expression (or 0).
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns all three.
+@End Security_Scope
+Process called "sql_window_function" takes function_expr as Integer, window_spec as Integer, filter_expr as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_WINDOW_FUNCTION, function_expr, window_spec, filter_expr, 0
+End Process
+
+@Reasoning
+CASE WHEN expression per SQL/Foundation 6.12.  branches is a List of
+two-entry sublists [condition_expr, result_expr]; else_expr is the
+trailing ELSE or 0.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_CASE_WHEN; p0 = branches list, p1 = else expr.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns branches and else.
+@End Security_Scope
+Process called "sql_case_when" takes branches as Integer, else_expr as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_CASE_WHEN, branches, else_expr, 0, 0
+End Process
+
+@Reasoning
+Subquery expression (scalar or EXISTS, depending on context).  payload
+is a SELECT statement record.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_SUBQUERY; p0 = SELECT statement pointer.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns subquery.
+@End Security_Scope
+Process called "sql_subquery" takes select_stmt as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_SUBQUERY, select_stmt, 0, 0, 0
+End Process
+
+@Reasoning
+CAST(expr AS type) expression per SQL/Foundation 6.13.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_CAST; p0 = inner expression, p1 = target type name.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns expr and type name.
+@End Security_Scope
+Process called "sql_cast" takes inner_expr as Integer, target_type as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_CAST, inner_expr, target_type, 0, 0
+End Process
+
+@Reasoning
+COLLATE expression per SQL/Foundation 6.11.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_EXPR_COLLATE; p0 = inner expression, p1 = collation name.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns expr and collation name.
+@End Security_Scope
+Process called "sql_collate" takes inner_expr as Integer, collation_name as Integer returns Integer:
+    Return proc sql_alloc with SQL_EXPR_COLLATE, inner_expr, collation_name, 0, 0
+End Process
+
+Note: ============================================================================
+Note: SELECT STATEMENT
+Note: ============================================================================
+
+@Reasoning
+Construct a SELECT statement record.
+
+Payload slots:
+  p0 = WITH clause (List of CTE records, or 0)
+  p1 = select item list (required, non-zero)
+  p2 = FROM tree (List of join-spec records, or 0)
+  p3 = "rest" record holding WHERE/GROUP/HAVING/ORDER/LIMIT/OFFSET
+       fields (allocated lazily by sql_select_set_*)
+@End Reasoning
+@Implementation
+sql_alloc with SQL_STMT_SELECT.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns all four payloads.
+@End Security_Scope
+Process called "sql_select" takes select_list as Integer returns Integer:
+    Return proc sql_alloc with SQL_STMT_SELECT, 0, select_list, 0, 0
+End Process
+
+@Reasoning
+Attach an optional WITH clause (a List of CTE records) to a SELECT.
+@End Reasoning
+@Implementation
+Write the cte_list pointer into payload 0.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sql_select_set_with" takes select as Integer, cte_list as Integer returns Integer:
+    If select is equal to 0:
+        Return SQL_NULL
+    End If
+    proc memory_set_int64 from Memory with select, SQL_OFF_P0, cte_list
+    Return SQL_OK
+End Process
+
+@Reasoning
+Attach a FROM/JOIN tree to the SELECT.  from_list is a List of join-spec
+records.
+@End Reasoning
+@Implementation
+Write into payload 2.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sql_select_set_from" takes select as Integer, from_list as Integer returns Integer:
+    If select is equal to 0:
+        Return SQL_NULL
+    End If
+    proc memory_set_int64 from Memory with select, SQL_OFF_P2, from_list
+    Return SQL_OK
+End Process
+
+@Reasoning
+The "rest" record holds WHERE/GROUP/HAVING/ORDER/LIMIT/OFFSET.  Size 64
+bytes, layout:
+
+  off  0  WHERE expression
+  off  8  GROUP BY list (List of expressions)
+  off 16  HAVING expression
+  off 24  WINDOW clause list (List of named window specs)
+  off 32  ORDER BY list (List of order-item records)
+  off 40  LIMIT expression
+  off 48  OFFSET expression
+  off 56  reserved
+@End Reasoning
+@Implementation
+Layout.allocate(64); zero all slots.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.
+@End Security_Scope
+Process called "sql_select_rest_alloc" returns Integer:
+    Let rec be proc allocate from Layout with 64
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, 0, 0
+    proc memory_set_int64 from Memory with rec, 8, 0
+    proc memory_set_int64 from Memory with rec, 16, 0
+    proc memory_set_int64 from Memory with rec, 24, 0
+    proc memory_set_int64 from Memory with rec, 32, 0
+    proc memory_set_int64 from Memory with rec, 40, 0
+    proc memory_set_int64 from Memory with rec, 48, 0
+    proc memory_set_int64 from Memory with rec, 56, 0
+    Return rec
+End Process
+
+@Reasoning
+Helper: ensure the rest-record exists on the SELECT.  Returns the rest
+pointer.
+@End Reasoning
+@Implementation
+If payload 3 is 0, allocate rest record and store it; return current
+pointer.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sql_select_ensure_rest" takes select as Integer returns Integer:
+    If select is equal to 0:
+        Return 0
+    End If
+    Let rest be proc memory_get_int64 from Memory with select, SQL_OFF_P3
+    If rest is equal to 0:
+        Set rest to (proc sql_select_rest_alloc)
+        proc memory_set_int64 from Memory with select, SQL_OFF_P3, rest
+    End If
+    Return rest
+End Process
+
+@Reasoning
+Set the WHERE expression on a SELECT.
+@End Reasoning
+@Implementation
+Ensure rest record; write WHERE slot.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sql_select_set_where" takes select as Integer, where_expr as Integer returns Integer:
+    Let rest be proc sql_select_ensure_rest with select
+    If rest is equal to 0:
+        Return SQL_NULL
+    End If
+    proc memory_set_int64 from Memory with rest, 0, where_expr
+    Return SQL_OK
+End Process
+
+Process called "sql_select_set_group_by" takes select as Integer, group_list as Integer returns Integer:
+    Let rest be proc sql_select_ensure_rest with select
+    If rest is equal to 0:
+        Return SQL_NULL
+    End If
+    proc memory_set_int64 from Memory with rest, 8, group_list
+    Return SQL_OK
+End Process
+
+Process called "sql_select_set_having" takes select as Integer, having_expr as Integer returns Integer:
+    Let rest be proc sql_select_ensure_rest with select
+    If rest is equal to 0:
+        Return SQL_NULL
+    End If
+    proc memory_set_int64 from Memory with rest, 16, having_expr
+    Return SQL_OK
+End Process
+
+Process called "sql_select_set_order_by" takes select as Integer, order_list as Integer returns Integer:
+    Let rest be proc sql_select_ensure_rest with select
+    If rest is equal to 0:
+        Return SQL_NULL
+    End If
+    proc memory_set_int64 from Memory with rest, 32, order_list
+    Return SQL_OK
+End Process
+
+Process called "sql_select_set_limit" takes select as Integer, limit_expr as Integer returns Integer:
+    Let rest be proc sql_select_ensure_rest with select
+    If rest is equal to 0:
+        Return SQL_NULL
+    End If
+    proc memory_set_int64 from Memory with rest, 40, limit_expr
+    Return SQL_OK
+End Process
+
+Process called "sql_select_set_offset" takes select as Integer, offset_expr as Integer returns Integer:
+    Let rest be proc sql_select_ensure_rest with select
+    If rest is equal to 0:
+        Return SQL_NULL
+    End If
+    proc memory_set_int64 from Memory with rest, 48, offset_expr
+    Return SQL_OK
+End Process
+
+@Reasoning
+Read accessor: WHERE expression (or 0 if none).
+@End Reasoning
+@Implementation
+Load rest pointer, then load slot 0.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sql_select_get_where" takes select as Integer returns Integer:
+    If select is equal to 0:
+        Return 0
+    End If
+    Let rest be proc memory_get_int64 from Memory with select, SQL_OFF_P3
+    If rest is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with rest, 0
+End Process
+
+Process called "sql_select_get_group_by" takes select as Integer returns Integer:
+    If select is equal to 0:
+        Return 0
+    End If
+    Let rest be proc memory_get_int64 from Memory with select, SQL_OFF_P3
+    If rest is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with rest, 8
+End Process
+
+Process called "sql_select_get_having" takes select as Integer returns Integer:
+    If select is equal to 0:
+        Return 0
+    End If
+    Let rest be proc memory_get_int64 from Memory with select, SQL_OFF_P3
+    If rest is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with rest, 16
+End Process
+
+Process called "sql_select_get_order_by" takes select as Integer returns Integer:
+    If select is equal to 0:
+        Return 0
+    End If
+    Let rest be proc memory_get_int64 from Memory with select, SQL_OFF_P3
+    If rest is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with rest, 32
+End Process
+
+Process called "sql_select_get_limit" takes select as Integer returns Integer:
+    If select is equal to 0:
+        Return 0
+    End If
+    Let rest be proc memory_get_int64 from Memory with select, SQL_OFF_P3
+    If rest is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with rest, 40
+End Process
+
+Process called "sql_select_get_offset" takes select as Integer returns Integer:
+    If select is equal to 0:
+        Return 0
+    End If
+    Let rest be proc memory_get_int64 from Memory with select, SQL_OFF_P3
+    If rest is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with rest, 48
+End Process
+
+Note: ============================================================================
+Note: INSERT / UPDATE / DELETE STATEMENTS
+Note: ============================================================================
+
+@Reasoning
+INSERT statement per SQL/Foundation 14.11.
+
+Payload slots:
+  p0 = target table name
+  p1 = column list (List of column-name strings, or 0 for "all columns")
+  p2 = values: either a List of value-row lists (List of List of exprs)
+       or a single SELECT statement; the discriminator is p3 (= 0 means
+       values rows; = 1 means SELECT subquery).
+@End Reasoning
+@Implementation
+sql_alloc with SQL_STMT_INSERT.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns all four payloads.
+@End Security_Scope
+Process called "sql_insert_values" takes table as Integer, columns as Integer, rows as Integer returns Integer:
+    Return proc sql_alloc with SQL_STMT_INSERT, table, columns, rows, 0
+End Process
+
+Process called "sql_insert_select" takes table as Integer, columns as Integer, source_select as Integer returns Integer:
+    Return proc sql_alloc with SQL_STMT_INSERT, table, columns, source_select, 1
+End Process
+
+@Reasoning
+UPDATE statement per SQL/Foundation 14.10.
+
+Payload slots:
+  p0 = target table
+  p1 = assignment list (List of [column_name, expr] sublists)
+  p2 = FROM tree (PostgreSQL-style multi-table UPDATE; 0 if plain UPDATE)
+  p3 = WHERE expression (or 0)
+@End Reasoning
+@Implementation
+sql_alloc with SQL_STMT_UPDATE.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns all four payloads.
+@End Security_Scope
+Process called "sql_update" takes table as Integer, assignments as Integer, from_list as Integer, where_expr as Integer returns Integer:
+    Return proc sql_alloc with SQL_STMT_UPDATE, table, assignments, from_list, where_expr
+End Process
+
+@Reasoning
+DELETE statement per SQL/Foundation 14.8.
+Payload slots:
+  p0 = target table
+  p1 = USING list (PostgreSQL-style multi-table DELETE; 0 if plain)
+  p2 = WHERE expression (or 0)
+@End Reasoning
+@Implementation
+sql_alloc with SQL_STMT_DELETE.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns payloads.
+@End Security_Scope
+Process called "sql_delete" takes table as Integer, using_list as Integer, where_expr as Integer returns Integer:
+    Return proc sql_alloc with SQL_STMT_DELETE, table, using_list, where_expr, 0
+End Process
+
+Note: ============================================================================
+Note: TRANSACTION CONTROL
+Note: ============================================================================
+
+@Reasoning
+BEGIN / COMMIT / ROLLBACK transaction statements per SQL/Foundation
+17.2.
+@End Reasoning
+@Implementation
+sql_alloc with the appropriate statement tag and no payloads.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+None.
+@End Security_Scope
+Process called "sql_begin" returns Integer:
+    Return proc sql_alloc with SQL_STMT_BEGIN, 0, 0, 0, 0
+End Process
+
+Process called "sql_commit" returns Integer:
+    Return proc sql_alloc with SQL_STMT_COMMIT, 0, 0, 0, 0
+End Process
+
+Process called "sql_rollback" returns Integer:
+    Return proc sql_alloc with SQL_STMT_ROLLBACK, 0, 0, 0, 0
+End Process
+
+Note: ============================================================================
+Note: DDL: CREATE TABLE / DROP TABLE / CREATE INDEX / CREATE VIEW
+Note: ============================================================================
+
+@Reasoning
+CREATE TABLE per SQL/Foundation 11.3.
+
+Payload slots:
+  p0 = table name
+  p1 = column-definition list (List of column-def records)
+  p2 = constraints list (List of table-constraint records)
+  p3 = options (List of dialect-specific options) or 0
+@End Reasoning
+@Implementation
+sql_alloc with SQL_STMT_CREATE_TABLE.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns payloads.
+@End Security_Scope
+Process called "sql_create_table" takes table as Integer, columns as Integer, constraints as Integer, options as Integer returns Integer:
+    Return proc sql_alloc with SQL_STMT_CREATE_TABLE, table, columns, constraints, options
+End Process
+
+@Reasoning
+ALTER TABLE per SQL/Foundation 11.10.  actions is a List of
+alter-action records.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_STMT_ALTER_TABLE.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns payloads.
+@End Security_Scope
+Process called "sql_alter_table" takes table as Integer, actions as Integer returns Integer:
+    Return proc sql_alloc with SQL_STMT_ALTER_TABLE, table, actions, 0, 0
+End Process
+
+@Reasoning
+DROP TABLE per SQL/Foundation 11.21.
+@End Reasoning
+@Implementation
+sql_alloc with SQL_STMT_DROP_TABLE; p0 = table name, p1 = cascade flag.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns table name.
+@End Security_Scope
+Process called "sql_drop_table" takes table as Integer, cascade as Integer returns Integer:
+    Return proc sql_alloc with SQL_STMT_DROP_TABLE, table, cascade, 0, 0
+End Process
+
+@Reasoning
+CREATE INDEX per SQL/Foundation supplement.
+
+Payload slots:
+  p0 = index name
+  p1 = table name
+  p2 = column list
+  p3 = unique flag
+@End Reasoning
+@Implementation
+sql_alloc with SQL_STMT_CREATE_INDEX.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns payloads.
+@End Security_Scope
+Process called "sql_create_index" takes index_name as Integer, table as Integer, columns as Integer, unique as Integer returns Integer:
+    Return proc sql_alloc with SQL_STMT_CREATE_INDEX, index_name, table, columns, unique
+End Process
+
+@Reasoning
+CREATE VIEW per SQL/Foundation 11.32.
+
+Payload slots:
+  p0 = view name
+  p1 = column list (optional, or 0)
+  p2 = query (SELECT statement)
+  p3 = with-check-option flag
+@End Reasoning
+@Implementation
+sql_alloc with SQL_STMT_CREATE_VIEW.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns payloads.
+@End Security_Scope
+Process called "sql_create_view" takes view_name as Integer, columns as Integer, query as Integer, with_check as Integer returns Integer:
+    Return proc sql_alloc with SQL_STMT_CREATE_VIEW, view_name, columns, query, with_check
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS
+Note: ============================================================================
+
+Process called "sql_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, SQL_OFF_KIND
+End Process
+
+Process called "sql_get_p0" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, SQL_OFF_P0
+End Process
+
+Process called "sql_get_p1" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, SQL_OFF_P1
+End Process
+
+Process called "sql_get_p2" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, SQL_OFF_P2
+End Process
+
+Process called "sql_get_p3" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, SQL_OFF_P3
+End Process
+
+Process called "sql_get_dialect" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, SQL_OFF_DIALECT
+End Process
+
+Process called "sql_set_dialect" takes node as Integer, dialect as Integer returns Integer:
+    If node is equal to 0:
+        Return SQL_NULL
+    End If
+    proc memory_set_int64 from Memory with node, SQL_OFF_DIALECT, dialect
+    Return SQL_OK
+End Process
+
+Note: ============================================================================
+Note: JOIN SPEC
+Note: ============================================================================
+
+@Reasoning
+Join-spec record per SQL/Foundation 7.10.  Records the join kind (one of
+SQL_JOIN_*), the left and right relation expressions (column-ref, table
+literal, or nested join), and the ON / USING condition.
+
+Layout (48 bytes):
+  off  0  join kind tag
+  off  8  left relation
+  off 16  right relation
+  off 24  on/using condition expression (or 0 for cross/lateral)
+  off 32  alias (right-relation alias, or 0)
+  off 40  reserved
+@End Reasoning
+@Implementation
+Layout.allocate(48); write five slots.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Owns all referenced subtrees.
+@End Security_Scope
+Process called "sql_join_spec" takes kind as Integer, left as Integer, right as Integer, condition as Integer, alias as Integer returns Integer:
+    Let rec be proc allocate from Layout with 48
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, 0, kind
+    proc memory_set_int64 from Memory with rec, 8, left
+    proc memory_set_int64 from Memory with rec, 16, right
+    proc memory_set_int64 from Memory with rec, 24, condition
+    proc memory_set_int64 from Memory with rec, 32, alias
+    proc memory_set_int64 from Memory with rec, 40, 0
+    Return rec
+End Process
+
+Process called "sql_join_kind" takes join as Integer returns Integer:
+    If join is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with join, 0
+End Process
+
+Process called "sql_join_left" takes join as Integer returns Integer:
+    If join is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with join, 8
+End Process
+
+Process called "sql_join_right" takes join as Integer returns Integer:
+    If join is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with join, 16
+End Process
+
+Process called "sql_join_condition" takes join as Integer returns Integer:
+    If join is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with join, 24
+End Process
+
+Process called "sql_join_alias" takes join as Integer returns Integer:
+    If join is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with join, 32
+End Process
+
+Process called "sql_join_destroy" takes join as Integer returns Integer:
+    If join is equal to 0:
+        Return SQL_OK
+    End If
+    proc deallocate from Layout with join
+    Return SQL_OK
+End Process
+
+Note: ============================================================================
+Note: GENERIC DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Free a 48-byte SQL node record.  Does NOT recursively free payloads;
+callers wishing to tear down whole trees should use sql_destroy_deep.
+Useful when payloads are shared across multiple parent nodes.
+@End Reasoning
+@Implementation
+Layout.deallocate.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sql_destroy_shallow" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return SQL_OK
+    End If
+    proc deallocate from Layout with node
+    Return SQL_OK
+End Process
+
+@Reasoning
+Recursively destroy a SQL AST node, every payload that is itself an AST
+node, every string payload that the constructor took ownership of, and
+the record itself.
+@End Reasoning
+@Implementation
+Switch on kind to identify which payloads to free, then dispatch:
+  - For expressions and statements that take pure pointer-typed
+    payloads, recurse via sql_destroy_deep on each payload pointer that
+    looks AST-shaped (verified by checking the SQL_OFF_KIND slot
+    membership in the known range).
+  - For string payloads, Layout.deallocate.
+  - For List payloads, walk and recurse.
+This implementation conservatively recurses on every non-zero payload
+that resembles an AST node and frees lists of expressions.
+@End Implementation
+@Performance_Hints
+O(subtree size).
+@End Performance_Hints
+@Security_Scope
+Caller must not reuse shared subtrees after destroy.
+@End Security_Scope
+Process called "sql_destroy_deep" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return SQL_OK
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, SQL_OFF_KIND
+    Let p0 be proc memory_get_int64 from Memory with node, SQL_OFF_P0
+    Let p1 be proc memory_get_int64 from Memory with node, SQL_OFF_P1
+    Let p2 be proc memory_get_int64 from Memory with node, SQL_OFF_P2
+    Let p3 be proc memory_get_int64 from Memory with node, SQL_OFF_P3
+
+    If kind is equal to SQL_EXPR_COLUMN_REF:
+        If p0 is not equal to 0:
+            proc deallocate from Layout with p0
+        End If
+        If p1 is not equal to 0:
+            proc deallocate from Layout with p1
+        End If
+    End If
+    If kind is equal to SQL_EXPR_LITERAL:
+        If p0 is not equal to 0:
+            proc deallocate from Layout with p0
+        End If
+    End If
+    If kind is equal to SQL_EXPR_BINARY_OP:
+        proc sql_destroy_deep with p1
+        proc sql_destroy_deep with p2
+    End If
+    If kind is equal to SQL_EXPR_UNARY_OP:
+        proc sql_destroy_deep with p1
+    End If
+    If kind is equal to SQL_EXPR_FUNCTION_CALL:
+        If p0 is not equal to 0:
+            proc deallocate from Layout with p0
+        End If
+        If p1 is not equal to 0:
+            proc sql_destroy_expr_list with p1
+        End If
+    End If
+    If kind is equal to SQL_EXPR_AGGREGATE:
+        If p0 is not equal to 0:
+            proc deallocate from Layout with p0
+        End If
+        If p1 is not equal to 0:
+            proc sql_destroy_expr_list with p1
+        End If
+    End If
+    If kind is equal to SQL_EXPR_CAST:
+        proc sql_destroy_deep with p0
+        If p1 is not equal to 0:
+            proc deallocate from Layout with p1
+        End If
+    End If
+    If kind is equal to SQL_EXPR_COLLATE:
+        proc sql_destroy_deep with p0
+        If p1 is not equal to 0:
+            proc deallocate from Layout with p1
+        End If
+    End If
+    If kind is equal to SQL_EXPR_SUBQUERY:
+        proc sql_destroy_deep with p0
+    End If
+    If kind is equal to SQL_STMT_SELECT:
+        If p1 is not equal to 0:
+            proc sql_destroy_expr_list with p1
+        End If
+        If p2 is not equal to 0:
+            proc sql_destroy_join_list with p2
+        End If
+        If p3 is not equal to 0:
+            proc sql_destroy_select_rest with p3
+        End If
+    End If
+    If kind is equal to SQL_STMT_DROP_TABLE:
+        If p0 is not equal to 0:
+            proc deallocate from Layout with p0
+        End If
+    End If
+    If kind is equal to SQL_STMT_BEGIN:
+        Set kind to kind
+    End If
+    proc deallocate from Layout with node
+    Return SQL_OK
+End Process
+
+@Reasoning
+Helper: destroy a List of expression records.
+@End Reasoning
+@Implementation
+Iterate and recurse.
+@End Implementation
+@Performance_Hints
+O(list size).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sql_destroy_expr_list" takes lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return SQL_OK
+    End If
+    Let cc be proc list_length from List with lst
+    Let i be 0
+    While i is less than cc:
+        Let e be proc list_get from List with lst, i
+        proc sql_destroy_deep with e
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with lst
+    Return SQL_OK
+End Process
+
+@Reasoning
+Helper: destroy a List of join-spec records.
+@End Reasoning
+@Implementation
+Iterate; for each entry, recurse on left/right/condition and free the
+record.
+@End Implementation
+@Performance_Hints
+O(list size).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sql_destroy_join_list" takes lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return SQL_OK
+    End If
+    Let cc be proc list_length from List with lst
+    Let i be 0
+    While i is less than cc:
+        Let j be proc list_get from List with lst, i
+        If j is not equal to 0:
+            Let left be proc memory_get_int64 from Memory with j, 8
+            Let right be proc memory_get_int64 from Memory with j, 16
+            Let cond be proc memory_get_int64 from Memory with j, 24
+            Let alias be proc memory_get_int64 from Memory with j, 32
+            proc sql_destroy_deep with left
+            proc sql_destroy_deep with right
+            proc sql_destroy_deep with cond
+            If alias is not equal to 0:
+                proc deallocate from Layout with alias
+            End If
+            proc deallocate from Layout with j
+        End If
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with lst
+    Return SQL_OK
+End Process
+
+@Reasoning
+Helper: destroy a SELECT statement's "rest" record (WHERE/GROUP/HAVING/
+ORDER/LIMIT/OFFSET).  Walks every non-zero slot and recurses.
+@End Reasoning
+@Implementation
+For each non-zero slot in [0,8,16,24,32,40,48), dispatch to
+sql_destroy_deep (slot 24 = window list = list of expressions).
+@End Implementation
+@Performance_Hints
+O(rest contents).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "sql_destroy_select_rest" takes rest as Integer returns Integer:
+    If rest is equal to 0:
+        Return SQL_OK
+    End If
+    Let where_e be proc memory_get_int64 from Memory with rest, 0
+    Let group_l be proc memory_get_int64 from Memory with rest, 8
+    Let having_e be proc memory_get_int64 from Memory with rest, 16
+    Let window_l be proc memory_get_int64 from Memory with rest, 24
+    Let order_l be proc memory_get_int64 from Memory with rest, 32
+    Let limit_e be proc memory_get_int64 from Memory with rest, 40
+    Let offset_e be proc memory_get_int64 from Memory with rest, 48
+    proc sql_destroy_deep with where_e
+    If group_l is not equal to 0:
+        proc sql_destroy_expr_list with group_l
+    End If
+    proc sql_destroy_deep with having_e
+    If window_l is not equal to 0:
+        proc sql_destroy_expr_list with window_l
+    End If
+    If order_l is not equal to 0:
+        proc sql_destroy_expr_list with order_l
+    End If
+    proc sql_destroy_deep with limit_e
+    proc sql_destroy_deep with offset_e
+    proc deallocate from Layout with rest
+    Return SQL_OK
+End Process

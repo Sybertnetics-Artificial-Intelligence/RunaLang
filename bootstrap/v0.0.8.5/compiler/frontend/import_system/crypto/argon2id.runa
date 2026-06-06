@@ -1,0 +1,2171 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+ARGON2ID - Memory-hard password hashing per RFC 9106
+==============================================================================
+
+Argon2id is the hybrid variant of the Argon2 family (Argon2d / Argon2i /
+Argon2id) winning the Password Hashing Competition (2015). It is the
+RFC-recommended variant for password hashing, KDF and proof-of-work because
+it provides:
+
+  - Memory-hardness: large working set (m KB of 1024-byte blocks) forces
+    attackers using ASIC/FPGA/GPU to spend ~m * t memory-time product on
+    each guess; cannot be parallelized below this floor by time-memory
+    tradeoff (TMTO) attacks that reduce memory cost at the expense of
+    additional computation -- Argon2d's data-dependent addressing in
+    passes 1+ forces the attacker to materialize the full matrix.
+
+  - Side-channel resistance for the first half pass: Argon2i (data-INdependent
+    indexing) on segments 0 and 1 of pass 0 means the password-derived
+    early blocks are accessed at indices that do not depend on the password
+    contents. This defeats cache-timing side-channel attacks that would
+    otherwise be feasible against pure-Argon2d.
+
+  - The hybrid construction (Argon2i for the first half pass, Argon2d for
+    the rest) thus simultaneously resists TMTO (Argon2d's contribution)
+    and cache-timing side-channels on the password-knowing early blocks
+    (Argon2i's contribution).
+
+Algorithm structure (RFC 9106):
+
+  1. Pre-hashing H_0 = BLAKE2b(
+       LE32(p) || LE32(T) || LE32(m) || LE32(t) || LE32(v=0x13) || LE32(y=2)
+       || LE32(|P|) || P || LE32(|S|) || S || LE32(|K|) || K
+       || LE32(|X|) || X
+     ), 64 bytes.
+
+     where p=parallelism, T=tag length, m=memory cost, t=iterations,
+     v=0x13 (version 1.3), y=2 (Argon2id type), P=password, S=salt,
+     K=secret key (may be empty), X=associated data (may be empty).
+
+  2. Memory matrix B[p][q] of 1024-byte blocks, q = m_prime / p, where
+     m_prime = floor(m / (4p)) * 4p. Segment length SL = q / 4.
+
+  3. Initial blocks per lane i = 0 .. p-1:
+       B[i][0] = H'( H_0 || LE32(0) || LE32(i), 1024 bytes )
+       B[i][1] = H'( H_0 || LE32(1) || LE32(i), 1024 bytes )
+
+  4. For pass r = 0 .. t-1:
+       For slice s = 0 .. 3:                  Note: slice = segment column
+         For each lane i = 0 .. p-1 in parallel:
+           For position j in segment (r=0, s=0: j starts at 2; else j=0):
+             Compute next block B[i][s*SL + j] = G( prev_block, ref_block )
+             where the previous block is the last block computed in this
+             lane, and the reference block is chosen by the indexing rule:
+               - Argon2id, r=0, s in {0,1}: data-independent (Argon2i)
+                 indexing: J1, J2 from the addressing-block pseudorandom
+                 stream produced by applying G to a counter block.
+               - All other (r, s): data-dependent (Argon2d) indexing:
+                 J1, J2 are the first two uint32 words of prev_block.
+
+  5. Final block C = XOR of B[i][q-1] for all lanes i.
+
+  6. Tag = H'(C, T bytes) into caller-supplied output buffer.
+
+Internal primitives implemented inline in this file:
+
+  - BLAKE2b: full-output (up to 64 bytes) Blake2b hash per RFC 7693.
+  - H' (RFC 9106 section 3.3): variable-length hash chaining Blake2b to
+    produce arbitrary-length outputs (used to produce 1024-byte blocks
+    and the final T-byte tag).
+  - G (RFC 9106 section 3.5): the Argon2 compression function. Takes
+    two 1024-byte blocks X, Y; produces a 1024-byte block Z. Built from
+    the Blake2b round function P applied to 8 rows then 8 columns of
+    R = X XOR Y, with a final XOR of R back into the permuted matrix.
+
+Numerical conventions:
+  - All integer values are stored little-endian per RFC 9106 section 3.
+  - LE32 / LE64 helpers serialise uint32 / uint64 values to memory.
+  - 64-bit modular arithmetic is performed using the 64-bit mask U64_MASK.
+
+Parameter validation (returns 0 on failure):
+  - m < 8*p  (RFC 9106 section 3.1 minimum memory: m must be at least 8*p
+              so segment_length = floor(m / (4p)) / 4 >= 2).
+  - t < 1, p < 1.
+  - output_len < 4, output_len > 0xFFFFFFFF.
+  - salt_len < 8 (RFC 9106 minimum salt length).
+  - All buffer pointers null with positive length.
+
+Memory and timing posture:
+  - Memory: the m KB matrix is the dominant allocation. For the RFC 9106
+    Appendix B vector (m=32, p=4) this is 32 KB plus working blocks.
+  - Argon2i addressing produces 128 (J1, J2) pairs per address block; we
+    regenerate the address block at slice boundaries by zero-init then
+    applying G(zero, X) twice with X = (r, lane, slice, total_blocks,
+    iterations, type=2, counter, zero_pad). RFC 9106 section 3.4 part 1.b.
+
+References:
+  - RFC 9106, "Argon2 Memory-Hard Function for Password Hashing and
+    Proof-of-Work Applications", A. Biryukov, D. Dinu, D. Khovratovich,
+    S. Josefsson.
+  - RFC 7693, "The BLAKE2 Cryptographic Hash and Message Authentication
+    Code (MAC)", M-J. Saarinen, J-P. Aumasson.
+  - Biryukov, Dinu, Khovratovich, "Argon2: the memory-hard function for
+    password hashing and other applications", 2017 PHC submission.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as SecureMem
+
+Note: ============================================================================
+Note: Section 0: Constants
+Note: ============================================================================
+
+Constant ARGON2_BLOCK_SIZE as Integer is 1024
+Constant ARGON2_QWORDS_PER_BLOCK as Integer is 128
+Constant ARGON2_VERSION_13 as Integer is 19
+Constant ARGON2_TYPE_ID as Integer is 2
+Constant ARGON2_SYNC_POINTS as Integer is 4
+Constant ARGON2_PREHASH_DIGEST_LEN as Integer is 64
+Constant ARGON2_PREHASH_SEED_LEN as Integer is 72
+Constant BLAKE2B_OUT_BYTES as Integer is 64
+Constant BLAKE2B_BLOCK_BYTES as Integer is 128
+Constant U64_MASK as Integer is 18446744073709551615
+Constant U32_MASK_A2 as Integer is 4294967295
+Constant U8_MASK as Integer is 255
+
+Note: BLAKE2b IV (RFC 7693 section 2.6) -- fractional bits of sqrt of first 8 primes.
+Constant BLAKE2B_IV0 as Integer is 7640891576956012808
+Constant BLAKE2B_IV1 as Integer is 13503953896175478587
+Constant BLAKE2B_IV2 as Integer is 4354685564936845355
+Constant BLAKE2B_IV3 as Integer is 11912009170470909681
+Constant BLAKE2B_IV4 as Integer is 5840696475078001361
+Constant BLAKE2B_IV5 as Integer is 11170449401992604703
+Constant BLAKE2B_IV6 as Integer is 2270897969802886507
+Constant BLAKE2B_IV7 as Integer is 6620516959819538809
+
+Note: ============================================================================
+Note: Section 1: 64-bit arithmetic helpers
+Note: ============================================================================
+
+Process called "argon2_u64_add" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Modular 64-bit addition: (a + b) mod 2^64. Runa Integer is 64-bit
+    signed so plain addition wraps in two's complement, which is the
+    correct uint64 modular result after masking.
+    @End Reasoning
+
+    @Implementation
+    Plain addition followed by bitwise_and with U64_MASK. Both inputs
+    must already be in [0, 2^64). The mask is a no-op on the value bits
+    but ensures the result reads back as a positive Integer when used
+    as a uint64.
+    @End Implementation
+
+    @Performance_Hints
+    Single add plus one mask. Sub-nanosecond. RFC 9106 reference impl
+    achieves the same in two instructions on x86-64.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: timing independent of operand values.
+    @End Security_Scope
+
+    Let sum_value be a plus b
+    Return sum_value bitwise_and U64_MASK
+End Process
+
+Process called "argon2_u64_mul_low" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Computes the low 64 bits of a * b. Used in the BLAKE2b round function
+    P's modified addition step where Argon2 specifies
+    2 * (a_low32 * b_low32) addition rather than the original BLAKE2b
+    plain addition.
+    @End Reasoning
+
+    @Implementation
+    Multiplies a by b modulo 2^64. Runa Integer is 64-bit signed so the
+    result naturally truncates to the low 64 bits in two's-complement,
+    after which masking with U64_MASK normalises to unsigned.
+    @End Implementation
+
+    @Performance_Hints
+    Single multiply plus mask. On x86-64 this is a single IMUL.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time on every CPU we target. IMUL latency is fixed.
+    @End Security_Scope
+
+    Let product be a multiplied by b
+    Return product bitwise_and U64_MASK
+End Process
+
+Process called "argon2_low32" takes value as Integer returns Integer:
+    @Reasoning
+    Returns the low 32 bits of value as a uint32 (0..2^32-1).
+    @End Reasoning
+
+    @Implementation
+    Single AND with U32_MASK_A2 = 2^32 - 1.
+    @End Implementation
+
+    @Performance_Hints Sub-nanosecond. @End Performance_Hints
+    @Security_Scope Constant-time. @End Security_Scope
+
+    Return value bitwise_and U32_MASK_A2
+End Process
+
+Process called "argon2_rotr64" takes value as Integer, n as Integer returns Integer:
+    @Reasoning
+    Rotate-right of a uint64 by n bits (0 <= n < 64). Used in the
+    BLAKE2b round function P with rotation constants 32, 24, 16, 63.
+    @End Reasoning
+
+    @Implementation
+    Splits value into the low n bits and the high (64-n) bits, then
+    re-assembles with the low bits moved to the top. Implemented with
+    a power-of-two divide for the right shift (preserving sign-free
+    behaviour via the U64 mask) and a power-of-two multiply for the
+    left shift, OR-combined and masked to 64 bits.
+    @End Implementation
+
+    @Performance_Hints
+    Three integer ops plus two power-of-two loops to construct the
+    shift constants. A future Runa codegen pass can lower this to a
+    single ROR instruction on x86-64.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: timing depends only on n (loop-invariant in Blake2b
+    where the rotation constants are fixed).
+    @End Security_Scope
+
+    Let n_mod be n modulo by 64
+    If n_mod is equal to 0:
+        Return value bitwise_and U64_MASK
+    End If
+
+    Let shift_left be 1
+    Let il be 0
+    Let left_count be 64 minus n_mod
+    While il is less than left_count:
+        Set shift_left to shift_left multiplied by 2
+        Set il to il plus 1
+    End While
+
+    Let shift_right be 1
+    Let ir be 0
+    While ir is less than n_mod:
+        Set shift_right to shift_right multiplied by 2
+        Set ir to ir plus 1
+    End While
+
+    Let v_masked be value bitwise_and U64_MASK
+    Let left_part be v_masked multiplied by shift_left
+    Set left_part to left_part bitwise_and U64_MASK
+    Let right_part be v_masked divided by shift_right
+    Let combined be left_part bitwise_or right_part
+    Return combined bitwise_and U64_MASK
+End Process
+
+Process called "argon2_load64_le" takes ptr as Integer, offset as Integer returns Integer:
+    @Reasoning
+    Loads 8 bytes from ptr[offset..offset+8] as a little-endian uint64.
+    @End Reasoning
+
+    @Implementation
+    Reads 8 individual bytes and reassembles via shifts and OR. The
+    cost is fixed and constant-time; on a future codegen pass with
+    unaligned 64-bit loads enabled this can lower to a single MOV.
+    @End Implementation
+
+    @Performance_Hints
+    Eight byte loads plus seven shifts plus seven ORs. Future SIMD
+    codegen can fuse to a single 64-bit unaligned load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. No secret-dependent indexing into ptr beyond offset
+    which is loop-counter driven, not data-driven.
+    @End Security_Scope
+
+    Let b0 be proc memory_get_byte from Memory with ptr, offset
+    Let b1 be proc memory_get_byte from Memory with ptr, offset plus 1
+    Let b2 be proc memory_get_byte from Memory with ptr, offset plus 2
+    Let b3 be proc memory_get_byte from Memory with ptr, offset plus 3
+    Let b4 be proc memory_get_byte from Memory with ptr, offset plus 4
+    Let b5 be proc memory_get_byte from Memory with ptr, offset plus 5
+    Let b6 be proc memory_get_byte from Memory with ptr, offset plus 6
+    Let b7 be proc memory_get_byte from Memory with ptr, offset plus 7
+
+    Let r be b0
+    Set r to r bitwise_or (b1 multiplied by 256)
+    Set r to r bitwise_or (b2 multiplied by 65536)
+    Set r to r bitwise_or (b3 multiplied by 16777216)
+    Set r to r bitwise_or (b4 multiplied by 4294967296)
+    Set r to r bitwise_or (b5 multiplied by 1099511627776)
+    Set r to r bitwise_or (b6 multiplied by 281474976710656)
+    Set r to r bitwise_or (b7 multiplied by 72057594037927936)
+    Return r bitwise_and U64_MASK
+End Process
+
+Process called "argon2_store64_le" takes ptr as Integer, offset as Integer, value as Integer returns Integer:
+    @Reasoning
+    Stores a uint64 to ptr[offset..offset+8] in little-endian order.
+    @End Reasoning
+
+    @Implementation
+    Extracts each of the 8 bytes via a divide-by-power-of-2 then AND
+    with 0xFF and writes them to consecutive byte positions.
+    @End Implementation
+
+    @Performance_Hints
+    Eight stores. Future codegen can lower to a single 64-bit unaligned
+    write.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let v be value bitwise_and U64_MASK
+    Let b0 be v bitwise_and U8_MASK
+    Let b1 be (v divided by 256) bitwise_and U8_MASK
+    Let b2 be (v divided by 65536) bitwise_and U8_MASK
+    Let b3 be (v divided by 16777216) bitwise_and U8_MASK
+    Let b4 be (v divided by 4294967296) bitwise_and U8_MASK
+    Let b5 be (v divided by 1099511627776) bitwise_and U8_MASK
+    Let b6 be (v divided by 281474976710656) bitwise_and U8_MASK
+    Let b7 be (v divided by 72057594037927936) bitwise_and U8_MASK
+    proc memory_set_byte from Memory with ptr, offset, b0
+    proc memory_set_byte from Memory with ptr, offset plus 1, b1
+    proc memory_set_byte from Memory with ptr, offset plus 2, b2
+    proc memory_set_byte from Memory with ptr, offset plus 3, b3
+    proc memory_set_byte from Memory with ptr, offset plus 4, b4
+    proc memory_set_byte from Memory with ptr, offset plus 5, b5
+    proc memory_set_byte from Memory with ptr, offset plus 6, b6
+    proc memory_set_byte from Memory with ptr, offset plus 7, b7
+    Return 1
+End Process
+
+Process called "argon2_store32_le" takes ptr as Integer, offset as Integer, value as Integer returns Integer:
+    @Reasoning
+    Stores a uint32 to ptr[offset..offset+4] in little-endian order.
+    @End Reasoning
+
+    @Implementation
+    Four byte stores via AND-and-divide.
+    @End Implementation
+
+    @Performance_Hints Sub-nanosecond. @End Performance_Hints
+    @Security_Scope Constant-time. @End Security_Scope
+
+    Let v be value bitwise_and U32_MASK_A2
+    Let b0 be v bitwise_and U8_MASK
+    Let b1 be (v divided by 256) bitwise_and U8_MASK
+    Let b2 be (v divided by 65536) bitwise_and U8_MASK
+    Let b3 be (v divided by 16777216) bitwise_and U8_MASK
+    proc memory_set_byte from Memory with ptr, offset, b0
+    proc memory_set_byte from Memory with ptr, offset plus 1, b1
+    proc memory_set_byte from Memory with ptr, offset plus 2, b2
+    proc memory_set_byte from Memory with ptr, offset plus 3, b3
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Section 2: BLAKE2b core
+Note: ============================================================================
+Note: BLAKE2b RFC 7693 -- variable-output cryptographic hash; the
+Note: building-block we need for H_0 (the pre-hash) and H' (the variable-
+Note: length hash used to produce 1024-byte blocks and the final tag).
+Note: ============================================================================
+
+Process called "blake2b_g_mix" takes v as Integer, ia as Integer, ib as Integer, ic as Integer, id as Integer, x as Integer, y as Integer returns Integer:
+    @Reasoning
+    BLAKE2b G mixing function operating on four uint64 state words v[ia],
+    v[ib], v[ic], v[id] with two uint64 message words x and y. This is
+    the BLAKE2b round-function step (RFC 7693 section 3.1), NOT the
+    Argon2 compression function G (those share a name in spec).
+    @End Reasoning
+
+    @Implementation
+    Per RFC 7693 section 3.1:
+      a = a + b + x
+      d = (d XOR a) >>> 32
+      c = c + d
+      b = (b XOR c) >>> 24
+      a = a + b + y
+      d = (d XOR a) >>> 16
+      c = c + d
+      b = (b XOR c) >>> 63
+    All additions are modulo 2^64. The state v is a 16-uint64 array
+    stored at v[0..127] (8 bytes per slot).
+    @End Implementation
+
+    @Performance_Hints
+    Eight 64-bit adds, four XORs, four rotates. The hot loop of
+    Blake2b is 12 rounds, each invoking G eight times, so ~96 G calls
+    per 128-byte compression. Future SIMD codegen can pack columns
+    into AVX2 registers.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. No secret-dependent branches or memory accesses.
+    @End Security_Scope
+
+    Let off_a be ia multiplied by 8
+    Let off_b be ib multiplied by 8
+    Let off_c be ic multiplied by 8
+    Let off_d be id multiplied by 8
+
+    Let va be proc memory_get_qword from Memory with v, off_a
+    Let vb be proc memory_get_qword from Memory with v, off_b
+    Let vc be proc memory_get_qword from Memory with v, off_c
+    Let vd be proc memory_get_qword from Memory with v, off_d
+
+    Let sum_ab be proc argon2_u64_add with va, vb
+    Set va to proc argon2_u64_add with sum_ab, x
+    Let xor_da be vd bitwise_xor va
+    Set vd to proc argon2_rotr64 with xor_da, 32
+
+    Set vc to proc argon2_u64_add with vc, vd
+    Let xor_bc be vb bitwise_xor vc
+    Set vb to proc argon2_rotr64 with xor_bc, 24
+
+    Let sum_ab2 be proc argon2_u64_add with va, vb
+    Set va to proc argon2_u64_add with sum_ab2, y
+    Let xor_da2 be vd bitwise_xor va
+    Set vd to proc argon2_rotr64 with xor_da2, 16
+
+    Set vc to proc argon2_u64_add with vc, vd
+    Let xor_bc2 be vb bitwise_xor vc
+    Set vb to proc argon2_rotr64 with xor_bc2, 63
+
+    proc memory_set_qword from Memory with v, off_a, va
+    proc memory_set_qword from Memory with v, off_b, vb
+    proc memory_set_qword from Memory with v, off_c, vc
+    proc memory_set_qword from Memory with v, off_d, vd
+    Return 1
+End Process
+
+Process called "blake2b_sigma" takes round_idx as Integer, pos as Integer returns Integer:
+    @Reasoning
+    Returns the SIGMA[round_idx mod 10][pos] permutation entry for the
+    BLAKE2b message schedule. SIGMA is 10 rows of 16 entries each
+    (RFC 7693 section 2.7); round 10 and 11 of BLAKE2b reuse rows 0
+    and 1 (round_idx mod 10).
+    @End Reasoning
+
+    @Implementation
+    Encoded as a flat 160-entry table built into a Match expression
+    keyed on (round_idx mod 10) * 16 + pos. Each entry is in 0..15.
+    @End Implementation
+
+    @Performance_Hints
+    Table lookup. The compiler will lower a sequence of When clauses
+    into a jump table.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time at the algorithmic level: round_idx and pos are
+    loop counters, not secret-dependent.
+    @End Security_Scope
+
+    Let r be round_idx modulo by 10
+    Let idx be (r multiplied by 16) plus pos
+    Match idx:
+        When 0:
+            Return 0
+        When 1:
+            Return 1
+        When 2:
+            Return 2
+        When 3:
+            Return 3
+        When 4:
+            Return 4
+        When 5:
+            Return 5
+        When 6:
+            Return 6
+        When 7:
+            Return 7
+        When 8:
+            Return 8
+        When 9:
+            Return 9
+        When 10:
+            Return 10
+        When 11:
+            Return 11
+        When 12:
+            Return 12
+        When 13:
+            Return 13
+        When 14:
+            Return 14
+        When 15:
+            Return 15
+        When 16:
+            Return 14
+        When 17:
+            Return 10
+        When 18:
+            Return 4
+        When 19:
+            Return 8
+        When 20:
+            Return 9
+        When 21:
+            Return 15
+        When 22:
+            Return 13
+        When 23:
+            Return 6
+        When 24:
+            Return 1
+        When 25:
+            Return 12
+        When 26:
+            Return 0
+        When 27:
+            Return 2
+        When 28:
+            Return 11
+        When 29:
+            Return 7
+        When 30:
+            Return 5
+        When 31:
+            Return 3
+        When 32:
+            Return 11
+        When 33:
+            Return 8
+        When 34:
+            Return 12
+        When 35:
+            Return 0
+        When 36:
+            Return 5
+        When 37:
+            Return 2
+        When 38:
+            Return 15
+        When 39:
+            Return 13
+        When 40:
+            Return 10
+        When 41:
+            Return 14
+        When 42:
+            Return 3
+        When 43:
+            Return 6
+        When 44:
+            Return 7
+        When 45:
+            Return 1
+        When 46:
+            Return 9
+        When 47:
+            Return 4
+        When 48:
+            Return 7
+        When 49:
+            Return 9
+        When 50:
+            Return 3
+        When 51:
+            Return 1
+        When 52:
+            Return 13
+        When 53:
+            Return 12
+        When 54:
+            Return 11
+        When 55:
+            Return 14
+        When 56:
+            Return 2
+        When 57:
+            Return 6
+        When 58:
+            Return 5
+        When 59:
+            Return 10
+        When 60:
+            Return 4
+        When 61:
+            Return 0
+        When 62:
+            Return 15
+        When 63:
+            Return 8
+        When 64:
+            Return 9
+        When 65:
+            Return 0
+        When 66:
+            Return 5
+        When 67:
+            Return 7
+        When 68:
+            Return 2
+        When 69:
+            Return 4
+        When 70:
+            Return 10
+        When 71:
+            Return 15
+        When 72:
+            Return 14
+        When 73:
+            Return 1
+        When 74:
+            Return 11
+        When 75:
+            Return 12
+        When 76:
+            Return 6
+        When 77:
+            Return 8
+        When 78:
+            Return 3
+        When 79:
+            Return 13
+        When 80:
+            Return 2
+        When 81:
+            Return 12
+        When 82:
+            Return 6
+        When 83:
+            Return 10
+        When 84:
+            Return 0
+        When 85:
+            Return 11
+        When 86:
+            Return 8
+        When 87:
+            Return 3
+        When 88:
+            Return 4
+        When 89:
+            Return 13
+        When 90:
+            Return 7
+        When 91:
+            Return 5
+        When 92:
+            Return 15
+        When 93:
+            Return 14
+        When 94:
+            Return 1
+        When 95:
+            Return 9
+        When 96:
+            Return 12
+        When 97:
+            Return 5
+        When 98:
+            Return 1
+        When 99:
+            Return 15
+        When 100:
+            Return 14
+        When 101:
+            Return 13
+        When 102:
+            Return 4
+        When 103:
+            Return 10
+        When 104:
+            Return 0
+        When 105:
+            Return 7
+        When 106:
+            Return 6
+        When 107:
+            Return 3
+        When 108:
+            Return 9
+        When 109:
+            Return 2
+        When 110:
+            Return 8
+        When 111:
+            Return 11
+        When 112:
+            Return 13
+        When 113:
+            Return 11
+        When 114:
+            Return 7
+        When 115:
+            Return 14
+        When 116:
+            Return 12
+        When 117:
+            Return 1
+        When 118:
+            Return 3
+        When 119:
+            Return 9
+        When 120:
+            Return 5
+        When 121:
+            Return 0
+        When 122:
+            Return 15
+        When 123:
+            Return 4
+        When 124:
+            Return 8
+        When 125:
+            Return 6
+        When 126:
+            Return 2
+        When 127:
+            Return 10
+        When 128:
+            Return 6
+        When 129:
+            Return 15
+        When 130:
+            Return 14
+        When 131:
+            Return 9
+        When 132:
+            Return 11
+        When 133:
+            Return 3
+        When 134:
+            Return 0
+        When 135:
+            Return 8
+        When 136:
+            Return 12
+        When 137:
+            Return 2
+        When 138:
+            Return 13
+        When 139:
+            Return 7
+        When 140:
+            Return 1
+        When 141:
+            Return 4
+        When 142:
+            Return 10
+        When 143:
+            Return 5
+        When 144:
+            Return 10
+        When 145:
+            Return 2
+        When 146:
+            Return 8
+        When 147:
+            Return 4
+        When 148:
+            Return 7
+        When 149:
+            Return 6
+        When 150:
+            Return 1
+        When 151:
+            Return 5
+        When 152:
+            Return 15
+        When 153:
+            Return 11
+        When 154:
+            Return 9
+        When 155:
+            Return 14
+        When 156:
+            Return 3
+        When 157:
+            Return 12
+        When 158:
+            Return 13
+        When 159:
+            Return 0
+    End Match
+    Return 0
+End Process
+
+Process called "blake2b_compress" takes h as Integer, msg_block as Integer, t_low as Integer, t_high as Integer, is_last as Integer returns Integer:
+    @Reasoning
+    BLAKE2b compression function F (RFC 7693 section 3.2). Mixes a
+    128-byte message block into the 64-byte hash state h, with byte
+    counter t = (t_high << 64) | t_low and a final-block flag is_last.
+    @End Reasoning
+
+    @Implementation
+    1. Initialize 128-byte work vector v: v[0..7] = h[0..7], v[8..15] = IV[0..7]
+       with v[12] XOR= t_low, v[13] XOR= t_high, v[14] XOR= 0xFFFF...FFFF
+       if is_last is true.
+    2. Parse msg_block into 16 uint64 words m[0..15] in little-endian.
+    3. Run 12 rounds. Each round applies G to 4 columns then 4 diagonals
+       of v, with the message word indices from SIGMA[round mod 10].
+    4. Mix v back into h: h[i] = h[i] XOR v[i] XOR v[i+8] for i in 0..7.
+    @End Implementation
+
+    @Performance_Hints
+    12 rounds * 8 G calls = 96 G calls per 128 bytes compressed. The
+    bulk of Blake2b time. Future SIMD codegen can pack 4 v lanes into
+    AVX2 registers and run 2 G in parallel per round.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. No secret-dependent branches or memory accesses.
+    The msg_block, h, and message indices via SIGMA are all
+    counter-driven within rounds.
+    @End Security_Scope
+
+    Let arena be proc arena_create from Arena with 4096
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Let v be proc arena_allocate from Arena with arena, 128
+    If v is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+    Let m be proc arena_allocate from Arena with arena, 128
+    If m is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+
+    Note: v[0..7] = h[0..7]
+    Let i be 0
+    While i is less than 8:
+        Let off be i multiplied by 8
+        Let val be proc memory_get_qword from Memory with h, off
+        proc memory_set_qword from Memory with v, off, val
+        Set i to i plus 1
+    End While
+
+    Note: v[8..15] = IV[0..7]
+    proc memory_set_qword from Memory with v, 64, BLAKE2B_IV0
+    proc memory_set_qword from Memory with v, 72, BLAKE2B_IV1
+    proc memory_set_qword from Memory with v, 80, BLAKE2B_IV2
+    proc memory_set_qword from Memory with v, 88, BLAKE2B_IV3
+    proc memory_set_qword from Memory with v, 96, BLAKE2B_IV4
+    proc memory_set_qword from Memory with v, 104, BLAKE2B_IV5
+    proc memory_set_qword from Memory with v, 112, BLAKE2B_IV6
+    proc memory_set_qword from Memory with v, 120, BLAKE2B_IV7
+
+    Note: v[12] ^= t_low; v[13] ^= t_high
+    Let v12 be proc memory_get_qword from Memory with v, 96
+    Set v12 to v12 bitwise_xor t_low
+    proc memory_set_qword from Memory with v, 96, v12
+    Let v13 be proc memory_get_qword from Memory with v, 104
+    Set v13 to v13 bitwise_xor t_high
+    proc memory_set_qword from Memory with v, 104, v13
+
+    Note: if is_last: v[14] ^= 0xFFFFFFFFFFFFFFFF
+    If is_last is not equal to 0:
+        Let v14 be proc memory_get_qword from Memory with v, 112
+        Set v14 to v14 bitwise_xor U64_MASK
+        proc memory_set_qword from Memory with v, 112, v14
+    End If
+
+    Note: Parse msg_block into m[0..15] as little-endian uint64
+    Let j be 0
+    While j is less than 16:
+        Let src_off be j multiplied by 8
+        Let mv be proc argon2_load64_le with msg_block, src_off
+        proc memory_set_qword from Memory with m, src_off, mv
+        Set j to j plus 1
+    End While
+
+    Note: 12 rounds
+    Let round_idx be 0
+    While round_idx is less than 12:
+        Note: Column step: G(v, 0,4,8,12, m[s0], m[s1])
+        Let s0 be proc blake2b_sigma with round_idx, 0
+        Let s1 be proc blake2b_sigma with round_idx, 1
+        Let m_s0 be proc memory_get_qword from Memory with m, s0 multiplied by 8
+        Let m_s1 be proc memory_get_qword from Memory with m, s1 multiplied by 8
+        proc blake2b_g_mix with v, 0, 4, 8, 12, m_s0, m_s1
+
+        Let s2 be proc blake2b_sigma with round_idx, 2
+        Let s3 be proc blake2b_sigma with round_idx, 3
+        Let m_s2 be proc memory_get_qword from Memory with m, s2 multiplied by 8
+        Let m_s3 be proc memory_get_qword from Memory with m, s3 multiplied by 8
+        proc blake2b_g_mix with v, 1, 5, 9, 13, m_s2, m_s3
+
+        Let s4 be proc blake2b_sigma with round_idx, 4
+        Let s5 be proc blake2b_sigma with round_idx, 5
+        Let m_s4 be proc memory_get_qword from Memory with m, s4 multiplied by 8
+        Let m_s5 be proc memory_get_qword from Memory with m, s5 multiplied by 8
+        proc blake2b_g_mix with v, 2, 6, 10, 14, m_s4, m_s5
+
+        Let s6 be proc blake2b_sigma with round_idx, 6
+        Let s7 be proc blake2b_sigma with round_idx, 7
+        Let m_s6 be proc memory_get_qword from Memory with m, s6 multiplied by 8
+        Let m_s7 be proc memory_get_qword from Memory with m, s7 multiplied by 8
+        proc blake2b_g_mix with v, 3, 7, 11, 15, m_s6, m_s7
+
+        Note: Diagonal step
+        Let s8 be proc blake2b_sigma with round_idx, 8
+        Let s9 be proc blake2b_sigma with round_idx, 9
+        Let m_s8 be proc memory_get_qword from Memory with m, s8 multiplied by 8
+        Let m_s9 be proc memory_get_qword from Memory with m, s9 multiplied by 8
+        proc blake2b_g_mix with v, 0, 5, 10, 15, m_s8, m_s9
+
+        Let s10 be proc blake2b_sigma with round_idx, 10
+        Let s11 be proc blake2b_sigma with round_idx, 11
+        Let m_s10 be proc memory_get_qword from Memory with m, s10 multiplied by 8
+        Let m_s11 be proc memory_get_qword from Memory with m, s11 multiplied by 8
+        proc blake2b_g_mix with v, 1, 6, 11, 12, m_s10, m_s11
+
+        Let s12 be proc blake2b_sigma with round_idx, 12
+        Let s13 be proc blake2b_sigma with round_idx, 13
+        Let m_s12 be proc memory_get_qword from Memory with m, s12 multiplied by 8
+        Let m_s13 be proc memory_get_qword from Memory with m, s13 multiplied by 8
+        proc blake2b_g_mix with v, 2, 7, 8, 13, m_s12, m_s13
+
+        Let s14 be proc blake2b_sigma with round_idx, 14
+        Let s15 be proc blake2b_sigma with round_idx, 15
+        Let m_s14 be proc memory_get_qword from Memory with m, s14 multiplied by 8
+        Let m_s15 be proc memory_get_qword from Memory with m, s15 multiplied by 8
+        proc blake2b_g_mix with v, 3, 4, 9, 14, m_s14, m_s15
+
+        Set round_idx to round_idx plus 1
+    End While
+
+    Note: h[i] ^= v[i] ^ v[i+8]
+    Let k be 0
+    While k is less than 8:
+        Let off2 be k multiplied by 8
+        Let hi be proc memory_get_qword from Memory with h, off2
+        Let vi be proc memory_get_qword from Memory with v, off2
+        Let vi8 be proc memory_get_qword from Memory with v, off2 plus 64
+        Let newhi be hi bitwise_xor vi
+        Set newhi to newhi bitwise_xor vi8
+        proc memory_set_qword from Memory with h, off2, newhi
+        Set k to k plus 1
+    End While
+
+    proc arena_destroy from Arena with arena
+    Return 1
+End Process
+
+Process called "blake2b_hash" takes arena as Integer, input as Integer, input_len as Integer, output as Integer, output_len as Integer returns Integer:
+    @Reasoning
+    Variable-output BLAKE2b hash with 1 <= output_len <= 64. No key,
+    no salt, no personalization (per Argon2's usage). The parameter
+    block sets digest_length = output_len, fanout = 1, depth = 1.
+    @End Reasoning
+
+    @Implementation
+    Per RFC 7693 sections 3.2 and 3.3:
+    1. Initialise h[0..7] = IV[0..7].
+    2. h[0] ^= 0x01010000 | (key_len << 8) | output_len. key_len = 0.
+    3. If input_len > 0: while remaining > 128 bytes, compress with
+       is_last=0 and t advanced by 128. Final 1..128-byte block
+       (with zero-padding if needed) compresses with is_last=1 and
+       t advanced by the real (non-padded) input_len.
+    4. If input_len = 0: compress a zero block with t=0, is_last=1.
+    5. Copy first output_len bytes of the resulting 64-byte digest
+       (little-endian uint64s) into output.
+    @End Implementation
+
+    @Performance_Hints
+    One compression per 128 bytes of input plus one for the trailing
+    partial block. For 64-byte inputs (the Argon2 H' chain), this is
+    a single compression.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time on Blake2b's inputs. No secret-dependent branches.
+    Caller is responsible for buffer ownership; this proc does not
+    wipe its inputs (caller-side secrets are caller's job).
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If output is equal to 0:
+        Return 0
+    End If
+    If output_len is less than 1:
+        Return 0
+    End If
+    If output_len is greater than BLAKE2B_OUT_BYTES:
+        Return 0
+    End If
+    If input_len is less than 0:
+        Return 0
+    End If
+    If input is equal to 0:
+        If input_len is greater than 0:
+            Return 0
+        End If
+    End If
+
+    Let h be proc arena_allocate from Arena with arena, 64
+    If h is equal to 0:
+        Return 0
+    End If
+
+    Note: h[0..7] = IV[0..7]
+    proc memory_set_qword from Memory with h, 0, BLAKE2B_IV0
+    proc memory_set_qword from Memory with h, 8, BLAKE2B_IV1
+    proc memory_set_qword from Memory with h, 16, BLAKE2B_IV2
+    proc memory_set_qword from Memory with h, 24, BLAKE2B_IV3
+    proc memory_set_qword from Memory with h, 32, BLAKE2B_IV4
+    proc memory_set_qword from Memory with h, 40, BLAKE2B_IV5
+    proc memory_set_qword from Memory with h, 48, BLAKE2B_IV6
+    proc memory_set_qword from Memory with h, 56, BLAKE2B_IV7
+
+    Note: h[0] ^= 0x0101_0000 | (key_len << 8) | output_len
+    Note: key_len = 0; param = output_len | 0x01010000
+    Let h0 be proc memory_get_qword from Memory with h, 0
+    Let param be output_len bitwise_or 16842752
+    Set h0 to h0 bitwise_xor param
+    proc memory_set_qword from Memory with h, 0, h0
+
+    Note: Allocate a single 128-byte scratch block for compression input
+    Let block_buf be proc arena_allocate from Arena with arena, BLAKE2B_BLOCK_BYTES
+    If block_buf is equal to 0:
+        Return 0
+    End If
+
+    Note: Process all full and final input blocks
+    Let pos be 0
+    Let bytes_compressed be 0
+    Note: A Blake2b stream that has any data must call F at least once
+    Note: on the final block with is_last=1. We hold back the last
+    Note: 128 bytes (or all of them if <=128) for the final call.
+
+    If input_len is equal to 0:
+        Note: Empty-input case: compress a 128-byte zero block with t=0, last=1
+        proc memory_zero from Memory with block_buf, BLAKE2B_BLOCK_BYTES
+        proc blake2b_compress with h, block_buf, 0, 0, 1
+    Otherwise:
+        While input_len minus pos is greater than BLAKE2B_BLOCK_BYTES:
+            proc memory_copy from Memory with block_buf, input plus pos, BLAKE2B_BLOCK_BYTES
+            Set bytes_compressed to bytes_compressed plus BLAKE2B_BLOCK_BYTES
+            Let t_low be bytes_compressed bitwise_and U64_MASK
+            proc blake2b_compress with h, block_buf, t_low, 0, 0
+            Set pos to pos plus BLAKE2B_BLOCK_BYTES
+        End While
+
+        Note: Final block: copy remaining bytes (1..128), zero-pad
+        proc memory_zero from Memory with block_buf, BLAKE2B_BLOCK_BYTES
+        Let remaining be input_len minus pos
+        If remaining is greater than 0:
+            proc memory_copy from Memory with block_buf, input plus pos, remaining
+        End If
+        Set bytes_compressed to bytes_compressed plus remaining
+        Let final_t_low be bytes_compressed bitwise_and U64_MASK
+        proc blake2b_compress with h, block_buf, final_t_low, 0, 1
+    End If
+
+    Note: Output: little-endian serialise the first output_len bytes of h
+    Let oi be 0
+    While oi is less than output_len:
+        Let qword_idx be oi divided by 8
+        Let byte_in_qword be oi modulo by 8
+        Let qoff be qword_idx multiplied by 8
+        Let qval be proc memory_get_qword from Memory with h, qoff
+        Let divisor be 1
+        Let sc be 0
+        While sc is less than byte_in_qword:
+            Set divisor to divisor multiplied by 256
+            Set sc to sc plus 1
+        End While
+        Let shifted be qval divided by divisor
+        Let byte_val be shifted bitwise_and U8_MASK
+        proc memory_set_byte from Memory with output, oi, byte_val
+        Set oi to oi plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Section 3: H' -- variable-length hash (RFC 9106 section 3.3)
+Note: ============================================================================
+
+Process called "argon2_h_prime" takes arena as Integer, input as Integer, input_len as Integer, output as Integer, output_len as Integer returns Integer:
+    @Reasoning
+    The variable-length hash H' (RFC 9106 section 3.3). Produces an
+    output_len-byte digest of the input by chaining BLAKE2b outputs.
+    Used to produce 1024-byte blocks (B[i][0], B[i][1]) and the final
+    T-byte tag.
+    @End Reasoning
+
+    @Implementation
+    Per RFC 9106 section 3.3:
+      If T <= 64:
+        H'(X, T) = BLAKE2b(LE32(T) || X, T)
+      Else:
+        r = ceil(T / 32) - 2
+        V_1 = BLAKE2b(LE32(T) || X, 64)
+        V_2 = BLAKE2b(V_1, 64)
+        ...
+        V_r = BLAKE2b(V_{r-1}, 64)
+        V_{r+1} = BLAKE2b(V_r, T - 32*r)
+        H'(X, T) = V_1[0..31] || V_2[0..31] || ... || V_r[0..31] || V_{r+1}
+      In words: prepend the 4-byte LE T, hash to 64 bytes for the first
+      block, then for each subsequent 32-byte chunk re-hash the previous
+      64-byte block to a new 64-byte block (taking the first 32 bytes of
+      each as output), and finally hash the previous block to the
+      remaining (output_len - 32*r) bytes.
+    @End Implementation
+
+    @Performance_Hints
+    For T = 64: one Blake2b call (most internal uses are this).
+    For T = 1024: r = 30 chained Blake2b calls plus 1 final variable
+    Blake2b for the last 32 bytes. About 31 Blake2b compressions per
+    1024-byte block.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. The chained 32-byte taps prevent length-extension
+    attacks on the variable-length composition.
+    @End Security_Scope
+
+    If output_len is less than 1:
+        Return 0
+    End If
+
+    Note: Build prefixed input: LE32(output_len) || input
+    Let prefix_len be 4 plus input_len
+    Let prefixed be proc arena_allocate from Arena with arena, prefix_len
+    If prefixed is equal to 0:
+        Return 0
+    End If
+    proc argon2_store32_le with prefixed, 0, output_len
+    If input_len is greater than 0:
+        proc memory_copy from Memory with prefixed plus 4, input, input_len
+    End If
+
+    If output_len is less than or equal to BLAKE2B_OUT_BYTES:
+        Note: Short branch: single Blake2b call
+        Let rc1 be proc blake2b_hash with arena, prefixed, prefix_len, output, output_len
+        Return rc1
+    End If
+
+    Note: Long branch: chained Blake2b calls
+    Let v_prev be proc arena_allocate from Arena with arena, BLAKE2B_OUT_BYTES
+    If v_prev is equal to 0:
+        Return 0
+    End If
+    Let v_next be proc arena_allocate from Arena with arena, BLAKE2B_OUT_BYTES
+    If v_next is equal to 0:
+        Return 0
+    End If
+
+    Note: V_1 = Blake2b(LE32(T) || X, 64)
+    Let rc2 be proc blake2b_hash with arena, prefixed, prefix_len, v_prev, BLAKE2B_OUT_BYTES
+    If rc2 is equal to 0:
+        Return 0
+    End If
+    Note: Copy V_1[0..31] to output[0..31]
+    proc memory_copy from Memory with output, v_prev, 32
+
+    Note: Chain: V_{k+1} = Blake2b(V_k, 64); output[32*k .. 32*k+31] = V_{k+1}[0..31]
+    Note: We need (r-1) more 64-byte hashes followed by 1 final hash of size
+    Note: (output_len - 32*r) bytes, where r = ceil(output_len/32) - 2.
+    Note: Total 32-byte chunks written from V_1..V_r is r. Then V_{r+1}
+    Note: provides the last (output_len - 32*r) bytes (could be 1..64).
+
+    Note: Compute r = ceil(output_len / 32) - 2
+    Let r_val be output_len plus 31
+    Set r_val to r_val divided by 32
+    Set r_val to r_val minus 2
+
+    Let kk be 1
+    While kk is less than r_val:
+        Let rc3 be proc blake2b_hash with arena, v_prev, BLAKE2B_OUT_BYTES, v_next, BLAKE2B_OUT_BYTES
+        If rc3 is equal to 0:
+            Return 0
+        End If
+        proc memory_copy from Memory with output plus (kk multiplied by 32), v_next, 32
+        proc memory_copy from Memory with v_prev, v_next, BLAKE2B_OUT_BYTES
+        Set kk to kk plus 1
+    End While
+
+    Note: Final partial: V_{r+1} = Blake2b(V_r, output_len - 32*r)
+    Let tail_len be output_len minus (r_val multiplied by 32)
+    Let rc4 be proc blake2b_hash with arena, v_prev, BLAKE2B_OUT_BYTES, output plus (r_val multiplied by 32), tail_len
+    If rc4 is equal to 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Section 4: Argon2 round function P (BLAKE2b round on a row)
+Note: ============================================================================
+
+Process called "argon2_gb" takes state as Integer, ia as Integer, ib as Integer, ic as Integer, id as Integer returns Integer:
+    @Reasoning
+    The "GB" mixing function used inside the Argon2 round function P
+    (RFC 9106 section 3.6). This differs from the original Blake2b G
+    in two ways:
+      - It takes no message-word inputs (m=0).
+      - It uses a modified addition step: a = a + b + 2 * lower32(a) *
+        lower32(b), where lower32() is the low 32 bits.
+    The rotation constants and overall structure are otherwise identical
+    to Blake2b G.
+    @End Reasoning
+
+    @Implementation
+    Per RFC 9106 section 3.6:
+      a = a + b + 2 * lower32(a) * lower32(b)
+      d = (d XOR a) >>> 32
+      c = c + d + 2 * lower32(c) * lower32(d)
+      b = (b XOR c) >>> 24
+      a = a + b + 2 * lower32(a) * lower32(b)
+      d = (d XOR a) >>> 16
+      c = c + d + 2 * lower32(c) * lower32(d)
+      b = (b XOR c) >>> 63
+    All arithmetic modulo 2^64.
+
+    state is a 128-byte buffer holding 16 uint64 words (a row of the
+    block matrix view).
+    @End Implementation
+
+    @Performance_Hints
+    Twelve 64-bit adds (8 from the +b/+d, 4 from the multiplications),
+    two multiplies, four XORs, four rotates. Per round P invocation
+    (8 GB calls), this is ~96 ops on 128 bytes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. The deliberate inclusion of multiplication makes
+    this slower on ASIC/FPGA than pure XOR-and-rotate primitives,
+    contributing to Argon2's memory-hardness.
+    @End Security_Scope
+
+    Let off_a be ia multiplied by 8
+    Let off_b be ib multiplied by 8
+    Let off_c be ic multiplied by 8
+    Let off_d be id multiplied by 8
+
+    Let va be proc memory_get_qword from Memory with state, off_a
+    Let vb be proc memory_get_qword from Memory with state, off_b
+    Let vc be proc memory_get_qword from Memory with state, off_c
+    Let vd be proc memory_get_qword from Memory with state, off_d
+
+    Note: a = a + b + 2 * lower32(a) * lower32(b)
+    Let low_a be proc argon2_low32 with va
+    Let low_b be proc argon2_low32 with vb
+    Let mul_ab be proc argon2_u64_mul_low with low_a, low_b
+    Let two_mul be proc argon2_u64_add with mul_ab, mul_ab
+    Let ab_sum be proc argon2_u64_add with va, vb
+    Set va to proc argon2_u64_add with ab_sum, two_mul
+
+    Let xor_da be vd bitwise_xor va
+    Set vd to proc argon2_rotr64 with xor_da, 32
+
+    Note: c = c + d + 2 * lower32(c) * lower32(d)
+    Let low_c be proc argon2_low32 with vc
+    Let low_d be proc argon2_low32 with vd
+    Let mul_cd be proc argon2_u64_mul_low with low_c, low_d
+    Let two_mul2 be proc argon2_u64_add with mul_cd, mul_cd
+    Let cd_sum be proc argon2_u64_add with vc, vd
+    Set vc to proc argon2_u64_add with cd_sum, two_mul2
+
+    Let xor_bc be vb bitwise_xor vc
+    Set vb to proc argon2_rotr64 with xor_bc, 24
+
+    Note: a = a + b + 2 * lower32(a) * lower32(b)
+    Let low_a2 be proc argon2_low32 with va
+    Let low_b2 be proc argon2_low32 with vb
+    Let mul_ab2 be proc argon2_u64_mul_low with low_a2, low_b2
+    Let two_mul3 be proc argon2_u64_add with mul_ab2, mul_ab2
+    Let ab_sum2 be proc argon2_u64_add with va, vb
+    Set va to proc argon2_u64_add with ab_sum2, two_mul3
+
+    Let xor_da2 be vd bitwise_xor va
+    Set vd to proc argon2_rotr64 with xor_da2, 16
+
+    Note: c = c + d + 2 * lower32(c) * lower32(d)
+    Let low_c2 be proc argon2_low32 with vc
+    Let low_d2 be proc argon2_low32 with vd
+    Let mul_cd2 be proc argon2_u64_mul_low with low_c2, low_d2
+    Let two_mul4 be proc argon2_u64_add with mul_cd2, mul_cd2
+    Let cd_sum2 be proc argon2_u64_add with vc, vd
+    Set vc to proc argon2_u64_add with cd_sum2, two_mul4
+
+    Let xor_bc2 be vb bitwise_xor vc
+    Set vb to proc argon2_rotr64 with xor_bc2, 63
+
+    proc memory_set_qword from Memory with state, off_a, va
+    proc memory_set_qword from Memory with state, off_b, vb
+    proc memory_set_qword from Memory with state, off_c, vc
+    proc memory_set_qword from Memory with state, off_d, vd
+    Return 1
+End Process
+
+Process called "argon2_round_p" takes state as Integer returns Integer:
+    @Reasoning
+    The P round function (RFC 9106 section 3.6 equation 8). Takes a
+    16-uint64 / 128-byte chunk and applies eight GB mixing operations
+    (four columns, four diagonals) just like a Blake2b round.
+    @End Reasoning
+
+    @Implementation
+    Per RFC 9106 section 3.6:
+      Columns:
+        GB(v0, v4, v8,  v12)
+        GB(v1, v5, v9,  v13)
+        GB(v2, v6, v10, v14)
+        GB(v3, v7, v11, v15)
+      Diagonals:
+        GB(v0, v5, v10, v15)
+        GB(v1, v6, v11, v12)
+        GB(v2, v7, v8,  v13)
+        GB(v3, v4, v9,  v14)
+    @End Implementation
+
+    @Performance_Hints
+    Eight GB calls per P invocation. Per Argon2 G compression: 16
+    P calls (8 row-major, 8 column-major) = 128 GB calls per 1024-byte
+    block.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    proc argon2_gb with state, 0, 4, 8, 12
+    proc argon2_gb with state, 1, 5, 9, 13
+    proc argon2_gb with state, 2, 6, 10, 14
+    proc argon2_gb with state, 3, 7, 11, 15
+    proc argon2_gb with state, 0, 5, 10, 15
+    proc argon2_gb with state, 1, 6, 11, 12
+    proc argon2_gb with state, 2, 7, 8, 13
+    proc argon2_gb with state, 3, 4, 9, 14
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Section 5: Argon2 G compression function
+Note: ============================================================================
+
+Process called "argon2_g_compress" takes arena as Integer, x_block as Integer, y_block as Integer, z_block as Integer returns Integer:
+    @Reasoning
+    The Argon2 compression function G(X, Y) = Z (RFC 9106 section 3.5).
+    Takes two 1024-byte blocks, produces one 1024-byte block.
+    @End Reasoning
+
+    @Implementation
+    Per RFC 9106 section 3.5:
+      R = X XOR Y                         (1024 bytes)
+      Q = R                                (save for final XOR)
+      Treat R as an 8x8 matrix of 16-byte cells -- i.e., R is a
+      128 x 64-bit grid view as 8 rows of 16 uint64 words.
+      For row i = 0..7: apply P to R[i] (rows of 128 bytes each).
+      For col j = 0..7: apply P to the j-th column of R (collecting
+        16 uint64 words from columns 2j, 2j+1 across all 8 rows).
+      Z = R XOR Q.
+    Output Z to z_block.
+    @End Implementation
+
+    @Performance_Hints
+    Dominant cost: 16 P calls per 1024 bytes = ~128 GB calls + 1024
+    bytes of XORs at the start and end. ~2K cycles per block on x86-64
+    in a tight C implementation; this Runa implementation has higher
+    overhead due to per-call setup but scales as expected.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time on X, Y, Z. The G function is the cryptographic
+    heart of Argon2's memory-hardness: each block depends on two
+    other blocks, forcing the attacker to keep the matrix in memory.
+    @End Security_Scope
+
+    Note: Allocate R and Q (both 1024 bytes)
+    Let r_buf be proc arena_allocate from Arena with arena, ARGON2_BLOCK_SIZE
+    If r_buf is equal to 0:
+        Return 0
+    End If
+    Let q_buf be proc arena_allocate from Arena with arena, ARGON2_BLOCK_SIZE
+    If q_buf is equal to 0:
+        Return 0
+    End If
+
+    Note: R = X XOR Y; also save in Q
+    Let qi be 0
+    While qi is less than ARGON2_QWORDS_PER_BLOCK:
+        Let off be qi multiplied by 8
+        Let xv be proc memory_get_qword from Memory with x_block, off
+        Let yv be proc memory_get_qword from Memory with y_block, off
+        Let xv_xor_yv be xv bitwise_xor yv
+        proc memory_set_qword from Memory with r_buf, off, xv_xor_yv
+        proc memory_set_qword from Memory with q_buf, off, xv_xor_yv
+        Set qi to qi plus 1
+    End While
+
+    Note: Row pass: apply P to each of the 8 rows of 16 uint64s (128 bytes)
+    Let row_i be 0
+    While row_i is less than 8:
+        Let row_ptr be r_buf plus (row_i multiplied by 128)
+        proc argon2_round_p with row_ptr
+        Set row_i to row_i plus 1
+    End While
+
+    Note: Column pass: P operates on a contiguous 16-uint64 buffer, but
+    Note: each column collects 16 uint64 words from columns (2j, 2j+1)
+    Note: across 8 rows. Per RFC 9106 section 3.6:
+    Note:   Column j (j = 0..7) takes the 16 words at offsets
+    Note:     R[0][2j], R[0][2j+1], R[1][2j], R[1][2j+1],
+    Note:     R[2][2j], R[2][2j+1], R[3][2j], R[3][2j+1],
+    Note:     R[4][2j], R[4][2j+1], R[5][2j], R[5][2j+1],
+    Note:     R[6][2j], R[6][2j+1], R[7][2j], R[7][2j+1]
+    Note: where R[row][word_in_row] is a uint64.
+    Note: We gather to a temp buffer, run P, then scatter back.
+
+    Let col_tmp be proc arena_allocate from Arena with arena, 128
+    If col_tmp is equal to 0:
+        Return 0
+    End If
+
+    Let col_j be 0
+    While col_j is less than 8:
+        Note: Gather
+        Let row_idx be 0
+        While row_idx is less than 8:
+            Let pair_idx be 0
+            While pair_idx is less than 2:
+                Let src_qword_idx be (row_idx multiplied by 16) plus (col_j multiplied by 2) plus pair_idx
+                Let src_off be src_qword_idx multiplied by 8
+                Let dst_qword_idx be (row_idx multiplied by 2) plus pair_idx
+                Let dst_off be dst_qword_idx multiplied by 8
+                Let val be proc memory_get_qword from Memory with r_buf, src_off
+                proc memory_set_qword from Memory with col_tmp, dst_off, val
+                Set pair_idx to pair_idx plus 1
+            End While
+            Set row_idx to row_idx plus 1
+        End While
+
+        proc argon2_round_p with col_tmp
+
+        Note: Scatter back
+        Let row_idx2 be 0
+        While row_idx2 is less than 8:
+            Let pair_idx2 be 0
+            While pair_idx2 is less than 2:
+                Let src_qword_idx2 be (row_idx2 multiplied by 2) plus pair_idx2
+                Let src_off2 be src_qword_idx2 multiplied by 8
+                Let dst_qword_idx2 be (row_idx2 multiplied by 16) plus (col_j multiplied by 2) plus pair_idx2
+                Let dst_off2 be dst_qword_idx2 multiplied by 8
+                Let val2 be proc memory_get_qword from Memory with col_tmp, src_off2
+                proc memory_set_qword from Memory with r_buf, dst_off2, val2
+                Set pair_idx2 to pair_idx2 plus 1
+            End While
+            Set row_idx2 to row_idx2 plus 1
+        End While
+
+        Set col_j to col_j plus 1
+    End While
+
+    Note: Z = R XOR Q
+    Let zi be 0
+    While zi is less than ARGON2_QWORDS_PER_BLOCK:
+        Let off2 be zi multiplied by 8
+        Let rv be proc memory_get_qword from Memory with r_buf, off2
+        Let qv be proc memory_get_qword from Memory with q_buf, off2
+        Let zv be rv bitwise_xor qv
+        proc memory_set_qword from Memory with z_block, off2, zv
+        Set zi to zi plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Section 6: Indexing / addressing
+Note: ============================================================================
+
+Process called "argon2_index_alpha" takes pass as Integer, slice as Integer, lane as Integer, lanes as Integer, segment_length as Integer, lane_length as Integer, position_in_segment as Integer, ref_lane as Integer, pseudo_rand_low32 as Integer returns Integer:
+    @Reasoning
+    Compute the index (within ref_lane) of the reference block, given
+    the pseudo-random pair derived per RFC 9106 section 3.4.
+
+    Per the spec (section 3.4 part 1.2.2):
+    - reference_area_size is the number of blocks the new block can
+      reference (counting back from the current position, modulo lane
+      wrap).
+    - relative_position is a nonlinear (J1^2 / 2^32-ish) index into
+      reference_area_size.
+    - absolute_position adds the starting offset of the segment.
+    @End Reasoning
+
+    @Implementation
+    Per RFC 9106 section 3.4 part 1.2.2:
+      reference_area_size:
+        if pass == 0:
+          if slice == 0:    ref_area = position_in_segment - 1
+          else if ref_lane == lane:
+                            ref_area = slice * segment_length + position_in_segment - 1
+          else if position_in_segment == 0:
+                            ref_area = slice * segment_length - 1
+          else:             ref_area = slice * segment_length
+        else:
+          if ref_lane == lane:
+                            ref_area = lane_length - segment_length + position_in_segment - 1
+          else if position_in_segment == 0:
+                            ref_area = lane_length - segment_length - 1
+          else:             ref_area = lane_length - segment_length
+
+      relative_position:
+        x = pseudo_rand_low32
+        x = (x * x) >> 32                                Note: x in [0, 2^32)
+        y = (reference_area_size * x) >> 32
+        relative_position = reference_area_size - 1 - y
+
+      absolute_position:
+        if pass == 0:
+          start_position = 0
+        else:
+          start_position = (slice + 1) * segment_length mod lane_length
+        absolute_position = (start_position + relative_position) mod
+                             lane_length
+
+      Return absolute_position.
+    @End Implementation
+
+    @Performance_Hints
+    A few uint32 multiplies and integer divides. Sub-microsecond.
+    @End Performance_Hints
+
+    @Security_Scope
+    For Argon2d (data-dependent): the pseudo_rand_low32 is a function
+    of secret-derived previous block, so this index is secret-dependent.
+    For Argon2i and pass-0-segments-{0,1} of Argon2id: pseudo_rand_low32
+    is data-independent, so indexing is data-independent.
+    @End Security_Scope
+
+    Let ref_area_size be 0
+    If pass is equal to 0:
+        If slice is equal to 0:
+            Set ref_area_size to position_in_segment minus 1
+        Otherwise:
+            If ref_lane is equal to lane:
+                Set ref_area_size to (slice multiplied by segment_length) plus position_in_segment minus 1
+            Otherwise:
+                If position_in_segment is equal to 0:
+                    Set ref_area_size to (slice multiplied by segment_length) minus 1
+                Otherwise:
+                    Set ref_area_size to slice multiplied by segment_length
+                End If
+            End If
+        End If
+    Otherwise:
+        If ref_lane is equal to lane:
+            Set ref_area_size to lane_length minus segment_length plus position_in_segment minus 1
+        Otherwise:
+            If position_in_segment is equal to 0:
+                Set ref_area_size to lane_length minus segment_length minus 1
+            Otherwise:
+                Set ref_area_size to lane_length minus segment_length
+            End If
+        End If
+    End If
+
+    Note: relative_position = ref_area_size - 1 -
+    Note:                     ((ref_area_size * ((J1^2) >> 32)) >> 32)
+    Let j1 be pseudo_rand_low32 bitwise_and U32_MASK_A2
+    Let x be j1 multiplied by j1
+    Set x to x divided by 4294967296
+    Set x to x bitwise_and U32_MASK_A2
+
+    Let y be ref_area_size multiplied by x
+    Set y to y divided by 4294967296
+
+    Let relative_position be ref_area_size minus 1
+    Set relative_position to relative_position minus y
+
+    Let start_position be 0
+    If pass is equal to 0:
+        Set start_position to 0
+    Otherwise:
+        Set start_position to (slice plus 1) multiplied by segment_length
+        Set start_position to start_position modulo by lane_length
+    End If
+
+    Let absolute_position be start_position plus relative_position
+    Set absolute_position to absolute_position modulo by lane_length
+    Return absolute_position
+End Process
+
+Process called "argon2_fill_address_block" takes arena as Integer, pass as Integer, lane as Integer, slice as Integer, lanes as Integer, total_blocks as Integer, iterations as Integer, type_code as Integer, counter as Integer, addr_block as Integer, zero_block as Integer, input_block as Integer returns Integer:
+    @Reasoning
+    Generate the next 1024-byte address block for Argon2i indexing
+    (RFC 9106 section 3.4 part 1.b). The address block holds 128
+    little-endian uint64 values; the first 32 bits of each are J1
+    candidates and the next 32 bits are J2 candidates, giving 128
+    (J1, J2) pairs per block.
+
+    Per spec: input_block holds eight uint64 values:
+      [r, lane, slice, total_blocks, iterations, type_code, counter, 0]
+    The address block is generated by applying G twice:
+      addr_block = G(zero_block, G(zero_block, input_block))
+    @End Reasoning
+
+    @Implementation
+    1. Increment input_block[6] = counter.
+    2. tmp = G(zero_block, input_block).
+    3. addr_block = G(zero_block, tmp).
+    @End Implementation
+
+    @Performance_Hints
+    Two G compressions per 128 (J1, J2) pairs. Address blocks are
+    regenerated once per 128 positions per segment per lane per pass.
+    @End Performance_Hints
+
+    @Security_Scope
+    Data-independent by construction: input_block depends only on
+    public parameters and a counter.
+    @End Security_Scope
+
+    Note: Set input_block[6] (offset 48) = counter
+    proc memory_set_qword from Memory with input_block, 48, counter
+
+    Note: tmp = G(zero_block, input_block)
+    Let tmp_block be proc arena_allocate from Arena with arena, ARGON2_BLOCK_SIZE
+    If tmp_block is equal to 0:
+        Return 0
+    End If
+    Let rc1 be proc argon2_g_compress with arena, zero_block, input_block, tmp_block
+    If rc1 is equal to 0:
+        Return 0
+    End If
+
+    Note: addr_block = G(zero_block, tmp)
+    Let rc2 be proc argon2_g_compress with arena, zero_block, tmp_block, addr_block
+    If rc2 is equal to 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Section 7: Top-level argon2id_hash
+Note: ============================================================================
+
+Process called "argon2id_hash" takes password as Integer, password_len as Integer, salt as Integer, salt_len as Integer, secret as Integer, secret_len as Integer, associated_data as Integer, ad_len as Integer, m_cost_kb as Integer, t_iterations as Integer, p_parallelism as Integer, output as Integer, output_len as Integer returns Integer:
+    @Reasoning
+    Top-level Argon2id password hashing function (RFC 9106). Performs
+    parameter validation, builds the pre-hash H_0, allocates the m-KB
+    memory matrix B, computes the initial blocks per lane, runs
+    t_iterations passes over the matrix with hybrid Argon2id indexing
+    (data-independent on pass-0 segments 0 and 1; data-dependent
+    elsewhere), then XOR-aggregates the final blocks and emits the
+    output_len-byte tag via H'.
+    @End Reasoning
+
+    @Implementation
+    Per RFC 9106 sections 3.1 through 3.7:
+
+    1. Validate parameters. Reject if:
+       - m_cost_kb < 8 * p_parallelism (so segment_length >= 2).
+       - t_iterations < 1.
+       - p_parallelism < 1 or > 16777215 (24-bit max per spec).
+       - output_len < 4 or > 4294967295.
+       - salt_len < 8.
+       - secret_len < 0 or ad_len < 0 or password_len < 0.
+       - All input pointers null with positive lengths.
+
+    2. m_prime = floor(m_cost_kb / (4 * p)) * (4 * p).
+       q = m_prime / p (blocks per lane).
+       segment_length = q / ARGON2_SYNC_POINTS = q / 4.
+
+    3. Build the pre-hash seed (each length-prefixed uint32 LE):
+         LE32(p) || LE32(T) || LE32(m_cost) || LE32(t) ||
+         LE32(0x13) || LE32(2) ||
+         LE32(|P|) || P || LE32(|S|) || S ||
+         LE32(|K|) || K || LE32(|X|) || X
+       H_0 = Blake2b(seed, 64).
+
+    4. For each lane i in 0..p-1:
+       B[i][0] = H'(H_0 || LE32(0) || LE32(i), 1024)
+       B[i][1] = H'(H_0 || LE32(1) || LE32(i), 1024)
+
+    5. For pass r in 0..t-1:
+       For slice s in 0..3:
+         For each lane i in 0..p-1:
+           starting_index = (r == 0 && s == 0) ? 2 : 0
+           For j = starting_index..segment_length-1:
+             cur_pos_in_lane = s * segment_length + j
+             prev_pos = (j == 0 && s == 0)
+                          ? lane_length - 1
+                          : cur_pos_in_lane - 1
+             prev_block = B[i][prev_pos]
+
+             if (r == 0 && s in {0,1}):  Note: Argon2id Argon2i branch
+               Refill address block every 128 positions; J1, J2 come
+               from address_block[j_in_addr].
+             else:                        Note: Argon2d branch
+               J1 = lower32(prev_block), J2 = upper32 of prev_block.
+
+             Decode (J1, J2):
+               ref_lane = J2 mod p; on (r=0, s=0) force ref_lane = i.
+               position_in_segment = j
+               ref_index = argon2_index_alpha(...)
+               ref_block = B[ref_lane][ref_index]
+
+             new_block = G(prev_block, ref_block)
+             if r > 0: new_block = new_block XOR B[i][cur_pos_in_lane]
+             B[i][cur_pos_in_lane] = new_block
+
+    6. Final = B[0][q-1]
+       For i = 1..p-1: Final XOR= B[i][q-1]
+       output[0..T-1] = H'(Final, output_len)
+
+    Note on the 9-arg dotted-call workaround: We do NOT cross the 8-arg
+    boundary on any dotted call inside this proc -- this top-level
+    proc has 13 parameters but it is the public entry; all internal
+    calls are <= 7 args.
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by passes over the m-KB matrix. Each block fill is one
+    G compression (~16 P rounds = 128 GB calls). Total compressions
+    per call: ~ (m_cost_kb / 1.0) * t_iterations.
+
+    For RFC 9106 Appendix B (m=32, t=3, p=4): 32 * 3 = 96 block fills
+    plus the initial 8 blocks via H' plus the final H'(32) tag.
+    @End Performance_Hints
+
+    @Security_Scope
+    Memory-hardness: the m KB matrix is the dominant working set and
+    cannot be compressed by attackers without paying a quadratic
+    time-memory product. Brute-force candidate testing thus costs
+    m * t memory * time per guess, exponentially more expensive on
+    GPU/ASIC than per-CPU memory-bandwidth-bound hashing.
+
+    Side-channel posture (Argon2id specifically):
+    - Hybrid mode: pass 0 segments 0 and 1 use data-INdependent
+      indexing (Argon2i). This block range is computed while the
+      password is freshest in the matrix and therefore most exposed
+      to cache-timing side-channels. By choosing indices from a
+      pseudorandom stream that does NOT depend on data values, we
+      defeat cache-timing attacks on the password.
+    - All other segments (pass 0 slices 2,3 and passes 1..t-1) use
+      data-DEPendent indexing (Argon2d). This is the part that
+      defeats TMTO attacks: an attacker cannot precompute blocks
+      because the indexing pattern depends on the matrix contents
+      themselves, which depend on the password.
+    - The hybrid Argon2id thus simultaneously defeats:
+        * TMTO attacks (via Argon2d component).
+        * Cache-timing side-channel attacks on the password
+          (via Argon2i component for the early password-dependent
+          memory accesses).
+
+    What this proc does NOT mitigate:
+    - Physical side-channels (power analysis, EM emanations).
+      These require hardware countermeasures.
+    - Speculative execution leaks at the microarchitecture level
+      (Spectre / Meltdown / similar). Out of scope for software
+      cryptographic primitives.
+    - Caller-side leaks of password / output buffer. Caller MUST
+      zeroize sensitive inputs after use; this proc does not own
+      caller-provided buffers.
+
+    References:
+    - RFC 9106, sections 3.4 (Argon2id indexing) and 7 (Security).
+    - Alwen, Blocki, "Towards Practical Attacks on Argon2i and Balloon
+      Hashing", EuroCrypt 2017 -- motivation for Argon2id over
+      Argon2i alone.
+    @End Security_Scope
+
+    Note: ---- Step 1: parameter validation ----
+    If p_parallelism is less than 1:
+        Return 0
+    End If
+    If p_parallelism is greater than 16777215:
+        Return 0
+    End If
+    If t_iterations is less than 1:
+        Return 0
+    End If
+    If output_len is less than 4:
+        Return 0
+    End If
+    If salt_len is less than 8:
+        Return 0
+    End If
+    If password_len is less than 0:
+        Return 0
+    End If
+    If secret_len is less than 0:
+        Return 0
+    End If
+    If ad_len is less than 0:
+        Return 0
+    End If
+    Let min_memory be 8 multiplied by p_parallelism
+    If m_cost_kb is less than min_memory:
+        Return 0
+    End If
+    If output is equal to 0:
+        Return 0
+    End If
+    If salt is equal to 0:
+        Return 0
+    End If
+    If password is equal to 0:
+        If password_len is greater than 0:
+            Return 0
+        End If
+    End If
+    If secret is equal to 0:
+        If secret_len is greater than 0:
+            Return 0
+        End If
+    End If
+    If associated_data is equal to 0:
+        If ad_len is greater than 0:
+            Return 0
+        End If
+    End If
+
+    Note: ---- Step 2: working arena (sized for the matrix + scratch) ----
+    Note: matrix bytes = m_prime * 1024; plus scratch (~1 MB) for
+    Note: G compressions and address blocks.
+    Let four_p be 4 multiplied by p_parallelism
+    Let m_prime be m_cost_kb divided by four_p
+    Set m_prime to m_prime multiplied by four_p
+    Let lane_length be m_prime divided by p_parallelism
+    Let segment_length be lane_length divided by ARGON2_SYNC_POINTS
+    Let matrix_bytes be m_prime multiplied by ARGON2_BLOCK_SIZE
+
+    Let arena_capacity be matrix_bytes plus 1048576
+    Let arena be proc arena_create from Arena with arena_capacity
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Step 3: pre-hash H_0 ----
+    Note: Seed = LE32(p) || LE32(T) || LE32(m) || LE32(t) ||
+    Note:        LE32(0x13) || LE32(2) || LE32(|P|) || P ||
+    Note:        LE32(|S|) || S || LE32(|K|) || K ||
+    Note:        LE32(|X|) || X
+    Let seed_len be 24 plus 4 plus password_len plus 4 plus salt_len plus 4 plus secret_len plus 4 plus ad_len
+    Let seed be proc arena_allocate from Arena with arena, seed_len
+    If seed is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+    proc argon2_store32_le with seed, 0, p_parallelism
+    proc argon2_store32_le with seed, 4, output_len
+    proc argon2_store32_le with seed, 8, m_cost_kb
+    proc argon2_store32_le with seed, 12, t_iterations
+    proc argon2_store32_le with seed, 16, ARGON2_VERSION_13
+    proc argon2_store32_le with seed, 20, ARGON2_TYPE_ID
+
+    Let cursor be 24
+    proc argon2_store32_le with seed, cursor, password_len
+    Set cursor to cursor plus 4
+    If password_len is greater than 0:
+        proc memory_copy from Memory with seed plus cursor, password, password_len
+        Set cursor to cursor plus password_len
+    End If
+    proc argon2_store32_le with seed, cursor, salt_len
+    Set cursor to cursor plus 4
+    proc memory_copy from Memory with seed plus cursor, salt, salt_len
+    Set cursor to cursor plus salt_len
+    proc argon2_store32_le with seed, cursor, secret_len
+    Set cursor to cursor plus 4
+    If secret_len is greater than 0:
+        proc memory_copy from Memory with seed plus cursor, secret, secret_len
+        Set cursor to cursor plus secret_len
+    End If
+    proc argon2_store32_le with seed, cursor, ad_len
+    Set cursor to cursor plus 4
+    If ad_len is greater than 0:
+        proc memory_copy from Memory with seed plus cursor, associated_data, ad_len
+        Set cursor to cursor plus ad_len
+    End If
+
+    Let h_zero be proc arena_allocate from Arena with arena, ARGON2_PREHASH_DIGEST_LEN
+    If h_zero is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+    Let pre_rc be proc blake2b_hash with arena, seed, seed_len, h_zero, ARGON2_PREHASH_DIGEST_LEN
+    If pre_rc is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+
+    Note: ---- Step 4: allocate matrix B[p][q] ----
+    Note: Index of block B[lane][col] within matrix:
+    Note:   lane * lane_length + col   (each block = ARGON2_BLOCK_SIZE)
+    Let matrix be proc arena_allocate from Arena with arena, matrix_bytes
+    If matrix is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+    proc memory_zero from Memory with matrix, matrix_bytes
+
+    Note: ---- Step 5: initialise B[i][0] and B[i][1] ----
+    Note: Use h_seed = h_zero (64) || LE32(0) || LE32(i) for B[i][0]
+    Note:     h_seed = h_zero (64) || LE32(1) || LE32(i) for B[i][1]
+    Let h_seed be proc arena_allocate from Arena with arena, ARGON2_PREHASH_SEED_LEN
+    If h_seed is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+    proc memory_copy from Memory with h_seed, h_zero, ARGON2_PREHASH_DIGEST_LEN
+
+    Let lane_init be 0
+    While lane_init is less than p_parallelism:
+        Note: B[lane_init][0]
+        proc argon2_store32_le with h_seed, ARGON2_PREHASH_DIGEST_LEN, 0
+        proc argon2_store32_le with h_seed, ARGON2_PREHASH_DIGEST_LEN plus 4, lane_init
+        Let block0_off be lane_init multiplied by lane_length
+        Set block0_off to block0_off multiplied by ARGON2_BLOCK_SIZE
+        Let init0_rc be proc argon2_h_prime with arena, h_seed, ARGON2_PREHASH_SEED_LEN, matrix plus block0_off, ARGON2_BLOCK_SIZE
+        If init0_rc is equal to 0:
+            proc arena_destroy from Arena with arena
+            Return 0
+        End If
+
+        Note: B[lane_init][1]
+        proc argon2_store32_le with h_seed, ARGON2_PREHASH_DIGEST_LEN, 1
+        proc argon2_store32_le with h_seed, ARGON2_PREHASH_DIGEST_LEN plus 4, lane_init
+        Let block1_off be (lane_init multiplied by lane_length) plus 1
+        Set block1_off to block1_off multiplied by ARGON2_BLOCK_SIZE
+        Let init1_rc be proc argon2_h_prime with arena, h_seed, ARGON2_PREHASH_SEED_LEN, matrix plus block1_off, ARGON2_BLOCK_SIZE
+        If init1_rc is equal to 0:
+            proc arena_destroy from Arena with arena
+            Return 0
+        End If
+
+        Set lane_init to lane_init plus 1
+    End While
+
+    Note: ---- Step 6: fill the matrix ----
+    Note: Persistent scratch buffers reused across all G compressions:
+    Note:   - zero_block: 1024 zero bytes for address-block generation.
+    Note:   - input_block: 1024 bytes holding the input for address-block
+    Note:                  generation (r, lane, slice, total_blocks,
+    Note:                  iterations, type=2, counter, 0).
+    Note:   - addr_block: 1024 bytes output of address-block generation;
+    Note:                 128 (J1, J2) pairs.
+    Note:   - new_block: 1024 bytes scratch for the new block being
+    Note:                computed (G output before XOR-merge for pass r>0).
+    Let zero_block be proc arena_allocate from Arena with arena, ARGON2_BLOCK_SIZE
+    If zero_block is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+    proc memory_zero from Memory with zero_block, ARGON2_BLOCK_SIZE
+
+    Let input_block be proc arena_allocate from Arena with arena, ARGON2_BLOCK_SIZE
+    If input_block is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+    Let addr_block be proc arena_allocate from Arena with arena, ARGON2_BLOCK_SIZE
+    If addr_block is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+    Let new_block be proc arena_allocate from Arena with arena, ARGON2_BLOCK_SIZE
+    If new_block is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+
+    Let r_pass be 0
+    While r_pass is less than t_iterations:
+        Let s_slice be 0
+        While s_slice is less than ARGON2_SYNC_POINTS:
+            Let lane_idx be 0
+            While lane_idx is less than p_parallelism:
+                Note: Determine if Argon2i (data-independent) applies
+                Let is_argon2i_segment be 0
+                If r_pass is equal to 0:
+                    If s_slice is less than 2:
+                        Set is_argon2i_segment to 1
+                    End If
+                End If
+
+                Note: Argon2i: prepare input_block and address_counter
+                Let address_counter be 0
+                If is_argon2i_segment is not equal to 0:
+                    proc memory_zero from Memory with input_block, ARGON2_BLOCK_SIZE
+                    proc memory_set_qword from Memory with input_block, 0, r_pass
+                    proc memory_set_qword from Memory with input_block, 8, lane_idx
+                    proc memory_set_qword from Memory with input_block, 16, s_slice
+                    proc memory_set_qword from Memory with input_block, 24, m_prime
+                    proc memory_set_qword from Memory with input_block, 32, t_iterations
+                    proc memory_set_qword from Memory with input_block, 40, ARGON2_TYPE_ID
+                    Note: input_block[48] = counter (set inside fill_address_block)
+                    Note: input_block[56] = 0 (already zeroed)
+                End If
+
+                Note: Position iteration: pass 0 slice 0 starts at index 2
+                Let starting_index be 0
+                If r_pass is equal to 0:
+                    If s_slice is equal to 0:
+                        Set starting_index to 2
+                    End If
+                End If
+
+                Let j be starting_index
+                While j is less than segment_length:
+                    Let cur_pos_in_lane be (s_slice multiplied by segment_length) plus j
+
+                    Note: Determine prev block position
+                    Let prev_pos be 0
+                    If cur_pos_in_lane is equal to 0:
+                        Set prev_pos to lane_length minus 1
+                    Otherwise:
+                        Set prev_pos to cur_pos_in_lane minus 1
+                    End If
+
+                    Let prev_block be matrix plus ((lane_idx multiplied by lane_length plus prev_pos) multiplied by ARGON2_BLOCK_SIZE)
+
+                    Note: Obtain (J1, J2)
+                    Let j1_val be 0
+                    Let j2_val be 0
+
+                    If is_argon2i_segment is not equal to 0:
+                        Note: Refill address block once every 128 positions or at j=0
+                        Let pos_in_addr_block be j modulo by 128
+                        If pos_in_addr_block is equal to 0:
+                            Set address_counter to address_counter plus 1
+                            Let fill_rc be proc argon2_fill_address_block with arena, r_pass, lane_idx, s_slice, p_parallelism, m_prime, t_iterations, ARGON2_TYPE_ID, address_counter, addr_block, zero_block, input_block
+                            If fill_rc is equal to 0:
+                                proc arena_destroy from Arena with arena
+                                Return 0
+                            End If
+                        End If
+                        Let pair_off be pos_in_addr_block multiplied by 8
+                        Let pair_word be proc memory_get_qword from Memory with addr_block, pair_off
+                        Set j1_val to pair_word bitwise_and U32_MASK_A2
+                        Set j2_val to pair_word divided by 4294967296
+                        Set j2_val to j2_val bitwise_and U32_MASK_A2
+                    Otherwise:
+                        Note: Argon2d: J1, J2 from prev_block[0..7]
+                        Let prev_word be proc memory_get_qword from Memory with prev_block, 0
+                        Set j1_val to prev_word bitwise_and U32_MASK_A2
+                        Set j2_val to prev_word divided by 4294967296
+                        Set j2_val to j2_val bitwise_and U32_MASK_A2
+                    End If
+
+                    Note: Decode ref_lane
+                    Let ref_lane be j2_val modulo by p_parallelism
+                    If r_pass is equal to 0:
+                        If s_slice is equal to 0:
+                            Set ref_lane to lane_idx
+                        End If
+                    End If
+
+                    Note: Compute ref_index in ref_lane
+                    Let ref_index be proc argon2_index_alpha with r_pass, s_slice, lane_idx, p_parallelism, segment_length, lane_length, j, ref_lane, j1_val
+
+                    Note: ref_block = B[ref_lane][ref_index]
+                    Let ref_block be matrix plus ((ref_lane multiplied by lane_length plus ref_index) multiplied by ARGON2_BLOCK_SIZE)
+
+                    Note: cur_block address
+                    Let cur_block be matrix plus ((lane_idx multiplied by lane_length plus cur_pos_in_lane) multiplied by ARGON2_BLOCK_SIZE)
+
+                    Note: new_block = G(prev, ref)
+                    Let g_rc be proc argon2_g_compress with arena, prev_block, ref_block, new_block
+                    If g_rc is equal to 0:
+                        proc arena_destroy from Arena with arena
+                        Return 0
+                    End If
+
+                    Note: For pass r > 0: new_block XOR= existing cur_block
+                    If r_pass is greater than 0:
+                        Let qi2 be 0
+                        While qi2 is less than ARGON2_QWORDS_PER_BLOCK:
+                            Let qoff2 be qi2 multiplied by 8
+                            Let nv be proc memory_get_qword from Memory with new_block, qoff2
+                            Let ov be proc memory_get_qword from Memory with cur_block, qoff2
+                            Let merged be nv bitwise_xor ov
+                            proc memory_set_qword from Memory with new_block, qoff2, merged
+                            Set qi2 to qi2 plus 1
+                        End While
+                    End If
+
+                    Note: Store new_block at cur position
+                    proc memory_copy from Memory with cur_block, new_block, ARGON2_BLOCK_SIZE
+
+                    Set j to j plus 1
+                End While
+
+                Set lane_idx to lane_idx plus 1
+            End While
+            Set s_slice to s_slice plus 1
+        End While
+        Set r_pass to r_pass plus 1
+    End While
+
+    Note: ---- Step 7: final aggregate ----
+    Note: Final = B[0][q-1] XOR B[1][q-1] XOR ... XOR B[p-1][q-1]
+    Let last_idx be lane_length minus 1
+    Let final_block be proc arena_allocate from Arena with arena, ARGON2_BLOCK_SIZE
+    If final_block is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+    Let lane_final_off_0 be last_idx multiplied by ARGON2_BLOCK_SIZE
+    proc memory_copy from Memory with final_block, matrix plus lane_final_off_0, ARGON2_BLOCK_SIZE
+
+    Let lane_x be 1
+    While lane_x is less than p_parallelism:
+        Let lane_off be (lane_x multiplied by lane_length plus last_idx) multiplied by ARGON2_BLOCK_SIZE
+        Let qi3 be 0
+        While qi3 is less than ARGON2_QWORDS_PER_BLOCK:
+            Let qoff3 be qi3 multiplied by 8
+            Let fv be proc memory_get_qword from Memory with final_block, qoff3
+            Let lv be proc memory_get_qword from Memory with matrix plus lane_off, qoff3
+            Let nv2 be fv bitwise_xor lv
+            proc memory_set_qword from Memory with final_block, qoff3, nv2
+            Set qi3 to qi3 plus 1
+        End While
+        Set lane_x to lane_x plus 1
+    End While
+
+    Note: ---- Step 8: tag = H'(final_block, output_len) ----
+    Let tag_rc be proc argon2_h_prime with arena, final_block, ARGON2_BLOCK_SIZE, output, output_len
+    If tag_rc is equal to 0:
+        proc arena_destroy from Arena with arena
+        Return 0
+    End If
+
+    Note: ---- Step 9: clean up sensitive intermediates ----
+    proc secure_zero from SecureMem with seed, seed_len
+    proc secure_zero from SecureMem with h_zero, ARGON2_PREHASH_DIGEST_LEN
+    proc secure_zero from SecureMem with h_seed, ARGON2_PREHASH_SEED_LEN
+    proc secure_zero from SecureMem with matrix, matrix_bytes
+    proc secure_zero from SecureMem with new_block, ARGON2_BLOCK_SIZE
+    proc secure_zero from SecureMem with addr_block, ARGON2_BLOCK_SIZE
+    proc secure_zero from SecureMem with input_block, ARGON2_BLOCK_SIZE
+    proc secure_zero from SecureMem with final_block, ARGON2_BLOCK_SIZE
+
+    proc arena_destroy from Arena with arena
+    Return 1
+End Process

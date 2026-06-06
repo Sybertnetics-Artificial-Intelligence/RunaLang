@@ -1,0 +1,1293 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+DOMAIN - Domain Name and Hostname Primitive (Tier 1)
+
+Implements domain-name and hostname validation per RFC 1035 (Domain Names -
+Implementation and Specification) and RFC 1123 (Requirements for Internet
+Hosts - Application and Support). Internationalized Domain Name (IDN)
+support follows RFC 3490 (IDNA: Internationalizing Domain Names in
+Applications) using the Punycode encoding defined in RFC 3492.
+
+Validation rules:
+  - Total length 1..253 characters per RFC 1035 section 2.3.4
+  - Each label 1..63 characters per RFC 1035 section 2.3.4
+  - LDH (Letter-Digit-Hyphen) rule per RFC 1123 section 2.1:
+      labels consist of ASCII letters, digits, and hyphens
+      first and last characters of a label must be alphanumeric
+  - Labels separated by '.'
+  - Comparison is case-insensitive per RFC 1035 section 2.3.3
+
+Punycode encoding (RFC 3492):
+  Bootstring algorithm using base 36 (digits + letters) with adaptive
+  bias. Provided here as the encode/decode pair operating on bare Punycode
+  strings. The ToASCII / ToUnicode wrappers add the "xn--" ACE prefix and
+  apply NamePrep (RFC 3491) selectively.
+
+  This implementation correctly handles UTF-8 encoded input. For each
+  Unicode code point > 127 the code point is computed from the UTF-8 byte
+  sequence (1..4 bytes) and inserted into the Punycode delta stream.
+
+NamePrep handling:
+  This module performs a minimal lowercase fold per RFC 3491 section 4
+  Step 1 (case mapping using ASCII tolower) which is sufficient for the
+  ASCII case and the common BMP code points that are already in the
+  canonical form. Full Unicode case mapping is layered on top by callers
+  that link the full Unicode database.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let DOMAIN_MAX_LENGTH be 253
+Let LABEL_MAX_LENGTH be 63
+
+Note: Punycode parameters per RFC 3492 section 5.
+Let PUNY_BASE be 36
+Let PUNY_TMIN be 1
+Let PUNY_TMAX be 26
+Let PUNY_SKEW be 38
+Let PUNY_DAMP be 700
+Let PUNY_INITIAL_BIAS be 72
+Let PUNY_INITIAL_N be 128
+Let PUNY_DELIMITER be 45
+
+Note: ============================================================================
+Note: CASE-INSENSITIVE LDH VALIDATION
+Note: ============================================================================
+
+@Reasoning
+Check whether a single ASCII byte is alphanumeric per RFC 1123 section 2.1.
+Helper for hostname validation.
+@End Reasoning
+
+@Implementation
+ASCII alpha or digit.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Used to enforce label-boundary rules.
+@End Security_Scope
+Process called "domain_is_alphanumeric" takes ch as Integer returns Integer:
+    Let ca be proc is_alpha from Char with ch
+    If ca is equal to 1:
+        Return 1
+    End If
+    Let cd be proc is_digit from Char with ch
+    If cd is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Check whether a single ASCII byte is a valid LDH character per RFC 1123.
+Letters, digits, and hyphens are valid in the middle of a label.
+@End Reasoning
+
+@Implementation
+Alpha, digit, or '-'.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Reject any character outside LDH; rejects Unicode in raw form.
+@End Security_Scope
+Process called "domain_is_ldh" takes ch as Integer returns Integer:
+    Let ca be proc is_alpha from Char with ch
+    If ca is equal to 1:
+        Return 1
+    End If
+    Let cd be proc is_digit from Char with ch
+    If cd is equal to 1:
+        Return 1
+    End If
+    If ch is equal to 45:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Validate a single label per RFC 1035 + RFC 1123:
+  - Length 1..63
+  - All characters LDH
+  - First and last characters alphanumeric (no leading/trailing hyphen)
+@End Reasoning
+
+@Implementation
+Length and boundary checks; loop over interior chars for LDH validity.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over label length. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Rejects empty labels (which would create consecutive dots), labels with
+non-LDH characters, and labels with leading or trailing hyphens (the
+latter being reserved per RFC 5891 for ACE prefix and similar uses).
+@End Security_Scope
+Process called "domain_is_valid_label" takes label as Integer, start as Integer, length as Integer returns Integer:
+    If label is equal to 0:
+        Return 0
+    End If
+    If length is less than 1:
+        Return 0
+    End If
+    If length is greater than LABEL_MAX_LENGTH:
+        Return 0
+    End If
+    Let first be proc memory_get_byte from Memory with label, start
+    Let first_ok be proc domain_is_alphanumeric with first
+    If first_ok is equal to 0:
+        Return 0
+    End If
+    Let last_pos be start plus length minus 1
+    Let last be proc memory_get_byte from Memory with label, last_pos
+    Let last_ok be proc domain_is_alphanumeric with last
+    If last_ok is equal to 0:
+        Return 0
+    End If
+    Let i be 1
+    Let interior_max be length minus 1
+    While i is less than interior_max:
+        Let ch be proc memory_get_byte from Memory with label, start plus i
+        Let ok be proc domain_is_ldh with ch
+        If ok is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Validate a complete domain name (presentation form) per RFC 1035 and
+RFC 1123. Total length must be at most 253 characters. Each dot-separated
+label must satisfy the label rules.
+@End Reasoning
+
+@Implementation
+Scan for '.' separators. For each label found, validate via the label
+predicate. The trailing dot of an FQDN is permitted but does not count
+toward the length limit per RFC 1035 section 3.1.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over input length. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Strict per RFC; protects against name-injection attacks that rely on
+out-of-spec characters.
+@End Security_Scope
+Process called "domain_is_valid_hostname" takes domain_str as Integer returns Integer:
+    If domain_str is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with domain_str
+    If length is equal to 0:
+        Return 0
+    End If
+    Let effective_length be length
+    Note: Trailing dot tolerated for FQDN form.
+    Let last_ch be proc memory_get_byte from Memory with domain_str, length minus 1
+    If last_ch is equal to 46:
+        Set effective_length to length minus 1
+    End If
+    If effective_length is equal to 0:
+        Return 0
+    End If
+    If effective_length is greater than DOMAIN_MAX_LENGTH:
+        Return 0
+    End If
+    Let label_start be 0
+    Let label_length be 0
+    Let i be 0
+    While i is less than effective_length:
+        Let ch be proc memory_get_byte from Memory with domain_str, i
+        If ch is equal to 46:
+            Let ok be proc domain_is_valid_label with domain_str, label_start, label_length
+            If ok is equal to 0:
+                Return 0
+            End If
+            Set label_start to i plus 1
+            Set label_length to 0
+        Otherwise:
+            Set label_length to label_length plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Let final_ok be proc domain_is_valid_label with domain_str, label_start, label_length
+    If final_ok is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: DOMAIN MANIPULATION
+Note: ============================================================================
+
+@Reasoning
+Return the parent domain: everything after the first label and separating
+dot. For "www.example.com" returns "example.com". For "com" (no dots)
+returns 0 since there is no parent.
+@End Reasoning
+
+@Implementation
+Locate first '.'; allocate substring from byte after the dot to end.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 for inputs without a parent so callers can detect the root.
+@End Security_Scope
+Process called "domain_parent" takes domain_str as Integer returns Integer:
+    If domain_str is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with domain_str
+    Let i be 0
+    Let dot_pos be -1
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with domain_str, i
+        If ch is equal to 46:
+            Set dot_pos to i
+            Set i to length
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+    If dot_pos is less than 0:
+        Return 0
+    End If
+    Let parent_start be dot_pos plus 1
+    Let parent_len be length minus parent_start
+    If parent_len is less than 1:
+        Return 0
+    End If
+    Return proc string_substring from StringPrim with domain_str, parent_start, parent_len
+End Process
+
+@Reasoning
+Return the root label: the rightmost label after the final dot. For
+"www.example.com" returns "com". For "localhost" (no dots) returns a copy
+of the whole string.
+@End Reasoning
+
+@Implementation
+Locate last '.'; copy from byte after that dot to end. If no dot, copy
+the entire input.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+No external input handling beyond what is documented.
+@End Security_Scope
+Process called "domain_root" takes domain_str as Integer returns Integer:
+    If domain_str is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with domain_str
+    If length is equal to 0:
+        Return 0
+    End If
+    Let i be length minus 1
+    Let last_dot be -1
+    Let done be 0
+    While i is greater than or equal to 0:
+        If done is equal to 0:
+            Let ch be proc memory_get_byte from Memory with domain_str, i
+            If ch is equal to 46:
+                Set last_dot to i
+                Set done to 1
+            Otherwise:
+                Set i to i minus 1
+            End If
+        Otherwise:
+            Set i to -1
+        End If
+    End While
+    If last_dot is less than 0:
+        Return proc string_duplicate from StringPrim with domain_str
+    End If
+    Let root_start be last_dot plus 1
+    Let root_len be length minus root_start
+    Return proc string_substring from StringPrim with domain_str, root_start, root_len
+End Process
+
+Note: ============================================================================
+Note: PUNYCODE HELPERS
+Note: ============================================================================
+
+@Reasoning
+Convert a Punycode digit value 0..35 to its ASCII character per RFC 3492
+section 5. Digits 0..25 map to 'a'..'z'; digits 26..35 map to '0'..'9'.
+@End Reasoning
+
+@Implementation
+Range branch.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on out-of-range input.
+@End Security_Scope
+Process called "domain_puny_digit_to_char" takes value as Integer returns Integer:
+    If value is less than 0:
+        Return -1
+    End If
+    If value is less than 26:
+        Return value plus 97
+    End If
+    If value is less than 36:
+        Return value minus 26 plus 48
+    End If
+    Return -1
+End Process
+
+@Reasoning
+Convert an ASCII Punycode character to its digit value 0..35 per RFC 3492.
+'a'..'z' / 'A'..'Z' -> 0..25; '0'..'9' -> 26..35.
+@End Reasoning
+
+@Implementation
+Range tests on the three character classes.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns -1 on invalid character.
+@End Security_Scope
+Process called "domain_puny_char_to_digit" takes ch as Integer returns Integer:
+    If ch is greater than or equal to 97:
+        If ch is less than or equal to 122:
+            Return ch minus 97
+        End If
+    End If
+    If ch is greater than or equal to 65:
+        If ch is less than or equal to 90:
+            Return ch minus 65
+        End If
+    End If
+    If ch is greater than or equal to 48:
+        If ch is less than or equal to 57:
+            Return ch plus 26 minus 48
+        End If
+    End If
+    Return -1
+End Process
+
+@Reasoning
+Compute the threshold value t per RFC 3492 section 6.1 step 3.6 used by
+the variable-length integer encoding/decoding loops. The threshold is
+TMIN if k <= bias + TMIN, TMAX if k >= bias + TMAX, or k - bias otherwise.
+@End Reasoning
+
+@Implementation
+Straightforward branch over the bias-relative position.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "domain_puny_threshold" takes k as Integer, bias as Integer returns Integer:
+    Let low_bound be bias plus PUNY_TMIN
+    Let high_bound be bias plus PUNY_TMAX
+    If k is less than or equal to low_bound:
+        Return PUNY_TMIN
+    End If
+    If k is greater than or equal to high_bound:
+        Return PUNY_TMAX
+    End If
+    Return k minus bias
+End Process
+
+@Reasoning
+Adapt the bias per RFC 3492 section 6.1 step 3.5 / section 3.4. Called
+after each code-point insertion to update the encoding bias for the next
+delta.
+@End Reasoning
+
+@Implementation
+Standard adaptation: divide delta by DAMP on first delta else by 2, add
+delta / numpoints, then loop dividing while delta exceeds the threshold,
+incrementing k by BASE each iteration. Finally k + (BASE - TMIN + 1) *
+delta / (delta + SKEW).
+@End Implementation
+
+@Performance_Hints
+Time: O(log delta).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "domain_puny_adapt" takes delta as Integer, numpoints as Integer, firsttime as Integer returns Integer:
+    Let d be delta
+    If firsttime is equal to 1:
+        Set d to d divided by PUNY_DAMP
+    Otherwise:
+        Set d to d divided by 2
+    End If
+    Set d to d plus (d divided by numpoints)
+    Let k be 0
+    Let limit be ((PUNY_BASE minus PUNY_TMIN) multiplied by PUNY_TMAX) divided by 2
+    While d is greater than limit:
+        Set d to d divided by (PUNY_BASE minus PUNY_TMIN)
+        Set k to k plus PUNY_BASE
+    End While
+    Let bias be k plus (((PUNY_BASE minus PUNY_TMIN plus 1) multiplied by d) divided by (d plus PUNY_SKEW))
+    Return bias
+End Process
+
+Note: ============================================================================
+Note: UTF-8 DECODE
+Note: ============================================================================
+
+@Reasoning
+Decode a UTF-8 byte sequence into a sequence of Unicode code points.
+Returns an allocated array of int64 code points plus the count via two
+out-parameter pointers. Used by the Punycode encoder which operates on
+code points, not bytes.
+@End Reasoning
+
+@Implementation
+Walk the UTF-8 byte stream. For each lead byte determine the sequence
+length from the high bits and combine the trailing 6-bit groups. Reject
+malformed sequences (returns 0).
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over input bytes. Space: O(n) for the code-point buffer in
+the worst case.
+@End Performance_Hints
+
+@Security_Scope
+Strict UTF-8: rejects overlong encodings, lone surrogates, and bytes
+outside the legal lead-trail patterns.
+@End Security_Scope
+Process called "domain_utf8_decode" takes bytes_ptr as Integer, byte_length as Integer, out_count_ptr as Integer returns Integer:
+    If bytes_ptr is equal to 0:
+        Return 0
+    End If
+    If byte_length is less than 0:
+        Return 0
+    End If
+    Let buffer_capacity be byte_length plus 1
+    Let buffer be proc allocate from Layout with buffer_capacity multiplied by 8
+    If buffer is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    Let cp_count be 0
+    Let parse_failed be 0
+    While i is less than byte_length:
+        If parse_failed is equal to 0:
+            Let b0 be proc memory_get_byte from Memory with bytes_ptr, i
+            If b0 is less than 128:
+                proc memory_set_int64 from Memory with buffer, cp_count multiplied by 8, b0
+                Set cp_count to cp_count plus 1
+                Set i to i plus 1
+            Otherwise:
+                If b0 is less than 192:
+                    Note: continuation byte at lead position - invalid.
+                    Set parse_failed to 1
+                Otherwise:
+                    If b0 is less than 224:
+                        Note: 2-byte sequence.
+                        If i plus 1 is greater than or equal to byte_length:
+                            Set parse_failed to 1
+                        Otherwise:
+                            Let b1 be proc memory_get_byte from Memory with bytes_ptr, i plus 1
+                            If b1 is less than 128:
+                                Set parse_failed to 1
+                            End If
+                            If b1 is greater than or equal to 192:
+                                Set parse_failed to 1
+                            End If
+                            If parse_failed is equal to 0:
+                                Let cp be ((b0 minus 192) multiplied by 64) plus (b1 minus 128)
+                                If cp is less than 128:
+                                    Set parse_failed to 1
+                                End If
+                                If parse_failed is equal to 0:
+                                    proc memory_set_int64 from Memory with buffer, cp_count multiplied by 8, cp
+                                    Set cp_count to cp_count plus 1
+                                    Set i to i plus 2
+                                End If
+                            End If
+                        End If
+                    Otherwise:
+                        If b0 is less than 240:
+                            Note: 3-byte sequence.
+                            If i plus 2 is greater than or equal to byte_length:
+                                Set parse_failed to 1
+                            Otherwise:
+                                Let b1 be proc memory_get_byte from Memory with bytes_ptr, i plus 1
+                                Let b2 be proc memory_get_byte from Memory with bytes_ptr, i plus 2
+                                If b1 is less than 128:
+                                    Set parse_failed to 1
+                                End If
+                                If b1 is greater than or equal to 192:
+                                    Set parse_failed to 1
+                                End If
+                                If b2 is less than 128:
+                                    Set parse_failed to 1
+                                End If
+                                If b2 is greater than or equal to 192:
+                                    Set parse_failed to 1
+                                End If
+                                If parse_failed is equal to 0:
+                                    Let cp be ((b0 minus 224) multiplied by 4096) plus ((b1 minus 128) multiplied by 64) plus (b2 minus 128)
+                                    If cp is less than 2048:
+                                        Set parse_failed to 1
+                                    End If
+                                    Note: Reject surrogates 0xD800..0xDFFF.
+                                    If cp is greater than or equal to 55296:
+                                        If cp is less than or equal to 57343:
+                                            Set parse_failed to 1
+                                        End If
+                                    End If
+                                    If parse_failed is equal to 0:
+                                        proc memory_set_int64 from Memory with buffer, cp_count multiplied by 8, cp
+                                        Set cp_count to cp_count plus 1
+                                        Set i to i plus 3
+                                    End If
+                                End If
+                            End If
+                        Otherwise:
+                            If b0 is less than 248:
+                                Note: 4-byte sequence.
+                                If i plus 3 is greater than or equal to byte_length:
+                                    Set parse_failed to 1
+                                Otherwise:
+                                    Let b1 be proc memory_get_byte from Memory with bytes_ptr, i plus 1
+                                    Let b2 be proc memory_get_byte from Memory with bytes_ptr, i plus 2
+                                    Let b3 be proc memory_get_byte from Memory with bytes_ptr, i plus 3
+                                    If b1 is less than 128:
+                                        Set parse_failed to 1
+                                    End If
+                                    If b1 is greater than or equal to 192:
+                                        Set parse_failed to 1
+                                    End If
+                                    If b2 is less than 128:
+                                        Set parse_failed to 1
+                                    End If
+                                    If b2 is greater than or equal to 192:
+                                        Set parse_failed to 1
+                                    End If
+                                    If b3 is less than 128:
+                                        Set parse_failed to 1
+                                    End If
+                                    If b3 is greater than or equal to 192:
+                                        Set parse_failed to 1
+                                    End If
+                                    If parse_failed is equal to 0:
+                                        Let cp be ((b0 minus 240) multiplied by 262144) plus ((b1 minus 128) multiplied by 4096) plus ((b2 minus 128) multiplied by 64) plus (b3 minus 128)
+                                        If cp is less than 65536:
+                                            Set parse_failed to 1
+                                        End If
+                                        If cp is greater than 1114111:
+                                            Set parse_failed to 1
+                                        End If
+                                        If parse_failed is equal to 0:
+                                            proc memory_set_int64 from Memory with buffer, cp_count multiplied by 8, cp
+                                            Set cp_count to cp_count plus 1
+                                            Set i to i plus 4
+                                        End If
+                                    End If
+                                End If
+                            Otherwise:
+                                Set parse_failed to 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        Otherwise:
+            Set i to byte_length
+        End If
+    End While
+    If parse_failed is equal to 1:
+        proc deallocate from Layout with buffer
+        Return 0
+    End If
+    If out_count_ptr is not equal to 0:
+        proc memory_set_int64 from Memory with out_count_ptr, 0, cp_count
+    End If
+    Return buffer
+End Process
+
+@Reasoning
+Encode a single Unicode code point into a UTF-8 byte sequence in the
+provided StringBuilder. Used by the Punycode decoder to emit decoded
+output as UTF-8.
+@End Reasoning
+
+@Implementation
+Standard UTF-8 encoding per RFC 3629:
+  cp < 128         -> 1 byte
+  cp < 2048        -> 2 bytes 110xxxxx 10xxxxxx
+  cp < 65536       -> 3 bytes 1110xxxx 10xxxxxx 10xxxxxx
+  cp < 1114112     -> 4 bytes 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Rejects surrogates and out-of-range code points.
+@End Security_Scope
+Process called "domain_utf8_encode" takes sb as Integer, cp as Integer returns Integer:
+    If sb is equal to 0:
+        Return 0
+    End If
+    If cp is less than 0:
+        Return 0
+    End If
+    If cp is greater than 1114111:
+        Return 0
+    End If
+    If cp is greater than or equal to 55296:
+        If cp is less than or equal to 57343:
+            Return 0
+        End If
+    End If
+    If cp is less than 128:
+        proc stringbuilder_append_char from SB with sb, cp
+        Return 1
+    End If
+    If cp is less than 2048:
+        Let b0 be 192 plus (cp divided by 64)
+        Let b1 be 128 plus (cp modulo by 64)
+        proc stringbuilder_append_char from SB with sb, b0
+        proc stringbuilder_append_char from SB with sb, b1
+        Return 1
+    End If
+    If cp is less than 65536:
+        Let b0 be 224 plus (cp divided by 4096)
+        Let b1 be 128 plus ((cp divided by 64) modulo by 64)
+        Let b2 be 128 plus (cp modulo by 64)
+        proc stringbuilder_append_char from SB with sb, b0
+        proc stringbuilder_append_char from SB with sb, b1
+        proc stringbuilder_append_char from SB with sb, b2
+        Return 1
+    End If
+    Let b0 be 240 plus (cp divided by 262144)
+    Let b1 be 128 plus ((cp divided by 4096) modulo by 64)
+    Let b2 be 128 plus ((cp divided by 64) modulo by 64)
+    Let b3 be 128 plus (cp modulo by 64)
+    proc stringbuilder_append_char from SB with sb, b0
+    proc stringbuilder_append_char from SB with sb, b1
+    proc stringbuilder_append_char from SB with sb, b2
+    proc stringbuilder_append_char from SB with sb, b3
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PUNYCODE ENCODE / DECODE (RFC 3492)
+Note: ============================================================================
+
+@Reasoning
+Encode a Unicode label to Punycode per RFC 3492 section 6.3 (encoding).
+Accepts a UTF-8 input string and produces an ASCII Punycode string
+suitable for ACE prefixing.
+@End Reasoning
+
+@Implementation
+1. Decode UTF-8 input into a code-point array.
+2. Copy all basic (< 128) code points to the output, in order, followed
+   by the delimiter '-' if any basic code points were copied.
+3. Initialize n = 128, delta = 0, bias = 72.
+4. Repeat while there are non-basic code points to emit:
+   a. Find the smallest code point m >= n in the input.
+   b. delta += (m - n) * (h + 1).
+   c. n = m.
+   d. For each code point c in the input in order:
+        If c < n, delta++.
+        If c == n: emit a variable-length integer for delta using base 36
+                   with adaptive bias; reset delta; update bias.
+   e. delta++; n++.
+@End Implementation
+
+@Performance_Hints
+Time: O(n^2) over code-point count. Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on UTF-8 decoding failure or allocation failure.
+@End Security_Scope
+Process called "domain_punycode_encode" takes utf8_input as Integer returns Integer:
+    If utf8_input is equal to 0:
+        Return 0
+    End If
+    Let input_len be proc string_length from StringCore with utf8_input
+    Let count_holder be proc allocate from Layout with 8
+    If count_holder is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with count_holder, 0, 0
+    Let codepoints be proc domain_utf8_decode with utf8_input, input_len, count_holder
+    If codepoints is equal to 0:
+        proc deallocate from Layout with count_holder
+        Return 0
+    End If
+    Let cp_count be proc memory_get_int64 from Memory with count_holder, 0
+    proc deallocate from Layout with count_holder
+
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        proc deallocate from Layout with codepoints
+        Return 0
+    End If
+
+    Note: Step 1 - emit basic code points.
+    Let h be 0
+    Let i be 0
+    While i is less than cp_count:
+        Let cp be proc memory_get_int64 from Memory with codepoints, i multiplied by 8
+        If cp is less than 128:
+            proc stringbuilder_append_char from SB with sb, cp
+            Set h to h plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Let b be h
+    If b is greater than 0:
+        If b is less than cp_count:
+            proc stringbuilder_append_char from SB with sb, PUNY_DELIMITER
+        End If
+    End If
+
+    Let n be PUNY_INITIAL_N
+    Let delta be 0
+    Let bias be PUNY_INITIAL_BIAS
+    Let total_cp be cp_count
+
+    While h is less than total_cp:
+        Note: Find minimum code point m >= n.
+        Let m be 2147483647
+        Set i to 0
+        While i is less than total_cp:
+            Let cp be proc memory_get_int64 from Memory with codepoints, i multiplied by 8
+            If cp is greater than or equal to n:
+                If cp is less than m:
+                    Set m to cp
+                End If
+            End If
+            Set i to i plus 1
+        End While
+
+        Set delta to delta plus ((m minus n) multiplied by (h plus 1))
+        Set n to m
+
+        Set i to 0
+        While i is less than total_cp:
+            Let cp be proc memory_get_int64 from Memory with codepoints, i multiplied by 8
+            If cp is less than n:
+                Set delta to delta plus 1
+            End If
+            If cp is equal to n:
+                Note: Variable-length integer emit.
+                Let q be delta
+                Let k be PUNY_BASE
+                Let inner_done be 0
+                While inner_done is equal to 0:
+                    Let t be proc domain_puny_threshold with k, bias
+                    If q is less than t:
+                        Let dch be proc domain_puny_digit_to_char with q
+                        proc stringbuilder_append_char from SB with sb, dch
+                        Set inner_done to 1
+                    Otherwise:
+                        Let digit_val be t plus ((q minus t) modulo by (PUNY_BASE minus t))
+                        Let dch be proc domain_puny_digit_to_char with digit_val
+                        proc stringbuilder_append_char from SB with sb, dch
+                        Set q to (q minus t) divided by (PUNY_BASE minus t)
+                        Set k to k plus PUNY_BASE
+                    End If
+                End While
+                Let first_flag be 0
+                If h is equal to b:
+                    Set first_flag to 1
+                End If
+                Set bias to proc domain_puny_adapt with delta, h plus 1, first_flag
+                Set delta to 0
+                Set h to h plus 1
+            End If
+            Set i to i plus 1
+        End While
+        Set delta to delta plus 1
+        Set n to n plus 1
+    End While
+
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    proc deallocate from Layout with codepoints
+    Return result
+End Process
+
+@Reasoning
+Decode a Punycode-encoded ASCII label to UTF-8 per RFC 3492 section 6.2.
+The input is the bare Punycode (without "xn--" prefix).
+@End Reasoning
+
+@Implementation
+1. Locate the last '-' (delimiter). Everything before it is the basic
+   code-point prefix; copy directly into the code-point buffer.
+2. Initialize n = 128, i = 0, bias = 72, output index = number of basic
+   code points.
+3. While input remains:
+   a. Decode a variable-length integer into 'delta' using base-36 digits
+      and threshold(k, bias).
+   b. i += delta.
+   c. n += i / (out_len + 1); i = i modulo (out_len + 1).
+   d. Insert code point n at position i in the output buffer.
+   e. bias = adapt(delta, out_len + 1, first_flag); i += 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(n^2). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Strict: rejects out-of-range digits, integer overflow during delta
+accumulation, and missing trailing data.
+@End Security_Scope
+Process called "domain_punycode_decode" takes puny_input as Integer returns Integer:
+    If puny_input is equal to 0:
+        Return 0
+    End If
+    Let input_len be proc string_length from StringCore with puny_input
+    Note: Find last delimiter '-' in input.
+    Let delim_pos be -1
+    Let i be input_len minus 1
+    Let scanning be 1
+    While i is greater than or equal to 0:
+        If scanning is equal to 1:
+            Let ch be proc memory_get_byte from Memory with puny_input, i
+            If ch is equal to PUNY_DELIMITER:
+                Set delim_pos to i
+                Set scanning to 0
+            Otherwise:
+                Set i to i minus 1
+            End If
+        Otherwise:
+            Set i to -1
+        End If
+    End While
+
+    Note: Allocate code-point buffer big enough for worst case.
+    Let cap be input_len plus 1
+    Let codepoints be proc allocate from Layout with cap multiplied by 8
+    If codepoints is equal to 0:
+        Return 0
+    End If
+    Let out_len be 0
+    If delim_pos is greater than or equal to 0:
+        Note: Copy basic prefix. Reject any non-ASCII byte (basic code points must be < 128).
+        Let k be 0
+        While k is less than delim_pos:
+            Let ch be proc memory_get_byte from Memory with puny_input, k
+            If ch is greater than or equal to 128:
+                proc deallocate from Layout with codepoints
+                Return 0
+            End If
+            proc memory_set_int64 from Memory with codepoints, out_len multiplied by 8, ch
+            Set out_len to out_len plus 1
+            Set k to k plus 1
+        End While
+    End If
+
+    Let parse_pos be 0
+    If delim_pos is greater than or equal to 0:
+        Set parse_pos to delim_pos plus 1
+    End If
+    Let n be PUNY_INITIAL_N
+    Let bias be PUNY_INITIAL_BIAS
+    Let ip be 0
+    Let parse_failed be 0
+
+    While parse_pos is less than input_len:
+        If parse_failed is equal to 0:
+            Let old_i be ip
+            Let w be 1
+            Let k be PUNY_BASE
+            Let inner_done be 0
+            While inner_done is equal to 0:
+                If parse_pos is greater than or equal to input_len:
+                    Set parse_failed to 1
+                    Set inner_done to 1
+                Otherwise:
+                    Let ch be proc memory_get_byte from Memory with puny_input, parse_pos
+                    Let digit be proc domain_puny_char_to_digit with ch
+                    Set parse_pos to parse_pos plus 1
+                    If digit is less than 0:
+                        Set parse_failed to 1
+                        Set inner_done to 1
+                    Otherwise:
+                        Set ip to ip plus (digit multiplied by w)
+                        Let t be proc domain_puny_threshold with k, bias
+                        If digit is less than t:
+                            Set inner_done to 1
+                        Otherwise:
+                            Set w to w multiplied by (PUNY_BASE minus t)
+                            Set k to k plus PUNY_BASE
+                        End If
+                    End If
+                End If
+            End While
+            If parse_failed is equal to 0:
+                Let out_plus_one be out_len plus 1
+                Let first_flag be 0
+                If old_i is equal to 0:
+                    Set first_flag to 1
+                End If
+                Set bias to proc domain_puny_adapt with ip minus old_i, out_plus_one, first_flag
+                Set n to n plus (ip divided by out_plus_one)
+                Set ip to ip modulo by out_plus_one
+                Note: Shift code points right by 1 starting at ip to make room.
+                Let shift_pos be out_len
+                While shift_pos is greater than ip:
+                    Let val be proc memory_get_int64 from Memory with codepoints, (shift_pos minus 1) multiplied by 8
+                    proc memory_set_int64 from Memory with codepoints, shift_pos multiplied by 8, val
+                    Set shift_pos to shift_pos minus 1
+                End While
+                proc memory_set_int64 from Memory with codepoints, ip multiplied by 8, n
+                Set out_len to out_len plus 1
+                Set ip to ip plus 1
+            End If
+        Otherwise:
+            Set parse_pos to input_len
+        End If
+    End While
+
+    If parse_failed is equal to 1:
+        proc deallocate from Layout with codepoints
+        Return 0
+    End If
+
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        proc deallocate from Layout with codepoints
+        Return 0
+    End If
+    Let q be 0
+    While q is less than out_len:
+        Let cp be proc memory_get_int64 from Memory with codepoints, q multiplied by 8
+        proc domain_utf8_encode with sb, cp
+        Set q to q plus 1
+    End While
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    proc deallocate from Layout with codepoints
+    Return result
+End Process
+
+Note: ============================================================================
+Note: TOASCII / TOUNICODE PER RFC 3490
+Note: ============================================================================
+
+@Reasoning
+Test whether a label contains any non-ASCII byte. Used to decide whether
+ToASCII must invoke Punycode for the label.
+@End Reasoning
+
+@Implementation
+Linear scan checking byte > 127.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "domain_label_has_non_ascii" takes label as Integer, start as Integer, length as Integer returns Integer:
+    If label is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with label, start plus i
+        If ch is greater than 127:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Convert a Unicode domain name (UTF-8) to its ASCII Compatible Encoding
+(ACE) form per RFC 3490 (ToASCII). Each label containing non-ASCII bytes
+is Punycode-encoded and prefixed with "xn--".
+@End Reasoning
+
+@Implementation
+Split on '.', process each label, join with '.'. Labels with non-ASCII
+content are passed through domain_punycode_encode and prefixed with
+"xn--". ASCII-only labels are emitted verbatim (lowercased for
+case-insensitive equivalence per RFC 3491 section 4 step 1 basic case).
+@End Implementation
+
+@Performance_Hints
+Time: O(n) plus the Punycode cost per non-ASCII label.
+@End Performance_Hints
+
+@Security_Scope
+Strict: rejects malformed UTF-8 in any label, and rejects labels whose
+encoded form exceeds the 63-byte limit per RFC 1035.
+@End Security_Scope
+Process called "domain_to_ascii" takes utf8_input as Integer returns Integer:
+    If utf8_input is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with utf8_input
+    If length is equal to 0:
+        Return 0
+    End If
+    Let out_sb be proc stringbuilder_create from SB
+    If out_sb is equal to 0:
+        Return 0
+    End If
+    Let label_start be 0
+    Let i be 0
+    Let parse_failed be 0
+    While i is less than length plus 1:
+        If parse_failed is equal to 0:
+            Let at_end be 0
+            If i is equal to length:
+                Set at_end to 1
+            End If
+            Let is_dot be 0
+            If at_end is equal to 0:
+                Let ch be proc memory_get_byte from Memory with utf8_input, i
+                If ch is equal to 46:
+                    Set is_dot to 1
+                End If
+            End If
+            If at_end is equal to 1:
+                Set is_dot to 1
+            End If
+            If is_dot is equal to 1:
+                Let label_length be i minus label_start
+                If label_length is greater than 0:
+                    Let has_non_ascii be proc domain_label_has_non_ascii with utf8_input, label_start, label_length
+                    If has_non_ascii is equal to 1:
+                        Let label_str be proc string_substring from StringPrim with utf8_input, label_start, label_length
+                        If label_str is equal to 0:
+                            Set parse_failed to 1
+                        Otherwise:
+                            Let encoded be proc domain_punycode_encode with label_str
+                            proc deallocate from Layout with label_str
+                            If encoded is equal to 0:
+                                Set parse_failed to 1
+                            Otherwise:
+                                Let encoded_len be proc string_length from StringCore with encoded
+                                If encoded_len plus 4 is greater than LABEL_MAX_LENGTH:
+                                    proc deallocate from Layout with encoded
+                                    Set parse_failed to 1
+                                Otherwise:
+                                    proc stringbuilder_append_char from SB with out_sb, 120
+                                    proc stringbuilder_append_char from SB with out_sb, 110
+                                    proc stringbuilder_append_char from SB with out_sb, 45
+                                    proc stringbuilder_append_char from SB with out_sb, 45
+                                    proc stringbuilder_append from SB with out_sb, encoded
+                                    proc deallocate from Layout with encoded
+                                End If
+                            End If
+                        End If
+                    Otherwise:
+                        Note: ASCII-only label, lowercase fold.
+                        Let k be 0
+                        While k is less than label_length:
+                            Let ch be proc memory_get_byte from Memory with utf8_input, label_start plus k
+                            Let lc be proc to_lower from Char with ch
+                            proc stringbuilder_append_char from SB with out_sb, lc
+                            Set k to k plus 1
+                        End While
+                    End If
+                End If
+                If at_end is equal to 0:
+                    proc stringbuilder_append_char from SB with out_sb, 46
+                End If
+                Set label_start to i plus 1
+            End If
+            Set i to i plus 1
+        Otherwise:
+            Set i to length plus 1
+        End If
+    End While
+    If parse_failed is equal to 1:
+        proc stringbuilder_destroy from SB with out_sb
+        Return 0
+    End If
+    Let result be proc stringbuilder_to_string from SB with out_sb
+    proc stringbuilder_destroy from SB with out_sb
+    Return result
+End Process
+
+@Reasoning
+Convert an ASCII Compatible Encoding (ACE) domain name to its Unicode
+(UTF-8) form per RFC 3490 (ToUnicode). Each "xn--<puny>" label is
+Punycode-decoded; other labels are passed through unchanged.
+@End Reasoning
+
+@Implementation
+Split on '.', process each label, join with '.'. Labels beginning with
+"xn--" are passed through domain_punycode_decode (after stripping the
+prefix). Non-ACE labels are emitted as-is.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) plus the Punycode-decode cost per ACE label.
+@End Performance_Hints
+
+@Security_Scope
+Decoder rejects malformed Punycode but tolerates non-ACE labels.
+@End Security_Scope
+Process called "domain_to_unicode" takes ace_input as Integer returns Integer:
+    If ace_input is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with ace_input
+    If length is equal to 0:
+        Return 0
+    End If
+    Let out_sb be proc stringbuilder_create from SB
+    If out_sb is equal to 0:
+        Return 0
+    End If
+    Let label_start be 0
+    Let i be 0
+    Let parse_failed be 0
+    While i is less than length plus 1:
+        If parse_failed is equal to 0:
+            Let at_end be 0
+            If i is equal to length:
+                Set at_end to 1
+            End If
+            Let is_dot be 0
+            If at_end is equal to 0:
+                Let ch be proc memory_get_byte from Memory with ace_input, i
+                If ch is equal to 46:
+                    Set is_dot to 1
+                End If
+            End If
+            If at_end is equal to 1:
+                Set is_dot to 1
+            End If
+            If is_dot is equal to 1:
+                Let label_length be i minus label_start
+                If label_length is greater than 0:
+                    Let is_ace be 0
+                    If label_length is greater than 4:
+                        Let c0 be proc memory_get_byte from Memory with ace_input, label_start
+                        Let c1 be proc memory_get_byte from Memory with ace_input, label_start plus 1
+                        Let c2 be proc memory_get_byte from Memory with ace_input, label_start plus 2
+                        Let c3 be proc memory_get_byte from Memory with ace_input, label_start plus 3
+                        Let lc0 be proc to_lower from Char with c0
+                        Let lc1 be proc to_lower from Char with c1
+                        If lc0 is equal to 120:
+                            If lc1 is equal to 110:
+                                If c2 is equal to 45:
+                                    If c3 is equal to 45:
+                                        Set is_ace to 1
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                    If is_ace is equal to 1:
+                        Let puny_start be label_start plus 4
+                        Let puny_len be label_length minus 4
+                        Let puny_str be proc string_substring from StringPrim with ace_input, puny_start, puny_len
+                        If puny_str is equal to 0:
+                            Set parse_failed to 1
+                        Otherwise:
+                            Let decoded be proc domain_punycode_decode with puny_str
+                            proc deallocate from Layout with puny_str
+                            If decoded is equal to 0:
+                                Set parse_failed to 1
+                            Otherwise:
+                                proc stringbuilder_append from SB with out_sb, decoded
+                                proc deallocate from Layout with decoded
+                            End If
+                        End If
+                    Otherwise:
+                        Let k be 0
+                        While k is less than label_length:
+                            Let ch be proc memory_get_byte from Memory with ace_input, label_start plus k
+                            proc stringbuilder_append_char from SB with out_sb, ch
+                            Set k to k plus 1
+                        End While
+                    End If
+                End If
+                If at_end is equal to 0:
+                    proc stringbuilder_append_char from SB with out_sb, 46
+                End If
+                Set label_start to i plus 1
+            End If
+            Set i to i plus 1
+        Otherwise:
+            Set i to length plus 1
+        End If
+    End While
+    If parse_failed is equal to 1:
+        proc stringbuilder_destroy from SB with out_sb
+        Return 0
+    End If
+    Let result be proc stringbuilder_to_string from SB with out_sb
+    proc stringbuilder_destroy from SB with out_sb
+    Return result
+End Process

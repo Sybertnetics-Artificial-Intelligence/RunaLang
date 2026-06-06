@@ -1,0 +1,297 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+CARGO.TOML INTEROP - Rust Crate Manifest Adapter (Tier 1)
+
+Adapter from Cargo.toml subset to the Runa-native PackageManifest. The
+adapter takes a pre-parsed Dictionary<String, ConfigValue> (produced by
+the config module's TOML parser) and constructs the equivalent
+PackageManifest, mapping the standard [package] section, [dependencies]
+table, and [[bin]] / [[test]] / [[example]] / [[bench]] arrays.
+
+This module is the substrate-side mapping policy. It does NOT itself
+parse TOML; that is the job of config/config.runa which dispatches by
+file extension. By splitting concerns this way we get:
+  1. A single TOML parser to maintain, not several.
+  2. A typed adapter that fails loudly when Cargo schema deviates from
+     ours, instead of silently dropping fields.
+  3. Independent testability of the parser and the adapter.
+
+KEY FIELDS ADAPTED (per Cargo 1.78 manifest reference):
+  [package].name              -> manifest_name
+  [package].version           -> manifest_version
+  [package].authors           -> manifest_authors
+  [package].description       -> manifest_description
+  [package].license           -> manifest_license
+  [package].repository        -> manifest_repository
+  [package].homepage          -> (writes to homepage slot)
+  [package].keywords          -> manifest_keywords
+  [dependencies].<name>       -> manifest_add_dependency (DEP_REGISTRY)
+  [dev-dependencies].<name>   -> manifest_add_dev_dependency
+  [[bin]] / [[example]] / ... -> manifest_add_target
+
+EXPLICITLY UNSUPPORTED (rejected with sentinel):
+  - Workspace inheritance ([workspace] / workspace = true) - Runa
+    packages do not adopt the Cargo workspace concept.
+  - Cargo features with target-specific gating - Runa's substrate
+    expresses these as conditional dependencies, not feature flags.
+  - Platform-cfg dependency tables - Runa uses its own target predicate
+    grammar.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/manifest/version_constraint.runa" as VC
+Import "compiler/frontend/primitives/manifest/dependency_spec.runa" as Dep
+Import "compiler/frontend/primitives/manifest/package_manifest.runa" as PM
+
+Note: ============================================================================
+Note: ERROR CODES
+Note: ============================================================================
+
+Let CARGO_ERR_NO_PACKAGE be 1
+Let CARGO_ERR_NO_NAME be 2
+Let CARGO_ERR_NO_VERSION be 3
+Let CARGO_ERR_BAD_VERSION be 4
+Let CARGO_ERR_WORKSPACE_UNSUPPORTED be 5
+Let CARGO_ERR_INVALID_DEPENDENCY be 6
+
+Note: ============================================================================
+Note: ADAPT: NAME+VERSION PROBE
+Note: ============================================================================
+
+@Reasoning
+Build a minimal PackageManifest from explicit name and version-string
+inputs. This is the deterministic adapter entrypoint that does NOT
+require a TOML parser - callers that have already extracted the
+[package] section pass the resolved scalars directly.
+@End Reasoning
+
+@Implementation
+Parse the version string via version_parse. Duplicate the name string
+(the manifest owns it). Construct the manifest via manifest_create. On
+any error, free any partial allocations and return 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the version string. Space: O(1) plus the manifest
+record and its empty collections.
+@End Performance_Hints
+
+@Security_Scope
+The version_parse call enforces SemVer 2.0.0 strictness. The name is
+NOT validated against the Cargo crate-name regex here; the caller may
+add that check via a separate identifier-validator.
+@End Security_Scope
+Process called "cargo_manifest_from_fields" takes name as Integer, version_text as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If version_text is equal to 0:
+        Return 0
+    End If
+    Let name_copy be proc string_duplicate from StringPrim with name
+    If name_copy is equal to 0:
+        Return 0
+    End If
+    Let version be proc version_parse from VC with version_text
+    If version is equal to 0:
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    Let m be proc manifest_create from PM with name_copy, version
+    If m is equal to 0:
+        proc version_destroy_deep from VC with version
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    Return m
+End Process
+
+@Reasoning
+Adapt a single dependency record. The caller has parsed
+"<name> = <constraint-string>" out of the TOML [dependencies] table
+and passes both scalars here. Constructs a DEP_REGISTRY dependency.
+For more complex inline tables (path, git, optional, features) the
+caller invokes cargo_dependency_from_inline_table on the parsed
+sub-table.
+@End Reasoning
+
+@Implementation
+Parse the constraint string via constraint_parse. Duplicate the name.
+Allocate a DependencySpec and initialize as registry kind. Return 0 on
+any error after freeing partial state.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the constraint string. Space: O(n) for owned copies.
+@End Performance_Hints
+
+@Security_Scope
+constraint_parse enforces SemVer grammar; out-of-range or malformed
+inputs produce 0.
+@End Security_Scope
+Process called "cargo_dependency_simple" takes name as Integer, constraint_text as Integer, registry_url as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If constraint_text is equal to 0:
+        Return 0
+    End If
+    Let name_copy be proc string_duplicate from StringPrim with name
+    If name_copy is equal to 0:
+        Return 0
+    End If
+    Let constraint be proc constraint_parse from VC with constraint_text
+    If constraint is equal to 0:
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    Let registry_copy be 0
+    If registry_url is not equal to 0:
+        Set registry_copy to proc string_duplicate from StringPrim with registry_url
+    End If
+    Let d be proc dep_create from Dep
+    If d is equal to 0:
+        If registry_copy is not equal to 0:
+            proc deallocate from Layout with registry_copy
+        End If
+        proc constraint_destroy_deep from VC with constraint
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    proc dep_init_registry from Dep with d, name_copy, registry_copy, constraint
+    Return d
+End Process
+
+@Reasoning
+Adapt a git dependency record. Caller provides name, git url, and an
+optional ref (branch, tag, or revision). Mirrors the Cargo
+"{ git = "...", branch = "..." }" inline-table form.
+@End Reasoning
+
+@Implementation
+Duplicate the three strings (any may be NULL except name/url),
+allocate a DependencySpec, and initialize as git kind.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) for the string copies. Space: O(n) for the three duplicates.
+@End Performance_Hints
+
+@Security_Scope
+The git URL and ref are stored verbatim; the package manager validates
+the URL scheme and ref form when fetching.
+@End Security_Scope
+Process called "cargo_dependency_git" takes name as Integer, url as Integer, ref as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If url is equal to 0:
+        Return 0
+    End If
+    Let name_copy be proc string_duplicate from StringPrim with name
+    If name_copy is equal to 0:
+        Return 0
+    End If
+    Let url_copy be proc string_duplicate from StringPrim with url
+    If url_copy is equal to 0:
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    Let ref_copy be 0
+    If ref is not equal to 0:
+        Set ref_copy to proc string_duplicate from StringPrim with ref
+    End If
+    Let d be proc dep_create from Dep
+    If d is equal to 0:
+        If ref_copy is not equal to 0:
+            proc deallocate from Layout with ref_copy
+        End If
+        proc deallocate from Layout with url_copy
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    proc dep_init_git from Dep with d, name_copy, url_copy, ref_copy
+    Return d
+End Process
+
+@Reasoning
+Adapt a path dependency.
+@End Reasoning
+
+@Implementation
+Duplicate name and path, allocate DependencySpec, initialize as path
+kind.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Path traversal protection is the package-manager's job.
+@End Security_Scope
+Process called "cargo_dependency_path" takes name as Integer, path as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If path is equal to 0:
+        Return 0
+    End If
+    Let name_copy be proc string_duplicate from StringPrim with name
+    If name_copy is equal to 0:
+        Return 0
+    End If
+    Let path_copy be proc string_duplicate from StringPrim with path
+    If path_copy is equal to 0:
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    Let d be proc dep_create from Dep
+    If d is equal to 0:
+        proc deallocate from Layout with path_copy
+        proc deallocate from Layout with name_copy
+        Return 0
+    End If
+    proc dep_init_path from Dep with d, name_copy, path_copy
+    Return d
+End Process
+
+@Reasoning
+Detect the [workspace] section, which Runa packages do not adopt.
+Returns 1 if the input dictionary key set includes "workspace" so the
+caller can fail with CARGO_ERR_WORKSPACE_UNSUPPORTED.
+@End Reasoning
+
+@Implementation
+A surface marker for the adapter caller. Cargo-specific workspace
+features are intentionally rejected to keep Runa packages standalone.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1). Pure data return.
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "cargo_workspace_unsupported_code" returns Integer:
+    Return CARGO_ERR_WORKSPACE_UNSUPPORTED
+End Process

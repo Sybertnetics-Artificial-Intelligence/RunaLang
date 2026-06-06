@@ -1,0 +1,871 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+BUFFERED I/O - Buffered reader/writer abstractions over raw file
+descriptors.
+
+A BufferedReader wraps a file descriptor with an in-memory buffer of
+configurable size and provides read, read_line, read_until, peek and
+skip operations. A BufferedWriter wraps a fd with a write buffer and
+provides write, write_line and flush.
+
+Reader/Writer polymorphism is achieved via a small tag field rather
+than first-class traits (stage1 does not implement traits yet). All
+operations check the tag to dispatch correctly.
+
+BufferedReader layout (56 bytes):
+  offset 0:  tag             (8 bytes) - IO_TAG_READER
+  offset 8:  fd              (8 bytes) - underlying file descriptor
+  offset 16: buffer          (8 bytes) - pointer to buffer bytes
+  offset 24: buffer_size     (8 bytes) - allocated capacity
+  offset 32: position        (8 bytes) - current read cursor inside buffer
+  offset 40: filled          (8 bytes) - number of valid bytes
+  offset 48: eof_flag        (8 bytes) - 1 once underlying read returned 0
+
+BufferedWriter layout (48 bytes):
+  offset 0:  tag             (8 bytes) - IO_TAG_WRITER
+  offset 8:  fd              (8 bytes) - underlying file descriptor
+  offset 16: buffer          (8 bytes) - pointer to buffer bytes
+  offset 24: buffer_size     (8 bytes) - allocated capacity
+  offset 32: position        (8 bytes) - bytes pending in buffer
+  offset 40: error_flag      (8 bytes) - sticky error if last fio_write failed
+
+Dependencies:
+- memory/layout.runa
+- core/memory_core.runa
+- io/file_io.runa
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/io/file_io.runa" as FIO
+
+Constant BR_OFF_TAG as Integer is 0
+Constant BR_OFF_FD as Integer is 8
+Constant BR_OFF_BUF as Integer is 16
+Constant BR_OFF_BUFSIZE as Integer is 24
+Constant BR_OFF_POS as Integer is 32
+Constant BR_OFF_FILLED as Integer is 40
+Constant BR_OFF_EOF as Integer is 48
+Constant BR_STRUCT_SIZE as Integer is 56
+
+Constant BW_OFF_TAG as Integer is 0
+Constant BW_OFF_FD as Integer is 8
+Constant BW_OFF_BUF as Integer is 16
+Constant BW_OFF_BUFSIZE as Integer is 24
+Constant BW_OFF_POS as Integer is 32
+Constant BW_OFF_ERR as Integer is 40
+Constant BW_STRUCT_SIZE as Integer is 48
+
+Constant IO_TAG_READER as Integer is 1
+Constant IO_TAG_WRITER as Integer is 2
+
+Constant IO_DEFAULT_BUFFER as Integer is 8192
+
+Constant IO_OK as Integer is 1
+Constant IO_EOF as Integer is 0
+Constant IO_ERR_INVALID as Integer is -1
+Constant IO_ERR_IO as Integer is -2
+Constant IO_ERR_BUFFER_FULL as Integer is -3
+Constant IO_ERR_TAG_MISMATCH as Integer is -4
+
+Note: ============================================================================
+Note: Reader lifecycle
+Note: ============================================================================
+
+@Reasoning
+Construct a BufferedReader bound to a raw file descriptor. A zero or
+negative buffer_size selects the default of 8 KiB.
+@End Reasoning
+
+@Implementation
+Allocate the record and the buffer, set the tag and fd, zero counters.
+@End Implementation
+
+@Performance_Hints
+One allocation of the record + one allocation of the byte buffer.
+@End Performance_Hints
+
+@Security_Scope
+The buffered reader does not close the fd unless buffered_reader_close
+is invoked; ownership rests with the caller.
+@End Security_Scope
+
+Process called "buffered_reader_create" takes fd as Integer, buffer_size as Integer returns Integer:
+    Let cap be buffer_size
+    If cap is less than or equal to 0:
+        Set cap to IO_DEFAULT_BUFFER
+    End If
+    Let r be proc allocate from Memory with BR_STRUCT_SIZE
+    If r is equal to 0:
+        Return 0
+    End If
+    Let buf be proc allocate from Memory with cap
+    If buf is equal to 0:
+        proc deallocate from Memory with r
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with r, BR_OFF_TAG, IO_TAG_READER
+    proc memory_set_int64 from Mem with r, BR_OFF_FD, fd
+    proc memory_set_int64 from Mem with r, BR_OFF_BUF, buf
+    proc memory_set_int64 from Mem with r, BR_OFF_BUFSIZE, cap
+    proc memory_set_int64 from Mem with r, BR_OFF_POS, 0
+    proc memory_set_int64 from Mem with r, BR_OFF_FILLED, 0
+    proc memory_set_int64 from Mem with r, BR_OFF_EOF, 0
+    Return r
+End Process
+
+Process called "buffered_reader_close" takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    Let tag be proc memory_get_int64 from Mem with r, BR_OFF_TAG
+    If tag is not equal to IO_TAG_READER:
+        Return IO_ERR_TAG_MISMATCH
+    End If
+    Let fd be proc memory_get_int64 from Mem with r, BR_OFF_FD
+    Let buf be proc memory_get_int64 from Mem with r, BR_OFF_BUF
+    proc fio_close from FIO with fd
+    If buf is not equal to 0:
+        proc deallocate from Memory with buf
+    End If
+    proc deallocate from Memory with r
+    Return IO_OK
+End Process
+
+@Reasoning
+Refill the internal buffer. Called whenever the caller has consumed all
+available bytes and needs more.
+@End Reasoning
+
+@Implementation
+If we are already at EOF, return IO_EOF without touching the buffer.
+Otherwise issue a single fio_read up to buffer_size and update fill and
+position counters.
+@End Implementation
+
+@Performance_Hints
+One syscall per refill.
+@End Performance_Hints
+
+@Security_Scope
+The fd must remain open until buffered_reader_close is invoked.
+@End Security_Scope
+
+Process called "buffered_reader_refill" takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    Let eof be proc memory_get_int64 from Mem with r, BR_OFF_EOF
+    If eof is equal to 1:
+        Return IO_EOF
+    End If
+    Let fd be proc memory_get_int64 from Mem with r, BR_OFF_FD
+    Let buf be proc memory_get_int64 from Mem with r, BR_OFF_BUF
+    Let cap be proc memory_get_int64 from Mem with r, BR_OFF_BUFSIZE
+    Let n be proc fio_read from FIO with fd, buf, cap
+    If n is less than 0:
+        Return IO_ERR_IO
+    End If
+    If n is equal to 0:
+        proc memory_set_int64 from Mem with r, BR_OFF_EOF, 1
+        proc memory_set_int64 from Mem with r, BR_OFF_POS, 0
+        proc memory_set_int64 from Mem with r, BR_OFF_FILLED, 0
+        Return IO_EOF
+    End If
+    proc memory_set_int64 from Mem with r, BR_OFF_POS, 0
+    proc memory_set_int64 from Mem with r, BR_OFF_FILLED, n
+    Return n
+End Process
+
+Process called "buffered_reader_available" takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Let pos be proc memory_get_int64 from Mem with r, BR_OFF_POS
+    Let filled be proc memory_get_int64 from Mem with r, BR_OFF_FILLED
+    Return filled minus pos
+End Process
+
+@Reasoning
+Read up to `count` bytes into `dest`. The implementation pulls from the
+buffer first and refills as necessary. Returns the number of bytes
+copied (which may be less than count at EOF).
+@End Reasoning
+
+@Implementation
+Loop: copy bytes from the buffer into dest until count is satisfied or
+the buffer is empty. When the buffer empties, refill. Stop on EOF.
+@End Implementation
+
+@Performance_Hints
+A short read can be served entirely from the buffer with zero syscalls.
+Large reads cost ceil(count/buffer_size) syscalls.
+@End Performance_Hints
+
+@Security_Scope
+The caller must ensure dest has at least count writable bytes.
+@End Security_Scope
+
+Process called "buffered_reader_read" takes r as Integer, dest as Integer, count as Integer returns Integer:
+    If r is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    If dest is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    If count is less than or equal to 0:
+        Return 0
+    End If
+    Let tag be proc memory_get_int64 from Mem with r, BR_OFF_TAG
+    If tag is not equal to IO_TAG_READER:
+        Return IO_ERR_TAG_MISMATCH
+    End If
+    Let copied be 0
+    While copied is less than count:
+        Let available be proc buffered_reader_available with r
+        If available is equal to 0:
+            Let refill_rc be proc buffered_reader_refill with r
+            If refill_rc is equal to IO_EOF:
+                Return copied
+            End If
+            If refill_rc is less than 0:
+                Return refill_rc
+            End If
+            Set available to proc buffered_reader_available with r
+        End If
+        Let to_copy be count minus copied
+        If to_copy is greater than available:
+            Set to_copy to available
+        End If
+        Let buf be proc memory_get_int64 from Mem with r, BR_OFF_BUF
+        Let pos be proc memory_get_int64 from Mem with r, BR_OFF_POS
+        Let src be buf plus pos
+        Let dst be dest plus copied
+        proc memory_copy from Mem with dst, src, to_copy
+        proc memory_set_int64 from Mem with r, BR_OFF_POS, (pos plus to_copy)
+        Set copied to copied plus to_copy
+    End While
+    Return copied
+End Process
+
+@Reasoning
+Read a single line terminated by '\n'. The newline is consumed but not
+included in the returned buffer length. CR is preserved unchanged so
+text/binary safety is maintained.
+@End Reasoning
+
+@Implementation
+Use read_until with delimiter '\n' (10). After the call, trim a final
+'\n' if present.
+@End Implementation
+
+@Performance_Hints
+Best case the entire line lives in one buffer fill.
+@End Performance_Hints
+
+@Security_Scope
+The returned buffer is heap-allocated; the caller owns it and must
+deallocate.
+@End Security_Scope
+
+Process called "buffered_reader_read_line" takes r as Integer, out_len_holder as Integer returns Integer:
+    Note: Read one logical line from the BufferedReader. A line is terminated
+    Note: by any of LF, CRLF, or bare CR (the three conventions found in real-
+    Note: world text streams from Unix, Windows, and classic Mac OS / network
+    Note: protocols respectively). The trailing terminator bytes are stripped
+    Note: from the returned buffer; the length written to out_len_holder is the
+    Note: payload length only.
+
+    Note: Algorithm:
+    Note:   1. Pull bytes one at a time, appending to a growing heap buffer.
+    Note:   2. Stop appending when we see LF (10) or CR (13).
+    Note:   3. If the terminator was CR, peek the next byte: if it's LF,
+    Note:      consume it too (CRLF case). Otherwise leave it pending (bare CR).
+    Note:   4. Return the buffer with length set to the payload (no terminator).
+    Note:   5. EOF on first byte yields a 0 return and len=0 (no allocation
+    Note:      returned to the caller).
+    If r is equal to 0:
+        Return 0
+    End If
+    If out_len_holder is equal to 0:
+        Return 0
+    End If
+    Let tag be proc memory_get_int64 from Mem with r, BR_OFF_TAG
+    If tag is not equal to IO_TAG_READER:
+        Return 0
+    End If
+
+    Let capacity be 16
+    Let length be 0
+    Let buf be proc allocate from Memory with capacity
+    If buf is equal to 0:
+        Return 0
+    End If
+
+    Let saw_terminator be 0
+    Let last_terminator be 0
+    Let read_done be 0
+    Let read_error be 0
+    While read_done is equal to 0:
+        Let available be proc buffered_reader_available with r
+        If available is equal to 0:
+            Let refill_rc be proc buffered_reader_refill with r
+            If refill_rc is equal to IO_EOF:
+                Set read_done to 1
+            End If
+            If refill_rc is less than 0:
+                Set read_error to 1
+                Set read_done to 1
+            End If
+        End If
+        If read_done is equal to 0:
+            Let inner_buf be proc memory_get_int64 from Mem with r, BR_OFF_BUF
+            Let pos be proc memory_get_int64 from Mem with r, BR_OFF_POS
+            Let b be proc memory_get_byte from Mem with inner_buf, pos
+            proc memory_set_int64 from Mem with r, BR_OFF_POS, (pos plus 1)
+            If b is equal to 10:
+                Set saw_terminator to 1
+                Set last_terminator to 10
+                Set read_done to 1
+            End If
+            If b is equal to 13:
+                Set saw_terminator to 1
+                Set last_terminator to 13
+                Set read_done to 1
+            End If
+            If b is not equal to 10:
+                If b is not equal to 13:
+                    If length is greater than or equal to capacity:
+                        Let new_capacity be capacity multiplied by 2
+                        Let new_buf be proc allocate from Memory with new_capacity
+                        If new_buf is equal to 0:
+                            proc deallocate from Memory with buf
+                            Return 0
+                        End If
+                        proc memory_copy from Mem with new_buf, buf, length
+                        proc deallocate from Memory with buf
+                        Set buf to new_buf
+                        Set capacity to new_capacity
+                    End If
+                    proc memory_set_byte from Mem with buf, length, b
+                    Set length to length plus 1
+                End If
+            End If
+        End If
+    End While
+
+    If read_error is equal to 1:
+        proc deallocate from Memory with buf
+        Return 0
+    End If
+
+    Note: If the terminator was CR, check whether the next byte is LF; if so,
+    Note: consume it (handles the Windows / network CRLF convention). The
+    Note: refill is necessary because the CR may have been the last byte in the
+    Note: previous fill — we need a fresh chance to read the following LF.
+    If last_terminator is equal to 13:
+        Let post_avail be proc buffered_reader_available with r
+        If post_avail is equal to 0:
+            Let refill2 be proc buffered_reader_refill with r
+            If refill2 is greater than 0:
+                Set post_avail to proc buffered_reader_available with r
+            End If
+        End If
+        If post_avail is greater than 0:
+            Let inner2 be proc memory_get_int64 from Mem with r, BR_OFF_BUF
+            Let pos2 be proc memory_get_int64 from Mem with r, BR_OFF_POS
+            Let peek_b be proc memory_get_byte from Mem with inner2, pos2
+            If peek_b is equal to 10:
+                proc memory_set_int64 from Mem with r, BR_OFF_POS, (pos2 plus 1)
+            End If
+        End If
+    End If
+
+    Note: EOF without any terminator. If we collected zero bytes the caller
+    Note: receives the standard EOF signal (free + return 0, len=0).
+    If saw_terminator is equal to 0:
+        If length is equal to 0:
+            proc deallocate from Memory with buf
+            proc memory_set_int64 from Mem with out_len_holder, 0, 0
+            Return 0
+        End If
+    End If
+
+    proc memory_set_int64 from Mem with out_len_holder, 0, length
+    Return buf
+End Process
+
+@Reasoning
+Read into a freshly allocated buffer up to and including the next byte
+that matches `delimiter`. Returns the buffer pointer and writes the
+length into the holder. Returns 0 immediately at EOF with no bytes
+buffered.
+@End Reasoning
+
+@Implementation
+Maintain a growing buffer (16-byte initial capacity, doubling on
+overflow). Pull bytes one at a time from the BufferedReader, append,
+stop after writing the delimiter or on EOF.
+@End Implementation
+
+@Performance_Hints
+Doubling growth gives amortised O(1) append. Byte-at-a-time copies are
+unavoidable for delimiter-driven reads.
+@End Performance_Hints
+
+@Security_Scope
+Caller owns the returned buffer. Returns 0 only on EOF-with-no-input or
+allocation failure.
+@End Security_Scope
+
+Process called "buffered_reader_read_until" takes r as Integer, delimiter as Integer, out_len_holder as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    If out_len_holder is equal to 0:
+        Return 0
+    End If
+    Let tag be proc memory_get_int64 from Mem with r, BR_OFF_TAG
+    If tag is not equal to IO_TAG_READER:
+        Return 0
+    End If
+    Let capacity be 16
+    Let length be 0
+    Let buf be proc allocate from Memory with capacity
+    If buf is equal to 0:
+        Return 0
+    End If
+    While 1 is equal to 1:
+        Let available be proc buffered_reader_available with r
+        If available is equal to 0:
+            Let refill_rc be proc buffered_reader_refill with r
+            If refill_rc is equal to IO_EOF:
+                If length is equal to 0:
+                    proc deallocate from Memory with buf
+                    proc memory_set_int64 from Mem with out_len_holder, 0, 0
+                    Return 0
+                End If
+                proc memory_set_int64 from Mem with out_len_holder, 0, length
+                Return buf
+            End If
+            If refill_rc is less than 0:
+                proc deallocate from Memory with buf
+                Return 0
+            End If
+        End If
+        Let inner_buf be proc memory_get_int64 from Mem with r, BR_OFF_BUF
+        Let pos be proc memory_get_int64 from Mem with r, BR_OFF_POS
+        Let b be proc memory_get_byte from Mem with inner_buf, pos
+        proc memory_set_int64 from Mem with r, BR_OFF_POS, (pos plus 1)
+        If length is greater than or equal to capacity:
+            Let new_capacity be capacity multiplied by 2
+            Let new_buf be proc allocate from Memory with new_capacity
+            If new_buf is equal to 0:
+                proc deallocate from Memory with buf
+                Return 0
+            End If
+            proc memory_copy from Mem with new_buf, buf, length
+            proc deallocate from Memory with buf
+            Set buf to new_buf
+            Set capacity to new_capacity
+        End If
+        proc memory_set_byte from Mem with buf, length, b
+        Set length to length plus 1
+        If b is equal to delimiter:
+            proc memory_set_int64 from Mem with out_len_holder, 0, length
+            Return buf
+        End If
+    End While
+    proc memory_set_int64 from Mem with out_len_holder, 0, length
+    Return buf
+End Process
+
+@Reasoning
+Look at upcoming bytes without consuming them. Returns the count
+peeked; caller passes a destination buffer of `count` bytes.
+@End Reasoning
+
+@Implementation
+Refill if the buffer is empty. Copy min(count, available) bytes into
+dest without advancing the read position.
+@End Implementation
+
+@Performance_Hints
+A single memory copy; never advances the buffer cursor.
+@End Performance_Hints
+
+@Security_Scope
+dest must have at least count writable bytes.
+@End Security_Scope
+
+Process called "buffered_reader_peek" takes r as Integer, dest as Integer, count as Integer returns Integer:
+    If r is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    If dest is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    If count is less than or equal to 0:
+        Return 0
+    End If
+    Let available be proc buffered_reader_available with r
+    If available is equal to 0:
+        Let refill_rc be proc buffered_reader_refill with r
+        If refill_rc is equal to IO_EOF:
+            Return 0
+        End If
+        If refill_rc is less than 0:
+            Return refill_rc
+        End If
+        Set available to proc buffered_reader_available with r
+    End If
+    Let to_copy be count
+    If to_copy is greater than available:
+        Set to_copy to available
+    End If
+    Let buf be proc memory_get_int64 from Mem with r, BR_OFF_BUF
+    Let pos be proc memory_get_int64 from Mem with r, BR_OFF_POS
+    Let src be buf plus pos
+    proc memory_copy from Mem with dest, src, to_copy
+    Return to_copy
+End Process
+
+Process called "buffered_reader_skip" takes r as Integer, count as Integer returns Integer:
+    If r is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    If count is less than or equal to 0:
+        Return 0
+    End If
+    Let skipped be 0
+    While skipped is less than count:
+        Let available be proc buffered_reader_available with r
+        If available is equal to 0:
+            Let refill_rc be proc buffered_reader_refill with r
+            If refill_rc is equal to IO_EOF:
+                Return skipped
+            End If
+            If refill_rc is less than 0:
+                Return refill_rc
+            End If
+            Set available to proc buffered_reader_available with r
+        End If
+        Let to_skip be count minus skipped
+        If to_skip is greater than available:
+            Set to_skip to available
+        End If
+        Let pos be proc memory_get_int64 from Mem with r, BR_OFF_POS
+        proc memory_set_int64 from Mem with r, BR_OFF_POS, (pos plus to_skip)
+        Set skipped to skipped plus to_skip
+    End While
+    Return skipped
+End Process
+
+Process called "buffered_reader_eof" takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 1
+    End If
+    Let available be proc buffered_reader_available with r
+    If available is greater than 0:
+        Return 0
+    End If
+    Let eof be proc memory_get_int64 from Mem with r, BR_OFF_EOF
+    Return eof
+End Process
+
+Note: ============================================================================
+Note: Writer lifecycle
+Note: ============================================================================
+
+@Reasoning
+Wrap a writable fd with a buffer. write/write_line stage bytes in the
+buffer; flush pushes them through to the OS in a single syscall.
+@End Reasoning
+
+@Implementation
+Allocate record + byte buffer, store fd and tag. error_flag captures
+the first failed syscall so callers can detect partial output without
+inspecting every operation.
+@End Implementation
+
+@Performance_Hints
+One allocation per writer; subsequent writes are O(1) until the buffer
+overflows.
+@End Performance_Hints
+
+@Security_Scope
+The fd is owned by the caller until buffered_writer_close runs.
+@End Security_Scope
+
+Process called "buffered_writer_create" takes fd as Integer, buffer_size as Integer returns Integer:
+    Let cap be buffer_size
+    If cap is less than or equal to 0:
+        Set cap to IO_DEFAULT_BUFFER
+    End If
+    Let w be proc allocate from Memory with BW_STRUCT_SIZE
+    If w is equal to 0:
+        Return 0
+    End If
+    Let buf be proc allocate from Memory with cap
+    If buf is equal to 0:
+        proc deallocate from Memory with w
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with w, BW_OFF_TAG, IO_TAG_WRITER
+    proc memory_set_int64 from Mem with w, BW_OFF_FD, fd
+    proc memory_set_int64 from Mem with w, BW_OFF_BUF, buf
+    proc memory_set_int64 from Mem with w, BW_OFF_BUFSIZE, cap
+    proc memory_set_int64 from Mem with w, BW_OFF_POS, 0
+    proc memory_set_int64 from Mem with w, BW_OFF_ERR, 0
+    Return w
+End Process
+
+Process called "buffered_writer_close" takes w as Integer returns Integer:
+    If w is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    Let tag be proc memory_get_int64 from Mem with w, BW_OFF_TAG
+    If tag is not equal to IO_TAG_WRITER:
+        Return IO_ERR_TAG_MISMATCH
+    End If
+    proc buffered_writer_flush with w
+    Let fd be proc memory_get_int64 from Mem with w, BW_OFF_FD
+    Let buf be proc memory_get_int64 from Mem with w, BW_OFF_BUF
+    proc fio_close from FIO with fd
+    If buf is not equal to 0:
+        proc deallocate from Memory with buf
+    End If
+    proc deallocate from Memory with w
+    Return IO_OK
+End Process
+
+@Reasoning
+Write `count` bytes from src into the buffer. Spills to the OS on
+overflow without unbuffered fallthrough.
+@End Reasoning
+
+@Implementation
+Loop until count bytes have been staged. When the buffer is full, call
+buffered_writer_flush. If flush fails, mark the writer as failed and
+return the error code.
+@End Implementation
+
+@Performance_Hints
+Best case O(count). Pathological cases (count >> buffer_size) cause
+ceil(count/buffer_size) syscalls.
+@End Performance_Hints
+
+@Security_Scope
+src must have at least `count` readable bytes.
+@End Security_Scope
+
+Process called "buffered_writer_write" takes w as Integer, src as Integer, count as Integer returns Integer:
+    If w is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    If src is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    If count is less than or equal to 0:
+        Return 0
+    End If
+    Let tag be proc memory_get_int64 from Mem with w, BW_OFF_TAG
+    If tag is not equal to IO_TAG_WRITER:
+        Return IO_ERR_TAG_MISMATCH
+    End If
+    Let written be 0
+    While written is less than count:
+        Let pos be proc memory_get_int64 from Mem with w, BW_OFF_POS
+        Let cap be proc memory_get_int64 from Mem with w, BW_OFF_BUFSIZE
+        Let free_space be cap minus pos
+        If free_space is equal to 0:
+            Let flush_rc be proc buffered_writer_flush with w
+            If flush_rc is less than 0:
+                Return flush_rc
+            End If
+            Set pos to proc memory_get_int64 from Mem with w, BW_OFF_POS
+            Set free_space to cap minus pos
+            If free_space is equal to 0:
+                Return IO_ERR_BUFFER_FULL
+            End If
+        End If
+        Let to_write be count minus written
+        If to_write is greater than free_space:
+            Set to_write to free_space
+        End If
+        Let buf be proc memory_get_int64 from Mem with w, BW_OFF_BUF
+        Let dst be buf plus pos
+        Let src_ptr be src plus written
+        proc memory_copy from Mem with dst, src_ptr, to_write
+        proc memory_set_int64 from Mem with w, BW_OFF_POS, (pos plus to_write)
+        Set written to written plus to_write
+    End While
+    Return written
+End Process
+
+@Reasoning
+Stage a single byte. Mirrors buffered_writer_write for one-byte inputs
+without the loop overhead.
+@End Reasoning
+
+@Implementation
+If the buffer is full, flush first. Then write a single byte and
+advance position.
+@End Implementation
+
+@Performance_Hints
+O(1) amortised.
+@End Performance_Hints
+
+@Security_Scope
+None.
+@End Security_Scope
+
+Process called "buffered_writer_write_byte" takes w as Integer, byte_value as Integer returns Integer:
+    If w is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    Let pos be proc memory_get_int64 from Mem with w, BW_OFF_POS
+    Let cap be proc memory_get_int64 from Mem with w, BW_OFF_BUFSIZE
+    If pos is greater than or equal to cap:
+        Let flush_rc be proc buffered_writer_flush with w
+        If flush_rc is less than 0:
+            Return flush_rc
+        End If
+        Set pos to proc memory_get_int64 from Mem with w, BW_OFF_POS
+    End If
+    Let buf be proc memory_get_int64 from Mem with w, BW_OFF_BUF
+    proc memory_set_byte from Mem with buf, pos, byte_value
+    proc memory_set_int64 from Mem with w, BW_OFF_POS, (pos plus 1)
+    Return 1
+End Process
+
+@Reasoning
+Write bytes followed by a newline. Useful for line-oriented logs and
+debug output.
+@End Reasoning
+
+@Implementation
+buffered_writer_write of count bytes followed by a write_byte of 10.
+@End Implementation
+
+@Performance_Hints
+At most one syscall.
+@End Performance_Hints
+
+@Security_Scope
+None.
+@End Security_Scope
+
+Process called "buffered_writer_write_line" takes w as Integer, src as Integer, count as Integer returns Integer:
+    Let rc be proc buffered_writer_write with w, src, count
+    If rc is less than 0:
+        Return rc
+    End If
+    Let nl_rc be proc buffered_writer_write_byte with w, 10
+    If nl_rc is less than 0:
+        Return nl_rc
+    End If
+    Return rc plus 1
+End Process
+
+@Reasoning
+Flush pending bytes to the underlying fd. Sticky errors mean repeated
+calls do not retry a failed syscall - flush is best-effort once an
+error has been recorded.
+@End Reasoning
+
+@Implementation
+If the buffer is empty, return OK immediately. Otherwise call
+fio_write; on success reset position to zero. On failure record
+IO_ERR_IO in error_flag and surface it.
+@End Implementation
+
+@Performance_Hints
+One syscall per call.
+@End Performance_Hints
+
+@Security_Scope
+The fd must be writable. Partial writes are retried internally until
+the full buffer is drained or the syscall reports an error.
+@End Security_Scope
+
+Process called "buffered_writer_flush" takes w as Integer returns Integer:
+    If w is equal to 0:
+        Return IO_ERR_INVALID
+    End If
+    Let tag be proc memory_get_int64 from Mem with w, BW_OFF_TAG
+    If tag is not equal to IO_TAG_WRITER:
+        Return IO_ERR_TAG_MISMATCH
+    End If
+    Let pos be proc memory_get_int64 from Mem with w, BW_OFF_POS
+    If pos is equal to 0:
+        Return IO_OK
+    End If
+    Let fd be proc memory_get_int64 from Mem with w, BW_OFF_FD
+    Let buf be proc memory_get_int64 from Mem with w, BW_OFF_BUF
+    Let cursor be 0
+    While cursor is less than pos:
+        Let remaining be pos minus cursor
+        Let src be buf plus cursor
+        Let n be proc fio_write from FIO with fd, src, remaining
+        If n is less than or equal to 0:
+            proc memory_set_int64 from Mem with w, BW_OFF_ERR, 1
+            Return IO_ERR_IO
+        End If
+        Set cursor to cursor plus n
+    End While
+    proc memory_set_int64 from Mem with w, BW_OFF_POS, 0
+    Return IO_OK
+End Process
+
+Process called "buffered_writer_has_error" takes w as Integer returns Integer:
+    If w is equal to 0:
+        Return 1
+    End If
+    Return proc memory_get_int64 from Mem with w, BW_OFF_ERR
+End Process
+
+Process called "buffered_writer_pending" takes w as Integer returns Integer:
+    If w is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with w, BW_OFF_POS
+End Process
+
+Note: ============================================================================
+Note: Tag inspection
+Note: ============================================================================
+
+Process called "buffered_io_tag" takes handle as Integer returns Integer:
+    If handle is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with handle, 0
+End Process
+
+Process called "buffered_io_is_reader" takes handle as Integer returns Integer:
+    If handle is equal to 0:
+        Return 0
+    End If
+    Let tag be proc memory_get_int64 from Mem with handle, 0
+    If tag is equal to IO_TAG_READER:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "buffered_io_is_writer" takes handle as Integer returns Integer:
+    If handle is equal to 0:
+        Return 0
+    End If
+    Let tag be proc memory_get_int64 from Mem with handle, 0
+    If tag is equal to IO_TAG_WRITER:
+        Return 1
+    End If
+    Return 0
+End Process

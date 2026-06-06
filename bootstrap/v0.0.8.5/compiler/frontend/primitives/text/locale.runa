@@ -1,0 +1,423 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+LOCALE - Language + Region + Variant Tag Primitive
+==============================================================================
+
+A Locale is the standard Unicode/IETF identifier for a (language,
+region, variant) triple used by every locale-aware operation in the
+stdlib: date formatting, number formatting, collation, case-folding
+locale specials (Turkish dotted-I), and message catalogs.
+
+References:
+- BCP 47: Tags for Identifying Languages
+- IETF RFC 5646: Tags for Identifying Languages
+- ISO 639-1 / 639-2: Language codes
+- ISO 3166-1: Country codes
+- POSIX locale format: language_TERRITORY.encoding[@modifier]
+
+Format examples supported by locale_from_string:
+- "en"               -> language only
+- "en-US"            -> BCP 47 (preferred)
+- "en_US"            -> POSIX with underscore
+- "zh-Hans-CN"       -> language + script + region (BCP 47)
+- "en-US.UTF-8"      -> POSIX with encoding (encoding is discarded)
+- "de-DE.UTF-8@euro" -> POSIX with encoding + modifier (both discarded)
+
+Memory layout for Locale (40 bytes):
+  offset 0:  language pointer (Integer, 8 bytes) - 2-3 lowercase ASCII chars
+  offset 8:  script pointer   (Integer, 8 bytes) - 4 chars titlecase (or 0)
+  offset 16: region pointer   (Integer, 8 bytes) - 2 uppercase chars (or 0)
+  offset 24: variant pointer  (Integer, 8 bytes) - free-form string (or 0)
+  offset 32: original pointer (Integer, 8 bytes) - the input string
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StrCore
+
+Constant LOCALE_HEADER_SIZE as Integer is 40
+Constant LOCALE_OFFSET_LANGUAGE as Integer is 0
+Constant LOCALE_OFFSET_SCRIPT as Integer is 8
+Constant LOCALE_OFFSET_REGION as Integer is 16
+Constant LOCALE_OFFSET_VARIANT as Integer is 24
+Constant LOCALE_OFFSET_ORIGINAL as Integer is 32
+
+Note: ============================================================================
+Note: INTERNAL HELPERS
+Note: ============================================================================
+
+Process called "locale_internal_to_lower_ascii" takes c as Integer returns Integer:
+    If c is greater than or equal to 65:
+        If c is less than or equal to 90:
+            Return c plus 32
+        End If
+    End If
+    Return c
+End Process
+
+Process called "locale_internal_to_upper_ascii" takes c as Integer returns Integer:
+    If c is greater than or equal to 97:
+        If c is less than or equal to 122:
+            Return c minus 32
+        End If
+    End If
+    Return c
+End Process
+
+Process called "locale_internal_is_alpha" takes c as Integer returns Integer:
+    If c is greater than or equal to 65:
+        If c is less than or equal to 90:
+            Return 1
+        End If
+    End If
+    If c is greater than or equal to 97:
+        If c is less than or equal to 122:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "locale_internal_is_separator" takes c as Integer returns Integer:
+    Note: BCP 47 uses '-', POSIX uses '_'. Both are valid subtag separators.
+    If c is equal to 45:
+        Return 1
+    End If
+    If c is equal to 95:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "locale_internal_copy_subtag" takes src as Integer, start as Integer, end_pos as Integer, upper as Integer returns Integer:
+    Note: Copies bytes [start, end_pos) from src into a new null-terminated
+    Note: string, lowercasing or uppercasing as requested.
+    Note: upper=0 -> lowercase, upper=1 -> uppercase, upper=2 -> titlecase
+    Let len be end_pos minus start
+    If len is less than 0:
+        Return 0
+    End If
+    Let buf be allocate(len plus 1)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than len:
+        Let c be Memory.memory_get_byte(src, start plus i)
+        Let mapped be c
+        If upper is equal to 0:
+            Set mapped to locale_internal_to_lower_ascii(c)
+        Otherwise:
+            If upper is equal to 1:
+                Set mapped to locale_internal_to_upper_ascii(c)
+            Otherwise:
+                If upper is equal to 2:
+                    If i is equal to 0:
+                        Set mapped to locale_internal_to_upper_ascii(c)
+                    Otherwise:
+                        Set mapped to locale_internal_to_lower_ascii(c)
+                    End If
+                End If
+            End If
+        End If
+        Memory.memory_set_byte(buf, i, mapped)
+        Set i to i plus 1
+    End While
+    Memory.memory_set_byte(buf, len, 0)
+    Return buf
+End Process
+
+Process called "locale_internal_dup_string" takes src as Integer returns Integer:
+    Note: Allocates and returns a null-terminated copy of src.
+    If src is equal to 0:
+        Return 0
+    End If
+    Let len be StrCore.string_length(src)
+    Let buf be allocate(len plus 1)
+    If buf is equal to 0:
+        Return 0
+    End If
+    If len is greater than 0:
+        Memory.memory_copy(buf, src, len)
+    End If
+    Memory.memory_set_byte(buf, len, 0)
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: CONSTRUCTION
+Note: ============================================================================
+
+Process called "locale_from_string" takes tag as Integer returns Integer:
+    @Reasoning
+        Parses a BCP 47 or POSIX locale tag. Subtags are separated by
+        '-' (BCP 47) or '_' (POSIX). The first 2-3 letter subtag is
+        the language; an optional 4-letter titlecase subtag is the
+        script; an optional 2-letter uppercase subtag is the region.
+        Any remaining content is captured as variant (this captures
+        the encoding/modifier in POSIX tags so downstream code can
+        inspect it without it being mistaken for region/script).
+    @End Reasoning
+    @Implementation
+        Single-pass scan: tokenize on '-' or '_', classify each token
+        by length and character set, populate the matching field.
+    @End Implementation
+    @Performance_Hints
+        O(n) over tag length.
+    @End Performance_Hints
+    @Security_Scope
+        Strictly bounded by input length; never allocates more than
+        the source bytes + 5 small subtag buffers.
+    @End Security_Scope
+
+    If tag is equal to 0:
+        Return 0
+    End If
+    Let tag_len be StrCore.string_length(tag)
+    If tag_len is equal to 0:
+        Return 0
+    End If
+
+    Let header be allocate(LOCALE_HEADER_SIZE)
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_pointer(header, LOCALE_OFFSET_LANGUAGE, 0)
+    Memory.memory_set_pointer(header, LOCALE_OFFSET_SCRIPT, 0)
+    Memory.memory_set_pointer(header, LOCALE_OFFSET_REGION, 0)
+    Memory.memory_set_pointer(header, LOCALE_OFFSET_VARIANT, 0)
+    Memory.memory_set_pointer(header, LOCALE_OFFSET_ORIGINAL, locale_internal_dup_string(tag))
+
+    Note: Find boundary between language subtag and rest. Language is
+    Note: 1-8 ASCII letters terminated by separator, '.', or end.
+    Let lang_end be 0
+    Let scanning_lang be 1
+    While scanning_lang is equal to 1:
+        If lang_end is greater than or equal to tag_len:
+            Set scanning_lang to 0
+        Otherwise:
+            Let c_lang be Memory.memory_get_byte(tag, lang_end)
+            If locale_internal_is_alpha(c_lang) is equal to 1:
+                Set lang_end to lang_end plus 1
+                If lang_end is greater than or equal to 8:
+                    Set scanning_lang to 0
+                End If
+            Otherwise:
+                Set scanning_lang to 0
+            End If
+        End If
+    End While
+    If lang_end is equal to 0:
+        Note: No leading alpha - invalid
+        Let orig_p be Memory.memory_get_pointer(header, LOCALE_OFFSET_ORIGINAL)
+        If orig_p is not equal to 0:
+            deallocate(orig_p)
+        End If
+        deallocate(header)
+        Return 0
+    End If
+
+    Let language be locale_internal_copy_subtag(tag, 0, lang_end, 0)
+    Memory.memory_set_pointer(header, LOCALE_OFFSET_LANGUAGE, language)
+
+    Note: Now parse subsequent subtags
+    Let pos be lang_end
+    While pos is less than tag_len:
+        Let sep_byte be Memory.memory_get_byte(tag, pos)
+        If locale_internal_is_separator(sep_byte) is equal to 1:
+            Set pos to pos plus 1
+            Note: Capture next subtag bytes up to next separator or end or '.' or '@'
+            Let sub_start be pos
+            Let scanning be 1
+            While scanning is equal to 1:
+                If pos is greater than or equal to tag_len:
+                    Set scanning to 0
+                Otherwise:
+                    Let sc be Memory.memory_get_byte(tag, pos)
+                    If locale_internal_is_separator(sc) is equal to 1:
+                        Set scanning to 0
+                    Otherwise:
+                        If sc is equal to 46:
+                            Set scanning to 0
+                        Otherwise:
+                            If sc is equal to 64:
+                                Set scanning to 0
+                            Otherwise:
+                                Set pos to pos plus 1
+                            End If
+                        End If
+                    End If
+                End If
+            End While
+            Let sub_len be pos minus sub_start
+            If sub_len is greater than 0:
+                Note: Classify the subtag
+                Note: 4 alpha letters -> script (titlecase)
+                Note: 2 alpha letters -> region (uppercase) if not script slot
+                Note: 3 digits -> region (numeric UN M.49)
+                Note: else -> variant
+                Let cur_script be Memory.memory_get_pointer(header, LOCALE_OFFSET_SCRIPT)
+                Let cur_region be Memory.memory_get_pointer(header, LOCALE_OFFSET_REGION)
+                Let all_alpha be 1
+                Let all_digit be 1
+                Let ci be 0
+                While ci is less than sub_len:
+                    Let ch be Memory.memory_get_byte(tag, sub_start plus ci)
+                    If locale_internal_is_alpha(ch) is equal to 0:
+                        Set all_alpha to 0
+                    End If
+                    If ch is less than 48:
+                        Set all_digit to 0
+                    End If
+                    If ch is greater than 57:
+                        Set all_digit to 0
+                    End If
+                    Set ci to ci plus 1
+                End While
+
+                If sub_len is equal to 4:
+                    If all_alpha is equal to 1:
+                        If cur_script is equal to 0:
+                            Let script_buf be locale_internal_copy_subtag(tag, sub_start, pos, 2)
+                            Memory.memory_set_pointer(header, LOCALE_OFFSET_SCRIPT, script_buf)
+                        Otherwise:
+                            Let var_buf be locale_internal_copy_subtag(tag, sub_start, pos, 0)
+                            Memory.memory_set_pointer(header, LOCALE_OFFSET_VARIANT, var_buf)
+                        End If
+                    Otherwise:
+                        Let var_buf2 be locale_internal_copy_subtag(tag, sub_start, pos, 0)
+                        Memory.memory_set_pointer(header, LOCALE_OFFSET_VARIANT, var_buf2)
+                    End If
+                Otherwise:
+                    If sub_len is equal to 2:
+                        If all_alpha is equal to 1:
+                            If cur_region is equal to 0:
+                                Let region_buf be locale_internal_copy_subtag(tag, sub_start, pos, 1)
+                                Memory.memory_set_pointer(header, LOCALE_OFFSET_REGION, region_buf)
+                            Otherwise:
+                                Let var_buf3 be locale_internal_copy_subtag(tag, sub_start, pos, 0)
+                                Memory.memory_set_pointer(header, LOCALE_OFFSET_VARIANT, var_buf3)
+                            End If
+                        Otherwise:
+                            Let var_buf4 be locale_internal_copy_subtag(tag, sub_start, pos, 0)
+                            Memory.memory_set_pointer(header, LOCALE_OFFSET_VARIANT, var_buf4)
+                        End If
+                    Otherwise:
+                        If sub_len is equal to 3:
+                            If all_digit is equal to 1:
+                                If cur_region is equal to 0:
+                                    Let region_buf2 be locale_internal_copy_subtag(tag, sub_start, pos, 1)
+                                    Memory.memory_set_pointer(header, LOCALE_OFFSET_REGION, region_buf2)
+                                Otherwise:
+                                    Let var_buf5 be locale_internal_copy_subtag(tag, sub_start, pos, 0)
+                                    Memory.memory_set_pointer(header, LOCALE_OFFSET_VARIANT, var_buf5)
+                                End If
+                            Otherwise:
+                                Let var_buf6 be locale_internal_copy_subtag(tag, sub_start, pos, 0)
+                                Memory.memory_set_pointer(header, LOCALE_OFFSET_VARIANT, var_buf6)
+                            End If
+                        Otherwise:
+                            Let var_buf7 be locale_internal_copy_subtag(tag, sub_start, pos, 0)
+                            Memory.memory_set_pointer(header, LOCALE_OFFSET_VARIANT, var_buf7)
+                        End If
+                    End If
+                End If
+            End If
+        Otherwise:
+            Note: '.' or '@' starts encoding/modifier - everything to end is variant
+            Let rest_start be pos
+            Set pos to tag_len
+            Let cur_var be Memory.memory_get_pointer(header, LOCALE_OFFSET_VARIANT)
+            If cur_var is equal to 0:
+                Let var_tail be locale_internal_copy_subtag(tag, rest_start, tag_len, 0)
+                Memory.memory_set_pointer(header, LOCALE_OFFSET_VARIANT, var_tail)
+            End If
+        End If
+    End While
+
+    Return header
+End Process
+
+Process called "locale_destroy" takes loc as Integer returns Integer:
+    If loc is equal to 0:
+        Return 0
+    End If
+    Let lang be Memory.memory_get_pointer(loc, LOCALE_OFFSET_LANGUAGE)
+    If lang is not equal to 0:
+        deallocate(lang)
+    End If
+    Let script be Memory.memory_get_pointer(loc, LOCALE_OFFSET_SCRIPT)
+    If script is not equal to 0:
+        deallocate(script)
+    End If
+    Let region be Memory.memory_get_pointer(loc, LOCALE_OFFSET_REGION)
+    If region is not equal to 0:
+        deallocate(region)
+    End If
+    Let variant be Memory.memory_get_pointer(loc, LOCALE_OFFSET_VARIANT)
+    If variant is not equal to 0:
+        deallocate(variant)
+    End If
+    Let original be Memory.memory_get_pointer(loc, LOCALE_OFFSET_ORIGINAL)
+    If original is not equal to 0:
+        deallocate(original)
+    End If
+    deallocate(loc)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS
+Note: ============================================================================
+
+Process called "locale_language" takes loc as Integer returns Integer:
+    If loc is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(loc, LOCALE_OFFSET_LANGUAGE)
+End Process
+
+Process called "locale_script" takes loc as Integer returns Integer:
+    If loc is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(loc, LOCALE_OFFSET_SCRIPT)
+End Process
+
+Process called "locale_region" takes loc as Integer returns Integer:
+    If loc is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(loc, LOCALE_OFFSET_REGION)
+End Process
+
+Process called "locale_variant" takes loc as Integer returns Integer:
+    If loc is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(loc, LOCALE_OFFSET_VARIANT)
+End Process
+
+Process called "locale_original" takes loc as Integer returns Integer:
+    Note: The raw input string, useful for round-tripping or
+    Note: diagnostic display.
+    If loc is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(loc, LOCALE_OFFSET_ORIGINAL)
+End Process

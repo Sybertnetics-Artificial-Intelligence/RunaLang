@@ -1,0 +1,992 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Fixed-size Float64 vectors (Vector2, Vector3, Vector4).
+
+Memory layout (heap-allocated, little-endian IEEE-754 binary64 per lane):
+  Vector2: 16 bytes  (x at +0,  y at +8)
+  Vector3: 24 bytes  (x at +0,  y at +8,  z at +16)
+  Vector4: 32 bytes  (x at +0,  y at +8,  z at +16, w at +24)
+
+Backing storage uses Layout.allocate so vectors live on the owned heap
+(Tier 3) and survive across calls. Callers free with vectorN_free.
+
+Operations implemented:
+  - allocate / free / set / get / copy
+  - add / sub / scalar_mul / negate
+  - dot product
+  - cross product (Vector3 only - right-hand rule x_hat * y_hat = z_hat)
+  - magnitude (Euclidean norm) and magnitude_squared
+  - normalize (in-place)
+  - distance / distance_squared
+  - angle_between (radians, via dot/(|a||b|) then acos)
+  - lerp (linear interpolation)
+  - project (vector projection of a onto b)
+  - reflect (Snell-style reflection across normal)
+
+@Reasoning
+Fixed-dimension vectors are the workhorse type for 3D graphics, robotics,
+physics simulation, and any geometric computation. Implementing them as
+flat Float64 buffers (rather than struct fields) keeps the layout uniform
+across Vector2/3/4 and lets the same memory_get/set routines apply at
+every lane, which matches the existing code style in numeric/fixed/int256.
+@End Reasoning
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/core/trig_core.runa" as Trig
+
+Note: ============================================================================
+Note: Constants
+Note: ============================================================================
+
+Constant VECTOR2_SIZE_BYTES as Integer is 16
+Constant VECTOR3_SIZE_BYTES as Integer is 24
+Constant VECTOR4_SIZE_BYTES as Integer is 32
+
+Note: ============================================================================
+Note: Bit-cast helpers between Float and Integer bit pattern
+Note: ============================================================================
+
+Process called "vec_float_to_bits" takes x as Float returns Integer:
+    @Reasoning
+        Reinterpret a Float64 register as a 64-bit Integer bit pattern
+        without changing any bits. Required to bridge native Float
+        arithmetic and Integer-based memory store / trig_core APIs.
+    @End Reasoning
+    @Implementation
+        x lands at [rbp-8] (Float param slot). result lands at [rbp-16]
+        (Integer local). One mov copies the raw 64-bit pattern across.
+    @End Implementation
+    @Performance_Hints
+        Single mov, zero latency on modern OoO cores.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time. Pure bit reinterpretation.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "vec_bits_to_float" takes b as Integer returns Float:
+    @Reasoning
+        Inverse of vec_float_to_bits. Reinterpret a 64-bit Integer bit
+        pattern as a Float64.
+    @End Reasoning
+    @Implementation
+        Same single mov pattern; the stack slots are typed differently
+        but bit-identical.
+    @End Implementation
+    @Performance_Hints
+        Single mov.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let result be 0.0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "vec_store_lane" takes ptr as Integer, offset as Integer, value as Float returns Integer:
+    @Reasoning
+        Write one Float64 lane at ptr+offset. Used by every constructor
+        and arithmetic operation in this module.
+    @End Reasoning
+    @Implementation
+        Bit-cast value to its 64-bit pattern, then memory_set_int64.
+    @End Implementation
+    @Performance_Hints
+        Two instructions plus the memory_set_int64 call body.
+    @End Performance_Hints
+    @Security_Scope
+        Caller must ensure ptr+offset is within an allocated lane.
+    @End Security_Scope
+    Let bits be proc vec_float_to_bits with value
+    Let _w be proc memory_set_int64 from Memory with ptr, offset, bits
+    Return 0
+End Process
+
+Process called "vec_load_lane" takes ptr as Integer, offset as Integer returns Float:
+    @Reasoning
+        Read one Float64 lane at ptr+offset.
+    @End Reasoning
+    @Implementation
+        memory_get_int64 then bit-cast to Float64.
+    @End Implementation
+    @Performance_Hints
+        One memory read plus one mov.
+    @End Performance_Hints
+    @Security_Scope
+        Caller must ensure ptr+offset is within an allocated lane.
+    @End Security_Scope
+    Let bits be proc memory_get_int64 from Memory with ptr, offset
+    Let value be proc vec_bits_to_float with bits
+    Return value
+End Process
+
+Note: ============================================================================
+Note: Vector2 - 2D Float64 vector
+Note: ============================================================================
+
+Process called "vector2_allocate" returns Integer:
+    @Reasoning
+        Allocate a fresh 16-byte zeroed Vector2 on the owned heap.
+    @End Reasoning
+    @Implementation
+        Layout.allocate returns zero-initialized storage, so the
+        resulting vector represents (0.0, 0.0).
+    @End Implementation
+    @Performance_Hints
+        O(1) on the size-class fast path.
+    @End Performance_Hints
+    @Security_Scope
+        Zeroed; no leak from prior occupants.
+    @End Security_Scope
+    Let ptr be proc allocate from Layout with VECTOR2_SIZE_BYTES
+    Return ptr
+End Process
+
+Process called "vector2_free" takes v as Integer returns Integer:
+    @Reasoning
+        Release a Vector2 buffer.
+    @End Reasoning
+    @Implementation
+        Idempotent on null.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Caller must drop the pointer after this call.
+    @End Security_Scope
+    If v is equal to 0:
+        Return 0
+    End If
+    Let _d be proc deallocate from Layout with v
+    Return 0
+End Process
+
+Process called "vector2_set" takes v as Integer, x as Float, y as Float returns Integer:
+    @Reasoning
+        Initialize both lanes.
+    @End Reasoning
+    @Implementation
+        Two store_lane calls.
+    @End Implementation
+    @Performance_Hints
+        Two 8-byte writes.
+    @End Performance_Hints
+    @Security_Scope
+        Caller owns v.
+    @End Security_Scope
+    Let _x be proc vec_store_lane with v, 0, x
+    Let _y be proc vec_store_lane with v, 8, y
+    Return 0
+End Process
+
+Process called "vector2_get_x" takes v as Integer returns Float:
+    Return proc vec_load_lane with v, 0
+End Process
+
+Process called "vector2_get_y" takes v as Integer returns Float:
+    Return proc vec_load_lane with v, 8
+End Process
+
+Process called "vector2_copy" takes src as Integer, dst as Integer returns Integer:
+    @Reasoning
+        Bitwise copy of 16 bytes from src to dst.
+    @End Reasoning
+    @Implementation
+        memory_copy with explicit length.
+    @End Implementation
+    @Performance_Hints
+        O(1), 2 qword writes by memory_copy fast path.
+    @End Performance_Hints
+    @Security_Scope
+        No aliasing issues for forward copy of small fixed buffer.
+    @End Security_Scope
+    Let _c be proc memory_copy from Memory with dst, src, VECTOR2_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "vector2_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Lane-wise sum r = a + b. Reads both operands into Float locals
+        first so result may safely alias either input.
+    @End Reasoning
+    @Implementation
+        Two Float adds and two store_lanes.
+    @End Implementation
+    @Performance_Hints
+        Two addsd + two memory writes.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe via snapshot.
+    @End Security_Scope
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let _x be proc vec_store_lane with result, 0, ax plus bx
+    Let _y be proc vec_store_lane with result, 8, ay plus b_y
+    Return 0
+End Process
+
+Process called "vector2_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Lane-wise r = a - b.
+    @End Reasoning
+    @Implementation
+        Snapshot then subsd lane by lane.
+    @End Implementation
+    @Performance_Hints
+        Two subsd + two writes.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let _x be proc vec_store_lane with result, 0, ax minus bx
+    Let _y be proc vec_store_lane with result, 8, ay minus b_y
+    Return 0
+End Process
+
+Process called "vector2_scalar_mul" takes v as Integer, s as Float, result as Integer returns Integer:
+    @Reasoning
+        Each lane is multiplied by the scalar.
+    @End Reasoning
+    @Implementation
+        Snapshot then two mulsd.
+    @End Implementation
+    @Performance_Hints
+        Two mulsd + two writes.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let vx be proc vec_load_lane with v, 0
+    Let vy be proc vec_load_lane with v, 8
+    Let _x be proc vec_store_lane with result, 0, vx multiplied by s
+    Let _y be proc vec_store_lane with result, 8, vy multiplied by s
+    Return 0
+End Process
+
+Process called "vector2_negate" takes v as Integer, result as Integer returns Integer:
+    @Reasoning
+        Negate every lane.
+    @End Reasoning
+    @Implementation
+        Multiply by -1.0 lane-wise.
+    @End Implementation
+    @Performance_Hints
+        Could be optimized to xor of the sign bit; we use multiply for
+        IEEE-754 correctness on NaN payloads.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let vx be proc vec_load_lane with v, 0
+    Let vy be proc vec_load_lane with v, 8
+    Let neg_one be 0.0 minus 1.0
+    Let _x be proc vec_store_lane with result, 0, vx multiplied by neg_one
+    Let _y be proc vec_store_lane with result, 8, vy multiplied by neg_one
+    Return 0
+End Process
+
+Process called "vector2_dot" takes a as Integer, b as Integer returns Float:
+    @Reasoning
+        Inner product ax*bx + ay*by.
+    @End Reasoning
+    @Implementation
+        Direct evaluation. No Kahan compensation: callers needing extended
+        precision should use the float128 variant once available.
+    @End Implementation
+    @Performance_Hints
+        Two mulsd, one addsd.
+    @End Performance_Hints
+    @Security_Scope
+        No aliasing issues; result is a Float scalar.
+    @End Security_Scope
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let prod1 be ax multiplied by bx
+    Let prod2 be ay multiplied by b_y
+    Return prod1 plus prod2
+End Process
+
+Process called "vector2_magnitude_squared" takes v as Integer returns Float:
+    @Reasoning
+        |v|^2 = dot(v, v). Cheaper than magnitude (skips sqrt).
+    @End Reasoning
+    @Implementation
+        Direct fused sum of squares.
+    @End Implementation
+    @Performance_Hints
+        Two mulsd + one addsd, no sqrt.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let vx be proc vec_load_lane with v, 0
+    Let vy be proc vec_load_lane with v, 8
+    Let sq be (vx multiplied by vx) plus (vy multiplied by vy)
+    Return sq
+End Process
+
+Process called "vector2_magnitude" takes v as Integer returns Float:
+    @Reasoning
+        Euclidean norm sqrt(x^2 + y^2).
+    @End Reasoning
+    @Implementation
+        Uses Arith.sqrt (hardware sqrtsd).
+    @End Implementation
+    @Performance_Hints
+        One sqrtsd dominates.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time on non-denormal inputs.
+    @End Security_Scope
+    Let mag_sq be proc vector2_magnitude_squared with v
+    Let mag be proc sqrt from Arith with mag_sq
+    Return mag
+End Process
+
+Process called "vector2_normalize" takes v as Integer, result as Integer returns Integer:
+    @Reasoning
+        Produce a unit vector with the same direction as v. If |v|=0,
+        write zero to result and return -1 to signal degenerate input.
+    @End Reasoning
+    @Implementation
+        Divide each lane by the magnitude.
+    @End Implementation
+    @Performance_Hints
+        One sqrt, one divsd, two mulsd lane multiplies.
+    @End Performance_Hints
+    @Security_Scope
+        Caller checks return code.
+    @End Security_Scope
+    Let mag be proc vector2_magnitude with v
+    If mag is equal to 0.0:
+        Let _zx be proc vec_store_lane with result, 0, 0.0
+        Let _zy be proc vec_store_lane with result, 8, 0.0
+        Return 0 minus 1
+    End If
+    Let inv be 1.0 divided by mag
+    Let _r be proc vector2_scalar_mul with v, inv, result
+    Return 0
+End Process
+
+Process called "vector2_distance" takes a as Integer, b as Integer returns Float:
+    @Reasoning
+        |a - b|.
+    @End Reasoning
+    @Implementation
+        Lane-difference, sum-of-squares, sqrt. No intermediate allocation.
+    @End Implementation
+    @Performance_Hints
+        Two subsd, two mulsd, addsd, sqrtsd.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let dx be ax minus bx
+    Let dy be ay minus b_y
+    Let sq be (dx multiplied by dx) plus (dy multiplied by dy)
+    Return proc sqrt from Arith with sq
+End Process
+
+Process called "vector2_distance_squared" takes a as Integer, b as Integer returns Float:
+    @Reasoning
+        |a - b|^2. Useful in nearest-neighbor / hot-loop code paths.
+    @End Reasoning
+    @Implementation
+        Lane difference + sum of squares.
+    @End Implementation
+    @Performance_Hints
+        Avoids sqrt.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let dx be ax minus bx
+    Let dy be ay minus b_y
+    Return (dx multiplied by dx) plus (dy multiplied by dy)
+End Process
+
+Process called "vector2_lerp" takes a as Integer, b as Integer, t as Float, result as Integer returns Integer:
+    @Reasoning
+        Linear interpolation r = a + t*(b - a). Standard "fma form" for
+        numerical stability over the naive (1-t)*a + t*b which loses
+        precision near t=0 and t=1.
+    @End Reasoning
+    @Implementation
+        Lane-wise: r = a + t*(b - a).
+    @End Implementation
+    @Performance_Hints
+        Two subsd + two mulsd + two addsd.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let rx be ax plus (t multiplied by (bx minus ax))
+    Let ry be ay plus (t multiplied by (b_y minus ay))
+    Let _x be proc vec_store_lane with result, 0, rx
+    Let _y be proc vec_store_lane with result, 8, ry
+    Return 0
+End Process
+
+Process called "vector2_project" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Projection of a onto b: proj_b(a) = (a . b / b . b) * b.
+        Returns -1 if |b|=0.
+    @End Reasoning
+    @Implementation
+        Compute dot(a,b) and |b|^2, then scale b by their ratio.
+    @End Implementation
+    @Performance_Hints
+        Two dots + one division + one scalar_mul.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let dot be proc vector2_dot with a, b
+    Let bb be proc vector2_magnitude_squared with b
+    If bb is equal to 0.0:
+        Let _zx be proc vec_store_lane with result, 0, 0.0
+        Let _zy be proc vec_store_lane with result, 8, 0.0
+        Return 0 minus 1
+    End If
+    Let k be dot divided by bb
+    Let _r be proc vector2_scalar_mul with b, k, result
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Vector3 - 3D Float64 vector
+Note: ============================================================================
+
+Process called "vector3_allocate" returns Integer:
+    @Reasoning
+        Allocate 24-byte zeroed Vector3.
+    @End Reasoning
+    @Implementation
+        Layout.allocate.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        Zeroed.
+    @End Security_Scope
+    Let ptr be proc allocate from Layout with VECTOR3_SIZE_BYTES
+    Return ptr
+End Process
+
+Process called "vector3_free" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let _d be proc deallocate from Layout with v
+    Return 0
+End Process
+
+Process called "vector3_set" takes v as Integer, x as Float, y as Float, z as Float returns Integer:
+    Let _x be proc vec_store_lane with v, 0, x
+    Let _y be proc vec_store_lane with v, 8, y
+    Let _z be proc vec_store_lane with v, 16, z
+    Return 0
+End Process
+
+Process called "vector3_get_x" takes v as Integer returns Float:
+    Return proc vec_load_lane with v, 0
+End Process
+
+Process called "vector3_get_y" takes v as Integer returns Float:
+    Return proc vec_load_lane with v, 8
+End Process
+
+Process called "vector3_get_z" takes v as Integer returns Float:
+    Return proc vec_load_lane with v, 16
+End Process
+
+Process called "vector3_copy" takes src as Integer, dst as Integer returns Integer:
+    Let _c be proc memory_copy from Memory with dst, src, VECTOR3_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "vector3_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Lane-wise sum across 3 lanes.
+    @End Reasoning
+    @Implementation
+        Snapshot inputs then write result.
+    @End Implementation
+    @Performance_Hints
+        Three addsd.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let _x be proc vec_store_lane with result, 0, ax plus bx
+    Let _y be proc vec_store_lane with result, 8, ay plus b_y
+    Let _z be proc vec_store_lane with result, 16, az plus bz
+    Return 0
+End Process
+
+Process called "vector3_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let _x be proc vec_store_lane with result, 0, ax minus bx
+    Let _y be proc vec_store_lane with result, 8, ay minus b_y
+    Let _z be proc vec_store_lane with result, 16, az minus bz
+    Return 0
+End Process
+
+Process called "vector3_scalar_mul" takes v as Integer, s as Float, result as Integer returns Integer:
+    Let vx be proc vec_load_lane with v, 0
+    Let vy be proc vec_load_lane with v, 8
+    Let vz be proc vec_load_lane with v, 16
+    Let _x be proc vec_store_lane with result, 0, vx multiplied by s
+    Let _y be proc vec_store_lane with result, 8, vy multiplied by s
+    Let _z be proc vec_store_lane with result, 16, vz multiplied by s
+    Return 0
+End Process
+
+Process called "vector3_negate" takes v as Integer, result as Integer returns Integer:
+    Let neg_one be 0.0 minus 1.0
+    Let _r be proc vector3_scalar_mul with v, neg_one, result
+    Return 0
+End Process
+
+Process called "vector3_dot" takes a as Integer, b as Integer returns Float:
+    @Reasoning
+        Inner product over 3 lanes.
+    @End Reasoning
+    @Implementation
+        Direct fused sum.
+    @End Implementation
+    @Performance_Hints
+        Three mulsd + two addsd.
+    @End Performance_Hints
+    @Security_Scope
+        No aliasing.
+    @End Security_Scope
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let p1 be ax multiplied by bx
+    Let p2 be ay multiplied by b_y
+    Let p3 be az multiplied by bz
+    Return (p1 plus p2) plus p3
+End Process
+
+Process called "vector3_cross" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Right-hand-rule cross product:
+          r.x = a.y*b.z - a.z*b.y
+          r.y = a.z*b.x - a.x*b.z
+          r.z = a.x*b.y - a.y*b.x
+        Property: x_hat cross y_hat = z_hat.
+    @End Reasoning
+    @Implementation
+        Snapshot all six lanes before writing result to permit aliasing.
+    @End Implementation
+    @Performance_Hints
+        Six mulsd + three subsd. Standard cross-product cost.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let rx be (ay multiplied by bz) minus (az multiplied by b_y)
+    Let ry be (az multiplied by bx) minus (ax multiplied by bz)
+    Let rz be (ax multiplied by b_y) minus (ay multiplied by bx)
+    Let _x be proc vec_store_lane with result, 0, rx
+    Let _y be proc vec_store_lane with result, 8, ry
+    Let _z be proc vec_store_lane with result, 16, rz
+    Return 0
+End Process
+
+Process called "vector3_magnitude_squared" takes v as Integer returns Float:
+    Let vx be proc vec_load_lane with v, 0
+    Let vy be proc vec_load_lane with v, 8
+    Let vz be proc vec_load_lane with v, 16
+    Let p1 be vx multiplied by vx
+    Let p2 be vy multiplied by vy
+    Let p3 be vz multiplied by vz
+    Return (p1 plus p2) plus p3
+End Process
+
+Process called "vector3_magnitude" takes v as Integer returns Float:
+    Let mag_sq be proc vector3_magnitude_squared with v
+    Return proc sqrt from Arith with mag_sq
+End Process
+
+Process called "vector3_normalize" takes v as Integer, result as Integer returns Integer:
+    Let mag be proc vector3_magnitude with v
+    If mag is equal to 0.0:
+        Let _zx be proc vec_store_lane with result, 0, 0.0
+        Let _zy be proc vec_store_lane with result, 8, 0.0
+        Let _zz be proc vec_store_lane with result, 16, 0.0
+        Return 0 minus 1
+    End If
+    Let inv be 1.0 divided by mag
+    Let _r be proc vector3_scalar_mul with v, inv, result
+    Return 0
+End Process
+
+Process called "vector3_distance" takes a as Integer, b as Integer returns Float:
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let dx be ax minus bx
+    Let dy be ay minus b_y
+    Let dz be az minus bz
+    Let sq be ((dx multiplied by dx) plus (dy multiplied by dy)) plus (dz multiplied by dz)
+    Return proc sqrt from Arith with sq
+End Process
+
+Process called "vector3_distance_squared" takes a as Integer, b as Integer returns Float:
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let dx be ax minus bx
+    Let dy be ay minus b_y
+    Let dz be az minus bz
+    Return ((dx multiplied by dx) plus (dy multiplied by dy)) plus (dz multiplied by dz)
+End Process
+
+Process called "vector3_lerp" takes a as Integer, b as Integer, t as Float, result as Integer returns Integer:
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let rx be ax plus (t multiplied by (bx minus ax))
+    Let ry be ay plus (t multiplied by (b_y minus ay))
+    Let rz be az plus (t multiplied by (bz minus az))
+    Let _x be proc vec_store_lane with result, 0, rx
+    Let _y be proc vec_store_lane with result, 8, ry
+    Let _z be proc vec_store_lane with result, 16, rz
+    Return 0
+End Process
+
+Process called "vector3_angle_between" takes a as Integer, b as Integer returns Float:
+    @Reasoning
+        theta = acos( (a . b) / (|a| * |b|) ). Returns Float64 NaN if
+        either vector is zero-length (division by zero) since the angle
+        is undefined.
+    @End Reasoning
+    @Implementation
+        Clamp the cosine to [-1, 1] before passing to acos so accumulated
+        floating-point error cannot push the argument out of the valid
+        domain.
+    @End Implementation
+    @Performance_Hints
+        Two magnitudes + one acos (the dominant cost is acos).
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time except for sign branches.
+    @End Security_Scope
+    Let dot be proc vector3_dot with a, b
+    Let ma be proc vector3_magnitude with a
+    Let mb be proc vector3_magnitude with b
+    Let denom be ma multiplied by mb
+    Let cos_theta be dot divided by denom
+    If cos_theta is greater than 1.0:
+        Set cos_theta to 1.0
+    End If
+    Let neg_one be 0.0 minus 1.0
+    If cos_theta is less than neg_one:
+        Set cos_theta to neg_one
+    End If
+    Let cos_bits be proc vec_float_to_bits with cos_theta
+    Let theta_bits be proc acos from Trig with cos_bits
+    Let theta be proc vec_bits_to_float with theta_bits
+    Return theta
+End Process
+
+Process called "vector3_project" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let dot be proc vector3_dot with a, b
+    Let bb be proc vector3_magnitude_squared with b
+    If bb is equal to 0.0:
+        Let _zx be proc vec_store_lane with result, 0, 0.0
+        Let _zy be proc vec_store_lane with result, 8, 0.0
+        Let _zz be proc vec_store_lane with result, 16, 0.0
+        Return 0 minus 1
+    End If
+    Let k be dot divided by bb
+    Let _r be proc vector3_scalar_mul with b, k, result
+    Return 0
+End Process
+
+Process called "vector3_reflect" takes incident as Integer, normal as Integer, result as Integer returns Integer:
+    @Reasoning
+        r = i - 2 * (i . n) * n,  with n a unit vector by convention.
+        This is Snell-style reflection (perfect mirror, no refraction).
+    @End Reasoning
+    @Implementation
+        Compute the scalar 2 * dot(i, n), scale the normal by it, then
+        subtract from the incident vector.
+    @End Implementation
+    @Performance_Hints
+        One dot + one scalar_mul + one sub.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let dot be proc vector3_dot with incident, normal
+    Let k be 2.0 multiplied by dot
+    Let nx be proc vec_load_lane with normal, 0
+    Let ny be proc vec_load_lane with normal, 8
+    Let nz be proc vec_load_lane with normal, 16
+    Let ix be proc vec_load_lane with incident, 0
+    Let iy be proc vec_load_lane with incident, 8
+    Let iz be proc vec_load_lane with incident, 16
+    Let _x be proc vec_store_lane with result, 0, ix minus (k multiplied by nx)
+    Let _y be proc vec_store_lane with result, 8, iy minus (k multiplied by ny)
+    Let _z be proc vec_store_lane with result, 16, iz minus (k multiplied by nz)
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Vector4 - 4D Float64 vector (homogeneous coordinates, RGBA, quaternion-as-vec)
+Note: ============================================================================
+
+Process called "vector4_allocate" returns Integer:
+    Let ptr be proc allocate from Layout with VECTOR4_SIZE_BYTES
+    Return ptr
+End Process
+
+Process called "vector4_free" takes v as Integer returns Integer:
+    If v is equal to 0:
+        Return 0
+    End If
+    Let _d be proc deallocate from Layout with v
+    Return 0
+End Process
+
+Process called "vector4_set" takes v as Integer, x as Float, y as Float, z as Float, w as Float returns Integer:
+    Let _x be proc vec_store_lane with v, 0, x
+    Let _y be proc vec_store_lane with v, 8, y
+    Let _z be proc vec_store_lane with v, 16, z
+    Let _w be proc vec_store_lane with v, 24, w
+    Return 0
+End Process
+
+Process called "vector4_get_x" takes v as Integer returns Float:
+    Return proc vec_load_lane with v, 0
+End Process
+
+Process called "vector4_get_y" takes v as Integer returns Float:
+    Return proc vec_load_lane with v, 8
+End Process
+
+Process called "vector4_get_z" takes v as Integer returns Float:
+    Return proc vec_load_lane with v, 16
+End Process
+
+Process called "vector4_get_w" takes v as Integer returns Float:
+    Return proc vec_load_lane with v, 24
+End Process
+
+Process called "vector4_copy" takes src as Integer, dst as Integer returns Integer:
+    Let _c be proc memory_copy from Memory with dst, src, VECTOR4_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "vector4_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let aw be proc vec_load_lane with a, 24
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let bw be proc vec_load_lane with b, 24
+    Let _x be proc vec_store_lane with result, 0, ax plus bx
+    Let _y be proc vec_store_lane with result, 8, ay plus b_y
+    Let _z be proc vec_store_lane with result, 16, az plus bz
+    Let _w be proc vec_store_lane with result, 24, aw plus bw
+    Return 0
+End Process
+
+Process called "vector4_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let aw be proc vec_load_lane with a, 24
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let bw be proc vec_load_lane with b, 24
+    Let _x be proc vec_store_lane with result, 0, ax minus bx
+    Let _y be proc vec_store_lane with result, 8, ay minus b_y
+    Let _z be proc vec_store_lane with result, 16, az minus bz
+    Let _w be proc vec_store_lane with result, 24, aw minus bw
+    Return 0
+End Process
+
+Process called "vector4_scalar_mul" takes v as Integer, s as Float, result as Integer returns Integer:
+    Let vx be proc vec_load_lane with v, 0
+    Let vy be proc vec_load_lane with v, 8
+    Let vz be proc vec_load_lane with v, 16
+    Let vw be proc vec_load_lane with v, 24
+    Let _x be proc vec_store_lane with result, 0, vx multiplied by s
+    Let _y be proc vec_store_lane with result, 8, vy multiplied by s
+    Let _z be proc vec_store_lane with result, 16, vz multiplied by s
+    Let _w be proc vec_store_lane with result, 24, vw multiplied by s
+    Return 0
+End Process
+
+Process called "vector4_negate" takes v as Integer, result as Integer returns Integer:
+    Let neg_one be 0.0 minus 1.0
+    Let _r be proc vector4_scalar_mul with v, neg_one, result
+    Return 0
+End Process
+
+Process called "vector4_dot" takes a as Integer, b as Integer returns Float:
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let aw be proc vec_load_lane with a, 24
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let bw be proc vec_load_lane with b, 24
+    Let p1 be ax multiplied by bx
+    Let p2 be ay multiplied by b_y
+    Let p3 be az multiplied by bz
+    Let p4 be aw multiplied by bw
+    Return ((p1 plus p2) plus p3) plus p4
+End Process
+
+Process called "vector4_magnitude_squared" takes v as Integer returns Float:
+    Let vx be proc vec_load_lane with v, 0
+    Let vy be proc vec_load_lane with v, 8
+    Let vz be proc vec_load_lane with v, 16
+    Let vw be proc vec_load_lane with v, 24
+    Let p1 be vx multiplied by vx
+    Let p2 be vy multiplied by vy
+    Let p3 be vz multiplied by vz
+    Let p4 be vw multiplied by vw
+    Return ((p1 plus p2) plus p3) plus p4
+End Process
+
+Process called "vector4_magnitude" takes v as Integer returns Float:
+    Let mag_sq be proc vector4_magnitude_squared with v
+    Return proc sqrt from Arith with mag_sq
+End Process
+
+Process called "vector4_normalize" takes v as Integer, result as Integer returns Integer:
+    Let mag be proc vector4_magnitude with v
+    If mag is equal to 0.0:
+        Let _x be proc vec_store_lane with result, 0, 0.0
+        Let _y be proc vec_store_lane with result, 8, 0.0
+        Let _z be proc vec_store_lane with result, 16, 0.0
+        Let _w be proc vec_store_lane with result, 24, 0.0
+        Return 0 minus 1
+    End If
+    Let inv be 1.0 divided by mag
+    Let _r be proc vector4_scalar_mul with v, inv, result
+    Return 0
+End Process
+
+Process called "vector4_distance" takes a as Integer, b as Integer returns Float:
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let aw be proc vec_load_lane with a, 24
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let bw be proc vec_load_lane with b, 24
+    Let dx be ax minus bx
+    Let dy be ay minus b_y
+    Let dz be az minus bz
+    Let dw be aw minus bw
+    Let sq1 be (dx multiplied by dx) plus (dy multiplied by dy)
+    Let sq2 be (dz multiplied by dz) plus (dw multiplied by dw)
+    Return proc sqrt from Arith with (sq1 plus sq2)
+End Process
+
+Process called "vector4_lerp" takes a as Integer, b as Integer, t as Float, result as Integer returns Integer:
+    Let ax be proc vec_load_lane with a, 0
+    Let ay be proc vec_load_lane with a, 8
+    Let az be proc vec_load_lane with a, 16
+    Let aw be proc vec_load_lane with a, 24
+    Let bx be proc vec_load_lane with b, 0
+    Let b_y be proc vec_load_lane with b, 8
+    Let bz be proc vec_load_lane with b, 16
+    Let bw be proc vec_load_lane with b, 24
+    Let _x be proc vec_store_lane with result, 0, ax plus (t multiplied by (bx minus ax))
+    Let _y be proc vec_store_lane with result, 8, ay plus (t multiplied by (b_y minus ay))
+    Let _z be proc vec_store_lane with result, 16, az plus (t multiplied by (bz minus az))
+    Let _w be proc vec_store_lane with result, 24, aw plus (t multiplied by (bw minus aw))
+    Return 0
+End Process

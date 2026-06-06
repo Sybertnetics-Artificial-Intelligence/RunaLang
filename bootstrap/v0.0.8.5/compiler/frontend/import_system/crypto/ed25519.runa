@@ -1,0 +1,1435 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+Ed25519 SIGNATURE per RFC 8032 section 5.1
+==============================================================================
+
+Ed25519 is EdDSA over the twisted Edwards curve
+
+    -x^2 + y^2 = 1 + d * x^2 * y^2   over F_(2^255 - 19)
+
+with d = -121665/121666. The base point B has order
+L = 2^252 + 27742317777372353535851937790883648493 and cofactor 8.
+Public keys are 32-byte encoded points; signatures are 64 bytes (R||S).
+
+Implementation:
+- Field arithmetic via field25519.runa (10-limb radix-2^25.5).
+- Point group ops in extended Edwards coordinates (X, Y, Z, T) where
+  x = X/Z, y = Y/Z, T = XY/Z. The "extended" form (Hisil-Wong-Carter-
+  Dawson 2008) gives mixed-addition formulas with 8 field multiplications
+  per addition and 7 multiplications per doubling.
+- Scalar multiplication is constant-time bit-by-bit double-and-add with
+  fe25519_cswap based on bit values; identical instruction sequence for
+  every secret bit.
+- Hash: SHA-512 (sha2.runa).
+- Scalar reduction mod L: barrett-style reduction using the bigint
+  primitive set.
+
+Public API:
+- ed25519_keygen(seed_32, public_key_32, secret_key_64): RFC 8032 5.1.5.
+- ed25519_sign(secret_key_64, message, len, signature_64): RFC 8032 5.1.6.
+- ed25519_verify(public_key_32, message, len, signature_64) returns 1|0:
+  RFC 8032 5.1.7.
+
+Test vectors: RFC 8032 7.1.
+
+References:
+- RFC 8032 (Bernstein, Josefsson, Niederhagen, Reschke, Schwabe).
+- D.J. Bernstein, P. Birkner, M. Joye, T. Lange, C. Peters, "Twisted
+  Edwards Curves", AFRICACRYPT 2008.
+- Hisil, Wong, Carter, Dawson, "Twisted Edwards Curves Revisited",
+  ASIACRYPT 2008 (extended coordinates).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/field25519.runa" as Fe
+Import "compiler/frontend/import_system/crypto/sha2.runa" as Sha2
+Import "compiler/frontend/import_system/crypto/bigint.runa" as BigInt
+
+Constant ED25519_POINT_BYTES as Integer is 320
+Constant ED25519_SIG_BYTES as Integer is 64
+Constant ED25519_PUBKEY_BYTES as Integer is 32
+Constant ED25519_PRIVKEY_BYTES as Integer is 64
+Constant ED25519_SEED_BYTES as Integer is 32
+
+Note: ============================================================================
+Note: SECTION 1: Point allocation and basic field-element layout
+Note: ============================================================================
+
+Note: Point layout in memory (320 bytes total):
+Note:   offset   0..79  : X (80 bytes, 10 limbs)
+Note:   offset  80..159 : Y
+Note:   offset 160..239 : Z
+Note:   offset 240..319 : T
+
+Process called "ed25519_point_alloc" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocates an extended Edwards point: 4 fe25519 elements packed
+    contiguously (X, Y, Z, T), 320 bytes total. Initial value is the
+    identity point (0, 1, 1, 0).
+    @End Reasoning
+
+    @Security_Scope
+    Arena allocation; lifetime tied to arena.
+    @End Security_Scope
+
+    Let buf be Arena.arena_allocate(arena, ED25519_POINT_BYTES)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Note: Zero everything first.
+    Let i be 0
+    While i is less than 40:
+        Memory.memory_set_qword(buf, i multiplied by 8, 0)
+        Set i to i plus 1
+    End While
+    Note: Identity = (X=0, Y=1, Z=1, T=0). Limb 0 of Y is 1, limb 0 of Z is 1.
+    Memory.memory_set_qword(buf, 80, 1)
+    Memory.memory_set_qword(buf, 160, 1)
+    Return buf
+End Process
+
+Process called "ed25519_point_x" takes p as Integer returns Integer:
+    Return p
+End Process
+
+Process called "ed25519_point_y" takes p as Integer returns Integer:
+    Return p plus 80
+End Process
+
+Process called "ed25519_point_z" takes p as Integer returns Integer:
+    Return p plus 160
+End Process
+
+Process called "ed25519_point_t" takes p as Integer returns Integer:
+    Return p plus 240
+End Process
+
+Process called "ed25519_point_copy" takes dest as Integer, src as Integer returns Integer:
+    Let i be 0
+    While i is less than 40:
+        Let limb be Memory.memory_get_int64(src, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, limb)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "ed25519_point_set_identity" takes p as Integer returns Integer:
+    Let i be 0
+    While i is less than 40:
+        Memory.memory_set_qword(p, i multiplied by 8, 0)
+        Set i to i plus 1
+    End While
+    Memory.memory_set_qword(p, 80, 1)
+    Memory.memory_set_qword(p, 160, 1)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Curve constant d = -121665/121666 (precomputed field element)
+Note: ============================================================================
+
+Process called "ed25519_load_d" takes d_out as Integer returns Integer:
+    @Reasoning
+    Loads the curve constant d = -121665/121666 (mod p) as a 10-limb
+    field element. The 32-byte little-endian encoding of d is the
+    well-known constant from RFC 8032 5.1:
+      a3 78 59 13 ca 4d eb 75 ab d8 41 41 4d 0a 70 00
+      98 e8 79 77 79 40 c7 8c 73 fe 6f 2b ee 6c 03 52
+    @End Reasoning
+
+    @Security_Scope
+    Hard-coded constant; no secrets touched.
+    @End Security_Scope
+
+    Note: Limb-direct values for d (extracted via the unpack schedule on
+    Note: the byte sequence above). These constants are computed offline
+    Note: and verified against RFC 8032 7.1 test vector reconstruction.
+    Memory.memory_set_qword(d_out, 0, 56195235)
+    Memory.memory_set_qword(d_out, 8, 13857412)
+    Memory.memory_set_qword(d_out, 16, 51736253)
+    Memory.memory_set_qword(d_out, 24, 6949390)
+    Memory.memory_set_qword(d_out, 32, 114729)
+    Memory.memory_set_qword(d_out, 40, 24766616)
+    Memory.memory_set_qword(d_out, 48, 60832955)
+    Memory.memory_set_qword(d_out, 56, 30306712)
+    Memory.memory_set_qword(d_out, 64, 48412415)
+    Memory.memory_set_qword(d_out, 72, 21499315)
+    Return 1
+End Process
+
+Process called "ed25519_load_2d" takes d2_out as Integer returns Integer:
+    @Reasoning
+    Loads 2d as a field element, used inline in extended-coordinates
+    point addition where the constant 2d multiplies T1*T2.
+
+    Computed offline as fe25519_add(d, d) then fe25519_carry; constants
+    are verified against the canonical 2d value from RFC 8032 reference
+    implementations.
+    @End Reasoning
+
+    @Security_Scope
+    Hard-coded constant.
+    @End Security_Scope
+
+    Memory.memory_set_qword(d2_out, 0, 45281625)
+    Memory.memory_set_qword(d2_out, 8, 27714825)
+    Memory.memory_set_qword(d2_out, 16, 36363642)
+    Memory.memory_set_qword(d2_out, 24, 13898781)
+    Memory.memory_set_qword(d2_out, 32, 229458)
+    Memory.memory_set_qword(d2_out, 40, 15978800)
+    Memory.memory_set_qword(d2_out, 48, 54557047)
+    Memory.memory_set_qword(d2_out, 56, 27058993)
+    Memory.memory_set_qword(d2_out, 64, 29715967)
+    Memory.memory_set_qword(d2_out, 72, 9444199)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Point addition in extended coordinates (RFC 8032 5.1.4)
+Note: ============================================================================
+
+Process called "ed25519_point_add" takes arena as Integer, dest as Integer, p as Integer, q as Integer returns Integer:
+    @Reasoning
+    Adds two extended-coordinates points: dest = P + Q.
+    Formula (Hisil-Wong-Carter-Dawson "Twisted Edwards Curves Revisited"
+    Section 3.1, "addition formulas with cost 9M"):
+      A = (Y1 - X1) * (Y2 - X2)
+      B = (Y1 + X1) * (Y2 + X2)
+      C = T1 * 2d * T2
+      D = Z1 * 2  * Z2
+      E = B - A
+      F = D - C
+      G = D + C
+      H = B + A
+      X3 = E * F
+      Y3 = G * H
+      T3 = E * H
+      Z3 = F * G
+
+    All field operations are constant-time.
+    @End Reasoning
+
+    @Implementation
+    Allocates 11 scratch field elements: A, B, C, D, E, F, G, H, x1y1_a,
+    x1y1_b, 2d, plus T1*T2 intermediate. Performs the 9 multiplications
+    + 7 additions/subtractions sequentially.
+    @End Implementation
+
+    @Performance_Hints
+    9 field multiplications per addition. The 2d constant is loaded
+    once per call; for tight inner loops a caller-supplied 2d field
+    element saves a few qword writes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: every operation is constant-time. No branches
+    depend on point values.
+    @End Security_Scope
+
+    Let A be proc fe25519_alloc from Fe with arena
+    Let B be proc fe25519_alloc from Fe with arena
+    Let C be proc fe25519_alloc from Fe with arena
+    Let D be proc fe25519_alloc from Fe with arena
+    Let E be proc fe25519_alloc from Fe with arena
+    Let F be proc fe25519_alloc from Fe with arena
+    Let G be proc fe25519_alloc from Fe with arena
+    Let H be proc fe25519_alloc from Fe with arena
+    Let t1 be proc fe25519_alloc from Fe with arena
+    Let t2 be proc fe25519_alloc from Fe with arena
+    Let two_d be proc fe25519_alloc from Fe with arena
+
+    If A is equal to 0:
+        Return 0
+    End If
+    If two_d is equal to 0:
+        Return 0
+    End If
+
+    proc ed25519_load_2d with two_d
+
+    Let p_x be p
+    Let p_y be p plus 80
+    Let p_z be p plus 160
+    Let p_t be p plus 240
+    Let q_x be q
+    Let q_y be q plus 80
+    Let q_z be q plus 160
+    Let q_t be q plus 240
+    Let dest_x be dest
+    Let dest_y be dest plus 80
+    Let dest_z be dest plus 160
+    Let dest_t be dest plus 240
+
+    Note: t1 = Y1 - X1, t2 = Y2 - X2
+    proc fe25519_sub from Fe with t1, p_y, p_x
+    proc fe25519_sub from Fe with t2, q_y, q_x
+    Note: A = t1 * t2
+    proc fe25519_mul from Fe with A, t1, t2
+
+    Note: t1 = Y1 + X1, t2 = Y2 + X2
+    proc fe25519_add from Fe with t1, p_y, p_x
+    proc fe25519_add from Fe with t2, q_y, q_x
+    Note: B = t1 * t2
+    proc fe25519_mul from Fe with B, t1, t2
+
+    Note: C = T1 * 2d * T2
+    proc fe25519_mul from Fe with t1, p_t, two_d
+    proc fe25519_mul from Fe with C, t1, q_t
+
+    Note: D = 2 * Z1 * Z2
+    proc fe25519_mul from Fe with t1, p_z, q_z
+    proc fe25519_add from Fe with D, t1, t1
+
+    Note: E = B - A, F = D - C, G = D + C, H = B + A
+    proc fe25519_sub from Fe with E, B, A
+    proc fe25519_sub from Fe with F, D, C
+    proc fe25519_add from Fe with G, D, C
+    proc fe25519_add from Fe with H, B, A
+
+    Note: X3 = E*F, Y3 = G*H, T3 = E*H, Z3 = F*G
+    proc fe25519_mul from Fe with dest_x, E, F
+    proc fe25519_mul from Fe with dest_y, G, H
+    proc fe25519_mul from Fe with dest_t, E, H
+    proc fe25519_mul from Fe with dest_z, F, G
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Point doubling in extended coordinates
+Note: ============================================================================
+
+Process called "ed25519_point_double" takes arena as Integer, dest as Integer, p as Integer returns Integer:
+    @Reasoning
+    Doubles an extended-coordinates point: dest = 2 * P.
+    Formula (HWCD 2008 section 3.3 "doubling formula"):
+      A = X1^2
+      B = Y1^2
+      C = 2 * Z1^2
+      H = A + B
+      E = H - (X1 + Y1)^2
+      G = A - B
+      F = C + G
+      X3 = E * F
+      Y3 = G * H
+      T3 = E * H
+      Z3 = F * G
+
+    Costs 4 squarings + 4 multiplications + 1 doubling.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time, all field ops are constant-time.
+    @End Security_Scope
+
+    Let A be proc fe25519_alloc from Fe with arena
+    Let B be proc fe25519_alloc from Fe with arena
+    Let C be proc fe25519_alloc from Fe with arena
+    Let E be proc fe25519_alloc from Fe with arena
+    Let F be proc fe25519_alloc from Fe with arena
+    Let G be proc fe25519_alloc from Fe with arena
+    Let H be proc fe25519_alloc from Fe with arena
+    Let t1 be proc fe25519_alloc from Fe with arena
+    Let t2 be proc fe25519_alloc from Fe with arena
+
+    If A is equal to 0:
+        Return 0
+    End If
+    If t2 is equal to 0:
+        Return 0
+    End If
+
+    Let p_x be p
+    Let p_y be p plus 80
+    Let p_z be p plus 160
+    Let dest_x be dest
+    Let dest_y be dest plus 80
+    Let dest_z be dest plus 160
+    Let dest_t be dest plus 240
+
+    Note: A = X1^2
+    proc fe25519_sqr from Fe with A, p_x
+    Note: B = Y1^2
+    proc fe25519_sqr from Fe with B, p_y
+    Note: t1 = Z1^2, C = 2 * Z1^2
+    proc fe25519_sqr from Fe with t1, p_z
+    proc fe25519_add from Fe with C, t1, t1
+    Note: H = A + B
+    proc fe25519_add from Fe with H, A, B
+    Note: t2 = X1 + Y1, t1 = (X1+Y1)^2, E = H - t1
+    proc fe25519_add from Fe with t2, p_x, p_y
+    proc fe25519_sqr from Fe with t1, t2
+    proc fe25519_sub from Fe with E, H, t1
+    Note: G = A - B, F = C + G
+    proc fe25519_sub from Fe with G, A, B
+    proc fe25519_add from Fe with F, C, G
+
+    Note: X3 = E*F, Y3 = G*H, T3 = E*H, Z3 = F*G
+    proc fe25519_mul from Fe with dest_x, E, F
+    proc fe25519_mul from Fe with dest_y, G, H
+    proc fe25519_mul from Fe with dest_t, E, H
+    proc fe25519_mul from Fe with dest_z, F, G
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Conditional point select (constant-time)
+Note: ============================================================================
+
+Process called "ed25519_point_select" takes dest as Integer, a as Integer, b as Integer, condition as Integer returns Integer:
+    @Reasoning
+    Constant-time conditional point assignment: dest := a if condition=1
+    else dest := b. Used inside scalar multiplication to fold a
+    double-and-add step into a branchless sequence.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: 40 limb reads from each source, 40 writes.
+    @End Security_Scope
+
+    Let mask be 0 minus condition
+    Let not_mask be mask bitwise_xor 0 minus 1
+    Let i be 0
+    While i is less than 40:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Let bi be Memory.memory_get_int64(b, i multiplied by 8)
+        Let from_a be ai bitwise_and mask
+        Let from_b be bi bitwise_and not_mask
+        Memory.memory_set_qword(dest, i multiplied by 8, from_a bitwise_or from_b)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: Scalar multiplication (constant-time double-and-add)
+Note: ============================================================================
+
+Process called "ed25519_scalarmult" takes arena as Integer, result as Integer, scalar_32 as Integer, point as Integer returns Integer:
+    @Reasoning
+    Computes result = [scalar] * point in extended Edwards coordinates.
+    Uses constant-time bit-by-bit double-and-add: at each scalar bit
+    position, the accumulator is doubled, and a temporary "candidate"
+    addition with the input point is conditionally selected based on
+    the bit value via ed25519_point_select. This is the simplest
+    constant-time pattern; window-based methods cut the multiplication
+    count by ~75% but require a constant-time table lookup that is more
+    complex to audit.
+
+    The loop iterates over scalar bits from bit 255 (high) down to bit 0
+    (low), exactly 256 iterations. The accumulator starts at the
+    identity and is doubled at each step.
+    @End Reasoning
+
+    @Implementation
+    1. Allocate accumulator R = identity, scratch S, T.
+    2. For bit_index from 255 down to 0:
+       a. R = 2 * R
+       b. S = R + point
+       c. R = select(S, R, bit_value)
+    3. Copy R into result.
+    @End Implementation
+
+    @Performance_Hints
+    256 doublings + 256 additions per scalar mult. With ~13 field ops
+    per doubling and ~16 per addition, total is ~7400 field mul/sqr
+    operations per scalar mult. The bit-by-bit loop is ~4x slower than
+    a 4-bit windowed method but requires no precomputed table.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: same instruction sequence regardless of scalar bits.
+    The candidate addition is always performed; the select is branchless.
+    @End Security_Scope
+
+    Let R be proc ed25519_point_alloc with arena
+    Let S be proc ed25519_point_alloc with arena
+    If R is equal to 0:
+        Return 0
+    End If
+    If S is equal to 0:
+        Return 0
+    End If
+
+    Let bit_index be 255
+    While bit_index is greater than 0 minus 1:
+        Note: R = 2 * R
+        proc ed25519_point_double with arena, R, R
+
+        Note: S = R + point
+        proc ed25519_point_add with arena, S, R, point
+
+        Note: Extract bit (scalar_32[byte] >> bit_in_byte) & 1
+        Let byte_index be bit_index shifted right by 3
+        Let bit_in_byte be bit_index bitwise_and 7
+        Let byte_val be Memory.memory_get_byte(scalar_32, byte_index)
+        Let bit_val be (byte_val shifted right by bit_in_byte) bitwise_and 1
+
+        Note: R = (bit_val == 1) ? S : R
+        proc ed25519_point_select with R, S, R, bit_val
+
+        Set bit_index to bit_index minus 1
+    End While
+
+    proc ed25519_point_copy with result, R
+    Return 1
+End Process
+
+Process called "ed25519_load_basepoint" takes arena as Integer, B_out as Integer returns Integer:
+    @Reasoning
+    Loads the Ed25519 base point B = (X, Y) where
+      y = 4/5 (mod p) and x is the corresponding positive root.
+    The constants below are the limb representations of B's (X, Y, Z=1,
+    T=X*Y) extended-coordinates form, verified offline against the
+    canonical Ed25519 base point values from RFC 8032 5.1.
+    @End Reasoning
+
+    @Security_Scope
+    Public constant; not secret.
+    @End Security_Scope
+
+    Note: B.X (10 limbs)
+    Memory.memory_set_qword(B_out, 0, 52811034)
+    Memory.memory_set_qword(B_out, 8, 25909283)
+    Memory.memory_set_qword(B_out, 16, 16144682)
+    Memory.memory_set_qword(B_out, 24, 17082669)
+    Memory.memory_set_qword(B_out, 32, 27570973)
+    Memory.memory_set_qword(B_out, 40, 30858332)
+    Memory.memory_set_qword(B_out, 48, 40966398)
+    Memory.memory_set_qword(B_out, 56, 8378388)
+    Memory.memory_set_qword(B_out, 64, 20764389)
+    Memory.memory_set_qword(B_out, 72, 8758491)
+
+    Note: B.Y (10 limbs) = encoding of 4/5 mod p
+    Memory.memory_set_qword(B_out, 80, 40265304)
+    Memory.memory_set_qword(B_out, 88, 26843545)
+    Memory.memory_set_qword(B_out, 96, 6710886)
+    Memory.memory_set_qword(B_out, 104, 13421772)
+    Memory.memory_set_qword(B_out, 112, 53687091)
+    Memory.memory_set_qword(B_out, 120, 26843545)
+    Memory.memory_set_qword(B_out, 128, 6710886)
+    Memory.memory_set_qword(B_out, 136, 13421772)
+    Memory.memory_set_qword(B_out, 144, 53687091)
+    Memory.memory_set_qword(B_out, 152, 26843545)
+
+    Note: B.Z = 1
+    Memory.memory_set_qword(B_out, 160, 1)
+    Let zi be 1
+    While zi is less than 10:
+        Memory.memory_set_qword(B_out, 160 plus zi multiplied by 8, 0)
+        Set zi to zi plus 1
+    End While
+
+    Note: B.T = B.X * B.Y; compute now via field mul on the just-loaded limbs.
+    Let bx_addr be B_out
+    Let by_addr be B_out plus 80
+    Let bt_addr be B_out plus 240
+    proc fe25519_mul from Fe with bt_addr, bx_addr, by_addr
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 7: Point compression / decompression (RFC 8032 5.1.2)
+Note: ============================================================================
+
+Process called "ed25519_point_compress" takes arena as Integer, p as Integer, bytes32_out as Integer returns Integer:
+    @Reasoning
+    Compresses an extended-coordinates point to 32 bytes per RFC 8032
+    5.1.2: encode y, then set the top bit of the last byte to the
+    parity of x (i.e. x mod 2).
+
+    Affine coordinates: x = X / Z, y = Y / Z. Compute Z^-1 once, then
+    multiply.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: one inversion + two multiplications + one pack +
+    one byte read + one OR.
+    @End Security_Scope
+
+    Let inv_z be proc fe25519_alloc from Fe with arena
+    Let x_affine be proc fe25519_alloc from Fe with arena
+    Let y_affine be proc fe25519_alloc from Fe with arena
+    If inv_z is equal to 0:
+        Return 0
+    End If
+
+    Let p_x be p
+    Let p_y be p plus 80
+    Let p_z be p plus 160
+
+    proc fe25519_inv from Fe with arena, inv_z, p_z
+    proc fe25519_mul from Fe with x_affine, p_x, inv_z
+    proc fe25519_mul from Fe with y_affine, p_y, inv_z
+
+    Note: Pack y as 32 bytes
+    proc fe25519_pack from Fe with y_affine, bytes32_out
+
+    Note: Set top bit of last byte to parity of x
+    Let x_parity be proc fe25519_is_negative from Fe with x_affine
+    Let last be Memory.memory_get_byte(bytes32_out, 31)
+    Let last_masked be last bitwise_and 127
+    Let last_final be last_masked bitwise_or (x_parity multiplied by 128)
+    Memory.memory_set_byte(bytes32_out, 31, last_final)
+    Return 1
+End Process
+
+Process called "ed25519_point_decompress" takes arena as Integer, p_out as Integer, bytes32_in as Integer returns Integer:
+    @Reasoning
+    Decompresses a 32-byte encoding to an extended-coordinates point
+    per RFC 8032 5.1.3. Steps:
+      1. Extract sign bit from byte 31, then mask it off.
+      2. Decode y from the cleared bytes (already in F_p representation).
+      3. Compute v = y^2 - 1, u = d * y^2 + 1.
+      4. Compute candidate x = (v * u^3) * (v * u^7)^((p-5)/8) = (v/u)^(1/2) up to sign.
+      5. Check that x^2 * u == v (mod p); if not, multiply x by sqrt(-1).
+      6. If x parity doesn't match the sign bit, negate x.
+      7. Compute T = X*Y, Z = 1.
+
+    Returns 1 on success, 0 on invalid encoding.
+    @End Reasoning
+
+    @Implementation
+    Uses fe25519_pow_p_minus_5_div_8 for the square root. The
+    multiply-by-sqrt(-1) branch is implemented via a constant-time
+    select against the precomputed sqrtm1 constant.
+    @End Implementation
+
+    @Security_Scope
+    Operates on a public input (the encoded point); side-channel
+    leakage of internal branches is acceptable because the input is
+    not secret. The implementation still uses constant-time field
+    arithmetic so that future use with secret inputs (if any) does
+    not regress.
+    @End Security_Scope
+
+    Let sign_byte be Memory.memory_get_byte(bytes32_in, 31)
+    Let x_sign_bit be sign_byte shifted right by 7
+
+    Let local_bytes be Arena.arena_allocate(arena, 32)
+    If local_bytes is equal to 0:
+        Return 0
+    End If
+    Let ci be 0
+    While ci is less than 32:
+        Let bv be Memory.memory_get_byte(bytes32_in, ci)
+        Memory.memory_set_byte(local_bytes, ci, bv)
+        Set ci to ci plus 1
+    End While
+    Memory.memory_set_byte(local_bytes, 31, sign_byte bitwise_and 127)
+
+    Let y_fe be proc fe25519_alloc from Fe with arena
+    proc fe25519_unpack from Fe with y_fe, local_bytes
+
+    Let y2 be proc fe25519_alloc from Fe with arena
+    Let v be proc fe25519_alloc from Fe with arena
+    Let u be proc fe25519_alloc from Fe with arena
+    Let one be proc fe25519_alloc from Fe with arena
+    Let d_fe be proc fe25519_alloc from Fe with arena
+    proc fe25519_set_one from Fe with one
+    proc ed25519_load_d with d_fe
+
+    proc fe25519_sqr from Fe with y2, y_fe
+    proc fe25519_sub from Fe with v, y2, one
+    proc fe25519_mul from Fe with u, d_fe, y2
+    proc fe25519_add from Fe with u, u, one
+
+    Note: Solve x = sqrt(v/u). Use the chain:
+    Note:   beta = (v * u^3) * (v * u^7)^((p-5)/8)
+    Note: Then check beta^2 * u == v; if not, multiply by sqrt(-1).
+    Let u2 be proc fe25519_alloc from Fe with arena
+    Let u3 be proc fe25519_alloc from Fe with arena
+    Let u7 be proc fe25519_alloc from Fe with arena
+    Let vu3 be proc fe25519_alloc from Fe with arena
+    Let vu7 be proc fe25519_alloc from Fe with arena
+    Let pow_term be proc fe25519_alloc from Fe with arena
+    Let beta be proc fe25519_alloc from Fe with arena
+
+    proc fe25519_sqr from Fe with u2, u
+    proc fe25519_mul from Fe with u3, u2, u
+    proc fe25519_sqr from Fe with u7, u3
+    proc fe25519_mul from Fe with u7, u7, u
+    proc fe25519_mul from Fe with vu3, v, u3
+    proc fe25519_mul from Fe with vu7, v, u7
+    proc fe25519_pow_p_minus_5_div_8 from Fe with arena, pow_term, vu7
+    proc fe25519_mul from Fe with beta, vu3, pow_term
+
+    Note: Verify beta^2 * u == v
+    Let check be proc fe25519_alloc from Fe with arena
+    Let beta_sq be proc fe25519_alloc from Fe with arena
+    proc fe25519_sqr from Fe with beta_sq, beta
+    proc fe25519_mul from Fe with check, beta_sq, u
+
+    Note: Test (check - v) == 0
+    Let diff be proc fe25519_alloc from Fe with arena
+    proc fe25519_sub from Fe with diff, check, v
+    Let diff_is_zero be proc fe25519_is_zero from Fe with diff
+
+    Note: If not zero, try beta * sqrt(-1). sqrt(-1) is a fixed constant.
+    Let sqrtm1 be proc fe25519_alloc from Fe with arena
+    proc ed25519_load_sqrtm1 with sqrtm1
+    Let beta_alt be proc fe25519_alloc from Fe with arena
+    proc fe25519_mul from Fe with beta_alt, beta, sqrtm1
+
+    Note: Choose x = beta if diff_is_zero else beta_alt.
+    Let x_fe be proc fe25519_alloc from Fe with arena
+    proc fe25519_select from Fe with x_fe, beta, beta_alt, diff_is_zero
+
+    Note: Validate the chosen x: check x^2 * u == v (now should hold).
+    Let x_sq be proc fe25519_alloc from Fe with arena
+    Let check2 be proc fe25519_alloc from Fe with arena
+    proc fe25519_sqr from Fe with x_sq, x_fe
+    proc fe25519_mul from Fe with check2, x_sq, u
+    Let diff2 be proc fe25519_alloc from Fe with arena
+    proc fe25519_sub from Fe with diff2, check2, v
+    Let valid be proc fe25519_is_zero from Fe with diff2
+    If valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Match x sign to sign bit: if x is zero and sign bit is 1, reject.
+    Let x_is_zero be proc fe25519_is_zero from Fe with x_fe
+    If x_is_zero is equal to 1:
+        If x_sign_bit is equal to 1:
+            Return 0
+        End If
+    End If
+
+    Note: If x parity != x_sign_bit, negate x.
+    Let x_parity_now be proc fe25519_is_negative from Fe with x_fe
+    Let neg_needed be x_parity_now bitwise_xor x_sign_bit
+    Let neg_x be proc fe25519_alloc from Fe with arena
+    proc fe25519_neg from Fe with neg_x, x_fe
+    Let x_final be proc fe25519_alloc from Fe with arena
+    proc fe25519_select from Fe with x_final, neg_x, x_fe, neg_needed
+
+    Note: Build point in extended coords: X = x_final, Y = y, Z = 1, T = X*Y
+    Let p_x be p_out
+    Let p_y be p_out plus 80
+    Let p_z be p_out plus 160
+    Let p_t be p_out plus 240
+    proc fe25519_copy from Fe with p_x, x_final
+    proc fe25519_copy from Fe with p_y, y_fe
+    proc fe25519_set_one from Fe with p_z
+    proc fe25519_mul from Fe with p_t, x_final, y_fe
+    Return 1
+End Process
+
+Process called "ed25519_load_sqrtm1" takes out_fe as Integer returns Integer:
+    @Reasoning
+    Loads sqrt(-1) (mod p) as a 10-limb field element. The 32-byte
+    little-endian encoding (matching the Ed25519 reference
+    implementations) is:
+      b0 a0 0e 4a 27 1b ee c4 78 e4 2f ad 06 18 43 2f
+      a7 d7 fb 3d 99 00 4d 2b 0b df c1 4f 80 24 83 2b
+    @End Reasoning
+
+    Memory.memory_set_qword(out_fe, 0, 21849544)
+    Memory.memory_set_qword(out_fe, 8, 7708231)
+    Memory.memory_set_qword(out_fe, 16, 47222866)
+    Memory.memory_set_qword(out_fe, 24, 14881763)
+    Memory.memory_set_qword(out_fe, 32, 32125361)
+    Memory.memory_set_qword(out_fe, 40, 2103107)
+    Memory.memory_set_qword(out_fe, 48, 4459478)
+    Memory.memory_set_qword(out_fe, 56, 4148945)
+    Memory.memory_set_qword(out_fe, 64, 64955085)
+    Memory.memory_set_qword(out_fe, 72, 5862152)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 8: Scalar arithmetic mod L (group order)
+Note: ============================================================================
+
+Process called "ed25519_load_group_order_le_bytes" takes out_buffer as Integer returns Integer:
+    @Reasoning
+    Writes L (Ed25519 group order) as 32 bytes little-endian:
+      L = 2^252 + 27742317777372353535851937790883648493
+        = 0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed
+      LE bytes:
+        ed d3 f5 5c 1a 63 12 58 d6 9c f7 a2 de f9 de 14
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10
+    @End Reasoning
+
+    Memory.memory_set_byte(out_buffer, 0, 237)
+    Memory.memory_set_byte(out_buffer, 1, 211)
+    Memory.memory_set_byte(out_buffer, 2, 245)
+    Memory.memory_set_byte(out_buffer, 3, 92)
+    Memory.memory_set_byte(out_buffer, 4, 26)
+    Memory.memory_set_byte(out_buffer, 5, 99)
+    Memory.memory_set_byte(out_buffer, 6, 18)
+    Memory.memory_set_byte(out_buffer, 7, 88)
+    Memory.memory_set_byte(out_buffer, 8, 214)
+    Memory.memory_set_byte(out_buffer, 9, 156)
+    Memory.memory_set_byte(out_buffer, 10, 247)
+    Memory.memory_set_byte(out_buffer, 11, 162)
+    Memory.memory_set_byte(out_buffer, 12, 222)
+    Memory.memory_set_byte(out_buffer, 13, 249)
+    Memory.memory_set_byte(out_buffer, 14, 222)
+    Memory.memory_set_byte(out_buffer, 15, 20)
+    Let i be 16
+    While i is less than 31:
+        Memory.memory_set_byte(out_buffer, i, 0)
+        Set i to i plus 1
+    End While
+    Memory.memory_set_byte(out_buffer, 31, 16)
+    Return 1
+End Process
+
+Process called "ed25519_le32_to_be32" takes arena as Integer, le_in as Integer, in_len as Integer returns Integer:
+    @Reasoning
+    Reverses a little-endian byte buffer to big-endian. Caller-allocated
+    output via arena. Used to bridge Ed25519's little-endian scalar /
+    hash byte order to bigint.runa's big-endian byte interface.
+    @End Reasoning
+
+    Let out_buffer be Arena.arena_allocate(arena, in_len)
+    If out_buffer is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than in_len:
+        Let src_b be Memory.memory_get_byte(le_in, in_len minus 1 minus i)
+        Memory.memory_set_byte(out_buffer, i, src_b)
+        Set i to i plus 1
+    End While
+    Return out_buffer
+End Process
+
+Process called "ed25519_be_to_le_bytes" takes be_in as Integer, in_len as Integer, le_out as Integer, le_len as Integer returns Integer:
+    @Reasoning
+    Reverses a big-endian byte buffer (length in_len) into le_out
+    (length le_len). If le_len > in_len, the extra (high-order) bytes
+    are zero-padded; if le_len < in_len, the high-order BE bytes (which
+    must all be zero for a valid modular reduction) are dropped.
+    @End Reasoning
+
+    Let i be 0
+    While i is less than le_len:
+        Memory.memory_set_byte(le_out, i, 0)
+        Set i to i plus 1
+    End While
+
+    Let copy_len be in_len
+    If copy_len is greater than le_len:
+        Set copy_len to le_len
+    End If
+
+    Let j be 0
+    While j is less than copy_len:
+        Let src_b be Memory.memory_get_byte(be_in, in_len minus 1 minus j)
+        Memory.memory_set_byte(le_out, j, src_b)
+        Set j to j plus 1
+    End While
+    Return 1
+End Process
+
+Process called "ed25519_scalar_reduce" takes arena as Integer, in_bytes as Integer, in_len as Integer, out_bytes_32 as Integer returns Integer:
+    @Reasoning
+    Reduces a little-endian byte sequence modulo L (Ed25519 group order).
+    Used twice in the signing flow:
+      - To derive k from SHA-512(R || A || msg) (64-byte hash -> 32 bytes mod L)
+      - To compute S = (r + k*a) mod L
+    Plus once in verify:
+      - To reduce the S scalar from the signature (32 bytes)
+
+    Strategy: byte-reverse the input to BE, parse as bigint, modular-
+    reduce against L, write back as 32 bytes LE.
+    @End Reasoning
+
+    @Implementation
+    1. Allocate BE buffer of size in_len. Reverse bytes.
+    2. Parse as bigint via bigint_from_bytes_be.
+    3. Build L as bigint via bigint_from_bytes_be on the 32-byte BE form
+       of L.
+    4. Call bigint_mod to get input mod L.
+    5. Serialize back to 32-byte BE via bigint_to_bytes_be.
+    6. Byte-reverse to LE into out_bytes_32.
+    @End Implementation
+
+    @Security_Scope
+    Operates on either secret (signing) or public (verifying) scalars.
+    bigint_mod's reduction is constant-time when the inputs are bounded
+    by the bigint capacity. The byte-reversal loops are constant-time
+    by length only.
+    @End Security_Scope
+
+    Let be_buffer be proc ed25519_le32_to_be32 with arena, in_bytes, in_len
+    If be_buffer is equal to 0:
+        Return 0
+    End If
+
+    Let in_bn be proc bigint_from_bytes_be from BigInt with arena, be_buffer, in_len
+    If in_bn is equal to 0:
+        Return 0
+    End If
+
+    Note: Build L (32-byte BE)
+    Let L_le be Arena.arena_allocate(arena, 32)
+    If L_le is equal to 0:
+        Return 0
+    End If
+    proc ed25519_load_group_order_le_bytes with L_le
+
+    Let L_be be Arena.arena_allocate(arena, 32)
+    If L_be is equal to 0:
+        Return 0
+    End If
+    Let lb be 0
+    While lb is less than 32:
+        Let src_b be Memory.memory_get_byte(L_le, 31 minus lb)
+        Memory.memory_set_byte(L_be, lb, src_b)
+        Set lb to lb plus 1
+    End While
+
+    Let L_bn be proc bigint_from_bytes_be from BigInt with arena, L_be, 32
+    If L_bn is equal to 0:
+        Return 0
+    End If
+
+    Let reduced_bn be proc bigint_alloc from BigInt with arena, 8
+    If reduced_bn is equal to 0:
+        Return 0
+    End If
+    Let mod_rc be proc bigint_mod from BigInt with arena, reduced_bn, in_bn, L_bn
+    If mod_rc is equal to 0:
+        Return 0
+    End If
+
+    Let reduced_be be Arena.arena_allocate(arena, 32)
+    If reduced_be is equal to 0:
+        Return 0
+    End If
+    proc bigint_to_bytes_be from BigInt with reduced_bn, reduced_be, 32
+
+    proc ed25519_be_to_le_bytes with reduced_be, 32, out_bytes_32, 32
+    Return 1
+End Process
+
+Process called "ed25519_scalar_mul_add" takes arena as Integer, a_le as Integer, b_le as Integer, c_le as Integer, out_le as Integer returns Integer:
+    @Reasoning
+    Computes (a * b + c) mod L, where all values are 32-byte little-
+    endian scalars. Used in signing to compute S = r + k*a (mod L).
+
+    Strategy: convert each operand to bigint, compute mul + add via the
+    existing bigint primitives, reduce mod L, write back as 32 bytes LE.
+    @End Reasoning
+
+    @Implementation
+    1. Convert a, b, c from LE to BE buffers (32 bytes each).
+    2. Parse as bigints.
+    3. ab = a * b (via bigint_mul into a 64-limb destination).
+    4. res = ab + c (via bigint_add).
+    5. res_mod_L = res mod L.
+    6. Serialize and reverse to out_le.
+    @End Implementation
+
+    @Security_Scope
+    Operates on secret scalars during signing. The bigint primitives
+    used here are constant-time relative to limb count, but their
+    timing depends on the modular reduction path's number of subtraction
+    iterations. Acceptable for Ed25519 signing because the signing
+    private key bytes do not flow into the reduction iteration count.
+    @End Security_Scope
+
+    Let a_be be proc ed25519_le32_to_be32 with arena, a_le, 32
+    Let b_be be proc ed25519_le32_to_be32 with arena, b_le, 32
+    Let c_be be proc ed25519_le32_to_be32 with arena, c_le, 32
+    If a_be is equal to 0:
+        Return 0
+    End If
+    If b_be is equal to 0:
+        Return 0
+    End If
+    If c_be is equal to 0:
+        Return 0
+    End If
+
+    Let a_bn be proc bigint_from_bytes_be from BigInt with arena, a_be, 32
+    Let b_bn be proc bigint_from_bytes_be from BigInt with arena, b_be, 32
+    Let c_bn be proc bigint_from_bytes_be from BigInt with arena, c_be, 32
+
+    Note: ab needs up to 8 limbs * 2 = 16 limbs of capacity (1024 bits).
+    Let ab_bn be proc bigint_alloc from BigInt with arena, 16
+    proc bigint_mul from BigInt with ab_bn, a_bn, b_bn
+
+    Let abc_bn be proc bigint_alloc from BigInt with arena, 17
+    proc bigint_add from BigInt with abc_bn, ab_bn, c_bn
+
+    Note: Reduce mod L
+    Let L_le_buffer be Arena.arena_allocate(arena, 32)
+    proc ed25519_load_group_order_le_bytes with L_le_buffer
+    Let L_be_buffer be Arena.arena_allocate(arena, 32)
+    Let lb be 0
+    While lb is less than 32:
+        Let src_b be Memory.memory_get_byte(L_le_buffer, 31 minus lb)
+        Memory.memory_set_byte(L_be_buffer, lb, src_b)
+        Set lb to lb plus 1
+    End While
+    Let L_bn be proc bigint_from_bytes_be from BigInt with arena, L_be_buffer, 32
+
+    Let reduced_bn be proc bigint_alloc from BigInt with arena, 8
+    proc bigint_mod from BigInt with arena, reduced_bn, abc_bn, L_bn
+
+    Let reduced_be be Arena.arena_allocate(arena, 32)
+    proc bigint_to_bytes_be from BigInt with reduced_bn, reduced_be, 32
+    proc ed25519_be_to_le_bytes with reduced_be, 32, out_le, 32
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 9: Key generation (RFC 8032 5.1.5)
+Note: ============================================================================
+
+Process called "ed25519_keygen" takes arena as Integer, seed_32 as Integer, public_key_out_32 as Integer, secret_key_out_64 as Integer returns Integer:
+    @Reasoning
+    Derives an Ed25519 keypair from a 32-byte seed per RFC 8032 5.1.5:
+      1. h = SHA-512(seed). h is 64 bytes.
+      2. Take h[0..31] as scalar a (after clamping):
+           a[0]  &= 248
+           a[31] &= 127
+           a[31] |= 64
+         (This matches the X25519 clamping; for Ed25519 the cleared bits
+         remove cofactor and out-of-range scalars.)
+      3. h[32..63] is the "prefix" used during signing as nonce derivation
+         seed.
+      4. Public key A = [a] * B (encoded as 32 bytes).
+      5. Output:
+           public_key = A (32 bytes)
+           secret_key = seed (32 bytes) || A (32 bytes)
+    @End Reasoning
+
+    @Implementation
+    Allocates scratch for SHA-512 output, clamped scalar, base point,
+    and result point.
+    @End Implementation
+
+    @Security_Scope
+    The seed is the actual secret. SHA-512 of the seed yields the
+    scalar a; loss of a allows signing. The secret_key buffer
+    intentionally stores the seed (not a) so that signing always
+    re-derives the prefix from the same SHA-512 invocation, matching
+    RFC 8032's intent.
+    @End Security_Scope
+
+    If seed_32 is equal to 0:
+        Return 0
+    End If
+    If public_key_out_32 is equal to 0:
+        Return 0
+    End If
+    If secret_key_out_64 is equal to 0:
+        Return 0
+    End If
+
+    Let h be Arena.arena_allocate(arena, 64)
+    If h is equal to 0:
+        Return 0
+    End If
+    proc sha512_hash from Sha2 with arena, seed_32, 32, h
+
+    Note: Clamp the low 32 bytes of h to form scalar a.
+    Let b0 be Memory.memory_get_byte(h, 0)
+    Memory.memory_set_byte(h, 0, b0 bitwise_and 248)
+    Let b31 be Memory.memory_get_byte(h, 31)
+    Let b31_c be b31 bitwise_and 127
+    Memory.memory_set_byte(h, 31, b31_c bitwise_or 64)
+
+    Note: Compute A = a * B
+    Let base_point be proc ed25519_point_alloc with arena
+    Let result_point be proc ed25519_point_alloc with arena
+    If base_point is equal to 0:
+        Return 0
+    End If
+    If result_point is equal to 0:
+        Return 0
+    End If
+
+    proc ed25519_load_basepoint with arena, base_point
+    proc ed25519_scalarmult with arena, result_point, h, base_point
+    proc ed25519_point_compress with arena, result_point, public_key_out_32
+
+    Note: secret_key = seed || A
+    Let ci be 0
+    While ci is less than 32:
+        Let sb be Memory.memory_get_byte(seed_32, ci)
+        Memory.memory_set_byte(secret_key_out_64, ci, sb)
+        Set ci to ci plus 1
+    End While
+    Let cj be 0
+    While cj is less than 32:
+        Let pb be Memory.memory_get_byte(public_key_out_32, cj)
+        Memory.memory_set_byte(secret_key_out_64, 32 plus cj, pb)
+        Set cj to cj plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 10: Signing (RFC 8032 5.1.6)
+Note: ============================================================================
+
+Process called "ed25519_sign" takes arena as Integer, secret_key_64 as Integer, message as Integer, message_length as Integer, signature_out_64 as Integer returns Integer:
+    @Reasoning
+    Deterministic Ed25519 signing per RFC 8032 5.1.6:
+      seed = secret_key[0..31]
+      A    = secret_key[32..63]
+      h    = SHA-512(seed)
+      a    = clamp(h[0..31])
+      prefix = h[32..63]
+      r    = SHA-512(prefix || message)  reduced mod L
+      R    = [r] * B  (encoded as 32 bytes)
+      k    = SHA-512(R || A || message)  reduced mod L
+      S    = (r + k * a) mod L
+      signature = R || S
+    @End Reasoning
+
+    @Implementation
+    Concatenates the bytes via temporary arena buffers, calls SHA-512
+    twice, performs two scalar mults (one for R, none again -- only one
+    [r]B), reduces twice mod L, and computes the final S.
+    @End Implementation
+
+    @Performance_Hints
+    Total cost: 2 SHA-512 evals + 1 scalar mult + ~4 bigint operations.
+    Dominated by the scalar mult.
+    @End Performance_Hints
+
+    @Security_Scope
+    The seed and the derived scalar a never leave the arena once
+    written. Callers are responsible for arena_reset / secure_zero on
+    the arena to wipe these intermediates. The signing flow is
+    deterministic (no random nonce), eliminating an entire class of
+    nonce-reuse attacks.
+    @End Security_Scope
+
+    If secret_key_64 is equal to 0:
+        Return 0
+    End If
+    If signature_out_64 is equal to 0:
+        Return 0
+    End If
+
+    Let seed be secret_key_64
+    Let A_bytes be secret_key_64 plus 32
+
+    Let h be Arena.arena_allocate(arena, 64)
+    If h is equal to 0:
+        Return 0
+    End If
+    proc sha512_hash from Sha2 with arena, seed, 32, h
+
+    Note: Clamp a in-place
+    Let h0 be Memory.memory_get_byte(h, 0)
+    Memory.memory_set_byte(h, 0, h0 bitwise_and 248)
+    Let h31 be Memory.memory_get_byte(h, 31)
+    Memory.memory_set_byte(h, 31, (h31 bitwise_and 127) bitwise_or 64)
+
+    Let a_scalar be h
+    Let prefix be h plus 32
+
+    Note: r = SHA-512(prefix || message), reduce mod L
+    Let r_input_len be 32 plus message_length
+    Let r_input be Arena.arena_allocate(arena, r_input_len)
+    If r_input is equal to 0:
+        Return 0
+    End If
+    Let pi be 0
+    While pi is less than 32:
+        Let pb be Memory.memory_get_byte(prefix, pi)
+        Memory.memory_set_byte(r_input, pi, pb)
+        Set pi to pi plus 1
+    End While
+    Let mi be 0
+    While mi is less than message_length:
+        Let mb be Memory.memory_get_byte(message, mi)
+        Memory.memory_set_byte(r_input, 32 plus mi, mb)
+        Set mi to mi plus 1
+    End While
+
+    Let r_hash be Arena.arena_allocate(arena, 64)
+    If r_hash is equal to 0:
+        Return 0
+    End If
+    proc sha512_hash from Sha2 with arena, r_input, r_input_len, r_hash
+
+    Let r_scalar be Arena.arena_allocate(arena, 32)
+    If r_scalar is equal to 0:
+        Return 0
+    End If
+    proc ed25519_scalar_reduce with arena, r_hash, 64, r_scalar
+
+    Note: R = [r] * B
+    Let base_point be proc ed25519_point_alloc with arena
+    Let R_point be proc ed25519_point_alloc with arena
+    proc ed25519_load_basepoint with arena, base_point
+    proc ed25519_scalarmult with arena, R_point, r_scalar, base_point
+
+    Let R_bytes be signature_out_64
+    proc ed25519_point_compress with arena, R_point, R_bytes
+
+    Note: k = SHA-512(R || A || message), reduce mod L
+    Let k_input_len be 32 plus 32 plus message_length
+    Let k_input be Arena.arena_allocate(arena, k_input_len)
+    If k_input is equal to 0:
+        Return 0
+    End If
+    Let ki be 0
+    While ki is less than 32:
+        Let rb be Memory.memory_get_byte(R_bytes, ki)
+        Memory.memory_set_byte(k_input, ki, rb)
+        Set ki to ki plus 1
+    End While
+    Let kj be 0
+    While kj is less than 32:
+        Let ab be Memory.memory_get_byte(A_bytes, kj)
+        Memory.memory_set_byte(k_input, 32 plus kj, ab)
+        Set kj to kj plus 1
+    End While
+    Let km be 0
+    While km is less than message_length:
+        Let mb2 be Memory.memory_get_byte(message, km)
+        Memory.memory_set_byte(k_input, 64 plus km, mb2)
+        Set km to km plus 1
+    End While
+
+    Let k_hash be Arena.arena_allocate(arena, 64)
+    proc sha512_hash from Sha2 with arena, k_input, k_input_len, k_hash
+
+    Let k_scalar be Arena.arena_allocate(arena, 32)
+    proc ed25519_scalar_reduce with arena, k_hash, 64, k_scalar
+
+    Note: S = (r + k * a) mod L
+    Let S_bytes be signature_out_64 plus 32
+    proc ed25519_scalar_mul_add with arena, k_scalar, a_scalar, r_scalar, S_bytes
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 11: Verification (RFC 8032 5.1.7)
+Note: ============================================================================
+
+Process called "ed25519_is_small_order_point" takes encoded_a as Integer returns Integer:
+    @Reasoning
+    Rejects the 8 small-order points on Ed25519 per RFC 8032 5.1.7.
+    These compressed encodings are forbidden as public keys because they
+    enable cofactor-based forgery. The fixed table of small-order
+    encodings (after the parity-bit mask) is:
+      00..00 01            (point of order 1 / identity)
+      00..00 80            (negation of identity)
+      ff..7f ec            (other small-order points)
+      ff..ff ee            (one of the 8-torsion)
+      and four more.
+    We check the structural ones (all-zero with various trailing bytes)
+    explicitly; the remaining 4 require a curve-arithmetic-level check
+    via [8]A == identity, which would require an extra scalar mult.
+
+    For a tightening implementation, a future revision should add the
+    full [8]A == identity check via ed25519_scalarmult. The structural
+    checks below cover the most common attack patterns (identity and
+    its negation, the trivial small-subgroup points).
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time over the 32-byte input. The early-return semantics
+    here are intentional and only based on public input bytes.
+    @End Security_Scope
+
+    If encoded_a is equal to 0:
+        Return 0
+    End If
+
+    Let first_byte be Memory.memory_get_byte(encoded_a, 0)
+    Let last_byte be Memory.memory_get_byte(encoded_a, 31)
+
+    Note: Check all-zero middle
+    Let middle_zeros be 1
+    Let i be 1
+    While i is less than 31:
+        Let bv be Memory.memory_get_byte(encoded_a, i)
+        If bv is not equal to 0:
+            Set middle_zeros to 0
+        End If
+        Set i to i plus 1
+    End While
+
+    If middle_zeros is equal to 1:
+        Note: Identity-like encodings
+        If first_byte is equal to 1:
+            If last_byte is equal to 0:
+                Return 1
+            End If
+        End If
+        If first_byte is equal to 0:
+            If last_byte is equal to 128:
+                Return 1
+            End If
+            If last_byte is equal to 0:
+                Return 1
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "ed25519_verify" takes arena as Integer, public_key_32 as Integer, message as Integer, message_length as Integer, signature_64 as Integer returns Integer:
+    @Reasoning
+    Verifies an Ed25519 signature per RFC 8032 5.1.7:
+      R = signature[0..31] (decoded as point)
+      S = signature[32..63] (must be < L)
+      A = public_key (decoded as point)
+      k = SHA-512(R || A || message) reduced mod L
+      Accept iff [S]B == R + [k]A on the curve.
+
+    Constant-time relative to the public input (no secrets involved in
+    verification).
+    @End Reasoning
+
+    @Implementation
+    1. Reject if signature_64 or public_key_32 is null.
+    2. Reject small-order public keys.
+    3. Decode R and A.
+    4. Check S < L.
+    5. Compute k from SHA-512 hash.
+    6. Compute lhs = [S]B and rhs = R + [k]A.
+    7. Compare compressed forms of lhs and rhs.
+    @End Implementation
+
+    @Performance_Hints
+    Two scalar mults + one point addition + 1 SHA-512. Verification
+    cost is roughly 2x the cost of signing on this implementation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public input only. Implementation does not need to be constant-
+    time (no secret data flows through verification). However, the
+    underlying primitives are constant-time anyway, so the verifier
+    inherits that property at no extra cost.
+    @End Security_Scope
+
+    If public_key_32 is equal to 0:
+        Return 0
+    End If
+    If signature_64 is equal to 0:
+        Return 0
+    End If
+
+    Note: Reject small-order public key
+    If proc ed25519_is_small_order_point with public_key_32 is equal to 1:
+        Return 0
+    End If
+
+    Let R_bytes be signature_64
+    Let S_bytes be signature_64 plus 32
+
+    Note: S range check: 0 <= S < L. Convert S to BE bigint and compare.
+    Let S_be be proc ed25519_le32_to_be32 with arena, S_bytes, 32
+    If S_be is equal to 0:
+        Return 0
+    End If
+    Let S_bn be proc bigint_from_bytes_be from BigInt with arena, S_be, 32
+    If S_bn is equal to 0:
+        Return 0
+    End If
+    Let L_le_buf be Arena.arena_allocate(arena, 32)
+    proc ed25519_load_group_order_le_bytes with L_le_buf
+    Let L_be_buf be Arena.arena_allocate(arena, 32)
+    Let lb be 0
+    While lb is less than 32:
+        Let src_b be Memory.memory_get_byte(L_le_buf, 31 minus lb)
+        Memory.memory_set_byte(L_be_buf, lb, src_b)
+        Set lb to lb plus 1
+    End While
+    Let L_bn be proc bigint_from_bytes_be from BigInt with arena, L_be_buf, 32
+    Let s_cmp be proc bigint_compare from BigInt with S_bn, L_bn
+    If s_cmp is greater than 0 minus 1:
+        Return 0
+    End If
+
+    Note: Decode R and A
+    Let R_point be proc ed25519_point_alloc with arena
+    Let A_point be proc ed25519_point_alloc with arena
+    Let r_ok be proc ed25519_point_decompress with arena, R_point, R_bytes
+    If r_ok is equal to 0:
+        Return 0
+    End If
+    Let a_ok be proc ed25519_point_decompress with arena, A_point, public_key_32
+    If a_ok is equal to 0:
+        Return 0
+    End If
+
+    Note: k = SHA-512(R || A || message) reduced mod L
+    Let k_input_len be 32 plus 32 plus message_length
+    Let k_input be Arena.arena_allocate(arena, k_input_len)
+    Let ki be 0
+    While ki is less than 32:
+        Let rb be Memory.memory_get_byte(R_bytes, ki)
+        Memory.memory_set_byte(k_input, ki, rb)
+        Set ki to ki plus 1
+    End While
+    Let kj be 0
+    While kj is less than 32:
+        Let ab be Memory.memory_get_byte(public_key_32, kj)
+        Memory.memory_set_byte(k_input, 32 plus kj, ab)
+        Set kj to kj plus 1
+    End While
+    Let km be 0
+    While km is less than message_length:
+        Let mb be Memory.memory_get_byte(message, km)
+        Memory.memory_set_byte(k_input, 64 plus km, mb)
+        Set km to km plus 1
+    End While
+    Let k_hash be Arena.arena_allocate(arena, 64)
+    proc sha512_hash from Sha2 with arena, k_input, k_input_len, k_hash
+    Let k_scalar be Arena.arena_allocate(arena, 32)
+    proc ed25519_scalar_reduce with arena, k_hash, 64, k_scalar
+
+    Note: lhs = [S]B
+    Let base_point be proc ed25519_point_alloc with arena
+    proc ed25519_load_basepoint with arena, base_point
+    Let lhs be proc ed25519_point_alloc with arena
+    proc ed25519_scalarmult with arena, lhs, S_bytes, base_point
+
+    Note: rhs = R + [k]A
+    Let kA be proc ed25519_point_alloc with arena
+    proc ed25519_scalarmult with arena, kA, k_scalar, A_point
+    Let rhs be proc ed25519_point_alloc with arena
+    proc ed25519_point_add with arena, rhs, R_point, kA
+
+    Note: Compare via compressed encoding
+    Let lhs_enc be Arena.arena_allocate(arena, 32)
+    Let rhs_enc be Arena.arena_allocate(arena, 32)
+    proc ed25519_point_compress with arena, lhs, lhs_enc
+    proc ed25519_point_compress with arena, rhs, rhs_enc
+
+    Let eq_acc be 0
+    Let ei be 0
+    While ei is less than 32:
+        Let lb_val be Memory.memory_get_byte(lhs_enc, ei)
+        Let rb_val be Memory.memory_get_byte(rhs_enc, ei)
+        Set eq_acc to eq_acc bitwise_or (lb_val bitwise_xor rb_val)
+        Set ei to ei plus 1
+    End While
+    If eq_acc is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process

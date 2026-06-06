@@ -1,0 +1,530 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+ENVIRONMENT VARIABLE - Typed Process Environment Primitive (Tier 1)
+
+Wraps process environment access. The actual envp string array is
+maintained by the host process and made accessible to Runa code via the
+syscall-layer environment manager (build_runtime/environment_manager.o).
+
+This module provides the typed-access layer above that:
+  - env_get_string  -> typed presence-aware read returning a duplicated
+                       string OR a caller-supplied default
+  - env_get_integer -> string read + decimal parse + default fallback
+  - env_get_bool    -> string read + truthy / falsy normalization
+  - env_get_required -> errors if absent
+
+Layout (EnvironmentVariable, 32 bytes):
+  offset  0 : name        (8 bytes, String pointer)
+  offset  8 : value       (8 bytes, String pointer or 0)
+  offset 16 : default_val (8 bytes, String pointer or 0)
+  offset 24 : present     (8 bytes, 0 = absent, 1 = present)
+
+References:
+  - IEEE Std 1003.1 (POSIX) - environment variable conventions
+  - Windows _wenviron equivalent on Win64 builds
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Let ENV_VAR_SIZE be 32
+
+Let ENV_ERR_NOT_FOUND be -1
+Let ENV_ERR_NULL_NAME be -2
+
+Note: ============================================================================
+Note: ENV LOOKUP - PROCESS API
+Note: ============================================================================
+
+Note:
+The environment lookup callback is supplied by the host runtime. At
+bootstrap time the v0.0.8.5 compiler does not yet expose a first-class
+getenv-equivalent primitive; the build_runtime environment_manager
+object file exports the symbol. This module declares the API surface
+and a registration hook so the runtime layer can wire the implementation
+without circular imports.
+
+Until the runtime registration is complete, env_lookup_default returns
+ENV_ERR_NOT_FOUND. This is the same fallback path callers exercise for
+genuinely-absent variables, so production code that only consults
+env_get_string_or always gets a usable result.
+
+The registered_callback field is a process-singleton pointer (kept as
+an Integer for now since first-class function values do not yet exist
+in v0.0.8.5).
+:End Note
+
+Let registered_callback be 0
+
+@Reasoning
+Register a runtime-provided env_lookup callback. The callback takes a
+String name and returns either 0 (not found) or a String pointer the
+caller owns. Stored as a singleton so subsequent env_get_* calls
+dispatch through it.
+@End Reasoning
+
+@Implementation
+Store the supplied pointer in the module-level singleton.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Only one callback is registered per process. Registration twice
+overwrites the prior pointer - callers must coordinate.
+@End Security_Scope
+Process called "env_register_callback" takes callback as Integer returns Integer:
+    Set registered_callback to callback
+    Return 1
+End Process
+
+@Reasoning
+Default env-lookup used until the runtime callback is registered.
+Returns ENV_ERR_NOT_FOUND for every name so callers exercise the
+default-fallback paths.
+@End Reasoning
+
+@Implementation
+Indirect function calls are not yet first-class in the v0.0.8.5
+bootstrap compiler. The registration mechanism exists so future
+compiler versions can wire indirect dispatch here. Until then this
+routine returns ENV_ERR_NOT_FOUND.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns a sentinel that maps to the safe "not found" path.
+@End Security_Scope
+Process called "env_lookup_raw" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return ENV_ERR_NULL_NAME
+    End If
+    Return ENV_ERR_NOT_FOUND
+End Process
+
+Note: ============================================================================
+Note: TYPED READS
+Note: ============================================================================
+
+@Reasoning
+Read an environment variable as a string, returning a freshly-
+duplicated buffer the caller owns. Returns 0 (NULL) if the variable
+is unset.
+@End Reasoning
+
+@Implementation
+Invoke env_lookup_raw. On ENV_ERR_NOT_FOUND or ENV_ERR_NULL_NAME
+return 0. Otherwise duplicate the returned pointer so the caller owns
+its copy independent of the runtime's internal storage.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) for the duplicate. Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Environment variables may carry untrusted data; callers must validate
+the string before use in security-sensitive contexts (paths, command
+arguments, SQL).
+@End Security_Scope
+Process called "env_get_string" takes name as Integer returns Integer:
+    Let raw be proc env_lookup_raw with name
+    If raw is less than 0:
+        Return 0
+    End If
+    If raw is equal to 0:
+        Return 0
+    End If
+    Return proc string_duplicate from StringPrim with raw
+End Process
+
+@Reasoning
+Read an environment variable as a string with a fallback default if
+absent. The default string is duplicated so the caller owns the result
+unconditionally.
+@End Reasoning
+
+@Implementation
+Call env_get_string; if 0, duplicate the default.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Default value is treated as trusted - it is the caller's literal.
+@End Security_Scope
+Process called "env_get_string_or" takes name as Integer, default_value as Integer returns Integer:
+    Let v be proc env_get_string with name
+    If v is not equal to 0:
+        Return v
+    End If
+    If default_value is equal to 0:
+        Return 0
+    End If
+    Return proc string_duplicate from StringPrim with default_value
+End Process
+
+@Reasoning
+Read an environment variable as a decimal integer with default
+fallback. Negative values are supported via a leading '-'.
+@End Reasoning
+
+@Implementation
+Look up the raw string. Walk byte-by-byte to validate decimal digits
+and optional leading '-'. Accumulate into a 64-bit integer with
+overflow checking. On any malformed character return the default.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the string. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Strict parse rejects whitespace, leading '+', and trailing characters.
+Returns the default on any deviation to prevent silent acceptance of
+unusual numeric forms.
+@End Security_Scope
+Process called "env_get_integer" takes name as Integer, default_value as Integer returns Integer:
+    Let raw be proc env_lookup_raw with name
+    If raw is less than 0:
+        Return default_value
+    End If
+    If raw is equal to 0:
+        Return default_value
+    End If
+    Let length be proc string_length from StringCore with raw
+    If length is equal to 0:
+        Return default_value
+    End If
+    Let i be 0
+    Let is_neg be 0
+    Let first be proc memory_get_byte from Memory with raw, 0
+    If first is equal to 45:
+        Set is_neg to 1
+        Set i to 1
+        If length is equal to 1:
+            Return default_value
+        End If
+    End If
+    Let value be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with raw, i
+        Let is_d be proc is_digit from Char with ch
+        If is_d is equal to 0:
+            Return default_value
+        End If
+        Set value to value multiplied by 10
+        Set value to value plus (ch minus 48)
+        Set i to i plus 1
+    End While
+    If is_neg is equal to 1:
+        Set value to 0 minus value
+    End If
+    Return value
+End Process
+
+@Reasoning
+Read an environment variable as a boolean. Truthy: "1", "true", "yes",
+"on" (case-insensitive). Falsy: "0", "false", "no", "off". Anything
+else returns the default.
+@End Reasoning
+
+@Implementation
+Look up the raw string. Lowercase via Char.to_lower into a
+StringBuilder, then compare against the accepted forms.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the string. Space: O(n) for the lowercased buffer.
+@End Performance_Hints
+
+@Security_Scope
+Strict accepted-form list prevents accidental truthy interpretation
+of arbitrary non-empty strings.
+@End Security_Scope
+Process called "env_get_bool" takes name as Integer, default_value as Integer returns Integer:
+    Let raw be proc env_lookup_raw with name
+    If raw is less than 0:
+        Return default_value
+    End If
+    If raw is equal to 0:
+        Return default_value
+    End If
+    Let length be proc string_length from StringCore with raw
+    If length is equal to 0:
+        Return default_value
+    End If
+    If length is equal to 1:
+        Let c1 be proc memory_get_byte from Memory with raw, 0
+        If c1 is equal to 49:
+            Return 1
+        End If
+        If c1 is equal to 48:
+            Return 0
+        End If
+        Return default_value
+    End If
+    If length is equal to 4:
+        Let r0 be proc memory_get_byte from Memory with raw, 0
+        Let r1 be proc memory_get_byte from Memory with raw, 1
+        Let r2 be proc memory_get_byte from Memory with raw, 2
+        Let r3 be proc memory_get_byte from Memory with raw, 3
+        Let a be proc to_lower from Char with r0
+        Let b be proc to_lower from Char with r1
+        Let c be proc to_lower from Char with r2
+        Let d be proc to_lower from Char with r3
+        If a is equal to 116:
+            If b is equal to 114:
+                If c is equal to 117:
+                    If d is equal to 101:
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+    If length is equal to 5:
+        Let s0 be proc memory_get_byte from Memory with raw, 0
+        Let s1 be proc memory_get_byte from Memory with raw, 1
+        Let s2 be proc memory_get_byte from Memory with raw, 2
+        Let s3 be proc memory_get_byte from Memory with raw, 3
+        Let s4 be proc memory_get_byte from Memory with raw, 4
+        Let a2 be proc to_lower from Char with s0
+        Let b2 be proc to_lower from Char with s1
+        Let c2 be proc to_lower from Char with s2
+        Let d2 be proc to_lower from Char with s3
+        Let e2 be proc to_lower from Char with s4
+        If a2 is equal to 102:
+            If b2 is equal to 97:
+                If c2 is equal to 108:
+                    If d2 is equal to 115:
+                        If e2 is equal to 101:
+                            Return 0
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+    If length is equal to 3:
+        Let t0 be proc memory_get_byte from Memory with raw, 0
+        Let t1 be proc memory_get_byte from Memory with raw, 1
+        Let t2 be proc memory_get_byte from Memory with raw, 2
+        Let aa be proc to_lower from Char with t0
+        Let bb be proc to_lower from Char with t1
+        Let cc be proc to_lower from Char with t2
+        If aa is equal to 121:
+            If bb is equal to 101:
+                If cc is equal to 115:
+                    Return 1
+                End If
+            End If
+        End If
+        If aa is equal to 111:
+            If bb is equal to 102:
+                If cc is equal to 102:
+                    Return 0
+                End If
+            End If
+        End If
+    End If
+    If length is equal to 2:
+        Let u0 be proc memory_get_byte from Memory with raw, 0
+        Let u1 be proc memory_get_byte from Memory with raw, 1
+        Let xa be proc to_lower from Char with u0
+        Let xb be proc to_lower from Char with u1
+        If xa is equal to 110:
+            If xb is equal to 111:
+                Return 0
+            End If
+        End If
+        If xa is equal to 111:
+            If xb is equal to 110:
+                Return 1
+            End If
+        End If
+    End If
+    Return default_value
+End Process
+
+@Reasoning
+Read an environment variable that must be present. Returns 0 if absent
+- callers should escalate to a fatal-error path on this sentinel.
+@End Reasoning
+
+@Implementation
+Look up; if absent return 0 sentinel.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n) for the duplicate.
+@End Performance_Hints
+
+@Security_Scope
+Used by bootstrap code that refuses to run without configuration -
+typical pattern for production secrets and credentials.
+@End Security_Scope
+Process called "env_get_required" takes name as Integer returns Integer:
+    Return proc env_get_string with name
+End Process
+
+Note: ============================================================================
+Note: TYPED WRAPPER RECORD
+Note: ============================================================================
+
+@Reasoning
+Construct an EnvironmentVariable wrapper that captures the variable's
+current observation - name, present flag, value or default. Used by
+bootstrap diagnostics that need to log "which env vars were observed".
+@End Reasoning
+
+@Implementation
+Look up the name. Populate the 32-byte record. Duplicate the value or
+default into the record's owned slot.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returned record owns its strings and must be freed via env_var_destroy.
+@End Security_Scope
+Process called "env_var_capture" takes name as Integer, default_value as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let ev be proc allocate from Layout with ENV_VAR_SIZE
+    If ev is equal to 0:
+        Return 0
+    End If
+    Let name_copy be proc string_duplicate from StringPrim with name
+    If name_copy is equal to 0:
+        proc deallocate from Layout with ev
+        Return 0
+    End If
+    Let actual be proc env_get_string with name
+    Let present be 0
+    Let default_copy be 0
+    If actual is not equal to 0:
+        Set present to 1
+    Otherwise:
+        If default_value is not equal to 0:
+            Set default_copy to proc string_duplicate from StringPrim with default_value
+        End If
+    End If
+    proc memory_set_int64 from Memory with ev, 0, name_copy
+    proc memory_set_int64 from Memory with ev, 8, actual
+    proc memory_set_int64 from Memory with ev, 16, default_copy
+    proc memory_set_int64 from Memory with ev, 24, present
+    Return ev
+End Process
+
+@Reasoning
+Free the captured wrapper and its owned strings.
+@End Reasoning
+
+@Implementation
+Free name, value, default, then the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access the pointer after destroy.
+@End Security_Scope
+Process called "env_var_destroy" takes ev as Integer returns Integer:
+    If ev is equal to 0:
+        Return 0
+    End If
+    Let name be proc memory_get_int64 from Memory with ev, 0
+    If name is not equal to 0:
+        proc deallocate from Layout with name
+    End If
+    Let value be proc memory_get_int64 from Memory with ev, 8
+    If value is not equal to 0:
+        proc deallocate from Layout with value
+    End If
+    Let dflt be proc memory_get_int64 from Memory with ev, 16
+    If dflt is not equal to 0:
+        proc deallocate from Layout with dflt
+    End If
+    proc deallocate from Layout with ev
+    Return 1
+End Process
+
+@Reasoning
+True if the captured variable was present in the process environment.
+@End Reasoning
+
+@Implementation
+Load offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "env_var_is_present" takes ev as Integer returns Integer:
+    If ev is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with ev, 24
+End Process
+
+@Reasoning
+Return the captured value if present, the default otherwise. The
+returned string is owned by the captured record - do not free.
+@End Reasoning
+
+@Implementation
+If present, return offset 8. Else return offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returned pointer is alive only while the wrapper is alive.
+@End Security_Scope
+Process called "env_var_value_or_default" takes ev as Integer returns Integer:
+    If ev is equal to 0:
+        Return 0
+    End If
+    Let present be proc memory_get_int64 from Memory with ev, 24
+    If present is equal to 1:
+        Return proc memory_get_int64 from Memory with ev, 8
+    End If
+    Return proc memory_get_int64 from Memory with ev, 16
+End Process

@@ -1,0 +1,690 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+RESULT_SET - Database query result iterator.
+
+A ResultSet holds column metadata and a lazy cursor over rows. Rows
+are materialised on demand by calling the driver's row-fetch callback.
+
+Each Row is a 32-byte handle that points at a dense value buffer where
+slot i holds the encoded value for column i and a type tag for null
+handling.
+
+Column metadata layout (24 bytes per column):
+  offset 0:  name_ptr         (8 bytes) - column name (interned string)
+  offset 8:  name_len         (8 bytes)
+  offset 16: type_tag         (8 bytes) - one of VALUE_TAG_*
+
+ResultSet layout (64 bytes):
+  offset 0:  driver_handle    (8 bytes) - opaque driver-side cursor
+  offset 8:  next_row_fn      (8 bytes) - (driver_handle, out_row_holder) -> Integer
+  offset 16: close_fn         (8 bytes) - (driver_handle) -> Integer
+  offset 24: column_count     (8 bytes)
+  offset 32: columns_ptr      (8 bytes) - column-meta array
+  offset 40: current_row      (8 bytes) - latest row pointer or 0
+  offset 48: state            (8 bytes) - RS_STATE_*
+  offset 56: rows_fetched     (8 bytes)
+
+Row layout (32 bytes):
+  offset 0:  result_set_ptr   (8 bytes)
+  offset 8:  values_ptr       (8 bytes) - value buffer (column_count * 16 bytes)
+  offset 16: nulls_ptr        (8 bytes) - per-column 1-byte null markers
+  offset 24: column_count     (8 bytes)
+
+Per-value slot (16 bytes):
+  offset 0: tag
+  offset 8: data (Integer / pointer / Float bits)
+
+Dependencies:
+- memory/layout.runa
+- core/memory_core.runa
+- database/connection.runa (for driver dispatch helpers)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/database/connection.runa" as DB
+
+Constant COL_OFF_NAME as Integer is 0
+Constant COL_OFF_NAME_LEN as Integer is 8
+Constant COL_OFF_TYPE as Integer is 16
+Constant COL_STRUCT_SIZE as Integer is 24
+
+Constant RS_OFF_HANDLE as Integer is 0
+Constant RS_OFF_NEXT_FN as Integer is 8
+Constant RS_OFF_CLOSE_FN as Integer is 16
+Constant RS_OFF_COLUMN_COUNT as Integer is 24
+Constant RS_OFF_COLUMNS as Integer is 32
+Constant RS_OFF_CURRENT as Integer is 40
+Constant RS_OFF_STATE as Integer is 48
+Constant RS_OFF_FETCHED as Integer is 56
+Constant RS_STRUCT_SIZE as Integer is 64
+
+Constant ROW_OFF_RS as Integer is 0
+Constant ROW_OFF_VALUES as Integer is 8
+Constant ROW_OFF_NULLS as Integer is 16
+Constant ROW_OFF_COLUMN_COUNT as Integer is 24
+Constant ROW_STRUCT_SIZE as Integer is 32
+
+Constant VAL_OFF_TAG as Integer is 0
+Constant VAL_OFF_DATA as Integer is 8
+Constant VAL_SLOT_SIZE as Integer is 16
+
+Constant RS_STATE_FRESH as Integer is 0
+Constant RS_STATE_ROW_AVAILABLE as Integer is 1
+Constant RS_STATE_EXHAUSTED as Integer is 2
+Constant RS_STATE_CLOSED as Integer is 3
+
+Constant VALUE_TAG_NULL as Integer is 0
+Constant VALUE_TAG_INTEGER as Integer is 1
+Constant VALUE_TAG_FLOAT as Integer is 2
+Constant VALUE_TAG_STRING as Integer is 3
+Constant VALUE_TAG_BYTES as Integer is 4
+Constant VALUE_TAG_BOOLEAN as Integer is 5
+
+Constant RS_OK as Integer is 1
+Constant RS_END as Integer is 0
+Constant RS_ERR_INVALID as Integer is -1
+Constant RS_ERR_NULL_VALUE as Integer is -2
+Constant RS_ERR_TYPE_MISMATCH as Integer is -3
+Constant RS_ERR_COLUMN_NOT_FOUND as Integer is -4
+
+Note: ============================================================================
+Note: ResultSet lifecycle
+Note: ============================================================================
+
+@Reasoning
+Construct a ResultSet from driver-provided primitives. The caller
+passes:
+  driver_handle  - opaque cursor allocated by the driver
+  next_row_fn    - dispatched per next() call
+  close_fn       - dispatched by result_set_close
+  column_count   - number of columns
+  columns        - pointer to a column_count-sized array of metadata
+                   (24 bytes each)
+@End Reasoning
+
+@Implementation
+Allocate the 64-byte record and copy fields. Column metadata storage
+is borrowed; the driver retains ownership.
+@End Implementation
+
+@Performance_Hints
+A single allocation per result set.
+@End Performance_Hints
+
+@Security_Scope
+columns_ptr is borrowed; do not free it inside result_set_close.
+@End Security_Scope
+
+Process called "result_set_create" takes driver_handle as Integer, next_row_fn as Integer, close_fn as Integer, column_count as Integer, columns_ptr as Integer returns Integer:
+    Let rs be proc allocate from Memory with RS_STRUCT_SIZE
+    If rs is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with rs, RS_OFF_HANDLE, driver_handle
+    proc memory_set_int64 from Mem with rs, RS_OFF_NEXT_FN, next_row_fn
+    proc memory_set_int64 from Mem with rs, RS_OFF_CLOSE_FN, close_fn
+    proc memory_set_int64 from Mem with rs, RS_OFF_COLUMN_COUNT, column_count
+    proc memory_set_int64 from Mem with rs, RS_OFF_COLUMNS, columns_ptr
+    proc memory_set_int64 from Mem with rs, RS_OFF_CURRENT, 0
+    proc memory_set_int64 from Mem with rs, RS_OFF_STATE, RS_STATE_FRESH
+    proc memory_set_int64 from Mem with rs, RS_OFF_FETCHED, 0
+    Return rs
+End Process
+
+Process called "result_set_close" takes rs as Integer returns Integer:
+    If rs is equal to 0:
+        Return RS_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with rs, RS_OFF_STATE
+    If state is equal to RS_STATE_CLOSED:
+        Return RS_OK
+    End If
+    Let close_fn be proc memory_get_int64 from Mem with rs, RS_OFF_CLOSE_FN
+    Let driver_handle be proc memory_get_int64 from Mem with rs, RS_OFF_HANDLE
+    If close_fn is not equal to 0:
+        proc db_runtime_call_indirect_1 from DB with close_fn, driver_handle
+    End If
+    Let current be proc memory_get_int64 from Mem with rs, RS_OFF_CURRENT
+    If current is not equal to 0:
+        proc row_destroy with current
+        proc memory_set_int64 from Mem with rs, RS_OFF_CURRENT, 0
+    End If
+    proc memory_set_int64 from Mem with rs, RS_OFF_STATE, RS_STATE_CLOSED
+    proc deallocate from Memory with rs
+    Return RS_OK
+End Process
+
+Process called "result_set_column_count" takes rs as Integer returns Integer:
+    If rs is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with rs, RS_OFF_COLUMN_COUNT
+End Process
+
+Process called "result_set_rows_fetched" takes rs as Integer returns Integer:
+    If rs is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with rs, RS_OFF_FETCHED
+End Process
+
+Process called "result_set_is_exhausted" takes rs as Integer returns Integer:
+    If rs is equal to 0:
+        Return 1
+    End If
+    Let state be proc memory_get_int64 from Mem with rs, RS_OFF_STATE
+    If state is equal to RS_STATE_EXHAUSTED:
+        Return 1
+    End If
+    If state is equal to RS_STATE_CLOSED:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Pull the next row from the driver and surface it as a Row pointer. The
+driver writes into our scratch holder; we wrap that pointer in our Row
+record and store it as `current_row`. The previous row (if any) is
+released first.
+@End Reasoning
+
+@Implementation
+Dispatch next_row_fn via the 2-arg indirect shim with (driver_handle,
+out_row_holder). The driver must return RS_OK on success or RS_END at
+end-of-stream and write a Row pointer to out_row_holder.
+@End Implementation
+
+@Performance_Hints
+One driver call per fetch. The driver decides whether to batch under
+the hood.
+@End Performance_Hints
+
+@Security_Scope
+Rows returned by the driver are owned by the ResultSet; we free them
+in row_destroy.
+@End Security_Scope
+
+Process called "result_set_next_row" takes rs as Integer returns Integer:
+    If rs is equal to 0:
+        Return 0
+    End If
+    Let state be proc memory_get_int64 from Mem with rs, RS_OFF_STATE
+    If state is equal to RS_STATE_EXHAUSTED:
+        Return 0
+    End If
+    If state is equal to RS_STATE_CLOSED:
+        Return 0
+    End If
+
+    Let previous be proc memory_get_int64 from Mem with rs, RS_OFF_CURRENT
+    If previous is not equal to 0:
+        proc row_destroy with previous
+        proc memory_set_int64 from Mem with rs, RS_OFF_CURRENT, 0
+    End If
+
+    Let next_fn be proc memory_get_int64 from Mem with rs, RS_OFF_NEXT_FN
+    Let driver_handle be proc memory_get_int64 from Mem with rs, RS_OFF_HANDLE
+    Let holder be proc allocate from Memory with 8
+    If holder is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with holder, 0, 0
+    Let rc be proc db_runtime_call_indirect_2 from DB with next_fn, driver_handle, holder
+    Let row_ptr be proc memory_get_int64 from Mem with holder, 0
+    proc deallocate from Memory with holder
+    If rc is equal to RS_OK:
+        If row_ptr is not equal to 0:
+            proc memory_set_int64 from Mem with rs, RS_OFF_CURRENT, row_ptr
+            proc memory_set_int64 from Mem with rs, RS_OFF_STATE, RS_STATE_ROW_AVAILABLE
+            Let fetched be proc memory_get_int64 from Mem with rs, RS_OFF_FETCHED
+            proc memory_set_int64 from Mem with rs, RS_OFF_FETCHED, (fetched plus 1)
+            Return row_ptr
+        End If
+    End If
+    proc memory_set_int64 from Mem with rs, RS_OFF_STATE, RS_STATE_EXHAUSTED
+    Return 0
+End Process
+
+Process called "result_set_current_row" takes rs as Integer returns Integer:
+    If rs is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with rs, RS_OFF_CURRENT
+End Process
+
+Process called "result_set_column_name" takes rs as Integer, index as Integer returns Integer:
+    If rs is equal to 0:
+        Return 0
+    End If
+    If index is less than 0:
+        Return 0
+    End If
+    Let columns be proc memory_get_int64 from Mem with rs, RS_OFF_COLUMNS
+    Let count be proc memory_get_int64 from Mem with rs, RS_OFF_COLUMN_COUNT
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Let off be index multiplied by COL_STRUCT_SIZE
+    Let column_record be columns plus off
+    Return proc memory_get_int64 from Mem with column_record, COL_OFF_NAME
+End Process
+
+Process called "result_set_column_name_length" takes rs as Integer, index as Integer returns Integer:
+    If rs is equal to 0:
+        Return 0
+    End If
+    Let columns be proc memory_get_int64 from Mem with rs, RS_OFF_COLUMNS
+    Let count be proc memory_get_int64 from Mem with rs, RS_OFF_COLUMN_COUNT
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Let off be index multiplied by COL_STRUCT_SIZE
+    Let column_record be columns plus off
+    Return proc memory_get_int64 from Mem with column_record, COL_OFF_NAME_LEN
+End Process
+
+Process called "result_set_column_type" takes rs as Integer, index as Integer returns Integer:
+    If rs is equal to 0:
+        Return VALUE_TAG_NULL
+    End If
+    Let columns be proc memory_get_int64 from Mem with rs, RS_OFF_COLUMNS
+    Let count be proc memory_get_int64 from Mem with rs, RS_OFF_COLUMN_COUNT
+    If index is less than 0:
+        Return VALUE_TAG_NULL
+    End If
+    If index is greater than or equal to count:
+        Return VALUE_TAG_NULL
+    End If
+    Let off be index multiplied by COL_STRUCT_SIZE
+    Let column_record be columns plus off
+    Return proc memory_get_int64 from Mem with column_record, COL_OFF_TYPE
+End Process
+
+Note: ============================================================================
+Note: Row construction and access
+Note: ============================================================================
+
+@Reasoning
+row_create is invoked by driver glue when it materialises a row. The
+caller supplies a value buffer (column_count * 16 bytes) and a nulls
+buffer (column_count bytes). We take ownership of both buffers.
+@End Reasoning
+
+@Implementation
+Allocate 32-byte record, populate fields.
+@End Implementation
+
+@Performance_Hints
+One allocation per row, no per-cell allocation.
+@End Performance_Hints
+
+@Security_Scope
+Both buffers must be heap-allocated; row_destroy frees them.
+@End Security_Scope
+
+Process called "row_create" takes rs as Integer, values_ptr as Integer, nulls_ptr as Integer, column_count as Integer returns Integer:
+    Let row be proc allocate from Memory with ROW_STRUCT_SIZE
+    If row is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with row, ROW_OFF_RS, rs
+    proc memory_set_int64 from Mem with row, ROW_OFF_VALUES, values_ptr
+    proc memory_set_int64 from Mem with row, ROW_OFF_NULLS, nulls_ptr
+    proc memory_set_int64 from Mem with row, ROW_OFF_COLUMN_COUNT, column_count
+    Return row
+End Process
+
+Process called "row_destroy" takes row as Integer returns Integer:
+    If row is equal to 0:
+        Return RS_ERR_INVALID
+    End If
+    Let values_ptr be proc memory_get_int64 from Mem with row, ROW_OFF_VALUES
+    Let nulls_ptr be proc memory_get_int64 from Mem with row, ROW_OFF_NULLS
+    If values_ptr is not equal to 0:
+        proc deallocate from Memory with values_ptr
+    End If
+    If nulls_ptr is not equal to 0:
+        proc deallocate from Memory with nulls_ptr
+    End If
+    proc deallocate from Memory with row
+    Return RS_OK
+End Process
+
+Process called "row_column_count" takes row as Integer returns Integer:
+    If row is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with row, ROW_OFF_COLUMN_COUNT
+End Process
+
+Process called "row_set_value" takes row as Integer, index as Integer, tag as Integer, data as Integer returns Integer:
+    If row is equal to 0:
+        Return RS_ERR_INVALID
+    End If
+    Let column_count be proc memory_get_int64 from Mem with row, ROW_OFF_COLUMN_COUNT
+    If index is less than 0:
+        Return RS_ERR_INVALID
+    End If
+    If index is greater than or equal to column_count:
+        Return RS_ERR_INVALID
+    End If
+    Let values_ptr be proc memory_get_int64 from Mem with row, ROW_OFF_VALUES
+    Let slot_off be index multiplied by VAL_SLOT_SIZE
+    Let slot be values_ptr plus slot_off
+    proc memory_set_int64 from Mem with slot, VAL_OFF_TAG, tag
+    proc memory_set_int64 from Mem with slot, VAL_OFF_DATA, data
+    Let nulls_ptr be proc memory_get_int64 from Mem with row, ROW_OFF_NULLS
+    If tag is equal to VALUE_TAG_NULL:
+        proc memory_set_byte from Mem with nulls_ptr, index, 1
+    Otherwise:
+        proc memory_set_byte from Mem with nulls_ptr, index, 0
+    End If
+    Return RS_OK
+End Process
+
+Process called "row_is_null" takes row as Integer, index as Integer returns Integer:
+    If row is equal to 0:
+        Return 1
+    End If
+    Let column_count be proc memory_get_int64 from Mem with row, ROW_OFF_COLUMN_COUNT
+    If index is less than 0:
+        Return 1
+    End If
+    If index is greater than or equal to column_count:
+        Return 1
+    End If
+    Let nulls_ptr be proc memory_get_int64 from Mem with row, ROW_OFF_NULLS
+    Return proc memory_get_byte from Mem with nulls_ptr, index
+End Process
+
+Process called "row_value_tag" takes row as Integer, index as Integer returns Integer:
+    If row is equal to 0:
+        Return VALUE_TAG_NULL
+    End If
+    Let column_count be proc memory_get_int64 from Mem with row, ROW_OFF_COLUMN_COUNT
+    If index is less than 0:
+        Return VALUE_TAG_NULL
+    End If
+    If index is greater than or equal to column_count:
+        Return VALUE_TAG_NULL
+    End If
+    Let values_ptr be proc memory_get_int64 from Mem with row, ROW_OFF_VALUES
+    Let slot_off be index multiplied by VAL_SLOT_SIZE
+    Let slot be values_ptr plus slot_off
+    Return proc memory_get_int64 from Mem with slot, VAL_OFF_TAG
+End Process
+
+Process called "row_get_data" takes row as Integer, index as Integer returns Integer:
+    If row is equal to 0:
+        Return 0
+    End If
+    Let column_count be proc memory_get_int64 from Mem with row, ROW_OFF_COLUMN_COUNT
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to column_count:
+        Return 0
+    End If
+    Let values_ptr be proc memory_get_int64 from Mem with row, ROW_OFF_VALUES
+    Let slot_off be index multiplied by VAL_SLOT_SIZE
+    Let slot be values_ptr plus slot_off
+    Return proc memory_get_int64 from Mem with slot, VAL_OFF_DATA
+End Process
+
+Process called "row_get_integer" takes row as Integer, index as Integer returns Integer:
+    If row is equal to 0:
+        Return 0
+    End If
+    Let null_flag be proc row_is_null with row, index
+    If null_flag is equal to 1:
+        Return 0
+    End If
+    Let tag be proc row_value_tag with row, index
+    If tag is not equal to VALUE_TAG_INTEGER:
+        If tag is not equal to VALUE_TAG_BOOLEAN:
+            Return 0
+        End If
+    End If
+    Return proc row_get_data with row, index
+End Process
+
+Process called "row_get_float_bits" takes row as Integer, index as Integer returns Integer:
+    If row is equal to 0:
+        Return 0
+    End If
+    Let null_flag be proc row_is_null with row, index
+    If null_flag is equal to 1:
+        Return 0
+    End If
+    Let tag be proc row_value_tag with row, index
+    If tag is not equal to VALUE_TAG_FLOAT:
+        Return 0
+    End If
+    Return proc row_get_data with row, index
+End Process
+
+Process called "row_get_string" takes row as Integer, index as Integer returns Integer:
+    If row is equal to 0:
+        Return 0
+    End If
+    Let null_flag be proc row_is_null with row, index
+    If null_flag is equal to 1:
+        Return 0
+    End If
+    Let tag be proc row_value_tag with row, index
+    If tag is not equal to VALUE_TAG_STRING:
+        Return 0
+    End If
+    Return proc row_get_data with row, index
+End Process
+
+Process called "row_get_bytes" takes row as Integer, index as Integer returns Integer:
+    If row is equal to 0:
+        Return 0
+    End If
+    Let null_flag be proc row_is_null with row, index
+    If null_flag is equal to 1:
+        Return 0
+    End If
+    Let tag be proc row_value_tag with row, index
+    If tag is not equal to VALUE_TAG_BYTES:
+        Return 0
+    End If
+    Return proc row_get_data with row, index
+End Process
+
+Process called "row_get_boolean" takes row as Integer, index as Integer returns Integer:
+    If row is equal to 0:
+        Return 0
+    End If
+    Let null_flag be proc row_is_null with row, index
+    If null_flag is equal to 1:
+        Return 0
+    End If
+    Let tag be proc row_value_tag with row, index
+    If tag is not equal to VALUE_TAG_BOOLEAN:
+        Return 0
+    End If
+    Return proc row_get_data with row, index
+End Process
+
+@Reasoning
+Find a column by name. Linear scan is appropriate for typical query
+result widths; for very wide tables drivers can supply a hash-indexed
+column block.
+@End Reasoning
+
+@Implementation
+Iterate columns, comparing name pointers and byte content via a manual
+length+memory_compare since string_core is not imported here.
+@End Implementation
+
+@Performance_Hints
+O(column_count * name_length). Cache the index when querying multiple
+rows for the same column.
+@End Performance_Hints
+
+@Security_Scope
+name must be a borrowed pointer with name_length valid bytes.
+@End Security_Scope
+
+Process called "row_column_index" takes row as Integer, name as Integer, name_length as Integer returns Integer:
+    If row is equal to 0:
+        Return RS_ERR_COLUMN_NOT_FOUND
+    End If
+    If name is equal to 0:
+        Return RS_ERR_COLUMN_NOT_FOUND
+    End If
+    Let rs be proc memory_get_int64 from Mem with row, ROW_OFF_RS
+    If rs is equal to 0:
+        Return RS_ERR_COLUMN_NOT_FOUND
+    End If
+    Let columns be proc memory_get_int64 from Mem with rs, RS_OFF_COLUMNS
+    Let column_count be proc memory_get_int64 from Mem with rs, RS_OFF_COLUMN_COUNT
+    Let i be 0
+    While i is less than column_count:
+        Let off be i multiplied by COL_STRUCT_SIZE
+        Let column_record be columns plus off
+        Let candidate_ptr be proc memory_get_int64 from Mem with column_record, COL_OFF_NAME
+        Let candidate_len be proc memory_get_int64 from Mem with column_record, COL_OFF_NAME_LEN
+        If candidate_len is equal to name_length:
+            If candidate_ptr is not equal to 0:
+                Let cmp be proc memory_compare from Mem with candidate_ptr, name, candidate_len
+                If cmp is equal to 0:
+                    Return i
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return RS_ERR_COLUMN_NOT_FOUND
+End Process
+
+Process called "row_get_by_name" takes row as Integer, name as Integer, name_length as Integer, out_tag_holder as Integer returns Integer:
+    If row is equal to 0:
+        Return 0
+    End If
+    Let idx be proc row_column_index with row, name, name_length
+    If idx is less than 0:
+        Return 0
+    End If
+    If out_tag_holder is not equal to 0:
+        Let tag be proc row_value_tag with row, idx
+        proc memory_set_int64 from Mem with out_tag_holder, 0, tag
+    End If
+    Return proc row_get_data with row, idx
+End Process
+
+Note: ============================================================================
+Note: Row materialisation helpers
+Note: ============================================================================
+
+@Reasoning
+row_allocate_buffers is a convenience used by driver glue to construct
+a Row in one shot. It allocates both buffers and the row record.
+@End Reasoning
+
+@Implementation
+Allocate column_count * 16 bytes for values and column_count bytes for
+nulls. Zero both buffers. Then call row_create.
+@End Implementation
+
+@Performance_Hints
+Two allocations per row plus the record allocation.
+@End Performance_Hints
+
+@Security_Scope
+On allocation failure all partial buffers are released before returning
+0.
+@End Security_Scope
+
+Process called "row_allocate_buffers" takes rs as Integer, column_count as Integer returns Integer:
+    If column_count is less than 0:
+        Return 0
+    End If
+    Let values_bytes be column_count multiplied by VAL_SLOT_SIZE
+    Let values be proc allocate from Memory with values_bytes
+    If values is equal to 0:
+        Return 0
+    End If
+    Let nulls be proc allocate from Memory with column_count
+    If nulls is equal to 0:
+        proc deallocate from Memory with values
+        Return 0
+    End If
+    proc memory_zero from Mem with values, values_bytes
+    proc memory_zero from Mem with nulls, column_count
+    Let row be proc row_create with rs, values, nulls, column_count
+    If row is equal to 0:
+        proc deallocate from Memory with values
+        proc deallocate from Memory with nulls
+        Return 0
+    End If
+    Return row
+End Process
+
+@Reasoning
+Convert a row into a dictionary-style key/value buffer. Each entry is
+24 bytes laid out as [name_ptr, tag, data]. The buffer is heap-owned
+by the caller.
+@End Reasoning
+
+@Implementation
+Allocate column_count * 24 bytes, fill from row metadata and current
+slot contents, return the buffer along with the entry count via the
+holder.
+@End Implementation
+
+@Performance_Hints
+One allocation plus a linear fill.
+@End Performance_Hints
+
+@Security_Scope
+Caller deallocates the returned buffer.
+@End Security_Scope
+
+Constant ROW_DICT_ENTRY_SIZE as Integer is 24
+Constant ROW_DICT_NAME as Integer is 0
+Constant ROW_DICT_TAG as Integer is 8
+Constant ROW_DICT_DATA as Integer is 16
+
+Process called "row_to_dictionary" takes row as Integer, out_len_holder as Integer returns Integer:
+    If row is equal to 0:
+        If out_len_holder is not equal to 0:
+            proc memory_set_int64 from Mem with out_len_holder, 0, 0
+        End If
+        Return 0
+    End If
+    Let rs be proc memory_get_int64 from Mem with row, ROW_OFF_RS
+    Let column_count be proc memory_get_int64 from Mem with row, ROW_OFF_COLUMN_COUNT
+    Let bytes be column_count multiplied by ROW_DICT_ENTRY_SIZE
+    Let buf be proc allocate from Memory with bytes
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than column_count:
+        Let entry_off be i multiplied by ROW_DICT_ENTRY_SIZE
+        Let entry be buf plus entry_off
+        Let name_ptr be proc result_set_column_name with rs, i
+        Let tag be proc row_value_tag with row, i
+        Let data be proc row_get_data with row, i
+        proc memory_set_int64 from Mem with entry, ROW_DICT_NAME, name_ptr
+        proc memory_set_int64 from Mem with entry, ROW_DICT_TAG, tag
+        proc memory_set_int64 from Mem with entry, ROW_DICT_DATA, data
+        Set i to i plus 1
+    End While
+    If out_len_holder is not equal to 0:
+        proc memory_set_int64 from Mem with out_len_holder, 0, column_count
+    End If
+    Return buf
+End Process

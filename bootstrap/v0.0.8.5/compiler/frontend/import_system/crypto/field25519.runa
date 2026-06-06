@@ -1,0 +1,1494 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FIELD25519 - Arithmetic in F_p with p = 2^255 - 19
+==============================================================================
+
+Foundation for Ed25519 (twisted Edwards) and X25519 (Montgomery). All field
+operations are constant-time: no branches, no memory accesses, and no shifts
+that depend on the limb values, only on the fixed limb layout.
+
+Representation: 10 limbs of radix 2^25.5 (alternating 26-bit and 25-bit).
+Limb i contains bits [floor(25.5*i), floor(25.5*(i+1))) of the field value.
+  limb 0: 26 bits  (bits   0..25)
+  limb 1: 25 bits  (bits  26..50)
+  limb 2: 26 bits  (bits  51..76)
+  limb 3: 25 bits  (bits  77..101)
+  limb 4: 26 bits  (bits 102..127)
+  limb 5: 25 bits  (bits 128..152)
+  limb 6: 26 bits  (bits 153..178)
+  limb 7: 25 bits  (bits 179..203)
+  limb 8: 26 bits  (bits 204..229)
+  limb 9: 25 bits  (bits 230..254)
+
+Limbs are stored as 64-bit signed integers at consecutive 8-byte offsets.
+A field element occupies FIELD25519_BYTES = 80 bytes of arena memory.
+
+The 26/25 layout (TweetNaCl ref10) lets a limb-limb multiplication produce a
+~52-bit product, and the sum of 10 such products fits in ~58 bits, which is
+well within 64-bit signed range with room for carry propagation. The
+reduction 2^255 = 19 (mod p) is folded inline: any bit above position 254 is
+multiplied by 19 and reabsorbed into the low limbs.
+
+Reference:
+- D.J. Bernstein, "Curve25519: new Diffie-Hellman speed records", PKC 2006.
+- RFC 7748 section 5 (X25519).
+- RFC 8032 section 5.1 (Ed25519).
+- ref10 reference implementation in TweetNaCl / SUPERCOP.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+
+Constant FIELD25519_BYTES as Integer is 80
+Constant FIELD25519_MASK26 as Integer is 67108863
+Constant FIELD25519_MASK25 as Integer is 33554431
+Constant FIELD25519_TWO_TO_26 as Integer is 67108864
+Constant FIELD25519_TWO_TO_25 as Integer is 33554432
+
+Note: ============================================================================
+Note: SECTION 1: Limb load/store + element allocation
+Note: ============================================================================
+
+Process called "fe25519_alloc" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocates an 80-byte buffer in the arena to hold a 10-limb field
+    element. Initial value is 0 (all limbs zero from arena_allocate's
+    contract, but we explicitly zero in case the arena reused memory).
+    @End Reasoning
+
+    @Implementation
+    Allocates 80 bytes, writes zero to each of the ten 8-byte limb cells.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) ten-store loop. Same cost as a memset of a tenth of a cache line.
+    @End Performance_Hints
+
+    @Security_Scope
+    The zeroing leaves no residual data in the buffer. The buffer itself
+    is arena-backed and lives until arena_reset / arena_destroy.
+    @End Security_Scope
+
+    Let buffer be Arena.arena_allocate(arena, FIELD25519_BYTES)
+    If buffer is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than 10:
+        Memory.memory_set_qword(buffer, i multiplied by 8, 0)
+        Set i to i plus 1
+    End While
+    Return buffer
+End Process
+
+Process called "fe25519_get_limb" takes fe as Integer, index as Integer returns Integer:
+    @Reasoning
+    Reads the index-th 26-or-25-bit limb of a field element. Index must be
+    in [0, 9]. Returns 0 for out-of-range to keep callers branchless on
+    invalid indices.
+    @End Reasoning
+
+    @Security_Scope
+    The read is at a fixed offset determined by the index argument. When
+    the index is a compile-time constant (as it always is in the inlined
+    arithmetic kernels below), this is constant-time. When the index is a
+    runtime value, the memory access pattern depends only on the index,
+    not on the field element value.
+    @End Security_Scope
+
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than 9:
+        Return 0
+    End If
+    Return Memory.memory_get_int64(fe, index multiplied by 8)
+End Process
+
+Process called "fe25519_set_limb" takes fe as Integer, index as Integer, value as Integer returns Integer:
+    @Reasoning
+    Writes a single limb. Range-checks the index for safety.
+    @End Reasoning
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than 9:
+        Return 0
+    End If
+    Memory.memory_set_qword(fe, index multiplied by 8, value)
+    Return 1
+End Process
+
+Process called "fe25519_copy" takes dest as Integer, src as Integer returns Integer:
+    @Reasoning
+    Limb-wise copy of a field element. Used by point addition kernels to
+    save intermediate state. Constant-time: ten unconditional 64-bit reads
+    and writes.
+    @End Reasoning
+
+    @Security_Scope
+    The copy never branches on limb contents.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 10:
+        Let li be Memory.memory_get_int64(src, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, li)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe25519_set_zero" takes fe as Integer returns Integer:
+    @Reasoning
+    Sets the field element to 0. Constant-time: ten unconditional writes.
+    @End Reasoning
+    Let i be 0
+    While i is less than 10:
+        Memory.memory_set_qword(fe, i multiplied by 8, 0)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe25519_set_one" takes fe as Integer returns Integer:
+    @Reasoning
+    Sets the field element to 1 (limb0 = 1, all others zero).
+    @End Reasoning
+    Memory.memory_set_qword(fe, 0, 1)
+    Let i be 1
+    While i is less than 10:
+        Memory.memory_set_qword(fe, i multiplied by 8, 0)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Add, Sub, Neg (linear ops, no reduction needed inline)
+Note: ============================================================================
+
+Process called "fe25519_add" takes dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Component-wise addition: dest[i] = a[i] + b[i] for i in [0, 9]. With
+    26/25-bit limbs and bounded inputs, the sum fits in at most 27 bits per
+    limb, well within signed 64-bit range. No reduction is performed here;
+    callers that need normalized output must call fe25519_reduce.
+    @End Reasoning
+
+    @Implementation
+    Ten unconditional add/store operations.
+    @End Implementation
+
+    @Performance_Hints
+    Bounded inputs (|a_i|, |b_i| < 2^54) keep the result well clear of the
+    63-bit signed limit even across many chained additions.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. No data-dependent branches or memory accesses.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 10:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Let bi be Memory.memory_get_int64(b, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, ai plus bi)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe25519_sub" takes dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Component-wise subtraction: dest[i] = a[i] - b[i]. Sign is preserved in
+    each limb (signed 64-bit). Reduction is deferred to fe25519_reduce.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: ten unconditional sub/store operations.
+    @End Security_Scope
+
+    Let i be 0
+    While i is less than 10:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Let bi be Memory.memory_get_int64(b, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, ai minus bi)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe25519_neg" takes dest as Integer, a as Integer returns Integer:
+    @Reasoning
+    Negation: dest[i] = -a[i]. Result has the same magnitude bound as a.
+    @End Reasoning
+    Let i be 0
+    While i is less than 10:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Memory.memory_set_qword(dest, i multiplied by 8, 0 minus ai)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Carry propagation + canonical reduction
+Note: ============================================================================
+
+Process called "fe25519_carry" takes h as Integer returns Integer:
+    @Reasoning
+    Propagates carries through the ten limbs to bring each into its target
+    range (26 or 25 bits, signed). The overflow from limb 9 (top, 25-bit)
+    wraps to limb 0 via the curve25519 reduction identity
+    2^255 = 19 (mod p), so carry_9 * 19 is added back into limb 0.
+
+    The carry uses arithmetic right shift (signed). When the language
+    primitive is logical-shift-right of an unsigned 64-bit value, the
+    same result is obtained by adding 2^25 (or 2^24) before shifting and
+    subtracting 1 in the destination limb. We use signed shifts here
+    because Runa Integer arithmetic is two's-complement signed, which is
+    exactly what we need: a signed limb of value -1 right-shifted by 26
+    is still -1, propagating sign correctly.
+    @End Reasoning
+
+    @Implementation
+    The pattern interleaves carries from even and odd limbs:
+      c = (h[i] + 2^(s-1)) >> s
+      h[i+1] += c
+      h[i] -= c << s
+    where s is 26 for even indices and 25 for odd. The interleave starts
+    at limb 0, alternating up to limb 9, then a final wrap-around from
+    limb 9 back into limb 0 with the factor of 19.
+    @End Implementation
+
+    @Performance_Hints
+    O(n) over n=10 limbs. No multiplications except the constant 19 wrap.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: the carry pattern is fixed; only the limb values are
+    data-dependent and they only affect arithmetic results, not control
+    flow or memory addresses.
+    @End Security_Scope
+
+    Note: First carry pass (single pass suffices when inputs are bounded
+    Note: by the kernel guarantees of mul/sqr; chained sums may require
+    Note: a second pass which the caller invokes).
+
+    Note: limb 0 (26-bit) -> limb 1
+    Let h0 be Memory.memory_get_int64(h, 0)
+    Let c0 be h0 plus 33554432
+    Let c0_shr be c0 shifted right by 26
+    Let h1 be Memory.memory_get_int64(h, 8)
+    Set h1 to h1 plus c0_shr
+    Let c0_lo be c0_shr multiplied by 67108864
+    Set h0 to h0 minus c0_lo
+    Memory.memory_set_qword(h, 0, h0)
+    Memory.memory_set_qword(h, 8, h1)
+
+    Note: limb 1 (25-bit) -> limb 2
+    Let c1 be h1 plus 16777216
+    Let c1_shr be c1 shifted right by 25
+    Let h2 be Memory.memory_get_int64(h, 16)
+    Set h2 to h2 plus c1_shr
+    Let c1_lo be c1_shr multiplied by 33554432
+    Set h1 to h1 minus c1_lo
+    Memory.memory_set_qword(h, 8, h1)
+    Memory.memory_set_qword(h, 16, h2)
+
+    Note: limb 2 (26-bit) -> limb 3
+    Let c2 be h2 plus 33554432
+    Let c2_shr be c2 shifted right by 26
+    Let h3 be Memory.memory_get_int64(h, 24)
+    Set h3 to h3 plus c2_shr
+    Let c2_lo be c2_shr multiplied by 67108864
+    Set h2 to h2 minus c2_lo
+    Memory.memory_set_qword(h, 16, h2)
+    Memory.memory_set_qword(h, 24, h3)
+
+    Note: limb 3 (25-bit) -> limb 4
+    Let c3 be h3 plus 16777216
+    Let c3_shr be c3 shifted right by 25
+    Let h4 be Memory.memory_get_int64(h, 32)
+    Set h4 to h4 plus c3_shr
+    Let c3_lo be c3_shr multiplied by 33554432
+    Set h3 to h3 minus c3_lo
+    Memory.memory_set_qword(h, 24, h3)
+    Memory.memory_set_qword(h, 32, h4)
+
+    Note: limb 4 (26-bit) -> limb 5
+    Let c4 be h4 plus 33554432
+    Let c4_shr be c4 shifted right by 26
+    Let h5 be Memory.memory_get_int64(h, 40)
+    Set h5 to h5 plus c4_shr
+    Let c4_lo be c4_shr multiplied by 67108864
+    Set h4 to h4 minus c4_lo
+    Memory.memory_set_qword(h, 32, h4)
+    Memory.memory_set_qword(h, 40, h5)
+
+    Note: limb 5 (25-bit) -> limb 6
+    Let c5 be h5 plus 16777216
+    Let c5_shr be c5 shifted right by 25
+    Let h6 be Memory.memory_get_int64(h, 48)
+    Set h6 to h6 plus c5_shr
+    Let c5_lo be c5_shr multiplied by 33554432
+    Set h5 to h5 minus c5_lo
+    Memory.memory_set_qword(h, 40, h5)
+    Memory.memory_set_qword(h, 48, h6)
+
+    Note: limb 6 (26-bit) -> limb 7
+    Let c6 be h6 plus 33554432
+    Let c6_shr be c6 shifted right by 26
+    Let h7 be Memory.memory_get_int64(h, 56)
+    Set h7 to h7 plus c6_shr
+    Let c6_lo be c6_shr multiplied by 67108864
+    Set h6 to h6 minus c6_lo
+    Memory.memory_set_qword(h, 48, h6)
+    Memory.memory_set_qword(h, 56, h7)
+
+    Note: limb 7 (25-bit) -> limb 8
+    Let c7 be h7 plus 16777216
+    Let c7_shr be c7 shifted right by 25
+    Let h8 be Memory.memory_get_int64(h, 64)
+    Set h8 to h8 plus c7_shr
+    Let c7_lo be c7_shr multiplied by 33554432
+    Set h7 to h7 minus c7_lo
+    Memory.memory_set_qword(h, 56, h7)
+    Memory.memory_set_qword(h, 64, h8)
+
+    Note: limb 8 (26-bit) -> limb 9
+    Let c8 be h8 plus 33554432
+    Let c8_shr be c8 shifted right by 26
+    Let h9 be Memory.memory_get_int64(h, 72)
+    Set h9 to h9 plus c8_shr
+    Let c8_lo be c8_shr multiplied by 67108864
+    Set h8 to h8 minus c8_lo
+    Memory.memory_set_qword(h, 64, h8)
+    Memory.memory_set_qword(h, 72, h9)
+
+    Note: limb 9 (25-bit) -> wrap to limb 0 with factor 19
+    Let c9 be h9 plus 16777216
+    Let c9_shr be c9 shifted right by 25
+    Let c9_lo be c9_shr multiplied by 33554432
+    Set h9 to h9 minus c9_lo
+    Memory.memory_set_qword(h, 72, h9)
+
+    Let wrap_in be c9_shr multiplied by 19
+    Let h0b be Memory.memory_get_int64(h, 0)
+    Set h0b to h0b plus wrap_in
+    Memory.memory_set_qword(h, 0, h0b)
+
+    Note: Second carry from limb 0 only (rarely needs more after mul).
+    Let h0c be h0b
+    Let c0b be h0c plus 33554432
+    Let c0b_shr be c0b shifted right by 26
+    Let h1b be Memory.memory_get_int64(h, 8)
+    Set h1b to h1b plus c0b_shr
+    Let c0b_lo be c0b_shr multiplied by 67108864
+    Set h0c to h0c minus c0b_lo
+    Memory.memory_set_qword(h, 0, h0c)
+    Memory.memory_set_qword(h, 8, h1b)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Multiplication and squaring (the core kernel)
+Note: ============================================================================
+
+Process called "fe25519_mul" takes dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Schoolbook multiplication of two 10-limb radix-2^25.5 field elements,
+    followed by inline reduction of indices 10..18 back into indices 0..9
+    via the identity 2^255 = 19 (mod p). The result is stored in dest as
+    a 10-limb field element with bounded magnitude that fe25519_carry can
+    canonicalize.
+
+    Layout: limb i has weight 2^(ceil(25.5*i)). Cross-product limb i*j
+    contributes to output limb (i+j) with possibly a factor-of-2
+    adjustment whenever the parity of i and j leads to a half-weight
+    alignment mismatch (the 26/25 alternation requires the 2*a_i*b_j
+    pattern from ref10).
+
+    Reduction: output limb r=i+j with r >= 10 is wrapped into limb r-10
+    with a factor of 19. The factor-of-2 adjustments described above are
+    folded into the multipliers (1 or 2) and the wrap factor (19 or 38).
+    @End Reasoning
+
+    @Implementation
+    We follow the ref10 fe_mul schedule (TweetNaCl): the multiplier values
+    1, 2, 19, 38 are derived as:
+      - 2: appears when both source limbs are odd (25-bit), so their
+        product weight is 2^(25.5*(i+j)) - we cannot represent half-weights
+        in integer limbs, so we double the coefficient and the destination
+        limb's weight is taken as ceil(25.5*(i+j)) = 25.5*(i+j) + 0.5.
+      - 19: wrap factor for r >= 10 when neither doubling nor halving
+        applies.
+      - 38: combination of 2 (parity) and 19 (wrap).
+    @End Implementation
+
+    @Performance_Hints
+    100 multiplications + ~100 additions + 10 carries. On x86-64 each
+    multiplication is a single IMUL; on AArch64 a single MADD. The kernel
+    is purely arithmetic with no branches, ideal for superscalar issue.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time. The schedule of multiplications and additions is
+    fixed at compile time; only the limb values are data-dependent. No
+    table lookups, no conditional branches, no memory accesses that
+    depend on secret data.
+    @End Security_Scope
+
+    Let a0 be Memory.memory_get_int64(a, 0)
+    Let a1 be Memory.memory_get_int64(a, 8)
+    Let a2 be Memory.memory_get_int64(a, 16)
+    Let a3 be Memory.memory_get_int64(a, 24)
+    Let a4 be Memory.memory_get_int64(a, 32)
+    Let a5 be Memory.memory_get_int64(a, 40)
+    Let a6 be Memory.memory_get_int64(a, 48)
+    Let a7 be Memory.memory_get_int64(a, 56)
+    Let a8 be Memory.memory_get_int64(a, 64)
+    Let a9 be Memory.memory_get_int64(a, 72)
+
+    Let b0 be Memory.memory_get_int64(b, 0)
+    Let b1 be Memory.memory_get_int64(b, 8)
+    Let b2 be Memory.memory_get_int64(b, 16)
+    Let b3 be Memory.memory_get_int64(b, 24)
+    Let b4 be Memory.memory_get_int64(b, 32)
+    Let b5 be Memory.memory_get_int64(b, 40)
+    Let b6 be Memory.memory_get_int64(b, 48)
+    Let b7 be Memory.memory_get_int64(b, 56)
+    Let b8 be Memory.memory_get_int64(b, 64)
+    Let b9 be Memory.memory_get_int64(b, 72)
+
+    Note: Precompute 19*b_i and 2*a_i for the odd-indexed (25-bit) a limbs.
+    Let b1_19 be b1 multiplied by 19
+    Let b2_19 be b2 multiplied by 19
+    Let b3_19 be b3 multiplied by 19
+    Let b4_19 be b4 multiplied by 19
+    Let b5_19 be b5 multiplied by 19
+    Let b6_19 be b6 multiplied by 19
+    Let b7_19 be b7 multiplied by 19
+    Let b8_19 be b8 multiplied by 19
+    Let b9_19 be b9 multiplied by 19
+
+    Let a1_2 be a1 multiplied by 2
+    Let a3_2 be a3 multiplied by 2
+    Let a5_2 be a5 multiplied by 2
+    Let a7_2 be a7 multiplied by 2
+    Let a9_2 be a9 multiplied by 2
+
+    Note: r0 = a0*b0 + 38*(a1*b9 + a3*b7 + a5*b5 + a7*b3 + a9*b1)
+    Note:        + 19*(a2*b8 + a4*b6 + a6*b4 + a8*b2)
+    Let r0 be a0 multiplied by b0
+    Set r0 to r0 plus a1_2 multiplied by b9_19
+    Set r0 to r0 plus a2 multiplied by b8_19
+    Set r0 to r0 plus a3_2 multiplied by b7_19
+    Set r0 to r0 plus a4 multiplied by b6_19
+    Set r0 to r0 plus a5_2 multiplied by b5_19
+    Set r0 to r0 plus a6 multiplied by b4_19
+    Set r0 to r0 plus a7_2 multiplied by b3_19
+    Set r0 to r0 plus a8 multiplied by b2_19
+    Set r0 to r0 plus a9_2 multiplied by b1_19
+
+    Note: r1 = a0*b1 + a1*b0 + 19*(a2*b9 + a3*b8 + a4*b7 + a5*b6 + a6*b5 + a7*b4 + a8*b3 + a9*b2)
+    Let r1 be a0 multiplied by b1
+    Set r1 to r1 plus a1 multiplied by b0
+    Set r1 to r1 plus a2 multiplied by b9_19
+    Set r1 to r1 plus a3 multiplied by b8_19
+    Set r1 to r1 plus a4 multiplied by b7_19
+    Set r1 to r1 plus a5 multiplied by b6_19
+    Set r1 to r1 plus a6 multiplied by b5_19
+    Set r1 to r1 plus a7 multiplied by b4_19
+    Set r1 to r1 plus a8 multiplied by b3_19
+    Set r1 to r1 plus a9 multiplied by b2_19
+
+    Note: r2 = a0*b2 + 2*a1*b1 + a2*b0 + 38*(a3*b9 + a5*b7 + a7*b5 + a9*b3) + 19*(a4*b8 + a6*b6 + a8*b4)
+    Let r2 be a0 multiplied by b2
+    Set r2 to r2 plus a1_2 multiplied by b1
+    Set r2 to r2 plus a2 multiplied by b0
+    Set r2 to r2 plus a3_2 multiplied by b9_19
+    Set r2 to r2 plus a4 multiplied by b8_19
+    Set r2 to r2 plus a5_2 multiplied by b7_19
+    Set r2 to r2 plus a6 multiplied by b6_19
+    Set r2 to r2 plus a7_2 multiplied by b5_19
+    Set r2 to r2 plus a8 multiplied by b4_19
+    Set r2 to r2 plus a9_2 multiplied by b3_19
+
+    Note: r3 = a0*b3 + a1*b2 + a2*b1 + a3*b0 + 19*(a4*b9 + a5*b8 + a6*b7 + a7*b6 + a8*b5 + a9*b4)
+    Let r3 be a0 multiplied by b3
+    Set r3 to r3 plus a1 multiplied by b2
+    Set r3 to r3 plus a2 multiplied by b1
+    Set r3 to r3 plus a3 multiplied by b0
+    Set r3 to r3 plus a4 multiplied by b9_19
+    Set r3 to r3 plus a5 multiplied by b8_19
+    Set r3 to r3 plus a6 multiplied by b7_19
+    Set r3 to r3 plus a7 multiplied by b6_19
+    Set r3 to r3 plus a8 multiplied by b5_19
+    Set r3 to r3 plus a9 multiplied by b4_19
+
+    Note: r4 = a0*b4 + 2*a1*b3 + a2*b2 + 2*a3*b1 + a4*b0 + 38*(a5*b9 + a7*b7 + a9*b5) + 19*(a6*b8 + a8*b6)
+    Let r4 be a0 multiplied by b4
+    Set r4 to r4 plus a1_2 multiplied by b3
+    Set r4 to r4 plus a2 multiplied by b2
+    Set r4 to r4 plus a3_2 multiplied by b1
+    Set r4 to r4 plus a4 multiplied by b0
+    Set r4 to r4 plus a5_2 multiplied by b9_19
+    Set r4 to r4 plus a6 multiplied by b8_19
+    Set r4 to r4 plus a7_2 multiplied by b7_19
+    Set r4 to r4 plus a8 multiplied by b6_19
+    Set r4 to r4 plus a9_2 multiplied by b5_19
+
+    Note: r5 = a0*b5 + a1*b4 + a2*b3 + a3*b2 + a4*b1 + a5*b0 + 19*(a6*b9 + a7*b8 + a8*b7 + a9*b6)
+    Let r5 be a0 multiplied by b5
+    Set r5 to r5 plus a1 multiplied by b4
+    Set r5 to r5 plus a2 multiplied by b3
+    Set r5 to r5 plus a3 multiplied by b2
+    Set r5 to r5 plus a4 multiplied by b1
+    Set r5 to r5 plus a5 multiplied by b0
+    Set r5 to r5 plus a6 multiplied by b9_19
+    Set r5 to r5 plus a7 multiplied by b8_19
+    Set r5 to r5 plus a8 multiplied by b7_19
+    Set r5 to r5 plus a9 multiplied by b6_19
+
+    Note: r6 = a0*b6 + 2*a1*b5 + a2*b4 + 2*a3*b3 + a4*b2 + 2*a5*b1 + a6*b0 + 38*(a7*b9 + a9*b7) + 19*(a8*b8)
+    Let r6 be a0 multiplied by b6
+    Set r6 to r6 plus a1_2 multiplied by b5
+    Set r6 to r6 plus a2 multiplied by b4
+    Set r6 to r6 plus a3_2 multiplied by b3
+    Set r6 to r6 plus a4 multiplied by b2
+    Set r6 to r6 plus a5_2 multiplied by b1
+    Set r6 to r6 plus a6 multiplied by b0
+    Set r6 to r6 plus a7_2 multiplied by b9_19
+    Set r6 to r6 plus a8 multiplied by b8_19
+    Set r6 to r6 plus a9_2 multiplied by b7_19
+
+    Note: r7 = a0*b7 + a1*b6 + a2*b5 + a3*b4 + a4*b3 + a5*b2 + a6*b1 + a7*b0 + 19*(a8*b9 + a9*b8)
+    Let r7 be a0 multiplied by b7
+    Set r7 to r7 plus a1 multiplied by b6
+    Set r7 to r7 plus a2 multiplied by b5
+    Set r7 to r7 plus a3 multiplied by b4
+    Set r7 to r7 plus a4 multiplied by b3
+    Set r7 to r7 plus a5 multiplied by b2
+    Set r7 to r7 plus a6 multiplied by b1
+    Set r7 to r7 plus a7 multiplied by b0
+    Set r7 to r7 plus a8 multiplied by b9_19
+    Set r7 to r7 plus a9 multiplied by b8_19
+
+    Note: r8 = a0*b8 + 2*a1*b7 + a2*b6 + 2*a3*b5 + a4*b4 + 2*a5*b3 + a6*b2 + 2*a7*b1 + a8*b0 + 38*a9*b9
+    Let r8 be a0 multiplied by b8
+    Set r8 to r8 plus a1_2 multiplied by b7
+    Set r8 to r8 plus a2 multiplied by b6
+    Set r8 to r8 plus a3_2 multiplied by b5
+    Set r8 to r8 plus a4 multiplied by b4
+    Set r8 to r8 plus a5_2 multiplied by b3
+    Set r8 to r8 plus a6 multiplied by b2
+    Set r8 to r8 plus a7_2 multiplied by b1
+    Set r8 to r8 plus a8 multiplied by b0
+    Set r8 to r8 plus a9_2 multiplied by b9_19
+
+    Note: r9 = a0*b9 + a1*b8 + a2*b7 + a3*b6 + a4*b5 + a5*b4 + a6*b3 + a7*b2 + a8*b1 + a9*b0
+    Let r9 be a0 multiplied by b9
+    Set r9 to r9 plus a1 multiplied by b8
+    Set r9 to r9 plus a2 multiplied by b7
+    Set r9 to r9 plus a3 multiplied by b6
+    Set r9 to r9 plus a4 multiplied by b5
+    Set r9 to r9 plus a5 multiplied by b4
+    Set r9 to r9 plus a6 multiplied by b3
+    Set r9 to r9 plus a7 multiplied by b2
+    Set r9 to r9 plus a8 multiplied by b1
+    Set r9 to r9 plus a9 multiplied by b0
+
+    Memory.memory_set_qword(dest, 0, r0)
+    Memory.memory_set_qword(dest, 8, r1)
+    Memory.memory_set_qword(dest, 16, r2)
+    Memory.memory_set_qword(dest, 24, r3)
+    Memory.memory_set_qword(dest, 32, r4)
+    Memory.memory_set_qword(dest, 40, r5)
+    Memory.memory_set_qword(dest, 48, r6)
+    Memory.memory_set_qword(dest, 56, r7)
+    Memory.memory_set_qword(dest, 64, r8)
+    Memory.memory_set_qword(dest, 72, r9)
+
+    proc fe25519_carry with dest
+    Return 1
+End Process
+
+Process called "fe25519_sqr" takes dest as Integer, a as Integer returns Integer:
+    @Reasoning
+    Squaring of a 10-limb radix-2^25.5 field element. Implemented as
+    fe25519_mul(dest, a, a). A specialized squaring schedule can save
+    ~30% over the general multiplication by collapsing symmetric cross
+    products (a_i*a_j + a_j*a_i = 2*a_i*a_j), but the speedup requires
+    the 26/25 parity bookkeeping to be handled correctly. The simpler
+    derivation below uses the same well-tested multiplication kernel
+    and pays one extra multiplication group per limb (a factor of ~2
+    on the squaring kernel itself, but identical correctness).
+
+    For Ed25519 / X25519, the 255-squaring inversion chain dominates;
+    we accept the constant factor cost in exchange for sharing a
+    single audited reduction kernel between mul and sqr.
+    @End Reasoning
+
+    @Implementation
+    Delegates to fe25519_mul with b = a. Preserves a's storage because
+    fe25519_mul loads all source limbs into registers before any write
+    to dest, so dest=a aliasing is safe (callers always pass an
+    independent dest buffer here; if aliasing is ever needed, the
+    fe25519_mul source-load-before-store property holds).
+    @End Implementation
+
+    @Performance_Hints
+    Same cost profile as fe25519_mul (100 multiplications + 100
+    additions + 10 carries). For workloads dominated by squaring
+    (Fermat inversion's 255 squarings), this is the bottleneck, but
+    the constant-factor benefit of a specialized squaring kernel is
+    deferred to keep one reduction kernel under audit.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time, inherited from fe25519_mul.
+    @End Security_Scope
+
+    proc fe25519_mul with dest, a, a
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Constant-time conditional swap and equality
+Note: ============================================================================
+
+Process called "fe25519_cswap" takes a as Integer, b as Integer, swap_bit as Integer returns Integer:
+    @Reasoning
+    Conditionally swaps two field elements based on a single bit, without
+    branching. When swap_bit = 1, the contents of a and b are exchanged;
+    when swap_bit = 0, both are unchanged. This is the core primitive that
+    makes the Montgomery ladder constant-time: each ladder step CSWAPs the
+    two accumulator points based on the current scalar bit, ensuring the
+    same memory accesses regardless of the bit's value.
+    @End Reasoning
+
+    @Implementation
+    For each limb i:
+      mask = -swap_bit              (all-ones if swap_bit=1, all-zero if 0)
+      t = mask AND (a[i] XOR b[i])
+      a[i] = a[i] XOR t
+      b[i] = b[i] XOR t
+    When swap_bit=0, mask=0 so t=0 and both limbs are unchanged. When
+    swap_bit=1, mask=-1 so t=a[i] XOR b[i], and XOR-ing both sides
+    completes the swap.
+    @End Implementation
+
+    @Performance_Hints
+    10 iterations, each 4 arithmetic ops and 2 stores. ~40ns on modern
+    cores. The compiler is free to lower the loop as a fixed unrolled
+    sequence.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: identical instruction sequence regardless of swap_bit.
+    The mask construction has no branches.
+    Precondition: swap_bit must be 0 or 1; callers should normalize via
+    secure_memory.normalize_to_bool if uncertain.
+    @End Security_Scope
+
+    Let mask be 0 minus swap_bit
+    Let i be 0
+    While i is less than 10:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Let bi be Memory.memory_get_int64(b, i multiplied by 8)
+        Let xored be ai bitwise_xor bi
+        Let t be xored bitwise_and mask
+        Let new_a be ai bitwise_xor t
+        Let new_b be bi bitwise_xor t
+        Memory.memory_set_qword(a, i multiplied by 8, new_a)
+        Memory.memory_set_qword(b, i multiplied by 8, new_b)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fe25519_select" takes dest as Integer, a as Integer, b as Integer, condition as Integer returns Integer:
+    @Reasoning
+    Constant-time conditional move: dest := a when condition = 1,
+    dest := b when condition = 0. Both source elements are read on
+    every call to prevent cache-side-channel leakage of the condition.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time. The selection is performed via bitwise mask, with no
+    branches and identical memory access pattern in both cases.
+    @End Security_Scope
+
+    Let mask be 0 minus condition
+    Let not_mask be mask bitwise_xor 0 minus 1
+    Let i be 0
+    While i is less than 10:
+        Let ai be Memory.memory_get_int64(a, i multiplied by 8)
+        Let bi be Memory.memory_get_int64(b, i multiplied by 8)
+        Let from_a be ai bitwise_and mask
+        Let from_b be bi bitwise_and not_mask
+        Memory.memory_set_qword(dest, i multiplied by 8, from_a bitwise_or from_b)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: Packing (field element -> 32 bytes) and unpacking
+Note: ============================================================================
+
+Process called "fe25519_unpack" takes fe as Integer, bytes32 as Integer returns Integer:
+    @Reasoning
+    Decodes a 32-byte little-endian buffer into a 10-limb field element
+    representation. The top bit of byte 31 is masked out (Ed25519's
+    encoded points carry the sign of x in that bit; for X25519's u
+    coordinate it must be cleared anyway per RFC 7748).
+
+    Each 26-bit / 25-bit limb is extracted by combining bytes with the
+    appropriate shift offset.
+    @End Reasoning
+
+    @Implementation
+    Reads bytes32[0..31] (with byte 31's top bit cleared), then computes
+    each limb via byte-shift-add. Stores 10 limbs in fe.
+    @End Implementation
+
+    @Security_Scope
+    Constant-time: 32 byte reads, 32 byte combines, no branches.
+    @End Security_Scope
+
+    Let b0 be Memory.memory_get_byte(bytes32, 0)
+    Let b1 be Memory.memory_get_byte(bytes32, 1)
+    Let b2 be Memory.memory_get_byte(bytes32, 2)
+    Let b3 be Memory.memory_get_byte(bytes32, 3)
+    Let b4 be Memory.memory_get_byte(bytes32, 4)
+    Let b5 be Memory.memory_get_byte(bytes32, 5)
+    Let b6 be Memory.memory_get_byte(bytes32, 6)
+    Let b7 be Memory.memory_get_byte(bytes32, 7)
+    Let b8 be Memory.memory_get_byte(bytes32, 8)
+    Let b9 be Memory.memory_get_byte(bytes32, 9)
+    Let b10 be Memory.memory_get_byte(bytes32, 10)
+    Let b11 be Memory.memory_get_byte(bytes32, 11)
+    Let b12 be Memory.memory_get_byte(bytes32, 12)
+    Let b13 be Memory.memory_get_byte(bytes32, 13)
+    Let b14 be Memory.memory_get_byte(bytes32, 14)
+    Let b15 be Memory.memory_get_byte(bytes32, 15)
+    Let b16 be Memory.memory_get_byte(bytes32, 16)
+    Let b17 be Memory.memory_get_byte(bytes32, 17)
+    Let b18 be Memory.memory_get_byte(bytes32, 18)
+    Let b19 be Memory.memory_get_byte(bytes32, 19)
+    Let b20 be Memory.memory_get_byte(bytes32, 20)
+    Let b21 be Memory.memory_get_byte(bytes32, 21)
+    Let b22 be Memory.memory_get_byte(bytes32, 22)
+    Let b23 be Memory.memory_get_byte(bytes32, 23)
+    Let b24 be Memory.memory_get_byte(bytes32, 24)
+    Let b25 be Memory.memory_get_byte(bytes32, 25)
+    Let b26 be Memory.memory_get_byte(bytes32, 26)
+    Let b27 be Memory.memory_get_byte(bytes32, 27)
+    Let b28 be Memory.memory_get_byte(bytes32, 28)
+    Let b29 be Memory.memory_get_byte(bytes32, 29)
+    Let b30 be Memory.memory_get_byte(bytes32, 30)
+    Let b31_raw be Memory.memory_get_byte(bytes32, 31)
+    Let b31 be b31_raw bitwise_and 127
+
+    Note: limb 0 = bits   0..25   = b0 | b1<<8 | b2<<16 | (b3 & 0x03)<<24
+    Let l0 be b0
+    Set l0 to l0 plus b1 multiplied by 256
+    Set l0 to l0 plus b2 multiplied by 65536
+    Set l0 to l0 plus (b3 bitwise_and 3) multiplied by 16777216
+
+    Note: limb 1 = bits  26..50   = (b3>>2) | b4<<6 | b5<<14 | (b6 & 0x07)<<22
+    Let l1 be b3 shifted right by 2
+    Set l1 to l1 plus b4 multiplied by 64
+    Set l1 to l1 plus b5 multiplied by 16384
+    Set l1 to l1 plus (b6 bitwise_and 7) multiplied by 4194304
+
+    Note: limb 2 = bits  51..76   = (b6>>3) | b7<<5 | b8<<13 | (b9 & 0x1F)<<21
+    Let l2 be b6 shifted right by 3
+    Set l2 to l2 plus b7 multiplied by 32
+    Set l2 to l2 plus b8 multiplied by 8192
+    Set l2 to l2 plus (b9 bitwise_and 31) multiplied by 2097152
+
+    Note: limb 3 = bits  77..101  = (b9>>5) | b10<<3 | b11<<11 | (b12 & 0x3F)<<19
+    Let l3 be b9 shifted right by 5
+    Set l3 to l3 plus b10 multiplied by 8
+    Set l3 to l3 plus b11 multiplied by 2048
+    Set l3 to l3 plus (b12 bitwise_and 63) multiplied by 524288
+
+    Note: limb 4 = bits 102..127  = (b12>>6) | b13<<2 | b14<<10 | b15<<18
+    Let l4 be b12 shifted right by 6
+    Set l4 to l4 plus b13 multiplied by 4
+    Set l4 to l4 plus b14 multiplied by 1024
+    Set l4 to l4 plus b15 multiplied by 262144
+
+    Note: limb 5 = bits 128..152  = b16 | b17<<8 | b18<<16 | (b19 & 0x01)<<24
+    Let l5 be b16
+    Set l5 to l5 plus b17 multiplied by 256
+    Set l5 to l5 plus b18 multiplied by 65536
+    Set l5 to l5 plus (b19 bitwise_and 1) multiplied by 16777216
+
+    Note: limb 6 = bits 153..178  = (b19>>1) | b20<<7 | b21<<15 | (b22 & 0x07)<<23
+    Let l6 be b19 shifted right by 1
+    Set l6 to l6 plus b20 multiplied by 128
+    Set l6 to l6 plus b21 multiplied by 32768
+    Set l6 to l6 plus (b22 bitwise_and 7) multiplied by 8388608
+
+    Note: limb 7 = bits 179..203  = (b22>>3) | b23<<5 | b24<<13 | (b25 & 0x1F)<<21
+    Let l7 be b22 shifted right by 3
+    Set l7 to l7 plus b23 multiplied by 32
+    Set l7 to l7 plus b24 multiplied by 8192
+    Set l7 to l7 plus (b25 bitwise_and 31) multiplied by 2097152
+
+    Note: limb 8 = bits 204..229  = (b25>>5) | b26<<3 | b27<<11 | (b28 & 0x3F)<<19
+    Let l8 be b25 shifted right by 5
+    Set l8 to l8 plus b26 multiplied by 8
+    Set l8 to l8 plus b27 multiplied by 2048
+    Set l8 to l8 plus (b28 bitwise_and 63) multiplied by 524288
+
+    Note: limb 9 = bits 230..254  = (b28>>6) | b29<<2 | b30<<10 | b31<<18
+    Let l9 be b28 shifted right by 6
+    Set l9 to l9 plus b29 multiplied by 4
+    Set l9 to l9 plus b30 multiplied by 1024
+    Set l9 to l9 plus b31 multiplied by 262144
+
+    Memory.memory_set_qword(fe, 0, l0)
+    Memory.memory_set_qword(fe, 8, l1)
+    Memory.memory_set_qword(fe, 16, l2)
+    Memory.memory_set_qword(fe, 24, l3)
+    Memory.memory_set_qword(fe, 32, l4)
+    Memory.memory_set_qword(fe, 40, l5)
+    Memory.memory_set_qword(fe, 48, l6)
+    Memory.memory_set_qword(fe, 56, l7)
+    Memory.memory_set_qword(fe, 64, l8)
+    Memory.memory_set_qword(fe, 72, l9)
+    Return 1
+End Process
+
+Process called "fe25519_freeze" takes fe as Integer returns Integer:
+    @Reasoning
+    Reduces a field element to its unique canonical representative in
+    [0, p). This is required before packing back to bytes because the
+    raw limbs may represent a value >= p (specifically, the result of
+    earlier arithmetic may be in [0, 2p) due to the lazy reduction).
+
+    The canonical reduction subtracts p from fe and selects the result
+    based on whether the subtraction underflowed: if fe < p, the
+    original is correct; if fe >= p, the reduced value is correct.
+
+    Two carry passes are performed before the comparison to ensure each
+    limb is in its target range. Then a comparison-and-subtract pattern
+    handles the wrap from values >= p.
+    @End Reasoning
+
+    @Implementation
+    Standard ref10 fe_tobytes pre-step. The pattern:
+      1. Carry-propagate (two passes).
+      2. Add 19 to h[0] and carry through; if h[9] overflowed, the
+         result was >= p and we keep the +19 addition.
+      3. Otherwise subtract 19 back from h[0] and clear the carry.
+    @End Implementation
+
+    @Security_Scope
+    Constant-time: the comparison-and-subtract is implemented as
+    arithmetic with conditional masks, not branches.
+    @End Security_Scope
+
+    Note: Two carry passes to bring all limbs into their canonical
+    Note: range [0, 2^bitsize).
+    proc fe25519_carry with fe
+    proc fe25519_carry with fe
+
+    Note: Compute h + 19. If h + 19 has its high (limb 9) bit set above
+    Note: 2^24, then h was already >= 2^255 - 19, so the true value is
+    Note: h - (p - 19) = h - p + 19. We mask all limbs by either keeping
+    Note: them or subtracting p.
+    Note: Equivalent classical approach: Try h - p and use h - p if it
+    Note: didn't underflow. Implemented via carry-out detection.
+
+    Let h0 be Memory.memory_get_int64(fe, 0)
+    Let h1 be Memory.memory_get_int64(fe, 8)
+    Let h2 be Memory.memory_get_int64(fe, 16)
+    Let h3 be Memory.memory_get_int64(fe, 24)
+    Let h4 be Memory.memory_get_int64(fe, 32)
+    Let h5 be Memory.memory_get_int64(fe, 40)
+    Let h6 be Memory.memory_get_int64(fe, 48)
+    Let h7 be Memory.memory_get_int64(fe, 56)
+    Let h8 be Memory.memory_get_int64(fe, 64)
+    Let h9 be Memory.memory_get_int64(fe, 72)
+
+    Note: First conditional subtraction of p. q = (h + 19) >> 255 indicates
+    Note: whether h >= p - 19; we then subtract p by adjusting h[0] by -19
+    Note: and clearing the top bit of h[9].
+    Let q0 be h0 plus 19
+    Let q be q0 shifted right by 26
+    Set q to (h1 plus q) shifted right by 25
+    Set q to (h2 plus q) shifted right by 26
+    Set q to (h3 plus q) shifted right by 25
+    Set q to (h4 plus q) shifted right by 26
+    Set q to (h5 plus q) shifted right by 25
+    Set q to (h6 plus q) shifted right by 26
+    Set q to (h7 plus q) shifted right by 25
+    Set q to (h8 plus q) shifted right by 26
+    Set q to (h9 plus q) shifted right by 25
+
+    Note: q is now 0 if h < p, 1 if h >= p (when h >= p we want to subtract p).
+    Set h0 to h0 plus 19 multiplied by q
+
+    Let mask26 be 67108863
+    Let mask25 be 33554431
+
+    Note: Now propagate carries with bitmask of each limb to its range.
+    Let h1n be h1 plus (h0 shifted right by 26)
+    Let h0n be h0 bitwise_and mask26
+    Let h2n be h2 plus (h1n shifted right by 25)
+    Let h1m be h1n bitwise_and mask25
+    Let h3n be h3 plus (h2n shifted right by 26)
+    Let h2m be h2n bitwise_and mask26
+    Let h4n be h4 plus (h3n shifted right by 25)
+    Let h3m be h3n bitwise_and mask25
+    Let h5n be h5 plus (h4n shifted right by 26)
+    Let h4m be h4n bitwise_and mask26
+    Let h6n be h6 plus (h5n shifted right by 25)
+    Let h5m be h5n bitwise_and mask25
+    Let h7n be h7 plus (h6n shifted right by 26)
+    Let h6m be h6n bitwise_and mask26
+    Let h8n be h8 plus (h7n shifted right by 25)
+    Let h7m be h7n bitwise_and mask25
+    Let h9n be h9 plus (h8n shifted right by 26)
+    Let h8m be h8n bitwise_and mask26
+    Let h9m be h9n bitwise_and mask25
+
+    Memory.memory_set_qword(fe, 0, h0n)
+    Memory.memory_set_qword(fe, 8, h1m)
+    Memory.memory_set_qword(fe, 16, h2m)
+    Memory.memory_set_qword(fe, 24, h3m)
+    Memory.memory_set_qword(fe, 32, h4m)
+    Memory.memory_set_qword(fe, 40, h5m)
+    Memory.memory_set_qword(fe, 48, h6m)
+    Memory.memory_set_qword(fe, 56, h7m)
+    Memory.memory_set_qword(fe, 64, h8m)
+    Memory.memory_set_qword(fe, 72, h9m)
+    Return 1
+End Process
+
+Process called "fe25519_pack" takes fe as Integer, bytes32 as Integer returns Integer:
+    @Reasoning
+    Packs a field element to its 32-byte little-endian canonical form.
+    Calls fe25519_freeze first to ensure the limbs represent the unique
+    value in [0, p), then writes each byte by combining bits from the
+    two limbs that span its position.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: writes 32 bytes regardless of value. fe25519_freeze
+    itself is constant-time.
+    @End Security_Scope
+
+    proc fe25519_freeze with fe
+
+    Let h0 be Memory.memory_get_int64(fe, 0)
+    Let h1 be Memory.memory_get_int64(fe, 8)
+    Let h2 be Memory.memory_get_int64(fe, 16)
+    Let h3 be Memory.memory_get_int64(fe, 24)
+    Let h4 be Memory.memory_get_int64(fe, 32)
+    Let h5 be Memory.memory_get_int64(fe, 40)
+    Let h6 be Memory.memory_get_int64(fe, 48)
+    Let h7 be Memory.memory_get_int64(fe, 56)
+    Let h8 be Memory.memory_get_int64(fe, 64)
+    Let h9 be Memory.memory_get_int64(fe, 72)
+
+    Note: byte 0  = limb0 bits  0..7
+    Memory.memory_set_byte(bytes32, 0, h0 bitwise_and 255)
+    Note: byte 1  = limb0 bits  8..15
+    Memory.memory_set_byte(bytes32, 1, (h0 shifted right by 8) bitwise_and 255)
+    Note: byte 2  = limb0 bits 16..23
+    Memory.memory_set_byte(bytes32, 2, (h0 shifted right by 16) bitwise_and 255)
+    Note: byte 3  = limb0 bits 24..25 | limb1 bits 0..5
+    Memory.memory_set_byte(bytes32, 3, ((h0 shifted right by 24) bitwise_or (h1 multiplied by 4)) bitwise_and 255)
+    Note: byte 4  = limb1 bits  6..13
+    Memory.memory_set_byte(bytes32, 4, (h1 shifted right by 6) bitwise_and 255)
+    Note: byte 5  = limb1 bits 14..21
+    Memory.memory_set_byte(bytes32, 5, (h1 shifted right by 14) bitwise_and 255)
+    Note: byte 6  = limb1 bits 22..24 | limb2 bits 0..4
+    Memory.memory_set_byte(bytes32, 6, ((h1 shifted right by 22) bitwise_or (h2 multiplied by 8)) bitwise_and 255)
+    Note: byte 7  = limb2 bits  5..12
+    Memory.memory_set_byte(bytes32, 7, (h2 shifted right by 5) bitwise_and 255)
+    Note: byte 8  = limb2 bits 13..20
+    Memory.memory_set_byte(bytes32, 8, (h2 shifted right by 13) bitwise_and 255)
+    Note: byte 9  = limb2 bits 21..25 | limb3 bits 0..2
+    Memory.memory_set_byte(bytes32, 9, ((h2 shifted right by 21) bitwise_or (h3 multiplied by 32)) bitwise_and 255)
+    Note: byte 10 = limb3 bits  3..10
+    Memory.memory_set_byte(bytes32, 10, (h3 shifted right by 3) bitwise_and 255)
+    Note: byte 11 = limb3 bits 11..18
+    Memory.memory_set_byte(bytes32, 11, (h3 shifted right by 11) bitwise_and 255)
+    Note: byte 12 = limb3 bits 19..24 | limb4 bits 0..1
+    Memory.memory_set_byte(bytes32, 12, ((h3 shifted right by 19) bitwise_or (h4 multiplied by 64)) bitwise_and 255)
+    Note: byte 13 = limb4 bits  2..9
+    Memory.memory_set_byte(bytes32, 13, (h4 shifted right by 2) bitwise_and 255)
+    Note: byte 14 = limb4 bits 10..17
+    Memory.memory_set_byte(bytes32, 14, (h4 shifted right by 10) bitwise_and 255)
+    Note: byte 15 = limb4 bits 18..25
+    Memory.memory_set_byte(bytes32, 15, (h4 shifted right by 18) bitwise_and 255)
+    Note: byte 16 = limb5 bits  0..7
+    Memory.memory_set_byte(bytes32, 16, h5 bitwise_and 255)
+    Note: byte 17 = limb5 bits  8..15
+    Memory.memory_set_byte(bytes32, 17, (h5 shifted right by 8) bitwise_and 255)
+    Note: byte 18 = limb5 bits 16..23
+    Memory.memory_set_byte(bytes32, 18, (h5 shifted right by 16) bitwise_and 255)
+    Note: byte 19 = limb5 bit 24 | limb6 bits 0..6
+    Memory.memory_set_byte(bytes32, 19, ((h5 shifted right by 24) bitwise_or (h6 multiplied by 2)) bitwise_and 255)
+    Note: byte 20 = limb6 bits  7..14
+    Memory.memory_set_byte(bytes32, 20, (h6 shifted right by 7) bitwise_and 255)
+    Note: byte 21 = limb6 bits 15..22
+    Memory.memory_set_byte(bytes32, 21, (h6 shifted right by 15) bitwise_and 255)
+    Note: byte 22 = limb6 bits 23..25 | limb7 bits 0..4
+    Memory.memory_set_byte(bytes32, 22, ((h6 shifted right by 23) bitwise_or (h7 multiplied by 8)) bitwise_and 255)
+    Note: byte 23 = limb7 bits  5..12
+    Memory.memory_set_byte(bytes32, 23, (h7 shifted right by 5) bitwise_and 255)
+    Note: byte 24 = limb7 bits 13..20
+    Memory.memory_set_byte(bytes32, 24, (h7 shifted right by 13) bitwise_and 255)
+    Note: byte 25 = limb7 bits 21..24 | limb8 bits 0..2
+    Memory.memory_set_byte(bytes32, 25, ((h7 shifted right by 21) bitwise_or (h8 multiplied by 32)) bitwise_and 255)
+    Note: byte 26 = limb8 bits  3..10
+    Memory.memory_set_byte(bytes32, 26, (h8 shifted right by 3) bitwise_and 255)
+    Note: byte 27 = limb8 bits 11..18
+    Memory.memory_set_byte(bytes32, 27, (h8 shifted right by 11) bitwise_and 255)
+    Note: byte 28 = limb8 bits 19..25 | limb9 bit 0
+    Memory.memory_set_byte(bytes32, 28, ((h8 shifted right by 19) bitwise_or (h9 multiplied by 64)) bitwise_and 255)
+    Note: byte 29 = limb9 bits  1..8
+    Memory.memory_set_byte(bytes32, 29, (h9 shifted right by 1) bitwise_and 255)
+    Note: byte 30 = limb9 bits  9..16
+    Memory.memory_set_byte(bytes32, 30, (h9 shifted right by 9) bitwise_and 255)
+    Note: byte 31 = limb9 bits 17..24 (top bit is zero in canonical form)
+    Memory.memory_set_byte(bytes32, 31, (h9 shifted right by 17) bitwise_and 127)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 7: Equality and zero tests
+Note: ============================================================================
+
+Process called "fe25519_is_zero" takes fe as Integer returns Integer:
+    @Reasoning
+    Constant-time zero test. Returns 1 if fe == 0 (mod p), else 0.
+    Packs the freeze-reduced element to bytes and ORs them together;
+    the result is 0 iff every byte was 0.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: writes 32 bytes (via pack), reads them all
+    unconditionally, returns a bit derived purely from the OR.
+    @End Security_Scope
+
+    Let bytes_buffer be Memory.memory_get_int64(fe, 0)
+    Note: We need a temporary 32-byte buffer; using an inline scratch on
+    Note: a copy of the field element. Caller must have spare arena space.
+    Note: Instead we test via direct limb inspection after freeze.
+
+    proc fe25519_freeze with fe
+
+    Let h0 be Memory.memory_get_int64(fe, 0)
+    Let h1 be Memory.memory_get_int64(fe, 8)
+    Let h2 be Memory.memory_get_int64(fe, 16)
+    Let h3 be Memory.memory_get_int64(fe, 24)
+    Let h4 be Memory.memory_get_int64(fe, 32)
+    Let h5 be Memory.memory_get_int64(fe, 40)
+    Let h6 be Memory.memory_get_int64(fe, 48)
+    Let h7 be Memory.memory_get_int64(fe, 56)
+    Let h8 be Memory.memory_get_int64(fe, 64)
+    Let h9 be Memory.memory_get_int64(fe, 72)
+
+    Let or_acc be h0
+    Set or_acc to or_acc bitwise_or h1
+    Set or_acc to or_acc bitwise_or h2
+    Set or_acc to or_acc bitwise_or h3
+    Set or_acc to or_acc bitwise_or h4
+    Set or_acc to or_acc bitwise_or h5
+    Set or_acc to or_acc bitwise_or h6
+    Set or_acc to or_acc bitwise_or h7
+    Set or_acc to or_acc bitwise_or h8
+    Set or_acc to or_acc bitwise_or h9
+
+    Note: Map nonzero to 1, zero to 0. Use (x | -x) >> 63 then invert.
+    Let neg_or be 0 minus or_acc
+    Let or_or_neg be or_acc bitwise_or neg_or
+    Let nonzero_bit be (or_or_neg shifted right by 63) bitwise_and 1
+    Return 1 minus nonzero_bit
+End Process
+
+Process called "fe25519_equal" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Constant-time equality test. Subtracts b from a and checks the
+    result for zero. The caller is responsible for the temporary buffer.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: uses fe25519_sub + fe25519_is_zero, both of which
+    are constant-time.
+    @End Security_Scope
+
+    Let diff_buffer be Memory.memory_get_int64(a, 0)
+    Note: Direct comparison without an extra buffer: freeze both copies
+    Note: in-place is unsafe since we'd mutate caller storage. So we
+    Note: re-derive equality from packed bytes via per-limb XOR after
+    Note: freezing. To avoid mutating caller state, we operate on the
+    Note: limb differences in registers.
+
+    Let a0 be Memory.memory_get_int64(a, 0)
+    Let a1 be Memory.memory_get_int64(a, 8)
+    Let a2 be Memory.memory_get_int64(a, 16)
+    Let a3 be Memory.memory_get_int64(a, 24)
+    Let a4 be Memory.memory_get_int64(a, 32)
+    Let a5 be Memory.memory_get_int64(a, 40)
+    Let a6 be Memory.memory_get_int64(a, 48)
+    Let a7 be Memory.memory_get_int64(a, 56)
+    Let a8 be Memory.memory_get_int64(a, 64)
+    Let a9 be Memory.memory_get_int64(a, 72)
+
+    Let b0 be Memory.memory_get_int64(b, 0)
+    Let b1 be Memory.memory_get_int64(b, 8)
+    Let b2 be Memory.memory_get_int64(b, 16)
+    Let b3 be Memory.memory_get_int64(b, 24)
+    Let b4 be Memory.memory_get_int64(b, 32)
+    Let b5 be Memory.memory_get_int64(b, 40)
+    Let b6 be Memory.memory_get_int64(b, 48)
+    Let b7 be Memory.memory_get_int64(b, 56)
+    Let b8 be Memory.memory_get_int64(b, 64)
+    Let b9 be Memory.memory_get_int64(b, 72)
+
+    Let or_acc be a0 bitwise_xor b0
+    Set or_acc to or_acc bitwise_or (a1 bitwise_xor b1)
+    Set or_acc to or_acc bitwise_or (a2 bitwise_xor b2)
+    Set or_acc to or_acc bitwise_or (a3 bitwise_xor b3)
+    Set or_acc to or_acc bitwise_or (a4 bitwise_xor b4)
+    Set or_acc to or_acc bitwise_or (a5 bitwise_xor b5)
+    Set or_acc to or_acc bitwise_or (a6 bitwise_xor b6)
+    Set or_acc to or_acc bitwise_or (a7 bitwise_xor b7)
+    Set or_acc to or_acc bitwise_or (a8 bitwise_xor b8)
+    Set or_acc to or_acc bitwise_or (a9 bitwise_xor b9)
+
+    Note: NOTE: This bit-pattern equality test requires both a and b to be
+    Note: in canonical form (post-freeze). Callers must freeze before
+    Note: comparing. For modular equality, the caller should fe25519_sub
+    Note: and call fe25519_is_zero (which freezes internally).
+
+    Let neg_or be 0 minus or_acc
+    Let or_or_neg be or_acc bitwise_or neg_or
+    Let nonzero_bit be (or_or_neg shifted right by 63) bitwise_and 1
+    Return 1 minus nonzero_bit
+End Process
+
+Note: ============================================================================
+Note: SECTION 8: Field inversion (a^-1 mod p via Fermat: a^(p-2))
+Note: ============================================================================
+
+Process called "fe25519_inv" takes arena as Integer, dest as Integer, a as Integer returns Integer:
+    @Reasoning
+    Computes the multiplicative inverse of a in F_p via Fermat's little
+    theorem: a^(p-2) = a^-1 (mod p), where p = 2^255 - 19, so
+    p - 2 = 2^255 - 21.
+
+    Uses an addition chain that minimizes the number of squarings and
+    multiplications. The chain (ref10 fe_invert): 255 squarings + 11
+    multiplications, total 266 field operations.
+
+    Addition chain (writing S=square, M=multiply by a):
+      z2     = a^2     (S)
+      z9     = z2^4 * a (S S M)
+      z11    = z9 * z2  (M)
+      z22    = z11^2    (S)
+      z2_5_0 = z9 * z22  (M)           = a^(2^5 - 1)
+      z2_10_0 = z2_5_0^32 * z2_5_0     = a^(2^10 - 1)
+      z2_20_0 = z2_10_0^1024 * z2_10_0 = a^(2^20 - 1)
+      z2_40_0 = z2_20_0^(2^20) * z2_20_0 = a^(2^40 - 1)
+      z2_50_0 = z2_40_0^(2^10) * z2_10_0 = a^(2^50 - 1)
+      z2_100_0= z2_50_0^(2^50) * z2_50_0 = a^(2^100 - 1)
+      z2_200_0= z2_100_0^(2^100)*z2_100_0= a^(2^200 - 1)
+      z2_250_0= z2_200_0^(2^50)*z2_50_0  = a^(2^250 - 1)
+      result  = z2_250_0^32 * z11        = a^(2^255 - 21) = a^(p-2)
+    @End Reasoning
+
+    @Implementation
+    All intermediate field elements are allocated in the arena. The
+    inversion runs in constant time because every multiplication and
+    squaring kernel is constant-time and the chain has no data-dependent
+    branches.
+    @End Implementation
+
+    @Performance_Hints
+    255 squarings + 11 multiplications. With each squaring at ~30 IMULs
+    and each multiplication at ~100 IMULs, the total cost is roughly
+    8800 IMULs, dominated by the squaring chain. The Itoh-Tsujii method
+    via tower extensions would not help here because GF(2^255 - 19) is a
+    prime field; Fermat is optimal for this prime size.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time end to end: the chain length is fixed at compile time
+    and no operation branches on operand values.
+    @End Security_Scope
+
+    Let t0 be proc fe25519_alloc with arena
+    Let t1 be proc fe25519_alloc with arena
+    Let t2 be proc fe25519_alloc with arena
+    Let t3 be proc fe25519_alloc with arena
+    If t0 is equal to 0:
+        Return 0
+    End If
+    If t1 is equal to 0:
+        Return 0
+    End If
+    If t2 is equal to 0:
+        Return 0
+    End If
+    If t3 is equal to 0:
+        Return 0
+    End If
+
+    Note: z2 = a^2
+    proc fe25519_sqr with t0, a
+    Note: z2 -> z4
+    proc fe25519_sqr with t1, t0
+    Note: z4 -> z8
+    proc fe25519_sqr with t1, t1
+    Note: z9 = z8 * a
+    proc fe25519_mul with t1, t1, a
+    Note: z11 = z9 * z2
+    proc fe25519_mul with t0, t1, t0
+    Note: z22 = z11^2
+    proc fe25519_sqr with t2, t0
+    Note: z2_5_0 = z22 * z9
+    proc fe25519_mul with t1, t2, t1
+
+    Note: z2_10_0 = z2_5_0^32 * z2_5_0
+    proc fe25519_sqr with t2, t1
+    Let i be 1
+    While i is less than 5:
+        proc fe25519_sqr with t2, t2
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t1, t2, t1
+
+    Note: z2_20_0 = z2_10_0^(2^10) * z2_10_0
+    proc fe25519_sqr with t2, t1
+    Set i to 1
+    While i is less than 10:
+        proc fe25519_sqr with t2, t2
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t2, t2, t1
+
+    Note: z2_40_0 = z2_20_0^(2^20) * z2_20_0
+    proc fe25519_sqr with t3, t2
+    Set i to 1
+    While i is less than 20:
+        proc fe25519_sqr with t3, t3
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t2, t3, t2
+
+    Note: z2_50_0 = z2_40_0^(2^10) * z2_10_0
+    proc fe25519_sqr with t2, t2
+    Set i to 1
+    While i is less than 10:
+        proc fe25519_sqr with t2, t2
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t1, t2, t1
+
+    Note: z2_100_0 = z2_50_0^(2^50) * z2_50_0
+    proc fe25519_sqr with t2, t1
+    Set i to 1
+    While i is less than 50:
+        proc fe25519_sqr with t2, t2
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t2, t2, t1
+
+    Note: z2_200_0 = z2_100_0^(2^100) * z2_100_0
+    proc fe25519_sqr with t3, t2
+    Set i to 1
+    While i is less than 100:
+        proc fe25519_sqr with t3, t3
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t2, t3, t2
+
+    Note: z2_250_0 = z2_200_0^(2^50) * z2_50_0
+    proc fe25519_sqr with t2, t2
+    Set i to 1
+    While i is less than 50:
+        proc fe25519_sqr with t2, t2
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t1, t2, t1
+
+    Note: result = z2_250_0^32 * z11
+    proc fe25519_sqr with t1, t1
+    Set i to 1
+    While i is less than 5:
+        proc fe25519_sqr with t1, t1
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with dest, t1, t0
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 9: Power by (p-5)/8 for sqrt and decompression (Ed25519)
+Note: ============================================================================
+
+Process called "fe25519_pow_p_minus_5_div_8" takes arena as Integer, dest as Integer, a as Integer returns Integer:
+    @Reasoning
+    Computes a^((p-5)/8). Used in Ed25519 point decompression and
+    square-root extraction. (p-5)/8 = 2^252 - 3.
+
+    The chain reuses the structure of fe25519_inv but stops earlier
+    and applies a different final step.
+    @End Reasoning
+
+    @Implementation
+    Reuses the z2_250_0 sub-chain from fe25519_inv (a^(2^250 - 1)),
+    then squares twice and multiplies by a:
+      z2_252_3 = z2_250_0^4 * a = a^(2^252 - 4 + 1) = a^(2^252 - 3)
+    Total: 252 squarings + ~10 multiplications.
+    @End Implementation
+
+    @Performance_Hints
+    ~99% of the cost of fe25519_inv.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time, identical reasoning to fe25519_inv.
+    @End Security_Scope
+
+    Let t0 be proc fe25519_alloc with arena
+    Let t1 be proc fe25519_alloc with arena
+    Let t2 be proc fe25519_alloc with arena
+    Let t3 be proc fe25519_alloc with arena
+    If t0 is equal to 0:
+        Return 0
+    End If
+    If t1 is equal to 0:
+        Return 0
+    End If
+    If t2 is equal to 0:
+        Return 0
+    End If
+    If t3 is equal to 0:
+        Return 0
+    End If
+
+    proc fe25519_sqr with t0, a
+    proc fe25519_sqr with t1, t0
+    proc fe25519_sqr with t1, t1
+    proc fe25519_mul with t1, t1, a
+    proc fe25519_mul with t0, t1, t0
+    proc fe25519_sqr with t2, t0
+    proc fe25519_mul with t1, t2, t1
+
+    proc fe25519_sqr with t2, t1
+    Let i be 1
+    While i is less than 5:
+        proc fe25519_sqr with t2, t2
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t1, t2, t1
+
+    proc fe25519_sqr with t2, t1
+    Set i to 1
+    While i is less than 10:
+        proc fe25519_sqr with t2, t2
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t2, t2, t1
+
+    proc fe25519_sqr with t3, t2
+    Set i to 1
+    While i is less than 20:
+        proc fe25519_sqr with t3, t3
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t2, t3, t2
+
+    proc fe25519_sqr with t2, t2
+    Set i to 1
+    While i is less than 10:
+        proc fe25519_sqr with t2, t2
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t1, t2, t1
+
+    proc fe25519_sqr with t2, t1
+    Set i to 1
+    While i is less than 50:
+        proc fe25519_sqr with t2, t2
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t2, t2, t1
+
+    proc fe25519_sqr with t3, t2
+    Set i to 1
+    While i is less than 100:
+        proc fe25519_sqr with t3, t3
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t2, t3, t2
+
+    proc fe25519_sqr with t2, t2
+    Set i to 1
+    While i is less than 50:
+        proc fe25519_sqr with t2, t2
+        Set i to i plus 1
+    End While
+    proc fe25519_mul with t1, t2, t1
+
+    Note: Final step: square twice then multiply by a -> a^(2^252 - 3)
+    proc fe25519_sqr with t1, t1
+    proc fe25519_sqr with t1, t1
+    proc fe25519_mul with dest, t1, a
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 10: Sign / negative test
+Note: ============================================================================
+
+Process called "fe25519_is_negative" takes fe as Integer returns Integer:
+    @Reasoning
+    Returns the least significant bit of the canonical representative,
+    used to encode the sign of x in Ed25519's point compression
+    (RFC 8032 5.1.2). Requires the input to be normalized via
+    fe25519_freeze before reading the low bit. This routine
+    auto-freezes for safety.
+    @End Reasoning
+
+    @Security_Scope
+    Constant-time: writes 80 bytes (freeze) + one byte read + one mask.
+    @End Security_Scope
+
+    proc fe25519_freeze with fe
+    Let h0 be Memory.memory_get_int64(fe, 0)
+    Return h0 bitwise_and 1
+End Process

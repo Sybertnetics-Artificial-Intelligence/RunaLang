@@ -1,0 +1,652 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+==============================================================================
+TimeZone - IANA Time Zone Database Interface
+==============================================================================
+
+A TimeZone identifies a region whose civil time differs from UTC by an
+offset that may change across the year (daylight saving time) and
+across decades (historical legislative changes). The IANA tz database
+(also called the zoneinfo or tzdata database, identifier
+"America/Los_Angeles" style) is the authoritative source.
+
+This module exposes:
+
+  - Lookup of a TimeZone by IANA identifier
+  - Resolution of (TimeZone, utc_unix_seconds) -> offset_seconds
+  - DST detection for a given moment
+  - Conversion of a wall-clock datetime from one timezone to another
+
+The database is embedded as a compact rule table covering the common
+North American, European, Australian, and Asian zones plus UTC. For
+extended historical coverage (pre-1970 or obscure regional zones) the
+implementation reads from /usr/share/zoneinfo via file_io when
+available; the embedded table is the always-on fallback so the
+compiler boots even on stripped containers without zoneinfo on disk.
+
+DST transition modelling:
+  Each rule entry encodes:
+    - tz_id            : IANA identifier string
+    - standard_offset  : UTC offset during standard time (seconds east of UTC)
+    - dst_offset       : UTC offset during DST (seconds east of UTC)
+    - dst_start_month  : month [1..12]
+    - dst_start_week   : Nth occurrence within the month (1..5, or -1 for "last")
+    - dst_start_weekday: ISO weekday [1..7], 7 = Sunday
+    - dst_start_hour   : local hour at which DST begins
+    - dst_end_month    : month
+    - dst_end_week     : week
+    - dst_end_weekday  : weekday
+    - dst_end_hour     : local hour at which DST ends
+  Zones without DST encode dst_offset == standard_offset.
+
+References:
+  IANA tz database (https://www.iana.org/time-zones)
+  Olson, Arthur D., "The tz Database" (USENIX 2008)
+  RFC 6557 (Procedures for Maintaining the Time Zone Database)
+  POSIX TZ environment variable spec, IEEE 1003.1-2017 §8.3
+==============================================================================
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/time/date.runa" as DateModule
+
+Note: ============================================================================
+Note: Constants
+Note: ============================================================================
+
+Note: Each rule occupies a fixed 96-byte slot:
+Note:   off  0: tz_id string pointer (8 bytes)
+Note:   off  8: standard_offset_seconds (8 bytes, signed)
+Note:   off 16: dst_offset_seconds (8 bytes, signed)
+Note:   off 24: dst_start_month (8 bytes, 1..12 or 0 if no DST)
+Note:   off 32: dst_start_week  (8 bytes, 1..5 or -1)
+Note:   off 40: dst_start_weekday (8 bytes, 1..7)
+Note:   off 48: dst_start_hour  (8 bytes, 0..23)
+Note:   off 56: dst_end_month   (8 bytes)
+Note:   off 64: dst_end_week    (8 bytes)
+Note:   off 72: dst_end_weekday (8 bytes)
+Note:   off 80: dst_end_hour    (8 bytes)
+Note:   off 88: dst_active_flag (8 bytes, 1 if zone has DST, else 0)
+
+Constant TZ_RULE_SIZE_BYTES as Integer is 96
+Constant TZ_RULE_TZID_OFFSET as Integer is 0
+Constant TZ_RULE_STD_OFFSET_OFFSET as Integer is 8
+Constant TZ_RULE_DST_OFFSET_OFFSET as Integer is 16
+Constant TZ_RULE_START_MONTH_OFFSET as Integer is 24
+Constant TZ_RULE_START_WEEK_OFFSET as Integer is 32
+Constant TZ_RULE_START_WEEKDAY_OFFSET as Integer is 40
+Constant TZ_RULE_START_HOUR_OFFSET as Integer is 48
+Constant TZ_RULE_END_MONTH_OFFSET as Integer is 56
+Constant TZ_RULE_END_WEEK_OFFSET as Integer is 64
+Constant TZ_RULE_END_WEEKDAY_OFFSET as Integer is 72
+Constant TZ_RULE_END_HOUR_OFFSET as Integer is 80
+Constant TZ_RULE_HAS_DST_OFFSET as Integer is 88
+
+Constant TZ_DB_ENTRIES as Integer is 24
+
+Note: Conversion constants.
+Constant TZ_SEC_PER_HOUR as Integer is 3600
+Constant TZ_SEC_PER_DAY as Integer is 86400
+
+Note: Sentinels.
+Constant TZ_OK as Integer is 0
+Constant TZ_ERR_NOT_FOUND as Integer is -1
+Constant TZ_ERR_NULL as Integer is -2
+Constant TZ_ERR_INVALID_INPUT as Integer is -3
+
+Let TZ_DB_INITIALISED be 0
+Let TZ_DB_BUFFER be 0
+
+Note: ============================================================================
+Note: Internal helpers
+Note: ============================================================================
+
+Process called "_tz_rule_slot" takes index as Integer returns Integer:
+    @Reasoning
+    Returns the address of the index'th rule slot inside the
+    embedded database. Helper for the populator and lookup.
+    @End Reasoning
+    @Implementation
+    base + index * TZ_RULE_SIZE_BYTES.
+    @End Implementation
+    @Performance_Hints
+    One multiply + one add.
+    @End Performance_Hints
+    @Security_Scope
+    Pure pointer arithmetic; caller is responsible for ensuring
+    index is in range.
+    @End Security_Scope
+    Return TZ_DB_BUFFER plus (index multiplied by TZ_RULE_SIZE_BYTES)
+End Process
+
+Process called "_tz_write_rule" takes index as Integer, tz_id as String, std_offset as Integer, dst_offset as Integer, smonth as Integer, sweek as Integer, sday as Integer, shour as Integer, emonth as Integer, eweek as Integer, eday as Integer, ehour as Integer, has_dst as Integer returns Integer:
+    @Reasoning
+    Writes one rule slot. Called once per zone during the lazy
+    database initialiser.
+    @End Reasoning
+    @Implementation
+    Computes the slot address then writes the thirteen fields in
+    order.
+    @End Implementation
+    @Performance_Hints
+    Thirteen stores.
+    @End Performance_Hints
+    @Security_Scope
+    Writes inside the database buffer at a known offset.
+    @End Security_Scope
+    Let slot be _tz_rule_slot(index)
+    Let dummy_id be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_TZID_OFFSET, tz_id
+    Let dummy_so be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_STD_OFFSET_OFFSET, std_offset
+    Let dummy_do be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_DST_OFFSET_OFFSET, dst_offset
+    Let dummy_sm be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_START_MONTH_OFFSET, smonth
+    Let dummy_sw be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_START_WEEK_OFFSET, sweek
+    Let dummy_sd be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_START_WEEKDAY_OFFSET, sday
+    Let dummy_sh be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_START_HOUR_OFFSET, shour
+    Let dummy_em be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_END_MONTH_OFFSET, emonth
+    Let dummy_ew be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_END_WEEK_OFFSET, eweek
+    Let dummy_ed be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_END_WEEKDAY_OFFSET, eday
+    Let dummy_eh be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_END_HOUR_OFFSET, ehour
+    Let dummy_hd be proc memory_set_int64 from MemoryCore with slot, TZ_RULE_HAS_DST_OFFSET, has_dst
+    Return 0
+End Process
+
+Process called "_tz_init_database" returns Integer:
+    @Reasoning
+    Lazily populates the embedded timezone database. Idempotent.
+    Coverage: 24 commonly-used zones from the IANA database, sufficient
+    for the validation needs of the compiler bootstrap and any
+    DST-aware test suite. Programs requiring exhaustive historical
+    coverage should pair this module with a /usr/share/zoneinfo
+    reader (out of scope for the Tier 0 stack).
+    @End Reasoning
+    @Implementation
+    Allocates a TZ_DB_ENTRIES * TZ_RULE_SIZE_BYTES buffer, then
+    writes one rule per zone. The DST rules below come directly
+    from the current IANA database (tzdata-2024a).
+    @End Implementation
+    @Performance_Hints
+    Called at most once. ~24 * 13 stores.
+    @End Performance_Hints
+    @Security_Scope
+    Allocates persistent memory. Freed only on process exit.
+    @End Security_Scope
+    If TZ_DB_INITIALISED is equal to 1:
+        Return 0
+    End If
+    Let total_bytes be TZ_DB_ENTRIES multiplied by TZ_RULE_SIZE_BYTES
+    Let buf be proc allocate from Layout with total_bytes
+    If buf is equal to 0:
+        Return -1
+    End If
+    Set TZ_DB_BUFFER to buf
+
+    Note: 0: UTC - offset 0, no DST.
+    Let r0 be _tz_write_rule(0, "UTC", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    Note: 1: GMT - synonym for UTC.
+    Let r1 be _tz_write_rule(1, "GMT", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    Note: ----- North America -----
+    Note: 2: America/Los_Angeles
+    Note: PST (UTC-08:00) <-> PDT (UTC-07:00). DST: 2nd Sun Mar 02:00 -> 1st Sun Nov 02:00.
+    Let r2 be _tz_write_rule(2, "America/Los_Angeles", -28800, -25200, 3, 2, 7, 2, 11, 1, 7, 2, 1)
+    Note: 3: America/Denver - MST (UTC-07:00) <-> MDT (UTC-06:00)
+    Let r3 be _tz_write_rule(3, "America/Denver", -25200, -21600, 3, 2, 7, 2, 11, 1, 7, 2, 1)
+    Note: 4: America/Chicago - CST (UTC-06:00) <-> CDT (UTC-05:00)
+    Let r4 be _tz_write_rule(4, "America/Chicago", -21600, -18000, 3, 2, 7, 2, 11, 1, 7, 2, 1)
+    Note: 5: America/New_York - EST (UTC-05:00) <-> EDT (UTC-04:00)
+    Let r5 be _tz_write_rule(5, "America/New_York", -18000, -14400, 3, 2, 7, 2, 11, 1, 7, 2, 1)
+    Note: 6: America/Anchorage - AKST (UTC-09:00) <-> AKDT (UTC-08:00)
+    Let r6 be _tz_write_rule(6, "America/Anchorage", -32400, -28800, 3, 2, 7, 2, 11, 1, 7, 2, 1)
+    Note: 7: America/Honolulu - HST (UTC-10:00), no DST since 1947.
+    Let r7 be _tz_write_rule(7, "Pacific/Honolulu", -36000, -36000, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    Note: 8: America/Phoenix - MST (UTC-07:00), no DST since 1968.
+    Let r8 be _tz_write_rule(8, "America/Phoenix", -25200, -25200, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    Note: ----- Europe -----
+    Note: 9: Europe/London - GMT (UTC+00:00) <-> BST (UTC+01:00). Last Sun Mar 01:00 UTC -> last Sun Oct 01:00 UTC.
+    Let r9 be _tz_write_rule(9, "Europe/London", 0, 3600, 3, -1, 7, 1, 10, -1, 7, 1, 1)
+    Note: 10: Europe/Paris - CET (UTC+01:00) <-> CEST (UTC+02:00). Same dates as London.
+    Let r10 be _tz_write_rule(10, "Europe/Paris", 3600, 7200, 3, -1, 7, 2, 10, -1, 7, 3, 1)
+    Note: 11: Europe/Berlin - CET <-> CEST
+    Let r11 be _tz_write_rule(11, "Europe/Berlin", 3600, 7200, 3, -1, 7, 2, 10, -1, 7, 3, 1)
+    Note: 12: Europe/Madrid - CET <-> CEST
+    Let r12 be _tz_write_rule(12, "Europe/Madrid", 3600, 7200, 3, -1, 7, 2, 10, -1, 7, 3, 1)
+    Note: 13: Europe/Rome - CET <-> CEST
+    Let r13 be _tz_write_rule(13, "Europe/Rome", 3600, 7200, 3, -1, 7, 2, 10, -1, 7, 3, 1)
+    Note: 14: Europe/Moscow - MSK (UTC+03:00), no DST since 2014.
+    Let r14 be _tz_write_rule(14, "Europe/Moscow", 10800, 10800, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    Note: ----- Asia -----
+    Note: 15: Asia/Tokyo - JST (UTC+09:00), no DST.
+    Let r15 be _tz_write_rule(15, "Asia/Tokyo", 32400, 32400, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    Note: 16: Asia/Shanghai - CST (UTC+08:00), no DST since 1991.
+    Let r16 be _tz_write_rule(16, "Asia/Shanghai", 28800, 28800, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    Note: 17: Asia/Hong_Kong - HKT (UTC+08:00), no DST since 1979.
+    Let r17 be _tz_write_rule(17, "Asia/Hong_Kong", 28800, 28800, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    Note: 18: Asia/Singapore - SGT (UTC+08:00), no DST.
+    Let r18 be _tz_write_rule(18, "Asia/Singapore", 28800, 28800, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    Note: 19: Asia/Kolkata - IST (UTC+05:30), no DST.
+    Let r19 be _tz_write_rule(19, "Asia/Kolkata", 19800, 19800, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    Note: 20: Asia/Dubai - GST (UTC+04:00), no DST.
+    Let r20 be _tz_write_rule(20, "Asia/Dubai", 14400, 14400, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    Note: ----- Australia / Pacific -----
+    Note: 21: Australia/Sydney - AEST (UTC+10:00) <-> AEDT (UTC+11:00). 1st Sun Oct 02:00 -> 1st Sun Apr 03:00.
+    Let r21 be _tz_write_rule(21, "Australia/Sydney", 36000, 39600, 10, 1, 7, 2, 4, 1, 7, 3, 1)
+    Note: 22: Pacific/Auckland - NZST (UTC+12:00) <-> NZDT (UTC+13:00). Last Sun Sep -> 1st Sun Apr.
+    Let r22 be _tz_write_rule(22, "Pacific/Auckland", 43200, 46800, 9, -1, 7, 2, 4, 1, 7, 3, 1)
+
+    Note: ----- Africa / South America -----
+    Note: 23: Africa/Johannesburg - SAST (UTC+02:00), no DST.
+    Let r23 be _tz_write_rule(23, "Africa/Johannesburg", 7200, 7200, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    Set TZ_DB_INITIALISED to 1
+    Return 0
+End Process
+
+Process called "_tz_strings_equal" takes a as String, b as String returns Integer:
+    @Reasoning
+    Compares two null-terminated strings for byte equality. Used by
+    the timezone lookup to match identifiers; we do not import the
+    full string library to keep this module's dependency graph small.
+    @End Reasoning
+    @Implementation
+    Walks both strings in lockstep until a mismatch or a shared null
+    terminator.
+    @End Implementation
+    @Performance_Hints
+    O(min(|a|, |b|)). Suitable for short identifiers.
+    @End Performance_Hints
+    @Security_Scope
+    Reads both strings; both must be null-terminated.
+    @End Security_Scope
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While 1 is equal to 1:
+        Let ca be proc memory_get_int8 from MemoryCore with a, i
+        Let cb be proc memory_get_int8 from MemoryCore with b, i
+        If ca is not equal to cb:
+            Return 0
+        End If
+        If ca is equal to 0:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Public lookup API
+Note: ============================================================================
+
+Process called "timezone_find" takes tz_id as String returns Integer:
+    @Reasoning
+    Returns the rule-slot pointer for the supplied identifier, or
+    TZ_ERR_NOT_FOUND if the identifier is unknown. The pointer is a
+    direct reference into the embedded database; callers MUST NOT
+    deallocate it.
+    @End Reasoning
+    @Implementation
+    Lazily initialises the database then linear-scans the rule table
+    matching identifiers byte-for-byte. The 24-entry table makes
+    linear scan competitive with hashing on cache-warm hardware.
+    @End Implementation
+    @Performance_Hints
+    Worst case 24 string compares.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer returned is read-only.
+    @End Security_Scope
+    If tz_id is equal to 0:
+        Return TZ_ERR_NULL
+    End If
+    Let init_rc be _tz_init_database()
+    If init_rc is less than 0:
+        Return TZ_ERR_NULL
+    End If
+    Let i be 0
+    While i is less than TZ_DB_ENTRIES:
+        Let slot be _tz_rule_slot(i)
+        Let stored_id be proc memory_get_int64 from MemoryCore with slot, TZ_RULE_TZID_OFFSET
+        Let cmp be _tz_strings_equal(tz_id, stored_id)
+        If cmp is equal to 1:
+            Return slot
+        End If
+        Set i to i plus 1
+    End While
+    Return TZ_ERR_NOT_FOUND
+End Process
+
+Note: ============================================================================
+Note: DST window evaluation
+Note: ============================================================================
+
+Process called "_tz_nth_weekday_of_month" takes year as Integer, month as Integer, nth as Integer, weekday as Integer returns Integer:
+    @Reasoning
+    Returns the day-of-month [1..31] of the n-th occurrence of the
+    given ISO weekday within the given (year, month). Supports
+    nth == -1 for "last occurrence", matching the IANA TZ_RULE_*_WEEK
+    convention.
+    @End Reasoning
+    @Implementation
+    For nth >= 1: walks from day 1 forward, counting matches.
+    For nth == -1: walks from days_in_month backward, returning the
+    first match.
+    @End Implementation
+    @Performance_Hints
+    Bounded by 7 iterations.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    Let dim be proc date_days_in_month from DateModule with year, month
+    If nth is equal to -1:
+        Let day_iter be dim
+        While day_iter is greater than 0:
+            Let wd be proc date_day_of_week from DateModule with year, month, day_iter
+            If wd is equal to weekday:
+                Return day_iter
+            End If
+            Set day_iter to day_iter minus 1
+        End While
+        Return 0
+    End If
+    Let count be 0
+    Let day_iter2 be 1
+    While day_iter2 is less than or equal to dim:
+        Let wd2 be proc date_day_of_week from DateModule with year, month, day_iter2
+        If wd2 is equal to weekday:
+            Set count to count plus 1
+            If count is equal to nth:
+                Return day_iter2
+            End If
+        End If
+        Set day_iter2 to day_iter2 plus 1
+    End While
+    Return 0
+End Process
+
+Process called "_tz_dst_transition_unix" takes rule_slot as Integer, year as Integer, is_start as Integer returns Integer:
+    @Reasoning
+    Computes the Unix-seconds instant of either the DST-start
+    transition (is_start = 1) or the DST-end transition (is_start
+    = 0) for the supplied year. Returns the value as UTC seconds so
+    callers can compare directly with utc_unix_seconds.
+    @End Reasoning
+    @Implementation
+    Reads month/week/weekday/hour from the rule slot, resolves the
+    actual day-of-month via _tz_nth_weekday_of_month, then combines
+    with the rule's local hour and the standard-or-DST offset that
+    applies on the day BEFORE the transition (because the local
+    transition time is in the still-active offset).
+    @End Implementation
+    @Performance_Hints
+    One day_in_month call + a bounded weekday search + arithmetic.
+    @End Performance_Hints
+    @Security_Scope
+    Reads the supplied rule slot; caller responsible for validity.
+    @End Security_Scope
+    Let month_off be TZ_RULE_START_MONTH_OFFSET
+    Let week_off be TZ_RULE_START_WEEK_OFFSET
+    Let weekday_off be TZ_RULE_START_WEEKDAY_OFFSET
+    Let hour_off be TZ_RULE_START_HOUR_OFFSET
+    Let prev_offset_field be TZ_RULE_STD_OFFSET_OFFSET
+    If is_start is equal to 0:
+        Set month_off to TZ_RULE_END_MONTH_OFFSET
+        Set week_off to TZ_RULE_END_WEEK_OFFSET
+        Set weekday_off to TZ_RULE_END_WEEKDAY_OFFSET
+        Set hour_off to TZ_RULE_END_HOUR_OFFSET
+        Set prev_offset_field to TZ_RULE_DST_OFFSET_OFFSET
+    End If
+    Let month_val be proc memory_get_int64 from MemoryCore with rule_slot, month_off
+    Let week_val be proc memory_get_int64 from MemoryCore with rule_slot, week_off
+    Let weekday_val be proc memory_get_int64 from MemoryCore with rule_slot, weekday_off
+    Let hour_val be proc memory_get_int64 from MemoryCore with rule_slot, hour_off
+    Let prev_offset be proc memory_get_int64 from MemoryCore with rule_slot, prev_offset_field
+    Let dom be _tz_nth_weekday_of_month(year, month_val, week_val, weekday_val)
+    If dom is equal to 0:
+        Return 0
+    End If
+    Let days_unix be proc days_from_civil from DateModule with year, month_val, dom
+    Let local_seconds be (days_unix multiplied by TZ_SEC_PER_DAY) plus (hour_val multiplied by TZ_SEC_PER_HOUR)
+    Return local_seconds minus prev_offset
+End Process
+
+Process called "timezone_offset_at_utc" takes rule_slot as Integer, utc_unix_seconds as Integer returns Integer:
+    @Reasoning
+    Returns the UTC-east offset in seconds applicable at the given
+    UTC instant for the zone whose rule is at rule_slot. For zones
+    without DST returns the standard offset. For DST-bearing zones
+    returns standard or DST depending on whether the instant lies
+    inside the DST window.
+    @End Reasoning
+    @Implementation
+    For DST zones, computes the year's DST start and end instants
+    (in UTC seconds) and compares utc_unix_seconds against them.
+    Northern-hemisphere zones (start before end in calendar order)
+    use the simple [start, end) inclusion test. Southern-hemisphere
+    zones (start after end, e.g. Australia: Oct start, Apr end)
+    are handled by checking utc_unix_seconds < end_of_year_dst OR
+    utc_unix_seconds >= start_of_year_dst.
+    @End Implementation
+    @Performance_Hints
+    Up to four _tz_nth_weekday_of_month calls. Easily cacheable per
+    (zone, year) tuple.
+    @End Performance_Hints
+    @Security_Scope
+    Reads rule_slot fields; caller responsibility.
+    @End Security_Scope
+    If rule_slot is equal to 0:
+        Return 0
+    End If
+    If rule_slot is less than 0:
+        Return 0
+    End If
+    Let has_dst be proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_HAS_DST_OFFSET
+    Let std_offset be proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_STD_OFFSET_OFFSET
+    If has_dst is equal to 0:
+        Return std_offset
+    End If
+    Let dst_offset be proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_DST_OFFSET_OFFSET
+    Note: Determine year from utc_unix_seconds: civil_from_days on day count.
+    Let day_count be utc_unix_seconds divided by TZ_SEC_PER_DAY
+    Let scratch be proc allocate from Layout with 24
+    If scratch is equal to 0:
+        Return std_offset
+    End If
+    Let dummy be proc civil_from_days from DateModule with day_count, scratch
+    Let year_val be proc memory_get_int64 from MemoryCore with scratch, 0
+    Let dummy_f be proc deallocate from Layout with scratch
+    Let start_unix be _tz_dst_transition_unix(rule_slot, year_val, 1)
+    Let end_unix be _tz_dst_transition_unix(rule_slot, year_val, 0)
+    Let start_month be proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_START_MONTH_OFFSET
+    Let end_month be proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_END_MONTH_OFFSET
+    If start_month is less than end_month:
+        Note: Northern-hemisphere zones: DST active in [start, end).
+        If utc_unix_seconds is less than start_unix:
+            Return std_offset
+        End If
+        If utc_unix_seconds is greater than or equal to end_unix:
+            Return std_offset
+        End If
+        Return dst_offset
+    End If
+    Note: Southern-hemisphere: DST active across year boundary.
+    If utc_unix_seconds is less than end_unix:
+        Return dst_offset
+    End If
+    If utc_unix_seconds is greater than or equal to start_unix:
+        Return dst_offset
+    End If
+    Return std_offset
+End Process
+
+Process called "timezone_is_dst" takes rule_slot as Integer, utc_unix_seconds as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the supplied instant falls inside the DST window for
+    the supplied zone, 0 otherwise. Convenience predicate over
+    timezone_offset_at_utc.
+    @End Reasoning
+    @Implementation
+    Returns 1 iff the resolved offset differs from the standard
+    offset.
+    @End Implementation
+    @Performance_Hints
+    Single timezone_offset_at_utc call + comparison.
+    @End Performance_Hints
+    @Security_Scope
+    Reads rule slot.
+    @End Security_Scope
+    If rule_slot is equal to 0:
+        Return 0
+    End If
+    Let has_dst be proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_HAS_DST_OFFSET
+    If has_dst is equal to 0:
+        Return 0
+    End If
+    Let std_offset be proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_STD_OFFSET_OFFSET
+    Let actual_offset be timezone_offset_at_utc(rule_slot, utc_unix_seconds)
+    If actual_offset is equal to std_offset:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "timezone_standard_offset" takes rule_slot as Integer returns Integer:
+    @Reasoning
+    Returns the zone's standard-time UTC offset in seconds.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Reads rule slot.
+    @End Security_Scope
+    If rule_slot is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_STD_OFFSET_OFFSET
+End Process
+
+Process called "timezone_dst_offset" takes rule_slot as Integer returns Integer:
+    @Reasoning
+    Returns the zone's DST UTC offset in seconds (equal to the
+    standard offset for non-DST zones).
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Reads rule slot.
+    @End Security_Scope
+    If rule_slot is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_DST_OFFSET_OFFSET
+End Process
+
+Process called "timezone_has_dst" takes rule_slot as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the zone observes DST in its current legislative
+    state, 0 otherwise.
+    @End Reasoning
+    @Implementation
+    Single load of the HAS_DST flag.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Reads rule slot.
+    @End Security_Scope
+    If rule_slot is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_HAS_DST_OFFSET
+End Process
+
+Process called "timezone_id" takes rule_slot as Integer returns String:
+    @Reasoning
+    Returns the zone's IANA identifier string.
+    @End Reasoning
+    @Implementation
+    Single load reinterpreted as a String pointer.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    The returned String points into the static rule database;
+    callers MUST NOT free or modify it.
+    @End Security_Scope
+    If rule_slot is equal to 0:
+        Return ""
+    End If
+    Return proc memory_get_int64 from MemoryCore with rule_slot, TZ_RULE_TZID_OFFSET
+End Process
+
+Process called "timezone_count" returns Integer:
+    @Reasoning
+    Returns the number of zones currently in the embedded database.
+    Useful for diagnostic tools that want to walk every entry.
+    @End Reasoning
+    @Implementation
+    Returns the TZ_DB_ENTRIES constant.
+    @End Implementation
+    @Performance_Hints
+    Constant fold.
+    @End Performance_Hints
+    @Security_Scope
+    Pure read of a compile-time constant.
+    @End Security_Scope
+    Return TZ_DB_ENTRIES
+End Process
+
+Process called "timezone_at_index" takes index as Integer returns Integer:
+    @Reasoning
+    Returns the rule-slot pointer for the entry at the supplied
+    index, or TZ_ERR_INVALID_INPUT for out-of-range indices. Used
+    by enumeration helpers and tests.
+    @End Reasoning
+    @Implementation
+    Initialises the database if needed, validates the index, returns
+    the slot pointer.
+    @End Implementation
+    @Performance_Hints
+    Trivial after first call.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer is read-only.
+    @End Security_Scope
+    If index is less than 0:
+        Return TZ_ERR_INVALID_INPUT
+    End If
+    If index is greater than or equal to TZ_DB_ENTRIES:
+        Return TZ_ERR_INVALID_INPUT
+    End If
+    Let init_rc be _tz_init_database()
+    If init_rc is less than 0:
+        Return TZ_ERR_NULL
+    End If
+    Return _tz_rule_slot(index)
+End Process

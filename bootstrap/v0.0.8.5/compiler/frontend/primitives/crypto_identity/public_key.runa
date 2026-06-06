@@ -1,0 +1,610 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+PUBLIC_KEY - Algorithm-tagged public key value (Tier 1 crypto identity)
+==============================================================================
+
+A PublicKey carries:
+  - the cryptographic algorithm identifier (CryptoAlgorithm tag)
+  - the raw key bytes
+  - the byte length
+
+The algorithm tag travels with the key bytes so downstream verify procs can
+refuse to operate on a key whose declared algorithm does not match what the
+caller is requesting. This eliminates the entire class of "I thought this was
+an Ed25519 key but it's actually an ECDSA key" confusion bugs, which have
+caused real production CVEs.
+
+Memory layout (arena-allocated, 32 bytes total):
+  offset  0 : algorithm tag      (8 bytes, integer)
+  offset  8 : key_bytes pointer  (8 bytes, pointer into arena)
+  offset 16 : key_bytes length   (8 bytes, integer)
+  offset 24 : flags              (8 bytes; bit 0 = compressed, reserved)
+
+Validation:
+  - At construction, key_bytes_length MUST equal the algorithm's declared key
+    byte length (per algorithm_key_byte_length) for fixed-length algorithms.
+  - RSA public keys (variable-length modulus) bypass that exact check but
+    must still pass a sanity bound (key_bytes_length >= 256 and <= 2048).
+  - Algorithm tag MUST be a recognized signature, KEM, or key-agreement
+    identifier. Hash/AEAD/KDF tags are rejected because those classes have
+    no concept of "public key".
+
+References:
+- RFC 7468: textual encodings (PEM) for PKIX keys.
+- RFC 5280: X.509 SubjectPublicKeyInfo wrapping for DER.
+- RFC 8410: Ed25519/Ed448/X25519/X448 in PKIX.
+- IETF draft-ietf-lamps-dilithium-certificates: ML-DSA in PKIX.
+- IETF draft-ietf-lamps-x509-slhdsa: SLH-DSA in PKIX.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/bytes.runa" as BytesP
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+Import "compiler/frontend/import_system/crypto/sha2.runa" as Sha2
+Import "compiler/frontend/import_system/crypto/sha3.runa" as Sha3
+Import "compiler/frontend/import_system/crypto/blake3.runa" as Blake3
+
+Let PUBLIC_KEY_STRUCT_SIZE be 32
+Let PUBLIC_KEY_OFF_ALGORITHM be 0
+Let PUBLIC_KEY_OFF_BYTES_PTR be 8
+Let PUBLIC_KEY_OFF_BYTES_LEN be 16
+Let PUBLIC_KEY_OFF_FLAGS be 24
+
+Let PK_FLAG_COMPRESSED be 1
+
+Note: ============================================================================
+Note: SECTION 1: Construction and validation
+Note: ============================================================================
+
+@Reasoning
+Allocates and validates a PublicKey value. The algorithm tag MUST be a
+recognized signature, KEM, or key-agreement identifier; otherwise the
+construction is refused with a 0 return.
+
+Per HC#11, algorithm dispatch happens only on known tags; an unknown tag
+must never resolve to a default. The construction-time check is the
+single point of enforcement so downstream procs (signature_verify,
+public_key_to_pem, etc.) can rely on the invariant "alg is known and
+matches the bytes-length".
+
+For fixed-length algorithms, key_bytes_length must equal
+algorithm_key_byte_length(algorithm). For RSA, the length is not algorithm-
+fixed; the caller is responsible for providing a SubjectPublicKeyInfo or
+RSAPublicKey DER blob, and we validate only a sanity bound.
+
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Reject NULL/zero arguments, negative lengths, and zero arena.
+  2. Verify algorithm tag is a signature, KEM, or key-agreement tag.
+     (Hash, AEAD, KDF tags are rejected.)
+  3. For fixed-length algorithms (non-RSA): require
+     key_bytes_length == algorithm_key_byte_length(algorithm).
+  4. For RSA: require 256 <= key_bytes_length <= 2048 as a sanity bound.
+     (Modulus byte length is variable.)
+  5. Allocate the 32-byte struct from arena, zero-initialize.
+  6. Allocate a separate buffer of size key_bytes_length, copy in the
+     provided bytes.
+  7. Store algorithm, pointer, length, flags. Return the struct pointer.
+
+Returns 0 on any validation failure or allocation failure.
+@End Implementation
+
+@Performance_Hints
+O(n) in key_bytes_length due to the copy. Two arena allocations.
+@End Performance_Hints
+
+@Security_Scope
+Construction validation prevents algorithm-confusion attacks. The key bytes
+are duplicated into arena-owned storage so the caller's buffer can be safely
+freed or modified after this call returns.
+
+The algorithm tag, byte length, and flags are non-secret metadata. The key
+BYTES themselves are public-key material and therefore not secret either,
+but the type structurally prevents private-key bytes from being passed
+through this constructor.
+
+References:
+- HC#11 (TASC): algorithm-tagged crypto material.
+- RFC 8410 section 4: Ed25519/Ed448 SubjectPublicKey representation.
+@End Security_Scope
+Process called "public_key_create" takes arena as Integer, algorithm as Integer, bytes_in as Integer, bytes_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If bytes_in is equal to 0:
+        Return 0
+    End If
+    If bytes_length is less than 0:
+        Return 0
+    End If
+
+    Note: Algorithm must be signature, KEM, or key-agreement.
+    Let is_sig be Alg.algorithm_is_signature(algorithm)
+    Let is_kem be Alg.algorithm_is_kem_or_kex(algorithm)
+    If is_sig is equal to 0:
+        If is_kem is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Note: Length validation: fixed-length algs vs RSA.
+    Let expected_len be Alg.algorithm_key_byte_length(algorithm)
+    If expected_len is greater than 0:
+        If bytes_length is not equal to expected_len:
+            Return 0
+        End If
+    Otherwise:
+        Note: RSA path. Accept 256..2048 bytes inclusive.
+        If bytes_length is less than 256:
+            Return 0
+        End If
+        If bytes_length is greater than 2048:
+            Return 0
+        End If
+    End If
+
+    Let pk be Arena.arena_allocate(arena, PUBLIC_KEY_STRUCT_SIZE)
+    If pk is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than PUBLIC_KEY_STRUCT_SIZE:
+        Memory.memory_set_byte(pk, zi, 0)
+        Set zi to zi plus 1
+    End While
+
+    Let buf be Arena.arena_allocate(arena, bytes_length)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(buf, bytes_in, bytes_length)
+
+    Memory.memory_set_qword(pk, PUBLIC_KEY_OFF_ALGORITHM, algorithm)
+    Memory.memory_set_qword(pk, PUBLIC_KEY_OFF_BYTES_PTR, buf)
+    Memory.memory_set_qword(pk, PUBLIC_KEY_OFF_BYTES_LEN, bytes_length)
+    Memory.memory_set_qword(pk, PUBLIC_KEY_OFF_FLAGS, 0)
+    Return pk
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Accessors
+Note: ============================================================================
+
+@Reasoning
+Returns the algorithm tag carried by the public key, or 0 if pk is null.
+@End Reasoning
+
+@Implementation
+Reads the first qword at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "public_key_algorithm" takes pk as Integer returns Integer:
+    If pk is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(pk, PUBLIC_KEY_OFF_ALGORITHM)
+End Process
+
+@Reasoning
+Returns the raw key-byte buffer pointer carried by the public key, or 0
+if pk is null. The pointer is owned by the originating arena; callers
+must not free it directly.
+@End Reasoning
+
+@Implementation
+Reads the qword at offset 8.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Public-key bytes are not secret. Pointer is arena-owned; caller must not
+mutate or free.
+@End Security_Scope
+Process called "public_key_bytes" takes pk as Integer returns Integer:
+    If pk is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(pk, PUBLIC_KEY_OFF_BYTES_PTR)
+End Process
+
+@Reasoning
+Returns the key-byte buffer length, or 0 if pk is null.
+@End Reasoning
+
+@Implementation
+Reads the qword at offset 16.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "public_key_byte_length" takes pk as Integer returns Integer:
+    If pk is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(pk, PUBLIC_KEY_OFF_BYTES_LEN)
+End Process
+
+@Reasoning
+Returns the flag word, or 0 if pk is null.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 24.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "public_key_flags" takes pk as Integer returns Integer:
+    If pk is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(pk, PUBLIC_KEY_OFF_FLAGS)
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Equality (constant-time on key bytes)
+Note: ============================================================================
+
+@Reasoning
+Constant-time equality predicate. Two public keys are equal iff:
+  (a) both are non-null
+  (b) their algorithm tags match
+  (c) their byte lengths match
+  (d) their byte buffers compare equal under constant_time_compare
+
+The algorithm/length checks short-circuit BEFORE any byte-level comparison,
+which is safe because algorithm and length are non-secret metadata. The
+byte-level comparison itself is constant-time so this primitive is also
+appropriate for comparing keys whose match would reveal sensitive
+information (e.g., a known-key fingerprint check in a TLS pinning context).
+@End Reasoning
+
+@Implementation
+Short-circuit on null, algorithm mismatch, or length mismatch. For the
+byte comparison, dispatch to secure_memory.constant_time_compare.
+@End Implementation
+
+@Performance_Hints
+O(n) in key length when both keys pass the early checks. Constant-time
+within a given length to defeat timing side-channels.
+@End Performance_Hints
+
+@Security_Scope
+Constant-time on byte comparison only. The early-out on algorithm/length
+is intentional and safe because those fields are public.
+
+Use this primitive whenever a positive result implies authorization or
+membership; do NOT use a non-constant-time memcmp.
+@End Security_Scope
+Process called "public_key_equal" takes pk_a as Integer, pk_b as Integer returns Integer:
+    If pk_a is equal to 0:
+        Return 0
+    End If
+    If pk_b is equal to 0:
+        Return 0
+    End If
+    Let alg_a be public_key_algorithm(pk_a)
+    Let alg_b be public_key_algorithm(pk_b)
+    If alg_a is not equal to alg_b:
+        Return 0
+    End If
+    Let len_a be public_key_byte_length(pk_a)
+    Let len_b be public_key_byte_length(pk_b)
+    If len_a is not equal to len_b:
+        Return 0
+    End If
+    Let buf_a be public_key_bytes(pk_a)
+    Let buf_b be public_key_bytes(pk_b)
+    Return Secure.constant_time_compare(buf_a, buf_b, len_a)
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Hex / Base64 encoding
+Note: ============================================================================
+
+@Reasoning
+Returns the public-key bytes encoded as a lowercase hex string. The
+encoding is independent of the algorithm; the algorithm tag is NOT
+embedded in the hex output, so the caller is responsible for keeping the
+tag and hex together (or using to_pem/to_der for self-describing
+encodings).
+
+Hex output is 2*N characters for N input bytes per RFC 4648 section 8
+(Base16 encoding), but always lowercase per common cryptographic
+convention.
+@End Reasoning
+
+@Implementation
+Wraps the key bytes in a transient Bytes header and calls
+bytes_to_hex_string. The returned String is heap-allocated and owned by
+the caller.
+@End Implementation
+
+@Performance_Hints
+O(n) in key length. One Bytes header allocation plus the hex buffer.
+@End Performance_Hints
+
+@Security_Scope
+Public-key bytes are not secret; the output may be logged, persisted,
+displayed, or printed.
+@End Security_Scope
+Process called "public_key_to_hex_string" takes pk as Integer returns Integer:
+    If pk is equal to 0:
+        Return 0
+    End If
+    Let buf be public_key_bytes(pk)
+    Let len be public_key_byte_length(pk)
+    Let b be BytesP.bytes_from_array(buf, len)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let hex be BytesP.bytes_to_hex_string(b)
+    BytesP.bytes_destroy(b)
+    Return hex
+End Process
+
+@Reasoning
+Returns the public-key bytes encoded as a Base64 string per RFC 4648
+section 4 (standard alphabet, padding included).
+@End Reasoning
+
+@Implementation
+Wraps key bytes in a transient Bytes header and calls bytes_to_base64.
+@End Implementation
+
+@Performance_Hints
+O(n). One Bytes header allocation plus the base64 buffer.
+@End Performance_Hints
+
+@Security_Scope
+Public-key bytes are not secret.
+@End Security_Scope
+Process called "public_key_to_base64" takes pk as Integer returns Integer:
+    If pk is equal to 0:
+        Return 0
+    End If
+    Let buf be public_key_bytes(pk)
+    Let len be public_key_byte_length(pk)
+    Let b be BytesP.bytes_from_array(buf, len)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let b64 be BytesP.bytes_to_base64(b)
+    BytesP.bytes_destroy(b)
+    Return b64
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Fingerprint
+Note: ============================================================================
+
+@Reasoning
+Computes a fingerprint of the public key by hashing the canonical
+encoding of (algorithm-tag || key-bytes) with the requested hash
+algorithm. The output is written into out_buffer; the buffer must be at
+least algorithm_hash_byte_length(hash_alg) bytes wide.
+
+Domain separation: we prepend the algorithm tag as an 8-byte little-
+endian integer so two keys with identical byte content but different
+algorithm assignments produce different fingerprints. Without this,
+the rare case of an Ed25519 32-byte key whose byte content happens to
+equal an X25519 32-byte key would yield colliding fingerprints, which
+is exactly the cross-algorithm confusion the PublicKey type is meant
+to prevent.
+
+The fingerprint is a one-way function of public material, so it is
+itself public.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate pk is non-null and hash_alg is a hash algorithm tag.
+  2. Compute total_len = 8 + key_bytes_length, allocate scratch buffer.
+  3. Write algorithm tag as 8 bytes little-endian at offset 0.
+  4. Copy key bytes at offset 8.
+  5. Dispatch to the requested hash function:
+     - SHA2-256, SHA2-384, SHA2-512: sha2.runa
+     - SHA3-256, SHA3-384, SHA3-512: sha3.runa
+     - BLAKE3: blake3.runa
+     - Others: return 0 (not supported)
+  6. Return 1 on success, 0 on any failure.
+@End Implementation
+
+@Performance_Hints
+O(n + h) where n is key length and h is hash output. One arena allocation
+for the (tag || bytes) scratch buffer.
+@End Performance_Hints
+
+@Security_Scope
+Output is non-secret. Hash function must be a collision-resistant
+cryptographic hash; only the registered hash tags are accepted.
+
+The tag prefix is essential for cross-algorithm domain separation.
+Removing it would silently weaken the fingerprint by enabling
+algorithm-confusion attacks on systems that key on the fingerprint.
+
+References:
+- FIPS 180-4: SHA-2.
+- FIPS 202: SHA-3.
+- BLAKE3 specification.
+- NIST SP 800-185: SHA-3 derived functions (cSHAKE for domain separation
+  rationale; we use prefix concatenation here for compatibility with
+  fixed-output hashes).
+@End Security_Scope
+Process called "public_key_fingerprint" takes arena as Integer, pk as Integer, hash_alg as Integer, out_buffer as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If pk is equal to 0:
+        Return 0
+    End If
+    If out_buffer is equal to 0:
+        Return 0
+    End If
+    If Alg.algorithm_is_hash(hash_alg) is equal to 0:
+        Return 0
+    End If
+
+    Let alg_tag be public_key_algorithm(pk)
+    Let key_buf be public_key_bytes(pk)
+    Let key_len be public_key_byte_length(pk)
+    Let total be 8 plus key_len
+    Let scratch be Arena.arena_allocate(arena, total)
+    If scratch is equal to 0:
+        Return 0
+    End If
+
+    Note: Write algorithm tag as 8 bytes little-endian.
+    Let value be alg_tag
+    Let i be 0
+    While i is less than 8:
+        Let byte_v be value modulo by 256
+        Memory.memory_set_byte(scratch, i, byte_v)
+        Set value to value divided by 256
+        Set i to i plus 1
+    End While
+    Note: Copy key bytes.
+    Memory.memory_copy(scratch plus 8, key_buf, key_len)
+
+    Note: Dispatch.
+    If hash_alg is equal to Alg.ALG_SHA2_256:
+        Return Sha2.sha256_hash(arena, scratch, total, out_buffer)
+    End If
+    If hash_alg is equal to Alg.ALG_SHA2_384:
+        Return Sha2.sha384_hash(arena, scratch, total, out_buffer)
+    End If
+    If hash_alg is equal to Alg.ALG_SHA2_512:
+        Return Sha2.sha512_hash(arena, scratch, total, out_buffer)
+    End If
+    If hash_alg is equal to Alg.ALG_SHA3_256:
+        Return Sha3.sha3_256_hash(arena, scratch, total, out_buffer)
+    End If
+    If hash_alg is equal to Alg.ALG_SHA3_384:
+        Return Sha3.sha3_384_hash(arena, scratch, total, out_buffer)
+    End If
+    If hash_alg is equal to Alg.ALG_SHA3_512:
+        Return Sha3.sha3_512_hash(arena, scratch, total, out_buffer)
+    End If
+    If hash_alg is equal to Alg.ALG_BLAKE3:
+        Return Blake3.blake3_hash(arena, scratch, total, out_buffer)
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: Construction from hex / base64 strings
+Note: ============================================================================
+
+@Reasoning
+Reconstruct a PublicKey from an algorithm tag and a hex-encoded byte
+string. Hex digits may be upper or lower case; whitespace is rejected.
+The algorithm tag is validated by public_key_create downstream.
+@End Reasoning
+
+@Implementation
+Decode the hex string into a heap-allocated Bytes via bytes_from_hex_string,
+then copy into an arena-owned PublicKey via public_key_create. The
+intermediate Bytes is destroyed.
+@End Implementation
+
+@Performance_Hints
+O(n). Two allocations: the intermediate Bytes and the arena PublicKey.
+@End Performance_Hints
+
+@Security_Scope
+Hex decoding validates each character is a hex digit. Algorithm validation
+happens in public_key_create. The reconstructed key has the exact same
+algorithm tag as supplied; cross-algorithm confusion is impossible.
+@End Security_Scope
+Process called "public_key_from_hex_string" takes arena as Integer, algorithm as Integer, hex_str as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If hex_str is equal to 0:
+        Return 0
+    End If
+    Let b be BytesP.bytes_from_hex_string(hex_str)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let buf be BytesP.bytes_data(b)
+    Let len be BytesP.bytes_length(b)
+    Let pk be public_key_create(arena, algorithm, buf, len)
+    BytesP.bytes_destroy(b)
+    Return pk
+End Process
+
+@Reasoning
+Reconstruct a PublicKey from an algorithm tag and a Base64-encoded
+byte string per RFC 4648 section 4.
+@End Reasoning
+
+@Implementation
+Decode via bytes_from_base64, then copy into arena-owned PublicKey.
+@End Implementation
+
+@Performance_Hints
+O(n). Two allocations.
+@End Performance_Hints
+
+@Security_Scope
+Base64 decoding validates the alphabet. Algorithm validation in
+public_key_create. No cross-algorithm risk.
+@End Security_Scope
+Process called "public_key_from_base64" takes arena as Integer, algorithm as Integer, b64_str as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If b64_str is equal to 0:
+        Return 0
+    End If
+    Let b be BytesP.bytes_from_base64(b64_str)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let buf be BytesP.bytes_data(b)
+    Let len be BytesP.bytes_length(b)
+    Let pk be public_key_create(arena, algorithm, buf, len)
+    BytesP.bytes_destroy(b)
+    Return pk
+End Process

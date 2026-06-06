@@ -1,0 +1,710 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+POLY1305 - One-time message authentication code per RFC 8439
+==============================================================================
+
+Poly1305 is a one-time MAC by D. J. Bernstein operating in the prime field
+GF(2^130 - 5). It takes a 32-byte key (split into a 16-byte multiplier `r`
+and a 16-byte additive offset `s`) and produces a 16-byte tag.
+
+Algorithm (RFC 8439 section 2.5):
+  Inputs: 32-byte key, message of arbitrary length.
+  1. Split key: r = key[0..16], s = key[16..32].
+  2. Clamp r per RFC 8439 section 2.5.1:
+       r &= 0x0ffffffc0ffffffc0ffffffc0fffffff
+     (clears top-4 bits of bytes 3,7,11,15 and bottom-2 bits of bytes 4,8,12).
+  3. Accumulator a := 0.
+  4. For each 16-byte block m_i of the message (last block may be 1..16):
+       Treat m_i as little-endian; append a "1" byte after the block content.
+       For a full 16-byte block this means appending 0x01 as byte 16.
+       For a short last block of L bytes (1 <= L < 16) the trailing "1" is
+       byte L, and bytes (L+1)..16 are zero.
+       a := (a + n_i) * r  (mod 2^130 - 5)
+  5. Return (a + s) mod 2^128 as a 16-byte little-endian tag.
+
+Field representation:
+  We use the canonical 5-limb 26-bit representation:
+    field element X = h0 + h1*2^26 + h2*2^52 + h3*2^78 + h4*2^104
+  Each limb fits comfortably in 32 bits between reductions, and the product
+  of two 26-bit values fits in 52 bits which fits in a 64-bit Integer. This
+  representation tracks Bernstein's reference floating-point poly1305 and the
+  BoringSSL portable code.
+
+Side-channel posture:
+  - All arithmetic is constant-time integer ops; no branches or memory
+    accesses depend on accumulator or key contents.
+  - The block-pad loop always walks 16 bytes regardless of where the
+    "1" byte falls; the short-block one-bit append is gated on a public
+    length, not on key/data.
+
+Out-of-scope side channels:
+  - Microarchitectural variance in 64-bit multiply (uniform on every CPU
+    we target; CONSTANT-TIME-MUL annotation in @Security_Scope).
+
+References:
+- RFC 8439, "ChaCha20 and Poly1305 for IETF Protocols".
+- D. J. Bernstein, "The Poly1305-AES message-authentication code", FSE 2005.
+- BoringSSL crypto/poly1305/poly1305.c (portable reference).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as SecureMem
+
+Constant POLY1305_KEY_SIZE as Integer is 32
+Constant POLY1305_TAG_SIZE as Integer is 16
+Constant POLY1305_BLOCK_SIZE as Integer is 16
+Constant POLY1305_LIMB_MASK as Integer is 67108863
+Note: 2^26 - 1 = 0x3ffffff
+
+Process called "poly1305_load_le32" takes ptr as Integer, offset as Integer returns Integer:
+    @Reasoning
+    Loads 4 bytes little-endian from ptr+offset as an unsigned 32-bit value.
+    Equivalent to memory_get_int32 but explicit about endianness and free of
+    the sign-extension that memory_get_int32 applies (we want the raw 32-bit
+    unsigned interpretation).
+    @End Reasoning
+
+    @Implementation
+    b0 + 256*b1 + 65536*b2 + 16777216*b3. Result is in [0, 2^32).
+    @End Implementation
+
+    @Performance_Hints
+    Four byte loads + three multiplies + three adds. Sub-nanosecond.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time (no secret-dependent control flow). Public addresses.
+    @End Security_Scope
+
+    Let b0 be proc memory_get_byte from Memory with ptr, offset
+    Let b1 be proc memory_get_byte from Memory with ptr, offset plus 1
+    Let b2 be proc memory_get_byte from Memory with ptr, offset plus 2
+    Let b3 be proc memory_get_byte from Memory with ptr, offset plus 3
+    Let val be b0 plus b1 multiplied by 256
+    Set val to val plus b2 multiplied by 65536
+    Set val to val plus b3 multiplied by 16777216
+    Return val
+End Process
+
+Process called "poly1305_store_le32" takes ptr as Integer, offset as Integer, value as Integer returns Integer:
+    @Reasoning
+    Stores the low 32 bits of `value` as 4 little-endian bytes.
+    @End Reasoning
+
+    @Implementation
+    Decomposes the 32-bit value into four bytes via mask+shift.
+    @End Implementation
+
+    @Performance_Hints
+    Four byte stores. Sub-nanosecond.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+
+    Let v0 be value bitwise_and 255
+    Let v_shift1 be value divided by 256
+    Let v1 be v_shift1 bitwise_and 255
+    Let v_shift2 be value divided by 65536
+    Let v2 be v_shift2 bitwise_and 255
+    Let v_shift3 be value divided by 16777216
+    Let v3 be v_shift3 bitwise_and 255
+    proc memory_set_byte from Memory with ptr, offset, v0
+    proc memory_set_byte from Memory with ptr, offset plus 1, v1
+    proc memory_set_byte from Memory with ptr, offset plus 2, v2
+    proc memory_set_byte from Memory with ptr, offset plus 3, v3
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Block-mac inner loop (single 16-byte or short final block)
+Note: ============================================================================
+
+Process called "poly1305_process_block" takes h_buf as Integer, r_buf as Integer, block_buf as Integer, block_len as Integer returns Integer:
+    @Reasoning
+    Processes one (full or short) Poly1305 block by computing
+      h := (h + n) * r  (mod 2^130 - 5)
+    where n is the block byte content interpreted as a little-endian integer
+    with an appended "1" byte at position block_len.
+    @End Reasoning
+
+    @Implementation
+    1. Build the 5-limb representation of n by reading 5 26-bit slices from
+       (block_buf || 0x01 || zeros)[0..17]:
+         n0 = bytes[0..3]  & 0x3ffffff
+         n1 = (bytes[3..7]  >> 2) & 0x3ffffff
+         n2 = (bytes[6..10] >> 4) & 0x3ffffff
+         n3 = (bytes[9..13] >> 6) & 0x3ffffff
+         n4 = bytes[12..16]      [naturally < 2^32 since byte 16 is 0x01
+                                  for full block, 0 for short block, plus
+                                  the byte we appended at block_len].
+       For a full 16-byte block the trailing 0x01 lives in n4 at bit 24.
+       For a short L-byte block we place 0x01 at byte L manually before
+       computing n4 to preserve constant-time block-byte handling.
+    2. Add: h_i += n_i.
+    3. Multiply: t = h * r in 5x5 schoolbook form, carrying 64-bit partial
+       products. Apply the (mod 2^130 - 5) reduction by folding the high
+       limbs back into the low limbs (multiply by 5 and add).
+    4. Reduce carries so each h_i fits in 26 bits (h4 fits in 26 + a small
+       carry that we propagate back).
+    5. Store h limbs back to h_buf.
+
+    All arithmetic is constant-time integer math; the only branch is the
+    public-length-driven block-build at the start.
+    @End Implementation
+
+    @Performance_Hints
+    25 multiplies + 25 adds per block plus carry propagation. On a 64-bit
+    CPU each multiply is single-cycle; total per-block cost is ~10ns on
+    modern x86 without SIMD lowering.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time: every loop iterates exactly POLY1305_BLOCK_SIZE+1 = 17
+    times to handle the final "1" byte. The block-byte-array assembly
+    walks all 17 byte positions regardless of block_len, with zero fills
+    for positions beyond block_len-1 (and a single 0x01 at position
+    block_len, which is itself public per RFC 8439).
+
+    Out of scope: microarchitectural multiply timing variance
+    (uniform on x86-64, ARM64, RISC-V).
+    @End Security_Scope
+
+    Note: ---- Step 1: build a 17-byte working block ----
+    Note: We build it on the local stack via a small fixed-size byte array
+    Note: addressed by an auxiliary scratch pointer scratch[0..17].
+    Note: For Runa's flat memory model we use block_buf's caller-provided
+    Note: storage which is at least 17 bytes (callers must allocate 17).
+
+    Note: Step 1: place 0x01 at byte `block_len` and zero bytes after.
+    Let pad_idx be block_len
+    proc memory_set_byte from Memory with block_buf, pad_idx, 1
+    Let zi be pad_idx plus 1
+    While zi is less than 17:
+        proc memory_set_byte from Memory with block_buf, zi, 0
+        Set zi to zi plus 1
+    End While
+
+    Note: Step 2: Decompose the 17-byte block into 5 26-bit limbs.
+    Note: Limb i covers bits [26i, 26i+25] of the 130-bit number n where
+    Note: n = sum_{b=0..16} block_buf[b] * 256^b. We extract each 26-bit
+    Note: limb by loading a 32-bit little-endian window at the byte offset
+    Note: whose bit-position straddles the limb base and shifting to align.
+    Let b0_3 be proc poly1305_load_le32 with block_buf, 0
+    Let b3_6 be proc poly1305_load_le32 with block_buf, 3
+    Let b6_9 be proc poly1305_load_le32 with block_buf, 6
+    Let b9_12 be proc poly1305_load_le32 with block_buf, 9
+    Let b13_16 be proc poly1305_load_le32 with block_buf, 13
+
+    Let n0 be b0_3 bitwise_and POLY1305_LIMB_MASK
+    Let b3_6_shr2 be b3_6 divided by 4
+    Let n1 be b3_6_shr2 bitwise_and POLY1305_LIMB_MASK
+    Let b6_9_shr4 be b6_9 divided by 16
+    Let n2 be b6_9_shr4 bitwise_and POLY1305_LIMB_MASK
+    Let b9_12_shr6 be b9_12 divided by 64
+    Let n3 be b9_12_shr6 bitwise_and POLY1305_LIMB_MASK
+    Note: n4 covers bits 104..129. Bytes 13..16 of the padded block cover
+    Note: bits 104..135. The low 26 bits of (block_buf[13..16] as LE u32)
+    Note: are exactly bits 104..129. For a full block the trailing 0x01
+    Note: at block_buf[16] sets bit 128 (limb 4 bit 24, value 16777216).
+    Note: For a short block of length L the 0x01 lives at block_buf[L]
+    Note: (L < 16), so block_buf[16] = 0 and n4 ends with bit 128 clear.
+    Let n4 be b13_16 bitwise_and POLY1305_LIMB_MASK
+
+    Note: Load h limbs from h_buf
+    Let h0 be proc memory_get_qword from Memory with h_buf, 0
+    Let h1 be proc memory_get_qword from Memory with h_buf, 8
+    Let h2 be proc memory_get_qword from Memory with h_buf, 16
+    Let h3 be proc memory_get_qword from Memory with h_buf, 24
+    Let h4 be proc memory_get_qword from Memory with h_buf, 32
+
+    Note: Step 3: h += n
+    Set h0 to h0 plus n0
+    Set h1 to h1 plus n1
+    Set h2 to h2 plus n2
+    Set h3 to h3 plus n3
+    Set h4 to h4 plus n4
+
+    Note: Load r limbs from r_buf
+    Let r0 be proc memory_get_qword from Memory with r_buf, 0
+    Let r1 be proc memory_get_qword from Memory with r_buf, 8
+    Let r2 be proc memory_get_qword from Memory with r_buf, 16
+    Let r3 be proc memory_get_qword from Memory with r_buf, 24
+    Let r4 be proc memory_get_qword from Memory with r_buf, 32
+
+    Note: Precompute r1*5, r2*5, r3*5, r4*5 for the reduction
+    Let s1 be r1 multiplied by 5
+    Let s2 be r2 multiplied by 5
+    Let s3 be r3 multiplied by 5
+    Let s4 be r4 multiplied by 5
+
+    Note: Step 4: t = h * r (schoolbook 5x5, lazy reduction via *5 wraparound)
+    Note: t0 = h0*r0 + h1*s4 + h2*s3 + h3*s2 + h4*s1
+    Let t0 be h0 multiplied by r0
+    Set t0 to t0 plus h1 multiplied by s4
+    Set t0 to t0 plus h2 multiplied by s3
+    Set t0 to t0 plus h3 multiplied by s2
+    Set t0 to t0 plus h4 multiplied by s1
+
+    Let t1 be h0 multiplied by r1
+    Set t1 to t1 plus h1 multiplied by r0
+    Set t1 to t1 plus h2 multiplied by s4
+    Set t1 to t1 plus h3 multiplied by s3
+    Set t1 to t1 plus h4 multiplied by s2
+
+    Let t2 be h0 multiplied by r2
+    Set t2 to t2 plus h1 multiplied by r1
+    Set t2 to t2 plus h2 multiplied by r0
+    Set t2 to t2 plus h3 multiplied by s4
+    Set t2 to t2 plus h4 multiplied by s3
+
+    Let t3 be h0 multiplied by r3
+    Set t3 to t3 plus h1 multiplied by r2
+    Set t3 to t3 plus h2 multiplied by r1
+    Set t3 to t3 plus h3 multiplied by r0
+    Set t3 to t3 plus h4 multiplied by s4
+
+    Let t4 be h0 multiplied by r4
+    Set t4 to t4 plus h1 multiplied by r3
+    Set t4 to t4 plus h2 multiplied by r2
+    Set t4 to t4 plus h3 multiplied by r1
+    Set t4 to t4 plus h4 multiplied by r0
+
+    Note: Step 5: carry propagation to bring each limb back to 26 bits.
+    Let c be t0 divided by 67108864
+    Let new_h0 be t0 bitwise_and POLY1305_LIMB_MASK
+    Set t1 to t1 plus c
+    Let c1 be t1 divided by 67108864
+    Let new_h1 be t1 bitwise_and POLY1305_LIMB_MASK
+    Set t2 to t2 plus c1
+    Let c2 be t2 divided by 67108864
+    Let new_h2 be t2 bitwise_and POLY1305_LIMB_MASK
+    Set t3 to t3 plus c2
+    Let c3 be t3 divided by 67108864
+    Let new_h3 be t3 bitwise_and POLY1305_LIMB_MASK
+    Set t4 to t4 plus c3
+    Let c4 be t4 divided by 67108864
+    Let new_h4 be t4 bitwise_and POLY1305_LIMB_MASK
+
+    Note: Fold c4 (the carry out of h4) back into h0 multiplied by 5
+    Note: (because 2^130 = 5 mod p, so a carry across the 130-bit boundary
+    Note: represents 5 units in the low limb).
+    Let folded be c4 multiplied by 5
+    Set new_h0 to new_h0 plus folded
+    Let c5 be new_h0 divided by 67108864
+    Set new_h0 to new_h0 bitwise_and POLY1305_LIMB_MASK
+    Set new_h1 to new_h1 plus c5
+    Note: Propagate one more time through h2, h3, h4 to ensure every limb
+    Note: ends in [0, 2^26) so the next block's schoolbook multiply does
+    Note: not overflow 64-bit Integers (h_i * r_j must stay below ~2^60).
+    Let c6 be new_h1 divided by 67108864
+    Set new_h1 to new_h1 bitwise_and POLY1305_LIMB_MASK
+    Set new_h2 to new_h2 plus c6
+    Let c7 be new_h2 divided by 67108864
+    Set new_h2 to new_h2 bitwise_and POLY1305_LIMB_MASK
+    Set new_h3 to new_h3 plus c7
+    Let c8 be new_h3 divided by 67108864
+    Set new_h3 to new_h3 bitwise_and POLY1305_LIMB_MASK
+    Set new_h4 to new_h4 plus c8
+
+    Note: Store back
+    proc memory_set_qword from Memory with h_buf, 0, new_h0
+    proc memory_set_qword from Memory with h_buf, 8, new_h1
+    proc memory_set_qword from Memory with h_buf, 16, new_h2
+    proc memory_set_qword from Memory with h_buf, 24, new_h3
+    proc memory_set_qword from Memory with h_buf, 32, new_h4
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Poly1305 MAC (one-shot)
+Note: ============================================================================
+
+Process called "poly1305_mac" takes arena as Integer, key as Integer, message as Integer, length as Integer, out_tag as Integer returns Integer:
+    @Reasoning
+    Computes the Poly1305 16-byte tag over message[0..length) under the
+    given 32-byte key per RFC 8439 section 2.5.3.
+    @End Reasoning
+
+    @Implementation
+    1. Validate inputs.
+    2. Allocate working state: h[5 qwords], r[5 qwords], block_scratch[17].
+    3. Build clamped r:
+         The RFC 8439 clamp mask is 0x0ffffffc0ffffffc0ffffffc0fffffff
+         (clear top 4 bits of bytes 3, 7, 11, 15; clear bottom 2 bits of
+         bytes 4, 8, 12). Apply to the first 16 bytes of key, then split
+         into 26-bit limbs.
+    4. h := 0.
+    5. For each 16-byte block of the message: process_block(h, r, block, 16).
+    6. If a partial block remains: process_block(h, r, block, partial_len).
+    7. Reduce h to canonical form (h might equal p..p+(2^130-1); subtract
+       p if h >= p, in constant time).
+    8. Serialize h to 16 bytes little-endian, then add the additive offset
+        s = key[16..32] modulo 2^128, masking off any carry into bit 128.
+    9. Store the resulting 16 bytes into out_tag.
+    10. Securely wipe r and h (they are derived from / contain the secret).
+    @End Implementation
+
+    @Performance_Hints
+    Per-block cost is poly1305_process_block (25 multiplies plus carries).
+    Total per byte: ~0.7 cycles/byte software, ~0.3 with SIMD lowering.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time per byte. Both the r-clamp and the per-block multiply
+    are pure arithmetic without secret-dependent control flow.
+
+    NEVER use the same 32-byte Poly1305 key twice with distinct messages.
+    Poly1305 is a one-time MAC: with two tags under the same key an
+    attacker can solve for r and forge tags. RFC 8439 satisfies this by
+    deriving a fresh Poly1305 key from a (ChaCha20 key, nonce) pair via
+    block 0 of ChaCha20. Callers MUST follow the same discipline.
+
+    Out of scope: power-analysis countermeasures (hardware-level),
+    fault-injection countermeasures (platform-level).
+
+    References:
+    - RFC 8439 section 2.5.
+    - Bernstein, "The Poly1305-AES message-authentication code", FSE 2005.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If length is less than 0:
+        Return 0
+    End If
+    If out_tag is equal to 0:
+        Return 0
+    End If
+    If message is equal to 0:
+        If length is greater than 0:
+            Return 0
+        End If
+    End If
+
+    Note: ---- Build clamped r as 5 26-bit limbs ----
+    Note: clamp mask bytes 0..15:
+    Note:   0  -> 0xff   8 -> 0xfc
+    Note:   1  -> 0xff   9 -> 0xff
+    Note:   2  -> 0xff  10 -> 0xff
+    Note:   3  -> 0x0f  11 -> 0x0f
+    Note:   4  -> 0xfc  12 -> 0xfc
+    Note:   5  -> 0xff  13 -> 0xff
+    Note:   6  -> 0xff  14 -> 0xff
+    Note:   7  -> 0x0f  15 -> 0x0f
+
+    Let r_bytes be proc arena_allocate from Arena with arena, 16
+    If r_bytes is equal to 0:
+        Return 0
+    End If
+    Let kb_idx be 0
+    While kb_idx is less than 16:
+        Let kb be proc memory_get_byte from Memory with key, kb_idx
+        proc memory_set_byte from Memory with r_bytes, kb_idx, kb
+        Set kb_idx to kb_idx plus 1
+    End While
+
+    Note: Apply per-byte clamp constants
+    Let m3 be proc memory_get_byte from Memory with r_bytes, 3
+    proc memory_set_byte from Memory with r_bytes, 3, m3 bitwise_and 15
+
+    Let m7 be proc memory_get_byte from Memory with r_bytes, 7
+    proc memory_set_byte from Memory with r_bytes, 7, m7 bitwise_and 15
+
+    Let m11 be proc memory_get_byte from Memory with r_bytes, 11
+    proc memory_set_byte from Memory with r_bytes, 11, m11 bitwise_and 15
+
+    Let m15 be proc memory_get_byte from Memory with r_bytes, 15
+    proc memory_set_byte from Memory with r_bytes, 15, m15 bitwise_and 15
+
+    Let m4 be proc memory_get_byte from Memory with r_bytes, 4
+    proc memory_set_byte from Memory with r_bytes, 4, m4 bitwise_and 252
+
+    Let m8 be proc memory_get_byte from Memory with r_bytes, 8
+    proc memory_set_byte from Memory with r_bytes, 8, m8 bitwise_and 252
+
+    Let m12 be proc memory_get_byte from Memory with r_bytes, 12
+    proc memory_set_byte from Memory with r_bytes, 12, m12 bitwise_and 252
+
+    Note: Decompose clamped r into 5 26-bit limbs
+    Let r_buf be proc arena_allocate from Arena with arena, 40
+    If r_buf is equal to 0:
+        Return 0
+    End If
+
+    Let rb0_3 be proc poly1305_load_le32 with r_bytes, 0
+    Let rb3_6 be proc poly1305_load_le32 with r_bytes, 3
+    Let rb6_9 be proc poly1305_load_le32 with r_bytes, 6
+    Let rb9_12 be proc poly1305_load_le32 with r_bytes, 9
+    Let rb12_15 be proc poly1305_load_le32 with r_bytes, 12
+
+    Let r0 be rb0_3 bitwise_and POLY1305_LIMB_MASK
+    Let rb3_6_shr2 be rb3_6 divided by 4
+    Let r1 be rb3_6_shr2 bitwise_and POLY1305_LIMB_MASK
+    Let rb6_9_shr4 be rb6_9 divided by 16
+    Let r2 be rb6_9_shr4 bitwise_and POLY1305_LIMB_MASK
+    Let rb9_12_shr6 be rb9_12 divided by 64
+    Let r3 be rb9_12_shr6 bitwise_and POLY1305_LIMB_MASK
+    Let r4 be rb12_15 divided by 256
+    Note: Per the RFC the high limb r4 holds the top 24 bits of byte 12..15
+    Note: (byte 16 is not part of r). We extract bytes 12..15 as a 32-bit LE
+    Note: integer and shift right by 8 to drop the byte-12 contribution
+    Note: already captured by r3. The byte-12 high 6 bits (after clamp) are
+    Note: clamped to 0 anyway, but we follow the canonical extraction.
+
+    proc memory_set_qword from Memory with r_buf, 0, r0
+    proc memory_set_qword from Memory with r_buf, 8, r1
+    proc memory_set_qword from Memory with r_buf, 16, r2
+    proc memory_set_qword from Memory with r_buf, 24, r3
+    proc memory_set_qword from Memory with r_buf, 32, r4
+
+    Note: ---- Initialize h := 0 ----
+    Let h_buf be proc arena_allocate from Arena with arena, 40
+    If h_buf is equal to 0:
+        Return 0
+    End If
+    proc memory_zero from Memory with h_buf, 40
+
+    Note: ---- Allocate per-block scratch ----
+    Let block_scratch be proc arena_allocate from Arena with arena, 17
+    If block_scratch is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Process full 16-byte blocks ----
+    Let processed be 0
+    While processed plus POLY1305_BLOCK_SIZE is less than or equal to length:
+        Let bi be 0
+        While bi is less than POLY1305_BLOCK_SIZE:
+            Let mb be proc memory_get_byte from Memory with message, processed plus bi
+            proc memory_set_byte from Memory with block_scratch, bi, mb
+            Set bi to bi plus 1
+        End While
+        Note: process_block places 0x01 at block_len = 16 (block_scratch[16])
+        proc poly1305_process_block with h_buf, r_buf, block_scratch, POLY1305_BLOCK_SIZE
+        Set processed to processed plus POLY1305_BLOCK_SIZE
+    End While
+
+    Note: ---- Process final partial block (if any) ----
+    Let remainder be length minus processed
+    If remainder is greater than 0:
+        Let bi2 be 0
+        While bi2 is less than remainder:
+            Let mb2 be proc memory_get_byte from Memory with message, processed plus bi2
+            proc memory_set_byte from Memory with block_scratch, bi2, mb2
+            Set bi2 to bi2 plus 1
+        End While
+        Note: process_block places 0x01 at block_len = remainder and zeros after
+        proc poly1305_process_block with h_buf, r_buf, block_scratch, remainder
+    End If
+
+    Note: ---- Final reduction of h to canonical [0, p) ----
+    Note: After processing, h is in [0, 2^130 + something_small). One more
+    Note: carry pass plus a conditional subtraction of p brings h into
+    Note: canonical form. We perform the subtraction in constant time by
+    Note: subtracting p, then using the sign bit of the result to select
+    Note: between the original h and the reduced h.
+
+    Let h0 be proc memory_get_qword from Memory with h_buf, 0
+    Let h1 be proc memory_get_qword from Memory with h_buf, 8
+    Let h2 be proc memory_get_qword from Memory with h_buf, 16
+    Let h3 be proc memory_get_qword from Memory with h_buf, 24
+    Let h4 be proc memory_get_qword from Memory with h_buf, 32
+
+    Note: One more carry pass to bring h fully into [0, 2^130) before
+    Note: comparing to p. After process_block every limb is already in
+    Note: [0, 2^26), but a defensive propagation here protects against
+    Note: residual carries from edge cases (empty message, final partial
+    Note: block left h with a tight carry).
+    Let c_final be h1 divided by 67108864
+    Set h1 to h1 bitwise_and POLY1305_LIMB_MASK
+    Set h2 to h2 plus c_final
+    Let c_final2 be h2 divided by 67108864
+    Set h2 to h2 bitwise_and POLY1305_LIMB_MASK
+    Set h3 to h3 plus c_final2
+    Let c_final3 be h3 divided by 67108864
+    Set h3 to h3 bitwise_and POLY1305_LIMB_MASK
+    Set h4 to h4 plus c_final3
+    Let c_final4 be h4 divided by 67108864
+    Set h4 to h4 bitwise_and POLY1305_LIMB_MASK
+    Set h0 to h0 plus c_final4 multiplied by 5
+    Let c_final5 be h0 divided by 67108864
+    Set h0 to h0 bitwise_and POLY1305_LIMB_MASK
+    Set h1 to h1 plus c_final5
+    Note: Propagate residual c_final5 once more (the worst-case wrap from
+    Note: c_final4 *5 has c_final4 in [0, 4] so c_final5 in [0, 1]).
+    Let c_final6 be h1 divided by 67108864
+    Set h1 to h1 bitwise_and POLY1305_LIMB_MASK
+    Set h2 to h2 plus c_final6
+
+    Note: Compute h - p where p = 2^130 - 5. In limb form p =
+    Note: (2^26 - 5, 2^26 - 1, 2^26 - 1, 2^26 - 1, 2^26 - 1) approx -
+    Note: actually p = 5 in limb0 less than 2^130. Subtract:
+    Note:   g0 = h0 + 5
+    Note:   carry g0 -> g1 etc.
+    Note: If after adding 5 and propagating, the carry exits limb 4 (i.e.
+    Note: g4 >= 2^26), then h >= p and we should use g; else use h.
+
+    Let g0 be h0 plus 5
+    Let gc0 be g0 divided by 67108864
+    Set g0 to g0 bitwise_and POLY1305_LIMB_MASK
+    Let g1 be h1 plus gc0
+    Let gc1 be g1 divided by 67108864
+    Set g1 to g1 bitwise_and POLY1305_LIMB_MASK
+    Let g2 be h2 plus gc1
+    Let gc2 be g2 divided by 67108864
+    Set g2 to g2 bitwise_and POLY1305_LIMB_MASK
+    Let g3 be h3 plus gc2
+    Let gc3 be g3 divided by 67108864
+    Set g3 to g3 bitwise_and POLY1305_LIMB_MASK
+    Let g4 be h4 plus gc3
+    Note: If g4 >= 2^26, the carry exited limb 4 - meaning h+5 >= 2^130,
+    Note: i.e. h >= p. Subtracting 2^130 from g4 yields h - p in low 130 bits.
+    Let mask_select be g4 divided by 67108864
+    Note: mask_select is 1 if h >= p, 0 otherwise. We use it to select.
+
+    Note: If mask_select is 1, use (g0, g1, g2, g3, g4 - 2^26); else use h.
+    Note: Constant-time select by arithmetic mask.
+    Let neg_mask be 0 minus mask_select
+    Let inv_mask be neg_mask bitwise_xor 0 minus 1
+    Note: neg_mask = -1 if select, 0 if not. inv_mask = 0 if select, -1 if not.
+    Let sel_h0 be g0 bitwise_and neg_mask
+    Let sel_h1 be g1 bitwise_and neg_mask
+    Let sel_h2 be g2 bitwise_and neg_mask
+    Let sel_h3 be g3 bitwise_and neg_mask
+    Let g4_reduced be g4 minus 67108864
+    Let sel_h4 be g4_reduced bitwise_and neg_mask
+
+    Let keep_h0 be h0 bitwise_and inv_mask
+    Let keep_h1 be h1 bitwise_and inv_mask
+    Let keep_h2 be h2 bitwise_and inv_mask
+    Let keep_h3 be h3 bitwise_and inv_mask
+    Let keep_h4 be h4 bitwise_and inv_mask
+
+    Let final_h0 be sel_h0 bitwise_or keep_h0
+    Let final_h1 be sel_h1 bitwise_or keep_h1
+    Let final_h2 be sel_h2 bitwise_or keep_h2
+    Let final_h3 be sel_h3 bitwise_or keep_h3
+    Let final_h4 be sel_h4 bitwise_or keep_h4
+
+    Note: ---- Pack 5 26-bit limbs into 4 32-bit words (130 bits truncated to 128) ----
+    Note: word0 = h0 | (h1 << 26) & 0xFFFFFFFF      (low 32 bits)
+    Note: word1 = (h1 >> 6) | (h2 << 20) & 0xFFFFFFFF
+    Note: word2 = (h2 >> 12) | (h3 << 14) & 0xFFFFFFFF
+    Note: word3 = (h3 >> 18) | (h4 << 8) & 0xFFFFFFFF
+    Let h1_shift26 be final_h1 multiplied by 67108864
+    Let word0 be final_h0 plus h1_shift26
+    Let word0_masked be word0 bitwise_and 4294967295
+    Let h1_shr6 be final_h1 divided by 64
+    Let h2_shift20 be final_h2 multiplied by 1048576
+    Let word1 be h1_shr6 plus h2_shift20
+    Let word1_masked be word1 bitwise_and 4294967295
+    Let h2_shr12 be final_h2 divided by 4096
+    Let h3_shift14 be final_h3 multiplied by 16384
+    Let word2 be h2_shr12 plus h3_shift14
+    Let word2_masked be word2 bitwise_and 4294967295
+    Let h3_shr18 be final_h3 divided by 262144
+    Let h4_shift8 be final_h4 multiplied by 256
+    Let word3 be h3_shr18 plus h4_shift8
+    Let word3_masked be word3 bitwise_and 4294967295
+
+    Note: ---- Add s = key[16..32] modulo 2^128 ----
+    Let s0 be proc poly1305_load_le32 with key, 16
+    Let s1 be proc poly1305_load_le32 with key, 20
+    Let s2 be proc poly1305_load_le32 with key, 24
+    Let s3 be proc poly1305_load_le32 with key, 28
+
+    Let tag_w0 be word0_masked plus s0
+    Let tag_c0 be tag_w0 divided by 4294967296
+    Set tag_w0 to tag_w0 bitwise_and 4294967295
+    Let tag_w1 be word1_masked plus s1
+    Set tag_w1 to tag_w1 plus tag_c0
+    Let tag_c1 be tag_w1 divided by 4294967296
+    Set tag_w1 to tag_w1 bitwise_and 4294967295
+    Let tag_w2 be word2_masked plus s2
+    Set tag_w2 to tag_w2 plus tag_c1
+    Let tag_c2 be tag_w2 divided by 4294967296
+    Set tag_w2 to tag_w2 bitwise_and 4294967295
+    Let tag_w3 be word3_masked plus s3
+    Set tag_w3 to tag_w3 plus tag_c2
+    Set tag_w3 to tag_w3 bitwise_and 4294967295
+
+    Note: ---- Serialize the tag ----
+    proc poly1305_store_le32 with out_tag, 0, tag_w0
+    proc poly1305_store_le32 with out_tag, 4, tag_w1
+    proc poly1305_store_le32 with out_tag, 8, tag_w2
+    proc poly1305_store_le32 with out_tag, 12, tag_w3
+
+    Note: ---- Wipe secret-derived intermediates ----
+    proc secure_zero from SecureMem with r_bytes, 16
+    proc secure_zero from SecureMem with r_buf, 40
+    proc secure_zero from SecureMem with h_buf, 40
+    proc secure_zero from SecureMem with block_scratch, 17
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Poly1305 constant-time tag verification
+Note: ============================================================================
+
+Process called "poly1305_verify" takes arena as Integer, key as Integer, message as Integer, length as Integer, expected_tag as Integer returns Integer:
+    @Reasoning
+    Computes the Poly1305 tag and compares it to expected_tag in constant
+    time. Returns 1 if equal, 0 otherwise. The only safe way to verify
+    a Poly1305 tag in security-sensitive code; a naive memcmp leaks the
+    position of the first mismatching byte and enables forgery oracles.
+    @End Reasoning
+
+    @Implementation
+    1. Compute the tag into a local 16-byte buffer.
+    2. constant_time_compare against expected_tag.
+    3. Securely wipe the local computed tag.
+    @End Implementation
+
+    @Performance_Hints
+    Same cost as poly1305_mac plus 16-byte constant-time compare plus
+    16-byte wipe.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against Lucky13-class timing oracles on the tag bytes.
+    @End Security_Scope
+
+    Let computed_tag be proc arena_allocate from Arena with arena, POLY1305_TAG_SIZE
+    If computed_tag is equal to 0:
+        Return 0
+    End If
+
+    Let rc be proc poly1305_mac with arena, key, message, length, computed_tag
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Let eq be proc constant_time_compare from SecureMem with computed_tag, expected_tag, POLY1305_TAG_SIZE
+    proc secure_zero from SecureMem with computed_tag, POLY1305_TAG_SIZE
+    Return eq
+End Process

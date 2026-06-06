@@ -1,0 +1,496 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+TRANSACTION - Connection transaction wrapper with isolation levels and
+savepoints.
+
+A Transaction wraps a Connection in IN_TRANSACTION state. It provides
+commit, rollback and savepoint primitives plus a "with_transaction"
+convenience that commits on success and rolls back on error.
+
+IsolationLevel mapping:
+  ISOLATION_READ_UNCOMMITTED = 0
+  ISOLATION_READ_COMMITTED   = 1
+  ISOLATION_REPEATABLE_READ  = 2
+  ISOLATION_SERIALIZABLE     = 3
+
+Transaction layout (56 bytes):
+  offset 0:  connection_ptr      (8 bytes)
+  offset 8:  isolation_level     (8 bytes)
+  offset 16: state               (8 bytes) - TX_STATE_*
+  offset 24: savepoints_head     (8 bytes)
+  offset 32: savepoint_count     (8 bytes)
+  offset 40: savepoint_release_fn (8 bytes) - driver callback (handle, name_ptr) -> rc
+  offset 48: savepoint_rollback_fn (8 bytes)
+
+Savepoint node (24 bytes):
+  offset 0:  name_ptr            (8 bytes)
+  offset 8:  driver_token        (8 bytes)
+  offset 16: next                (8 bytes)
+
+Dependencies:
+- memory/layout.runa
+- core/memory_core.runa
+- database/connection.runa
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+Import "compiler/frontend/primitives/database/connection.runa" as DB
+
+Constant TX_OFF_CONN as Integer is 0
+Constant TX_OFF_ISOLATION as Integer is 8
+Constant TX_OFF_STATE as Integer is 16
+Constant TX_OFF_SAVEPOINTS as Integer is 24
+Constant TX_OFF_SP_COUNT as Integer is 32
+Constant TX_OFF_SP_RELEASE as Integer is 40
+Constant TX_OFF_SP_ROLLBACK as Integer is 48
+Constant TX_STRUCT_SIZE as Integer is 56
+
+Constant SP_OFF_NAME as Integer is 0
+Constant SP_OFF_TOKEN as Integer is 8
+Constant SP_OFF_NEXT as Integer is 16
+Constant SP_STRUCT_SIZE as Integer is 24
+
+Constant TX_STATE_ACTIVE as Integer is 1
+Constant TX_STATE_COMMITTED as Integer is 2
+Constant TX_STATE_ROLLED_BACK as Integer is 3
+
+Constant ISOLATION_READ_UNCOMMITTED as Integer is 0
+Constant ISOLATION_READ_COMMITTED as Integer is 1
+Constant ISOLATION_REPEATABLE_READ as Integer is 2
+Constant ISOLATION_SERIALIZABLE as Integer is 3
+
+Constant TX_OK as Integer is 1
+Constant TX_ERR_INVALID as Integer is 0
+Constant TX_ERR_STATE as Integer is -1
+Constant TX_ERR_DRIVER as Integer is -2
+Constant TX_ERR_NOT_FOUND as Integer is -3
+Constant TX_ERR_OOM as Integer is -4
+
+Note: ============================================================================
+Note: Transaction lifecycle
+Note: ============================================================================
+
+@Reasoning
+Begin a transaction at the requested isolation level. Internally we
+delegate to connection_begin which dispatches the driver's begin
+callback.
+@End Reasoning
+
+@Implementation
+Validate the isolation level, allocate the 56-byte record, dispatch
+connection_begin. On failure free the record and surface the underlying
+error.
+@End Implementation
+
+@Performance_Hints
+One allocation + one driver call.
+@End Performance_Hints
+
+@Security_Scope
+Caller must call transaction_commit or transaction_rollback before
+closing the connection.
+@End Security_Scope
+
+Process called "transaction_begin" takes c as Integer, isolation as Integer returns Integer:
+    If c is equal to 0:
+        Return 0
+    End If
+    Let level be isolation
+    If level is less than ISOLATION_READ_UNCOMMITTED:
+        Set level to ISOLATION_READ_UNCOMMITTED
+    End If
+    If level is greater than ISOLATION_SERIALIZABLE:
+        Set level to ISOLATION_SERIALIZABLE
+    End If
+    Let tx be proc allocate from Memory with TX_STRUCT_SIZE
+    If tx is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with tx, TX_OFF_CONN, c
+    proc memory_set_int64 from Mem with tx, TX_OFF_ISOLATION, level
+    proc memory_set_int64 from Mem with tx, TX_OFF_STATE, TX_STATE_ACTIVE
+    proc memory_set_int64 from Mem with tx, TX_OFF_SAVEPOINTS, 0
+    proc memory_set_int64 from Mem with tx, TX_OFF_SP_COUNT, 0
+    proc memory_set_int64 from Mem with tx, TX_OFF_SP_RELEASE, 0
+    proc memory_set_int64 from Mem with tx, TX_OFF_SP_ROLLBACK, 0
+    Let rc be proc connection_begin from DB with c, level
+    If rc is not equal to 1:
+        proc deallocate from Memory with tx
+        Return 0
+    End If
+    Return tx
+End Process
+
+Process called "transaction_state" takes tx as Integer returns Integer:
+    If tx is equal to 0:
+        Return TX_STATE_ROLLED_BACK
+    End If
+    Return proc memory_get_int64 from Mem with tx, TX_OFF_STATE
+End Process
+
+Process called "transaction_isolation" takes tx as Integer returns Integer:
+    If tx is equal to 0:
+        Return ISOLATION_READ_UNCOMMITTED
+    End If
+    Return proc memory_get_int64 from Mem with tx, TX_OFF_ISOLATION
+End Process
+
+Process called "transaction_connection" takes tx as Integer returns Integer:
+    If tx is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with tx, TX_OFF_CONN
+End Process
+
+Process called "transaction_savepoint_count" takes tx as Integer returns Integer:
+    If tx is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with tx, TX_OFF_SP_COUNT
+End Process
+
+Process called "transaction_release_savepoints" takes tx as Integer returns Integer:
+    If tx is equal to 0:
+        Return TX_ERR_INVALID
+    End If
+    Let head be proc memory_get_int64 from Mem with tx, TX_OFF_SAVEPOINTS
+    While head is not equal to 0:
+        Let next_n be proc memory_get_int64 from Mem with head, SP_OFF_NEXT
+        proc deallocate from Memory with head
+        Set head to next_n
+    End While
+    proc memory_set_int64 from Mem with tx, TX_OFF_SAVEPOINTS, 0
+    proc memory_set_int64 from Mem with tx, TX_OFF_SP_COUNT, 0
+    Return TX_OK
+End Process
+
+Process called "transaction_commit" takes tx as Integer returns Integer:
+    If tx is equal to 0:
+        Return TX_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with tx, TX_OFF_STATE
+    If state is not equal to TX_STATE_ACTIVE:
+        Return TX_ERR_STATE
+    End If
+    Let c be proc memory_get_int64 from Mem with tx, TX_OFF_CONN
+    Let rc be proc connection_commit from DB with c
+    If rc is not equal to 1:
+        proc memory_set_int64 from Mem with tx, TX_OFF_STATE, TX_STATE_ROLLED_BACK
+        proc transaction_release_savepoints with tx
+        proc deallocate from Memory with tx
+        Return TX_ERR_DRIVER
+    End If
+    proc memory_set_int64 from Mem with tx, TX_OFF_STATE, TX_STATE_COMMITTED
+    proc transaction_release_savepoints with tx
+    proc deallocate from Memory with tx
+    Return TX_OK
+End Process
+
+Process called "transaction_rollback" takes tx as Integer returns Integer:
+    If tx is equal to 0:
+        Return TX_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with tx, TX_OFF_STATE
+    If state is not equal to TX_STATE_ACTIVE:
+        Return TX_ERR_STATE
+    End If
+    Let c be proc memory_get_int64 from Mem with tx, TX_OFF_CONN
+    Let rc be proc connection_rollback from DB with c
+    proc memory_set_int64 from Mem with tx, TX_OFF_STATE, TX_STATE_ROLLED_BACK
+    proc transaction_release_savepoints with tx
+    proc deallocate from Memory with tx
+    If rc is not equal to 1:
+        Return TX_ERR_DRIVER
+    End If
+    Return TX_OK
+End Process
+
+Note: ============================================================================
+Note: Savepoint management
+Note: ============================================================================
+
+@Reasoning
+Savepoints provide nested rollback boundaries inside a single
+transaction. A driver-specific callback issues the SAVEPOINT statement
+and returns an opaque token (e.g. the savepoint identifier in
+Postgres). We retain that token so release/rollback can dispatch back
+to the driver.
+@End Reasoning
+
+@Implementation
+Allocate a 24-byte node, store name and token, push onto the head of
+the savepoints list, increment the counter. The connection must
+implement savepoint callbacks via transaction_install_savepoint_drivers.
+@End Implementation
+
+@Performance_Hints
+One allocation per savepoint.
+@End Performance_Hints
+
+@Security_Scope
+The name_ptr is borrowed; the driver retains the lifetime.
+@End Security_Scope
+
+Process called "transaction_install_savepoint_drivers" takes tx as Integer, savepoint_create_fn as Integer, release_fn as Integer, rollback_fn as Integer returns Integer:
+    If tx is equal to 0:
+        Return TX_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with tx, TX_OFF_SP_RELEASE, release_fn
+    proc memory_set_int64 from Mem with tx, TX_OFF_SP_ROLLBACK, rollback_fn
+    Note: The create callback is invoked through transaction_savepoint below.
+    Return TX_OK
+End Process
+
+Process called "transaction_savepoint" takes tx as Integer, name_ptr as Integer, create_fn as Integer returns Integer:
+    If tx is equal to 0:
+        Return TX_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with tx, TX_OFF_STATE
+    If state is not equal to TX_STATE_ACTIVE:
+        Return TX_ERR_STATE
+    End If
+    Let c be proc memory_get_int64 from Mem with tx, TX_OFF_CONN
+    Let handle be proc connection_handle from DB with c
+    Let token be 0
+    If create_fn is not equal to 0:
+        Set token to proc db_runtime_call_indirect_2 from DB with create_fn, handle, name_ptr
+        If token is equal to 0:
+            Return TX_ERR_DRIVER
+        End If
+    End If
+    Let node be proc allocate from Memory with SP_STRUCT_SIZE
+    If node is equal to 0:
+        Return TX_ERR_OOM
+    End If
+    proc memory_set_int64 from Mem with node, SP_OFF_NAME, name_ptr
+    proc memory_set_int64 from Mem with node, SP_OFF_TOKEN, token
+    Let head be proc memory_get_int64 from Mem with tx, TX_OFF_SAVEPOINTS
+    proc memory_set_int64 from Mem with node, SP_OFF_NEXT, head
+    proc memory_set_int64 from Mem with tx, TX_OFF_SAVEPOINTS, node
+    Let count be proc memory_get_int64 from Mem with tx, TX_OFF_SP_COUNT
+    proc memory_set_int64 from Mem with tx, TX_OFF_SP_COUNT, (count plus 1)
+    Return TX_OK
+End Process
+
+Process called "transaction_find_savepoint" takes tx as Integer, name_ptr as Integer, name_length as Integer returns Integer:
+    If tx is equal to 0:
+        Return 0
+    End If
+    Let node be proc memory_get_int64 from Mem with tx, TX_OFF_SAVEPOINTS
+    While node is not equal to 0:
+        Let candidate_name be proc memory_get_int64 from Mem with node, SP_OFF_NAME
+        If candidate_name is not equal to 0:
+            If name_ptr is not equal to 0:
+                Let cmp be proc memory_compare from Mem with candidate_name, name_ptr, name_length
+                If cmp is equal to 0:
+                    Return node
+                End If
+            End If
+        End If
+        Set node to proc memory_get_int64 from Mem with node, SP_OFF_NEXT
+    End While
+    Return 0
+End Process
+
+@Reasoning
+release_savepoint removes a previously taken savepoint by dispatching
+the driver's release callback and unlinking it from our list. Older
+savepoints (taken before this one) survive; younger savepoints are
+discarded since they could not exist without their ancestor.
+@End Reasoning
+
+@Implementation
+Walk the linked list, find the node and unlink it plus any nodes
+before it. For each unlinked node, call the driver's release callback
+and free the node.
+@End Implementation
+
+@Performance_Hints
+O(n) over savepoint list; n is small in practice.
+@End Performance_Hints
+
+@Security_Scope
+The driver token must remain valid until release is requested.
+@End Security_Scope
+
+Process called "transaction_release_savepoint" takes tx as Integer, name_ptr as Integer, name_length as Integer returns Integer:
+    If tx is equal to 0:
+        Return TX_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with tx, TX_OFF_STATE
+    If state is not equal to TX_STATE_ACTIVE:
+        Return TX_ERR_STATE
+    End If
+    Let head be proc memory_get_int64 from Mem with tx, TX_OFF_SAVEPOINTS
+    Let release_fn be proc memory_get_int64 from Mem with tx, TX_OFF_SP_RELEASE
+    Let c be proc memory_get_int64 from Mem with tx, TX_OFF_CONN
+    Let handle be proc connection_handle from DB with c
+
+    Note: Pop nodes from the head while they precede or equal the target.
+    Let found be 0
+    While head is not equal to 0:
+        Let next_n be proc memory_get_int64 from Mem with head, SP_OFF_NEXT
+        Let candidate_name be proc memory_get_int64 from Mem with head, SP_OFF_NAME
+        Let candidate_token be proc memory_get_int64 from Mem with head, SP_OFF_TOKEN
+        Let is_target be 0
+        If candidate_name is not equal to 0:
+            If name_ptr is not equal to 0:
+                Let cmp be proc memory_compare from Mem with candidate_name, name_ptr, name_length
+                If cmp is equal to 0:
+                    Set is_target to 1
+                End If
+            End If
+        End If
+        If release_fn is not equal to 0:
+            proc db_runtime_call_indirect_2 from DB with release_fn, handle, candidate_token
+        End If
+        proc deallocate from Memory with head
+        Let count be proc memory_get_int64 from Mem with tx, TX_OFF_SP_COUNT
+        If count is greater than 0:
+            proc memory_set_int64 from Mem with tx, TX_OFF_SP_COUNT, (count minus 1)
+        End If
+        Set head to next_n
+        If is_target is equal to 1:
+            Set found to 1
+            proc memory_set_int64 from Mem with tx, TX_OFF_SAVEPOINTS, next_n
+            Return TX_OK
+        End If
+    End While
+    proc memory_set_int64 from Mem with tx, TX_OFF_SAVEPOINTS, 0
+    If found is equal to 1:
+        Return TX_OK
+    End If
+    Return TX_ERR_NOT_FOUND
+End Process
+
+@Reasoning
+rollback_to_savepoint reverts work performed since the named savepoint
+without aborting the surrounding transaction.
+@End Reasoning
+
+@Implementation
+Walk the list to find the named savepoint. Dispatch the rollback
+callback. Drop all savepoints newer than (but not including) the
+target, keeping the target alive.
+@End Implementation
+
+@Performance_Hints
+One driver call plus O(unlinked-count) deallocations.
+@End Performance_Hints
+
+@Security_Scope
+Identical to release.
+@End Security_Scope
+
+Process called "transaction_rollback_to_savepoint" takes tx as Integer, name_ptr as Integer, name_length as Integer returns Integer:
+    If tx is equal to 0:
+        Return TX_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with tx, TX_OFF_STATE
+    If state is not equal to TX_STATE_ACTIVE:
+        Return TX_ERR_STATE
+    End If
+    Let target be proc transaction_find_savepoint with tx, name_ptr, name_length
+    If target is equal to 0:
+        Return TX_ERR_NOT_FOUND
+    End If
+    Let rollback_fn be proc memory_get_int64 from Mem with tx, TX_OFF_SP_ROLLBACK
+    Let c be proc memory_get_int64 from Mem with tx, TX_OFF_CONN
+    Let handle be proc connection_handle from DB with c
+    Let token be proc memory_get_int64 from Mem with target, SP_OFF_TOKEN
+    If rollback_fn is not equal to 0:
+        Let rc be proc db_runtime_call_indirect_2 from DB with rollback_fn, handle, token
+        If rc is not equal to 1:
+            Return TX_ERR_DRIVER
+        End If
+    End If
+    Note: Drop newer savepoints (head ... target's predecessor)
+    Let head be proc memory_get_int64 from Mem with tx, TX_OFF_SAVEPOINTS
+    While head is not equal to target:
+        If head is equal to 0:
+            Note: target was unlinked between checks
+            Return TX_ERR_NOT_FOUND
+        End If
+        Let next_n be proc memory_get_int64 from Mem with head, SP_OFF_NEXT
+        proc deallocate from Memory with head
+        Let count be proc memory_get_int64 from Mem with tx, TX_OFF_SP_COUNT
+        If count is greater than 0:
+            proc memory_set_int64 from Mem with tx, TX_OFF_SP_COUNT, (count minus 1)
+        End If
+        Set head to next_n
+    End While
+    proc memory_set_int64 from Mem with tx, TX_OFF_SAVEPOINTS, head
+    Return TX_OK
+End Process
+
+Note: ============================================================================
+Note: with_transaction convenience (RAII-style)
+Note: ============================================================================
+
+@Reasoning
+with_transaction provides RAII semantics: begin, invoke the user
+function, commit on success, rollback on error. The user function
+receives the connection pointer and returns DB_OK (1) for success or
+any other value to trigger rollback.
+@End Reasoning
+
+@Implementation
+transaction_begin, dispatch the user function with the connection.
+Inspect the return code to choose commit vs rollback. Return the user
+function's return code unchanged.
+@End Implementation
+
+@Performance_Hints
+Two driver calls + one indirect call.
+@End Performance_Hints
+
+@Security_Scope
+fn must not perform its own commit/rollback or savepoint release; the
+wrapper is the single source of transaction termination.
+@End Security_Scope
+
+Process called "with_transaction" takes c as Integer, isolation as Integer, fn as Integer returns Integer:
+    If c is equal to 0:
+        Return TX_ERR_INVALID
+    End If
+    If fn is equal to 0:
+        Return TX_ERR_INVALID
+    End If
+    Let tx be proc transaction_begin with c, isolation
+    If tx is equal to 0:
+        Return TX_ERR_DRIVER
+    End If
+    Let user_rc be proc db_runtime_call_indirect_1 from DB with fn, c
+    If user_rc is equal to 1:
+        Let commit_rc be proc transaction_commit with tx
+        If commit_rc is not equal to TX_OK:
+            Return commit_rc
+        End If
+        Return 1
+    End If
+    proc transaction_rollback with tx
+    Return user_rc
+End Process
+
+Process called "isolation_level_name" takes level as Integer returns Integer:
+    Note: Returns a static-style integer code for diagnostics. The driver
+    Note: maps this back to SQL text when emitting BEGIN statements.
+    If level is equal to ISOLATION_READ_UNCOMMITTED:
+        Return 1001
+    End If
+    If level is equal to ISOLATION_READ_COMMITTED:
+        Return 1002
+    End If
+    If level is equal to ISOLATION_REPEATABLE_READ:
+        Return 1003
+    End If
+    If level is equal to ISOLATION_SERIALIZABLE:
+        Return 1004
+    End If
+    Return 1000
+End Process

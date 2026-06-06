@@ -1,0 +1,677 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+MIME_TYPE - RFC 6838 Media Type Primitive
+==============================================================================
+
+A MimeType is a structured representation of an IANA media type tag:
+"type/subtype; parameter1=value1; parameter2=value2".
+
+References:
+- RFC 6838: Media Type Specifications and Registration Procedures
+- RFC 2046: MIME Part Two: Media Types
+- RFC 7231 section 3.1.1: HTTP Content-Type
+- IANA Media Types Registry
+
+Memory layout for MimeType (40 bytes):
+  offset 0:  type_str pointer    (Integer, 8 bytes) - lowercase null-term
+  offset 8:  subtype_str pointer (Integer, 8 bytes) - lowercase null-term
+  offset 16: params_keys pointer (Integer, 8 bytes) - allocated array of String*
+  offset 24: params_values ptr   (Integer, 8 bytes) - parallel array
+  offset 32: params_count        (Integer, 8 bytes)
+
+Parameter parsing follows RFC 6838 syntax:
+  parameter = name '=' value
+  name      = token (RFC 7230 token: ASCII letters/digits/-_.~+*'$%&)
+  value     = token | quoted-string
+  Names are case-insensitive (we normalize to lower).
+  Values may be quoted with double-quotes; quoted values may contain
+  backslash escapes. Outside of quotes, values are tokens.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StrCore
+
+Constant MIMETYPE_HEADER_SIZE as Integer is 40
+Constant MIME_OFFSET_TYPE as Integer is 0
+Constant MIME_OFFSET_SUBTYPE as Integer is 8
+Constant MIME_OFFSET_KEYS as Integer is 16
+Constant MIME_OFFSET_VALUES as Integer is 24
+Constant MIME_OFFSET_COUNT as Integer is 32
+
+Note: ============================================================================
+Note: COMMON-TYPE CONSTANT STRINGS
+Note: ============================================================================
+
+Constant MIME_STR_TEXT_PLAIN as String is "text/plain"
+Constant MIME_STR_TEXT_HTML as String is "text/html"
+Constant MIME_STR_TEXT_CSS as String is "text/css"
+Constant MIME_STR_TEXT_CSV as String is "text/csv"
+Constant MIME_STR_TEXT_JAVASCRIPT as String is "text/javascript"
+Constant MIME_STR_APPLICATION_JSON as String is "application/json"
+Constant MIME_STR_APPLICATION_XML as String is "application/xml"
+Constant MIME_STR_APPLICATION_PDF as String is "application/pdf"
+Constant MIME_STR_APPLICATION_OCTET_STREAM as String is "application/octet-stream"
+Constant MIME_STR_APPLICATION_FORM_URLENCODED as String is "application/x-www-form-urlencoded"
+Constant MIME_STR_APPLICATION_ZIP as String is "application/zip"
+Constant MIME_STR_IMAGE_PNG as String is "image/png"
+Constant MIME_STR_IMAGE_JPEG as String is "image/jpeg"
+Constant MIME_STR_IMAGE_GIF as String is "image/gif"
+Constant MIME_STR_IMAGE_WEBP as String is "image/webp"
+Constant MIME_STR_IMAGE_SVG as String is "image/svg+xml"
+Constant MIME_STR_AUDIO_MPEG as String is "audio/mpeg"
+Constant MIME_STR_VIDEO_MP4 as String is "video/mp4"
+Constant MIME_STR_MULTIPART_FORM_DATA as String is "multipart/form-data"
+
+Note: ============================================================================
+Note: INTERNAL HELPERS
+Note: ============================================================================
+
+Process called "mime_internal_to_lower_ascii" takes c as Integer returns Integer:
+    If c is greater than or equal to 65:
+        If c is less than or equal to 90:
+            Return c plus 32
+        End If
+    End If
+    Return c
+End Process
+
+Process called "mime_internal_is_token_char" takes c as Integer returns Integer:
+    Note: RFC 7230 token character set.
+    If c is greater than or equal to 65:
+        If c is less than or equal to 90:
+            Return 1
+        End If
+    End If
+    If c is greater than or equal to 97:
+        If c is less than or equal to 122:
+            Return 1
+        End If
+    End If
+    If c is greater than or equal to 48:
+        If c is less than or equal to 57:
+            Return 1
+        End If
+    End If
+    Note: Other RFC 7230 token chars: !#$%&'*+-.^_`|~
+    If c is equal to 33:
+        Return 1
+    End If
+    If c is equal to 35:
+        Return 1
+    End If
+    If c is equal to 36:
+        Return 1
+    End If
+    If c is equal to 37:
+        Return 1
+    End If
+    If c is equal to 38:
+        Return 1
+    End If
+    If c is equal to 39:
+        Return 1
+    End If
+    If c is equal to 42:
+        Return 1
+    End If
+    If c is equal to 43:
+        Return 1
+    End If
+    If c is equal to 45:
+        Return 1
+    End If
+    If c is equal to 46:
+        Return 1
+    End If
+    If c is equal to 94:
+        Return 1
+    End If
+    If c is equal to 95:
+        Return 1
+    End If
+    If c is equal to 96:
+        Return 1
+    End If
+    If c is equal to 124:
+        Return 1
+    End If
+    If c is equal to 126:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "mime_internal_alloc_lower_copy" takes src as Integer, start as Integer, end_pos as Integer returns Integer:
+    Let len be end_pos minus start
+    If len is less than 0:
+        Return 0
+    End If
+    Let buf be allocate(len plus 1)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than len:
+        Let c be Memory.memory_get_byte(src, start plus i)
+        Memory.memory_set_byte(buf, i, mime_internal_to_lower_ascii(c))
+        Set i to i plus 1
+    End While
+    Memory.memory_set_byte(buf, len, 0)
+    Return buf
+End Process
+
+Process called "mime_internal_alloc_raw_copy" takes src as Integer, start as Integer, end_pos as Integer returns Integer:
+    Let len be end_pos minus start
+    If len is less than 0:
+        Return 0
+    End If
+    Let buf be allocate(len plus 1)
+    If buf is equal to 0:
+        Return 0
+    End If
+    If len is greater than 0:
+        Memory.memory_copy(buf, src plus start, len)
+    End If
+    Memory.memory_set_byte(buf, len, 0)
+    Return buf
+End Process
+
+Process called "mime_internal_string_equals_ci" takes a as Integer, b as Integer returns Integer:
+    Note: Case-insensitive ASCII string equality.
+    If a is equal to b:
+        Return 1
+    End If
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    Let scanning be 1
+    Let result be 0
+    While scanning is equal to 1:
+        Let ca be Memory.memory_get_byte(a, i)
+        Let cb be Memory.memory_get_byte(b, i)
+        Let la be mime_internal_to_lower_ascii(ca)
+        Let lb be mime_internal_to_lower_ascii(cb)
+        If la is not equal to lb:
+            Set scanning to 0
+        Otherwise:
+            If ca is equal to 0:
+                Set result to 1
+                Set scanning to 0
+            Otherwise:
+                Set i to i plus 1
+            End If
+        End If
+    End While
+    Return result
+End Process
+
+Note: ============================================================================
+Note: PARSING
+Note: ============================================================================
+
+Process called "mimetype_parse" takes str as Integer returns Integer:
+    @Reasoning
+        Parses a media type string per RFC 6838 + RFC 7231 grammar:
+            media-type = type "/" subtype *( OWS ";" OWS parameter )
+            parameter  = name "=" ( token / quoted-string )
+        Returns 0 on syntax error; otherwise returns a populated
+        MimeType header.
+    @End Reasoning
+    @Implementation
+        Single-pass scanner:
+          1. Read token until '/' -> type (lowercased)
+          2. Read token until ';' or end -> subtype (lowercased)
+          3. For each ';' separated parameter: skip whitespace,
+             read name (lowercased), '=' , read value (token or
+             quoted-string with '\\' escapes).
+        Parameters are stored in two parallel arrays.
+    @End Implementation
+    @Performance_Hints
+        O(n) single pass. Allocates one string per name and value
+        plus two pointer arrays for the parameter table.
+    @End Performance_Hints
+    @Security_Scope
+        Tokens are validated against RFC 7230 character set; invalid
+        characters reject the parse. Quoted values are unescaped per
+        RFC 7230 quoted-string grammar.
+    @End Security_Scope
+
+    If str is equal to 0:
+        Return 0
+    End If
+    Let len be StrCore.string_length(str)
+    If len is equal to 0:
+        Return 0
+    End If
+
+    Let header be allocate(MIMETYPE_HEADER_SIZE)
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_pointer(header, MIME_OFFSET_TYPE, 0)
+    Memory.memory_set_pointer(header, MIME_OFFSET_SUBTYPE, 0)
+    Memory.memory_set_pointer(header, MIME_OFFSET_KEYS, 0)
+    Memory.memory_set_pointer(header, MIME_OFFSET_VALUES, 0)
+    Memory.memory_set_integer(header, MIME_OFFSET_COUNT, 0)
+
+    Let pos be 0
+    Note: Skip leading whitespace
+    Let ws_skip be 1
+    While ws_skip is equal to 1:
+        If pos is greater than or equal to len:
+            Set ws_skip to 0
+        Otherwise:
+            Let wc be Memory.memory_get_byte(str, pos)
+            If wc is equal to 32:
+                Set pos to pos plus 1
+            Otherwise:
+                If wc is equal to 9:
+                    Set pos to pos plus 1
+                Otherwise:
+                    Set ws_skip to 0
+                End If
+            End If
+        End If
+    End While
+
+    Note: Read type
+    Let type_start be pos
+    Let type_scan be 1
+    While type_scan is equal to 1:
+        If pos is greater than or equal to len:
+            Set type_scan to 0
+        Otherwise:
+            Let tc be Memory.memory_get_byte(str, pos)
+            If mime_internal_is_token_char(tc) is equal to 1:
+                Set pos to pos plus 1
+            Otherwise:
+                Set type_scan to 0
+            End If
+        End If
+    End While
+    Let type_end be pos
+    If type_end is equal to type_start:
+        deallocate(header)
+        Return 0
+    End If
+    If pos is greater than or equal to len:
+        deallocate(header)
+        Return 0
+    End If
+    Let slash_byte be Memory.memory_get_byte(str, pos)
+    If slash_byte is not equal to 47:
+        deallocate(header)
+        Return 0
+    End If
+    Set pos to pos plus 1
+
+    Let type_buf be mime_internal_alloc_lower_copy(str, type_start, type_end)
+    Memory.memory_set_pointer(header, MIME_OFFSET_TYPE, type_buf)
+
+    Note: Read subtype
+    Let subtype_start be pos
+    Let sub_scan be 1
+    While sub_scan is equal to 1:
+        If pos is greater than or equal to len:
+            Set sub_scan to 0
+        Otherwise:
+            Let sc be Memory.memory_get_byte(str, pos)
+            If mime_internal_is_token_char(sc) is equal to 1:
+                Set pos to pos plus 1
+            Otherwise:
+                Set sub_scan to 0
+            End If
+        End If
+    End While
+    Let subtype_end be pos
+    If subtype_end is equal to subtype_start:
+        deallocate(type_buf)
+        deallocate(header)
+        Return 0
+    End If
+    Let sub_buf be mime_internal_alloc_lower_copy(str, subtype_start, subtype_end)
+    Memory.memory_set_pointer(header, MIME_OFFSET_SUBTYPE, sub_buf)
+
+    Note: Pre-count parameters (each ';' marks one)
+    Let param_count_est be 0
+    Let q be pos
+    While q is less than len:
+        Let qc be Memory.memory_get_byte(str, q)
+        If qc is equal to 59:
+            Set param_count_est to param_count_est plus 1
+        End If
+        Set q to q plus 1
+    End While
+    If param_count_est is greater than 0:
+        Let keys_arr be allocate(param_count_est multiplied by 8)
+        If keys_arr is equal to 0:
+            deallocate(type_buf)
+            deallocate(sub_buf)
+            deallocate(header)
+            Return 0
+        End If
+        Let vals_arr be allocate(param_count_est multiplied by 8)
+        If vals_arr is equal to 0:
+            deallocate(keys_arr)
+            deallocate(type_buf)
+            deallocate(sub_buf)
+            deallocate(header)
+            Return 0
+        End If
+        Memory.memory_fill(keys_arr, 0, param_count_est multiplied by 8)
+        Memory.memory_fill(vals_arr, 0, param_count_est multiplied by 8)
+        Memory.memory_set_pointer(header, MIME_OFFSET_KEYS, keys_arr)
+        Memory.memory_set_pointer(header, MIME_OFFSET_VALUES, vals_arr)
+    End If
+
+    Let param_idx be 0
+    Let param_loop be 1
+    While param_loop is equal to 1:
+        Note: Skip OWS
+        Let ows1 be 1
+        While ows1 is equal to 1:
+            If pos is greater than or equal to len:
+                Set ows1 to 0
+            Otherwise:
+                Let wsc be Memory.memory_get_byte(str, pos)
+                If wsc is equal to 32:
+                    Set pos to pos plus 1
+                Otherwise:
+                    If wsc is equal to 9:
+                        Set pos to pos plus 1
+                    Otherwise:
+                        Set ows1 to 0
+                    End If
+                End If
+            End If
+        End While
+        If pos is greater than or equal to len:
+            Set param_loop to 0
+        Otherwise:
+            Let sep_c be Memory.memory_get_byte(str, pos)
+            If sep_c is not equal to 59:
+                Set param_loop to 0
+            Otherwise:
+                Set pos to pos plus 1
+                Note: Skip OWS after ;
+                Let ows2 be 1
+                While ows2 is equal to 1:
+                    If pos is greater than or equal to len:
+                        Set ows2 to 0
+                    Otherwise:
+                        Let wsc2 be Memory.memory_get_byte(str, pos)
+                        If wsc2 is equal to 32:
+                            Set pos to pos plus 1
+                        Otherwise:
+                            If wsc2 is equal to 9:
+                                Set pos to pos plus 1
+                            Otherwise:
+                                Set ows2 to 0
+                            End If
+                        End If
+                    End If
+                End While
+                Note: Read parameter name
+                Let name_start be pos
+                Let name_scan be 1
+                While name_scan is equal to 1:
+                    If pos is greater than or equal to len:
+                        Set name_scan to 0
+                    Otherwise:
+                        Let nc be Memory.memory_get_byte(str, pos)
+                        If mime_internal_is_token_char(nc) is equal to 1:
+                            Set pos to pos plus 1
+                        Otherwise:
+                            Set name_scan to 0
+                        End If
+                    End If
+                End While
+                Let name_end be pos
+                If name_end is equal to name_start:
+                    Set param_loop to 0
+                Otherwise:
+                    If pos is greater than or equal to len:
+                        Set param_loop to 0
+                    Otherwise:
+                        Let eq_c be Memory.memory_get_byte(str, pos)
+                        If eq_c is not equal to 61:
+                            Set param_loop to 0
+                        Otherwise:
+                            Set pos to pos plus 1
+                            Note: Read value: token or quoted-string
+                            Let val_buf be 0
+                            If pos is less than len:
+                                Let head_c be Memory.memory_get_byte(str, pos)
+                                If head_c is equal to 34:
+                                    Note: Quoted string
+                                    Set pos to pos plus 1
+                                    Let raw_max be len minus pos
+                                    Let scratch be allocate(raw_max plus 1)
+                                    If scratch is equal to 0:
+                                        Set param_loop to 0
+                                    Otherwise:
+                                        Let w be 0
+                                        Let qscan be 1
+                                        While qscan is equal to 1:
+                                            If pos is greater than or equal to len:
+                                                Set qscan to 0
+                                            Otherwise:
+                                                Let qc2 be Memory.memory_get_byte(str, pos)
+                                                If qc2 is equal to 34:
+                                                    Set pos to pos plus 1
+                                                    Set qscan to 0
+                                                Otherwise:
+                                                    If qc2 is equal to 92:
+                                                        Set pos to pos plus 1
+                                                        If pos is less than len:
+                                                            Let esc_c be Memory.memory_get_byte(str, pos)
+                                                            Memory.memory_set_byte(scratch, w, esc_c)
+                                                            Set w to w plus 1
+                                                            Set pos to pos plus 1
+                                                        End If
+                                                    Otherwise:
+                                                        Memory.memory_set_byte(scratch, w, qc2)
+                                                        Set w to w plus 1
+                                                        Set pos to pos plus 1
+                                                    End If
+                                                End If
+                                            End If
+                                        End While
+                                        Memory.memory_set_byte(scratch, w, 0)
+                                        Set val_buf to allocate(w plus 1)
+                                        If val_buf is equal to 0:
+                                            deallocate(scratch)
+                                            Set param_loop to 0
+                                        Otherwise:
+                                            If w is greater than 0:
+                                                Memory.memory_copy(val_buf, scratch, w)
+                                            End If
+                                            Memory.memory_set_byte(val_buf, w, 0)
+                                            deallocate(scratch)
+                                        End If
+                                    End If
+                                Otherwise:
+                                    Note: Bare token value
+                                    Let val_start be pos
+                                    Let val_scan be 1
+                                    While val_scan is equal to 1:
+                                        If pos is greater than or equal to len:
+                                            Set val_scan to 0
+                                        Otherwise:
+                                            Let vc be Memory.memory_get_byte(str, pos)
+                                            If mime_internal_is_token_char(vc) is equal to 1:
+                                                Set pos to pos plus 1
+                                            Otherwise:
+                                                Set val_scan to 0
+                                            End If
+                                        End If
+                                    End While
+                                    Set val_buf to mime_internal_alloc_raw_copy(str, val_start, pos)
+                                End If
+                            End If
+                            If param_loop is equal to 1:
+                                Let key_buf be mime_internal_alloc_lower_copy(str, name_start, name_end)
+                                Let keys_array be Memory.memory_get_pointer(header, MIME_OFFSET_KEYS)
+                                Let vals_array be Memory.memory_get_pointer(header, MIME_OFFSET_VALUES)
+                                Memory.memory_set_pointer(keys_array, param_idx multiplied by 8, key_buf)
+                                Memory.memory_set_pointer(vals_array, param_idx multiplied by 8, val_buf)
+                                Set param_idx to param_idx plus 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Memory.memory_set_integer(header, MIME_OFFSET_COUNT, param_idx)
+    Return header
+End Process
+
+Process called "mimetype_destroy" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let t be Memory.memory_get_pointer(m, MIME_OFFSET_TYPE)
+    If t is not equal to 0:
+        deallocate(t)
+    End If
+    Let s be Memory.memory_get_pointer(m, MIME_OFFSET_SUBTYPE)
+    If s is not equal to 0:
+        deallocate(s)
+    End If
+    Let count be Memory.memory_get_integer(m, MIME_OFFSET_COUNT)
+    Let keys be Memory.memory_get_pointer(m, MIME_OFFSET_KEYS)
+    Let vals be Memory.memory_get_pointer(m, MIME_OFFSET_VALUES)
+    Let i be 0
+    While i is less than count:
+        Let k be Memory.memory_get_pointer(keys, i multiplied by 8)
+        Let v be Memory.memory_get_pointer(vals, i multiplied by 8)
+        If k is not equal to 0:
+            deallocate(k)
+        End If
+        If v is not equal to 0:
+            deallocate(v)
+        End If
+        Set i to i plus 1
+    End While
+    If keys is not equal to 0:
+        deallocate(keys)
+    End If
+    If vals is not equal to 0:
+        deallocate(vals)
+    End If
+    deallocate(m)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS
+Note: ============================================================================
+
+Process called "mimetype_type" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(m, MIME_OFFSET_TYPE)
+End Process
+
+Process called "mimetype_subtype" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_pointer(m, MIME_OFFSET_SUBTYPE)
+End Process
+
+Process called "mimetype_parameter_count" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_integer(m, MIME_OFFSET_COUNT)
+End Process
+
+Process called "mimetype_parameter" takes m as Integer, name as Integer returns Integer:
+    @Reasoning
+        Returns the value (borrowed pointer) for parameter `name` or 0
+        if absent. Comparison is case-insensitive (RFC 6838).
+    @End Reasoning
+    @Implementation
+        Linear scan of the parameter table (typically 0-2 entries).
+    @End Implementation
+    @Performance_Hints
+        O(count). Fine for the small parameter counts seen in practice.
+    @End Performance_Hints
+    @Security_Scope
+        Safe; pure lookup.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let count be Memory.memory_get_integer(m, MIME_OFFSET_COUNT)
+    Let keys be Memory.memory_get_pointer(m, MIME_OFFSET_KEYS)
+    Let vals be Memory.memory_get_pointer(m, MIME_OFFSET_VALUES)
+    Let i be 0
+    While i is less than count:
+        Let k be Memory.memory_get_pointer(keys, i multiplied by 8)
+        If mime_internal_string_equals_ci(k, name) is equal to 1:
+            Return Memory.memory_get_pointer(vals, i multiplied by 8)
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "mimetype_parameter_at" takes m as Integer, index as Integer returns Integer:
+    Note: Returns the key string for parameter at index, or 0.
+    If m is equal to 0:
+        Return 0
+    End If
+    Let count be Memory.memory_get_integer(m, MIME_OFFSET_COUNT)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Let keys be Memory.memory_get_pointer(m, MIME_OFFSET_KEYS)
+    Return Memory.memory_get_pointer(keys, index multiplied by 8)
+End Process
+
+Process called "mimetype_value_at" takes m as Integer, index as Integer returns Integer:
+    Note: Returns the value string for parameter at index, or 0.
+    If m is equal to 0:
+        Return 0
+    End If
+    Let count be Memory.memory_get_integer(m, MIME_OFFSET_COUNT)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Let vals be Memory.memory_get_pointer(m, MIME_OFFSET_VALUES)
+    Return Memory.memory_get_pointer(vals, index multiplied by 8)
+End Process

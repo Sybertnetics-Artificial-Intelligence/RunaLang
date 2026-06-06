@@ -1,0 +1,1469 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+:End Note
+
+Note:
+==============================================================================
+lab - CIE XYZ, CIELAB, and CIELCh Color Spaces
+==============================================================================
+
+This module implements the CIE 1931 XYZ tristimulus colour space and its
+two derived perceptually-uniform spaces, CIELAB (1976) and CIELCh
+(polar reformulation of LAB). The defining white point is D65 with
+the Bradford-adapted sRGB primaries.
+
+The forward sRGB -> XYZ pipeline:
+
+    1. Apply sRGB inverse transfer function on each channel (handled by
+       the caller via rgb.srgb_to_linear; this module accepts pre-linear
+       inputs in xyz_from_linear_rgb).
+    2. Multiply [r, g, b]^T by the sRGB -> XYZ matrix M (D65, Bradford):
+
+           |  0.4124564  0.3575761  0.1804375 |
+       M = |  0.2126729  0.7151522  0.0721750 |
+           |  0.0193339  0.1191920  0.9503041 |
+
+The CIELAB transform from XYZ:
+
+           L* = 116 * f(Y / Yn) - 16
+           a* = 500 * ( f(X / Xn) - f(Y / Yn) )
+           b* = 200 * ( f(Y / Yn) - f(Z / Zn) )
+
+with the nonlinear f(t):
+
+           f(t) = t^(1/3)                       if  t > (6/29)^3
+           f(t) = (1/3) * (29/6)^2 * t + 4/29    otherwise
+
+This corresponds to f(t) = t^(1/3) for t > 0.008856 and
+f(t) = 7.787*t + 16/116 otherwise, matching the CIE 15:2004 reference.
+
+The CIELCh polar coordinates:
+
+           C* = sqrt(a^2 + b^2)
+           h  = atan2(b, a)  (in degrees, [0, 360))
+
+Two perceptual distance metrics are exposed: CIE76 (the original
+Euclidean distance in LAB) and CIEDE2000 (Sharma 2005 reference
+implementation) including the L', C', h' rotation term and the SL, SC,
+SH weighting functions.
+
+References:
+  - CIE 15:2004 "Colorimetry, 3rd Edition"
+  - G. Sharma, W. Wu, E. N. Dalal, "The CIEDE2000 color-difference
+    formula: Implementation notes, supplementary test data, and
+    mathematical observations", Color Research & Application
+    30(1), pp. 21-30, 2005
+  - sRGB matrix from IEC 61966-2-1:1999 (D65, Bradford)
+==============================================================================
+:End Note
+
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: STRUCT TYPE DEFINITIONS
+Note: ============================================================================
+
+Type called "ColorXyz":
+    x as Float
+    y as Float
+    z as Float
+End Type
+
+Type called "ColorLab":
+    l as Float
+    a as Float
+    b as Float
+End Type
+
+Type called "ColorLch":
+    l as Float
+    c as Float
+    h as Float
+End Type
+
+Type called "ColorLuv":
+    l as Float
+    u as Float
+    v as Float
+End Type
+
+Note: ============================================================================
+Note: NUMERIC HELPERS
+Note: ============================================================================
+
+Process called "absf" takes v as Float returns Float:
+    @Reasoning
+    Floating-point absolute value.
+    @End Reasoning
+    @Implementation
+    Compare then negate.
+    @End Implementation
+    @Performance_Hints
+    Single ucomisd plus negate.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If v is less than 0.0:
+        Return 0.0 minus v
+    End If
+    Return v
+End Process
+
+Process called "sqrtf" takes x as Float returns Float:
+    @Reasoning
+    Square-root delegating to arithmetic_core.sqrt which lowers to
+    sqrtsd on x86-64.
+    @End Reasoning
+    @Implementation
+    Single sqrt invocation.
+    @End Implementation
+    @Performance_Hints
+    ~14 cycle latency on modern x86-64.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return Arith.sqrt(x)
+End Process
+
+Process called "cbrtf" takes x as Float returns Float:
+    @Reasoning
+    Real-valued cube root via Newton-Raphson on y^3 - x = 0. Used by the
+    CIE LAB f(t) transform on the upper branch.
+    @End Reasoning
+    @Implementation
+    Sign-preserve, scale-reduce |x| into [1, 8] via halving / doubling
+    by 8.0, then six Newton iterations from a polynomial seed.
+    @End Implementation
+    @Performance_Hints
+    ~ 80 FLOPs total, dominated by the six iterations.
+    @End Performance_Hints
+    @Security_Scope
+    Pure. Bounded iteration count.
+    @End Security_Scope
+    Let sign be 1.0
+    Let m be x
+    If x is less than 0.0:
+        Set sign to 0.0 minus 1.0
+        Set m to 0.0 minus x
+    End If
+    If m is less than 0.000000000000000000000000000000001:
+        Return 0.0
+    End If
+    Let y be 1.0
+    Let scale_up be 0
+    Let scratch be m
+    While scratch is greater than 8.0:
+        Set scratch to scratch divided by 8.0
+        Set scale_up to scale_up plus 1
+        If scale_up is greater than 400:
+            Set scratch to 8.0
+        End If
+    End While
+    Let scale_dn be 0
+    While scratch is less than 1.0:
+        Set scratch to scratch multiplied by 8.0
+        Set scale_dn to scale_dn plus 1
+        If scale_dn is greater than 400:
+            Set scratch to 1.0
+        End If
+    End While
+    Set y to scratch
+    Let iter be 0
+    While iter is less than 8:
+        Let y2 be y multiplied by y
+        Let num be (y2 multiplied by y) minus scratch
+        Let den be 3.0 multiplied by y2
+        If den is less than or equal to 0.0:
+            Set iter to 8
+        Otherwise:
+            Set y to y minus (num divided by den)
+            Set iter to iter plus 1
+        End If
+    End While
+    Let pow2 be 1.0
+    Let iu be 0
+    While iu is less than scale_up:
+        Set pow2 to pow2 multiplied by 2.0
+        Set iu to iu plus 1
+    End While
+    Let pow2_dn be 1.0
+    Let id be 0
+    While id is less than scale_dn:
+        Set pow2_dn to pow2_dn multiplied by 2.0
+        Set id to id plus 1
+    End While
+    Set y to (y multiplied by pow2) divided by pow2_dn
+    Return sign multiplied by y
+End Process
+
+Process called "pow_real" takes base as Float, exponent as Float returns Float:
+    @Reasoning
+    Real-valued exponentiation via exp(y * ln(x)). Required by the
+    CIEDE2000 weighting and rotation terms whose exponents (3.5, 25, 7,
+    etc) are integer or half-integer values.
+    @End Reasoning
+    @Implementation
+    Range-reduce base into [1, 2) by repeated halving / doubling, sum
+    the Mercator series for ln(m), multiply by exponent, then sum the
+    Maclaurin series for exp(r). Output is reassembled with 2^n
+    scaling.
+    @End Implementation
+    @Performance_Hints
+    ~ 70 FLOPs per call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If exponent is equal to 0.0:
+        Return 1.0
+    End If
+    If base is less than or equal to 0.0:
+        Return 0.0
+    End If
+    Let m be base
+    Let k be 0
+    While m is greater than or equal to 2.0:
+        Set m to m divided by 2.0
+        Set k to k plus 1
+        If k is greater than 2048:
+            Return 0.0
+        End If
+    End While
+    Let kd be 0
+    While m is less than 1.0:
+        Set m to m multiplied by 2.0
+        Set kd to kd plus 1
+        If kd is greater than 2048:
+            Return 0.0
+        End If
+    End While
+    Let z be (m minus 1.0) divided by (m plus 1.0)
+    Let z2 be z multiplied by z
+    Let term be z
+    Let ln_m be 0.0
+    Let idx be 0
+    While idx is less than 30:
+        Let denom be Arith.int_to_float((2 multiplied by idx) plus 1)
+        Set ln_m to ln_m plus (term divided by denom)
+        Set term to term multiplied by z2
+        Set idx to idx plus 1
+    End While
+    Set ln_m to ln_m multiplied by 2.0
+    Let ln2 be 0.69314718055994530941723212145817656807550013436025525412
+    Let ln_base be ln_m plus (Arith.int_to_float(k) multiplied by ln2)
+    Set ln_base to ln_base minus (Arith.int_to_float(kd) multiplied by ln2)
+    Let y be exponent multiplied by ln_base
+    Let n_floor be Arith.float_to_int(y divided by ln2)
+    If y is less than 0.0:
+        If Arith.int_to_float(n_floor) is greater than (y divided by ln2):
+            Set n_floor to n_floor minus 1
+        End If
+    End If
+    Let r_y be y minus (Arith.int_to_float(n_floor) multiplied by ln2)
+    Let exp_r be 1.0
+    Let s_term be 1.0
+    Let i be 1
+    While i is less than 32:
+        Set s_term to (s_term multiplied by r_y) divided by Arith.int_to_float(i)
+        Set exp_r to exp_r plus s_term
+        Set i to i plus 1
+    End While
+    Let two_n be 1.0
+    If n_floor is greater than or equal to 0:
+        Let nn be n_floor
+        While nn is greater than 0:
+            Set two_n to two_n multiplied by 2.0
+            Set nn to nn minus 1
+        End While
+    Otherwise:
+        Let nn be 0 minus n_floor
+        While nn is greater than 0:
+            Set two_n to two_n divided by 2.0
+            Set nn to nn minus 1
+        End While
+    End If
+    Return exp_r multiplied by two_n
+End Process
+
+Process called "sin_deg" takes deg as Float returns Float:
+    @Reasoning
+    Sine of an angle expressed in degrees. Required by the CIEDE2000
+    rotation term and the LCh -> LAB conversion.
+    @End Reasoning
+    @Implementation
+    Reduces the angle modulo 360, converts to radians, then sums the
+    Taylor series sin(x) = x - x^3/6 + x^5/120 - x^7/5040 + ... to 13
+    terms with reduction into [-pi, pi] first.
+    @End Implementation
+    @Performance_Hints
+    ~ 30 multiplies per call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure, bounded reduction.
+    @End Security_Scope
+    Let d be deg
+    While d is greater than or equal to 360.0:
+        Set d to d minus 360.0
+    End While
+    While d is less than 0.0:
+        Set d to d plus 360.0
+    End While
+    Let pi_const be 3.14159265358979323846
+    Let x be (d multiplied by pi_const) divided by 180.0
+    If x is greater than pi_const:
+        Set x to x minus (2.0 multiplied by pi_const)
+    End If
+    Let result be 0.0
+    Let term be x
+    Let sign be 1.0
+    Let n be 1
+    While n is less than 28:
+        Set result to result plus (sign multiplied by term)
+        Set term to (term multiplied by x) multiplied by x
+        Let denom1 be Arith.int_to_float((2 multiplied by n) plus 1)
+        Let denom2 be Arith.int_to_float(2 multiplied by n)
+        Set term to term divided by denom1
+        Set term to term divided by denom2
+        Set sign to 0.0 minus sign
+        Set n to n plus 1
+    End While
+    Return result
+End Process
+
+Process called "cos_deg" takes deg as Float returns Float:
+    @Reasoning
+    Cosine in degrees implemented via sin_deg(90 - x).
+    @End Reasoning
+    @Implementation
+    Returns sin_deg(90 - deg).
+    @End Implementation
+    @Performance_Hints
+    Same cost as sin_deg.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return sin_deg(90.0 minus deg)
+End Process
+
+Process called "atan2_deg" takes y as Float, x as Float returns Float:
+    @Reasoning
+    Two-argument arctangent in degrees, returning a value in [0, 360).
+    Uses series reduction with octant dispatch for accuracy.
+    @End Reasoning
+    @Implementation
+    Reduces |y/x| via atan(t) Maclaurin series for |t|<=1; uses the
+    identity atan(t) + atan(1/t) = pi/2 for |t|>1; assembles the final
+    angle from the sign quadrant.
+    @End Implementation
+    @Performance_Hints
+    ~ 50 FLOPs per call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let pi_const be 3.14159265358979323846
+    If x is equal to 0.0:
+        If y is greater than 0.0:
+            Return 90.0
+        End If
+        If y is less than 0.0:
+            Return 270.0
+        End If
+        Return 0.0
+    End If
+    Let abs_y be absf(y)
+    Let abs_x be absf(x)
+    Let t be abs_y divided by abs_x
+    Let inverted be 0
+    If t is greater than 1.0:
+        Set t to 1.0 divided by t
+        Set inverted to 1
+    End If
+    Let result be 0.0
+    Let term be t
+    Let sign be 1.0
+    Let n be 0
+    Let t2 be t multiplied by t
+    While n is less than 60:
+        Let denom be Arith.int_to_float((2 multiplied by n) plus 1)
+        Set result to result plus ((sign multiplied by term) divided by denom)
+        Set term to term multiplied by t2
+        Set sign to 0.0 minus sign
+        Set n to n plus 1
+    End While
+    If inverted is equal to 1:
+        Set result to (pi_const divided by 2.0) minus result
+    End If
+    If x is less than 0.0:
+        If y is greater than or equal to 0.0:
+            Set result to pi_const minus result
+        Otherwise:
+            Set result to (0.0 minus pi_const) plus result
+        End If
+    Otherwise:
+        If y is less than 0.0:
+            Set result to 0.0 minus result
+        End If
+    End If
+    Let deg_val be (result multiplied by 180.0) divided by pi_const
+    While deg_val is less than 0.0:
+        Set deg_val to deg_val plus 360.0
+    End While
+    While deg_val is greater than or equal to 360.0:
+        Set deg_val to deg_val minus 360.0
+    End While
+    Return deg_val
+End Process
+
+Note: ============================================================================
+Note: D65 WHITE POINT (Bradford-adapted, XYZ tristimulus)
+Note: ============================================================================
+
+Process called "d65_white_x" returns Float:
+    @Reasoning
+    The X tristimulus of the CIE D65 illuminant when Y is normalised to 1.
+    Value 0.95047 matches CIE 15:2004 and IEC 61966-2-1.
+    @End Reasoning
+    @Implementation
+    Literal constant.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return 0.95047
+End Process
+
+Process called "d65_white_y" returns Float:
+    @Reasoning
+    Y tristimulus = 1.0 (definition of normalised D65).
+    @End Reasoning
+    @Implementation
+    Literal constant.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return 1.0
+End Process
+
+Process called "d65_white_z" returns Float:
+    @Reasoning
+    Z tristimulus = 1.08883.
+    @End Reasoning
+    @Implementation
+    Literal constant.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return 1.08883
+End Process
+
+Note: ============================================================================
+Note: sRGB <-> XYZ (D65, Bradford-adapted matrix)
+Note: ============================================================================
+
+Process called "linear_rgb_to_xyz_x" takes r as Float, g as Float, b as Float returns Float:
+    @Reasoning
+    Row 0 of the sRGB -> XYZ matrix multiplied by the linear-RGB vector.
+    @End Reasoning
+    @Implementation
+    Coefficients per IEC 61966-2-1 with Bradford adaptation to D65.
+    @End Implementation
+    @Performance_Hints
+    Three multiplies, two adds.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return ((0.4124564 multiplied by r) plus (0.3575761 multiplied by g)) plus (0.1804375 multiplied by b)
+End Process
+
+Process called "linear_rgb_to_xyz_y" takes r as Float, g as Float, b as Float returns Float:
+    @Reasoning
+    Row 1 of the sRGB -> XYZ matrix.
+    @End Reasoning
+    @Implementation
+    Coefficients per IEC 61966-2-1.
+    @End Implementation
+    @Performance_Hints
+    Three multiplies, two adds.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return ((0.2126729 multiplied by r) plus (0.7151522 multiplied by g)) plus (0.0721750 multiplied by b)
+End Process
+
+Process called "linear_rgb_to_xyz_z" takes r as Float, g as Float, b as Float returns Float:
+    @Reasoning
+    Row 2 of the sRGB -> XYZ matrix.
+    @End Reasoning
+    @Implementation
+    Coefficients per IEC 61966-2-1.
+    @End Implementation
+    @Performance_Hints
+    Three multiplies, two adds.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return ((0.0193339 multiplied by r) plus (0.1191920 multiplied by g)) plus (0.9503041 multiplied by b)
+End Process
+
+Process called "rgb_to_xyz" takes r as Float, g as Float, b as Float returns ColorXyz:
+    @Reasoning
+    Convert a non-linear sRGB triple (r, g, b in [0, 1]) to XYZ in the
+    D65 white-point reference. Applies the sRGB inverse transfer function
+    to each channel before the matrix multiply.
+    @End Reasoning
+    @Implementation
+    Linearises each channel via the IEC 61966-2-1 piecewise inverse
+    transfer, then evaluates the three matrix rows.
+    @End Implementation
+    @Performance_Hints
+    Three transfer evaluations dominate; matrix multiply adds 9 FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let r_lin be srgb_to_linear_local(r)
+    Let g_lin be srgb_to_linear_local(g)
+    Let b_lin be srgb_to_linear_local(b)
+    Let out be a value of type ColorXyz
+    Set out.x to linear_rgb_to_xyz_x(r_lin, g_lin, b_lin)
+    Set out.y to linear_rgb_to_xyz_y(r_lin, g_lin, b_lin)
+    Set out.z to linear_rgb_to_xyz_z(r_lin, g_lin, b_lin)
+    Return out
+End Process
+
+Process called "srgb_to_linear_local" takes c as Float returns Float:
+    @Reasoning
+    Local sRGB inverse transfer used by the rgb_to_xyz pipeline. Kept
+    private to lab.runa so the CIELAB conversion stack remains
+    self-contained and can be linked without pulling in rgb.runa's full
+    surface area when only XYZ / Lab / LCh / Luv conversions are needed.
+    @End Reasoning
+    @Implementation
+    Piecewise: c/12.92 for c<=0.04045 else ((c+0.055)/1.055)^2.4.
+    @End Implementation
+    @Performance_Hints
+    Toe branch is two FP ops; gamma branch dominated by pow_real.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let sign be 1.0
+    Let a be c
+    If c is less than 0.0:
+        Set sign to 0.0 minus 1.0
+        Set a to 0.0 minus c
+    End If
+    Let result be 0.0
+    If a is less than or equal to 0.04045:
+        Set result to a divided by 12.92
+    Otherwise:
+        Let inside be (a plus 0.055) divided by 1.055
+        Set result to pow_real(inside, 2.4)
+    End If
+    Return sign multiplied by result
+End Process
+
+Process called "linear_to_srgb_local" takes c as Float returns Float:
+    @Reasoning
+    Forward sRGB transfer function on a linear-RGB channel.
+    @End Reasoning
+    @Implementation
+    Piecewise: 12.92*c for c<=0.0031308 else 1.055*c^(1/2.4) - 0.055.
+    @End Implementation
+    @Performance_Hints
+    Toe branch is two FP ops; gamma branch dominated by pow_real.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let sign be 1.0
+    Let a be c
+    If c is less than 0.0:
+        Set sign to 0.0 minus 1.0
+        Set a to 0.0 minus c
+    End If
+    Let result be 0.0
+    If a is less than or equal to 0.0031308:
+        Set result to a multiplied by 12.92
+    Otherwise:
+        Let inv_gamma be 1.0 divided by 2.4
+        Set result to (1.055 multiplied by pow_real(a, inv_gamma)) minus 0.055
+    End If
+    Return sign multiplied by result
+End Process
+
+Note: ============================================================================
+Note: XYZ -> sRGB (D65, Bradford-adapted inverse matrix)
+Note: ============================================================================
+
+Process called "xyz_to_linear_rgb_r" takes x as Float, y as Float, z as Float returns Float:
+    @Reasoning
+    Row 0 of the inverse sRGB matrix (XYZ -> linear-RGB).
+    @End Reasoning
+    @Implementation
+    Coefficients per IEC 61966-2-1.
+    @End Implementation
+    @Performance_Hints
+    Three multiplies, two adds.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return ((3.2404542 multiplied by x) minus (1.5371385 multiplied by y)) minus (0.4985314 multiplied by z)
+End Process
+
+Process called "xyz_to_linear_rgb_g" takes x as Float, y as Float, z as Float returns Float:
+    @Reasoning
+    Row 1 of the inverse sRGB matrix.
+    @End Reasoning
+    @Implementation
+    Coefficients per IEC 61966-2-1.
+    @End Implementation
+    @Performance_Hints
+    Three multiplies, two adds.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return ((0.0 minus 0.9692660) multiplied by x) plus (((1.8760108 multiplied by y) plus (0.0415560 multiplied by z)))
+End Process
+
+Process called "xyz_to_linear_rgb_b" takes x as Float, y as Float, z as Float returns Float:
+    @Reasoning
+    Row 2 of the inverse sRGB matrix.
+    @End Reasoning
+    @Implementation
+    Coefficients per IEC 61966-2-1.
+    @End Implementation
+    @Performance_Hints
+    Three multiplies, two adds.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return (((0.0556434 multiplied by x) minus (0.2040259 multiplied by y)) plus (1.0572252 multiplied by z))
+End Process
+
+Process called "xyz_to_rgb" takes xyz as ColorXyz, out_rgb as Integer returns Integer:
+    @Reasoning
+    Convert an XYZ tristimulus back to sRGB (non-linear), writing the
+    four floats r, g, b, 1.0 into out_rgb at offsets 0/8/16/24.
+    @End Reasoning
+    @Implementation
+    Inverse matrix multiply followed by linear_to_srgb per channel.
+    @End Implementation
+    @Performance_Hints
+    Nine FLOPs for the matrix plus three transfer evaluations.
+    @End Performance_Hints
+    @Security_Scope
+    Caller guarantees out_rgb has at least 32 bytes.
+    @End Security_Scope
+    Let r_lin be xyz_to_linear_rgb_r(xyz.x, xyz.y, xyz.z)
+    Let g_lin be xyz_to_linear_rgb_g(xyz.x, xyz.y, xyz.z)
+    Let b_lin be xyz_to_linear_rgb_b(xyz.x, xyz.y, xyz.z)
+    Let r_srgb be linear_to_srgb_local(r_lin)
+    Let g_srgb be linear_to_srgb_local(g_lin)
+    Let b_srgb be linear_to_srgb_local(b_lin)
+    Let _wr be store_float_at_lab(out_rgb, 0, clamp01_local(r_srgb))
+    Let _wg be store_float_at_lab(out_rgb, 8, clamp01_local(g_srgb))
+    Let _wb be store_float_at_lab(out_rgb, 16, clamp01_local(b_srgb))
+    Let _wa be store_float_at_lab(out_rgb, 24, 1.0)
+    Return 0
+End Process
+
+Process called "clamp01_local" takes v as Float returns Float:
+    @Reasoning
+    Unit clamp used when writing channels back out.
+    @End Reasoning
+    @Implementation
+    Two compares.
+    @End Implementation
+    @Performance_Hints
+    Two compares.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If v is less than 0.0:
+        Return 0.0
+    End If
+    If v is greater than 1.0:
+        Return 1.0
+    End If
+    Return v
+End Process
+
+Note: ============================================================================
+Note: CIELAB f(t) AND ITS INVERSE
+Note: ============================================================================
+
+Process called "lab_f" takes t as Float returns Float:
+    @Reasoning
+    Nonlinear CIE LAB transform f(t). On the upper branch t > epsilon
+    (where epsilon = 216/24389 = 0.008856...), returns cbrt(t). On the
+    lower branch returns 7.787*t + 16/116. Used by xyz_to_lab.
+    @End Reasoning
+    @Implementation
+    Threshold at 0.008856 (216/24389). Below: linear with slope 7.787
+    (= (24389/27) / 116, approximately) plus 16/116.
+    @End Implementation
+    @Performance_Hints
+    Branch + either cbrtf or two FP ops.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let epsilon be Arith.int_to_float(216) divided by Arith.int_to_float(24389)
+    If t is greater than epsilon:
+        Return cbrtf(t)
+    End If
+    Let kappa be Arith.int_to_float(24389) divided by Arith.int_to_float(27)
+    Let slope be kappa divided by 116.0
+    Let offset be 16.0 divided by 116.0
+    Return (slope multiplied by t) plus offset
+End Process
+
+Process called "lab_f_inverse" takes ft as Float returns Float:
+    @Reasoning
+    Inverse of lab_f used by lab_to_xyz. The upper branch is the cube of
+    ft (ft^3 > epsilon iff f(t) > delta where delta = 6/29).
+    @End Reasoning
+    @Implementation
+    Threshold at 6/29 = 0.20689655... above which we cube; below we
+    invert the linear branch.
+    @End Implementation
+    @Performance_Hints
+    One compare, two FP ops on each branch.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let delta be 6.0 divided by 29.0
+    If ft is greater than delta:
+        Return (ft multiplied by ft) multiplied by ft
+    End If
+    Let kappa be Arith.int_to_float(24389) divided by Arith.int_to_float(27)
+    Let slope be kappa divided by 116.0
+    Let offset be 16.0 divided by 116.0
+    Return (ft minus offset) divided by slope
+End Process
+
+Process called "xyz_to_lab" takes xyz as ColorXyz returns ColorLab:
+    @Reasoning
+    Convert XYZ (D65 reference) to CIELAB. Divides by the D65 tristimulus
+    component, applies f, and assembles L*, a*, b* per CIE 15:2004.
+    @End Reasoning
+    @Implementation
+    L = 116 f(Y/Yn) - 16, a = 500 (f(X/Xn) - f(Y/Yn)),
+    b = 200 (f(Y/Yn) - f(Z/Zn)).
+    @End Implementation
+    @Performance_Hints
+    Three lab_f evaluations dominate.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let fx be lab_f(xyz.x divided by d65_white_x())
+    Let fy be lab_f(xyz.y divided by d65_white_y())
+    Let fz be lab_f(xyz.z divided by d65_white_z())
+    Let out be a value of type ColorLab
+    Set out.l to (116.0 multiplied by fy) minus 16.0
+    Set out.a to 500.0 multiplied by (fx minus fy)
+    Set out.b to 200.0 multiplied by (fy minus fz)
+    Return out
+End Process
+
+Process called "lab_to_xyz" takes lab as ColorLab returns ColorXyz:
+    @Reasoning
+    Inverse of xyz_to_lab.
+    @End Reasoning
+    @Implementation
+    fy = (L + 16) / 116, fx = a / 500 + fy, fz = fy - b / 200, then apply
+    lab_f_inverse to each and multiply by the D65 tristimulus.
+    @End Implementation
+    @Performance_Hints
+    Three lab_f_inverse evaluations dominate.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let fy be (lab.l plus 16.0) divided by 116.0
+    Let fx be (lab.a divided by 500.0) plus fy
+    Let fz be fy minus (lab.b divided by 200.0)
+    Let out be a value of type ColorXyz
+    Set out.x to lab_f_inverse(fx) multiplied by d65_white_x()
+    Set out.y to lab_f_inverse(fy) multiplied by d65_white_y()
+    Set out.z to lab_f_inverse(fz) multiplied by d65_white_z()
+    Return out
+End Process
+
+Note: ============================================================================
+Note: CIE 1976 L*u*v* COLOR SPACE
+Note: ============================================================================
+
+Process called "uv_prime_x" takes x as Float, y as Float, z as Float returns Float:
+    @Reasoning
+    The CIE 1976 u' chromaticity coordinate per CIE 15:2004:
+        u' = 4X / (X + 15Y + 3Z)
+    Returns 0.0 when the denominator is non-positive (the achromatic
+    axis at the origin has no defined chromaticity).
+    @End Reasoning
+    @Implementation
+    One linear combination + one divide.
+    @End Implementation
+    @Performance_Hints
+    Three FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let denom be x plus ((15.0 multiplied by y) plus (3.0 multiplied by z))
+    If denom is less than or equal to 0.0:
+        Return 0.0
+    End If
+    Return (4.0 multiplied by x) divided by denom
+End Process
+
+Process called "uv_prime_y" takes x as Float, y as Float, z as Float returns Float:
+    @Reasoning
+    The CIE 1976 v' chromaticity coordinate per CIE 15:2004:
+        v' = 9Y / (X + 15Y + 3Z)
+    Returns 0.0 when the denominator is non-positive.
+    @End Reasoning
+    @Implementation
+    One linear combination + one divide.
+    @End Implementation
+    @Performance_Hints
+    Three FLOPs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let denom be x plus ((15.0 multiplied by y) plus (3.0 multiplied by z))
+    If denom is less than or equal to 0.0:
+        Return 0.0
+    End If
+    Return (9.0 multiplied by y) divided by denom
+End Process
+
+Process called "luv_create" takes l as Float, u as Float, v as Float returns ColorLuv:
+    @Reasoning
+    Direct constructor for the CIE 1976 L*u*v* triple. No clamping: L
+    above 100 is valid for HDR pipelines and u / v are intentionally
+    unbounded for wide-gamut XYZ input.
+    @End Reasoning
+    @Implementation
+    Field assignment.
+    @End Implementation
+    @Performance_Hints
+    Three stores.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorLuv
+    Set out.l to l
+    Set out.u to u
+    Set out.v to v
+    Return out
+End Process
+
+Process called "xyz_to_luv" takes xyz as ColorXyz returns ColorLuv:
+    @Reasoning
+    Convert CIE 1931 XYZ (D65 reference) to CIE 1976 L*u*v* per
+    CIE 15:2004. The L* coordinate inherits the LAB lightness so the
+    luminance perception is consistent between the two spaces; u* and
+    v* are L*-weighted differences of the input chromaticity from the
+    D65 reference chromaticity:
+        L* = 116 * f(Y / Yw) - 16
+        u* = 13 * L* * (u' - u_w')
+        v* = 13 * L* * (v' - v_w')
+    where (u_w', v_w') is the D65 reference chromaticity computed at
+    the canonical D65 tristimulus.
+    @End Reasoning
+    @Implementation
+    Computes u' / v' for the colour and for the D65 reference, applies
+    the LAB f() to Y / Yw to recover L*, then forms the L*-weighted
+    difference for u* / v*.
+    @End Implementation
+    @Performance_Hints
+    Two divides + the lab_f evaluation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let u_prime be uv_prime_x(xyz.x, xyz.y, xyz.z)
+    Let v_prime be uv_prime_y(xyz.x, xyz.y, xyz.z)
+    Let u_prime_w be uv_prime_x(d65_white_x(), d65_white_y(), d65_white_z())
+    Let v_prime_w be uv_prime_y(d65_white_x(), d65_white_y(), d65_white_z())
+    Let yn be xyz.y divided by d65_white_y()
+    Let fy be lab_f(yn)
+    Let l_val be (116.0 multiplied by fy) minus 16.0
+    Let out be a value of type ColorLuv
+    Set out.l to l_val
+    Set out.u to (13.0 multiplied by l_val) multiplied by (u_prime minus u_prime_w)
+    Set out.v to (13.0 multiplied by l_val) multiplied by (v_prime minus v_prime_w)
+    Return out
+End Process
+
+Process called "luv_to_xyz" takes luv as ColorLuv returns ColorXyz:
+    @Reasoning
+    Inverse of xyz_to_luv. Recovers (X, Y, Z) at the D65 reference from
+    a CIELUV triple via the rearrangement:
+        Yn = ((L + 16) / 116)^3              if L > 8
+        Yn = L / kappa                        otherwise
+        u' = u / (13 L) + u_w'
+        v' = v / (13 L) + v_w'
+        X  = (9 Y u') / (4 v')
+        Z  = (12 - 3 u' - 20 v') Y / (4 v')
+    where kappa = 24389 / 27. At L = 0 the chromaticity is undefined and
+    the function returns the origin.
+    @End Reasoning
+    @Implementation
+    Selects the cubic / linear branch of Yn per CIE 15:2004; handles
+    the v' = 0 degenerate case by returning the origin (the only
+    in-gamut point with zero chromaticity is the black tristimulus).
+    @End Implementation
+    @Performance_Hints
+    Constant cost (a handful of divides and multiplies).
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorXyz
+    Set out.x to 0.0
+    Set out.y to 0.0
+    Set out.z to 0.0
+    If luv.l is less than or equal to 0.0:
+        Return out
+    End If
+    Let u_prime_w be uv_prime_x(d65_white_x(), d65_white_y(), d65_white_z())
+    Let v_prime_w be uv_prime_y(d65_white_x(), d65_white_y(), d65_white_z())
+    Let u_prime be (luv.u divided by (13.0 multiplied by luv.l)) plus u_prime_w
+    Let v_prime be (luv.v divided by (13.0 multiplied by luv.l)) plus v_prime_w
+    Let kappa be Arith.int_to_float(24389) divided by Arith.int_to_float(27)
+    Let yn be 0.0
+    If luv.l is greater than 8.0:
+        Let t be (luv.l plus 16.0) divided by 116.0
+        Set yn to (t multiplied by t) multiplied by t
+    Otherwise:
+        Set yn to luv.l divided by kappa
+    End If
+    Let y_val be yn multiplied by d65_white_y()
+    Set out.y to y_val
+    If v_prime is less than or equal to 0.0:
+        Return out
+    End If
+    Set out.x to ((9.0 multiplied by y_val) multiplied by u_prime) divided by (4.0 multiplied by v_prime)
+    Let z_factor be (12.0 minus ((3.0 multiplied by u_prime) plus (20.0 multiplied by v_prime))) multiplied by y_val
+    Set out.z to z_factor divided by (4.0 multiplied by v_prime)
+    Return out
+End Process
+
+Process called "luv_l" takes c as ColorLuv returns Float:
+    @Reasoning
+    Read the L* coordinate of a CIELUV triple.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.l
+End Process
+
+Process called "luv_u" takes c as ColorLuv returns Float:
+    @Reasoning
+    Read the u* coordinate of a CIELUV triple.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.u
+End Process
+
+Process called "luv_v" takes c as ColorLuv returns Float:
+    @Reasoning
+    Read the v* coordinate of a CIELUV triple.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.v
+End Process
+
+Note: ============================================================================
+Note: LAB <-> LCH POLAR CONVERSION
+Note: ============================================================================
+
+Process called "lab_to_lch" takes lab as ColorLab returns ColorLch:
+    @Reasoning
+    Convert CIELAB to CIELCh polar coordinates. Chroma C = sqrt(a^2 + b^2);
+    hue h = atan2(b, a) in degrees, wrapped to [0, 360).
+    @End Reasoning
+    @Implementation
+    sqrtf and atan2_deg.
+    @End Implementation
+    @Performance_Hints
+    One sqrt + one atan2 (~50 FLOPs).
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorLch
+    Set out.l to lab.l
+    Set out.c to sqrtf((lab.a multiplied by lab.a) plus (lab.b multiplied by lab.b))
+    Set out.h to atan2_deg(lab.b, lab.a)
+    Return out
+End Process
+
+Process called "lch_to_lab" takes lch as ColorLch returns ColorLab:
+    @Reasoning
+    Inverse of lab_to_lch.
+    @End Reasoning
+    @Implementation
+    a = C cos(h), b = C sin(h) with h in degrees.
+    @End Implementation
+    @Performance_Hints
+    One sin + one cos.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorLab
+    Set out.l to lch.l
+    Set out.a to lch.c multiplied by cos_deg(lch.h)
+    Set out.b to lch.c multiplied by sin_deg(lch.h)
+    Return out
+End Process
+
+Note: ============================================================================
+Note: PERCEPTUAL DISTANCE METRICS
+Note: ============================================================================
+
+Process called "delta_e_1976" takes c1 as ColorLab, c2 as ColorLab returns Float:
+    @Reasoning
+    Original CIE 1976 LAB distance: Euclidean in (L, a, b).
+    @End Reasoning
+    @Implementation
+    sqrt of squared differences.
+    @End Implementation
+    @Performance_Hints
+    Three multiplies + two adds + sqrt.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let dl be c1.l minus c2.l
+    Let da be c1.a minus c2.a
+    Let db be c1.b minus c2.b
+    Let sum be ((dl multiplied by dl) plus (da multiplied by da)) plus (db multiplied by db)
+    Return sqrtf(sum)
+End Process
+
+Process called "delta_e_2000" takes c1 as ColorLab, c2 as ColorLab returns Float:
+    @Reasoning
+    CIEDE2000 full distance per Sharma 2005 reference. Includes the
+    L' / C' / h' rotation term and the SL / SC / SH weighting functions.
+    Reference implementation matches Sharma's MATLAB script.
+    @End Reasoning
+    @Implementation
+    Step 1: compute mean chroma C_bar, and the G factor with C_bar^7.
+    Step 2: a' for each colour = a*(1 + G).
+    Step 3: C' = sqrt(a'^2 + b^2), h' = atan2(b, a') in degrees, [0, 360).
+    Step 4: deltaL', deltaC', deltaH' (with the hue-shift convention).
+    Step 5: SL, SC, SH weighting functions; RT rotation term using the
+    delta_theta = 30 exp(-((h'_bar - 275)/25)^2) angular argument.
+    @End Implementation
+    @Performance_Hints
+    Dominated by 4 pow_real evaluations (C_bar^7 twice, sqrt computations
+    are sqrtf). ~ 400 FLOPs per call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let l1 be c1.l
+    Let a1 be c1.a
+    Let b1 be c1.b
+    Let l2 be c2.l
+    Let a2 be c2.a
+    Let b2 be c2.b
+    Let c1_ab be sqrtf((a1 multiplied by a1) plus (b1 multiplied by b1))
+    Let c2_ab be sqrtf((a2 multiplied by a2) plus (b2 multiplied by b2))
+    Let c_bar_ab be (c1_ab plus c2_ab) divided by 2.0
+    Let c_bar_ab_7 be pow_real(c_bar_ab, 7.0)
+    Let pow25_7 be pow_real(25.0, 7.0)
+    Let g_factor be 0.5 multiplied by (1.0 minus sqrtf(c_bar_ab_7 divided by (c_bar_ab_7 plus pow25_7)))
+    Let a1_p be a1 multiplied by (1.0 plus g_factor)
+    Let a2_p be a2 multiplied by (1.0 plus g_factor)
+    Let c1_p be sqrtf((a1_p multiplied by a1_p) plus (b1 multiplied by b1))
+    Let c2_p be sqrtf((a2_p multiplied by a2_p) plus (b2 multiplied by b2))
+    Let h1_p be 0.0
+    If b1 is not equal to 0.0:
+        Set h1_p to atan2_deg(b1, a1_p)
+    Otherwise:
+        If a1_p is not equal to 0.0:
+            Set h1_p to atan2_deg(b1, a1_p)
+        End If
+    End If
+    Let h2_p be 0.0
+    If b2 is not equal to 0.0:
+        Set h2_p to atan2_deg(b2, a2_p)
+    Otherwise:
+        If a2_p is not equal to 0.0:
+            Set h2_p to atan2_deg(b2, a2_p)
+        End If
+    End If
+    Let dL be l2 minus l1
+    Let dC be c2_p minus c1_p
+    Let dh be 0.0
+    Let c_product be c1_p multiplied by c2_p
+    If c_product is equal to 0.0:
+        Set dh to 0.0
+    Otherwise:
+        Let diff be h2_p minus h1_p
+        If diff is greater than 180.0:
+            Set dh to diff minus 360.0
+        Otherwise:
+            If diff is less than (0.0 minus 180.0):
+                Set dh to diff plus 360.0
+            Otherwise:
+                Set dh to diff
+            End If
+        End If
+    End If
+    Let dH be 2.0 multiplied by sqrtf(c_product) multiplied by sin_deg(dh divided by 2.0)
+    Let l_bar be (l1 plus l2) divided by 2.0
+    Let c_bar be (c1_p plus c2_p) divided by 2.0
+    Let h_bar be 0.0
+    If c_product is equal to 0.0:
+        Set h_bar to h1_p plus h2_p
+    Otherwise:
+        Let diff_h be absf(h1_p minus h2_p)
+        If diff_h is greater than 180.0:
+            If (h1_p plus h2_p) is less than 360.0:
+                Set h_bar to ((h1_p plus h2_p) plus 360.0) divided by 2.0
+            Otherwise:
+                Set h_bar to ((h1_p plus h2_p) minus 360.0) divided by 2.0
+            End If
+        Otherwise:
+            Set h_bar to (h1_p plus h2_p) divided by 2.0
+        End If
+    End If
+    Let t_factor be 1.0
+    Set t_factor to t_factor minus (0.17 multiplied by cos_deg(h_bar minus 30.0))
+    Set t_factor to t_factor plus (0.24 multiplied by cos_deg(2.0 multiplied by h_bar))
+    Set t_factor to t_factor plus (0.32 multiplied by cos_deg((3.0 multiplied by h_bar) plus 6.0))
+    Set t_factor to t_factor minus (0.20 multiplied by cos_deg((4.0 multiplied by h_bar) minus 63.0))
+    Let l_bar_minus_50 be l_bar minus 50.0
+    Let s_l_numer be 0.015 multiplied by (l_bar_minus_50 multiplied by l_bar_minus_50)
+    Let s_l_denom be sqrtf(20.0 plus (l_bar_minus_50 multiplied by l_bar_minus_50))
+    Let s_l be 1.0 plus (s_l_numer divided by s_l_denom)
+    Let s_c be 1.0 plus (0.045 multiplied by c_bar)
+    Let s_h be 1.0 plus ((0.015 multiplied by c_bar) multiplied by t_factor)
+    Let h_term be (h_bar minus 275.0) divided by 25.0
+    Let delta_theta be 30.0 multiplied by pow_real(2.71828182845904523536, 0.0 minus (h_term multiplied by h_term))
+    Let c_bar_7 be pow_real(c_bar, 7.0)
+    Let r_c be 2.0 multiplied by sqrtf(c_bar_7 divided by (c_bar_7 plus pow25_7))
+    Let r_t be (0.0 minus sin_deg(2.0 multiplied by delta_theta)) multiplied by r_c
+    Let kL be 1.0
+    Let kC be 1.0
+    Let kH be 1.0
+    Let term_L be dL divided by (kL multiplied by s_l)
+    Let term_C be dC divided by (kC multiplied by s_c)
+    Let term_H be dH divided by (kH multiplied by s_h)
+    Let rt_term be r_t multiplied by (term_C multiplied by term_H)
+    Let sum_sq be ((term_L multiplied by term_L) plus (term_C multiplied by term_C)) plus (term_H multiplied by term_H)
+    Set sum_sq to sum_sq plus rt_term
+    Return sqrtf(sum_sq)
+End Process
+
+Note: ============================================================================
+Note: BIT-CAST HELPERS
+Note: ============================================================================
+
+Process called "float_to_bits_lab" takes x as Float returns Integer:
+    @Reasoning
+    Bit-cast Float64 to its 64-bit integer pattern.
+    @End Reasoning
+    @Implementation
+    Inline assembly reads the float-occupying stack slot as integer.
+    @End Implementation
+    @Performance_Hints
+    Single mov.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "store_float_at_lab" takes ptr as Integer, offset as Integer, value as Float returns Integer:
+    @Reasoning
+    Bit-cast a Float64 and store at ptr + offset.
+    @End Reasoning
+    @Implementation
+    float_to_bits_lab + memory_set_int64.
+    @End Implementation
+    @Performance_Hints
+    Two movs + one store.
+    @End Performance_Hints
+    @Security_Scope
+    Caller owns ptr.
+    @End Security_Scope
+    Let bits be float_to_bits_lab(value)
+    Let _w be Memory.memory_set_int64(ptr, offset, bits)
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS
+Note: ============================================================================
+
+Process called "xyz_x" takes c as ColorXyz returns Float:
+    @Reasoning
+    Read X tristimulus.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.x
+End Process
+
+Process called "xyz_y" takes c as ColorXyz returns Float:
+    @Reasoning
+    Read Y tristimulus.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.y
+End Process
+
+Process called "xyz_z" takes c as ColorXyz returns Float:
+    @Reasoning
+    Read Z tristimulus.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.z
+End Process
+
+Process called "lab_l" takes c as ColorLab returns Float:
+    @Reasoning
+    Read L*.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.l
+End Process
+
+Process called "lab_a" takes c as ColorLab returns Float:
+    @Reasoning
+    Read a*.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.a
+End Process
+
+Process called "lab_b" takes c as ColorLab returns Float:
+    @Reasoning
+    Read b*.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.b
+End Process
+
+Process called "lch_l" takes c as ColorLch returns Float:
+    @Reasoning
+    Read LCh L*.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.l
+End Process
+
+Process called "lch_c" takes c as ColorLch returns Float:
+    @Reasoning
+    Read chroma.
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.c
+End Process
+
+Process called "lch_h" takes c as ColorLch returns Float:
+    @Reasoning
+    Read hue (degrees).
+    @End Reasoning
+    @Implementation
+    Field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.h
+End Process
+
+Process called "lab_create" takes l as Float, a as Float, b as Float returns ColorLab:
+    @Reasoning
+    Direct ColorLab constructor.
+    @End Reasoning
+    @Implementation
+    Per-field assignment.
+    @End Implementation
+    @Performance_Hints
+    One allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorLab
+    Set out.l to l
+    Set out.a to a
+    Set out.b to b
+    Return out
+End Process
+
+Process called "lch_create" takes l as Float, c as Float, h as Float returns ColorLch:
+    @Reasoning
+    Direct ColorLch constructor.
+    @End Reasoning
+    @Implementation
+    Per-field assignment.
+    @End Implementation
+    @Performance_Hints
+    One allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorLch
+    Set out.l to l
+    Set out.c to c
+    Set out.h to h
+    Return out
+End Process
+
+Process called "xyz_create" takes x as Float, y as Float, z as Float returns ColorXyz:
+    @Reasoning
+    Direct ColorXyz constructor.
+    @End Reasoning
+    @Implementation
+    Per-field assignment.
+    @End Implementation
+    @Performance_Hints
+    One allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorXyz
+    Set out.x to x
+    Set out.y to y
+    Set out.z to z
+    Return out
+End Process

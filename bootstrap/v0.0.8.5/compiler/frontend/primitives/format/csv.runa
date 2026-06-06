@@ -1,0 +1,1214 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+==============================================================================
+CSV - RFC 4180 Comma-Separated Values plus common dialects (TSV, etc.)
+==============================================================================
+
+Pure-Runa CSV parser and serializer supporting RFC 4180 and common
+real-world dialect variations.
+
+References:
+- RFC 4180  - Common Format and MIME Type for CSV Files (October 2005)
+- IANA text/csv registration
+- POSIX awk/cut TSV de-facto conventions
+
+This module provides:
+- CsvDialect record exposing all dialect knobs (delimiter, quote, escape
+  style, line endings, skip-initial-space, strict-quoting).
+- csv_parse / csv_serialize for whole-document workflows.
+- TSV convenience: csv_tsv_dialect.
+- Streaming iterator: csv_iterator_create / csv_iterator_next for
+  inputs that exceed memory budget.
+- Field-level escape & quote logic per RFC 4180 section 2.
+:End Note
+
+Note: ============================================================================
+Note: TAG CONSTANTS
+Note: ============================================================================
+
+Constant CSV_ESCAPE_DOUBLE_QUOTE as Integer is 0
+Constant CSV_ESCAPE_BACKSLASH as Integer is 1
+
+Constant CSV_LINE_ENDING_CRLF as Integer is 0
+Constant CSV_LINE_ENDING_LF as Integer is 1
+Constant CSV_LINE_ENDING_AUTO as Integer is 2
+
+Constant CSV_RESULT_OK as Integer is 0
+Constant CSV_RESULT_ERROR as Integer is 1
+
+Note: ============================================================================
+Note: TYPE LAYOUTS
+Note: ============================================================================
+Note:
+CsvDialect (56 bytes):
+  offset 0 : delimiter         (Integer; ASCII byte code)
+  offset 8 : quote_char        (Integer; ASCII byte code)
+  offset 16: escape_style      (Integer; 0=double-quote, 1=backslash)
+  offset 24: line_endings      (Integer; 0=CRLF, 1=LF, 2=Auto)
+  offset 32: skip_initial_space(Integer; 0/1)
+  offset 40: strict_quoting    (Integer; 0/1)
+  offset 48: has_header        (Integer; 0/1 - parser hint, not enforced)
+
+CsvDocument (40 bytes):
+  offset 0 : header_ptr        (CsvRow pointer or 0)
+  offset 8 : rows_ptr          (buffer of CsvRow pointers)
+  offset 16: row_count         (Integer)
+  offset 24: row_capacity      (Integer)
+  offset 32: has_header_flag   (0/1)
+
+CsvRow (24 bytes):
+  offset 0 : fields_ptr        (buffer of String pointers)
+  offset 8 : field_count       (Integer)
+  offset 16: field_capacity    (Integer)
+
+CsvParseError (24 bytes):
+  offset 0 : line              (Integer, 1-based)
+  offset 8 : column            (Integer, 1-based)
+  offset 16: message           (String pointer)
+
+CsvResult (16 bytes):
+  offset 0 : variant           (0=Ok, 1=Error)
+  offset 8 : payload           (CsvDocument or CsvParseError pointer)
+
+CsvParserState (40 bytes):
+  offset 0 : source            (input string pointer)
+  offset 8 : pos               (current offset)
+  offset 16: line              (Integer, 1-based)
+  offset 24: column            (Integer, 1-based)
+  offset 32: dialect           (CsvDialect pointer)
+
+CsvIterator (40 bytes):
+  offset 0 : parser_state      (CsvParserState pointer)
+  offset 8 : done_flag         (0/1)
+  offset 16: last_error_line   (Integer)
+  offset 24: last_error_column (Integer)
+  offset 32: last_error_msg    (String pointer or 0)
+:End Note
+
+Note: ============================================================================
+Note: DIALECT CONSTRUCTORS
+Note: ============================================================================
+
+Process called "csv_dialect_create" returns Integer:
+    @Reasoning
+        Default RFC 4180 dialect: comma delimiter, double-quote field
+        wrapper, double-quote escape ("foo""bar"), CRLF line endings,
+        strict quoting (every quote-containing field must be wrapped).
+    @End Reasoning
+    @Implementation
+        Allocates 56-byte record and fills all seven knobs.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        No external input. Allocation failure returns 0.
+    @End Security_Scope
+
+    Let d be allocate(56)
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 0, 44)
+    __store(d, 8, 34)
+    __store(d, 16, 0)
+    __store(d, 24, 0)
+    __store(d, 32, 0)
+    __store(d, 40, 1)
+    __store(d, 48, 0)
+    Return d
+End Process
+
+Process called "csv_tsv_dialect" returns Integer:
+    @Reasoning
+        TSV (tab-separated values) per the de-facto convention used by
+        POSIX cut(1) and awk(1): tab delimiter, LF line endings, no
+        in-field quoting expected (strict_quoting=0).
+    @End Reasoning
+    @Implementation
+        Starts from csv_dialect_create and overrides delimiter to 9
+        (HT), line_endings to LF, strict_quoting to 0.
+    @End Implementation
+    @Performance_Hints
+        O(1).
+    @End Performance_Hints
+    @Security_Scope
+        No external input.
+    @End Security_Scope
+
+    Let d be csv_dialect_create()
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 0, 9)
+    __store(d, 24, 1)
+    __store(d, 40, 0)
+    Return d
+End Process
+
+Process called "csv_dialect_set_delimiter" that takes d as Integer, byte as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 0, byte)
+    Return 1
+End Process
+
+Process called "csv_dialect_set_quote_char" that takes d as Integer, byte as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 8, byte)
+    Return 1
+End Process
+
+Process called "csv_dialect_set_escape_style" that takes d as Integer, style as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 16, style)
+    Return 1
+End Process
+
+Process called "csv_dialect_set_line_endings" that takes d as Integer, mode as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 24, mode)
+    Return 1
+End Process
+
+Process called "csv_dialect_set_skip_initial_space" that takes d as Integer, flag as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 32, flag)
+    Return 1
+End Process
+
+Process called "csv_dialect_set_strict_quoting" that takes d as Integer, flag as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 40, flag)
+    Return 1
+End Process
+
+Process called "csv_dialect_set_has_header" that takes d as Integer, flag as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    __store(d, 48, flag)
+    Return 1
+End Process
+
+Process called "csv_dialect_destroy" that takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    deallocate(d)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: BYTE BUILDER (local, distinct from JSON's; same shape)
+Note: ============================================================================
+
+Process called "cbb_create" that takes initial_cap as Integer returns Integer:
+    Let b be allocate(24)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let cap be initial_cap
+    If cap is less than 16:
+        Set cap to 16
+    End If
+    Let data be allocate(cap)
+    If data is equal to 0:
+        deallocate(b)
+        Return 0
+    End If
+    __store(b, 0, data)
+    __store(b, 8, 0)
+    __store(b, 16, cap)
+    Return b
+End Process
+
+Process called "cbb_destroy" that takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let data be __load(b, 0)
+    If data is not equal to 0:
+        deallocate(data)
+    End If
+    deallocate(b)
+    Return 1
+End Process
+
+Process called "cbb_reserve" that takes b as Integer, extra as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be __load(b, 8)
+    Let cap be __load(b, 16)
+    Let needed be len plus extra plus 1
+    If needed is less than or equal to cap:
+        Return 1
+    End If
+    Let new_cap be cap
+    While new_cap is less than needed:
+        Set new_cap to new_cap multiplied by 2
+    End While
+    Let new_data be allocate(new_cap)
+    If new_data is equal to 0:
+        Return 0
+    End If
+    Let old_data be __load(b, 0)
+    Let i be 0
+    While i is less than len:
+        __byte_store(new_data, i, __byte_load(old_data, i))
+        Set i to i plus 1
+    End While
+    deallocate(old_data)
+    __store(b, 0, new_data)
+    __store(b, 16, new_cap)
+    Return 1
+End Process
+
+Process called "cbb_append_byte" that takes b as Integer, byte as Integer returns Integer:
+    If cbb_reserve(b, 1) is equal to 0:
+        Return 0
+    End If
+    Let data be __load(b, 0)
+    Let len be __load(b, 8)
+    __byte_store(data, len, byte)
+    __store(b, 8, len plus 1)
+    Return 1
+End Process
+
+Process called "cbb_append_string" that takes b as Integer, s as Integer returns Integer:
+    If s is equal to 0:
+        Return 1
+    End If
+    Let sl be string_length(s)
+    If cbb_reserve(b, sl) is equal to 0:
+        Return 0
+    End If
+    Let data be __load(b, 0)
+    Let len be __load(b, 8)
+    Let i be 0
+    While i is less than sl:
+        __byte_store(data, len plus i, string_char_at(s, i))
+        Set i to i plus 1
+    End While
+    __store(b, 8, len plus sl)
+    Return 1
+End Process
+
+Process called "cbb_finalize" that takes b as Integer returns Integer:
+    If b is equal to 0:
+        Return 0
+    End If
+    Let len be __load(b, 8)
+    Let data be __load(b, 0)
+    Let result be allocate(len plus 1)
+    If result is equal to 0:
+        cbb_destroy(b)
+        Return 0
+    End If
+    Let i be 0
+    While i is less than len:
+        __byte_store(result, i, __byte_load(data, i))
+        Set i to i plus 1
+    End While
+    __byte_store(result, len, 0)
+    cbb_destroy(b)
+    Return result
+End Process
+
+Note: ============================================================================
+Note: DOCUMENT / ROW CONSTRUCTORS
+Note: ============================================================================
+
+Process called "csv_row_create" returns Integer:
+    Let r be allocate(24)
+    If r is equal to 0:
+        Return 0
+    End If
+    Let fields be allocate(32)
+    If fields is equal to 0:
+        deallocate(r)
+        Return 0
+    End If
+    __store(r, 0, fields)
+    __store(r, 8, 0)
+    __store(r, 16, 4)
+    Return r
+End Process
+
+Process called "csv_row_field_count" that takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Return __load(r, 8)
+End Process
+
+Process called "csv_row_field_at" that takes r as Integer, index as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Let len be __load(r, 8)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to len:
+        Return 0
+    End If
+    Let fields be __load(r, 0)
+    Return __load(fields, index multiplied by 8)
+End Process
+
+Process called "csv_row_append_field" that takes r as Integer, field as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Let len be __load(r, 8)
+    Let cap be __load(r, 16)
+    If len is greater than or equal to cap:
+        Let new_cap be cap multiplied by 2
+        Let new_fields be allocate(new_cap multiplied by 8)
+        If new_fields is equal to 0:
+            Return 0
+        End If
+        Let old_fields be __load(r, 0)
+        Let i be 0
+        While i is less than len:
+            __store(new_fields, i multiplied by 8, __load(old_fields, i multiplied by 8))
+            Set i to i plus 1
+        End While
+        deallocate(old_fields)
+        __store(r, 0, new_fields)
+        __store(r, 16, new_cap)
+    End If
+    Let fields be __load(r, 0)
+    __store(fields, len multiplied by 8, field)
+    __store(r, 8, len plus 1)
+    Return 1
+End Process
+
+Process called "csv_document_create" returns Integer:
+    Let doc be allocate(40)
+    If doc is equal to 0:
+        Return 0
+    End If
+    Let rows be allocate(32)
+    If rows is equal to 0:
+        deallocate(doc)
+        Return 0
+    End If
+    __store(doc, 0, 0)
+    __store(doc, 8, rows)
+    __store(doc, 16, 0)
+    __store(doc, 24, 4)
+    __store(doc, 32, 0)
+    Return doc
+End Process
+
+Process called "csv_document_set_header" that takes doc as Integer, header_row as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    __store(doc, 0, header_row)
+    If header_row is not equal to 0:
+        __store(doc, 32, 1)
+    Otherwise:
+        __store(doc, 32, 0)
+    End If
+    Return 1
+End Process
+
+Process called "csv_document_has_header" that takes doc as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Return __load(doc, 32)
+End Process
+
+Process called "csv_document_header" that takes doc as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Return __load(doc, 0)
+End Process
+
+Process called "csv_document_row_count" that takes doc as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Return __load(doc, 16)
+End Process
+
+Process called "csv_document_row_at" that takes doc as Integer, index as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Let len be __load(doc, 16)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to len:
+        Return 0
+    End If
+    Let rows be __load(doc, 8)
+    Return __load(rows, index multiplied by 8)
+End Process
+
+Process called "csv_document_append_row" that takes doc as Integer, row as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Let len be __load(doc, 16)
+    Let cap be __load(doc, 24)
+    If len is greater than or equal to cap:
+        Let new_cap be cap multiplied by 2
+        Let new_rows be allocate(new_cap multiplied by 8)
+        If new_rows is equal to 0:
+            Return 0
+        End If
+        Let old_rows be __load(doc, 8)
+        Let i be 0
+        While i is less than len:
+            __store(new_rows, i multiplied by 8, __load(old_rows, i multiplied by 8))
+            Set i to i plus 1
+        End While
+        deallocate(old_rows)
+        __store(doc, 8, new_rows)
+        __store(doc, 24, new_cap)
+    End If
+    Let rows be __load(doc, 8)
+    __store(rows, len multiplied by 8, row)
+    __store(doc, 16, len plus 1)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: RESULT / ERROR
+Note: ============================================================================
+
+Process called "csv_result_ok" that takes value as Integer returns Integer:
+    Let r be allocate(16)
+    If r is equal to 0:
+        Return 0
+    End If
+    __store(r, 0, 0)
+    __store(r, 8, value)
+    Return r
+End Process
+
+Process called "csv_result_error" that takes err as Integer returns Integer:
+    Let r be allocate(16)
+    If r is equal to 0:
+        Return 0
+    End If
+    __store(r, 0, 1)
+    __store(r, 8, err)
+    Return r
+End Process
+
+Process called "csv_result_is_ok" that takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Let variant be __load(r, 0)
+    If variant is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "csv_result_payload" that takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Return __load(r, 8)
+End Process
+
+Process called "csv_error_create" that takes line as Integer, column as Integer, message as Integer returns Integer:
+    Let e be allocate(24)
+    If e is equal to 0:
+        Return 0
+    End If
+    __store(e, 0, line)
+    __store(e, 8, column)
+    If message is equal to 0:
+        __store(e, 16, string_duplicate(""))
+    Otherwise:
+        __store(e, 16, string_duplicate(message))
+    End If
+    Return e
+End Process
+
+Process called "csv_error_line" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 0)
+End Process
+
+Process called "csv_error_column" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 8)
+End Process
+
+Process called "csv_error_message" that takes e as Integer returns Integer:
+    If e is equal to 0:
+        Return 0
+    End If
+    Return __load(e, 16)
+End Process
+
+Note: ============================================================================
+Note: PARSER STATE
+Note: ============================================================================
+
+Process called "cps_create" that takes source as Integer, dialect as Integer returns Integer:
+    Let st be allocate(40)
+    If st is equal to 0:
+        Return 0
+    End If
+    __store(st, 0, source)
+    __store(st, 8, 0)
+    __store(st, 16, 1)
+    __store(st, 24, 1)
+    __store(st, 32, dialect)
+    Return st
+End Process
+
+Process called "cps_destroy" that takes st as Integer returns Integer:
+    If st is equal to 0:
+        Return 0
+    End If
+    deallocate(st)
+    Return 1
+End Process
+
+Process called "cps_peek" that takes st as Integer returns Integer:
+    If st is equal to 0:
+        Return 0
+    End If
+    Let source be __load(st, 0)
+    Let pos be __load(st, 8)
+    If source is equal to 0:
+        Return 0
+    End If
+    Let limit be string_length(source)
+    If pos is greater than or equal to limit:
+        Return 0
+    End If
+    Return string_char_at(source, pos)
+End Process
+
+Process called "cps_peek_at" that takes st as Integer, offset as Integer returns Integer:
+    If st is equal to 0:
+        Return 0
+    End If
+    Let source be __load(st, 0)
+    Let pos be __load(st, 8)
+    Let target be pos plus offset
+    Let limit be string_length(source)
+    If target is greater than or equal to limit:
+        Return 0
+    End If
+    Return string_char_at(source, target)
+End Process
+
+Process called "cps_advance" that takes st as Integer returns Integer:
+    If st is equal to 0:
+        Return 0
+    End If
+    Let c be cps_peek(st)
+    Let pos be __load(st, 8)
+    __store(st, 8, pos plus 1)
+    If c is equal to 10:
+        Let ln be __load(st, 16)
+        __store(st, 16, ln plus 1)
+        __store(st, 24, 1)
+        Return c
+    End If
+    Let col be __load(st, 24)
+    __store(st, 24, col plus 1)
+    Return c
+End Process
+
+Process called "cps_at_eof" that takes st as Integer returns Integer:
+    If st is equal to 0:
+        Return 1
+    End If
+    Let source be __load(st, 0)
+    Let pos be __load(st, 8)
+    Let limit be string_length(source)
+    If pos is greater than or equal to limit:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: FIELD PARSE - reads one field, returns NUL-terminated string
+Note: ============================================================================
+
+Process called "parse_field" that takes st as Integer returns Integer:
+    @Reasoning
+        Parses a single CSV field per RFC 4180 section 2:
+        - A field may be quoted with quote_char; inside quotes, two
+          consecutive quote_char bytes encode one literal quote.
+        - A field may be unquoted; it ends at delimiter, CR, LF, or EOF.
+        - When dialect.skip_initial_space is set, leading SPs are skipped
+          before deciding quoted/unquoted (excel-compatible behavior).
+        - When dialect.escape_style is BACKSLASH (extension), the byte
+          following \ inside a quoted field is taken literally.
+    @End Reasoning
+    @Implementation
+        Builds the field into a ByteBuilder. Branches on the first byte
+        after optional leading whitespace.
+    @End Implementation
+    @Performance_Hints
+        O(n) in field length.
+    @End Performance_Hints
+    @Security_Scope
+        All reads via cps_peek/cps_advance which bound-check.
+    @End Security_Scope
+
+    Let dialect be __load(st, 32)
+    Let delim be __load(dialect, 0)
+    Let qch be __load(dialect, 8)
+    Let escape_style be __load(dialect, 16)
+    Let skip_ws be __load(dialect, 32)
+    Let strict_q be __load(dialect, 40)
+    If skip_ws is equal to 1:
+        While cps_peek(st) is equal to 32:
+            cps_advance(st)
+        End While
+    End If
+    Let bb be cbb_create(32)
+    Let first be cps_peek(st)
+    If first is equal to qch:
+        cps_advance(st)
+        Let scanning be 1
+        While scanning is equal to 1:
+            Let c be cps_peek(st)
+            If c is equal to 0:
+                If cps_at_eof(st) is equal to 1:
+                    If strict_q is equal to 1:
+                        cbb_destroy(bb)
+                        Return 0
+                    End If
+                    Set scanning to 0
+                Otherwise:
+                    cbb_append_byte(bb, c)
+                    cps_advance(st)
+                End If
+            Otherwise:
+                If c is equal to qch:
+                    cps_advance(st)
+                    Let nxt be cps_peek(st)
+                    If escape_style is equal to 0:
+                        If nxt is equal to qch:
+                            cbb_append_byte(bb, qch)
+                            cps_advance(st)
+                        Otherwise:
+                            Set scanning to 0
+                        End If
+                    Otherwise:
+                        Set scanning to 0
+                    End If
+                Otherwise:
+                    If escape_style is equal to 1:
+                        If c is equal to 92:
+                            cps_advance(st)
+                            Let esc be cps_peek(st)
+                            If esc is equal to 0:
+                                cbb_destroy(bb)
+                                Return 0
+                            End If
+                            cps_advance(st)
+                            If esc is equal to 110:
+                                cbb_append_byte(bb, 10)
+                            Otherwise:
+                                If esc is equal to 114:
+                                    cbb_append_byte(bb, 13)
+                                Otherwise:
+                                    If esc is equal to 116:
+                                        cbb_append_byte(bb, 9)
+                                    Otherwise:
+                                        cbb_append_byte(bb, esc)
+                                    End If
+                                End If
+                            End If
+                        Otherwise:
+                            cbb_append_byte(bb, c)
+                            cps_advance(st)
+                        End If
+                    Otherwise:
+                        cbb_append_byte(bb, c)
+                        cps_advance(st)
+                    End If
+                End If
+            End If
+        End While
+        Return cbb_finalize(bb)
+    End If
+    Let scanning2 be 1
+    While scanning2 is equal to 1:
+        Let c2 be cps_peek(st)
+        If cps_at_eof(st) is equal to 1:
+            Set scanning2 to 0
+        Otherwise:
+            If c2 is equal to delim:
+                Set scanning2 to 0
+            Otherwise:
+                If c2 is equal to 10:
+                    Set scanning2 to 0
+                Otherwise:
+                    If c2 is equal to 13:
+                        Set scanning2 to 0
+                    Otherwise:
+                        cbb_append_byte(bb, c2)
+                        cps_advance(st)
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return cbb_finalize(bb)
+End Process
+
+Note: ============================================================================
+Note: ROW PARSE
+Note: ============================================================================
+
+Process called "parse_row" that takes st as Integer returns Integer:
+    Note: Parses one CSV row. Consumes the terminating line ending (CRLF, CR,
+    Note: LF, or EOF). Returns a CsvRow pointer or 0 on error.
+    Let row be csv_row_create()
+    If row is equal to 0:
+        Return 0
+    End If
+    Let dialect be __load(st, 32)
+    Let delim be __load(dialect, 0)
+    Let parsing be 1
+    While parsing is equal to 1:
+        Let field be parse_field(st)
+        If field is equal to 0:
+            Return 0
+        End If
+        csv_row_append_field(row, field)
+        Let nx be cps_peek(st)
+        If cps_at_eof(st) is equal to 1:
+            Set parsing to 0
+        Otherwise:
+            If nx is equal to delim:
+                cps_advance(st)
+            Otherwise:
+                If nx is equal to 13:
+                    cps_advance(st)
+                    If cps_peek(st) is equal to 10:
+                        cps_advance(st)
+                    End If
+                    Set parsing to 0
+                Otherwise:
+                    If nx is equal to 10:
+                        cps_advance(st)
+                        Set parsing to 0
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return row
+End Process
+
+Note: ============================================================================
+Note: PUBLIC PARSE
+Note: ============================================================================
+
+Process called "csv_parse" that takes text as Integer, dialect as Integer returns Integer:
+    @Reasoning
+        Parse text as CSV per the supplied dialect, returning a CsvResult
+        wrapping either a CsvDocument or CsvParseError.
+    @End Reasoning
+    @Implementation
+        Iterates parse_row until EOF. If the dialect has_header flag is
+        set, the first parsed row becomes the document header.
+    @End Implementation
+    @Performance_Hints
+        O(n) in input length. Memory usage proportional to input size.
+        For inputs larger than memory, use csv_iterator_* instead.
+    @End Performance_Hints
+    @Security_Scope
+        Untrusted input. Every byte access is bounded. Strict quoting
+        violations return an error rather than silently accepting.
+    @End Security_Scope
+
+    If text is equal to 0:
+        Let e1 be csv_error_create(1, 1, "null input")
+        Return csv_result_error(e1)
+    End If
+    Let owned_dialect be 0
+    If dialect is equal to 0:
+        Set dialect to csv_dialect_create()
+        Set owned_dialect to 1
+    End If
+    Let st be cps_create(text, dialect)
+    If st is equal to 0:
+        If owned_dialect is equal to 1:
+            csv_dialect_destroy(dialect)
+        End If
+        Let e2 be csv_error_create(1, 1, "out of memory")
+        Return csv_result_error(e2)
+    End If
+    Let doc be csv_document_create()
+    If doc is equal to 0:
+        cps_destroy(st)
+        If owned_dialect is equal to 1:
+            csv_dialect_destroy(dialect)
+        End If
+        Let e3 be csv_error_create(1, 1, "out of memory")
+        Return csv_result_error(e3)
+    End If
+    Let has_header be __load(dialect, 48)
+    Let consumed_header be 0
+    While cps_at_eof(st) is equal to 0:
+        Let row be parse_row(st)
+        If row is equal to 0:
+            Let ln be __load(st, 16)
+            Let col be __load(st, 24)
+            Let e4 be csv_error_create(ln, col, "malformed field")
+            cps_destroy(st)
+            If owned_dialect is equal to 1:
+                csv_dialect_destroy(dialect)
+            End If
+            Return csv_result_error(e4)
+        End If
+        If has_header is equal to 1:
+            If consumed_header is equal to 0:
+                csv_document_set_header(doc, row)
+                Set consumed_header to 1
+            Otherwise:
+                csv_document_append_row(doc, row)
+            End If
+        Otherwise:
+            csv_document_append_row(doc, row)
+        End If
+    End While
+    cps_destroy(st)
+    If owned_dialect is equal to 1:
+        csv_dialect_destroy(dialect)
+    End If
+    Return csv_result_ok(doc)
+End Process
+
+Note: ============================================================================
+Note: STREAMING ITERATOR - for inputs larger than memory
+Note: ============================================================================
+
+Process called "csv_iterator_create" that takes text as Integer, dialect as Integer returns Integer:
+    @Reasoning
+        Creates a streaming parser that yields one CsvRow at a time via
+        csv_iterator_next. The underlying input is still expected to be
+        a contiguous string buffer, but rows are not retained between
+        next() calls - callers can free each row before requesting the
+        next one. This caps peak memory at the largest single row.
+    @End Reasoning
+    @Implementation
+        Wraps a CsvParserState plus a done_flag and last-error slots.
+    @End Implementation
+    @Performance_Hints
+        Same big-O as csv_parse but constant memory in row-bounded form.
+    @End Performance_Hints
+    @Security_Scope
+        Same bound-checking as csv_parse.
+    @End Security_Scope
+
+    If text is equal to 0:
+        Return 0
+    End If
+    Let owned_dialect_flag be 0
+    Let d be dialect
+    If d is equal to 0:
+        Set d to csv_dialect_create()
+        Set owned_dialect_flag to 1
+    End If
+    Let it be allocate(48)
+    If it is equal to 0:
+        Return 0
+    End If
+    Let st be cps_create(text, d)
+    If st is equal to 0:
+        deallocate(it)
+        Return 0
+    End If
+    __store(it, 0, st)
+    __store(it, 8, 0)
+    __store(it, 16, 0)
+    __store(it, 24, 0)
+    __store(it, 32, 0)
+    __store(it, 40, owned_dialect_flag)
+    Return it
+End Process
+
+Process called "csv_iterator_next" that takes it as Integer returns Integer:
+    Note: Returns the next CsvRow or 0 when exhausted or on error.
+    Note: After 0 is returned, check csv_iterator_has_error to distinguish
+    Note: clean EOF from parse error.
+    If it is equal to 0:
+        Return 0
+    End If
+    Let done be __load(it, 8)
+    If done is equal to 1:
+        Return 0
+    End If
+    Let st be __load(it, 0)
+    If cps_at_eof(st) is equal to 1:
+        __store(it, 8, 1)
+        Return 0
+    End If
+    Let row be parse_row(st)
+    If row is equal to 0:
+        __store(it, 8, 1)
+        __store(it, 16, __load(st, 16))
+        __store(it, 24, __load(st, 24))
+        __store(it, 32, string_duplicate("malformed field"))
+        Return 0
+    End If
+    Return row
+End Process
+
+Process called "csv_iterator_has_error" that takes it as Integer returns Integer:
+    If it is equal to 0:
+        Return 0
+    End If
+    Let msg be __load(it, 32)
+    If msg is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "csv_iterator_error_line" that takes it as Integer returns Integer:
+    If it is equal to 0:
+        Return 0
+    End If
+    Return __load(it, 16)
+End Process
+
+Process called "csv_iterator_error_column" that takes it as Integer returns Integer:
+    If it is equal to 0:
+        Return 0
+    End If
+    Return __load(it, 24)
+End Process
+
+Process called "csv_iterator_error_message" that takes it as Integer returns Integer:
+    If it is equal to 0:
+        Return 0
+    End If
+    Return __load(it, 32)
+End Process
+
+Process called "csv_iterator_destroy" that takes it as Integer returns Integer:
+    If it is equal to 0:
+        Return 0
+    End If
+    Let st be __load(it, 0)
+    If st is not equal to 0:
+        Let owned be __load(it, 40)
+        Let d be __load(st, 32)
+        cps_destroy(st)
+        If owned is equal to 1:
+            csv_dialect_destroy(d)
+        End If
+    End If
+    Let msg be __load(it, 32)
+    If msg is not equal to 0:
+        deallocate(msg)
+    End If
+    deallocate(it)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SERIALIZATION
+Note: ============================================================================
+
+Process called "field_needs_quoting" that takes field as Integer, dialect as Integer returns Integer:
+    Note: True if the field contains any of: delimiter, quote_char, CR, LF.
+    Note: Per RFC 4180 section 2, such fields MUST be wrapped in quotes.
+    If field is equal to 0:
+        Return 0
+    End If
+    Let delim be __load(dialect, 0)
+    Let qch be __load(dialect, 8)
+    Let n be string_length(field)
+    Let i be 0
+    While i is less than n:
+        Let c be string_char_at(field, i)
+        If c is equal to delim:
+            Return 1
+        End If
+        If c is equal to qch:
+            Return 1
+        End If
+        If c is equal to 10:
+            Return 1
+        End If
+        If c is equal to 13:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "serialize_field" that takes b as Integer, field as Integer, dialect as Integer returns Integer:
+    Note: Emit one field with appropriate escaping per dialect.
+    Let qch be __load(dialect, 8)
+    Let escape_style be __load(dialect, 16)
+    Let needs_q be field_needs_quoting(field, dialect)
+    If needs_q is equal to 0:
+        If field is not equal to 0:
+            cbb_append_string(b, field)
+        End If
+        Return 1
+    End If
+    cbb_append_byte(b, qch)
+    If field is not equal to 0:
+        Let n be string_length(field)
+        Let i be 0
+        While i is less than n:
+            Let c be string_char_at(field, i)
+            If escape_style is equal to 0:
+                If c is equal to qch:
+                    cbb_append_byte(b, qch)
+                    cbb_append_byte(b, qch)
+                Otherwise:
+                    cbb_append_byte(b, c)
+                End If
+            Otherwise:
+                If c is equal to qch:
+                    cbb_append_byte(b, 92)
+                    cbb_append_byte(b, qch)
+                Otherwise:
+                    If c is equal to 92:
+                        cbb_append_byte(b, 92)
+                        cbb_append_byte(b, 92)
+                    Otherwise:
+                        If c is equal to 10:
+                            cbb_append_byte(b, 92)
+                            cbb_append_byte(b, 110)
+                        Otherwise:
+                            If c is equal to 13:
+                                cbb_append_byte(b, 92)
+                                cbb_append_byte(b, 114)
+                            Otherwise:
+                                cbb_append_byte(b, c)
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    cbb_append_byte(b, qch)
+    Return 1
+End Process
+
+Process called "serialize_row_into" that takes b as Integer, row as Integer, dialect as Integer returns Integer:
+    Let n be csv_row_field_count(row)
+    Let delim be __load(dialect, 0)
+    Let i be 0
+    While i is less than n:
+        If i is greater than 0:
+            cbb_append_byte(b, delim)
+        End If
+        serialize_field(b, csv_row_field_at(row, i), dialect)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "append_line_ending" that takes b as Integer, dialect as Integer returns Integer:
+    Let mode be __load(dialect, 24)
+    If mode is equal to 0:
+        cbb_append_byte(b, 13)
+        cbb_append_byte(b, 10)
+        Return 1
+    End If
+    If mode is equal to 1:
+        cbb_append_byte(b, 10)
+        Return 1
+    End If
+    cbb_append_byte(b, 13)
+    cbb_append_byte(b, 10)
+    Return 1
+End Process
+
+Process called "csv_serialize" that takes doc as Integer, dialect as Integer returns Integer:
+    @Reasoning
+        Emit doc as a CSV string using dialect knobs. RFC 4180 section
+        2.3 mandates CRLF terminators, but mode=LF and Auto (which
+        emits CRLF) are exposed for compatibility.
+    @End Reasoning
+    @Implementation
+        Builds the output in a ByteBuilder, emitting the header row
+        first (if present) then each data row, each terminated by the
+        dialect's chosen line ending. The final row also receives a
+        line terminator per RFC 4180 ABNF "file = ... record CRLF *(...)".
+    @End Implementation
+    @Performance_Hints
+        O(n) in total output bytes.
+    @End Performance_Hints
+    @Security_Scope
+        Pure transform of caller-owned data. No external I/O.
+    @End Security_Scope
+
+    If doc is equal to 0:
+        Return string_duplicate("")
+    End If
+    Let owned_dialect be 0
+    If dialect is equal to 0:
+        Set dialect to csv_dialect_create()
+        Set owned_dialect to 1
+    End If
+    Let b be cbb_create(128)
+    If b is equal to 0:
+        If owned_dialect is equal to 1:
+            csv_dialect_destroy(dialect)
+        End If
+        Return 0
+    End If
+    If csv_document_has_header(doc) is equal to 1:
+        serialize_row_into(b, csv_document_header(doc), dialect)
+        append_line_ending(b, dialect)
+    End If
+    Let n be csv_document_row_count(doc)
+    Let i be 0
+    While i is less than n:
+        serialize_row_into(b, csv_document_row_at(doc, i), dialect)
+        append_line_ending(b, dialect)
+        Set i to i plus 1
+    End While
+    Let result be cbb_finalize(b)
+    If owned_dialect is equal to 1:
+        csv_dialect_destroy(dialect)
+    End If
+    Return result
+End Process

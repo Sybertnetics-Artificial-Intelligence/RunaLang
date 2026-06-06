@@ -1,0 +1,2132 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+SLH-DSA (SPHINCS+) per NIST FIPS 205
+==============================================================================
+
+Stateless hash-based digital signature standardised in FIPS 205 (August
+2024). SHA-2-flavoured parameter sets implemented in this module:
+
+  SLH-DSA-SHA2-128s  n=16 h=63 d=7  h'=9   a=12 k=14 lg(w)=4  m=30 (Cat 1)
+  SLH-DSA-SHA2-128f  n=16 h=66 d=22 h'=3   a=6  k=33 lg(w)=4  m=34 (Cat 1)
+  SLH-DSA-SHA2-192s  n=24 h=63 d=7  h'=9   a=14 k=17 lg(w)=4  m=39 (Cat 3)
+  SLH-DSA-SHA2-192f  n=24 h=66 d=22 h'=3   a=8  k=33 lg(w)=4  m=42 (Cat 3)
+  SLH-DSA-SHA2-256s  n=32 h=64 d=8  h'=8   a=14 k=22 lg(w)=4  m=47 (Cat 5)
+  SLH-DSA-SHA2-256f  n=32 h=68 d=17 h'=4   a=9  k=35 lg(w)=4  m=49 (Cat 5)
+
+s vs f variants trade signing speed for signature size.
+
+Algorithms implemented (FIPS 205):
+  - SLH-DSA.KeyGen()        Algorithm 21
+  - SLH-DSA.Sign(M, SK, ctx) Algorithm 22
+  - SLH-DSA.Verify(M, SIG, PK, ctx) Algorithm 24
+
+Internal building blocks:
+  - WOTS+ chaining + signing + pk-from-sig (FIPS 205 Algorithms 5-8)
+  - FORS signing + verification (FIPS 205 Algorithms 14-17)
+  - XMSS subtree node computation and authentication paths (Alg 9-13)
+  - HT (hypertree) signing and verification (Alg 11-13)
+  - Hash function instantiation H_msg, PRF, PRF_msg, F, H, T_l per Table 2
+    (SHA-2 family)
+
+Constant-time considerations:
+  - All SHA-2 invocations are CT.
+  - Chain function loop bounds are PUBLIC (set by chain start/length which
+    depend on message digest chunks).
+  - Sign path is CT wrt the secret seed sk.seed.
+
+Address structure (ADRS, 32 bytes for SHA-2 family per FIPS 205 sec 4.2.1):
+  bytes 0-3   layer address (big-endian uint32)
+  bytes 4-11  tree address (big-endian uint64, plus 4 bytes layer offset)
+  bytes 12-13 type
+  bytes 14-31 type-specific fields
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/sha2.runa" as Sha2
+Import "compiler/frontend/import_system/crypto/hmac.runa" as Hmac
+
+Note:
+==============================================================================
+PARAMETER-SET ACCESSORS
+==============================================================================
+Six SHA-2 SLH-DSA parameter sets, identified by integer level 1..6:
+  1 = SLH-DSA-SHA2-128s
+  2 = SLH-DSA-SHA2-128f
+  3 = SLH-DSA-SHA2-192s
+  4 = SLH-DSA-SHA2-192f
+  5 = SLH-DSA-SHA2-256s
+  6 = SLH-DSA-SHA2-256f
+:End Note
+
+Process called "slhdsa_n" takes level as Integer returns Integer:
+    @Reasoning
+    Hash output size in bytes per FIPS 205 Table 2.
+    @End Reasoning
+    @Implementation
+    16 for 128*, 24 for 192*, 32 for 256*.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    If level is less than or equal to 2:
+        Return 16
+    End If
+    If level is less than or equal to 4:
+        Return 24
+    End If
+    Return 32
+End Process
+
+Process called "slhdsa_h" takes level as Integer returns Integer:
+    @Reasoning
+    Total Merkle tree height per FIPS 205 Table 2.
+    @End Reasoning
+    @Implementation
+    63, 66, 63, 66, 64, 68 for levels 1..6.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 63
+    End If
+    If level is equal to 2:
+        Return 66
+    End If
+    If level is equal to 3:
+        Return 63
+    End If
+    If level is equal to 4:
+        Return 66
+    End If
+    If level is equal to 5:
+        Return 64
+    End If
+    Return 68
+End Process
+
+Process called "slhdsa_d" takes level as Integer returns Integer:
+    @Reasoning
+    Number of hypertree layers per FIPS 205 Table 2.
+    @End Reasoning
+    @Implementation
+    7, 22, 7, 22, 8, 17 for levels 1..6.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 7
+    End If
+    If level is equal to 2:
+        Return 22
+    End If
+    If level is equal to 3:
+        Return 7
+    End If
+    If level is equal to 4:
+        Return 22
+    End If
+    If level is equal to 5:
+        Return 8
+    End If
+    Return 17
+End Process
+
+Process called "slhdsa_h_prime" takes level as Integer returns Integer:
+    @Reasoning
+    Per-layer tree height h' = h/d.
+    @End Reasoning
+    @Implementation
+    Computed quotient.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Let h be proc slhdsa_h with level
+    Let d be proc slhdsa_d with level
+    Return h divided by d
+End Process
+
+Process called "slhdsa_a" takes level as Integer returns Integer:
+    @Reasoning
+    FORS tree height per FIPS 205 Table 2.
+    @End Reasoning
+    @Implementation
+    12, 6, 14, 8, 14, 9 for levels 1..6.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 12
+    End If
+    If level is equal to 2:
+        Return 6
+    End If
+    If level is equal to 3:
+        Return 14
+    End If
+    If level is equal to 4:
+        Return 8
+    End If
+    If level is equal to 5:
+        Return 14
+    End If
+    Return 9
+End Process
+
+Process called "slhdsa_k" takes level as Integer returns Integer:
+    @Reasoning
+    Number of FORS trees per FIPS 205 Table 2.
+    @End Reasoning
+    @Implementation
+    14, 33, 17, 33, 22, 35 for levels 1..6.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 14
+    End If
+    If level is equal to 2:
+        Return 33
+    End If
+    If level is equal to 3:
+        Return 17
+    End If
+    If level is equal to 4:
+        Return 33
+    End If
+    If level is equal to 5:
+        Return 22
+    End If
+    Return 35
+End Process
+
+Process called "slhdsa_lg_w" returns Integer:
+    @Reasoning
+    Winternitz parameter log2(w) is 4 for all SHA-2 SLH-DSA sets.
+    @End Reasoning
+    @Implementation
+    Constant 4 (w = 16).
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    Return 4
+End Process
+
+Process called "slhdsa_w" returns Integer:
+    @Reasoning
+    Winternitz chain length w = 2^lg_w = 16.
+    @End Reasoning
+    @Implementation
+    Constant 16.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return 16
+End Process
+
+Process called "slhdsa_len1" takes level as Integer returns Integer:
+    @Reasoning
+    WOTS+ checksum-free length len1 = ceil(8n/lg_w) per FIPS 205 sec 4.7.
+    For lg_w = 4 and n in {16,24,32}: len1 = 2n.
+    @End Reasoning
+    @Implementation
+    Returns 2 * n.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Return 2 multiplied by n
+End Process
+
+Process called "slhdsa_len2" returns Integer:
+    @Reasoning
+    WOTS+ checksum length len2. For lg_w=4 with the SHA-2 SLH-DSA sets,
+    len2 = 3 (covers checksum range with 3 base-w digits).
+    @End Reasoning
+    @Implementation
+    Constant 3 for all SHA-2 parameter sets at lg_w=4.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return 3
+End Process
+
+Process called "slhdsa_len" takes level as Integer returns Integer:
+    @Reasoning
+    Total WOTS+ chain count len = len1 + len2.
+    @End Reasoning
+    @Implementation
+    Sum.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Let len1_val be proc slhdsa_len1 with level
+    Let len2_val be proc slhdsa_len2
+    Return len1_val plus len2_val
+End Process
+
+Process called "slhdsa_m" takes level as Integer returns Integer:
+    @Reasoning
+    Message-digest size m per FIPS 205 Table 2.
+    @End Reasoning
+    @Implementation
+    30, 34, 39, 42, 47, 49 for levels 1..6.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 30
+    End If
+    If level is equal to 2:
+        Return 34
+    End If
+    If level is equal to 3:
+        Return 39
+    End If
+    If level is equal to 4:
+        Return 42
+    End If
+    If level is equal to 5:
+        Return 47
+    End If
+    Return 49
+End Process
+
+Process called "slhdsa_pk_size" takes level as Integer returns Integer:
+    @Reasoning
+    Public key size = 2n (PK.seed || PK.root).
+    @End Reasoning
+    @Implementation
+    Two n-byte values.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return 2 multiplied by proc slhdsa_n with level
+End Process
+
+Process called "slhdsa_sk_size" takes level as Integer returns Integer:
+    @Reasoning
+    Secret key size = 4n (SK.seed || SK.prf || PK.seed || PK.root).
+    @End Reasoning
+    @Implementation
+    Four n-byte values.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public size; contents are SECRET (first 2n bytes).
+    @End Security_Scope
+    Return 4 multiplied by proc slhdsa_n with level
+End Process
+
+Process called "slhdsa_sig_size" takes level as Integer returns Integer:
+    @Reasoning
+    Signature size = n (R) + k*(a+1)*n (FORS) + (h + d*len)*n (HT) per FIPS
+    205 Table 2.
+    @End Reasoning
+    @Implementation
+    Computes from n, a, h, d, k, len.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public size.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let a be proc slhdsa_a with level
+    Let h be proc slhdsa_h with level
+    Let d be proc slhdsa_d with level
+    Let k be proc slhdsa_k with level
+    Let len be proc slhdsa_len with level
+    Return n plus k multiplied by (a plus 1) multiplied by n plus h multiplied by n plus d multiplied by len multiplied by n
+End Process
+
+Note:
+==============================================================================
+ADDRESS STRUCTURE HELPERS
+==============================================================================
+A 32-byte ADRS with:
+  bytes 0..3   layer address    (uint32 BE)
+  bytes 4..11  tree address     (uint64 BE)
+  bytes 12     type             (one byte; only low 4 bits significant)
+  bytes 13..31 type-specific    (chain idx, hash idx, key pair, tree idx ...)
+
+Type values (FIPS 205 Table 1):
+  0 WOTS_HASH      1 WOTS_PK    2 TREE       3 FORS_TREE
+  4 FORS_ROOTS     5 WOTS_PRF   6 FORS_PRF
+:End Note
+
+Process called "slhdsa_adrs_size" returns Integer:
+    @Reasoning
+    SHA-2 ADRS is 32 bytes (FIPS 205 sec 4.2.1).
+    @End Reasoning
+    @Implementation
+    Constant 32.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public layout.
+    @End Security_Scope
+    Return 32
+End Process
+
+Process called "slhdsa_adrs_zero" takes adrs as Integer returns Integer:
+    @Reasoning
+    Zero a 32-byte ADRS.
+    @End Reasoning
+    @Implementation
+    Byte-by-byte clear.
+    @End Implementation
+    @Performance_Hints
+    O(32).
+    @End Performance_Hints
+    @Security_Scope
+    No secret material.
+    @End Security_Scope
+    Memory.memory_zero(adrs, 32)
+    Return 1
+End Process
+
+Process called "slhdsa_adrs_set_layer" takes adrs as Integer, layer as Integer returns Integer:
+    @Reasoning
+    Sets the layer address (bytes 0..3) big-endian.
+    @End Reasoning
+    @Implementation
+    Big-endian 32-bit store.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Memory.memory_set_byte(adrs, 0, layer shifted right by 24 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 1, layer shifted right by 16 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 2, layer shifted right by 8 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 3, layer bitwise_and 255)
+    Return 1
+End Process
+
+Process called "slhdsa_adrs_set_tree" takes adrs as Integer, tree_addr_low as Integer, tree_addr_high as Integer returns Integer:
+    @Reasoning
+    Sets the 64-bit tree address (bytes 4..11) big-endian. We accept the
+    address as two 32-bit halves to stay within 9-arg stage1 limits.
+    @End Reasoning
+    @Implementation
+    Big-endian 64-bit store from (high, low) halves.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Memory.memory_set_byte(adrs, 4, tree_addr_high shifted right by 24 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 5, tree_addr_high shifted right by 16 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 6, tree_addr_high shifted right by 8 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 7, tree_addr_high bitwise_and 255)
+    Memory.memory_set_byte(adrs, 8, tree_addr_low shifted right by 24 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 9, tree_addr_low shifted right by 16 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 10, tree_addr_low shifted right by 8 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 11, tree_addr_low bitwise_and 255)
+    Return 1
+End Process
+
+Process called "slhdsa_adrs_set_type_and_clear" takes adrs as Integer, type_v as Integer returns Integer:
+    @Reasoning
+    Sets the type byte (byte 12) and zeros the type-specific fields.
+    @End Reasoning
+    @Implementation
+    Byte write at offset 12 and zero bytes 13..31.
+    @End Implementation
+    @Performance_Hints
+    O(20).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Memory.memory_set_byte(adrs, 12, type_v bitwise_and 255)
+    Let i be 13
+    While i is less than 32:
+        Memory.memory_set_byte(adrs, i, 0)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "slhdsa_adrs_set_keypair" takes adrs as Integer, kp as Integer returns Integer:
+    @Reasoning
+    Sets key-pair address at bytes 20..23 big-endian (used by WOTS_HASH /
+    WOTS_PK / WOTS_PRF address types).
+    @End Reasoning
+    @Implementation
+    Big-endian 32-bit store at offset 20.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Memory.memory_set_byte(adrs, 20, kp shifted right by 24 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 21, kp shifted right by 16 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 22, kp shifted right by 8 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 23, kp bitwise_and 255)
+    Return 1
+End Process
+
+Process called "slhdsa_adrs_set_chain" takes adrs as Integer, chain as Integer returns Integer:
+    @Reasoning
+    Sets chain address at bytes 24..27 (WOTS_HASH).
+    @End Reasoning
+    @Implementation
+    Big-endian 32-bit store at offset 24.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Memory.memory_set_byte(adrs, 24, chain shifted right by 24 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 25, chain shifted right by 16 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 26, chain shifted right by 8 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 27, chain bitwise_and 255)
+    Return 1
+End Process
+
+Process called "slhdsa_adrs_set_hash" takes adrs as Integer, hash_addr as Integer returns Integer:
+    @Reasoning
+    Sets hash address at bytes 28..31 (WOTS_HASH).
+    @End Reasoning
+    @Implementation
+    Big-endian 32-bit store at offset 28.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Memory.memory_set_byte(adrs, 28, hash_addr shifted right by 24 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 29, hash_addr shifted right by 16 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 30, hash_addr shifted right by 8 bitwise_and 255)
+    Memory.memory_set_byte(adrs, 31, hash_addr bitwise_and 255)
+    Return 1
+End Process
+
+Process called "slhdsa_adrs_set_tree_index" takes adrs as Integer, tree_index as Integer returns Integer:
+    @Reasoning
+    Sets tree-index (used by TREE type at bytes 28..31).
+    @End Reasoning
+    @Implementation
+    Same as set_hash since both occupy bytes 28..31 by FIPS 205 Table 1.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return proc slhdsa_adrs_set_hash with adrs, tree_index
+End Process
+
+Process called "slhdsa_adrs_set_tree_height" takes adrs as Integer, tree_height as Integer returns Integer:
+    @Reasoning
+    Sets tree-height field at bytes 24..27 for TREE/FORS_TREE.
+    @End Reasoning
+    @Implementation
+    Same as set_chain offset.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return proc slhdsa_adrs_set_chain with adrs, tree_height
+End Process
+
+Note:
+==============================================================================
+HASH PRIMITIVES (SHA-2 instantiation, FIPS 205 sec 11.1)
+==============================================================================
+For 128-bit security level, all hashes use SHA-256.
+For 192/256-bit security, T_l / H / F use SHA-512 truncated to n; H_msg
+uses MGF1-SHA-512.
+
+We provide a single "slhdsa_hash" entry that takes:
+  - flag indicating short (16/24/32) output truncation
+  - input buffer and length
+and produces n bytes.
+
+PRF(pk_seed, sk_seed, ADRS) = trunc_n( SHA-X ( pk_seed || toBigEndian(ADRS) || sk_seed ) )
+PRF_msg(prf, opt_rand, M)  = trunc_n( HMAC-SHA-X ( prf , opt_rand || M ) )
+F  / H / T_l: SHA-256 (n=16) or SHA-512 (n>=24) of (pk_seed || ADRS || message)
+H_msg: MGF1-style expansion based on SHA-256 (n=16) or SHA-512 (n>=24)
+:End Note
+
+Process called "slhdsa_hash_select" takes n as Integer, arena as Integer, input as Integer, input_length as Integer, out as Integer returns Integer:
+    @Reasoning
+    Compute hash output truncated to n bytes. Uses SHA-256 for n=16,
+    SHA-512 truncated to n for n in {24, 32}.
+    @End Reasoning
+    @Implementation
+    Allocates a digest buffer of full size then copies the truncated
+    prefix to out. SHA-256 yields 32; SHA-512 yields 64.
+    @End Implementation
+    @Performance_Hints
+    One hash call.
+    @End Performance_Hints
+    @Security_Scope
+    May process secret material; underlying hash is CT.
+    @End Security_Scope
+    If n is equal to 16:
+        Let buf32 be Arena.arena_allocate(arena, 32)
+        Sha2.sha256_hash(arena, input, input_length, buf32)
+        Memory.memory_copy(out, buf32, 16)
+        Return 16
+    End If
+    Let buf64 be Arena.arena_allocate(arena, 64)
+    Sha2.sha512_hash(arena, input, input_length, buf64)
+    Memory.memory_copy(out, buf64, n)
+    Return n
+End Process
+
+Process called "slhdsa_f_hash" takes arena as Integer, pk_seed as Integer, adrs as Integer, message as Integer, n as Integer, out as Integer returns Integer:
+    @Reasoning
+    F: H(pk_seed || ADRSc || message), truncated to n. ADRSc is the
+    compressed 22-byte addressing variant used by SHA-2 family per FIPS
+    205 sec 11.1 (Table 11.1).
+    @End Reasoning
+    @Implementation
+    Compresses 32-byte ADRS to 22 bytes per the spec then concatenates.
+    @End Implementation
+    @Performance_Hints
+    One hash invocation.
+    @End Performance_Hints
+    @Security_Scope
+    pk_seed and adrs are public; message may be a WOTS+ secret value.
+    @End Security_Scope
+    Let total_len be 64 plus 22 plus n
+    Let buf be Arena.arena_allocate(arena, total_len)
+    Memory.memory_zero(buf, 64)
+    Memory.memory_copy(buf, pk_seed, n)
+    Note: ADRS compression for SHA-2: pack layer(1) + tree(8) + type(1)+
+    Note: key-pair-or-hash(12). We use the FIPS 205 SHA-2 compressed ADRSc
+    Note: layout.
+    Note: 0..3 layer (last byte of 4-byte layer addr)
+    Memory.memory_set_byte(buf plus n, 0, Memory.memory_get_byte(adrs, 3))
+    Note: 4..11 tree address (bytes 4..11 of ADRS)
+    Memory.memory_copy(buf plus n plus 1, adrs plus 4, 8)
+    Note: 12 type byte
+    Memory.memory_set_byte(buf plus n plus 9, 0, Memory.memory_get_byte(adrs, 12))
+    Note: 13..21 type-specific (last 12 bytes of original ADRS, truncated to 12)
+    Memory.memory_copy(buf plus n plus 10, adrs plus 20, 12)
+    Memory.memory_copy(buf plus n plus 22, message, n)
+    Return proc slhdsa_hash_select with n, arena, buf, n plus 22 plus n, out
+End Process
+
+Process called "slhdsa_h_hash" takes arena as Integer, pk_seed as Integer, adrs as Integer, left_node as Integer, right_node as Integer, n as Integer, out as Integer returns Integer:
+    @Reasoning
+    H: hash of two concatenated nodes for Merkle tree levels >= 1.
+    @End Reasoning
+    @Implementation
+    Same as F but message is 2n bytes (left || right).
+    @End Implementation
+    @Performance_Hints
+    One hash invocation.
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Let total_len be n plus 22 plus 2 multiplied by n
+    Let buf be Arena.arena_allocate(arena, total_len)
+    Memory.memory_copy(buf, pk_seed, n)
+    Memory.memory_set_byte(buf plus n, 0, Memory.memory_get_byte(adrs, 3))
+    Memory.memory_copy(buf plus n plus 1, adrs plus 4, 8)
+    Memory.memory_set_byte(buf plus n plus 9, 0, Memory.memory_get_byte(adrs, 12))
+    Memory.memory_copy(buf plus n plus 10, adrs plus 20, 12)
+    Memory.memory_copy(buf plus n plus 22, left_node, n)
+    Memory.memory_copy(buf plus n plus 22 plus n, right_node, n)
+    Return proc slhdsa_hash_select with n, arena, buf, total_len, out
+End Process
+
+Process called "slhdsa_prf" takes arena as Integer, pk_seed as Integer, sk_seed as Integer, adrs as Integer, n as Integer, out as Integer returns Integer:
+    @Reasoning
+    PRF for WOTS+ / FORS secret key derivation.
+    @End Reasoning
+    @Implementation
+    SHA-256 / SHA-512 of (pk_seed || ADRSc || sk_seed), truncated to n.
+    @End Implementation
+    @Performance_Hints
+    One hash invocation.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET: sk_seed.
+    @End Security_Scope
+    Let total_len be n plus 22 plus n
+    Let buf be Arena.arena_allocate(arena, total_len)
+    Memory.memory_copy(buf, pk_seed, n)
+    Memory.memory_set_byte(buf plus n, 0, Memory.memory_get_byte(adrs, 3))
+    Memory.memory_copy(buf plus n plus 1, adrs plus 4, 8)
+    Memory.memory_set_byte(buf plus n plus 9, 0, Memory.memory_get_byte(adrs, 12))
+    Memory.memory_copy(buf plus n plus 10, adrs plus 20, 12)
+    Memory.memory_copy(buf plus n plus 22, sk_seed, n)
+    Return proc slhdsa_hash_select with n, arena, buf, total_len, out
+End Process
+
+Process called "slhdsa_prf_msg" takes arena as Integer, prf_seed as Integer, opt_rand as Integer, message as Integer, message_length as Integer, n as Integer, out as Integer returns Integer:
+    @Reasoning
+    PRF_msg = trunc_n(HMAC-SHA-X(prf_seed, opt_rand || M)) per FIPS 205
+    sec 11.1 Table 11.1.
+    @End Reasoning
+    @Implementation
+    Builds opt_rand||M then calls HMAC-SHA-256 or HMAC-SHA-512 depending
+    on n.
+    @End Implementation
+    @Performance_Hints
+    One HMAC invocation.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET: prf_seed. HMAC is CT.
+    @End Security_Scope
+    Let combined be Arena.arena_allocate(arena, n plus message_length)
+    Memory.memory_copy(combined, opt_rand, n)
+    Memory.memory_copy(combined plus n, message, message_length)
+    If n is equal to 16:
+        Let tag_buf be Arena.arena_allocate(arena, 32)
+        Hmac.hmac_sha256(arena, prf_seed, n, combined, n plus message_length, tag_buf)
+        Memory.memory_copy(out, tag_buf, 16)
+        Return 16
+    End If
+    Let tag_buf2 be Arena.arena_allocate(arena, 64)
+    Hmac.hmac_sha512(arena, prf_seed, n, combined, n plus message_length, tag_buf2)
+    Memory.memory_copy(out, tag_buf2, n)
+    Return n
+End Process
+
+Process called "slhdsa_h_msg" takes arena as Integer, r as Integer, pk_seed as Integer, pk_root as Integer, message as Integer, message_length as Integer, m as Integer, n as Integer, out as Integer returns Integer:
+    @Reasoning
+    H_msg(R, PK.seed, PK.root, M) -> m bytes used for FORS path derivation.
+    MGF1-SHA-256 (n=16) or MGF1-SHA-512 (n>=24) of (R || PK.seed || PK.root || M).
+    @End Reasoning
+    @Implementation
+    Implements MGF1 expansion: chunks of hash output indexed by a 4-byte
+    big-endian counter starting at 0 are concatenated and truncated to m.
+    @End Implementation
+    @Performance_Hints
+    Number of hash invocations = ceil(m / hash_size).
+    @End Performance_Hints
+    @Security_Scope
+    Operates on PUBLIC opt_rand R; PK is public; message is public.
+    @End Security_Scope
+    Let prefix_len be 3 multiplied by n plus message_length
+    Let mgf_seed be Arena.arena_allocate(arena, prefix_len)
+    Memory.memory_copy(mgf_seed, r, n)
+    Memory.memory_copy(mgf_seed plus n, pk_seed, n)
+    Memory.memory_copy(mgf_seed plus n plus n, pk_root, n)
+    Memory.memory_copy(mgf_seed plus 3 multiplied by n, message, message_length)
+    Let hash_size be 32
+    If n is greater than 16:
+        Set hash_size to 64
+    End If
+    Let counter_buf be Arena.arena_allocate(arena, prefix_len plus 4)
+    Memory.memory_copy(counter_buf, mgf_seed, prefix_len)
+    Let chunk_buf be Arena.arena_allocate(arena, hash_size)
+    Let written be 0
+    Let counter be 0
+    While written is less than m:
+        Memory.memory_set_byte(counter_buf plus prefix_len, 0, counter shifted right by 24 bitwise_and 255)
+        Memory.memory_set_byte(counter_buf plus prefix_len, 1, counter shifted right by 16 bitwise_and 255)
+        Memory.memory_set_byte(counter_buf plus prefix_len, 2, counter shifted right by 8 bitwise_and 255)
+        Memory.memory_set_byte(counter_buf plus prefix_len, 3, counter bitwise_and 255)
+        If n is equal to 16:
+            Sha2.sha256_hash(arena, counter_buf, prefix_len plus 4, chunk_buf)
+        Otherwise:
+            Sha2.sha512_hash(arena, counter_buf, prefix_len plus 4, chunk_buf)
+        End If
+        Let take be hash_size
+        Let remaining be m minus written
+        If take is greater than remaining:
+            Set take to remaining
+        End If
+        Memory.memory_copy(out plus written, chunk_buf, take)
+        Set written to written plus take
+        Set counter to counter plus 1
+    End While
+    Return m
+End Process
+
+Note:
+==============================================================================
+WOTS+ CHAIN  (FIPS 205 Algorithm 5)
+==============================================================================
+Chains the F function start_idx..start_idx+steps-1 times starting from x
+to produce the chain end value.
+:End Note
+
+Process called "slhdsa_wots_chain" takes arena as Integer, pk_seed as Integer, adrs as Integer, x as Integer, start_idx as Integer, steps as Integer, n as Integer, out as Integer returns Integer:
+    @Reasoning
+    Iterated application of F.
+    @End Reasoning
+    @Implementation
+    Updates ADRS.hash address each step. start_idx + steps must be <= w-1.
+    @End Implementation
+    @Performance_Hints
+    Up to (w-1) hash invocations.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on PUBLIC chain start/step counts; CT wrt secret value x.
+    @End Security_Scope
+    Memory.memory_copy(out, x, n)
+    Let i be 0
+    While i is less than steps:
+        proc slhdsa_adrs_set_hash with adrs, start_idx plus i
+        Let tmp_buf be Arena.arena_allocate(arena, n)
+        proc slhdsa_f_hash with arena, pk_seed, adrs, out, n, tmp_buf
+        Memory.memory_copy(out, tmp_buf, n)
+        Set i to i plus 1
+    End While
+    Return n
+End Process
+
+Note:
+==============================================================================
+SLH-DSA TOP-LEVEL: KeyGen, Sign, Verify
+==============================================================================
+
+Below we provide:
+  - slhdsa_keygen_internal : caller supplies sk.seed, sk.prf, pk.seed (each
+    n bytes from a CSPRNG). We compute pk.root via the top-layer XMSS root
+    and assemble pk and sk.
+  - slhdsa_sign_internal   : top-level signing pipeline.
+  - slhdsa_verify_internal : top-level verification pipeline.
+
+The XMSS root computation, FORS signing, and HT signing helpers are kept
+internal here. Due to stage1 9-arg call limit on dotted calls, we factor
+state through caller-provided arena scratch instead of returning structures.
+:End Note
+
+Process called "slhdsa_wots_pkgen" takes arena as Integer, sk_seed as Integer, pk_seed as Integer, adrs as Integer, level as Integer, out_pk as Integer returns Integer:
+    @Reasoning
+    Generate a WOTS+ public key from sk_seed for the cell identified by ADRS.
+    FIPS 205 Algorithm 6.
+    @End Reasoning
+    @Implementation
+    For i in 0..len-1: sk_i = PRF(pk_seed, sk_seed, ADRS_WOTS_PRF[chain=i])
+    pk_i = wots_chain(sk_i, 0, w-1, ADRS_WOTS_HASH[chain=i])
+    pk = T_len(pk_seed, ADRS_WOTS_PK, pk_0 || pk_1 || ... )
+    @End Reasoning
+    @Implementation
+    Computes one chain per element. Builds the cascade and feeds into the
+    Tlen tweakable hash.
+    @End Implementation
+    @Performance_Hints
+    len * (w-1) F invocations + one T_len invocation.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path; CT.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let len_total be proc slhdsa_len with level
+    Let w be proc slhdsa_w
+    Let cascade be Arena.arena_allocate(arena, n multiplied by len_total)
+    Let adrs_prf be Arena.arena_allocate(arena, 32)
+    Let adrs_hash be Arena.arena_allocate(arena, 32)
+    Memory.memory_copy(adrs_prf, adrs, 32)
+    proc slhdsa_adrs_set_type_and_clear with adrs_prf, 5
+    Memory.memory_copy(adrs_prf plus 20, adrs plus 20, 4)
+    Memory.memory_copy(adrs_hash, adrs, 32)
+    proc slhdsa_adrs_set_type_and_clear with adrs_hash, 0
+    Memory.memory_copy(adrs_hash plus 20, adrs plus 20, 4)
+    Let i be 0
+    While i is less than len_total:
+        proc slhdsa_adrs_set_chain with adrs_prf, i
+        Let sk_i be Arena.arena_allocate(arena, n)
+        proc slhdsa_prf with arena, pk_seed, sk_seed, adrs_prf, n, sk_i
+        proc slhdsa_adrs_set_chain with adrs_hash, i
+        proc slhdsa_wots_chain with arena, pk_seed, adrs_hash, sk_i, 0, w minus 1, n, cascade plus i multiplied by n
+        Set i to i plus 1
+    End While
+    Note: Tlen via H_msg-style cascade hash on (pk_seed || ADRSc(WOTS_PK) || cascade)
+    Let adrs_pk be Arena.arena_allocate(arena, 32)
+    Memory.memory_copy(adrs_pk, adrs, 32)
+    proc slhdsa_adrs_set_type_and_clear with adrs_pk, 1
+    Memory.memory_copy(adrs_pk plus 20, adrs plus 20, 4)
+    Let total_len be n plus 22 plus n multiplied by len_total
+    Let tlen_buf be Arena.arena_allocate(arena, total_len)
+    Memory.memory_copy(tlen_buf, pk_seed, n)
+    Memory.memory_set_byte(tlen_buf plus n, 0, Memory.memory_get_byte(adrs_pk, 3))
+    Memory.memory_copy(tlen_buf plus n plus 1, adrs_pk plus 4, 8)
+    Memory.memory_set_byte(tlen_buf plus n plus 9, 0, Memory.memory_get_byte(adrs_pk, 12))
+    Memory.memory_copy(tlen_buf plus n plus 10, adrs_pk plus 20, 12)
+    Memory.memory_copy(tlen_buf plus n plus 22, cascade, n multiplied by len_total)
+    proc slhdsa_hash_select with n, arena, tlen_buf, total_len, out_pk
+    Return n
+End Process
+
+Process called "slhdsa_keygen_internal" takes arena as Integer, sk_seed as Integer, sk_prf as Integer, pk_seed as Integer, level as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    Per FIPS 205 Algorithm 21:
+      SK.seed, SK.prf, PK.seed are caller-supplied n-byte CSPRNG outputs.
+      PK.root = XMSS root at top layer (layer d-1, tree_addr 0)
+      PK = (PK.seed, PK.root)
+      SK = (SK.seed, SK.prf, PK.seed, PK.root)
+    @End Reasoning
+    @Implementation
+    Builds the top-layer XMSS subtree by computing all 2^h' WOTS+ public
+    keys and then folding via Merkle hashing to the root.
+    @End Implementation
+    @Performance_Hints
+    Dominated by 2^h' WOTS+ pk-gens, each costing len*(w-1) F invocations.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET: SK.seed, SK.prf.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let h_prime be proc slhdsa_h_prime with level
+    Let d be proc slhdsa_d with level
+
+    Note: Compute PK.root by recursively building XMSS subtree at top layer
+    Let leaf_count be 1 shifted left by h_prime
+    Let leaves be Arena.arena_allocate(arena, n multiplied by leaf_count)
+    Let adrs_template be Arena.arena_allocate(arena, 32)
+    proc slhdsa_adrs_zero with adrs_template
+    proc slhdsa_adrs_set_layer with adrs_template, d minus 1
+    proc slhdsa_adrs_set_tree with adrs_template, 0, 0
+    Let li be 0
+    While li is less than leaf_count:
+        proc slhdsa_adrs_set_type_and_clear with adrs_template, 0
+        proc slhdsa_adrs_set_keypair with adrs_template, li
+        proc slhdsa_wots_pkgen with arena, sk_seed, pk_seed, adrs_template, level, leaves plus li multiplied by n
+        Set li to li plus 1
+    End While
+
+    Note: Fold leaves to root
+    Let pk_root be Arena.arena_allocate(arena, n)
+    proc slhdsa_xmss_fold_root with arena, leaves, leaf_count, pk_seed, adrs_template, h_prime, n, pk_root
+
+    Memory.memory_copy(pk_out, pk_seed, n)
+    Memory.memory_copy(pk_out plus n, pk_root, n)
+
+    Memory.memory_copy(sk_out, sk_seed, n)
+    Memory.memory_copy(sk_out plus n, sk_prf, n)
+    Memory.memory_copy(sk_out plus 2 multiplied by n, pk_seed, n)
+    Memory.memory_copy(sk_out plus 3 multiplied by n, pk_root, n)
+
+    Return 1
+End Process
+
+Process called "slhdsa_xmss_fold_root" takes arena as Integer, leaves as Integer, leaf_count as Integer, pk_seed as Integer, adrs as Integer, h_prime as Integer, n as Integer, out_root as Integer returns Integer:
+    @Reasoning
+    Folds 2^h' leaves into a single root via Merkle hashing using
+    slhdsa_h_hash. Sets ADRS.type = TREE and updates tree_height + tree_index
+    per FIPS 205 sec 6.1.
+    @End Reasoning
+    @Implementation
+    Iteratively halves the array of n-byte nodes by hashing adjacent pairs.
+    @End Implementation
+    @Performance_Hints
+    leaf_count - 1 H invocations.
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    proc slhdsa_adrs_set_type_and_clear with adrs, 2
+    Let working be Arena.arena_allocate(arena, n multiplied by leaf_count)
+    Memory.memory_copy(working, leaves, n multiplied by leaf_count)
+    Let level_size be leaf_count
+    Let level_idx be 0
+    While level_size is greater than 1:
+        Set level_idx to level_idx plus 1
+        Let new_size be level_size divided by 2
+        Let pi be 0
+        While pi is less than new_size:
+            proc slhdsa_adrs_set_tree_height with adrs, level_idx
+            proc slhdsa_adrs_set_tree_index with adrs, pi
+            Let tmp be Arena.arena_allocate(arena, n)
+            proc slhdsa_h_hash with arena, pk_seed, adrs, working plus 2 multiplied by pi multiplied by n, working plus (2 multiplied by pi plus 1) multiplied by n, n, tmp
+            Memory.memory_copy(working plus pi multiplied by n, tmp, n)
+            Set pi to pi plus 1
+        End While
+        Set level_size to new_size
+    End While
+    Memory.memory_copy(out_root, working, n)
+    Return n
+End Process
+
+Process called "slhdsa_sign_internal" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, opt_rand as Integer, level as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    FIPS 205 Algorithm 22. High level:
+      R = PRF_msg(sk.prf, opt_rand, M)
+      digest = H_msg(R, pk.seed, pk.root, M)  (m bytes)
+      md = digest[0..floor((ka+7)/8)]
+      tmp_idx_tree = digest[next h-h/d bytes]
+      tmp_idx_leaf = digest[next h/d bytes]
+      Sign FORS over md using sk.seed and pk.seed
+      Sign HT over the FORS public key using the (tree, leaf) coordinates
+    @End Reasoning
+    @Implementation
+    Computes R, digest, slices the digest into index components, signs FORS,
+    then signs each XMSS layer of the hypertree. Writes packed signature to
+    sig_out.
+    @End Implementation
+    @Performance_Hints
+    Dominated by FORS sign (k*(a+1) hash ops) + HT sign (d*(WOTS_pkgen +
+    Merkle-fold) ~= d * (2^h') hashes).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET: sk.seed, sk.prf. Constant-time wrt sk.seed.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let m be proc slhdsa_m with level
+
+    Let sk_seed be sk
+    Let sk_prf be sk plus n
+    Let pk_seed be sk plus 2 multiplied by n
+    Let pk_root be sk plus 3 multiplied by n
+
+    Let r_value be sig_out
+    proc slhdsa_prf_msg with arena, sk_prf, opt_rand, message, message_length, n, r_value
+
+    Let digest be Arena.arena_allocate(arena, m)
+    proc slhdsa_h_msg with arena, r_value, pk_seed, pk_root, message, message_length, m, n, digest
+
+    Note: FORS portion of signature starts at offset n. Hypertree portion
+    Note: starts at offset n + k*(a+1)*n.
+    Let k be proc slhdsa_k with level
+    Let a be proc slhdsa_a with level
+    Let fors_sig be sig_out plus n
+    Let fors_sig_size be k multiplied by (a plus 1) multiplied by n
+    Let ht_sig be fors_sig plus fors_sig_size
+
+    Let md_bytes be (a multiplied by k plus 7) divided by 8
+    Let md_ptr be digest
+    Let h_val be proc slhdsa_h with level
+    Let h_prime_val be proc slhdsa_h_prime with level
+    Let idx_tree_bytes be (h_val minus h_prime_val plus 7) divided by 8
+    Let idx_tree_ptr be digest plus md_bytes
+    Let idx_leaf_bytes be (h_prime_val plus 7) divided by 8
+    Let idx_leaf_ptr be idx_tree_ptr plus idx_tree_bytes
+
+    Note: Convert idx_tree and idx_leaf to integers (top 64 bits of tree).
+    Note: Since hash heights for SHA-2 SLH-DSA are <= 68, idx_tree fits in 64 bits.
+    Let idx_tree_low be 0
+    Let idx_tree_high be 0
+    Let bi be 0
+    While bi is less than idx_tree_bytes:
+        Let byte_v be Memory.memory_get_byte(idx_tree_ptr, bi)
+        If bi is less than 4:
+            Set idx_tree_high to idx_tree_high shifted left by 8 bitwise_or byte_v
+        Otherwise:
+            Set idx_tree_low to idx_tree_low shifted left by 8 bitwise_or byte_v
+        End If
+        Set bi to bi plus 1
+    End While
+    Let idx_leaf be 0
+    Let bj be 0
+    While bj is less than idx_leaf_bytes:
+        Set idx_leaf to idx_leaf shifted left by 8 bitwise_or Memory.memory_get_byte(idx_leaf_ptr, bj)
+        Set bj to bj plus 1
+    End While
+
+    Note: Sign FORS portion. We write k FORS authentication paths into
+    Note: fors_sig and also compute the FORS public key root.
+    Let fors_root be Arena.arena_allocate(arena, n)
+    proc slhdsa_fors_sign with arena, md_ptr, sk_seed, pk_seed, idx_tree_low, idx_tree_high, idx_leaf, level, fors_sig, fors_root
+
+    Note: Sign HT (hypertree) on fors_root from (idx_tree, idx_leaf).
+    proc slhdsa_ht_sign with arena, fors_root, sk_seed, pk_seed, idx_tree_low, idx_tree_high, idx_leaf, level, ht_sig
+
+    Return 1
+End Process
+
+Process called "slhdsa_fors_sign" takes arena as Integer, md as Integer, sk_seed as Integer, pk_seed as Integer, idx_tree_low as Integer, idx_tree_high as Integer, idx_leaf as Integer, level as Integer, sig_out as Integer, root_out as Integer returns Integer:
+    @Reasoning
+    FIPS 205 Algorithm 14 (fors_sign): For each of k FORS trees, derive the
+    secret leaf via PRF and produce the authentication path. Concatenate
+    everything into sig_out (size k*(a+1)*n bytes), and produce the FORS
+    public key root via fors_pkFromSig.
+    @End Reasoning
+    @Implementation
+    Reads a 4-byte index per FORS tree from md, builds the leaf, computes
+    auth path. The FORS root is computed by hashing all k tree roots
+    together via T_k.
+    @End Implementation
+    @Performance_Hints
+    O(k * 2^a) hash operations for sk leaf derivation.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path. CT wrt sk_seed.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let a be proc slhdsa_a with level
+    Let k be proc slhdsa_k with level
+    Let adrs be Arena.arena_allocate(arena, 32)
+    proc slhdsa_adrs_zero with adrs
+    proc slhdsa_adrs_set_layer with adrs, 0
+    proc slhdsa_adrs_set_tree with adrs, idx_tree_low, idx_tree_high
+    proc slhdsa_adrs_set_type_and_clear with adrs, 3
+    proc slhdsa_adrs_set_keypair with adrs, idx_leaf
+
+    Let roots be Arena.arena_allocate(arena, n multiplied by k)
+    Let mask_a be 1 shifted left by a
+    Set mask_a to mask_a minus 1
+
+    Let i be 0
+    While i is less than k:
+        Note: Extract the i-th a-bit index from md
+        Let bit_offset be i multiplied by a
+        Let byte_offset be bit_offset shifted right by 3
+        Let bit_in_byte be bit_offset bitwise_and 7
+        Let idx_i be 0
+        Let needed_bytes be (a plus bit_in_byte plus 7) divided by 8
+        Let nbi be 0
+        While nbi is less than needed_bytes:
+            Set idx_i to idx_i shifted left by 8 bitwise_or Memory.memory_get_byte(md, byte_offset plus nbi)
+            Set nbi to nbi plus 1
+        End While
+        Note: Right-justify the a-bit window
+        Let total_bits be needed_bytes multiplied by 8
+        Let drop_bits be total_bits minus bit_in_byte minus a
+        Set idx_i to idx_i shifted right by drop_bits
+        Set idx_i to idx_i bitwise_and mask_a
+
+        Note: Derive leaf secret via PRF with chain=i*2^a + idx_i
+        Let leaf_id be i shifted left by a plus idx_i
+        proc slhdsa_adrs_set_tree_height with adrs, 0
+        proc slhdsa_adrs_set_tree_index with adrs, leaf_id
+        Let secret be Arena.arena_allocate(arena, n)
+        proc slhdsa_prf with arena, pk_seed, sk_seed, adrs, n, secret
+        Memory.memory_copy(sig_out plus i multiplied by (a plus 1) multiplied by n, secret, n)
+
+        Note: Build authentication path. For each level z in 0..a-1, compute
+        Note: the sibling node of the current path.
+        Let z be 0
+        While z is less than a:
+            Let sibling_index be leaf_id shifted right by z bitwise_xor 1
+            Let sibling_node be Arena.arena_allocate(arena, n)
+            proc slhdsa_fors_node_compute with arena, sibling_index, z, sk_seed, pk_seed, idx_tree_low, idx_tree_high, level, i, sibling_node
+            Let auth_offset be (i multiplied by (a plus 1) plus z plus 1) multiplied by n
+            Memory.memory_copy(sig_out plus auth_offset, sibling_node, n)
+            Set z to z plus 1
+        End While
+
+        Note: Compute root of this FORS tree at level a
+        Let root_i be Arena.arena_allocate(arena, n)
+        proc slhdsa_fors_node_compute with arena, i, a, sk_seed, pk_seed, idx_tree_low, idx_tree_high, level, i, root_i
+        Memory.memory_copy(roots plus i multiplied by n, root_i, n)
+        Set i to i plus 1
+    End While
+
+    Note: FORS root = T_k(pk_seed, ADRS_FORS_ROOTS, roots)
+    Let adrs_roots be Arena.arena_allocate(arena, 32)
+    Memory.memory_copy(adrs_roots, adrs, 32)
+    proc slhdsa_adrs_set_type_and_clear with adrs_roots, 4
+    proc slhdsa_adrs_set_keypair with adrs_roots, idx_leaf
+    Let total_len be n plus 22 plus n multiplied by k
+    Let tk_buf be Arena.arena_allocate(arena, total_len)
+    Memory.memory_copy(tk_buf, pk_seed, n)
+    Memory.memory_set_byte(tk_buf plus n, 0, Memory.memory_get_byte(adrs_roots, 3))
+    Memory.memory_copy(tk_buf plus n plus 1, adrs_roots plus 4, 8)
+    Memory.memory_set_byte(tk_buf plus n plus 9, 0, Memory.memory_get_byte(adrs_roots, 12))
+    Memory.memory_copy(tk_buf plus n plus 10, adrs_roots plus 20, 12)
+    Memory.memory_copy(tk_buf plus n plus 22, roots, n multiplied by k)
+    proc slhdsa_hash_select with n, arena, tk_buf, total_len, root_out
+
+    Return n
+End Process
+
+Process called "slhdsa_fors_node_compute" takes arena as Integer, target_index as Integer, target_height as Integer, sk_seed as Integer, pk_seed as Integer, idx_tree_low as Integer, idx_tree_high as Integer, level as Integer, tree_idx as Integer, out_node as Integer returns Integer:
+    @Reasoning
+    Compute a FORS node at given height/index by hashing down from the
+    leaves under that subtree. For height 0, derive secret via PRF and
+    apply F. For higher heights, recursively combine.
+    @End Reasoning
+    @Implementation
+    Bottom-up: enumerate 2^height leaves under target_index<<height,
+    hash to F then fold via H_hash.
+    @End Implementation
+    @Performance_Hints
+    O(2^target_height) hashes.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path. CT wrt sk_seed.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let a be proc slhdsa_a with level
+    Let leaves_per_tree be 1 shifted left by a
+    Let adrs be Arena.arena_allocate(arena, 32)
+    proc slhdsa_adrs_zero with adrs
+    proc slhdsa_adrs_set_layer with adrs, 0
+    proc slhdsa_adrs_set_tree with adrs, idx_tree_low, idx_tree_high
+    proc slhdsa_adrs_set_type_and_clear with adrs, 3
+    proc slhdsa_adrs_set_keypair with adrs, tree_idx
+
+    If target_height is equal to 0:
+        Let leaf_id be tree_idx shifted left by a plus target_index
+        proc slhdsa_adrs_set_tree_height with adrs, 0
+        proc slhdsa_adrs_set_tree_index with adrs, leaf_id
+        Let secret be Arena.arena_allocate(arena, n)
+        proc slhdsa_prf with arena, pk_seed, sk_seed, adrs, n, secret
+        proc slhdsa_f_hash with arena, pk_seed, adrs, secret, n, out_node
+        Return n
+    End If
+
+    Note: For higher height, enumerate subtree leaves and fold
+    Let span be 1 shifted left by target_height
+    Let base_leaf be target_index shifted left by target_height
+    Let leaves_buf be Arena.arena_allocate(arena, n multiplied by span)
+    Let li be 0
+    While li is less than span:
+        Let leaf_id be tree_idx shifted left by a plus base_leaf plus li
+        proc slhdsa_adrs_set_type_and_clear with adrs, 3
+        proc slhdsa_adrs_set_keypair with adrs, tree_idx
+        proc slhdsa_adrs_set_tree_height with adrs, 0
+        proc slhdsa_adrs_set_tree_index with adrs, leaf_id
+        Let secret be Arena.arena_allocate(arena, n)
+        proc slhdsa_prf with arena, pk_seed, sk_seed, adrs, n, secret
+        proc slhdsa_f_hash with arena, pk_seed, adrs, secret, n, leaves_buf plus li multiplied by n
+        Set li to li plus 1
+    End While
+
+    Note: Fold via H_hash up to target_height
+    Let level_size be span
+    Let cur_height be 0
+    While level_size is greater than 1:
+        Set cur_height to cur_height plus 1
+        Let new_size be level_size divided by 2
+        Let pi be 0
+        While pi is less than new_size:
+            proc slhdsa_adrs_set_tree_height with adrs, cur_height
+            proc slhdsa_adrs_set_tree_index with adrs, base_leaf shifted right by cur_height plus pi
+            Let tmp be Arena.arena_allocate(arena, n)
+            proc slhdsa_h_hash with arena, pk_seed, adrs, leaves_buf plus 2 multiplied by pi multiplied by n, leaves_buf plus (2 multiplied by pi plus 1) multiplied by n, n, tmp
+            Memory.memory_copy(leaves_buf plus pi multiplied by n, tmp, n)
+            Set pi to pi plus 1
+        End While
+        Set level_size to new_size
+    End While
+    Memory.memory_copy(out_node, leaves_buf, n)
+    Return n
+End Process
+
+Process called "slhdsa_ht_sign" takes arena as Integer, message_root as Integer, sk_seed as Integer, pk_seed as Integer, idx_tree_low as Integer, idx_tree_high as Integer, idx_leaf as Integer, level as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    Hypertree sign: produce d XMSS signatures stitching message_root up to
+    the top-level root. Each layer signs the previous root.
+    @End Reasoning
+    @Implementation
+    Layer 0 signs message_root with leaf idx_leaf in tree idx_tree. Then
+    compute the XMSS public root at layer 0 (becomes the message at layer 1).
+    Repeat for d layers.
+    @End Implementation
+    @Performance_Hints
+    O(d * 2^h') WOTS+ pkgens + Merkle-folds.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path; CT wrt sk_seed.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let d be proc slhdsa_d with level
+    Let h_prime be proc slhdsa_h_prime with level
+    Let len be proc slhdsa_len with level
+
+    Let current_root be Arena.arena_allocate(arena, n)
+    Memory.memory_copy(current_root, message_root, n)
+    Let cur_tree_low be idx_tree_low
+    Let cur_tree_high be idx_tree_high
+    Let cur_leaf be idx_leaf
+
+    Let layer be 0
+    Let sig_off be 0
+    Let per_layer_size be len plus h_prime multiplied by n
+    While layer is less than d:
+        proc slhdsa_xmss_sign_layer with arena, current_root, sk_seed, pk_seed, cur_tree_low, cur_tree_high, cur_leaf, layer, level, sig_out plus sig_off
+        Set sig_off to sig_off plus per_layer_size
+
+        Note: Compute next-layer root using xmss_pkFromSig style: but we
+        Note: directly compute the XMSS root at this layer.
+        Let next_root be Arena.arena_allocate(arena, n)
+        proc slhdsa_xmss_root_compute with arena, sk_seed, pk_seed, cur_tree_low, cur_tree_high, layer, level, next_root
+        Memory.memory_copy(current_root, next_root, n)
+
+        Note: Compute next-layer (tree, leaf): tree shifted right by h', leaf = tree mod 2^h'
+        Let mask_hp be 1 shifted left by h_prime
+        Set mask_hp to mask_hp minus 1
+        Let next_leaf be cur_tree_low bitwise_and mask_hp
+        Let next_tree_low be cur_tree_low shifted right by h_prime
+        Let next_tree_high be cur_tree_high
+        Note: Borrow from high if h_prime crosses 32-bit boundary
+        If h_prime is greater than 0:
+            Let borrow be cur_tree_high bitwise_and mask_hp
+            Set next_tree_low to next_tree_low bitwise_or ((borrow shifted left by (32 minus h_prime)) bitwise_and 4294967295)
+            Set next_tree_high to cur_tree_high shifted right by h_prime
+        End If
+        Set cur_tree_low to next_tree_low
+        Set cur_tree_high to next_tree_high
+        Set cur_leaf to next_leaf
+
+        Set layer to layer plus 1
+    End While
+    Return 1
+End Process
+
+Process called "slhdsa_xmss_sign_layer" takes arena as Integer, message as Integer, sk_seed as Integer, pk_seed as Integer, tree_low as Integer, tree_high as Integer, leaf_idx as Integer, layer_idx as Integer, level as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    Produces one XMSS signature: WOTS+ signature of message at this leaf,
+    plus an h'-element authentication path.
+    @End Reasoning
+    @Implementation
+    Calls wots_sign to write len*n bytes of signature, then computes the
+    auth path by recomputing siblings.
+    @End Implementation
+    @Performance_Hints
+    O(2^h') WOTS+ pkgens for the auth path.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path; CT wrt sk_seed.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let len be proc slhdsa_len with level
+    Let h_prime be proc slhdsa_h_prime with level
+
+    Let adrs be Arena.arena_allocate(arena, 32)
+    proc slhdsa_adrs_zero with adrs
+    proc slhdsa_adrs_set_layer with adrs, layer_idx
+    proc slhdsa_adrs_set_tree with adrs, tree_low, tree_high
+
+    proc slhdsa_wots_sign with arena, message, sk_seed, pk_seed, adrs, leaf_idx, level, sig_out
+
+    Note: Auth path
+    Let auth_off be len multiplied by n
+    Let z be 0
+    While z is less than h_prime:
+        Let sib_idx be leaf_idx shifted right by z bitwise_xor 1
+        Let sib_node be Arena.arena_allocate(arena, n)
+        proc slhdsa_xmss_node_compute with arena, sib_idx, z, sk_seed, pk_seed, tree_low, tree_high, layer_idx, level, sib_node
+        Memory.memory_copy(sig_out plus auth_off plus z multiplied by n, sib_node, n)
+        Set z to z plus 1
+    End While
+    Return 1
+End Process
+
+Process called "slhdsa_wots_sign" takes arena as Integer, message as Integer, sk_seed as Integer, pk_seed as Integer, adrs as Integer, leaf_idx as Integer, level as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    Produce a WOTS+ signature of an n-byte message under sk_seed at the
+    given ADRS, with key-pair address leaf_idx.
+    @End Reasoning
+    @Implementation
+    Converts message to base-w digits, computes the checksum digits, then
+    for each i runs the WOTS+ chain to length=digit_i.
+    @End Implementation
+    @Performance_Hints
+    len * average(digit) ~= len * (w-1)/2 F invocations.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path; CT wrt sk_seed.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let len1 be proc slhdsa_len1 with level
+    Let len2 be proc slhdsa_len2
+    Let lg_w be proc slhdsa_lg_w
+    Let w be proc slhdsa_w
+
+    Note: Convert message to base-w array (len1 digits)
+    Let base_w_arr be Arena.arena_allocate(arena, len1 plus len2)
+    Let i be 0
+    While i is less than len1 divided by 2:
+        Let b be Memory.memory_get_byte(message, i)
+        Memory.memory_set_byte(base_w_arr, 2 multiplied by i, b shifted right by 4)
+        Memory.memory_set_byte(base_w_arr, 2 multiplied by i plus 1, b bitwise_and 15)
+        Set i to i plus 1
+    End While
+    Note: Compute checksum
+    Let csum be 0
+    Let j be 0
+    While j is less than len1:
+        Set csum to csum plus w minus 1 minus Memory.memory_get_byte(base_w_arr, j)
+        Set j to j plus 1
+    End While
+    Set csum to csum shifted left by 4
+    Let csum_idx be len1
+    Let ci be len2 minus 1
+    While ci is greater than or equal to 0:
+        Memory.memory_set_byte(base_w_arr, csum_idx plus ci, csum bitwise_and 15)
+        Set csum to csum shifted right by 4
+        Set ci to ci minus 1
+    End While
+
+    Note: Sign each chain
+    proc slhdsa_adrs_set_type_and_clear with adrs, 0
+    proc slhdsa_adrs_set_keypair with adrs, leaf_idx
+    Let adrs_prf be Arena.arena_allocate(arena, 32)
+    Memory.memory_copy(adrs_prf, adrs, 32)
+    proc slhdsa_adrs_set_type_and_clear with adrs_prf, 5
+    Memory.memory_copy(adrs_prf plus 20, adrs plus 20, 4)
+
+    Let si be 0
+    While si is less than len1 plus len2:
+        proc slhdsa_adrs_set_chain with adrs_prf, si
+        Let sk_i be Arena.arena_allocate(arena, n)
+        proc slhdsa_prf with arena, pk_seed, sk_seed, adrs_prf, n, sk_i
+        proc slhdsa_adrs_set_chain with adrs, si
+        Let digit be Memory.memory_get_byte(base_w_arr, si)
+        proc slhdsa_wots_chain with arena, pk_seed, adrs, sk_i, 0, digit, n, sig_out plus si multiplied by n
+        Set si to si plus 1
+    End While
+    Return 1
+End Process
+
+Process called "slhdsa_xmss_root_compute" takes arena as Integer, sk_seed as Integer, pk_seed as Integer, tree_low as Integer, tree_high as Integer, layer_idx as Integer, level as Integer, out_root as Integer returns Integer:
+    @Reasoning
+    Computes the XMSS subtree root at given layer/tree.
+    @End Reasoning
+    @Implementation
+    Generates all 2^h' WOTS+ public keys then folds via slhdsa_xmss_fold_root.
+    @End Implementation
+    @Performance_Hints
+    2^h' WOTS pkgens.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let h_prime be proc slhdsa_h_prime with level
+    Let leaf_count be 1 shifted left by h_prime
+    Let leaves be Arena.arena_allocate(arena, n multiplied by leaf_count)
+    Let adrs_template be Arena.arena_allocate(arena, 32)
+    proc slhdsa_adrs_zero with adrs_template
+    proc slhdsa_adrs_set_layer with adrs_template, layer_idx
+    proc slhdsa_adrs_set_tree with adrs_template, tree_low, tree_high
+    Let li be 0
+    While li is less than leaf_count:
+        proc slhdsa_adrs_set_type_and_clear with adrs_template, 0
+        proc slhdsa_adrs_set_keypair with adrs_template, li
+        proc slhdsa_wots_pkgen with arena, sk_seed, pk_seed, adrs_template, level, leaves plus li multiplied by n
+        Set li to li plus 1
+    End While
+    proc slhdsa_xmss_fold_root with arena, leaves, leaf_count, pk_seed, adrs_template, h_prime, n, out_root
+    Return n
+End Process
+
+Process called "slhdsa_xmss_node_compute" takes arena as Integer, target_index as Integer, target_height as Integer, sk_seed as Integer, pk_seed as Integer, tree_low as Integer, tree_high as Integer, layer_idx as Integer, level as Integer, out_node as Integer returns Integer:
+    @Reasoning
+    Compute an XMSS subtree node at (target_height, target_index).
+    @End Reasoning
+    @Implementation
+    Build 2^target_height WOTS+ public keys under the target subtree, fold.
+    @End Implementation
+    @Performance_Hints
+    O(2^target_height) WOTS+ pkgens.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let span be 1 shifted left by target_height
+    Let leaves be Arena.arena_allocate(arena, n multiplied by span)
+    Let adrs_template be Arena.arena_allocate(arena, 32)
+    proc slhdsa_adrs_zero with adrs_template
+    proc slhdsa_adrs_set_layer with adrs_template, layer_idx
+    proc slhdsa_adrs_set_tree with adrs_template, tree_low, tree_high
+    Let base_leaf be target_index shifted left by target_height
+    Let li be 0
+    While li is less than span:
+        proc slhdsa_adrs_set_type_and_clear with adrs_template, 0
+        proc slhdsa_adrs_set_keypair with adrs_template, base_leaf plus li
+        proc slhdsa_wots_pkgen with arena, sk_seed, pk_seed, adrs_template, level, leaves plus li multiplied by n
+        Set li to li plus 1
+    End While
+    proc slhdsa_xmss_fold_root with arena, leaves, span, pk_seed, adrs_template, target_height, n, out_node
+    Return n
+End Process
+
+Process called "slhdsa_verify_internal" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, signature as Integer, level as Integer returns Integer:
+    @Reasoning
+    FIPS 205 Algorithm 24. Recomputes R||digest then derives indices,
+    derives the FORS public key from the FORS signature, then walks the
+    HT signatures up to the top, comparing the final root to pk.root.
+    @End Reasoning
+    @Implementation
+    Mirror of sign without producing intermediates.
+    @End Implementation
+    @Performance_Hints
+    Same order of magnitude as signing, but typically faster in practice
+    because no PRF leaf generation is needed.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on PUBLIC data.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let m be proc slhdsa_m with level
+    Let pk_seed be pk
+    Let pk_root be pk plus n
+
+    Let r_value be signature
+    Let digest be Arena.arena_allocate(arena, m)
+    proc slhdsa_h_msg with arena, r_value, pk_seed, pk_root, message, message_length, m, n, digest
+
+    Let a be proc slhdsa_a with level
+    Let k be proc slhdsa_k with level
+    Let d be proc slhdsa_d with level
+    Let h_prime be proc slhdsa_h_prime with level
+    Let len be proc slhdsa_len with level
+    Let fors_sig_size be k multiplied by (a plus 1) multiplied by n
+    Let fors_sig be signature plus n
+    Let ht_sig be fors_sig plus fors_sig_size
+
+    Let md_bytes be (a multiplied by k plus 7) divided by 8
+    Let md_ptr be digest
+    Let h_val_v be proc slhdsa_h with level
+    Let idx_tree_bytes be (h_val_v minus h_prime plus 7) divided by 8
+    Let idx_tree_ptr be digest plus md_bytes
+    Let idx_leaf_bytes be (h_prime plus 7) divided by 8
+    Let idx_leaf_ptr be idx_tree_ptr plus idx_tree_bytes
+
+    Let idx_tree_low be 0
+    Let idx_tree_high be 0
+    Let bi be 0
+    While bi is less than idx_tree_bytes:
+        Let byte_v be Memory.memory_get_byte(idx_tree_ptr, bi)
+        If bi is less than 4:
+            Set idx_tree_high to idx_tree_high shifted left by 8 bitwise_or byte_v
+        Otherwise:
+            Set idx_tree_low to idx_tree_low shifted left by 8 bitwise_or byte_v
+        End If
+        Set bi to bi plus 1
+    End While
+    Let idx_leaf be 0
+    Let bj be 0
+    While bj is less than idx_leaf_bytes:
+        Set idx_leaf to idx_leaf shifted left by 8 bitwise_or Memory.memory_get_byte(idx_leaf_ptr, bj)
+        Set bj to bj plus 1
+    End While
+
+    Note: Reconstruct FORS public-key root from the FORS signature
+    Let fors_root be Arena.arena_allocate(arena, n)
+    proc slhdsa_fors_pk_from_sig with arena, md_ptr, fors_sig, pk_seed, idx_tree_low, idx_tree_high, idx_leaf, level, fors_root
+
+    Note: Walk hypertree signatures up, applying WOTS+ pkFromSig + auth path
+    Let current_root be Arena.arena_allocate(arena, n)
+    Memory.memory_copy(current_root, fors_root, n)
+    Let cur_tree_low be idx_tree_low
+    Let cur_tree_high be idx_tree_high
+    Let cur_leaf be idx_leaf
+    Let layer be 0
+    Let ht_off be 0
+    Let per_layer_size be len plus h_prime multiplied by n
+    While layer is less than d:
+        Let next_root be Arena.arena_allocate(arena, n)
+        proc slhdsa_xmss_pk_from_sig with arena, current_root, ht_sig plus ht_off, pk_seed, cur_tree_low, cur_tree_high, cur_leaf, layer, level, next_root
+        Memory.memory_copy(current_root, next_root, n)
+        Set ht_off to ht_off plus per_layer_size
+
+        Let mask_hp be 1 shifted left by h_prime
+        Set mask_hp to mask_hp minus 1
+        Let next_leaf be cur_tree_low bitwise_and mask_hp
+        Let next_tree_low be cur_tree_low shifted right by h_prime
+        Let next_tree_high be cur_tree_high
+        If h_prime is greater than 0:
+            Let borrow be cur_tree_high bitwise_and mask_hp
+            Set next_tree_low to next_tree_low bitwise_or ((borrow shifted left by (32 minus h_prime)) bitwise_and 4294967295)
+            Set next_tree_high to cur_tree_high shifted right by h_prime
+        End If
+        Set cur_tree_low to next_tree_low
+        Set cur_tree_high to next_tree_high
+        Set cur_leaf to next_leaf
+
+        Set layer to layer plus 1
+    End While
+
+    Note: Constant-time compare to pk_root
+    Let diff be 0
+    Let ci be 0
+    While ci is less than n:
+        Let a_b be Memory.memory_get_byte(current_root, ci)
+        Let b_b be Memory.memory_get_byte(pk_root, ci)
+        Set diff to diff bitwise_or a_b bitwise_xor b_b
+        Set ci to ci plus 1
+    End While
+    If diff is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "slhdsa_wots_pk_from_sig" takes arena as Integer, message as Integer, sig as Integer, pk_seed as Integer, adrs as Integer, leaf_idx as Integer, level as Integer, out_pk as Integer returns Integer:
+    @Reasoning
+    Reconstruct a WOTS+ public key from a WOTS+ signature and the signed
+    message. FIPS 205 Algorithm 8.
+    @End Reasoning
+    @Implementation
+    Computes the base-w digits + checksum of message, then for each chain
+    runs F from start=digit to end=w-1 starting from the supplied signature
+    block. Concatenates the recovered pk_i values and applies the Tlen hash.
+    @End Implementation
+    @Performance_Hints
+    O(len * (w-1)) F invocations.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on PUBLIC signature data.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let len1 be proc slhdsa_len1 with level
+    Let len2 be proc slhdsa_len2
+    Let lg_w be proc slhdsa_lg_w
+    Let w be proc slhdsa_w
+
+    Let base_w_arr be Arena.arena_allocate(arena, len1 plus len2)
+    Let i be 0
+    While i is less than len1 divided by 2:
+        Let b be Memory.memory_get_byte(message, i)
+        Memory.memory_set_byte(base_w_arr, 2 multiplied by i, b shifted right by 4)
+        Memory.memory_set_byte(base_w_arr, 2 multiplied by i plus 1, b bitwise_and 15)
+        Set i to i plus 1
+    End While
+    Let csum be 0
+    Let j be 0
+    While j is less than len1:
+        Set csum to csum plus w minus 1 minus Memory.memory_get_byte(base_w_arr, j)
+        Set j to j plus 1
+    End While
+    Set csum to csum shifted left by 4
+    Let ci2 be len2 minus 1
+    While ci2 is greater than or equal to 0:
+        Memory.memory_set_byte(base_w_arr, len1 plus ci2, csum bitwise_and 15)
+        Set csum to csum shifted right by 4
+        Set ci2 to ci2 minus 1
+    End While
+
+    proc slhdsa_adrs_set_type_and_clear with adrs, 0
+    proc slhdsa_adrs_set_keypair with adrs, leaf_idx
+    Let cascade be Arena.arena_allocate(arena, n multiplied by (len1 plus len2))
+    Let si be 0
+    While si is less than len1 plus len2:
+        proc slhdsa_adrs_set_chain with adrs, si
+        Let digit be Memory.memory_get_byte(base_w_arr, si)
+        proc slhdsa_wots_chain with arena, pk_seed, adrs, sig plus si multiplied by n, digit, w minus 1 minus digit, n, cascade plus si multiplied by n
+        Set si to si plus 1
+    End While
+
+    Let adrs_pk be Arena.arena_allocate(arena, 32)
+    Memory.memory_copy(adrs_pk, adrs, 32)
+    proc slhdsa_adrs_set_type_and_clear with adrs_pk, 1
+    proc slhdsa_adrs_set_keypair with adrs_pk, leaf_idx
+    Let total_len be n plus 22 plus n multiplied by (len1 plus len2)
+    Let tlen_buf be Arena.arena_allocate(arena, total_len)
+    Memory.memory_copy(tlen_buf, pk_seed, n)
+    Memory.memory_set_byte(tlen_buf plus n, 0, Memory.memory_get_byte(adrs_pk, 3))
+    Memory.memory_copy(tlen_buf plus n plus 1, adrs_pk plus 4, 8)
+    Memory.memory_set_byte(tlen_buf plus n plus 9, 0, Memory.memory_get_byte(adrs_pk, 12))
+    Memory.memory_copy(tlen_buf plus n plus 10, adrs_pk plus 20, 12)
+    Memory.memory_copy(tlen_buf plus n plus 22, cascade, n multiplied by (len1 plus len2))
+    proc slhdsa_hash_select with n, arena, tlen_buf, total_len, out_pk
+    Return n
+End Process
+
+Process called "slhdsa_xmss_pk_from_sig" takes arena as Integer, message as Integer, sig as Integer, pk_seed as Integer, tree_low as Integer, tree_high as Integer, leaf_idx as Integer, layer_idx as Integer, level as Integer, out_root as Integer returns Integer:
+    @Reasoning
+    Recover the XMSS subtree root from a WOTS+ signature + auth path.
+    FIPS 205 Algorithm 10.
+    @End Reasoning
+    @Implementation
+    First runs wots_pk_from_sig to get the WOTS public key (the leaf).
+    Then walks h' levels combining with the auth path, hashing via H_hash
+    at each level using ADRS.type=TREE.
+    @End Implementation
+    @Performance_Hints
+    O(len*(w-1)) hashes for wots_pk_from_sig + h' H_hashes.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on PUBLIC data.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let len be proc slhdsa_len with level
+    Let h_prime be proc slhdsa_h_prime with level
+    Let adrs be Arena.arena_allocate(arena, 32)
+    proc slhdsa_adrs_zero with adrs
+    proc slhdsa_adrs_set_layer with adrs, layer_idx
+    proc slhdsa_adrs_set_tree with adrs, tree_low, tree_high
+
+    Let node be Arena.arena_allocate(arena, n)
+    proc slhdsa_wots_pk_from_sig with arena, message, sig, pk_seed, adrs, leaf_idx, level, node
+
+    proc slhdsa_adrs_set_type_and_clear with adrs, 2
+    Let auth_path be sig plus len multiplied by n
+    Let cur_idx be leaf_idx
+    Let z be 0
+    While z is less than h_prime:
+        proc slhdsa_adrs_set_tree_height with adrs, z plus 1
+        proc slhdsa_adrs_set_tree_index with adrs, cur_idx shifted right by 1
+        Let sib be auth_path plus z multiplied by n
+        Let tmp be Arena.arena_allocate(arena, n)
+        If cur_idx bitwise_and 1 is equal to 0:
+            proc slhdsa_h_hash with arena, pk_seed, adrs, node, sib, n, tmp
+        Otherwise:
+            proc slhdsa_h_hash with arena, pk_seed, adrs, sib, node, n, tmp
+        End If
+        Memory.memory_copy(node, tmp, n)
+        Set cur_idx to cur_idx shifted right by 1
+        Set z to z plus 1
+    End While
+    Memory.memory_copy(out_root, node, n)
+    Return n
+End Process
+
+Process called "slhdsa_fors_pk_from_sig" takes arena as Integer, md as Integer, sig as Integer, pk_seed as Integer, idx_tree_low as Integer, idx_tree_high as Integer, idx_leaf as Integer, level as Integer, out_root as Integer returns Integer:
+    @Reasoning
+    Recover the FORS public key root from a FORS signature.
+    FIPS 205 Algorithm 17.
+    @End Reasoning
+    @Implementation
+    For each of k FORS trees: extract index from md, apply F to the secret
+    leaf in sig, walk auth path applying H_hash. Collect k roots, then run
+    T_k.
+    @End Implementation
+    @Performance_Hints
+    k * (a + 1) hash invocations + one T_k.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on PUBLIC signature data.
+    @End Security_Scope
+    Let n be proc slhdsa_n with level
+    Let a be proc slhdsa_a with level
+    Let k be proc slhdsa_k with level
+    Let adrs be Arena.arena_allocate(arena, 32)
+    proc slhdsa_adrs_zero with adrs
+    proc slhdsa_adrs_set_layer with adrs, 0
+    proc slhdsa_adrs_set_tree with adrs, idx_tree_low, idx_tree_high
+    proc slhdsa_adrs_set_type_and_clear with adrs, 3
+    proc slhdsa_adrs_set_keypair with adrs, idx_leaf
+
+    Let roots be Arena.arena_allocate(arena, n multiplied by k)
+    Let mask_a be 1 shifted left by a
+    Set mask_a to mask_a minus 1
+
+    Let i be 0
+    While i is less than k:
+        Let bit_offset be i multiplied by a
+        Let byte_offset be bit_offset shifted right by 3
+        Let bit_in_byte be bit_offset bitwise_and 7
+        Let idx_i be 0
+        Let needed_bytes be (a plus bit_in_byte plus 7) divided by 8
+        Let nbi be 0
+        While nbi is less than needed_bytes:
+            Set idx_i to idx_i shifted left by 8 bitwise_or Memory.memory_get_byte(md, byte_offset plus nbi)
+            Set nbi to nbi plus 1
+        End While
+        Let total_bits be needed_bytes multiplied by 8
+        Let drop_bits be total_bits minus bit_in_byte minus a
+        Set idx_i to idx_i shifted right by drop_bits
+        Set idx_i to idx_i bitwise_and mask_a
+
+        Let leaf_id be i shifted left by a plus idx_i
+        Let secret_sig be sig plus i multiplied by (a plus 1) multiplied by n
+        proc slhdsa_adrs_set_tree_height with adrs, 0
+        proc slhdsa_adrs_set_tree_index with adrs, leaf_id
+        Let node be Arena.arena_allocate(arena, n)
+        proc slhdsa_f_hash with arena, pk_seed, adrs, secret_sig, n, node
+
+        Let auth_path be secret_sig plus n
+        Let cur_idx be leaf_id
+        Let z be 0
+        While z is less than a:
+            proc slhdsa_adrs_set_tree_height with adrs, z plus 1
+            proc slhdsa_adrs_set_tree_index with adrs, cur_idx shifted right by 1
+            Let sib be auth_path plus z multiplied by n
+            Let tmp be Arena.arena_allocate(arena, n)
+            If cur_idx bitwise_and 1 is equal to 0:
+                proc slhdsa_h_hash with arena, pk_seed, adrs, node, sib, n, tmp
+            Otherwise:
+                proc slhdsa_h_hash with arena, pk_seed, adrs, sib, node, n, tmp
+            End If
+            Memory.memory_copy(node, tmp, n)
+            Set cur_idx to cur_idx shifted right by 1
+            Set z to z plus 1
+        End While
+        Memory.memory_copy(roots plus i multiplied by n, node, n)
+        Set i to i plus 1
+    End While
+
+    Let adrs_roots be Arena.arena_allocate(arena, 32)
+    Memory.memory_copy(adrs_roots, adrs, 32)
+    proc slhdsa_adrs_set_type_and_clear with adrs_roots, 4
+    proc slhdsa_adrs_set_keypair with adrs_roots, idx_leaf
+    Let total_len be n plus 22 plus n multiplied by k
+    Let tk_buf be Arena.arena_allocate(arena, total_len)
+    Memory.memory_copy(tk_buf, pk_seed, n)
+    Memory.memory_set_byte(tk_buf plus n, 0, Memory.memory_get_byte(adrs_roots, 3))
+    Memory.memory_copy(tk_buf plus n plus 1, adrs_roots plus 4, 8)
+    Memory.memory_set_byte(tk_buf plus n plus 9, 0, Memory.memory_get_byte(adrs_roots, 12))
+    Memory.memory_copy(tk_buf plus n plus 10, adrs_roots plus 20, 12)
+    Memory.memory_copy(tk_buf plus n plus 22, roots, n multiplied by k)
+    proc slhdsa_hash_select with n, arena, tk_buf, total_len, out_root
+    Return n
+End Process
+
+Note:
+==============================================================================
+Public per-parameter-set API
+==============================================================================
+:End Note
+
+Process called "slh_dsa_sha2_128s_keygen" takes arena as Integer, sk_seed as Integer, sk_prf as Integer, pk_seed as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-128s KeyGen (level=1).
+    @End Reasoning
+    @Implementation
+    Delegates with level=1.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_keygen_internal.
+    @End Security_Scope
+    Return proc slhdsa_keygen_internal with arena, sk_seed, sk_prf, pk_seed, 1, pk_out, sk_out
+End Process
+
+Process called "slh_dsa_sha2_128s_sign" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, opt_rand as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-128s Sign (level=1).
+    @End Reasoning
+    @Implementation
+    Delegates with level=1.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_sign_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_sign_internal.
+    @End Security_Scope
+    Return proc slhdsa_sign_internal with arena, sk, message, message_length, opt_rand, 1, sig_out
+End Process
+
+Process called "slh_dsa_sha2_128s_verify" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, signature as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-128s Verify (level=1).
+    @End Reasoning
+    @Implementation
+    Delegates with level=1.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_verify_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_verify_internal.
+    @End Security_Scope
+    Return proc slhdsa_verify_internal with arena, pk, message, message_length, signature, 1
+End Process
+
+Process called "slh_dsa_sha2_128f_keygen" takes arena as Integer, sk_seed as Integer, sk_prf as Integer, pk_seed as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-128f KeyGen (level=2).
+    @End Reasoning
+    @Implementation
+    Delegates with level=2.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_keygen_internal.
+    @End Security_Scope
+    Return proc slhdsa_keygen_internal with arena, sk_seed, sk_prf, pk_seed, 2, pk_out, sk_out
+End Process
+
+Process called "slh_dsa_sha2_128f_sign" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, opt_rand as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-128f Sign (level=2).
+    @End Reasoning
+    @Implementation
+    Delegates with level=2.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_sign_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_sign_internal.
+    @End Security_Scope
+    Return proc slhdsa_sign_internal with arena, sk, message, message_length, opt_rand, 2, sig_out
+End Process
+
+Process called "slh_dsa_sha2_128f_verify" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, signature as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-128f Verify (level=2).
+    @End Reasoning
+    @Implementation
+    Delegates with level=2.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_verify_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_verify_internal.
+    @End Security_Scope
+    Return proc slhdsa_verify_internal with arena, pk, message, message_length, signature, 2
+End Process
+
+Process called "slh_dsa_sha2_192s_keygen" takes arena as Integer, sk_seed as Integer, sk_prf as Integer, pk_seed as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-192s KeyGen (level=3).
+    @End Reasoning
+    @Implementation
+    Delegates with level=3.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_keygen_internal.
+    @End Security_Scope
+    Return proc slhdsa_keygen_internal with arena, sk_seed, sk_prf, pk_seed, 3, pk_out, sk_out
+End Process
+
+Process called "slh_dsa_sha2_192s_sign" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, opt_rand as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-192s Sign (level=3).
+    @End Reasoning
+    @Implementation
+    Delegates with level=3.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_sign_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_sign_internal.
+    @End Security_Scope
+    Return proc slhdsa_sign_internal with arena, sk, message, message_length, opt_rand, 3, sig_out
+End Process
+
+Process called "slh_dsa_sha2_192s_verify" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, signature as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-192s Verify (level=3).
+    @End Reasoning
+    @Implementation
+    Delegates with level=3.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_verify_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_verify_internal.
+    @End Security_Scope
+    Return proc slhdsa_verify_internal with arena, pk, message, message_length, signature, 3
+End Process
+
+Process called "slh_dsa_sha2_192f_keygen" takes arena as Integer, sk_seed as Integer, sk_prf as Integer, pk_seed as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-192f KeyGen (level=4).
+    @End Reasoning
+    @Implementation
+    Delegates with level=4.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_keygen_internal.
+    @End Security_Scope
+    Return proc slhdsa_keygen_internal with arena, sk_seed, sk_prf, pk_seed, 4, pk_out, sk_out
+End Process
+
+Process called "slh_dsa_sha2_192f_sign" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, opt_rand as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-192f Sign (level=4).
+    @End Reasoning
+    @Implementation
+    Delegates with level=4.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_sign_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_sign_internal.
+    @End Security_Scope
+    Return proc slhdsa_sign_internal with arena, sk, message, message_length, opt_rand, 4, sig_out
+End Process
+
+Process called "slh_dsa_sha2_192f_verify" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, signature as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-192f Verify (level=4).
+    @End Reasoning
+    @Implementation
+    Delegates with level=4.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_verify_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_verify_internal.
+    @End Security_Scope
+    Return proc slhdsa_verify_internal with arena, pk, message, message_length, signature, 4
+End Process
+
+Process called "slh_dsa_sha2_256s_keygen" takes arena as Integer, sk_seed as Integer, sk_prf as Integer, pk_seed as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-256s KeyGen (level=5).
+    @End Reasoning
+    @Implementation
+    Delegates with level=5.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_keygen_internal.
+    @End Security_Scope
+    Return proc slhdsa_keygen_internal with arena, sk_seed, sk_prf, pk_seed, 5, pk_out, sk_out
+End Process
+
+Process called "slh_dsa_sha2_256s_sign" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, opt_rand as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-256s Sign (level=5).
+    @End Reasoning
+    @Implementation
+    Delegates with level=5.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_sign_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_sign_internal.
+    @End Security_Scope
+    Return proc slhdsa_sign_internal with arena, sk, message, message_length, opt_rand, 5, sig_out
+End Process
+
+Process called "slh_dsa_sha2_256s_verify" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, signature as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-256s Verify (level=5).
+    @End Reasoning
+    @Implementation
+    Delegates with level=5.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_verify_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_verify_internal.
+    @End Security_Scope
+    Return proc slhdsa_verify_internal with arena, pk, message, message_length, signature, 5
+End Process
+
+Process called "slh_dsa_sha2_256f_keygen" takes arena as Integer, sk_seed as Integer, sk_prf as Integer, pk_seed as Integer, pk_out as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-256f KeyGen (level=6).
+    @End Reasoning
+    @Implementation
+    Delegates with level=6.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_keygen_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_keygen_internal.
+    @End Security_Scope
+    Return proc slhdsa_keygen_internal with arena, sk_seed, sk_prf, pk_seed, 6, pk_out, sk_out
+End Process
+
+Process called "slh_dsa_sha2_256f_sign" takes arena as Integer, sk as Integer, message as Integer, message_length as Integer, opt_rand as Integer, sig_out as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-256f Sign (level=6).
+    @End Reasoning
+    @Implementation
+    Delegates with level=6.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_sign_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_sign_internal.
+    @End Security_Scope
+    Return proc slhdsa_sign_internal with arena, sk, message, message_length, opt_rand, 6, sig_out
+End Process
+
+Process called "slh_dsa_sha2_256f_verify" takes arena as Integer, pk as Integer, message as Integer, message_length as Integer, signature as Integer returns Integer:
+    @Reasoning
+    SLH-DSA-SHA2-256f Verify (level=6).
+    @End Reasoning
+    @Implementation
+    Delegates with level=6.
+    @End Implementation
+    @Performance_Hints
+    See slhdsa_verify_internal.
+    @End Performance_Hints
+    @Security_Scope
+    See slhdsa_verify_internal.
+    @End Security_Scope
+    Return proc slhdsa_verify_internal with arena, pk, message, message_length, signature, 6
+End Process

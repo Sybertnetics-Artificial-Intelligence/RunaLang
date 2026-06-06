@@ -1,0 +1,190 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+ASYNC ITERATOR - Pull-based async iteration.
+
+An AsyncIter<T> is a function-pointer-based iterator. Each call to
+async_iter_next invokes the iterator function which returns the next
+value (or signals exhaustion via the out-flag).
+
+This complements stream.runa for cases where the producer is a pure
+function (no buffering) and async semantics are limited to "the value
+may not be ready immediately".
+
+AsyncIter layout (32 bytes):
+  offset 0:  next_fn        (8 bytes) - function pointer to producer
+  offset 8:  state_ptr      (8 bytes) - opaque producer state
+  offset 16: done_flag      (8 bytes) - 1 if iteration finished
+  offset 24: cleanup_fn     (8 bytes) - optional cleanup callback (0 if none)
+
+Dependencies:
+- concurrency/future_promise.runa (for indirect-call ABI)
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/concurrency/future_promise.runa" as FP
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant AI_OFF_NEXT_FN as Integer is 0
+Constant AI_OFF_STATE as Integer is 8
+Constant AI_OFF_DONE as Integer is 16
+Constant AI_OFF_CLEANUP as Integer is 24
+Constant AI_STRUCT_SIZE as Integer is 32
+
+Constant AI_OK as Integer is 1
+Constant AI_DONE as Integer is 0
+Constant AI_ERR_INVALID as Integer is 0
+
+@Reasoning
+Construct an iterator from a next-function pointer and an opaque state.
+The next_fn signature is: takes (state_ptr, out_value_holder, out_done_holder) returns Integer.
+@End Reasoning
+
+@Implementation
+Allocate the struct, store fields.
+@End Implementation
+
+@Performance_Hints
+O(1) - no syscalls.
+@End Performance_Hints
+
+@Security_Scope
+next_fn must remain valid for the iterator's lifetime.
+@End Security_Scope
+
+Process called "async_iter_create" takes next_fn as Integer, state_ptr as Integer, cleanup_fn as Integer returns Integer:
+    Let it be proc allocate from Memory with AI_STRUCT_SIZE
+    If it is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with it, AI_OFF_NEXT_FN, next_fn
+    proc memory_set_int64 from Mem with it, AI_OFF_STATE, state_ptr
+    proc memory_set_int64 from Mem with it, AI_OFF_DONE, 0
+    proc memory_set_int64 from Mem with it, AI_OFF_CLEANUP, cleanup_fn
+    Return it
+End Process
+
+@Reasoning
+Pull the next value. Returns AI_OK with *out_value_holder populated, or
+AI_DONE when iteration is finished.
+@End Reasoning
+
+@Implementation
+Check the done flag first. Then invoke next_fn via the closure runtime
+indirect call. The next_fn updates the done flag if exhausted.
+@End Implementation
+
+@Performance_Hints
+One indirect call per element.
+@End Performance_Hints
+
+@Security_Scope
+out_value_holder must point to writable 8-byte storage.
+@End Security_Scope
+
+Process called "async_iter_next" takes it as Integer, out_value_holder as Integer returns Integer:
+    If it is equal to 0:
+        Return AI_ERR_INVALID
+    End If
+    If out_value_holder is equal to 0:
+        Return AI_ERR_INVALID
+    End If
+    Let done be proc memory_get_int64 from Mem with it, AI_OFF_DONE
+    If done is not equal to 0:
+        proc memory_set_int64 from Mem with out_value_holder, 0, 0
+        Return AI_DONE
+    End If
+
+    Let next_fn be proc memory_get_int64 from Mem with it, AI_OFF_NEXT_FN
+    Let state_ptr be proc memory_get_int64 from Mem with it, AI_OFF_STATE
+
+    Note: next_fn signature: (state, out_value_holder, it_for_done_signal) -> result code (1=OK, 0=DONE)
+    Let rc be proc fp_runtime_call_indirect_3 from FP with next_fn, state_ptr, out_value_holder, it
+    If rc is equal to AI_OK:
+        Return AI_OK
+    End If
+    proc memory_set_int64 from Mem with it, AI_OFF_DONE, 1
+    proc memory_set_int64 from Mem with out_value_holder, 0, 0
+    Return AI_DONE
+End Process
+
+@Reasoning
+Manually mark the iterator as exhausted (e.g. for early termination).
+@End Reasoning
+
+@Implementation
+Set done flag.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "async_iter_mark_done" takes it as Integer returns Integer:
+    If it is equal to 0:
+        Return AI_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with it, AI_OFF_DONE, 1
+    Return AI_OK
+End Process
+
+@Reasoning
+Query whether the iterator is exhausted.
+@End Reasoning
+
+@Implementation
+Read the done flag.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "async_iter_is_done" takes it as Integer returns Integer:
+    If it is equal to 0:
+        Return 1
+    End If
+    Return proc memory_get_int64 from Mem with it, AI_OFF_DONE
+End Process
+
+@Reasoning
+Destroy the iterator, calling its cleanup callback first if one was
+provided.
+@End Reasoning
+
+@Implementation
+Invoke cleanup_fn(state_ptr) if non-zero, then free the struct.
+@End Implementation
+
+@Performance_Hints
+One indirect call + one free.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "async_iter_destroy" takes it as Integer returns Integer:
+    If it is equal to 0:
+        Return AI_ERR_INVALID
+    End If
+    Let cleanup_fn be proc memory_get_int64 from Mem with it, AI_OFF_CLEANUP
+    Let state_ptr be proc memory_get_int64 from Mem with it, AI_OFF_STATE
+    If cleanup_fn is not equal to 0:
+        proc fp_runtime_call_indirect_3 from FP with cleanup_fn, state_ptr, 0, 0
+    End If
+    proc deallocate from Memory with it
+    Return AI_OK
+End Process

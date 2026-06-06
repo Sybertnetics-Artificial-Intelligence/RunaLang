@@ -1,0 +1,467 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+==============================================================================
+Time Reference - Multiple Civil and Scientific Time Scales
+==============================================================================
+
+Time on Earth is not a single quantity. The civil clock most users see
+(UTC) is one of several non-equivalent time scales, and mixing them is
+the dominant source of bugs in satellite navigation, spaceflight,
+high-frequency trading, and distributed databases that span continents.
+
+This module enumerates the major scales and provides exact, leap-second-
+aware conversions between them. Every DateTime carries an explicit
+TimeReference; comparison across scales without an intermediate
+conversion is an error contract violation.
+
+The five scales tracked here:
+
+  UTC  (Coordinated Universal Time)
+       The civil reference broadcast by NTP servers. Tied to TAI but
+       with leap seconds inserted (in 1972 and intermittently since) to
+       keep |UT1 - UTC| < 0.9 s. Days are 86_400 seconds long EXCEPT on
+       leap-second days, which contain 86_401 (positive leap) or
+       86_399 (negative leap; never used to date) seconds.
+       Standard: ITU-R TF.460-6, IERS Bulletin C.
+
+  TAI  (International Atomic Time)
+       The continuous atomic standard maintained by ~450 caesium clocks
+       at BIPM (Bureau International des Poids et Mesures). Has no leap
+       seconds; pure SI second since the 1958-01-01 epoch alignment
+       with UT2. TAI = UTC + (leap seconds since 1972).
+       Standard: BIPM Circular T, ITU-R TF.460-6.
+       As of 2024: TAI - UTC = 37 s.
+
+  GPS  (Global Positioning System time)
+       Maintained by the United States Naval Observatory. Fixed offset
+       from TAI: GPS = TAI - 19 s (the offset captures TAI's lead over
+       UTC at the GPS epoch 1980-01-06 00:00:00 UTC, when TAI - UTC was
+       19 s). GPS time has NO leap seconds.
+       Standard: IS-GPS-200 §3.3.4 (Interface Specification).
+       GPS week rollover handled outside this module's scope.
+
+  GMT  (Greenwich Mean Time)
+       Historically a mean solar time at the Greenwich meridian. Today
+       used colloquially as a synonym for UTC; this module treats GMT
+       and UTC as numerically identical (offset 0 between them) but
+       preserves the label so output formatting and parsing can
+       distinguish "Z" / "+00:00" (UTC) from "GMT" suffixes
+       (RFC 5322 obsolete-zone form).
+       Standard: ITU-R TF.460-6 (deprecates GMT as a scientific term).
+
+  LocalCivil
+       The wall-clock time observed at a given location, derived from
+       UTC plus the offset from the IANA tz database for the relevant
+       timezone. Subject to DST transitions and historical offset
+       changes (e.g. Hawaii dropping DST in 1947). All LocalCivil
+       comparisons across timezone boundaries MUST go through UTC.
+
+  Monotonic
+       The Instant-class reading exposed by instant.runa. Has no
+       calendar interpretation. Comparisons with the calendar-based
+       scales above are invalid.
+
+References:
+  ITU-R Recommendation TF.460-6 (Standard-frequency and time-signal
+       emissions)
+  IERS Bulletin C (leap-second announcements)
+  IS-GPS-200 (GPS Interface Specification)
+  Allan, Ashby, Hodge: "The Science of Timekeeping", HP Application
+       Note 1289 (1997)
+  Seago & Seidelmann: "The Mean-Solar-Time Origin of UTC and the
+       Need for a New Atomic Standard", Astronomical Almanac
+==============================================================================
+:End Note
+
+Note: ============================================================================
+Note: TimeReference enum (encoded as small Integer)
+Note: ============================================================================
+
+Constant TIME_REF_UTC as Integer is 0
+Constant TIME_REF_TAI as Integer is 1
+Constant TIME_REF_GPS as Integer is 2
+Constant TIME_REF_GMT as Integer is 3
+Constant TIME_REF_LOCAL_CIVIL as Integer is 4
+Constant TIME_REF_MONOTONIC as Integer is 5
+
+Note: ============================================================================
+Note: Fixed offsets
+Note: ============================================================================
+
+Note: GPS = TAI - 19 s. From IS-GPS-200, §3.3.4: "GPS time is uniformly
+Note: offset from TAI by an integer number of seconds, currently 19 s,
+Note: equal to the number of leap seconds in UTC at GPS epoch
+Note: (1980-01-06 00:00:00 UTC)."
+Constant GPS_TAI_OFFSET_SECONDS as Integer is 19
+
+Note: GPS epoch in Unix seconds: 1980-01-06 00:00:00 UTC
+Note: = (10 leap years 1972-1979) * 366 + (4 normal years) * 365 + 6 days
+Note: Confirmed: 315_964_800 (the canonical constant in every GPS receiver).
+Constant GPS_EPOCH_UNIX_SECONDS as Integer is 315964800
+
+Note: Unix epoch in TAI seconds (1970-01-01 00:00:00 UTC).
+Note: At 1970-01-01 00:00:00 UTC, TAI - UTC was 10 s (post-1972 epoch
+Note: convention; pre-1972 a fractional rubber-second approximation
+Note: applied). For modern Unix-to-TAI conversion we use 10 s as the
+Note: baseline; current leap-second offset is added on top.
+Constant UNIX_EPOCH_TAI_OFFSET_SECONDS as Integer is 10
+
+Note: ============================================================================
+Note: Leap-second table (UTC seconds at which a leap second was inserted)
+Note: ============================================================================
+
+Note: This is the IERS leap-second table as of Bulletin C 67 (Jul 2023),
+Note: confirming no leap second on 2024-01-01 and no leap second
+Note: planned through Jun 2025. Each entry is the Unix timestamp at
+Note: which TAI - UTC incremented by 1.
+Note: Format: pairs (unix_seconds_at_insertion, tai_minus_utc_after).
+Note: All historical insertions since the 1972 epoch alignment when
+Note: TAI - UTC was set to 10 s exactly.
+Note: SOURCE: https://hpiers.obspm.fr/iers/bul/bulc/Leap_Second.dat
+Note: SOURCE: IERS Bulletin C as of July 2023 (no leap second 2024).
+
+Constant LEAP_TABLE_ENTRIES as Integer is 28
+
+Note: Encoded as flat Integer arrays (one for timestamps, one for offsets).
+Note: We initialise via runtime functions to avoid relying on stage1's
+Note: ability to populate static arrays. The actual table populator
+Note: lives in time_reference_leap_init which the linker invokes
+Note: lazily on first call to any conversion routine.
+
+Let LEAP_TABLE_INITIALISED be 0
+Let LEAP_TABLE_TIMESTAMPS be 0
+Let LEAP_TABLE_OFFSETS be 0
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+
+Process called "_leap_init_table" returns Integer:
+    @Reasoning
+    Lazily populates the leap-second table on first access. The data
+    is canonical IERS Bulletin C content current as of July 2023.
+    @End Reasoning
+    @Implementation
+    Allocates two parallel int64 arrays of LEAP_TABLE_ENTRIES slots
+    and writes the (unix_timestamp, tai_minus_utc) pairs. Uses
+    Layout.allocate (tier-3 owned heap) since the table outlives any
+    individual call. Idempotent: re-entry is a no-op once the
+    INITIALISED flag is set.
+    @End Implementation
+    @Performance_Hints
+    Called at most once per process. Subsequent lookups skip this
+    function entirely via the INITIALISED guard.
+    @End Performance_Hints
+    @Security_Scope
+    Allocates persistent memory; freed only on process exit.
+    @End Security_Scope
+    If LEAP_TABLE_INITIALISED is equal to 1:
+        Return 0
+    End If
+    Let bytes_needed be LEAP_TABLE_ENTRIES multiplied by 8
+    Let ts_buf be proc allocate from Layout with bytes_needed
+    Let off_buf be proc allocate from Layout with bytes_needed
+    If ts_buf is equal to 0:
+        Return -1
+    End If
+    If off_buf is equal to 0:
+        Let dummy_free be proc deallocate from Layout with ts_buf
+        Return -1
+    End If
+    Note: Each entry: unix timestamp of the SECOND immediately AFTER the
+    Note: inserted leap second; the offset is TAI - UTC starting at that
+    Note: instant. Pre-1972 alignment fixed TAI - UTC = 10 s.
+    Let dummy0 be proc memory_set_int64 from MemoryCore with ts_buf, 0, 78796800
+    Let dummy0o be proc memory_set_int64 from MemoryCore with off_buf, 0, 11
+    Let dummy1 be proc memory_set_int64 from MemoryCore with ts_buf, 8, 94694400
+    Let dummy1o be proc memory_set_int64 from MemoryCore with off_buf, 8, 12
+    Let dummy2 be proc memory_set_int64 from MemoryCore with ts_buf, 16, 126230400
+    Let dummy2o be proc memory_set_int64 from MemoryCore with off_buf, 16, 13
+    Let dummy3 be proc memory_set_int64 from MemoryCore with ts_buf, 24, 157766400
+    Let dummy3o be proc memory_set_int64 from MemoryCore with off_buf, 24, 14
+    Let dummy4 be proc memory_set_int64 from MemoryCore with ts_buf, 32, 189302400
+    Let dummy4o be proc memory_set_int64 from MemoryCore with off_buf, 32, 15
+    Let dummy5 be proc memory_set_int64 from MemoryCore with ts_buf, 40, 220924800
+    Let dummy5o be proc memory_set_int64 from MemoryCore with off_buf, 40, 16
+    Let dummy6 be proc memory_set_int64 from MemoryCore with ts_buf, 48, 252460800
+    Let dummy6o be proc memory_set_int64 from MemoryCore with off_buf, 48, 17
+    Let dummy7 be proc memory_set_int64 from MemoryCore with ts_buf, 56, 283996800
+    Let dummy7o be proc memory_set_int64 from MemoryCore with off_buf, 56, 18
+    Let dummy8 be proc memory_set_int64 from MemoryCore with ts_buf, 64, 315532800
+    Let dummy8o be proc memory_set_int64 from MemoryCore with off_buf, 64, 19
+    Let dummy9 be proc memory_set_int64 from MemoryCore with ts_buf, 72, 362793600
+    Let dummy9o be proc memory_set_int64 from MemoryCore with off_buf, 72, 20
+    Let dummy10 be proc memory_set_int64 from MemoryCore with ts_buf, 80, 394329600
+    Let dummy10o be proc memory_set_int64 from MemoryCore with off_buf, 80, 21
+    Let dummy11 be proc memory_set_int64 from MemoryCore with ts_buf, 88, 425865600
+    Let dummy11o be proc memory_set_int64 from MemoryCore with off_buf, 88, 22
+    Let dummy12 be proc memory_set_int64 from MemoryCore with ts_buf, 96, 489024000
+    Let dummy12o be proc memory_set_int64 from MemoryCore with off_buf, 96, 23
+    Let dummy13 be proc memory_set_int64 from MemoryCore with ts_buf, 104, 567993600
+    Let dummy13o be proc memory_set_int64 from MemoryCore with off_buf, 104, 24
+    Let dummy14 be proc memory_set_int64 from MemoryCore with ts_buf, 112, 631152000
+    Let dummy14o be proc memory_set_int64 from MemoryCore with off_buf, 112, 25
+    Let dummy15 be proc memory_set_int64 from MemoryCore with ts_buf, 120, 662688000
+    Let dummy15o be proc memory_set_int64 from MemoryCore with off_buf, 120, 26
+    Let dummy16 be proc memory_set_int64 from MemoryCore with ts_buf, 128, 709948800
+    Let dummy16o be proc memory_set_int64 from MemoryCore with off_buf, 128, 27
+    Let dummy17 be proc memory_set_int64 from MemoryCore with ts_buf, 136, 741484800
+    Let dummy17o be proc memory_set_int64 from MemoryCore with off_buf, 136, 28
+    Let dummy18 be proc memory_set_int64 from MemoryCore with ts_buf, 144, 773020800
+    Let dummy18o be proc memory_set_int64 from MemoryCore with off_buf, 144, 29
+    Let dummy19 be proc memory_set_int64 from MemoryCore with ts_buf, 152, 820454400
+    Let dummy19o be proc memory_set_int64 from MemoryCore with off_buf, 152, 30
+    Let dummy20 be proc memory_set_int64 from MemoryCore with ts_buf, 160, 867715200
+    Let dummy20o be proc memory_set_int64 from MemoryCore with off_buf, 160, 31
+    Let dummy21 be proc memory_set_int64 from MemoryCore with ts_buf, 168, 915148800
+    Let dummy21o be proc memory_set_int64 from MemoryCore with off_buf, 168, 32
+    Let dummy22 be proc memory_set_int64 from MemoryCore with ts_buf, 176, 1136073600
+    Let dummy22o be proc memory_set_int64 from MemoryCore with off_buf, 176, 33
+    Let dummy23 be proc memory_set_int64 from MemoryCore with ts_buf, 184, 1230768000
+    Let dummy23o be proc memory_set_int64 from MemoryCore with off_buf, 184, 34
+    Let dummy24 be proc memory_set_int64 from MemoryCore with ts_buf, 192, 1341100800
+    Let dummy24o be proc memory_set_int64 from MemoryCore with off_buf, 192, 35
+    Let dummy25 be proc memory_set_int64 from MemoryCore with ts_buf, 200, 1435708800
+    Let dummy25o be proc memory_set_int64 from MemoryCore with off_buf, 200, 36
+    Let dummy26 be proc memory_set_int64 from MemoryCore with ts_buf, 208, 1483228800
+    Let dummy26o be proc memory_set_int64 from MemoryCore with off_buf, 208, 37
+    Note: Entry 27 reserved for next IERS announcement (no leap second
+    Note: as of Bulletin C 67). Initialised to sentinel max so the
+    Note: lookup walks past it as "future, not applicable".
+    Let dummy27 be proc memory_set_int64 from MemoryCore with ts_buf, 216, 9223372036854775807
+    Let dummy27o be proc memory_set_int64 from MemoryCore with off_buf, 216, 37
+    Set LEAP_TABLE_TIMESTAMPS to ts_buf
+    Set LEAP_TABLE_OFFSETS to off_buf
+    Set LEAP_TABLE_INITIALISED to 1
+    Return 0
+End Process
+
+Process called "leap_seconds_at_unix_time" takes unix_seconds as Integer returns Integer:
+    @Reasoning
+    Returns TAI - UTC at the given Unix timestamp, in seconds. For
+    timestamps before the 1972 epoch the function returns 10 (the
+    1972 baseline); for timestamps in the table it returns the
+    largest stored offset whose insertion-time is <= unix_seconds.
+    @End Reasoning
+    @Implementation
+    Linear scan over the table from latest entry backward; for ~28
+    entries this is faster than a binary-search dispatch and avoids
+    the cmov chain on hot kernels. Lazily initialises the table.
+    @End Implementation
+    @Performance_Hints
+    O(N) over ~28 entries. Suitable for inner loops at NTP-poll rates;
+    use a cache wrapper for sub-microsecond rates.
+    @End Performance_Hints
+    @Security_Scope
+    Read-only table lookup. No external input.
+    @End Security_Scope
+    Let init_rc be _leap_init_table()
+    If init_rc is less than 0:
+        Return UNIX_EPOCH_TAI_OFFSET_SECONDS
+    End If
+    If unix_seconds is less than 78796800:
+        Return UNIX_EPOCH_TAI_OFFSET_SECONDS
+    End If
+    Let i be LEAP_TABLE_ENTRIES minus 1
+    While i is greater than or equal to 0:
+        Let offset_index be i multiplied by 8
+        Let ts_at_i be proc memory_get_int64 from MemoryCore with LEAP_TABLE_TIMESTAMPS, offset_index
+        If unix_seconds is greater than or equal to ts_at_i:
+            Return proc memory_get_int64 from MemoryCore with LEAP_TABLE_OFFSETS, offset_index
+        End If
+        Set i to i minus 1
+    End While
+    Return UNIX_EPOCH_TAI_OFFSET_SECONDS
+End Process
+
+Process called "tai_from_utc" takes utc_unix_seconds as Integer returns Integer:
+    @Reasoning
+    Converts a UTC Unix timestamp to TAI by adding TAI - UTC at that
+    instant. The Unix timestamp must be the seconds elapsed since
+    1970-01-01 00:00:00 UTC, NOT NIST count and NOT GPS week.
+    @End Reasoning
+    @Implementation
+    Returns utc_unix_seconds + leap_seconds_at_unix_time(utc_unix_seconds).
+    @End Implementation
+    @Performance_Hints
+    One table lookup + one add.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion. No syscalls.
+    @End Security_Scope
+    Let offset be leap_seconds_at_unix_time(utc_unix_seconds)
+    Return utc_unix_seconds plus offset
+End Process
+
+Process called "utc_from_tai" takes tai_unix_seconds as Integer returns Integer:
+    @Reasoning
+    Inverse of tai_from_utc. Because the leap-second function is keyed
+    on Unix (UTC) time, we use a corrective iteration: start with the
+    naive offset assuming no leap seconds, look up the offset at that
+    candidate UTC time, subtract from TAI again, and repeat until the
+    result is stable. Converges in at most two iterations in practice
+    because leap-second insertions are discrete and well separated.
+    @End Reasoning
+    @Implementation
+    Iterates up to four times then bails out with the best estimate.
+    Each iteration: candidate_utc = tai - leap_seconds_at(candidate_utc).
+    Termination is guaranteed because the offset increases monotonically
+    and is bounded above by leap-second history.
+    @End Implementation
+    @Performance_Hints
+    Worst case four lookups + four adds. Typical case two.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let candidate be tai_unix_seconds minus UNIX_EPOCH_TAI_OFFSET_SECONDS
+    Let iter be 0
+    While iter is less than 4:
+        Let offset be leap_seconds_at_unix_time(candidate)
+        Let new_candidate be tai_unix_seconds minus offset
+        If new_candidate is equal to candidate:
+            Return new_candidate
+        End If
+        Set candidate to new_candidate
+        Set iter to iter plus 1
+    End While
+    Return candidate
+End Process
+
+Process called "gps_from_tai" takes tai_unix_seconds as Integer returns Integer:
+    @Reasoning
+    GPS time runs 19 seconds behind TAI by definition. The offset is
+    fixed; no leap seconds apply.
+    @End Reasoning
+    @Implementation
+    Subtracts GPS_TAI_OFFSET_SECONDS.
+    @End Implementation
+    @Performance_Hints
+    Single subtract.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Return tai_unix_seconds minus GPS_TAI_OFFSET_SECONDS
+End Process
+
+Process called "tai_from_gps" takes gps_unix_seconds as Integer returns Integer:
+    @Reasoning
+    Inverse of gps_from_tai.
+    @End Reasoning
+    @Implementation
+    Adds GPS_TAI_OFFSET_SECONDS.
+    @End Implementation
+    @Performance_Hints
+    Single add.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Return gps_unix_seconds plus GPS_TAI_OFFSET_SECONDS
+End Process
+
+Process called "gps_from_utc" takes utc_unix_seconds as Integer returns Integer:
+    @Reasoning
+    Convenience composition: GPS = TAI - 19 = UTC + (leap seconds - 19).
+    @End Reasoning
+    @Implementation
+    Computes TAI then subtracts GPS_TAI_OFFSET_SECONDS.
+    @End Implementation
+    @Performance_Hints
+    One leap lookup + two adds.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let tai be tai_from_utc(utc_unix_seconds)
+    Return tai minus GPS_TAI_OFFSET_SECONDS
+End Process
+
+Process called "utc_from_gps" takes gps_unix_seconds as Integer returns Integer:
+    @Reasoning
+    Convenience composition: UTC = TAI - leap = (GPS + 19) - leap.
+    @End Reasoning
+    @Implementation
+    Computes TAI from GPS, then UTC from TAI via the iterative inverse.
+    @End Implementation
+    @Performance_Hints
+    Cost of utc_from_tai plus one add.
+    @End Performance_Hints
+    @Security_Scope
+    Pure conversion.
+    @End Security_Scope
+    Let tai be gps_unix_seconds plus GPS_TAI_OFFSET_SECONDS
+    Return utc_from_tai(tai)
+End Process
+
+Process called "time_reference_name" takes ref as Integer returns String:
+    @Reasoning
+    Maps a TimeReference enum value to its short label, suitable for
+    diagnostic output and serialisation tags. Returns "?" on unknown
+    values so the caller can detect corruption without crashing.
+    @End Reasoning
+    @Implementation
+    Switch on ref.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Returns static string constants.
+    @End Security_Scope
+    If ref is equal to TIME_REF_UTC:
+        Return "UTC"
+    End If
+    If ref is equal to TIME_REF_TAI:
+        Return "TAI"
+    End If
+    If ref is equal to TIME_REF_GPS:
+        Return "GPS"
+    End If
+    If ref is equal to TIME_REF_GMT:
+        Return "GMT"
+    End If
+    If ref is equal to TIME_REF_LOCAL_CIVIL:
+        Return "LocalCivil"
+    End If
+    If ref is equal to TIME_REF_MONOTONIC:
+        Return "Monotonic"
+    End If
+    Return "?"
+End Process
+
+Process called "time_reference_is_comparable" takes a_ref as Integer, b_ref as Integer returns Integer:
+    @Reasoning
+    Two scales are comparable iff (1) they are identical, or (2) both
+    are calendar-civil (UTC, GMT, TAI, GPS, LocalCivil) AND the caller
+    has explicitly converted them to a common scale before comparison.
+    Monotonic is comparable ONLY with itself. This predicate is the
+    pre-condition for any cross-DateTime equality / ordering operator.
+    @End Reasoning
+    @Implementation
+    Equal scales are always comparable. Monotonic is never comparable
+    with any other scale. All other pairs are comparable (with the
+    understanding that the caller must perform the conversion before
+    the comparison).
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Pure predicate.
+    @End Security_Scope
+    If a_ref is equal to b_ref:
+        Return 1
+    End If
+    If a_ref is equal to TIME_REF_MONOTONIC:
+        Return 0
+    End If
+    If b_ref is equal to TIME_REF_MONOTONIC:
+        Return 0
+    End If
+    Return 1
+End Process

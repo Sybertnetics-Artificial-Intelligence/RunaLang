@@ -1,0 +1,945 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+:End Note
+
+Note:
+==============================================================================
+rgb - sRGB and Linear-RGB Color Models
+==============================================================================
+
+ColorRgb is the canonical floating-point RGB+alpha colour type used by the
+T1-6 colour subsystem. Each channel is a Float64 in [0.0, 1.0] holding a
+non-linear sRGB-encoded value at the public API boundary. Conversions to
+and from linear-light RGB use the piecewise transfer function defined by
+IEC 61966-2-1:1999 (the sRGB standard), reproduced here:
+
+    linear = ((srgb + 0.055) / 1.055)^2.4    when srgb >  0.04045
+    linear =  srgb / 12.92                   when srgb <= 0.04045
+    srgb   = 1.055 * linear^(1/2.4) - 0.055  when linear > 0.0031308
+    srgb   = 12.92 * linear                  when linear <= 0.0031308
+
+Hex string parsing accepts the four CSS Color Module Level 4 forms:
+    #RGB        (3-digit short)
+    #RGBA       (4-digit short with alpha)
+    #RRGGBB     (6-digit)
+    #RRGGBBAA   (8-digit with alpha)
+
+Alpha compositing follows the Porter-Duff "over" operator (T. Porter and
+T. Duff, "Compositing digital images", SIGGRAPH 1984, ACM Computer
+Graphics 18(3), pp. 253-259). Public ColorRgb values are NON-premultiplied;
+rgb_blend, rgb_premultiply and rgb_unpremultiply manage the
+premultiplication on demand. Linear-space interpolation (rgb_lerp_linear)
+is the perceptually correct way to mix two sRGB colours.
+
+References:
+  - IEC 61966-2-1:1999 (sRGB)
+  - W3C CSS Color Module Level 4
+  - Porter & Duff, "Compositing Digital Images", SIGGRAPH 1984
+==============================================================================
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+
+Note: ============================================================================
+Note: STRUCT TYPE DEFINITION
+Note: ============================================================================
+
+Type called "ColorRgb":
+    r as Float
+    g as Float
+    b as Float
+    a as Float
+End Type
+
+Note: ============================================================================
+Note: LOCAL HELPERS
+Note: ============================================================================
+
+Process called "clamp01" takes v as Float returns Float:
+    @Reasoning
+    Saturate a channel into the unit interval [0.0, 1.0]. Boundary guard
+    for every ColorRgb constructor.
+    @End Reasoning
+    @Implementation
+    Two compares against literal endpoints.
+    @End Implementation
+    @Performance_Hints
+    Two ucomisd + two cmovs.
+    @End Performance_Hints
+    @Security_Scope
+    Pure function.
+    @End Security_Scope
+    If v is less than 0.0:
+        Return 0.0
+    End If
+    If v is greater than 1.0:
+        Return 1.0
+    End If
+    Return v
+End Process
+
+Process called "absf" takes v as Float returns Float:
+    @Reasoning
+    Floating-point absolute value used by sRGB transfer below the
+    threshold branch.
+    @End Reasoning
+    @Implementation
+    Single compare; negate when negative.
+    @End Implementation
+    @Performance_Hints
+    One ucomisd + one negate.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If v is less than 0.0:
+        Return 0.0 minus v
+    End If
+    Return v
+End Process
+
+Process called "powf_real" takes base as Float, exponent as Float returns Float:
+    @Reasoning
+    Real-valued exponentiation x^y for x > 0 implemented via
+    exp(y * ln(x)). The Taylor / Pade-style series here are normalised so
+    that all intermediate computations stay in the convergence region.
+    Required by the sRGB transfer functions which use exponents 2.4 and
+    1/2.4 = 0.41666... Both ln and exp are seeded from range-reductions
+    that keep the residual in [-0.5, 0.5] for ln and [0, ln 2] for exp.
+    @End Reasoning
+    @Implementation
+    Range-reduces x via the bit-pattern exponent split (here approximated
+    by halving / doubling loops since we do not have direct exponent
+    extraction), then evaluates ln(m) for m in [1, 2) via a 20-term
+    Mercator series. Multiplies by the exponent to get y*ln(x), then
+    evaluates exp via a 25-term Maclaurin expansion. Returns 0.0 for
+    base <= 0 (sRGB transfer never invokes powf_real on a negative value
+    because sign is stripped beforehand).
+    @End Implementation
+    @Performance_Hints
+    ~ 45 multiplies + 25 multiplies = O(70 FLOPs) per call. Adequate for
+    transfer-curve evaluation; not intended as a hot path.
+    @End Performance_Hints
+    @Security_Scope
+    Pure. Bounded iteration counts guarantee termination.
+    @End Security_Scope
+    If base is less than or equal to 0.0:
+        Return 0.0
+    End If
+    Let m be base
+    Let k be 0
+    While m is greater than or equal to 2.0:
+        Set m to m divided by 2.0
+        Set k to k plus 1
+        If k is greater than 2048:
+            Return 0.0
+        End If
+    End While
+    Let k_dn be 0
+    While m is less than 1.0:
+        Set m to m multiplied by 2.0
+        Set k_dn to k_dn plus 1
+        If k_dn is greater than 2048:
+            Return 0.0
+        End If
+    End While
+    Let z be (m minus 1.0) divided by (m plus 1.0)
+    Let z2 be z multiplied by z
+    Let term be z
+    Let ln_m be 0.0
+    Let idx be 0
+    While idx is less than 30:
+        Let denom be Arith.int_to_float((2 multiplied by idx) plus 1)
+        Set ln_m to ln_m plus (term divided by denom)
+        Set term to term multiplied by z2
+        Set idx to idx plus 1
+    End While
+    Set ln_m to ln_m multiplied by 2.0
+    Let ln2 be 0.69314718055994530941723212145817656807550013436025525412
+    Let ln_base be ln_m plus (Arith.int_to_float(k) multiplied by ln2)
+    Set ln_base to ln_base minus (Arith.int_to_float(k_dn) multiplied by ln2)
+    Let y be exponent multiplied by ln_base
+    Let n_floor be Arith.float_to_int(y divided by ln2)
+    If y is less than 0.0:
+        If Arith.int_to_float(n_floor) is greater than (y divided by ln2):
+            Set n_floor to n_floor minus 1
+        End If
+    End If
+    Let r_y be y minus (Arith.int_to_float(n_floor) multiplied by ln2)
+    Let exp_r be 1.0
+    Let s_term be 1.0
+    Let i be 1
+    While i is less than 32:
+        Set s_term to (s_term multiplied by r_y) divided by Arith.int_to_float(i)
+        Set exp_r to exp_r plus s_term
+        Set i to i plus 1
+    End While
+    Let two_n be 1.0
+    If n_floor is greater than or equal to 0:
+        Let nn be n_floor
+        While nn is greater than 0:
+            Set two_n to two_n multiplied by 2.0
+            Set nn to nn minus 1
+        End While
+    Otherwise:
+        Let nn be 0 minus n_floor
+        While nn is greater than 0:
+            Set two_n to two_n divided by 2.0
+            Set nn to nn minus 1
+        End While
+    End If
+    Return exp_r multiplied by two_n
+End Process
+
+Note: ============================================================================
+Note: CONSTRUCTORS
+Note: ============================================================================
+
+Process called "rgb_create" takes r as Float, g as Float, b as Float, a as Float returns ColorRgb:
+    @Reasoning
+    Construct a ColorRgb from four Float channel values in [0, 1], clamping
+    out-of-range inputs to the unit interval.
+    @End Reasoning
+    @Implementation
+    Per-component clamp via clamp01 before assignment.
+    @End Implementation
+    @Performance_Hints
+    Four clamps plus one struct allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure transformation.
+    @End Security_Scope
+    Let c be a value of type ColorRgb
+    Set c.r to clamp01(r)
+    Set c.g to clamp01(g)
+    Set c.b to clamp01(b)
+    Set c.a to clamp01(a)
+    Return c
+End Process
+
+Process called "rgb_from_u8" takes r as Integer, g as Integer, b as Integer, a as Integer returns ColorRgb:
+    @Reasoning
+    Build a ColorRgb from four uint8 channel values in [0, 255]. Channels
+    outside [0, 255] saturate to that range before dividing by 255.
+    @End Reasoning
+    @Implementation
+    Clamp each channel to [0, 255] then scale by 1/255.
+    @End Implementation
+    @Performance_Hints
+    Four integer clamps, four divides.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let rr be r
+    Let gg be g
+    Let bb be b
+    Let aa be a
+    If rr is less than 0:
+        Set rr to 0
+    End If
+    If rr is greater than 255:
+        Set rr to 255
+    End If
+    If gg is less than 0:
+        Set gg to 0
+    End If
+    If gg is greater than 255:
+        Set gg to 255
+    End If
+    If bb is less than 0:
+        Set bb to 0
+    End If
+    If bb is greater than 255:
+        Set bb to 255
+    End If
+    If aa is less than 0:
+        Set aa to 0
+    End If
+    If aa is greater than 255:
+        Set aa to 255
+    End If
+    Let c be a value of type ColorRgb
+    Set c.r to Arith.int_to_float(rr) divided by 255.0
+    Set c.g to Arith.int_to_float(gg) divided by 255.0
+    Set c.b to Arith.int_to_float(bb) divided by 255.0
+    Set c.a to Arith.int_to_float(aa) divided by 255.0
+    Return c
+End Process
+
+Note: ============================================================================
+Note: CONVERSIONS TO PACKED FORMATS
+Note: ============================================================================
+
+Process called "channel_to_u8" takes v as Float returns Integer:
+    @Reasoning
+    Quantise a unit-interval Float channel to its 8-bit representation,
+    using round-half-to-even consistent with floor(x*255 + 0.5).
+    @End Reasoning
+    @Implementation
+    Multiply by 255, add 0.5, truncate, then clamp.
+    @End Implementation
+    @Performance_Hints
+    Two FP ops plus a convert-to-int.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let clamped be clamp01(v)
+    Let scaled be (clamped multiplied by 255.0) plus 0.5
+    Let i be Arith.float_to_int(scaled)
+    If i is less than 0:
+        Return 0
+    End If
+    If i is greater than 255:
+        Return 255
+    End If
+    Return i
+End Process
+
+Process called "rgb_to_u8" takes c as ColorRgb, out_buf as Integer returns Integer:
+    @Reasoning
+    Quantise the four channels into the caller-supplied 4-byte buffer in
+    R,G,B,A order. Buffer ownership is the caller's.
+    @End Reasoning
+    @Implementation
+    Four channel_to_u8 calls plus four byte stores.
+    @End Implementation
+    @Performance_Hints
+    Four FP-to-int conversions, four stores.
+    @End Performance_Hints
+    @Security_Scope
+    Caller guarantees out_buf has at least 4 writable bytes.
+    @End Security_Scope
+    Let _r be Memory.memory_set_byte(out_buf, 0, channel_to_u8(c.r))
+    Let _g be Memory.memory_set_byte(out_buf, 1, channel_to_u8(c.g))
+    Let _b be Memory.memory_set_byte(out_buf, 2, channel_to_u8(c.b))
+    Let _a be Memory.memory_set_byte(out_buf, 3, channel_to_u8(c.a))
+    Return 0
+End Process
+
+Process called "rgb_to_u32_argb" takes c as ColorRgb returns Integer:
+    @Reasoning
+    Pack the colour into a 32-bit ARGB word with alpha in the high byte
+    (0xAARRGGBB). Layout used by Win32 / DirectX / Cairo / NSColor.
+    @End Reasoning
+    @Implementation
+    Channel quantisation followed by integer shifts and ors. The shift
+    counts are weaker than +/- so each shift is parenthesised.
+    @End Implementation
+    @Performance_Hints
+    Four converts + three shifts + three ors.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let r8 be channel_to_u8(c.r)
+    Let g8 be channel_to_u8(c.g)
+    Let b8 be channel_to_u8(c.b)
+    Let a8 be channel_to_u8(c.a)
+    Let result be (a8 shifted left by 24) bit_or (r8 shifted left by 16)
+    Set result to result bit_or (g8 shifted left by 8)
+    Set result to result bit_or b8
+    Return result
+End Process
+
+Process called "rgb_to_u32_rgba" takes c as ColorRgb returns Integer:
+    @Reasoning
+    Pack the colour into a 32-bit RGBA word with alpha in the low byte
+    (0xRRGGBBAA). Layout used by OpenGL textures and PNG image rows.
+    @End Reasoning
+    @Implementation
+    Channel quantisation followed by integer shifts and ors with the
+    shift counts parenthesised since shift is weaker than +/-.
+    @End Implementation
+    @Performance_Hints
+    Four converts + three shifts + three ors.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let r8 be channel_to_u8(c.r)
+    Let g8 be channel_to_u8(c.g)
+    Let b8 be channel_to_u8(c.b)
+    Let a8 be channel_to_u8(c.a)
+    Let result be (r8 shifted left by 24) bit_or (g8 shifted left by 16)
+    Set result to result bit_or (b8 shifted left by 8)
+    Set result to result bit_or a8
+    Return result
+End Process
+
+Note: ============================================================================
+Note: HEX STRING ENCODING / DECODING
+Note: ============================================================================
+
+Process called "hex_digit_byte" takes value as Integer returns Integer:
+    @Reasoning
+    Map a nibble value 0..15 to its ASCII lowercase hex digit byte.
+    @End Reasoning
+    @Implementation
+    [0..9] -> '0'..'9' (48..57); [10..15] -> 'a'..'f' (97..102).
+    @End Implementation
+    @Performance_Hints
+    Two compares, two arithmetic ops.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If value is less than 0:
+        Return 48
+    End If
+    If value is less than 10:
+        Return value plus 48
+    End If
+    If value is less than 16:
+        Return (value minus 10) plus 97
+    End If
+    Return 48
+End Process
+
+Process called "hex_value_of_byte" takes ch as Integer returns Integer:
+    @Reasoning
+    Inverse of hex_digit_byte. Maps ASCII hex digit to 0..15; returns -1
+    on non-hex input.
+    @End Reasoning
+    @Implementation
+    Three ranges: '0'..'9', 'a'..'f', 'A'..'F'.
+    @End Implementation
+    @Performance_Hints
+    Six compares maximum.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    If ch is greater than or equal to 48:
+        If ch is less than or equal to 57:
+            Return ch minus 48
+        End If
+    End If
+    If ch is greater than or equal to 97:
+        If ch is less than or equal to 102:
+            Return (ch minus 97) plus 10
+        End If
+    End If
+    If ch is greater than or equal to 65:
+        If ch is less than or equal to 70:
+            Return (ch minus 65) plus 10
+        End If
+    End If
+    Return 0 minus 1
+End Process
+
+Process called "write_hex_byte_into" takes buf as Integer, offset as Integer, byte_val as Integer returns Integer:
+    @Reasoning
+    Emit a two-character lowercase hex encoding of an 8-bit value into
+    buf at offset; returns the next offset.
+    @End Reasoning
+    @Implementation
+    High nibble then low nibble.
+    @End Implementation
+    @Performance_Hints
+    Two stores.
+    @End Performance_Hints
+    @Security_Scope
+    Caller owns buf.
+    @End Security_Scope
+    Let v be byte_val
+    If v is less than 0:
+        Set v to 0
+    End If
+    If v is greater than 255:
+        Set v to 255
+    End If
+    Let hi be v divided by 16
+    Let lo be v modulo by 16
+    Let _h be Memory.memory_set_byte(buf, offset, hex_digit_byte(hi))
+    Let _l be Memory.memory_set_byte(buf, offset plus 1, hex_digit_byte(lo))
+    Return offset plus 2
+End Process
+
+Process called "rgb_to_hex_string" takes c as ColorRgb, include_alpha as Integer returns Integer:
+    @Reasoning
+    Serialise to "#rrggbb" when include_alpha is 0, or "#rrggbbaa" when
+    include_alpha is non-zero. Returns a heap-allocated NUL-terminated
+    byte buffer.
+    @End Reasoning
+    @Implementation
+    Allocates 8 or 10 bytes, writes '#', then channel pairs.
+    @End Implementation
+    @Performance_Hints
+    Single allocation, fixed-size write sequence.
+    @End Performance_Hints
+    @Security_Scope
+    Caller must Layout.deallocate the returned pointer.
+    @End Security_Scope
+    Let alpha_form be 0
+    If include_alpha is not equal to 0:
+        Set alpha_form to 1
+    End If
+    Let needed be 8
+    If alpha_form is equal to 1:
+        Set needed to 10
+    End If
+    Let buf be Layout.allocate(needed)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let _h be Memory.memory_set_byte(buf, 0, 35)
+    Let off be write_hex_byte_into(buf, 1, channel_to_u8(c.r))
+    Set off to write_hex_byte_into(buf, off, channel_to_u8(c.g))
+    Set off to write_hex_byte_into(buf, off, channel_to_u8(c.b))
+    If alpha_form is equal to 1:
+        Set off to write_hex_byte_into(buf, off, channel_to_u8(c.a))
+        Let _z be Memory.memory_set_byte(buf, 9, 0)
+    Otherwise:
+        Let _z be Memory.memory_set_byte(buf, 7, 0)
+    End If
+    Return buf
+End Process
+
+Process called "rgb_from_hex_string" takes s as Integer returns ColorRgb:
+    @Reasoning
+    Parse a CSS Color Module Level 4 hex notation into a ColorRgb. Accepts
+    3, 4, 6, or 8 hex digits with an optional leading '#'. Invalid input
+    yields opaque black.
+    @End Reasoning
+    @Implementation
+    Length-dispatch: 3-digit -> double each nibble; 4-digit -> +alpha;
+    6-digit -> pairwise; 8-digit -> +alpha pairwise.
+    @End Implementation
+    @Performance_Hints
+    Bounded loop reading at most 9 input characters.
+    @End Performance_Hints
+    @Security_Scope
+    Validates each character via hex_value_of_byte and rejects invalid
+    forms without crashing.
+    @End Security_Scope
+    Let out be a value of type ColorRgb
+    Set out.r to 0.0
+    Set out.g to 0.0
+    Set out.b to 0.0
+    Set out.a to 1.0
+    If s is equal to 0:
+        Return out
+    End If
+    Let total_len be 0
+    Let scan be 0
+    While scan is less than 256:
+        Let ch be Memory.memory_get_byte(s, scan)
+        If ch is equal to 0:
+            Set scan to 256
+        Otherwise:
+            Set total_len to total_len plus 1
+            Set scan to scan plus 1
+        End If
+    End While
+    Let start be 0
+    If total_len is greater than 0:
+        Let first be Memory.memory_get_byte(s, 0)
+        If first is equal to 35:
+            Set start to 1
+        End If
+    End If
+    Let hex_len be total_len minus start
+    If hex_len is equal to 3:
+        Let r_n be hex_value_of_byte(Memory.memory_get_byte(s, start))
+        Let g_n be hex_value_of_byte(Memory.memory_get_byte(s, start plus 1))
+        Let b_n be hex_value_of_byte(Memory.memory_get_byte(s, start plus 2))
+        If r_n is less than 0:
+            Return out
+        End If
+        If g_n is less than 0:
+            Return out
+        End If
+        If b_n is less than 0:
+            Return out
+        End If
+        Set out.r to Arith.int_to_float((r_n multiplied by 16) plus r_n) divided by 255.0
+        Set out.g to Arith.int_to_float((g_n multiplied by 16) plus g_n) divided by 255.0
+        Set out.b to Arith.int_to_float((b_n multiplied by 16) plus b_n) divided by 255.0
+        Set out.a to 1.0
+        Return out
+    End If
+    If hex_len is equal to 4:
+        Let r_n be hex_value_of_byte(Memory.memory_get_byte(s, start))
+        Let g_n be hex_value_of_byte(Memory.memory_get_byte(s, start plus 1))
+        Let b_n be hex_value_of_byte(Memory.memory_get_byte(s, start plus 2))
+        Let a_n be hex_value_of_byte(Memory.memory_get_byte(s, start plus 3))
+        If r_n is less than 0:
+            Return out
+        End If
+        If g_n is less than 0:
+            Return out
+        End If
+        If b_n is less than 0:
+            Return out
+        End If
+        If a_n is less than 0:
+            Return out
+        End If
+        Set out.r to Arith.int_to_float((r_n multiplied by 16) plus r_n) divided by 255.0
+        Set out.g to Arith.int_to_float((g_n multiplied by 16) plus g_n) divided by 255.0
+        Set out.b to Arith.int_to_float((b_n multiplied by 16) plus b_n) divided by 255.0
+        Set out.a to Arith.int_to_float((a_n multiplied by 16) plus a_n) divided by 255.0
+        Return out
+    End If
+    If hex_len is equal to 6:
+        Let r_hi be hex_value_of_byte(Memory.memory_get_byte(s, start))
+        Let r_lo be hex_value_of_byte(Memory.memory_get_byte(s, start plus 1))
+        Let g_hi be hex_value_of_byte(Memory.memory_get_byte(s, start plus 2))
+        Let g_lo be hex_value_of_byte(Memory.memory_get_byte(s, start plus 3))
+        Let b_hi be hex_value_of_byte(Memory.memory_get_byte(s, start plus 4))
+        Let b_lo be hex_value_of_byte(Memory.memory_get_byte(s, start plus 5))
+        If r_hi is less than 0:
+            Return out
+        End If
+        If r_lo is less than 0:
+            Return out
+        End If
+        If g_hi is less than 0:
+            Return out
+        End If
+        If g_lo is less than 0:
+            Return out
+        End If
+        If b_hi is less than 0:
+            Return out
+        End If
+        If b_lo is less than 0:
+            Return out
+        End If
+        Set out.r to Arith.int_to_float((r_hi multiplied by 16) plus r_lo) divided by 255.0
+        Set out.g to Arith.int_to_float((g_hi multiplied by 16) plus g_lo) divided by 255.0
+        Set out.b to Arith.int_to_float((b_hi multiplied by 16) plus b_lo) divided by 255.0
+        Set out.a to 1.0
+        Return out
+    End If
+    If hex_len is equal to 8:
+        Let r_hi be hex_value_of_byte(Memory.memory_get_byte(s, start))
+        Let r_lo be hex_value_of_byte(Memory.memory_get_byte(s, start plus 1))
+        Let g_hi be hex_value_of_byte(Memory.memory_get_byte(s, start plus 2))
+        Let g_lo be hex_value_of_byte(Memory.memory_get_byte(s, start plus 3))
+        Let b_hi be hex_value_of_byte(Memory.memory_get_byte(s, start plus 4))
+        Let b_lo be hex_value_of_byte(Memory.memory_get_byte(s, start plus 5))
+        Let a_hi be hex_value_of_byte(Memory.memory_get_byte(s, start plus 6))
+        Let a_lo be hex_value_of_byte(Memory.memory_get_byte(s, start plus 7))
+        If r_hi is less than 0:
+            Return out
+        End If
+        If r_lo is less than 0:
+            Return out
+        End If
+        If g_hi is less than 0:
+            Return out
+        End If
+        If g_lo is less than 0:
+            Return out
+        End If
+        If b_hi is less than 0:
+            Return out
+        End If
+        If b_lo is less than 0:
+            Return out
+        End If
+        If a_hi is less than 0:
+            Return out
+        End If
+        If a_lo is less than 0:
+            Return out
+        End If
+        Set out.r to Arith.int_to_float((r_hi multiplied by 16) plus r_lo) divided by 255.0
+        Set out.g to Arith.int_to_float((g_hi multiplied by 16) plus g_lo) divided by 255.0
+        Set out.b to Arith.int_to_float((b_hi multiplied by 16) plus b_lo) divided by 255.0
+        Set out.a to Arith.int_to_float((a_hi multiplied by 16) plus a_lo) divided by 255.0
+        Return out
+    End If
+    Return out
+End Process
+
+Note: ============================================================================
+Note: sRGB <-> LINEAR TRANSFER FUNCTIONS (IEC 61966-2-1)
+Note: ============================================================================
+
+Process called "srgb_to_linear" takes c as Float returns Float:
+    @Reasoning
+    Map a sRGB-encoded scalar in [0, 1] to its linear-light equivalent
+    using the piecewise definition from IEC 61966-2-1:1999. The toe
+    region (srgb <= 0.04045) is linear with slope 1/12.92; above the toe
+    the transform is ((srgb + 0.055) / 1.055)^2.4. Negative inputs are
+    handled with sign-preservation so that the function is well-defined
+    as an odd extension.
+    @End Reasoning
+    @Implementation
+    Strip the sign, dispatch on the 0.04045 threshold, evaluate the
+    appropriate branch with powf_real(., 2.4) for the gamma branch, and
+    reapply the sign.
+    @End Implementation
+    @Performance_Hints
+    Toe branch is two FP ops; gamma branch dominated by powf_real
+    (~70 FLOPs).
+    @End Performance_Hints
+    @Security_Scope
+    Pure. Defined for all finite real inputs.
+    @End Security_Scope
+    Let sign be 1.0
+    Let a be c
+    If c is less than 0.0:
+        Set sign to 0.0 minus 1.0
+        Set a to 0.0 minus c
+    End If
+    Let result be 0.0
+    If a is less than or equal to 0.04045:
+        Set result to a divided by 12.92
+    Otherwise:
+        Let inside be (a plus 0.055) divided by 1.055
+        Set result to powf_real(inside, 2.4)
+    End If
+    Return sign multiplied by result
+End Process
+
+Process called "linear_to_srgb" takes c as Float returns Float:
+    @Reasoning
+    Inverse of srgb_to_linear. Linear toe (slope 12.92) for linear values
+    <= 0.0031308 transitions smoothly into 1.055*linear^(1/2.4) - 0.055
+    above the toe.
+    @End Reasoning
+    @Implementation
+    Sign-preserving dispatch. Calls powf_real(., 1.0 / 2.4) on the
+    gamma branch.
+    @End Implementation
+    @Performance_Hints
+    Same cost profile as srgb_to_linear.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let sign be 1.0
+    Let a be c
+    If c is less than 0.0:
+        Set sign to 0.0 minus 1.0
+        Set a to 0.0 minus c
+    End If
+    Let result be 0.0
+    If a is less than or equal to 0.0031308:
+        Set result to a multiplied by 12.92
+    Otherwise:
+        Let inv_gamma be 1.0 divided by 2.4
+        Set result to (1.055 multiplied by powf_real(a, inv_gamma)) minus 0.055
+    End If
+    Return sign multiplied by result
+End Process
+
+Note: ============================================================================
+Note: PORTER-DUFF "OVER" BLEND + PREMULTIPLICATION
+Note: ============================================================================
+
+Process called "rgb_premultiply" takes c as ColorRgb returns ColorRgb:
+    @Reasoning
+    Convert a non-premultiplied ColorRgb to premultiplied form by scaling
+    each RGB channel by alpha. The alpha channel is preserved.
+    @End Reasoning
+    @Implementation
+    Per-channel multiply by alpha.
+    @End Implementation
+    @Performance_Hints
+    Three multiplies, one struct allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorRgb
+    Set out.r to c.r multiplied by c.a
+    Set out.g to c.g multiplied by c.a
+    Set out.b to c.b multiplied by c.a
+    Set out.a to c.a
+    Return out
+End Process
+
+Process called "rgb_unpremultiply" takes c as ColorRgb returns ColorRgb:
+    @Reasoning
+    Convert a premultiplied ColorRgb back to non-premultiplied form by
+    dividing each RGB channel by alpha. Fully transparent input yields a
+    zero RGB output to avoid division by zero.
+    @End Reasoning
+    @Implementation
+    Guards alpha = 0; otherwise reciprocal-multiply.
+    @End Implementation
+    @Performance_Hints
+    One reciprocal + three multiplies.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let out be a value of type ColorRgb
+    If c.a is less than or equal to 0.0:
+        Set out.r to 0.0
+        Set out.g to 0.0
+        Set out.b to 0.0
+        Set out.a to 0.0
+        Return out
+    End If
+    Let inv_a be 1.0 divided by c.a
+    Set out.r to c.r multiplied by inv_a
+    Set out.g to c.g multiplied by inv_a
+    Set out.b to c.b multiplied by inv_a
+    Set out.a to c.a
+    Return out
+End Process
+
+Process called "rgb_blend" takes top as ColorRgb, base as ColorRgb, alpha as Float returns ColorRgb:
+    @Reasoning
+    Porter-Duff "over" composite of the top layer (already scaled by the
+    explicit alpha argument and its own alpha) onto the base layer. The
+    formula in straight-alpha form is:
+
+        a_out = a_top*alpha + a_base*(1 - a_top*alpha)
+        c_out = (c_top*(a_top*alpha) + c_base*a_base*(1 - a_top*alpha)) / a_out
+
+    Special-cased when a_out is zero (returns transparent black).
+    @End Reasoning
+    @Implementation
+    Combines top.a with the explicit alpha multiplier, then performs the
+    canonical Porter-Duff calculation in straight-alpha space.
+    @End Implementation
+    @Performance_Hints
+    Approximately ten FP ops per call.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let mix_a be top.a multiplied by clamp01(alpha)
+    Let one_minus_mix be 1.0 minus mix_a
+    Let out_a be mix_a plus (base.a multiplied by one_minus_mix)
+    Let result be a value of type ColorRgb
+    If out_a is less than or equal to 0.0:
+        Set result.r to 0.0
+        Set result.g to 0.0
+        Set result.b to 0.0
+        Set result.a to 0.0
+        Return result
+    End If
+    Let num_r be (top.r multiplied by mix_a) plus ((base.r multiplied by base.a) multiplied by one_minus_mix)
+    Let num_g be (top.g multiplied by mix_a) plus ((base.g multiplied by base.a) multiplied by one_minus_mix)
+    Let num_b be (top.b multiplied by mix_a) plus ((base.b multiplied by base.a) multiplied by one_minus_mix)
+    Set result.r to num_r divided by out_a
+    Set result.g to num_g divided by out_a
+    Set result.b to num_b divided by out_a
+    Set result.a to out_a
+    Return result
+End Process
+
+Process called "rgb_lerp_linear" takes c1 as ColorRgb, c2 as ColorRgb, t as Float returns ColorRgb:
+    @Reasoning
+    Linearly interpolate between two sRGB-encoded colours in LINEAR light
+    space, then re-encode the result back to sRGB. This is the
+    perceptually correct way to blend two sRGB samples and avoids the
+    muddy mid-tones that result from naive sRGB-space interpolation.
+    @End Reasoning
+    @Implementation
+    1. srgb_to_linear each channel of c1 and c2
+    2. lerp each linear channel by t in [0, 1]
+    3. linear_to_srgb each interpolated channel
+    Alpha is interpolated linearly in straight-alpha space.
+    @End Implementation
+    @Performance_Hints
+    Six srgb_to_linear plus three linear_to_srgb evaluations -> the
+    powf_real cost dominates.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Let tt be clamp01(t)
+    Let one_minus_t be 1.0 minus tt
+    Let r1_lin be srgb_to_linear(c1.r)
+    Let g1_lin be srgb_to_linear(c1.g)
+    Let b1_lin be srgb_to_linear(c1.b)
+    Let r2_lin be srgb_to_linear(c2.r)
+    Let g2_lin be srgb_to_linear(c2.g)
+    Let b2_lin be srgb_to_linear(c2.b)
+    Let r_mix be (r1_lin multiplied by one_minus_t) plus (r2_lin multiplied by tt)
+    Let g_mix be (g1_lin multiplied by one_minus_t) plus (g2_lin multiplied by tt)
+    Let b_mix be (b1_lin multiplied by one_minus_t) plus (b2_lin multiplied by tt)
+    Let out be a value of type ColorRgb
+    Set out.r to linear_to_srgb(r_mix)
+    Set out.g to linear_to_srgb(g_mix)
+    Set out.b to linear_to_srgb(b_mix)
+    Set out.a to (c1.a multiplied by one_minus_t) plus (c2.a multiplied by tt)
+    Return out
+End Process
+
+Note: ============================================================================
+Note: ACCESSORS (provided so other primitives can avoid touching struct fields
+Note: across the module boundary which the bootstrap parser does not permit
+Note: when the type lives in another module's namespace).
+Note: ============================================================================
+
+Process called "rgb_r" takes c as ColorRgb returns Float:
+    @Reasoning
+    Read the red channel of a ColorRgb. Trivial accessor exposed for
+    cross-module callers that cannot dereference qualified struct fields.
+    @End Reasoning
+    @Implementation
+    Direct field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.r
+End Process
+
+Process called "rgb_g" takes c as ColorRgb returns Float:
+    @Reasoning
+    Read the green channel.
+    @End Reasoning
+    @Implementation
+    Direct field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.g
+End Process
+
+Process called "rgb_b" takes c as ColorRgb returns Float:
+    @Reasoning
+    Read the blue channel.
+    @End Reasoning
+    @Implementation
+    Direct field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.b
+End Process
+
+Process called "rgb_a" takes c as ColorRgb returns Float:
+    @Reasoning
+    Read the alpha channel.
+    @End Reasoning
+    @Implementation
+    Direct field read.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure.
+    @End Security_Scope
+    Return c.a
+End Process

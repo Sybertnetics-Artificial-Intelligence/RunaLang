@@ -1,0 +1,1802 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+ELEMENT - Generic Markup Element / Attribute / Node Primitive (Tier 1)
+==============================================================================
+
+The substrate node types for every markup format Runa replaces - HTML,
+XML, SVG, RML, Markdown's embedded HTML blocks, and any tree-shaped
+markup document.  The shape mirrors the W3C DOM Level 3 Core
+specification (https://www.w3.org/TR/DOM-Level-3-Core/) with explicit
+support for XML namespaces (https://www.w3.org/TR/xml-names/) and the
+WHATWG DOM Living Standard's flat node model
+(https://dom.spec.whatwg.org/).
+
+Representation:
+  - Element: a heap record with eight slots (64 bytes).
+      slot 0  (off  0):  tag_name pointer        - String, NUL-terminated
+      slot 1  (off  8):  namespace pointer       - String or 0
+      slot 2  (off 16):  attribute list pointer  - List of Attribute records
+      slot 3  (off 24):  child list pointer      - List of MarkupNode records
+      slot 4  (off 32):  self_closing flag       - 0 or 1
+      slot 5  (off 40):  source_line             - 1-based line number
+      slot 6  (off 48):  source_column           - 1-based column number
+      slot 7  (off 56):  reserved                - 0
+
+  - Attribute: a heap record with four slots (32 bytes).
+      slot 0  (off  0):  name pointer            - String, NUL-terminated
+      slot 1  (off  8):  value pointer           - String, NUL-terminated
+      slot 2  (off 16):  namespace pointer       - String or 0
+      slot 3  (off 24):  reserved                - 0
+
+  - MarkupNode: a heap record with three slots (24 bytes) that tags an
+    underlying payload as one of six kinds defined below.
+      slot 0  (off  0):  kind                    - NODE_KIND_*
+      slot 1  (off  8):  payload pointer         - Element / String / etc.
+      slot 2  (off 16):  reserved                - 0
+
+  - DocumentTree: a heap record with four slots (32 bytes).
+      slot 0  (off  0):  doctype pointer         - String or 0
+      slot 1  (off  8):  root element pointer    - Element
+      slot 2  (off 16):  prologue node list      - List of MarkupNode (XML/HTML
+                                                   pre-root comments / PIs)
+      slot 3  (off 24):  epilogue node list      - List of MarkupNode (post-root
+                                                   comments)
+
+Node kinds (DOM Level 3 alignment):
+  NODE_KIND_ELEMENT                 1   ELEMENT_NODE
+  NODE_KIND_TEXT                    3   TEXT_NODE
+  NODE_KIND_COMMENT                 8   COMMENT_NODE
+  NODE_KIND_PROCESSING_INSTRUCTION  7   PROCESSING_INSTRUCTION_NODE
+  NODE_KIND_CDATA_SECTION           4   CDATA_SECTION_NODE
+  NODE_KIND_ENTITY_REFERENCE        5   ENTITY_REFERENCE_NODE
+
+Lifetime:
+  Every element and node owns its child list and attribute list.
+  element_destroy frees the entire subtree.  String slots reference
+  caller-owned data when created via the "_with_string" constructors and
+  duplicated heap data when created via the duplicating constructors.
+  The flag is set on a per-record basis so that element_destroy knows
+  whether to free the string payloads.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Constant ELEMENT_RECORD_SIZE as Integer is 64
+Constant ATTRIBUTE_RECORD_SIZE as Integer is 32
+Constant MARKUP_NODE_SIZE as Integer is 24
+Constant DOCUMENT_TREE_SIZE as Integer is 32
+
+Constant ELEMENT_OFF_TAG as Integer is 0
+Constant ELEMENT_OFF_NAMESPACE as Integer is 8
+Constant ELEMENT_OFF_ATTRS as Integer is 16
+Constant ELEMENT_OFF_CHILDREN as Integer is 24
+Constant ELEMENT_OFF_SELF_CLOSING as Integer is 32
+Constant ELEMENT_OFF_SOURCE_LINE as Integer is 40
+Constant ELEMENT_OFF_SOURCE_COLUMN as Integer is 48
+Constant ELEMENT_OFF_RESERVED as Integer is 56
+
+Constant ATTR_OFF_NAME as Integer is 0
+Constant ATTR_OFF_VALUE as Integer is 8
+Constant ATTR_OFF_NAMESPACE as Integer is 16
+Constant ATTR_OFF_RESERVED as Integer is 24
+
+Constant NODE_OFF_KIND as Integer is 0
+Constant NODE_OFF_PAYLOAD as Integer is 8
+Constant NODE_OFF_RESERVED as Integer is 16
+
+Constant DOCUMENT_OFF_DOCTYPE as Integer is 0
+Constant DOCUMENT_OFF_ROOT as Integer is 8
+Constant DOCUMENT_OFF_PROLOGUE as Integer is 16
+Constant DOCUMENT_OFF_EPILOGUE as Integer is 24
+
+Constant NODE_KIND_ELEMENT as Integer is 1
+Constant NODE_KIND_TEXT as Integer is 3
+Constant NODE_KIND_COMMENT as Integer is 8
+Constant NODE_KIND_PROCESSING_INSTRUCTION as Integer is 7
+Constant NODE_KIND_CDATA_SECTION as Integer is 4
+Constant NODE_KIND_ENTITY_REFERENCE as Integer is 5
+
+Constant ELEMENT_RESULT_OK as Integer is 0
+Constant ELEMENT_RESULT_NULL as Integer is -1
+Constant ELEMENT_RESULT_OOM as Integer is -2
+Constant ELEMENT_RESULT_NOT_FOUND as Integer is -3
+
+Note: ============================================================================
+Note: ATTRIBUTE CONSTRUCTION / ACCESS
+Note: ============================================================================
+
+@Reasoning
+Construct an Attribute record from a name, value, and optional namespace.
+W3C DOM Level 3 Core models an attribute as an Attr node; for the markup
+substrate the field set collapses to the name-value pair plus the optional
+namespace URI per the XML Namespaces 1.1 specification.  All three string
+parameters are stored by reference; caller retains ownership and must
+keep the storage live for the attribute's lifetime.  A namespace of 0
+indicates the no-namespace bucket which is canonical for HTML attributes
+without a prefix.
+@End Reasoning
+
+@Implementation
+Allocate a 32-byte record.  Write three 64-bit pointer slots and zero the
+reserved slot so structural equality on the slot bag works without a
+mask.  Return 0 on allocation failure so callers can propagate OOM.
+@End Implementation
+
+@Performance_Hints
+O(1) time, single Layout.allocate.  No string duplication; pure record
+assembly.  Heap residency: 32 bytes per attribute.
+@End Performance_Hints
+
+@Security_Scope
+The constructor accepts arbitrary pointer values without dereferencing
+them.  It is the caller's responsibility to ensure the pointers are
+either 0 or addresses of valid NUL-terminated UTF-8 strings; misuse
+manifests during serialization, not here.
+@End Security_Scope
+Process called "attribute_create" takes name as Integer, value as Integer, namespace as Integer returns Integer:
+    Let record be proc allocate from Layout with ATTRIBUTE_RECORD_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, ATTR_OFF_NAME, name
+    proc memory_set_int64 from Memory with record, ATTR_OFF_VALUE, value
+    proc memory_set_int64 from Memory with record, ATTR_OFF_NAMESPACE, namespace
+    proc memory_set_int64 from Memory with record, ATTR_OFF_RESERVED, 0
+    Return record
+End Process
+
+@Reasoning
+Read the name pointer out of an attribute record.  Provides DOM-style
+accessor semantics without exposing the raw memory layout to callers.
+@End Reasoning
+@Implementation
+Direct 64-bit load at offset 0.  Returns 0 if the attribute record itself
+is 0.
+@End Implementation
+@Performance_Hints
+O(1), single memory_get_int64 call.
+@End Performance_Hints
+@Security_Scope
+Null-safe: 0-valued attribute pointer short-circuits to 0.
+@End Security_Scope
+Process called "attribute_get_name" takes attribute as Integer returns Integer:
+    If attribute is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with attribute, ATTR_OFF_NAME
+End Process
+
+@Reasoning
+Read the attribute's value string pointer.
+@End Reasoning
+@Implementation
+Direct 64-bit load at offset 8.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "attribute_get_value" takes attribute as Integer returns Integer:
+    If attribute is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with attribute, ATTR_OFF_VALUE
+End Process
+
+@Reasoning
+Read the attribute's namespace URI pointer; 0 means the no-namespace
+bucket, which is HTML's default for attributes without a colon-prefixed
+name.
+@End Reasoning
+@Implementation
+Direct 64-bit load at offset 16.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "attribute_get_namespace" takes attribute as Integer returns Integer:
+    If attribute is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with attribute, ATTR_OFF_NAMESPACE
+End Process
+
+@Reasoning
+Release the attribute record's storage.  Strings are owned by callers,
+so this only frees the 32-byte record itself.
+@End Reasoning
+@Implementation
+Layout.deallocate on the record pointer.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Safe to call with 0 attribute pointer (does nothing).
+@End Security_Scope
+Process called "attribute_destroy" takes attribute as Integer returns Integer:
+    If attribute is equal to 0:
+        Return ELEMENT_RESULT_OK
+    End If
+    proc deallocate from Layout with attribute
+    Return ELEMENT_RESULT_OK
+End Process
+
+Note: ============================================================================
+Note: MARKUP NODE CONSTRUCTION / ACCESS
+Note: ============================================================================
+
+@Reasoning
+Construct a tagged MarkupNode with the given kind and payload pointer.
+The node is the union edge over Element / TextNode / Comment / PI /
+CDataSection / EntityReference; the payload's interpretation depends on
+the kind tag, mirroring DOM Level 3's Node base class.
+@End Reasoning
+@Implementation
+Allocate 24 bytes.  Write kind and payload pointer; zero reserved slot.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Caller-supplied kind is not range-checked here; out-of-range tags will
+be rejected by every downstream accessor and by the destructor.
+@End Security_Scope
+Process called "markup_node_create" takes kind as Integer, payload as Integer returns Integer:
+    Let record be proc allocate from Layout with MARKUP_NODE_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, NODE_OFF_KIND, kind
+    proc memory_set_int64 from Memory with record, NODE_OFF_PAYLOAD, payload
+    proc memory_set_int64 from Memory with record, NODE_OFF_RESERVED, 0
+    Return record
+End Process
+
+@Reasoning
+Create an Element-bearing MarkupNode in one step.  Common-case helper.
+@End Reasoning
+@Implementation
+Calls markup_node_create with NODE_KIND_ELEMENT.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Element pointer is stored verbatim; caller must keep the element alive
+until the node is destroyed.
+@End Security_Scope
+Process called "markup_node_create_element" takes element as Integer returns Integer:
+    Return proc markup_node_create with NODE_KIND_ELEMENT, element
+End Process
+
+@Reasoning
+Create a Text MarkupNode whose payload is a borrowed String pointer.
+The XML 1.1 specification defines text nodes as the runs of character
+data between tags.
+@End Reasoning
+@Implementation
+Calls markup_node_create with NODE_KIND_TEXT and the supplied string
+pointer.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+The string pointer is stored without duplication; caller retains
+ownership.
+@End Security_Scope
+Process called "markup_node_create_text" takes text as Integer returns Integer:
+    Return proc markup_node_create with NODE_KIND_TEXT, text
+End Process
+
+@Reasoning
+Create a Comment MarkupNode whose payload is the comment body text
+without the surrounding "<!--" / "-->" delimiters.
+@End Reasoning
+@Implementation
+Calls markup_node_create with NODE_KIND_COMMENT.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Borrowed string pointer.
+@End Security_Scope
+Process called "markup_node_create_comment" takes text as Integer returns Integer:
+    Return proc markup_node_create with NODE_KIND_COMMENT, text
+End Process
+
+@Reasoning
+Create a ProcessingInstruction MarkupNode.  Payload is a List with two
+entries: [target_string, data_string], matching XML 1.1 PI structure
+(<?target data?>).
+@End Reasoning
+@Implementation
+Calls markup_node_create with NODE_KIND_PROCESSING_INSTRUCTION; payload
+is a borrowed List pointer.
+@End Implementation
+@Performance_Hints
+O(1) for the node creation itself; caller is responsible for the List.
+@End Performance_Hints
+@Security_Scope
+The List payload must outlive the node, or be transferred by setting the
+node's payload to 0 before destroy.
+@End Security_Scope
+Process called "markup_node_create_processing_instruction" takes target_and_data_list as Integer returns Integer:
+    Return proc markup_node_create with NODE_KIND_PROCESSING_INSTRUCTION, target_and_data_list
+End Process
+
+@Reasoning
+Create a CDataSection MarkupNode.  CDATA is XML's mechanism for embedding
+raw character data without escaping; payload is the raw text body.
+@End Reasoning
+@Implementation
+Calls markup_node_create with NODE_KIND_CDATA_SECTION.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Borrowed string pointer.
+@End Security_Scope
+Process called "markup_node_create_cdata" takes text as Integer returns Integer:
+    Return proc markup_node_create with NODE_KIND_CDATA_SECTION, text
+End Process
+
+@Reasoning
+Create an EntityReference MarkupNode whose payload is the entity name
+without the surrounding "&" and ";".  Used for both predefined XML
+entities (&amp;, &lt;, &gt;, &apos;, &quot;) and document-defined entity
+references.
+@End Reasoning
+@Implementation
+Calls markup_node_create with NODE_KIND_ENTITY_REFERENCE.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Borrowed string pointer.
+@End Security_Scope
+Process called "markup_node_create_entity_reference" takes name as Integer returns Integer:
+    Return proc markup_node_create with NODE_KIND_ENTITY_REFERENCE, name
+End Process
+
+@Reasoning
+Retrieve the kind tag from a MarkupNode.
+@End Reasoning
+@Implementation
+Direct 64-bit load at offset 0.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Returns 0 (an invalid kind) for a 0-valued node, distinguishing it from
+any real node kind.
+@End Security_Scope
+Process called "markup_node_get_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, NODE_OFF_KIND
+End Process
+
+@Reasoning
+Retrieve the payload pointer from a MarkupNode.
+@End Reasoning
+@Implementation
+Direct 64-bit load at offset 8.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Interpretation of the returned pointer is the caller's
+responsibility per the node's kind tag.
+@End Security_Scope
+Process called "markup_node_get_payload" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, NODE_OFF_PAYLOAD
+End Process
+
+@Reasoning
+Predicate: is this node an element?  Hot-path discriminator for tree
+traversals.
+@End Reasoning
+@Implementation
+Compare the kind tag against NODE_KIND_ELEMENT.
+@End Implementation
+@Performance_Hints
+O(1), two loads and a compare.
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "markup_node_is_element" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let k be proc memory_get_int64 from Memory with node, NODE_OFF_KIND
+    If k is equal to NODE_KIND_ELEMENT:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Predicate: is this node a text node?
+@End Reasoning
+@Implementation
+Compare kind tag against NODE_KIND_TEXT.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "markup_node_is_text" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let k be proc memory_get_int64 from Memory with node, NODE_OFF_KIND
+    If k is equal to NODE_KIND_TEXT:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Release a MarkupNode and, for the kinds whose payload it owns
+transitively (Element), its payload as well.  Comments, text, CDATA, and
+entity reference payloads are caller-owned strings and are NOT freed
+here.
+@End Reasoning
+@Implementation
+If the node tag is NODE_KIND_ELEMENT, recursively destroy the element
+subtree.  Otherwise the payload is left untouched.  Finally Layout.deallocate
+the 24-byte record.
+@End Implementation
+@Performance_Hints
+O(subtree size) when destroying element nodes; O(1) for all other kinds.
+@End Performance_Hints
+@Security_Scope
+Caller-owned text payloads are preserved.  This avoids double-free when
+the same text string is referenced from multiple text nodes (common
+during incremental parsing).
+@End Security_Scope
+Process called "markup_node_destroy" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return ELEMENT_RESULT_OK
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, NODE_OFF_KIND
+    Let payload be proc memory_get_int64 from Memory with node, NODE_OFF_PAYLOAD
+    If kind is equal to NODE_KIND_ELEMENT:
+        proc element_destroy with payload
+    End If
+    proc deallocate from Layout with node
+    Return ELEMENT_RESULT_OK
+End Process
+
+Note: ============================================================================
+Note: ELEMENT CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Construct an Element record with the supplied tag name and namespace
+(both borrowed string pointers).  The attribute list and child list are
+freshly allocated empty Lists owned by the element.  This is the primary
+constructor for the markup substrate.
+
+self_closing is the boolean that distinguishes "<br/>" from "<div></div>".
+HTML void elements are always self-closing; XML elements MAY be when
+empty, controlled by the serializer's preference.
+@End Reasoning
+
+@Implementation
+Allocate a 64-byte record.  Allocate two backing Lists.  On any
+allocation failure undo the partial allocations and return 0.  Source
+line and column default to 0 (unknown); callers parsing from text fill
+them in via element_set_source_position.
+@End Implementation
+
+@Performance_Hints
+O(1) time, three Layout.allocate calls (record plus two list headers).
+Heap residency: 64 bytes for the element record plus the two empty
+backing lists from collections/list.runa.
+@End Performance_Hints
+
+@Security_Scope
+Tag and namespace pointers are borrowed.  Callers that pass dynamically
+allocated tag strings must call element_destroy_deep_strings (defined
+below) before letting the element drop, or arrange for separate
+deallocation of the tag storage.
+@End Security_Scope
+Process called "element_create" takes tag_name as Integer, namespace as Integer returns Integer:
+    Let record be proc allocate from Layout with ELEMENT_RECORD_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    Let attrs be proc list_create from List
+    If attrs is equal to 0:
+        proc deallocate from Layout with record
+        Return 0
+    End If
+    Let children be proc list_create from List
+    If children is equal to 0:
+        proc list_destroy from List with attrs
+        proc deallocate from Layout with record
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, ELEMENT_OFF_TAG, tag_name
+    proc memory_set_int64 from Memory with record, ELEMENT_OFF_NAMESPACE, namespace
+    proc memory_set_int64 from Memory with record, ELEMENT_OFF_ATTRS, attrs
+    proc memory_set_int64 from Memory with record, ELEMENT_OFF_CHILDREN, children
+    proc memory_set_int64 from Memory with record, ELEMENT_OFF_SELF_CLOSING, 0
+    proc memory_set_int64 from Memory with record, ELEMENT_OFF_SOURCE_LINE, 0
+    proc memory_set_int64 from Memory with record, ELEMENT_OFF_SOURCE_COLUMN, 0
+    proc memory_set_int64 from Memory with record, ELEMENT_OFF_RESERVED, 0
+    Return record
+End Process
+
+@Reasoning
+Mark the element as self-closing.  HTML void elements (area, base, br,
+col, embed, hr, img, input, link, meta, source, track, wbr per WHATWG
+HTML 13.1.2) MUST be self-closing.  XML empty elements MAY use the
+self-closing shorthand at serialization time.
+@End Reasoning
+@Implementation
+Write 1 to the self_closing slot.  Idempotent.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_set_self_closing" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    proc memory_set_int64 from Memory with element, ELEMENT_OFF_SELF_CLOSING, 1
+    Return ELEMENT_RESULT_OK
+End Process
+
+@Reasoning
+Record where the element appears in the source text so diagnostics
+emitted by downstream tooling (validators, linters) can point at the
+correct location.
+@End Reasoning
+@Implementation
+Write the line and column integers to the corresponding record slots.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Negative inputs are stored verbatim; consumers should treat them as
+"unknown".
+@End Security_Scope
+Process called "element_set_source_position" takes element as Integer, line as Integer, column as Integer returns Integer:
+    If element is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    proc memory_set_int64 from Memory with element, ELEMENT_OFF_SOURCE_LINE, line
+    proc memory_set_int64 from Memory with element, ELEMENT_OFF_SOURCE_COLUMN, column
+    Return ELEMENT_RESULT_OK
+End Process
+
+Note: ============================================================================
+Note: ELEMENT ACCESSORS
+Note: ============================================================================
+
+@Reasoning
+Return the element's tag name pointer (borrowed).
+@End Reasoning
+@Implementation
+Direct load at offset 0.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_get_tag_name" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with element, ELEMENT_OFF_TAG
+End Process
+
+@Reasoning
+Return the element's namespace URI pointer; 0 means the no-namespace
+bucket.
+@End Reasoning
+@Implementation
+Direct load at offset 8.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_get_namespace" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with element, ELEMENT_OFF_NAMESPACE
+End Process
+
+@Reasoning
+Return a pointer to the element's attribute list.  The list is owned by
+the element; callers must not destroy it independently.
+@End Reasoning
+@Implementation
+Direct load at offset 16.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_get_attributes" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with element, ELEMENT_OFF_ATTRS
+End Process
+
+@Reasoning
+Return a pointer to the element's child list.  Same ownership rules as
+element_get_attributes.
+@End Reasoning
+@Implementation
+Direct load at offset 24.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_get_children" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with element, ELEMENT_OFF_CHILDREN
+End Process
+
+@Reasoning
+Return the self-closing flag (0 or 1).
+@End Reasoning
+@Implementation
+Direct load at offset 32.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_is_self_closing" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with element, ELEMENT_OFF_SELF_CLOSING
+End Process
+
+@Reasoning
+Return the 1-based source line number recorded for the element, or 0
+when unknown.
+@End Reasoning
+@Implementation
+Direct load at offset 40.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_get_source_line" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with element, ELEMENT_OFF_SOURCE_LINE
+End Process
+
+@Reasoning
+Return the 1-based source column for the element, or 0 when unknown.
+@End Reasoning
+@Implementation
+Direct load at offset 48.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_get_source_column" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with element, ELEMENT_OFF_SOURCE_COLUMN
+End Process
+
+Note: ============================================================================
+Note: ELEMENT MUTATION
+Note: ============================================================================
+
+@Reasoning
+Attach a fully-constructed Attribute to an Element.  Insertion order is
+preserved per WHATWG DOM Living Standard's NamedNodeMap iteration order
+(which the spec defines as insertion order).
+@End Reasoning
+@Implementation
+Append the attribute pointer to the element's attribute list via
+List.list_push.
+@End Implementation
+@Performance_Hints
+Amortized O(1); the underlying List doubles capacity on growth.
+@End Performance_Hints
+@Security_Scope
+Null-safe for the element; null attributes are still appended so callers
+can model sentinel slots.
+@End Security_Scope
+Process called "element_append_attribute" takes element as Integer, attribute as Integer returns Integer:
+    If element is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    Let attrs be proc memory_get_int64 from Memory with element, ELEMENT_OFF_ATTRS
+    Return proc list_push from List with attrs, attribute
+End Process
+
+@Reasoning
+Look up an attribute by name and return its value pointer, or 0 if no
+attribute with that name exists.  This is the DOM Element.getAttribute()
+analog.  Comparison is byte-for-byte against the attribute's name slot;
+case-insensitivity for HTML must be handled at the caller by lowercasing
+the lookup key.
+@End Reasoning
+@Implementation
+Iterate the attribute list with list_get; for each attribute load the
+name slot and compare to the supplied key via StringCore.string_equals.
+Return the value slot of the first match.
+@End Implementation
+@Performance_Hints
+O(n) in attribute count.  Typical HTML elements carry fewer than a
+handful of attributes, so the linear scan is faster than a hash table
+in practice.
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Returns 0 (which collides with "attribute present but null
+value") only when the attribute is missing; callers needing presence
+distinction must call element_has_attribute first.
+@End Security_Scope
+Process called "element_get_attribute" takes element as Integer, name as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let attrs be proc memory_get_int64 from Memory with element, ELEMENT_OFF_ATTRS
+    Let count be proc list_length from List with attrs
+    Let i be 0
+    While i is less than count:
+        Let attr be proc list_get from List with attrs, i
+        Let attr_name be proc memory_get_int64 from Memory with attr, ATTR_OFF_NAME
+        Let eq be proc string_equals from StringCore with attr_name, name
+        If eq is equal to 1:
+            Return proc memory_get_int64 from Memory with attr, ATTR_OFF_VALUE
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Test whether an attribute with the given name is present on the element.
+Implements DOM Element.hasAttribute().
+@End Reasoning
+@Implementation
+Same scan as element_get_attribute but returns 1 on match instead of the
+value pointer.
+@End Implementation
+@Performance_Hints
+O(n) in attribute count.
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_has_attribute" takes element as Integer, name as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let attrs be proc memory_get_int64 from Memory with element, ELEMENT_OFF_ATTRS
+    Let count be proc list_length from List with attrs
+    Let i be 0
+    While i is less than count:
+        Let attr be proc list_get from List with attrs, i
+        Let attr_name be proc memory_get_int64 from Memory with attr, ATTR_OFF_NAME
+        Let eq be proc string_equals from StringCore with attr_name, name
+        If eq is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Append a child MarkupNode to the element's children list.  Insertion at
+the tail preserves document order, matching the WHATWG DOM appendChild
+semantics.
+@End Reasoning
+@Implementation
+List.list_push on the children list.
+@End Implementation
+@Performance_Hints
+Amortized O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe for the element; null child is still appended.
+@End Security_Scope
+Process called "element_append_child" takes element as Integer, child_node as Integer returns Integer:
+    If element is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    Let children be proc memory_get_int64 from Memory with element, ELEMENT_OFF_CHILDREN
+    Return proc list_push from List with children, child_node
+End Process
+
+@Reasoning
+Return the number of children attached to the element.
+@End Reasoning
+@Implementation
+List.list_length on the children list.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_child_count" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with element, ELEMENT_OFF_CHILDREN
+    Return proc list_length from List with children
+End Process
+
+@Reasoning
+Return the number of attributes attached to the element.
+@End Reasoning
+@Implementation
+List.list_length on the attributes list.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_attribute_count" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Let attrs be proc memory_get_int64 from Memory with element, ELEMENT_OFF_ATTRS
+    Return proc list_length from List with attrs
+End Process
+
+@Reasoning
+Return the child MarkupNode pointer at the given 0-based index, or 0
+when the index is out of range.
+@End Reasoning
+@Implementation
+List.list_get with bounds checking via list_length.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Out-of-range indices return 0 instead of trapping.
+@End Security_Scope
+Process called "element_get_child" takes element as Integer, index as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with element, ELEMENT_OFF_CHILDREN
+    Let count be proc list_length from List with children
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Return proc list_get from List with children, index
+End Process
+
+@Reasoning
+Return the Attribute pointer at the given 0-based index, or 0 when out
+of range.
+@End Reasoning
+@Implementation
+List.list_get with bounds checking via list_length.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Out-of-range indices return 0.
+@End Security_Scope
+Process called "element_get_attribute_at" takes element as Integer, index as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Let attrs be proc memory_get_int64 from Memory with element, ELEMENT_OFF_ATTRS
+    Let count be proc list_length from List with attrs
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Return proc list_get from List with attrs, index
+End Process
+
+Note: ============================================================================
+Note: ELEMENT DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Recursively destroy an element and every node beneath it.  Strings are
+caller-owned and untouched; this releases only the records, attribute
+records, and node records that the element owns.
+@End Reasoning
+@Implementation
+1. Walk the attribute list and free every Attribute record.
+2. Walk the child list and call markup_node_destroy on every entry;
+   markup_node_destroy itself recurses into Element children.
+3. Destroy the backing Lists.
+4. Layout.deallocate the 64-byte element record.
+@End Implementation
+@Performance_Hints
+O(total descendant count).
+@End Performance_Hints
+@Security_Scope
+Idempotent against 0 input.  Does not double-free string payloads
+because they are borrowed.
+@End Security_Scope
+Process called "element_destroy" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return ELEMENT_RESULT_OK
+    End If
+    Let attrs be proc memory_get_int64 from Memory with element, ELEMENT_OFF_ATTRS
+    If attrs is not equal to 0:
+        Let acount be proc list_length from List with attrs
+        Let i be 0
+        While i is less than acount:
+            Let attr be proc list_get from List with attrs, i
+            proc attribute_destroy with attr
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with attrs
+    End If
+    Let children be proc memory_get_int64 from Memory with element, ELEMENT_OFF_CHILDREN
+    If children is not equal to 0:
+        Let ccount be proc list_length from List with children
+        Let j be 0
+        While j is less than ccount:
+            Let child be proc list_get from List with children, j
+            proc markup_node_destroy with child
+            Set j to j plus 1
+        End While
+        proc list_destroy from List with children
+    End If
+    proc deallocate from Layout with element
+    Return ELEMENT_RESULT_OK
+End Process
+
+Note: ============================================================================
+Note: DOCUMENT TREE
+Note: ============================================================================
+
+@Reasoning
+Construct a DocumentTree with the supplied root element.  Doctype is
+optional and may be 0 for XML documents without one or for fragment
+trees.
+@End Reasoning
+@Implementation
+Allocate 32 bytes, write the four slots, allocate the two empty
+prologue/epilogue lists.  Returns 0 on OOM.
+@End Implementation
+@Performance_Hints
+O(1) plus two list-header allocations.
+@End Performance_Hints
+@Security_Scope
+Doctype and root pointers are borrowed.
+@End Security_Scope
+Process called "document_create" takes doctype as Integer, root as Integer returns Integer:
+    Let record be proc allocate from Layout with DOCUMENT_TREE_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    Let prologue be proc list_create from List
+    If prologue is equal to 0:
+        proc deallocate from Layout with record
+        Return 0
+    End If
+    Let epilogue be proc list_create from List
+    If epilogue is equal to 0:
+        proc list_destroy from List with prologue
+        proc deallocate from Layout with record
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, DOCUMENT_OFF_DOCTYPE, doctype
+    proc memory_set_int64 from Memory with record, DOCUMENT_OFF_ROOT, root
+    proc memory_set_int64 from Memory with record, DOCUMENT_OFF_PROLOGUE, prologue
+    proc memory_set_int64 from Memory with record, DOCUMENT_OFF_EPILOGUE, epilogue
+    Return record
+End Process
+
+@Reasoning
+Doctype accessor (borrowed string pointer or 0).
+@End Reasoning
+@Implementation
+Load at offset 0.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "document_get_doctype" takes doc as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with doc, DOCUMENT_OFF_DOCTYPE
+End Process
+
+@Reasoning
+Root element accessor.
+@End Reasoning
+@Implementation
+Load at offset 8.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "document_get_root" takes doc as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with doc, DOCUMENT_OFF_ROOT
+End Process
+
+@Reasoning
+Prologue list accessor - the comments and processing instructions that
+appear before the root element in an XML or HTML document.
+@End Reasoning
+@Implementation
+Load at offset 16.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "document_get_prologue" takes doc as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with doc, DOCUMENT_OFF_PROLOGUE
+End Process
+
+@Reasoning
+Epilogue list accessor - the comments that appear after the root element.
+@End Reasoning
+@Implementation
+Load at offset 24.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "document_get_epilogue" takes doc as Integer returns Integer:
+    If doc is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with doc, DOCUMENT_OFF_EPILOGUE
+End Process
+
+@Reasoning
+Append a MarkupNode to the document's prologue.
+@End Reasoning
+@Implementation
+List.list_push on the prologue list.
+@End Implementation
+@Performance_Hints
+Amortized O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe for the document.
+@End Security_Scope
+Process called "document_append_prologue_node" takes doc as Integer, node as Integer returns Integer:
+    If doc is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    Let prologue be proc memory_get_int64 from Memory with doc, DOCUMENT_OFF_PROLOGUE
+    Return proc list_push from List with prologue, node
+End Process
+
+@Reasoning
+Append a MarkupNode to the document's epilogue.
+@End Reasoning
+@Implementation
+List.list_push on the epilogue list.
+@End Implementation
+@Performance_Hints
+Amortized O(1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "document_append_epilogue_node" takes doc as Integer, node as Integer returns Integer:
+    If doc is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    Let epilogue be proc memory_get_int64 from Memory with doc, DOCUMENT_OFF_EPILOGUE
+    Return proc list_push from List with epilogue, node
+End Process
+
+@Reasoning
+Recursively destroy an entire document tree: root element subtree,
+prologue and epilogue node lists, and the document record itself.
+Doctype string is caller-owned.
+@End Reasoning
+@Implementation
+Walk prologue and epilogue lists destroying each node, destroy the
+backing lists, destroy the root element, free the document record.
+@End Implementation
+@Performance_Hints
+O(total node count).
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Doctype string is preserved.
+@End Security_Scope
+Process called "document_destroy" takes doc as Integer returns Integer:
+    If doc is equal to 0:
+        Return ELEMENT_RESULT_OK
+    End If
+    Let prologue be proc memory_get_int64 from Memory with doc, DOCUMENT_OFF_PROLOGUE
+    If prologue is not equal to 0:
+        Let pcount be proc list_length from List with prologue
+        Let i be 0
+        While i is less than pcount:
+            Let pnode be proc list_get from List with prologue, i
+            proc markup_node_destroy with pnode
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with prologue
+    End If
+    Let epilogue be proc memory_get_int64 from Memory with doc, DOCUMENT_OFF_EPILOGUE
+    If epilogue is not equal to 0:
+        Let ecount be proc list_length from List with epilogue
+        Let j be 0
+        While j is less than ecount:
+            Let enode be proc list_get from List with epilogue, j
+            proc markup_node_destroy with enode
+            Set j to j plus 1
+        End While
+        proc list_destroy from List with epilogue
+    End If
+    Let root be proc memory_get_int64 from Memory with doc, DOCUMENT_OFF_ROOT
+    proc element_destroy with root
+    proc deallocate from Layout with doc
+    Return ELEMENT_RESULT_OK
+End Process
+
+Note: ============================================================================
+Note: TRAVERSAL - DEPTH-FIRST WALK
+Note: ============================================================================
+
+@Reasoning
+Append every descendant Element of `root` (and `root` itself) to the
+caller-supplied output list in depth-first pre-order.  Text, comment, and
+other non-element nodes are not appended; only elements participate in
+the walk because element traversal is the common case for query engines
+(selector matching) and validators.  Pre-order matches the document-order
+traversal defined by WHATWG DOM section 4.2.2 and is what CSS selector
+matching (Selectors Level 4 section 4) requires.
+@End Reasoning
+@Implementation
+Iterative two-stack DFS to avoid Runa-stack pressure on deep documents:
+push the root, then pop-and-emit while pushing children in reverse so
+that the leftmost child is popped first.  A scratch List provides the
+work-stack.  Bails out cleanly with ELEMENT_RESULT_OOM if the work-stack
+allocation fails.
+@End Implementation
+@Performance_Hints
+O(n) in total element count.  One List allocation for the work stack,
+freed before return.
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Visits only nodes whose kind is NODE_KIND_ELEMENT, so a
+malformed payload pointer attached to a non-element node will never be
+dereferenced.
+@End Security_Scope
+Process called "element_walk" takes root as Integer, out_list as Integer returns Integer:
+    If root is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    If out_list is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    Let stack be proc list_create from List
+    If stack is equal to 0:
+        Return ELEMENT_RESULT_OOM
+    End If
+    proc list_push from List with stack, root
+    While 1 is equal to 1:
+        Let stack_len be proc list_length from List with stack
+        If stack_len is equal to 0:
+            proc list_destroy from List with stack
+            Return ELEMENT_RESULT_OK
+        End If
+        Let top_index be stack_len minus 1
+        Let elem be proc list_get from List with stack, top_index
+        proc list_remove from List with stack, top_index
+        If elem is not equal to 0:
+            proc list_push from List with out_list, elem
+            Let children be proc memory_get_int64 from Memory with elem, ELEMENT_OFF_CHILDREN
+            If children is not equal to 0:
+                Let ccount be proc list_length from List with children
+                Let idx be ccount minus 1
+                While idx is greater than or equal to 0:
+                    Let child_node be proc list_get from List with children, idx
+                    Let kind be proc memory_get_int64 from Memory with child_node, NODE_OFF_KIND
+                    If kind is equal to NODE_KIND_ELEMENT:
+                        Let child_elem be proc memory_get_int64 from Memory with child_node, NODE_OFF_PAYLOAD
+                        proc list_push from List with stack, child_elem
+                    End If
+                    Set idx to idx minus 1
+                End While
+            End If
+        End If
+    End While
+    proc list_destroy from List with stack
+    Return ELEMENT_RESULT_OK
+End Process
+
+@Reasoning
+Find every element under `root` whose tag name equals the supplied
+NUL-terminated key, returning a freshly allocated List of element
+pointers in document order.  Mirrors the DOM Element.getElementsByTagName
+collection but materialized as a List instead of as a live HTMLCollection.
+Comparison is byte-for-byte using StringCore.string_equals; HTML's
+ASCII-case-insensitive matching is the caller's responsibility (pass a
+lowercased key against a tree whose tag names have been lowercased on
+parse).
+@End Reasoning
+@Implementation
+Walk the tree with element_walk to gather all elements, then filter by
+tag-name equality into a result List.  The scratch list is freed before
+return; the result list is owned by the caller and must be destroyed
+with list_destroy.
+@End Implementation
+@Performance_Hints
+O(n) traversal + O(n) filter.  Two list allocations.  Element tag names
+are short, so the equality check is fast.
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Returns 0 on allocation failure so callers can distinguish
+OOM from "no matches" (an empty non-zero list).
+@End Security_Scope
+Process called "element_find_by_tag" takes root as Integer, tag_name as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    If tag_name is equal to 0:
+        Return 0
+    End If
+    Let all_elems be proc list_create from List
+    If all_elems is equal to 0:
+        Return 0
+    End If
+    proc element_walk with root, all_elems
+    Let result be proc list_create from List
+    If result is equal to 0:
+        proc list_destroy from List with all_elems
+        Return 0
+    End If
+    Let count be proc list_length from List with all_elems
+    Let i be 0
+    While i is less than count:
+        Let elem be proc list_get from List with all_elems, i
+        Let elem_tag be proc memory_get_int64 from Memory with elem, ELEMENT_OFF_TAG
+        Let eq be proc string_equals from StringCore with elem_tag, tag_name
+        If eq is equal to 1:
+            proc list_push from List with result, elem
+        End If
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with all_elems
+    Return result
+End Process
+
+@Reasoning
+Locate the first element whose `id` attribute equals the supplied key, or
+0 if no element carries that id.  Mirrors DOM Document.getElementById.
+The id attribute is identified by its canonical name "id" per the HTML
+Living Standard section 3.2.6; XML id attributes following the
+xml:id Recommendation (https://www.w3.org/TR/xml-id/) are not picked up
+by this primitive — callers needing XML id semantics must compose their
+own query using element_walk and element_get_attribute.
+@End Reasoning
+@Implementation
+Walk all elements into a scratch list, scan in document order, return
+the first element whose "id" attribute value equals the key.
+@End Implementation
+@Performance_Hints
+O(n).  Could be accelerated with an id index, but production HTML
+documents rarely have enough ids to justify the table overhead.
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Returns 0 for both "not found" and "OOM during walk", which
+is acceptable because the result is either a valid pointer or sentinel
+zero.
+@End Security_Scope
+Process called "element_find_by_id" takes root as Integer, id_value as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    If id_value is equal to 0:
+        Return 0
+    End If
+    Let all_elems be proc list_create from List
+    If all_elems is equal to 0:
+        Return 0
+    End If
+    proc element_walk with root, all_elems
+    Let id_key be "id"
+    Let count be proc list_length from List with all_elems
+    Let i be 0
+    Let found be 0
+    While i is less than count:
+        Let elem be proc list_get from List with all_elems, i
+        Let val be proc element_get_attribute with elem, id_key
+        If val is not equal to 0:
+            Let eq be proc string_equals from StringCore with val, id_value
+            If eq is equal to 1:
+                Set found to elem
+                Set i to count
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with all_elems
+    Return found
+End Process
+
+Note: ============================================================================
+Note: SERIALIZATION
+Note: ============================================================================
+
+@Reasoning
+Append `count` space characters to the StringBuilder used for pretty-
+printing element trees.  Two spaces per indent level is the convention
+used by the JSON specification (RFC 8259) when authors want indentation
+and by the prevailing HTML formatter community.
+@End Reasoning
+@Implementation
+While loop appending the space character (32) `count` times.
+@End Implementation
+@Performance_Hints
+O(count); typical indent depths are < 10.
+@End Performance_Hints
+@Security_Scope
+Null-safe builder.
+@End Security_Scope
+Process called "element_append_indent" takes sb as Integer, count as Integer returns Integer:
+    If sb is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    Let i be 0
+    While i is less than count:
+        proc stringbuilder_append_char from SB with sb, 32
+        Set i to i plus 1
+    End While
+    Return ELEMENT_RESULT_OK
+End Process
+
+@Reasoning
+Append an attribute's value enclosed in double quotes, escaping the
+characters defined by HTML5 section 8.1.2.3 attribute serialization:
+ampersand and quote.  Newlines are escaped using &#10; to keep the
+serialized form on a single line.
+@End Reasoning
+@Implementation
+Iterate the value string by character, write the escape sequence for
+each special character, write the raw byte otherwise.
+@End Implementation
+@Performance_Hints
+O(length).  No allocations beyond the StringBuilder's growth.
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "element_append_attr_value" takes sb as Integer, value as Integer returns Integer:
+    If sb is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    proc stringbuilder_append_char from SB with sb, 34
+    If value is equal to 0:
+        proc stringbuilder_append_char from SB with sb, 34
+        Return ELEMENT_RESULT_OK
+    End If
+    Let len be proc string_length from StringCore with value
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with value, i
+        If ch is equal to 38:
+            proc stringbuilder_append from SB with sb, "&amp;"
+        Otherwise:
+            If ch is equal to 34:
+                proc stringbuilder_append from SB with sb, "&quot;"
+            Otherwise:
+                If ch is equal to 60:
+                    proc stringbuilder_append from SB with sb, "&lt;"
+                Otherwise:
+                    If ch is equal to 62:
+                        proc stringbuilder_append from SB with sb, "&gt;"
+                    Otherwise:
+                        If ch is equal to 10:
+                            proc stringbuilder_append from SB with sb, "&#10;"
+                        Otherwise:
+                            proc stringbuilder_append_char from SB with sb, ch
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    proc stringbuilder_append_char from SB with sb, 34
+    Return ELEMENT_RESULT_OK
+End Process
+
+@Reasoning
+Recursive pretty-printer.  Emits a self-closing tag for void elements,
+a `<tag attrs/>` opening followed by indented children and a closing
+tag for normal elements.  Text, comment, CDATA, processing-instruction,
+and entity-reference children are emitted in HTML5 serialization form.
+@End Reasoning
+@Implementation
+1. Indent + `<tag` + attributes inline.
+2. If self_closing or zero children: `/>` then newline.
+3. Otherwise: `>` then newline; walk children with indent+1; indent + `</tag>` + newline.
+@End Implementation
+@Performance_Hints
+O(total subtree size).  StringBuilder amortizes allocations.
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Text payloads are escaped via element_append_text.
+@End Security_Scope
+Process called "element_append_text_escaped" takes sb as Integer, text as Integer returns Integer:
+    If sb is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    If text is equal to 0:
+        Return ELEMENT_RESULT_OK
+    End If
+    Let len be proc string_length from StringCore with text
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with text, i
+        If ch is equal to 38:
+            proc stringbuilder_append from SB with sb, "&amp;"
+        Otherwise:
+            If ch is equal to 60:
+                proc stringbuilder_append from SB with sb, "&lt;"
+            Otherwise:
+                If ch is equal to 62:
+                    proc stringbuilder_append from SB with sb, "&gt;"
+                Otherwise:
+                    proc stringbuilder_append_char from SB with sb, ch
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return ELEMENT_RESULT_OK
+End Process
+
+Process called "element_serialize_node" takes sb as Integer, node as Integer, indent as Integer returns Integer:
+    If node is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, NODE_OFF_KIND
+    Let payload be proc memory_get_int64 from Memory with node, NODE_OFF_PAYLOAD
+    If kind is equal to NODE_KIND_TEXT:
+        proc element_append_indent with sb, indent
+        proc element_append_text_escaped with sb, payload
+        proc stringbuilder_append_char from SB with sb, 10
+        Return ELEMENT_RESULT_OK
+    End If
+    If kind is equal to NODE_KIND_COMMENT:
+        proc element_append_indent with sb, indent
+        proc stringbuilder_append from SB with sb, "<!--"
+        If payload is not equal to 0:
+            proc stringbuilder_append from SB with sb, payload
+        End If
+        proc stringbuilder_append from SB with sb, "-->"
+        proc stringbuilder_append_char from SB with sb, 10
+        Return ELEMENT_RESULT_OK
+    End If
+    If kind is equal to NODE_KIND_CDATA_SECTION:
+        proc element_append_indent with sb, indent
+        proc stringbuilder_append from SB with sb, "<![CDATA["
+        If payload is not equal to 0:
+            proc stringbuilder_append from SB with sb, payload
+        End If
+        proc stringbuilder_append from SB with sb, "]]>"
+        proc stringbuilder_append_char from SB with sb, 10
+        Return ELEMENT_RESULT_OK
+    End If
+    If kind is equal to NODE_KIND_ENTITY_REFERENCE:
+        proc element_append_indent with sb, indent
+        proc stringbuilder_append_char from SB with sb, 38
+        If payload is not equal to 0:
+            proc stringbuilder_append from SB with sb, payload
+        End If
+        proc stringbuilder_append_char from SB with sb, 59
+        proc stringbuilder_append_char from SB with sb, 10
+        Return ELEMENT_RESULT_OK
+    End If
+    If kind is equal to NODE_KIND_ELEMENT:
+        proc element_serialize_element with sb, payload, indent
+        Return ELEMENT_RESULT_OK
+    End If
+    Return ELEMENT_RESULT_OK
+End Process
+
+Process called "element_serialize_element" takes sb as Integer, element as Integer, indent as Integer returns Integer:
+    If element is equal to 0:
+        Return ELEMENT_RESULT_NULL
+    End If
+    proc element_append_indent with sb, indent
+    proc stringbuilder_append_char from SB with sb, 60
+    Let tag be proc memory_get_int64 from Memory with element, ELEMENT_OFF_TAG
+    If tag is not equal to 0:
+        proc stringbuilder_append from SB with sb, tag
+    End If
+    Let attrs be proc memory_get_int64 from Memory with element, ELEMENT_OFF_ATTRS
+    If attrs is not equal to 0:
+        Let acount be proc list_length from List with attrs
+        Let i be 0
+        While i is less than acount:
+            Let attr be proc list_get from List with attrs, i
+            Let aname be proc memory_get_int64 from Memory with attr, ATTR_OFF_NAME
+            Let avalue be proc memory_get_int64 from Memory with attr, ATTR_OFF_VALUE
+            proc stringbuilder_append_char from SB with sb, 32
+            If aname is not equal to 0:
+                proc stringbuilder_append from SB with sb, aname
+            End If
+            proc stringbuilder_append_char from SB with sb, 61
+            proc element_append_attr_value with sb, avalue
+            Set i to i plus 1
+        End While
+    End If
+    Let self_close be proc memory_get_int64 from Memory with element, ELEMENT_OFF_SELF_CLOSING
+    Let children be proc memory_get_int64 from Memory with element, ELEMENT_OFF_CHILDREN
+    Let child_count be 0
+    If children is not equal to 0:
+        Set child_count to proc list_length from List with children
+    End If
+    If self_close is equal to 1:
+        proc stringbuilder_append from SB with sb, "/>"
+        proc stringbuilder_append_char from SB with sb, 10
+        Return ELEMENT_RESULT_OK
+    End If
+    If child_count is equal to 0:
+        proc stringbuilder_append_char from SB with sb, 62
+        proc stringbuilder_append from SB with sb, "</"
+        If tag is not equal to 0:
+            proc stringbuilder_append from SB with sb, tag
+        End If
+        proc stringbuilder_append_char from SB with sb, 62
+        proc stringbuilder_append_char from SB with sb, 10
+        Return ELEMENT_RESULT_OK
+    End If
+    proc stringbuilder_append_char from SB with sb, 62
+    proc stringbuilder_append_char from SB with sb, 10
+    Let j be 0
+    While j is less than child_count:
+        Let child_node be proc list_get from List with children, j
+        proc element_serialize_node with sb, child_node, indent plus 2
+        Set j to j plus 1
+    End While
+    proc element_append_indent with sb, indent
+    proc stringbuilder_append from SB with sb, "</"
+    If tag is not equal to 0:
+        proc stringbuilder_append from SB with sb, tag
+    End If
+    proc stringbuilder_append_char from SB with sb, 62
+    proc stringbuilder_append_char from SB with sb, 10
+    Return ELEMENT_RESULT_OK
+End Process
+
+@Reasoning
+Public entry point: serialize an element subtree to a newly-allocated
+NUL-terminated String.  The caller owns the returned string and must
+release it via the memory layer used by stringbuilder_to_string.
+@End Reasoning
+@Implementation
+Create a StringBuilder, recurse via element_serialize_element starting
+at the supplied indent, materialize the buffer with stringbuilder_to_string,
+release the builder.
+@End Implementation
+@Performance_Hints
+O(total subtree size + total text length).  One StringBuilder + one
+output string allocation.
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Returns 0 on OOM or null root.
+@End Security_Scope
+Process called "element_to_string" takes root as Integer, indent_level as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc element_serialize_element with sb, root, indent_level
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+Note: ============================================================================
+Note: DEEP CLONE
+Note: ============================================================================
+
+@Reasoning
+Recursively duplicate an element subtree.  String slots are shared with
+the original because the substrate treats strings as caller-owned; the
+clone references the same byte storage.  Callers needing fully
+independent strings must compose their own duplication using the
+StringCore primitives.
+@End Reasoning
+@Implementation
+Allocate a fresh element record with the same tag + namespace.  Copy
+the self-closing flag, source line, and source column.  Walk the
+original's attribute list and append clones of each attribute.  Walk
+the original's child list and clone each node, recursing into elements.
+@End Implementation
+@Performance_Hints
+O(total descendant count).  No string copies — pointers shared with
+source.
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Returns 0 on OOM; partial allocations are torn down via
+element_destroy so the heap stays consistent.
+@End Security_Scope
+Process called "markup_node_clone" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Memory with node, NODE_OFF_KIND
+    Let payload be proc memory_get_int64 from Memory with node, NODE_OFF_PAYLOAD
+    If kind is equal to NODE_KIND_ELEMENT:
+        Let cloned_elem be proc element_clone with payload
+        If cloned_elem is equal to 0:
+            Return 0
+        End If
+        Return proc markup_node_create with NODE_KIND_ELEMENT, cloned_elem
+    End If
+    Return proc markup_node_create with kind, payload
+End Process
+
+Process called "element_clone" takes element as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Let tag be proc memory_get_int64 from Memory with element, ELEMENT_OFF_TAG
+    Let ns be proc memory_get_int64 from Memory with element, ELEMENT_OFF_NAMESPACE
+    Let clone be proc element_create with tag, ns
+    If clone is equal to 0:
+        Return 0
+    End If
+    Let self_close be proc memory_get_int64 from Memory with element, ELEMENT_OFF_SELF_CLOSING
+    proc memory_set_int64 from Memory with clone, ELEMENT_OFF_SELF_CLOSING, self_close
+    Let src_line be proc memory_get_int64 from Memory with element, ELEMENT_OFF_SOURCE_LINE
+    proc memory_set_int64 from Memory with clone, ELEMENT_OFF_SOURCE_LINE, src_line
+    Let src_col be proc memory_get_int64 from Memory with element, ELEMENT_OFF_SOURCE_COLUMN
+    proc memory_set_int64 from Memory with clone, ELEMENT_OFF_SOURCE_COLUMN, src_col
+    Let attrs be proc memory_get_int64 from Memory with element, ELEMENT_OFF_ATTRS
+    If attrs is not equal to 0:
+        Let acount be proc list_length from List with attrs
+        Let i be 0
+        While i is less than acount:
+            Let src_attr be proc list_get from List with attrs, i
+            Let aname be proc memory_get_int64 from Memory with src_attr, ATTR_OFF_NAME
+            Let avalue be proc memory_get_int64 from Memory with src_attr, ATTR_OFF_VALUE
+            Let ans be proc memory_get_int64 from Memory with src_attr, ATTR_OFF_NAMESPACE
+            Let cloned_attr be proc attribute_create with aname, avalue, ans
+            If cloned_attr is equal to 0:
+                proc element_destroy with clone
+                Return 0
+            End If
+            proc element_append_attribute with clone, cloned_attr
+            Set i to i plus 1
+        End While
+    End If
+    Let children be proc memory_get_int64 from Memory with element, ELEMENT_OFF_CHILDREN
+    If children is not equal to 0:
+        Let ccount be proc list_length from List with children
+        Let j be 0
+        While j is less than ccount:
+            Let src_node be proc list_get from List with children, j
+            Let cloned_node be proc markup_node_clone with src_node
+            If cloned_node is equal to 0:
+                proc element_destroy with clone
+                Return 0
+            End If
+            proc element_append_child with clone, cloned_node
+            Set j to j plus 1
+        End While
+    End If
+    Return clone
+End Process

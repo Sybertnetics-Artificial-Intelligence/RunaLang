@@ -1,0 +1,1221 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+==============================================================================
+DateTime - Combined Wall-Clock Timestamp With TimeZone and TimeReference
+==============================================================================
+
+A DateTime represents an instant on a civil calendar, qualified by both
+a TimeZone (for offset-from-UTC computation) and a TimeReference (for
+distinguishing UTC, TAI, GPS, local civil, etc.). All cross-scale
+comparison must go through explicit conversion to the same TimeReference;
+the API enforces this contract via time_reference_is_comparable.
+
+Storage layout (32 bytes):
+  offset  0:  unix_epoch_seconds       - signed 64-bit, UTC-anchored
+                                         seconds since 1970-01-01 00:00:00
+  offset  8:  nanosecond_remainder     - 0..999_999_999, fractional second
+  offset 16:  tz_rule_slot             - pointer into the embedded
+                                         timezone database (or 0 for UTC)
+  offset 24:  time_reference           - TIME_REF_* enum value
+
+The seconds field is "the underlying scale's seconds" - for a UTC
+DateTime it is Unix-UTC seconds, for a TAI DateTime it is TAI seconds
+since 1970-01-01 00:00:00 TAI, and so on. The TimeReference enum tags
+which interpretation applies. Conversions between scales mutate the
+seconds field and rewrite the tag atomically through datetime_in_scale.
+
+References:
+  ISO 8601-1:2019 §5.4 (combined date and time of day, extended format)
+  RFC 3339 (Date and Time on the Internet: Timestamps) - the TLS /
+       HTTP profile of ISO 8601, mandating "T" separator and either
+       "Z" or numeric offset
+  RFC 2822 §3.3 (date format used by email) - obsolete-form GMT
+       suffix, named timezones from the four-letter table
+  IEEE Std 1003.1-2017 (POSIX) §4.16 (Seconds Since the Epoch)
+  Hinnant 2013 (date algorithms - civil_from_days, days_from_civil)
+==============================================================================
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/time/date.runa" as DateModule
+Import "compiler/frontend/primitives/time/time_of_day.runa" as TimeModule
+Import "compiler/frontend/primitives/time/duration.runa" as DurationModule
+Import "compiler/frontend/primitives/time/instant.runa" as InstantModule
+Import "compiler/frontend/primitives/time/time_reference.runa" as TimeRef
+Import "compiler/frontend/primitives/time/timezone.runa" as TZ
+
+Note: ============================================================================
+Note: Layout constants
+Note: ============================================================================
+
+Constant DT_SIZE_BYTES as Integer is 32
+Constant DT_SECONDS_OFFSET as Integer is 0
+Constant DT_NANO_OFFSET as Integer is 8
+Constant DT_TZ_OFFSET as Integer is 16
+Constant DT_REF_OFFSET as Integer is 24
+
+Constant DT_NS_PER_S as Integer is 1000000000
+Constant DT_SEC_PER_DAY as Integer is 86400
+Constant DT_SEC_PER_HOUR as Integer is 3600
+Constant DT_SEC_PER_MIN as Integer is 60
+
+Note: Error sentinels.
+Constant DT_OK as Integer is 0
+Constant DT_ERR_NULL as Integer is -1
+Constant DT_ERR_INCOMPARABLE_SCALES as Integer is -2
+Constant DT_ERR_INVALID_INPUT as Integer is -3
+
+Note: ASCII helpers for formatting.
+Constant DT_ASCII_ZERO as Integer is 48
+Constant DT_ASCII_DASH as Integer is 45
+Constant DT_ASCII_T as Integer is 84
+Constant DT_ASCII_Z as Integer is 90
+Constant DT_ASCII_COLON as Integer is 58
+Constant DT_ASCII_DOT as Integer is 46
+Constant DT_ASCII_PLUS as Integer is 43
+Constant DT_ASCII_SPACE as Integer is 32
+Constant DT_ASCII_COMMA as Integer is 44
+
+Note: ============================================================================
+Note: Allocation and construction
+Note: ============================================================================
+
+Process called "datetime_allocate" returns Integer:
+    @Reasoning
+    Reserves a 32-byte DateTime buffer.
+    @End Reasoning
+    @Implementation
+    Layout.allocate(32).
+    @End Implementation
+    @Performance_Hints
+    Single tier-3 alloc.
+    @End Performance_Hints
+    @Security_Scope
+    Caller must release via datetime_free.
+    @End Security_Scope
+    Return proc allocate from Layout with DT_SIZE_BYTES
+End Process
+
+Process called "datetime_free" takes dt as Integer returns Integer:
+    @Reasoning
+    Releases a DateTime buffer. Does not release the tz slot (which
+    is owned by the embedded database).
+    @End Reasoning
+    @Implementation
+    Layout.deallocate, null no-op.
+    @End Implementation
+    @Performance_Hints
+    One tier-3 free.
+    @End Performance_Hints
+    @Security_Scope
+    Standard heap rules.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return DT_OK
+    End If
+    Let dummy be proc deallocate from Layout with dt
+    Return DT_OK
+End Process
+
+Process called "datetime_from_unix_epoch_seconds" takes seconds as Integer returns Integer:
+    @Reasoning
+    Creates a UTC DateTime from a Unix-UTC seconds count.
+    @End Reasoning
+    @Implementation
+    Allocates, writes seconds, sets nanoseconds to 0, sets tz to 0
+    (UTC sentinel), sets time_reference to TIME_REF_UTC.
+    @End Implementation
+    @Performance_Hints
+    One alloc + four stores.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer returned to caller.
+    @End Security_Scope
+    Let dt_ptr be proc allocate from Layout with DT_SIZE_BYTES
+    If dt_ptr is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    Let dummy_s be proc memory_set_int64 from MemoryCore with dt_ptr, DT_SECONDS_OFFSET, seconds
+    Let dummy_n be proc memory_set_int64 from MemoryCore with dt_ptr, DT_NANO_OFFSET, 0
+    Let dummy_t be proc memory_set_int64 from MemoryCore with dt_ptr, DT_TZ_OFFSET, 0
+    Let utc_ref be proc TIME_REF_UTC from TimeRef
+    Let dummy_r be proc memory_set_int64 from MemoryCore with dt_ptr, DT_REF_OFFSET, utc_ref
+    Return dt_ptr
+End Process
+
+Process called "datetime_from_unix_epoch_nanos" takes nanos as Integer returns Integer:
+    @Reasoning
+    Creates a UTC DateTime from a Unix-UTC nanosecond count.
+    @End Reasoning
+    @Implementation
+    Splits the count into (seconds, nanosecond_remainder), then sets
+    the same fields as datetime_from_unix_epoch_seconds. For
+    negative inputs (pre-1970) the modulo branch keeps the remainder
+    non-negative per IEEE 1003.1-2017 §A.4.16.
+    @End Implementation
+    @Performance_Hints
+    One alloc + one divide + one modulo + four stores.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer returned to caller.
+    @End Security_Scope
+    Let secs be nanos divided by DT_NS_PER_S
+    Let rem be nanos modulo by DT_NS_PER_S
+    If rem is less than 0:
+        Set rem to rem plus DT_NS_PER_S
+        Set secs to secs minus 1
+    End If
+    Let dt_ptr be proc allocate from Layout with DT_SIZE_BYTES
+    If dt_ptr is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    Let dummy_s be proc memory_set_int64 from MemoryCore with dt_ptr, DT_SECONDS_OFFSET, secs
+    Let dummy_n be proc memory_set_int64 from MemoryCore with dt_ptr, DT_NANO_OFFSET, rem
+    Let dummy_t be proc memory_set_int64 from MemoryCore with dt_ptr, DT_TZ_OFFSET, 0
+    Let utc_ref be proc TIME_REF_UTC from TimeRef
+    Let dummy_r be proc memory_set_int64 from MemoryCore with dt_ptr, DT_REF_OFFSET, utc_ref
+    Return dt_ptr
+End Process
+
+Process called "datetime_from_components" takes year as Integer, month as Integer, day_val as Integer, hour as Integer, minute as Integer, second as Integer, ns as Integer, tz_slot as Integer returns Integer:
+    @Reasoning
+    Builds a DateTime from broken-down local-civil components. The
+    tz_slot is a rule pointer obtained from timezone_find; passing 0
+    means UTC. The seconds field stores the UTC anchor: local
+    components are first encoded as a tentative Unix-UTC value
+    assuming UTC, then the zone's offset at that instant is
+    subtracted to obtain the true UTC anchor.
+    @End Reasoning
+    @Implementation
+    1. Validate (y, m, d) and (h, m, s, ns) via the existing
+       primitives.
+    2. Compute days_from_civil(y, m, d), combine into a local-time
+       seconds value: local_secs = days*86400 + h*3600 + m*60 + s.
+    3. Query timezone_offset_at_utc with the local-secs candidate as
+       the UTC anchor (close enough; DST transitions are detected by
+       comparing the offset two ways and choosing the standard
+       offset around the ambiguous fall-back hour).
+    4. UTC seconds = local_secs - offset.
+    @End Implementation
+    @Performance_Hints
+    Validation + a couple of date arithmetic calls + the offset
+    lookup.
+    @End Performance_Hints
+    @Security_Scope
+    Returned pointer must be released via datetime_free.
+    @End Security_Scope
+    Let dv be proc date_validate from DateModule with year, month, day_val
+    If dv is less than 0:
+        Return dv
+    End If
+    Let tv be proc time_of_day_validate from TimeModule with hour, minute, second, ns
+    If tv is less than 0:
+        Return tv
+    End If
+    Let days_unix be proc days_from_civil from DateModule with year, month, day_val
+    Let local_secs be days_unix multiplied by DT_SEC_PER_DAY
+    Set local_secs to local_secs plus (hour multiplied by DT_SEC_PER_HOUR)
+    Set local_secs to local_secs plus (minute multiplied by DT_SEC_PER_MIN)
+    Set local_secs to local_secs plus second
+    Let offset be 0
+    If tz_slot is not equal to 0:
+        Set offset to proc timezone_offset_at_utc from TZ with tz_slot, local_secs
+    End If
+    Let utc_secs be local_secs minus offset
+    Let dt_ptr be proc allocate from Layout with DT_SIZE_BYTES
+    If dt_ptr is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    Let dummy_s be proc memory_set_int64 from MemoryCore with dt_ptr, DT_SECONDS_OFFSET, utc_secs
+    Let dummy_n be proc memory_set_int64 from MemoryCore with dt_ptr, DT_NANO_OFFSET, ns
+    Let dummy_t be proc memory_set_int64 from MemoryCore with dt_ptr, DT_TZ_OFFSET, tz_slot
+    Let utc_ref be proc TIME_REF_UTC from TimeRef
+    Let dummy_r be proc memory_set_int64 from MemoryCore with dt_ptr, DT_REF_OFFSET, utc_ref
+    Return dt_ptr
+End Process
+
+Process called "datetime_now_utc" returns Integer:
+    @Reasoning
+    Captures the current UTC wall-clock instant via CLOCK_REALTIME.
+    NOT skew-immune; use instant_now for elapsed-time measurement.
+    @End Reasoning
+    @Implementation
+    Reads CLOCK_REALTIME via instant_now_raw_clock, then splits the
+    resulting nanosecond count into seconds + nanosecond remainder.
+    @End Implementation
+    @Performance_Hints
+    One syscall + arithmetic split.
+    @End Performance_Hints
+    @Security_Scope
+    Wall-clock read; affected by admin clock adjustments and NTP.
+    @End Security_Scope
+    Let realtime_clock_id be proc CLOCK_REALTIME from InstantModule
+    Let ns_total be proc instant_now_raw_clock from InstantModule with realtime_clock_id
+    If ns_total is less than 0:
+        Return DT_ERR_NULL
+    End If
+    Return datetime_from_unix_epoch_nanos(ns_total)
+End Process
+
+Process called "datetime_now_local" takes tz_slot as Integer returns Integer:
+    @Reasoning
+    Captures the current UTC moment and tags it with the supplied
+    local zone. The underlying anchor remains UTC; the zone field
+    selects how local-component accessors interpret the same anchor.
+    @End Reasoning
+    @Implementation
+    Calls datetime_now_utc then overwrites the tz_slot field.
+    @End Implementation
+    @Performance_Hints
+    Same as datetime_now_utc plus one store.
+    @End Performance_Hints
+    @Security_Scope
+    Same as datetime_now_utc.
+    @End Security_Scope
+    Let dt be datetime_now_utc()
+    If dt is less than 0:
+        Return dt
+    End If
+    Let dummy be proc memory_set_int64 from MemoryCore with dt, DT_TZ_OFFSET, tz_slot
+    Return dt
+End Process
+
+Note: ============================================================================
+Note: Accessors
+Note: ============================================================================
+
+Process called "datetime_get_unix_seconds" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the seconds field unmodified.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with dt, DT_SECONDS_OFFSET
+End Process
+
+Process called "datetime_get_nanosecond" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the nanosecond remainder field (0..999_999_999).
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with dt, DT_NANO_OFFSET
+End Process
+
+Process called "datetime_get_timezone" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the timezone rule-slot pointer.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Returned pointer is read-only; do not free.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with dt, DT_TZ_OFFSET
+End Process
+
+Process called "datetime_get_time_reference" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the TimeReference enum value.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with dt, DT_REF_OFFSET
+End Process
+
+Process called "datetime_to_unix_epoch_seconds" takes dt as Integer returns Integer:
+    @Reasoning
+    Public alias of datetime_get_unix_seconds for serialisers that
+    want a stable "to UTC seconds" entry point.
+    @End Reasoning
+    @Implementation
+    Direct delegation.
+    @End Implementation
+    @Performance_Hints
+    Same as datetime_get_unix_seconds.
+    @End Performance_Hints
+    @Security_Scope
+    Read.
+    @End Security_Scope
+    Return datetime_get_unix_seconds(dt)
+End Process
+
+Process called "datetime_to_unix_epoch_nanos" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the timestamp as a single nanosecond count since the Unix
+    epoch (UTC). Useful for high-resolution serialisation (Protobuf
+    Timestamp, JSON microseconds, etc.).
+    @End Reasoning
+    @Implementation
+    seconds * 1_000_000_000 + nanosecond_remainder.
+    @End Implementation
+    @Performance_Hints
+    One load + one multiply + one add.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return 0
+    End If
+    Let s be proc memory_get_int64 from MemoryCore with dt, DT_SECONDS_OFFSET
+    Let n be proc memory_get_int64 from MemoryCore with dt, DT_NANO_OFFSET
+    Return (s multiplied by DT_NS_PER_S) plus n
+End Process
+
+Note: ============================================================================
+Note: Calendar accessors (year / month / day / hour / minute / second in zone)
+Note: ============================================================================
+
+Process called "datetime_to_local_seconds" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the local-civil seconds count for the given DateTime
+    (i.e. UTC seconds plus the zone's offset at that instant).
+    Used by every component accessor.
+    @End Reasoning
+    @Implementation
+    Reads the seconds, looks up the offset via timezone_offset_at_utc,
+    and adds.
+    @End Implementation
+    @Performance_Hints
+    One load + one timezone lookup.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return 0
+    End If
+    Let utc_s be proc memory_get_int64 from MemoryCore with dt, DT_SECONDS_OFFSET
+    Let tz_slot be proc memory_get_int64 from MemoryCore with dt, DT_TZ_OFFSET
+    Let offset be 0
+    If tz_slot is not equal to 0:
+        Set offset to proc timezone_offset_at_utc from TZ with tz_slot, utc_s
+    End If
+    Return utc_s plus offset
+End Process
+
+Process called "datetime_get_year" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the calendar year in the DateTime's zone.
+    @End Reasoning
+    @Implementation
+    Computes local seconds, divides by 86_400 to get the day count,
+    then asks civil_from_days for the year.
+    @End Implementation
+    @Performance_Hints
+    Local-seconds + civil_from_days.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let local_s be datetime_to_local_seconds(dt)
+    Let days be local_s divided by DT_SEC_PER_DAY
+    Let rem be local_s modulo by DT_SEC_PER_DAY
+    If rem is less than 0:
+        Set days to days minus 1
+    End If
+    Let scratch be proc allocate from Layout with 24
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let dummy be proc civil_from_days from DateModule with days, scratch
+    Let y be proc memory_get_int64 from MemoryCore with scratch, 0
+    Let dummy_f be proc deallocate from Layout with scratch
+    Return y
+End Process
+
+Process called "datetime_get_month" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the month [1..12] in the DateTime's zone.
+    @End Reasoning
+    @Implementation
+    Same pattern as datetime_get_year; reads offset 8 of the civil
+    triple.
+    @End Implementation
+    @Performance_Hints
+    Same as datetime_get_year.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let local_s be datetime_to_local_seconds(dt)
+    Let days be local_s divided by DT_SEC_PER_DAY
+    Let rem be local_s modulo by DT_SEC_PER_DAY
+    If rem is less than 0:
+        Set days to days minus 1
+    End If
+    Let scratch be proc allocate from Layout with 24
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let dummy be proc civil_from_days from DateModule with days, scratch
+    Let m be proc memory_get_int64 from MemoryCore with scratch, 8
+    Let dummy_f be proc deallocate from Layout with scratch
+    Return m
+End Process
+
+Process called "datetime_get_day" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the day-of-month [1..31] in the DateTime's zone.
+    @End Reasoning
+    @Implementation
+    Same pattern as datetime_get_year; reads offset 16.
+    @End Implementation
+    @Performance_Hints
+    Same as datetime_get_year.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let local_s be datetime_to_local_seconds(dt)
+    Let days be local_s divided by DT_SEC_PER_DAY
+    Let rem be local_s modulo by DT_SEC_PER_DAY
+    If rem is less than 0:
+        Set days to days minus 1
+    End If
+    Let scratch be proc allocate from Layout with 24
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let dummy be proc civil_from_days from DateModule with days, scratch
+    Let day_v be proc memory_get_int64 from MemoryCore with scratch, 16
+    Let dummy_f be proc deallocate from Layout with scratch
+    Return day_v
+End Process
+
+Process called "datetime_get_hour" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the hour [0..23] in the DateTime's zone.
+    @End Reasoning
+    @Implementation
+    (local_seconds mod 86_400) / 3_600.
+    @End Implementation
+    @Performance_Hints
+    One modulo + one divide.
+    @End Performance_Hints
+    @Security_Scope
+    Read.
+    @End Security_Scope
+    Let local_s be datetime_to_local_seconds(dt)
+    Let rem be local_s modulo by DT_SEC_PER_DAY
+    If rem is less than 0:
+        Set rem to rem plus DT_SEC_PER_DAY
+    End If
+    Return rem divided by DT_SEC_PER_HOUR
+End Process
+
+Process called "datetime_get_minute" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the minute [0..59] in the DateTime's zone.
+    @End Reasoning
+    @Implementation
+    ((local_seconds mod 3_600) / 60).
+    @End Implementation
+    @Performance_Hints
+    One modulo + one divide.
+    @End Performance_Hints
+    @Security_Scope
+    Read.
+    @End Security_Scope
+    Let local_s be datetime_to_local_seconds(dt)
+    Let rem be local_s modulo by DT_SEC_PER_HOUR
+    If rem is less than 0:
+        Set rem to rem plus DT_SEC_PER_HOUR
+    End If
+    Return rem divided by DT_SEC_PER_MIN
+End Process
+
+Process called "datetime_get_second" takes dt as Integer returns Integer:
+    @Reasoning
+    Returns the second [0..59] in the DateTime's zone.
+    @End Reasoning
+    @Implementation
+    local_seconds mod 60.
+    @End Implementation
+    @Performance_Hints
+    One modulo.
+    @End Performance_Hints
+    @Security_Scope
+    Read.
+    @End Security_Scope
+    Let local_s be datetime_to_local_seconds(dt)
+    Let rem be local_s modulo by DT_SEC_PER_MIN
+    If rem is less than 0:
+        Set rem to rem plus DT_SEC_PER_MIN
+    End If
+    Return rem
+End Process
+
+Note: ============================================================================
+Note: Arithmetic
+Note: ============================================================================
+
+Process called "datetime_add_duration" takes dt as Integer, d as Integer returns Integer:
+    @Reasoning
+    Returns a fresh DateTime equal to dt + d. The Duration's low limb
+    is interpreted as signed nanoseconds; for the standard +/- 292
+    year horizon this is exact. Larger magnitudes (rare in practice)
+    require a 128-bit-aware extended add which is documented as
+    out of scope for the Tier 0 stack.
+    @End Reasoning
+    @Implementation
+    Splits the duration's low limb into (seconds_delta, nano_delta),
+    propagates the carry, and writes the result. Carries the
+    timezone and time_reference unchanged.
+    @End Implementation
+    @Performance_Hints
+    A handful of arithmetic ops + one alloc.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer returned must be released via datetime_free.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    Let d_ns be proc duration_to_nanoseconds from DurationModule with d
+    Let cur_s be proc memory_get_int64 from MemoryCore with dt, DT_SECONDS_OFFSET
+    Let cur_n be proc memory_get_int64 from MemoryCore with dt, DT_NANO_OFFSET
+    Let cur_n_total be (cur_s multiplied by DT_NS_PER_S) plus cur_n
+    Let new_total be cur_n_total plus d_ns
+    Let new_s be new_total divided by DT_NS_PER_S
+    Let new_n be new_total modulo by DT_NS_PER_S
+    If new_n is less than 0:
+        Set new_n to new_n plus DT_NS_PER_S
+        Set new_s to new_s minus 1
+    End If
+    Let tz_slot be proc memory_get_int64 from MemoryCore with dt, DT_TZ_OFFSET
+    Let ref_val be proc memory_get_int64 from MemoryCore with dt, DT_REF_OFFSET
+    Let out be proc allocate from Layout with DT_SIZE_BYTES
+    If out is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    Let dummy_s be proc memory_set_int64 from MemoryCore with out, DT_SECONDS_OFFSET, new_s
+    Let dummy_n be proc memory_set_int64 from MemoryCore with out, DT_NANO_OFFSET, new_n
+    Let dummy_t be proc memory_set_int64 from MemoryCore with out, DT_TZ_OFFSET, tz_slot
+    Let dummy_r be proc memory_set_int64 from MemoryCore with out, DT_REF_OFFSET, ref_val
+    Return out
+End Process
+
+Process called "datetime_diff_nanos" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Returns (a - b) as a signed nanosecond count. Only valid when
+    both DateTimes share a time_reference compatible with comparison.
+    Returns DT_ERR_INCOMPARABLE_SCALES when the references disagree.
+    @End Reasoning
+    @Implementation
+    Computes the nanosecond representation of each side and
+    subtracts.
+    @End Implementation
+    @Performance_Hints
+    Two datetime_to_unix_epoch_nanos calls + one subtract.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    If a is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    Let a_ref be proc memory_get_int64 from MemoryCore with a, DT_REF_OFFSET
+    Let b_ref be proc memory_get_int64 from MemoryCore with b, DT_REF_OFFSET
+    Let comparable be proc time_reference_is_comparable from TimeRef with a_ref, b_ref
+    If comparable is equal to 0:
+        Return DT_ERR_INCOMPARABLE_SCALES
+    End If
+    Let an be datetime_to_unix_epoch_nanos(a)
+    Let bn be datetime_to_unix_epoch_nanos(b)
+    Return an minus bn
+End Process
+
+Process called "datetime_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Three-way compare on the underlying nanosecond representation,
+    after verifying the time references are comparable.
+    @End Reasoning
+    @Implementation
+    Returns DT_ERR_INCOMPARABLE_SCALES if the references are
+    incompatible, otherwise -1/0/+1.
+    @End Implementation
+    @Performance_Hints
+    One reference check + one subtract + a sign branch.
+    @End Performance_Hints
+    @Security_Scope
+    Read of caller-owned memory.
+    @End Security_Scope
+    Let a_ref be proc memory_get_int64 from MemoryCore with a, DT_REF_OFFSET
+    Let b_ref be proc memory_get_int64 from MemoryCore with b, DT_REF_OFFSET
+    Let comparable be proc time_reference_is_comparable from TimeRef with a_ref, b_ref
+    If comparable is equal to 0:
+        Return DT_ERR_INCOMPARABLE_SCALES
+    End If
+    Let an be datetime_to_unix_epoch_nanos(a)
+    Let bn be datetime_to_unix_epoch_nanos(b)
+    If an is less than bn:
+        Return -1
+    End If
+    If an is greater than bn:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "datetime_in_timezone" takes dt as Integer, target_tz as Integer returns Integer:
+    @Reasoning
+    Returns a fresh DateTime representing the same UTC instant as
+    dt but tagged with the supplied timezone. The seconds and
+    nanosecond fields are unchanged because they are the UTC anchor;
+    only the tz_slot pointer changes.
+    @End Reasoning
+    @Implementation
+    Allocates a new buffer, copies the seconds + nanoseconds +
+    time_reference, sets tz_slot to target_tz.
+    @End Implementation
+    @Performance_Hints
+    One alloc + four stores.
+    @End Performance_Hints
+    @Security_Scope
+    Returned pointer must be released via datetime_free.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    Let cur_s be proc memory_get_int64 from MemoryCore with dt, DT_SECONDS_OFFSET
+    Let cur_n be proc memory_get_int64 from MemoryCore with dt, DT_NANO_OFFSET
+    Let cur_r be proc memory_get_int64 from MemoryCore with dt, DT_REF_OFFSET
+    Let out be proc allocate from Layout with DT_SIZE_BYTES
+    If out is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    Let dummy_s be proc memory_set_int64 from MemoryCore with out, DT_SECONDS_OFFSET, cur_s
+    Let dummy_n be proc memory_set_int64 from MemoryCore with out, DT_NANO_OFFSET, cur_n
+    Let dummy_t be proc memory_set_int64 from MemoryCore with out, DT_TZ_OFFSET, target_tz
+    Let dummy_r be proc memory_set_int64 from MemoryCore with out, DT_REF_OFFSET, cur_r
+    Return out
+End Process
+
+Process called "datetime_in_scale" takes dt as Integer, target_ref as Integer returns Integer:
+    @Reasoning
+    Returns a fresh DateTime converted to the target TimeReference.
+    Used to migrate between UTC and TAI (or GPS) for cross-scale
+    arithmetic that the comparable-scales gate would otherwise
+    forbid.
+    @End Reasoning
+    @Implementation
+    Looks up the source reference, computes the new seconds via the
+    appropriate utc_from_tai / tai_from_utc / gps_from_tai chain,
+    then writes a new buffer.
+    @End Implementation
+    @Performance_Hints
+    One leap-second lookup + a few adds.
+    @End Performance_Hints
+    @Security_Scope
+    Returned pointer must be released via datetime_free.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    Let src_ref be proc memory_get_int64 from MemoryCore with dt, DT_REF_OFFSET
+    Let cur_s be proc memory_get_int64 from MemoryCore with dt, DT_SECONDS_OFFSET
+    Let cur_n be proc memory_get_int64 from MemoryCore with dt, DT_NANO_OFFSET
+    Let cur_tz be proc memory_get_int64 from MemoryCore with dt, DT_TZ_OFFSET
+
+    Let utc_secs be cur_s
+    Let utc_ref be proc TIME_REF_UTC from TimeRef
+    Let tai_ref be proc TIME_REF_TAI from TimeRef
+    Let gps_ref be proc TIME_REF_GPS from TimeRef
+    Let gmt_ref be proc TIME_REF_GMT from TimeRef
+
+    Note: Normalise source to UTC first.
+    If src_ref is equal to tai_ref:
+        Set utc_secs to proc utc_from_tai from TimeRef with cur_s
+    End If
+    If src_ref is equal to gps_ref:
+        Set utc_secs to proc utc_from_gps from TimeRef with cur_s
+    End If
+
+    Note: Convert UTC -> target.
+    Let new_s be utc_secs
+    If target_ref is equal to tai_ref:
+        Set new_s to proc tai_from_utc from TimeRef with utc_secs
+    End If
+    If target_ref is equal to gps_ref:
+        Set new_s to proc gps_from_utc from TimeRef with utc_secs
+    End If
+
+    Let out be proc allocate from Layout with DT_SIZE_BYTES
+    If out is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    Let dummy_s be proc memory_set_int64 from MemoryCore with out, DT_SECONDS_OFFSET, new_s
+    Let dummy_n be proc memory_set_int64 from MemoryCore with out, DT_NANO_OFFSET, cur_n
+    Let dummy_t be proc memory_set_int64 from MemoryCore with out, DT_TZ_OFFSET, cur_tz
+    Let dummy_r be proc memory_set_int64 from MemoryCore with out, DT_REF_OFFSET, target_ref
+    Return out
+End Process
+
+Note: ============================================================================
+Note: ISO 8601 / RFC 3339 formatting
+Note: ============================================================================
+
+Process called "_dt_write_4digit" takes buf as Integer, offset as Integer, value as Integer returns Integer:
+    @Reasoning
+    Local 4-digit writer mirroring date.runa's helper. Kept local
+    to keep date.runa's internals private.
+    @End Reasoning
+    @Implementation
+    Standard digit decomposition.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Bounded write.
+    @End Security_Scope
+    Let v be value
+    If v is less than 0:
+        Set v to 0 minus v
+    End If
+    Let t be v divided by 1000
+    Let r1 be v modulo by 1000
+    Let h be r1 divided by 100
+    Let r2 be r1 modulo by 100
+    Let te be r2 divided by 10
+    Let u be r2 modulo by 10
+    Let off0 be offset
+    Let off1 be offset plus 1
+    Let off2 be offset plus 2
+    Let off3 be offset plus 3
+    Let d0 be proc memory_set_int8 from MemoryCore with buf, off0, t plus DT_ASCII_ZERO
+    Let d1 be proc memory_set_int8 from MemoryCore with buf, off1, h plus DT_ASCII_ZERO
+    Let d2 be proc memory_set_int8 from MemoryCore with buf, off2, te plus DT_ASCII_ZERO
+    Let d3 be proc memory_set_int8 from MemoryCore with buf, off3, u plus DT_ASCII_ZERO
+    Return 4
+End Process
+
+Process called "_dt_write_2digit" takes buf as Integer, offset as Integer, value as Integer returns Integer:
+    @Reasoning
+    Local 2-digit writer.
+    @End Reasoning
+    @Implementation
+    Tens + units.
+    @End Implementation
+    @Performance_Hints
+    Constant time.
+    @End Performance_Hints
+    @Security_Scope
+    Bounded write.
+    @End Security_Scope
+    Let t be value divided by 10
+    Let u be value modulo by 10
+    Let off0 be offset
+    Let off1 be offset plus 1
+    Let d0 be proc memory_set_int8 from MemoryCore with buf, off0, t plus DT_ASCII_ZERO
+    Let d1 be proc memory_set_int8 from MemoryCore with buf, off1, u plus DT_ASCII_ZERO
+    Return 2
+End Process
+
+Process called "_dt_write_9digit_trimmed" takes buf as Integer, offset as Integer, value as Integer returns Integer:
+    @Reasoning
+    Writes up to 9 fractional-second digits, returning the actual
+    number written after trimming trailing zeros. For value = 0
+    writes nothing and returns 0.
+    @End Reasoning
+    @Implementation
+    Walks high-to-low, emitting digits. After emission scans
+    backward to count zero-tail bytes.
+    @End Implementation
+    @Performance_Hints
+    O(9).
+    @End Performance_Hints
+    @Security_Scope
+    Bounded write up to 9 bytes.
+    @End Security_Scope
+    If value is equal to 0:
+        Return 0
+    End If
+    Let divisor be 100000000
+    Let v be value
+    Let i be 0
+    While i is less than 9:
+        Let digit be v divided by divisor
+        Let pos be offset plus i
+        Let dummy be proc memory_set_int8 from MemoryCore with buf, pos, digit plus DT_ASCII_ZERO
+        Set v to v modulo by divisor
+        Set divisor to divisor divided by 10
+        Set i to i plus 1
+    End While
+    Let trim be 0
+    Let scan_pos be (offset plus 9) minus 1
+    While scan_pos is greater than offset:
+        Let c be proc memory_get_int8 from MemoryCore with buf, scan_pos
+        If c is equal to DT_ASCII_ZERO:
+            Set trim to trim plus 1
+            Set scan_pos to scan_pos minus 1
+        Otherwise:
+            Set scan_pos to offset
+        End If
+    End While
+    Return 9 minus trim
+End Process
+
+Process called "datetime_to_iso_8601" takes dt as Integer, out_buf as Integer, out_capacity as Integer returns Integer:
+    @Reasoning
+    Emits the ISO 8601 §5.4 / RFC 3339 §5.6 representation:
+      "YYYY-MM-DDTHH:MM:SS[.fffffffff]Z"
+    when the zone is UTC, or "...+HH:MM" / "...-HH:MM" when an
+    offset zone applies. Fractional seconds are trimmed of trailing
+    zeros per RFC 3339 implementations.
+    @End Reasoning
+    @Implementation
+    Builds the date portion, the 'T' separator, the time portion,
+    the fractional-second tail, then the offset suffix.
+    @End Implementation
+    @Performance_Hints
+    O(output length). No allocations beyond a 24-byte civil_from_days
+    scratch.
+    @End Performance_Hints
+    @Security_Scope
+    Bounded write; caller must provide capacity >= 35 for any
+    realistic zone.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    If out_buf is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    If out_capacity is less than 20:
+        Return DT_ERR_NULL
+    End If
+    Let y be datetime_get_year(dt)
+    Let m be datetime_get_month(dt)
+    Let d be datetime_get_day(dt)
+    Let h be datetime_get_hour(dt)
+    Let mi be datetime_get_minute(dt)
+    Let s be datetime_get_second(dt)
+    Let n be datetime_get_nanosecond(dt)
+    Let tz_slot be datetime_get_timezone(dt)
+    Let cursor be 0
+    If y is less than 0:
+        Let dummy_minus be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_DASH
+        Set cursor to cursor plus 1
+    End If
+    Let ylen be _dt_write_4digit(out_buf, cursor, y)
+    Set cursor to cursor plus ylen
+    Let dummy_d1 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_DASH
+    Set cursor to cursor plus 1
+    Let mlen be _dt_write_2digit(out_buf, cursor, m)
+    Set cursor to cursor plus mlen
+    Let dummy_d2 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_DASH
+    Set cursor to cursor plus 1
+    Let dlen be _dt_write_2digit(out_buf, cursor, d)
+    Set cursor to cursor plus dlen
+    Let dummy_t be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_T
+    Set cursor to cursor plus 1
+    Let hlen be _dt_write_2digit(out_buf, cursor, h)
+    Set cursor to cursor plus hlen
+    Let dummy_c1 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_COLON
+    Set cursor to cursor plus 1
+    Let mlen2 be _dt_write_2digit(out_buf, cursor, mi)
+    Set cursor to cursor plus mlen2
+    Let dummy_c2 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_COLON
+    Set cursor to cursor plus 1
+    Let slen be _dt_write_2digit(out_buf, cursor, s)
+    Set cursor to cursor plus slen
+    If n is greater than 0:
+        Let dummy_dot be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_DOT
+        Set cursor to cursor plus 1
+        Let frac_len be _dt_write_9digit_trimmed(out_buf, cursor, n)
+        Set cursor to cursor plus frac_len
+    End If
+    Note: Offset suffix.
+    Let utc_s be proc memory_get_int64 from MemoryCore with dt, DT_SECONDS_OFFSET
+    Let offset_secs be 0
+    If tz_slot is not equal to 0:
+        Set offset_secs to proc timezone_offset_at_utc from TZ with tz_slot, utc_s
+    End If
+    If offset_secs is equal to 0:
+        Let dummy_z be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_Z
+        Set cursor to cursor plus 1
+        Return cursor
+    End If
+    Let off_sign be DT_ASCII_PLUS
+    Let mag_off be offset_secs
+    If offset_secs is less than 0:
+        Set off_sign to DT_ASCII_DASH
+        Set mag_off to 0 minus offset_secs
+    End If
+    Let dummy_sign be proc memory_set_int8 from MemoryCore with out_buf, cursor, off_sign
+    Set cursor to cursor plus 1
+    Let off_hours be mag_off divided by DT_SEC_PER_HOUR
+    Let off_minutes be (mag_off modulo by DT_SEC_PER_HOUR) divided by DT_SEC_PER_MIN
+    Let olen be _dt_write_2digit(out_buf, cursor, off_hours)
+    Set cursor to cursor plus olen
+    Let dummy_c3 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_COLON
+    Set cursor to cursor plus 1
+    Let olen2 be _dt_write_2digit(out_buf, cursor, off_minutes)
+    Set cursor to cursor plus olen2
+    Return cursor
+End Process
+
+Process called "datetime_to_rfc_3339" takes dt as Integer, out_buf as Integer, out_capacity as Integer returns Integer:
+    @Reasoning
+    RFC 3339 is a strict profile of ISO 8601 with the same surface
+    syntax for our purposes. We delegate to datetime_to_iso_8601.
+    @End Reasoning
+    @Implementation
+    Direct delegation.
+    @End Implementation
+    @Performance_Hints
+    Same as datetime_to_iso_8601.
+    @End Performance_Hints
+    @Security_Scope
+    Same as datetime_to_iso_8601.
+    @End Security_Scope
+    Return datetime_to_iso_8601(dt, out_buf, out_capacity)
+End Process
+
+Process called "_dt_emit_string" takes buf as Integer, cursor as Integer, s as String returns Integer:
+    @Reasoning
+    Emits a null-terminated ASCII string into buf at the cursor,
+    returning the number of bytes written (excluding terminator).
+    Used by RFC 2822 formatting where weekday and month names appear.
+    @End Reasoning
+    @Implementation
+    Walks the source until a null byte, copying byte-by-byte.
+    @End Implementation
+    @Performance_Hints
+    O(strlen(s)).
+    @End Performance_Hints
+    @Security_Scope
+    Caller responsibility to keep out_capacity large enough.
+    @End Security_Scope
+    Let i be 0
+    While 1 is equal to 1:
+        Let c be proc memory_get_int8 from MemoryCore with s, i
+        If c is equal to 0:
+            Return i
+        End If
+        Let dst_pos be cursor plus i
+        Let dummy be proc memory_set_int8 from MemoryCore with buf, dst_pos, c
+        Set i to i plus 1
+    End While
+    Return i
+End Process
+
+Process called "_dt_weekday_name" takes wd as Integer returns String:
+    @Reasoning
+    Returns the RFC 2822 §3.3 three-letter weekday name.
+    @End Reasoning
+    @Implementation
+    Direct switch.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Returns static string constants.
+    @End Security_Scope
+    If wd is equal to 1:
+        Return "Mon"
+    End If
+    If wd is equal to 2:
+        Return "Tue"
+    End If
+    If wd is equal to 3:
+        Return "Wed"
+    End If
+    If wd is equal to 4:
+        Return "Thu"
+    End If
+    If wd is equal to 5:
+        Return "Fri"
+    End If
+    If wd is equal to 6:
+        Return "Sat"
+    End If
+    Return "Sun"
+End Process
+
+Process called "_dt_month_name" takes m as Integer returns String:
+    @Reasoning
+    Returns the RFC 2822 §3.3 three-letter month name.
+    @End Reasoning
+    @Implementation
+    Direct switch.
+    @End Implementation
+    @Performance_Hints
+    Trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Returns static string constants.
+    @End Security_Scope
+    If m is equal to 1:
+        Return "Jan"
+    End If
+    If m is equal to 2:
+        Return "Feb"
+    End If
+    If m is equal to 3:
+        Return "Mar"
+    End If
+    If m is equal to 4:
+        Return "Apr"
+    End If
+    If m is equal to 5:
+        Return "May"
+    End If
+    If m is equal to 6:
+        Return "Jun"
+    End If
+    If m is equal to 7:
+        Return "Jul"
+    End If
+    If m is equal to 8:
+        Return "Aug"
+    End If
+    If m is equal to 9:
+        Return "Sep"
+    End If
+    If m is equal to 10:
+        Return "Oct"
+    End If
+    If m is equal to 11:
+        Return "Nov"
+    End If
+    Return "Dec"
+End Process
+
+Process called "datetime_to_rfc_2822" takes dt as Integer, out_buf as Integer, out_capacity as Integer returns Integer:
+    @Reasoning
+    Emits the RFC 2822 §3.3 obs-zone date-time form, e.g.:
+      "Mon, 03 Jun 2026 15:04:05 +0000"
+    Used by email and other legacy text protocols.
+    @End Reasoning
+    @Implementation
+    Computes the weekday, prints weekday + ", " + day + " " + month
+    + " " + year + " " + hh + ":" + mm + ":" + ss + " " + offset.
+    @End Implementation
+    @Performance_Hints
+    O(output length).
+    @End Performance_Hints
+    @Security_Scope
+    Bounded write; caller should provide capacity >= 32.
+    @End Security_Scope
+    If dt is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    If out_buf is equal to 0:
+        Return DT_ERR_NULL
+    End If
+    If out_capacity is less than 31:
+        Return DT_ERR_NULL
+    End If
+    Let y be datetime_get_year(dt)
+    Let m be datetime_get_month(dt)
+    Let d be datetime_get_day(dt)
+    Let h be datetime_get_hour(dt)
+    Let mi be datetime_get_minute(dt)
+    Let s be datetime_get_second(dt)
+    Let tz_slot be datetime_get_timezone(dt)
+    Let wd be proc date_day_of_week from DateModule with y, m, d
+    Let cursor be 0
+    Let wname be _dt_weekday_name(wd)
+    Let wlen be _dt_emit_string(out_buf, cursor, wname)
+    Set cursor to cursor plus wlen
+    Let dummy_comma be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_COMMA
+    Set cursor to cursor plus 1
+    Let dummy_sp1 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_SPACE
+    Set cursor to cursor plus 1
+    Let dlen be _dt_write_2digit(out_buf, cursor, d)
+    Set cursor to cursor plus dlen
+    Let dummy_sp2 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_SPACE
+    Set cursor to cursor plus 1
+    Let mname be _dt_month_name(m)
+    Let mlen be _dt_emit_string(out_buf, cursor, mname)
+    Set cursor to cursor plus mlen
+    Let dummy_sp3 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_SPACE
+    Set cursor to cursor plus 1
+    Let ylen be _dt_write_4digit(out_buf, cursor, y)
+    Set cursor to cursor plus ylen
+    Let dummy_sp4 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_SPACE
+    Set cursor to cursor plus 1
+    Let hlen be _dt_write_2digit(out_buf, cursor, h)
+    Set cursor to cursor plus hlen
+    Let dummy_c1 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_COLON
+    Set cursor to cursor plus 1
+    Let mlen2 be _dt_write_2digit(out_buf, cursor, mi)
+    Set cursor to cursor plus mlen2
+    Let dummy_c2 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_COLON
+    Set cursor to cursor plus 1
+    Let slen be _dt_write_2digit(out_buf, cursor, s)
+    Set cursor to cursor plus slen
+    Let dummy_sp5 be proc memory_set_int8 from MemoryCore with out_buf, cursor, DT_ASCII_SPACE
+    Set cursor to cursor plus 1
+    Note: Offset in +HHMM / -HHMM form per RFC 2822 §3.3 ABNF.
+    Let utc_s be proc memory_get_int64 from MemoryCore with dt, DT_SECONDS_OFFSET
+    Let offset_secs be 0
+    If tz_slot is not equal to 0:
+        Set offset_secs to proc timezone_offset_at_utc from TZ with tz_slot, utc_s
+    End If
+    Let off_sign be DT_ASCII_PLUS
+    Let mag_off be offset_secs
+    If offset_secs is less than 0:
+        Set off_sign to DT_ASCII_DASH
+        Set mag_off to 0 minus offset_secs
+    End If
+    Let dummy_sign be proc memory_set_int8 from MemoryCore with out_buf, cursor, off_sign
+    Set cursor to cursor plus 1
+    Let off_hours be mag_off divided by DT_SEC_PER_HOUR
+    Let off_minutes be (mag_off modulo by DT_SEC_PER_HOUR) divided by DT_SEC_PER_MIN
+    Let oh_len be _dt_write_2digit(out_buf, cursor, off_hours)
+    Set cursor to cursor plus oh_len
+    Let om_len be _dt_write_2digit(out_buf, cursor, off_minutes)
+    Set cursor to cursor plus om_len
+    Return cursor
+End Process

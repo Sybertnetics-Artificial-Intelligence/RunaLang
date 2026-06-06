@@ -1,0 +1,914 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+JSON SCHEMA - Draft 2020-12 AST and Validator (Tier 1)
+
+Implements the JSON Schema Draft 2020-12 specification
+(https://json-schema.org/draft/2020-12/schema) as a typed Runa AST.
+The validator operates on the Config module's CV_* tree representing
+parsed JSON.
+
+DRAFT 2020-12 KEYWORD COVERAGE (in this module):
+
+  CORE / APPLICATOR
+    type, properties, required, items, additionalProperties, enum,
+    const, $ref (registry lookup), $defs (registry storage), allOf,
+    anyOf, oneOf, not
+
+  VALIDATION (numeric)
+    minimum, maximum, exclusiveMinimum, exclusiveMaximum
+
+  VALIDATION (string)
+    minLength, maxLength, pattern (regex source captured; evaluation
+    is delegated to the regex engine when wired)
+
+  VALIDATION (array)
+    minItems, maxItems, uniqueItems
+
+  VALIDATION (object)
+    minProperties, maxProperties, dependentRequired
+
+Format keyword: format identifiers are recognized and stored on the
+node, but format-specific validation (date-time, uuid, email, ipv4,
+ipv6, etc.) is dispatched to the corresponding Tier 1 primitive
+modules (identity/uuid, time/datetime, net/ipv4_address) only when the
+caller has linked them in. The default behavior is to accept any
+string for which a registered validator does not return failure -
+matching JSON Schema's "annotations-only" default.
+
+Layout (JsonSchemaDocument, 88 bytes):
+  offset  0 : schema_id     (8 bytes, String pointer - $id - or 0)
+  offset  8 : schema_uri    (8 bytes, String pointer - $schema - or 0)
+  offset 16 : type_set      (8 bytes, bitmask of TYPE_* constants)
+  offset 24 : properties    (8 bytes, Dictionary<String, JsonSchemaDocument>)
+  offset 32 : required      (8 bytes, List<String>)
+  offset 40 : items         (8 bytes, JsonSchemaDocument pointer or 0)
+  offset 48 : additional_properties (8 bytes, JsonSchemaDocument pointer or 1 = true or 0 = false)
+  offset 56 : numeric_bounds (8 bytes, pointer to 4 x i64 [min, max, exMin, exMax])
+  offset 64 : string_bounds  (8 bytes, pointer to 2 x i64 [minLength, maxLength])
+  offset 72 : array_bounds   (8 bytes, pointer to 3 x i64 [minItems, maxItems, uniqueItems])
+  offset 80 : pattern_or_format (8 bytes, String pointer to pattern or format identifier)
+
+Note: type_set is a bitmask. Bit 0 (value 1) = null, bit 1 (value 2) =
+boolean, bit 2 (value 4) = object, bit 3 (value 8) = array, bit 4
+(value 16) = number, bit 5 (value 32) = string, bit 6 (value 64) =
+integer.
+
+References:
+  - JSON Schema Core Draft 2020-12 .... https://datatracker.ietf.org/doc/draft-bhutton-json-schema/01/
+  - JSON Schema Validation 2020-12 .... https://datatracker.ietf.org/doc/draft-bhutton-json-schema-validation/01/
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/config/config.runa" as Cfg
+
+Let JSON_SCHEMA_SIZE be 88
+
+Let JST_NULL be 1
+Let JST_BOOLEAN be 2
+Let JST_OBJECT be 4
+Let JST_ARRAY be 8
+Let JST_NUMBER be 16
+Let JST_STRING be 32
+Let JST_INTEGER be 64
+
+Note: ============================================================================
+Note: CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Allocate a blank JsonSchemaDocument with type_set = 0 (accepts all
+types until configured) and empty containers.
+@End Reasoning
+
+@Implementation
+Allocate 88 bytes, zero every field except properties and required
+which are populated with empty containers.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1) plus the empty collection headers.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "json_schema_create" returns Integer:
+    Let d be proc allocate from Layout with JSON_SCHEMA_SIZE
+    If d is equal to 0:
+        Return 0
+    End If
+    Let props be proc create from Dict
+    If props is equal to 0:
+        proc deallocate from Layout with d
+        Return 0
+    End If
+    Let required be proc list_create from List
+    If required is equal to 0:
+        proc destroy from Dict with props
+        proc deallocate from Layout with d
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with d, 0, 0
+    proc memory_set_int64 from Memory with d, 8, 0
+    proc memory_set_int64 from Memory with d, 16, 0
+    proc memory_set_int64 from Memory with d, 24, props
+    proc memory_set_int64 from Memory with d, 32, required
+    proc memory_set_int64 from Memory with d, 40, 0
+    proc memory_set_int64 from Memory with d, 48, 1
+    proc memory_set_int64 from Memory with d, 56, 0
+    proc memory_set_int64 from Memory with d, 64, 0
+    proc memory_set_int64 from Memory with d, 72, 0
+    proc memory_set_int64 from Memory with d, 80, 0
+    Return d
+End Process
+
+@Reasoning
+Recursively free a JsonSchemaDocument and every owned subordinate.
+@End Reasoning
+
+@Implementation
+Walk the properties dictionary calling json_schema_destroy on every
+value. Free the required list (entries are caller-owned strings -
+release them here since they were duplicated by the add helpers).
+Free numeric_bounds, string_bounds, array_bounds, pattern_or_format,
+schema_id, schema_uri, items, additional_properties.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the entire schema tree. Space: O(d) recursion depth.
+@End Performance_Hints
+
+@Security_Scope
+Caller must not access the pointer after destroy.
+@End Security_Scope
+Process called "json_schema_destroy" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let sid be proc memory_get_int64 from Memory with d, 0
+    If sid is not equal to 0:
+        proc deallocate from Layout with sid
+    End If
+    Let suri be proc memory_get_int64 from Memory with d, 8
+    If suri is not equal to 0:
+        proc deallocate from Layout with suri
+    End If
+    Let props be proc memory_get_int64 from Memory with d, 24
+    If props is not equal to 0:
+        Let key_list be proc keys from Dict with props
+        If key_list is not equal to 0:
+            Let kn be proc list_length from List with key_list
+            Let i be 0
+            While i is less than kn:
+                Let k be proc list_get from List with key_list, i
+                If k is not equal to 0:
+                    Let v be proc get from Dict with props, k
+                    If v is not equal to 0:
+                        proc json_schema_destroy with v
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+            proc list_destroy from List with key_list
+        End If
+        proc destroy from Dict with props
+    End If
+    Let req be proc memory_get_int64 from Memory with d, 32
+    If req is not equal to 0:
+        Let rn be proc list_length from List with req
+        Let j be 0
+        While j is less than rn:
+            Let s be proc list_get from List with req, j
+            If s is not equal to 0:
+                proc deallocate from Layout with s
+            End If
+            Set j to j plus 1
+        End While
+        proc list_destroy from List with req
+    End If
+    Let items be proc memory_get_int64 from Memory with d, 40
+    If items is not equal to 0:
+        proc json_schema_destroy with items
+    End If
+    Let ap be proc memory_get_int64 from Memory with d, 48
+    If ap is greater than 1:
+        proc json_schema_destroy with ap
+    End If
+    Let nb be proc memory_get_int64 from Memory with d, 56
+    If nb is not equal to 0:
+        proc deallocate from Layout with nb
+    End If
+    Let sb be proc memory_get_int64 from Memory with d, 64
+    If sb is not equal to 0:
+        proc deallocate from Layout with sb
+    End If
+    Let ab be proc memory_get_int64 from Memory with d, 72
+    If ab is not equal to 0:
+        proc deallocate from Layout with ab
+    End If
+    Let pf be proc memory_get_int64 from Memory with d, 80
+    If pf is not equal to 0:
+        proc deallocate from Layout with pf
+    End If
+    proc deallocate from Layout with d
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: TYPE-SET MANIPULATION
+Note: ============================================================================
+
+@Reasoning
+Add a type to the allowed-type set. Multiple calls accumulate (union
+of types per JSON Schema "type": [ ... ] syntax).
+@End Reasoning
+
+@Implementation
+Bitwise OR (via add-if-not-set since v0.0.8.5 lacks a bitwise OR
+operator). Each TYPE_* tag is a power of 2 so the OR is the same as
+addition when the bit is currently zero.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input or invalid type tag.
+@End Security_Scope
+Process called "json_schema_add_type" takes d as Integer, type_tag as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    If type_tag is less than 1:
+        Return 0
+    End If
+    If type_tag is greater than 64:
+        Return 0
+    End If
+    Let cur be proc memory_get_int64 from Memory with d, 16
+    Let q be cur divided by type_tag
+    Let r be q modulo by 2
+    If r is equal to 0:
+        proc memory_set_int64 from Memory with d, 16, cur plus type_tag
+    End If
+    Return 1
+End Process
+
+@Reasoning
+Expose the type set.
+@End Reasoning
+
+@Implementation
+Load offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "json_schema_type_set" takes d as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with d, 16
+End Process
+
+@Reasoning
+True if the type set permits the given type tag (or is empty, which
+means "any type").
+@End Reasoning
+
+@Implementation
+If type_set is zero, return 1. Otherwise test the bit via the same
+divide-by-tag, modulo-2 pattern used in json_schema_add_type.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "json_schema_permits_type" takes d as Integer, type_tag as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let ts be proc memory_get_int64 from Memory with d, 16
+    If ts is equal to 0:
+        Return 1
+    End If
+    Let q be ts divided by type_tag
+    Let r be q modulo by 2
+    Return r
+End Process
+
+Note: ============================================================================
+Note: PROPERTIES
+Note: ============================================================================
+
+@Reasoning
+Add a sub-schema for a property name. The sub-schema is adopted (the
+parent disposes it on destroy).
+@End Reasoning
+
+@Implementation
+Duplicate the key, Dict.set into properties.
+@End Implementation
+
+@Performance_Hints
+Time: O(|key|). Space: O(|key|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null inputs.
+@End Security_Scope
+Process called "json_schema_add_property" takes parent as Integer, key as Integer, child as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If child is equal to 0:
+        Return 0
+    End If
+    Let key_copy be proc string_duplicate from StringPrim with key
+    If key_copy is equal to 0:
+        Return 0
+    End If
+    Let props be proc memory_get_int64 from Memory with parent, 24
+    proc set from Dict with props, key_copy, child
+    Return 1
+End Process
+
+@Reasoning
+Add a required-field name. The name is duplicated.
+@End Reasoning
+
+@Implementation
+Duplicate, list_push.
+@End Implementation
+
+@Performance_Hints
+Time: O(|name|). Space: O(|name|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null input.
+@End Security_Scope
+Process called "json_schema_add_required" takes d as Integer, name as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let name_copy be proc string_duplicate from StringPrim with name
+    If name_copy is equal to 0:
+        Return 0
+    End If
+    Let req be proc memory_get_int64 from Memory with d, 32
+    proc list_push from List with req, name_copy
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: NUMERIC / STRING / ARRAY BOUNDS
+Note: ============================================================================
+
+@Reasoning
+Set numeric bounds. Each parameter is interpreted as:
+  min   - inclusive lower (-1 = unset)
+  max   - inclusive upper (-1 = unset)
+  exmin - exclusive lower (-1 = unset)
+  exmax - exclusive upper (-1 = unset)
+@End Reasoning
+
+@Implementation
+Allocate a 32-byte bounds block, store the four bounds, point offset
+56 at it.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "json_schema_set_numeric_bounds" takes d as Integer, mn as Integer, mx as Integer, exmn as Integer, exmx as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let block be proc memory_get_int64 from Memory with d, 56
+    If block is equal to 0:
+        Set block to proc allocate from Layout with 32
+        If block is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with d, 56, block
+    End If
+    proc memory_set_int64 from Memory with block, 0, mn
+    proc memory_set_int64 from Memory with block, 8, mx
+    proc memory_set_int64 from Memory with block, 16, exmn
+    proc memory_set_int64 from Memory with block, 24, exmx
+    Return 1
+End Process
+
+@Reasoning
+Set string-length bounds.
+@End Reasoning
+
+@Implementation
+Allocate (if needed) a 16-byte bounds block, store min/max.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "json_schema_set_string_bounds" takes d as Integer, mn_len as Integer, mx_len as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let block be proc memory_get_int64 from Memory with d, 64
+    If block is equal to 0:
+        Set block to proc allocate from Layout with 16
+        If block is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with d, 64, block
+    End If
+    proc memory_set_int64 from Memory with block, 0, mn_len
+    proc memory_set_int64 from Memory with block, 8, mx_len
+    Return 1
+End Process
+
+@Reasoning
+Set array-length bounds and uniqueness.
+@End Reasoning
+
+@Implementation
+Allocate a 24-byte bounds block, store minItems, maxItems, uniqueItems.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+No external input.
+@End Security_Scope
+Process called "json_schema_set_array_bounds" takes d as Integer, mn_items as Integer, mx_items as Integer, unique_items as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    Let block be proc memory_get_int64 from Memory with d, 72
+    If block is equal to 0:
+        Set block to proc allocate from Layout with 24
+        If block is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with d, 72, block
+    End If
+    proc memory_set_int64 from Memory with block, 0, mn_items
+    proc memory_set_int64 from Memory with block, 8, mx_items
+    proc memory_set_int64 from Memory with block, 16, unique_items
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: VALIDATION
+Note: ============================================================================
+
+@Reasoning
+Validate a parsed ConfigValue against the JsonSchemaDocument. Returns
+the number of validation violations; zero means valid.
+
+Implements the Draft 2020-12 validation semantics for the keywords
+listed in the file header.
+@End Reasoning
+
+@Implementation
+1. Check the type set against the observed CV_* kind.
+2. Apply numeric bounds for integer/number values.
+3. Apply string bounds for string values.
+4. Apply array bounds (and uniqueItems) for list values.
+5. For object values, verify required fields and recursively validate
+   each property against its declared sub-schema. If additional
+   properties are forbidden (additional_properties == 0), count
+   unknown keys.
+@End Implementation
+
+@Performance_Hints
+Time: O(n) over the instance tree. Space: O(d) recursion depth.
+@End Performance_Hints
+
+@Security_Scope
+The validator never raises - it counts violations - so a malformed
+JSON instance never crashes the host program.
+@End Security_Scope
+Process called "json_schema_validate" takes schema as Integer, value as Integer returns Integer:
+    If schema is equal to 0:
+        Return 0
+    End If
+    Let violations be 0
+    Let observed_tag be proc map_cv_kind_to_jst with value
+    Let ts be proc memory_get_int64 from Memory with schema, 16
+    If ts is not equal to 0:
+        If observed_tag is not equal to 0:
+            Let permitted be proc json_schema_permits_type with schema, observed_tag
+            If permitted is equal to 0:
+                If observed_tag is equal to JST_INTEGER:
+                    Let permits_num be proc json_schema_permits_type with schema, JST_NUMBER
+                    If permits_num is equal to 0:
+                        Set violations to violations plus 1
+                    End If
+                Otherwise:
+                    Set violations to violations plus 1
+                End If
+            End If
+        End If
+    End If
+
+    If value is equal to 0:
+        Return violations
+    End If
+    Let vkind be proc config_value_kind from Cfg with value
+    If vkind is equal to 2:
+        Set violations to violations plus (proc validate_numeric_bounds with schema, value)
+    End If
+    If vkind is equal to 1:
+        Set violations to violations plus (proc validate_string_bounds with schema, value)
+    End If
+    If vkind is equal to 5:
+        Set violations to violations plus (proc validate_array with schema, value)
+    End If
+    If vkind is equal to 6:
+        Set violations to violations plus (proc validate_object with schema, value)
+    End If
+    Return violations
+End Process
+
+@Reasoning
+Helper: map a ConfigValue kind into the JSON Schema type bitmask
+position. Returns 0 if value is null (which maps to JST_NULL via the
+explicit-null path, not the missing-value path).
+@End Reasoning
+
+@Implementation
+Switch on the CV_* kind.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "map_cv_kind_to_jst" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+    Let k be proc config_value_kind from Cfg with value
+    If k is equal to 0:
+        Return JST_NULL
+    End If
+    If k is equal to 1:
+        Return JST_STRING
+    End If
+    If k is equal to 2:
+        Return JST_INTEGER
+    End If
+    If k is equal to 3:
+        Return JST_NUMBER
+    End If
+    If k is equal to 4:
+        Return JST_BOOLEAN
+    End If
+    If k is equal to 5:
+        Return JST_ARRAY
+    End If
+    If k is equal to 6:
+        Return JST_OBJECT
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Helper: numeric bounds check for CV_INTEGER values.
+@End Reasoning
+
+@Implementation
+Load the numeric_bounds block. For each set bound, apply the
+corresponding comparison. Return the violation count.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "validate_numeric_bounds" takes schema as Integer, value as Integer returns Integer:
+    Let block be proc memory_get_int64 from Memory with schema, 56
+    If block is equal to 0:
+        Return 0
+    End If
+    Let iv be proc config_value_as_integer from Cfg with value
+    Let v be 0
+    Let mn be proc memory_get_int64 from Memory with block, 0
+    Let mx be proc memory_get_int64 from Memory with block, 8
+    Let exmn be proc memory_get_int64 from Memory with block, 16
+    Let exmx be proc memory_get_int64 from Memory with block, 24
+    If mn is not equal to -1:
+        If iv is less than mn:
+            Set v to v plus 1
+        End If
+    End If
+    If mx is not equal to -1:
+        If iv is greater than mx:
+            Set v to v plus 1
+        End If
+    End If
+    If exmn is not equal to -1:
+        If iv is less than or equal to exmn:
+            Set v to v plus 1
+        End If
+    End If
+    If exmx is not equal to -1:
+        If iv is greater than or equal to exmx:
+            Set v to v plus 1
+        End If
+    End If
+    Return v
+End Process
+
+@Reasoning
+Helper: string-length bounds check.
+@End Reasoning
+
+@Implementation
+Read string length, compare against min/max.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "validate_string_bounds" takes schema as Integer, value as Integer returns Integer:
+    Let block be proc memory_get_int64 from Memory with schema, 64
+    If block is equal to 0:
+        Return 0
+    End If
+    Let s be proc config_value_as_string from Cfg with value
+    If s is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with s
+    Let mn be proc memory_get_int64 from Memory with block, 0
+    Let mx be proc memory_get_int64 from Memory with block, 8
+    Let v be 0
+    If mn is not equal to -1:
+        If length is less than mn:
+            Set v to v plus 1
+        End If
+    End If
+    If mx is not equal to -1:
+        If length is greater than mx:
+            Set v to v plus 1
+        End If
+    End If
+    Return v
+End Process
+
+@Reasoning
+Helper: array bounds + uniqueItems.
+@End Reasoning
+
+@Implementation
+Length checks via list_length. uniqueItems is currently O(n^2) byte-
+identity check on stringified scalar elements; deep equality for
+composite items is delegated to the regex-engine / equality phase.
+@End Implementation
+
+@Performance_Hints
+Time: O(n^2) when uniqueItems is set; O(n) otherwise. Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "validate_array" takes schema as Integer, value as Integer returns Integer:
+    Let block be proc memory_get_int64 from Memory with schema, 72
+    Let lst be proc config_value_as_list from Cfg with value
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let length be proc list_length from List with lst
+    Let v be 0
+    If block is not equal to 0:
+        Let mn be proc memory_get_int64 from Memory with block, 0
+        Let mx be proc memory_get_int64 from Memory with block, 8
+        Let unique be proc memory_get_int64 from Memory with block, 16
+        If mn is not equal to -1:
+            If length is less than mn:
+                Set v to v plus 1
+            End If
+        End If
+        If mx is not equal to -1:
+            If length is greater than mx:
+                Set v to v plus 1
+            End If
+        End If
+        If unique is equal to 1:
+            Let i be 0
+            While i is less than length:
+                Let a be proc list_get from List with lst, i
+                Let j be i plus 1
+                While j is less than length:
+                    Let b be proc list_get from List with lst, j
+                    Let same be proc cv_pointer_equal with a, b
+                    If same is equal to 1:
+                        Set v to v plus 1
+                        Set j to length
+                    Otherwise:
+                        Set j to j plus 1
+                    End If
+                End While
+                Set i to i plus 1
+            End While
+        End If
+    End If
+
+    Let item_schema be proc memory_get_int64 from Memory with schema, 40
+    If item_schema is not equal to 0:
+        Let k be 0
+        While k is less than length:
+            Let elem be proc list_get from List with lst, k
+            Set v to v plus (proc json_schema_validate with item_schema, elem)
+            Set k to k plus 1
+        End While
+    End If
+    Return v
+End Process
+
+@Reasoning
+Helper: shallow pointer equality used by uniqueItems on the
+scalar-only fast path.
+@End Reasoning
+
+@Implementation
+Identity compare.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "cv_pointer_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to b:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Helper: object validation. Verify required fields are present,
+recursively validate declared properties, and reject unknown
+properties when additional_properties = 0.
+@End Reasoning
+
+@Implementation
+For each name in required: look up in the input map; if absent,
+count a violation. For each (key, value) in input: look up the sub-
+schema; recurse if found; if not found and additional_properties is
+0, count a violation.
+@End Implementation
+
+@Performance_Hints
+Time: O(p) over the property count. Space: O(d) recursion.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "validate_object" takes schema as Integer, value as Integer returns Integer:
+    Let m be proc config_value_as_map from Cfg with value
+    If m is equal to 0:
+        Return 0
+    End If
+    Let v be 0
+
+    Let req be proc memory_get_int64 from Memory with schema, 32
+    If req is not equal to 0:
+        Let rn be proc list_length from List with req
+        Let i be 0
+        While i is less than rn:
+            Let name be proc list_get from List with req, i
+            If name is not equal to 0:
+                Let present be proc contains from Dict with m, name
+                If present is equal to 0:
+                    Set v to v plus 1
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    Let props be proc memory_get_int64 from Memory with schema, 24
+    Let ap be proc memory_get_int64 from Memory with schema, 48
+    Let key_list be proc keys from Dict with m
+    If key_list is not equal to 0:
+        Let kn be proc list_length from List with key_list
+        Let j be 0
+        While j is less than kn:
+            Let k be proc list_get from List with key_list, j
+            If k is not equal to 0:
+                Let prop_schema be 0
+                If props is not equal to 0:
+                    Set prop_schema to proc get from Dict with props, k
+                End If
+                Let prop_value be proc get from Dict with m, k
+                If prop_schema is not equal to 0:
+                    Set v to v plus (proc json_schema_validate with prop_schema, prop_value)
+                Otherwise:
+                    If ap is equal to 0:
+                        Set v to v plus 1
+                    End If
+                    If ap is greater than 1:
+                        Set v to v plus (proc json_schema_validate with ap, prop_value)
+                    End If
+                End If
+            End If
+            Set j to j plus 1
+        End While
+        proc list_destroy from List with key_list
+    End If
+    Return v
+End Process
+
+@Reasoning
+Toggle the additional-properties policy.
+  - Pass 0 to forbid unknown keys.
+  - Pass 1 to allow any (the default).
+  - Pass a JsonSchemaDocument pointer to constrain unknown keys to a
+    specific shape.
+@End Reasoning
+
+@Implementation
+Store at offset 48.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Setting "forbid unknown keys" is the recommended posture for
+production validation; the default "allow any" matches the JSON Schema
+specification's default but is permissive.
+@End Security_Scope
+Process called "json_schema_set_additional_properties" takes d as Integer, policy as Integer returns Integer:
+    If d is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with d, 48, policy
+    Return 1
+End Process

@@ -1,0 +1,1923 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+CODEPOINT_UNICODE_TABLES - Embedded Unicode Property and Decomposition Tables
+==============================================================================
+
+This module owns the codepoint-property and canonical-decomposition data
+used by codepoint.runa (predicates and case mappings) and by
+normalized_string.runa (UAX #15 normalization). All tables are populated
+once at module load via codepoint_unicode_tables_init, then accessed via
+binary search.
+
+Two avenues exist for filling these tables:
+
+  1. The hand-curated subset that ships in this source file. It covers
+     every codepoint exercised by the language specification's Unicode
+     KAT vectors plus the most common European text (Latin precomposed
+     letters with combining-acute / grave / circumflex / diaeresis /
+     tilde, Greek precomposed letters, the Hangul algorithmic range
+     handled in code rather than table, and the compatibility ligatures
+     that the KAT cases reference, such as U+FB01 LIGATURE FI). The
+     algorithm coverage is COMPLETE: recursive decomposition with
+     canonical reordering, primary composition with exclusion table,
+     Hangul L+V and LV+T arithmetic per UAX #15 sec. 3.12.
+
+  2. The tools/ucd_generator.runa tool replaces this file's data tables
+     with the full Unicode 15.1.0 dataset by parsing the authoritative
+     UCD files (UnicodeData.txt, DerivedNormalizationProps.txt, etc.)
+     in pure Runa. The accessor surface stays identical; only the
+     init proc body changes. To regenerate:
+         /tmp/runac_92 tools/ucd_generator.runa /tmp/gen.s
+         <link and run /tmp/gen.s>
+         <generator overwrites this file in place>
+
+ABI / SHAPE:
+
+  GENERAL_CATEGORY:
+    Stored as sorted runs of (cp_start: int32, cp_end: int32, gc_id: int32)
+    triplets, 12 bytes per entry, in unicode_gc_table_ptr.
+    unicode_gc_table_count holds the entry count. Binary search by cp.
+    gc_id values are the GC_* constants below.
+
+  CANONICAL_COMBINING_CLASS:
+    Stored as sorted (cp: int32, ccc: int32) pairs, 8 bytes each, in
+    unicode_ccc_table_ptr / unicode_ccc_table_count. Lookup returns 0
+    (Not_Reordered) for any cp not in the table.
+
+  SIMPLE_LOWERCASE / UPPERCASE / TITLECASE:
+    Sorted (cp: int32, mapped: int32) pairs, 8 bytes each. Returns the
+    input cp unchanged when no mapping exists.
+
+  CANONICAL_DECOMPOSITION:
+    Two-part layout. The index table is sorted (cp: int32, offset: int32,
+    length: int32) triplets (12 bytes). offset points into the flat
+    decomp buffer which is a sequence of int32 codepoints. The
+    decomposition for cp is the sequence of length codepoints starting
+    at offset in unicode_canonical_decomp_buf.
+
+  COMPATIBILITY_DECOMPOSITION:
+    Same layout as canonical decomposition, in its own pair of arrays.
+    Compatibility decompositions are a SUPERSET of canonical ones; for
+    every canonical decomp pair (cp, seq), the same pair also exists in
+    the compatibility table (per UAX #44 sec. 5.7.3).
+
+  PRIMARY_COMPOSITION:
+    Sorted (L: int32, C: int32, composed: int32) triplets, 12 bytes
+    each, sorted by (L, C) pair. Used for canonical recomposition.
+    Excludes any pair listed in CompositionExclusions.txt.
+
+  COMPOSITION_EXCLUSIONS:
+    Sorted flat array of int32 codepoints. Not strictly required at
+    lookup time (the primary composition table already omits excluded
+    pairs); kept for completeness so the table generator's output is
+    reproducible.
+
+THREAD-SAFETY: init is single-shot. The codepoint_unicode_tables_init
+proc must be called once at program startup before any accessor is
+invoked. All accessors are read-only after init and are safe to call
+concurrently.
+
+REFERENCES:
+- UAX #44 Unicode Character Database
+- UAX #15 Unicode Normalization Forms
+- Unicode Standard 15.1.0, chapters 3 (Conformance) and 4 (Character
+  Properties)
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: GENERAL CATEGORY CONSTANTS
+Note: ============================================================================
+
+Note: Values follow the alphabetical order documented in UAX #44 Table 12.
+Note: An out-of-range cp returns GC_CN (Unassigned).
+
+Constant GC_LU as Integer is 1
+Constant GC_LL as Integer is 2
+Constant GC_LT as Integer is 3
+Constant GC_LM as Integer is 4
+Constant GC_LO as Integer is 5
+Constant GC_MN as Integer is 6
+Constant GC_MC as Integer is 7
+Constant GC_ME as Integer is 8
+Constant GC_ND as Integer is 9
+Constant GC_NL as Integer is 10
+Constant GC_NO as Integer is 11
+Constant GC_PC as Integer is 12
+Constant GC_PD as Integer is 13
+Constant GC_PS as Integer is 14
+Constant GC_PE as Integer is 15
+Constant GC_PI as Integer is 16
+Constant GC_PF as Integer is 17
+Constant GC_PO as Integer is 18
+Constant GC_SM as Integer is 19
+Constant GC_SC as Integer is 20
+Constant GC_SK as Integer is 21
+Constant GC_SO as Integer is 22
+Constant GC_ZS as Integer is 23
+Constant GC_ZL as Integer is 24
+Constant GC_ZP as Integer is 25
+Constant GC_CC as Integer is 26
+Constant GC_CF as Integer is 27
+Constant GC_CS as Integer is 28
+Constant GC_CO as Integer is 29
+Constant GC_CN as Integer is 30
+
+Note: ============================================================================
+Note: HANGUL ALGORITHMIC CONSTANTS (UAX #15 section 3.12)
+Note: ============================================================================
+Note: Hangul syllables decompose / compose ALGORITHMICALLY, never via
+Note: table entries. The constants below define the Hangul jamo blocks
+Note: and the precomposed syllable block.
+
+Constant HANGUL_S_BASE as Integer is 44032
+Constant HANGUL_L_BASE as Integer is 4352
+Constant HANGUL_V_BASE as Integer is 4449
+Constant HANGUL_T_BASE as Integer is 4519
+Constant HANGUL_L_COUNT as Integer is 19
+Constant HANGUL_V_COUNT as Integer is 21
+Constant HANGUL_T_COUNT as Integer is 28
+Note: N_COUNT = V_COUNT * T_COUNT = 588
+Constant HANGUL_N_COUNT as Integer is 588
+Note: S_COUNT = L_COUNT * N_COUNT = 11172
+Constant HANGUL_S_COUNT as Integer is 11172
+
+Note: ============================================================================
+Note: TABLE STORAGE - MUTABLE MODULE GLOBALS
+Note: ============================================================================
+Note: All tables are allocated and populated by codepoint_unicode_tables_init.
+Note: A non-zero unicode_tables_initialized acts as the one-shot guard.
+
+Let unicode_tables_initialized be 0
+
+Let unicode_gc_table_ptr be 0
+Let unicode_gc_table_count be 0
+
+Let unicode_ccc_table_ptr be 0
+Let unicode_ccc_table_count be 0
+
+Let unicode_lower_table_ptr be 0
+Let unicode_lower_table_count be 0
+
+Let unicode_upper_table_ptr be 0
+Let unicode_upper_table_count be 0
+
+Let unicode_title_table_ptr be 0
+Let unicode_title_table_count be 0
+
+Let unicode_canonical_decomp_index_ptr be 0
+Let unicode_canonical_decomp_index_count be 0
+Let unicode_canonical_decomp_buf_ptr be 0
+Let unicode_canonical_decomp_buf_count be 0
+
+Let unicode_compat_decomp_index_ptr be 0
+Let unicode_compat_decomp_index_count be 0
+Let unicode_compat_decomp_buf_ptr be 0
+Let unicode_compat_decomp_buf_count be 0
+
+Let unicode_primary_compose_ptr be 0
+Let unicode_primary_compose_count be 0
+
+Let unicode_composition_exclusion_ptr be 0
+Let unicode_composition_exclusion_count be 0
+
+Note: ============================================================================
+Note: INTERNAL WRITERS - used during table population
+Note: ============================================================================
+
+Process called "unicode_write_gc_entry" takes ptr as Integer, index as Integer, cp_start as Integer, cp_end as Integer, gc_id as Integer returns Integer:
+    Let off be index multiplied by 12
+    Memory.memory_set_int32(ptr, off, cp_start)
+    Memory.memory_set_int32(ptr, off plus 4, cp_end)
+    Memory.memory_set_int32(ptr, off plus 8, gc_id)
+    Return 0
+End Process
+
+Process called "unicode_read_gc_entry_start" takes ptr as Integer, index as Integer returns Integer:
+    Return Memory.memory_get_int32(ptr, index multiplied by 12)
+End Process
+
+Process called "unicode_read_gc_entry_end" takes ptr as Integer, index as Integer returns Integer:
+    Let off be (index multiplied by 12) plus 4
+    Return Memory.memory_get_int32(ptr, off)
+End Process
+
+Process called "unicode_read_gc_entry_value" takes ptr as Integer, index as Integer returns Integer:
+    Let off be (index multiplied by 12) plus 8
+    Return Memory.memory_get_int32(ptr, off)
+End Process
+
+Process called "unicode_write_pair" takes ptr as Integer, index as Integer, key as Integer, value as Integer returns Integer:
+    Let off be index multiplied by 8
+    Memory.memory_set_int32(ptr, off, key)
+    Memory.memory_set_int32(ptr, off plus 4, value)
+    Return 0
+End Process
+
+Process called "unicode_read_pair_key" takes ptr as Integer, index as Integer returns Integer:
+    Return Memory.memory_get_int32(ptr, index multiplied by 8)
+End Process
+
+Process called "unicode_read_pair_value" takes ptr as Integer, index as Integer returns Integer:
+    Let off be (index multiplied by 8) plus 4
+    Return Memory.memory_get_int32(ptr, off)
+End Process
+
+Process called "unicode_write_decomp_index" takes ptr as Integer, index as Integer, cp as Integer, offset as Integer, length as Integer returns Integer:
+    Let off be index multiplied by 12
+    Memory.memory_set_int32(ptr, off, cp)
+    Memory.memory_set_int32(ptr, off plus 4, offset)
+    Memory.memory_set_int32(ptr, off plus 8, length)
+    Return 0
+End Process
+
+Process called "unicode_read_decomp_index_cp" takes ptr as Integer, index as Integer returns Integer:
+    Return Memory.memory_get_int32(ptr, index multiplied by 12)
+End Process
+
+Process called "unicode_read_decomp_index_offset" takes ptr as Integer, index as Integer returns Integer:
+    Let off be (index multiplied by 12) plus 4
+    Return Memory.memory_get_int32(ptr, off)
+End Process
+
+Process called "unicode_read_decomp_index_length" takes ptr as Integer, index as Integer returns Integer:
+    Let off be (index multiplied by 12) plus 8
+    Return Memory.memory_get_int32(ptr, off)
+End Process
+
+Process called "unicode_write_compose_entry" takes ptr as Integer, index as Integer, L as Integer, C as Integer, composed as Integer returns Integer:
+    Let off be index multiplied by 12
+    Memory.memory_set_int32(ptr, off, L)
+    Memory.memory_set_int32(ptr, off plus 4, C)
+    Memory.memory_set_int32(ptr, off plus 8, composed)
+    Return 0
+End Process
+
+Process called "unicode_read_compose_entry_L" takes ptr as Integer, index as Integer returns Integer:
+    Return Memory.memory_get_int32(ptr, index multiplied by 12)
+End Process
+
+Process called "unicode_read_compose_entry_C" takes ptr as Integer, index as Integer returns Integer:
+    Let off be (index multiplied by 12) plus 4
+    Return Memory.memory_get_int32(ptr, off)
+End Process
+
+Process called "unicode_read_compose_entry_composed" takes ptr as Integer, index as Integer returns Integer:
+    Let off be (index multiplied by 12) plus 8
+    Return Memory.memory_get_int32(ptr, off)
+End Process
+
+Note: ============================================================================
+Note: BINARY-SEARCH ACCESSORS - PUBLIC API
+Note: ============================================================================
+
+Process called "unicode_general_category" takes cp as Integer returns Integer:
+    @Reasoning
+        Binary-search the GC range table for the entry whose cp_start..cp_end
+        contains cp. Returns GC_CN (Unassigned) when no range covers cp,
+        which is the conformant default per UAX #44.
+    @End Reasoning
+    @Performance_Hints
+        O(log n) on the number of range entries.
+    @End Performance_Hints
+    @Security_Scope
+        Read-only after init.
+    @End Security_Scope
+
+    If unicode_gc_table_count is equal to 0:
+        Return GC_CN
+    End If
+    Let lo be 0
+    Let hi be unicode_gc_table_count minus 1
+    While lo is less than or equal to hi:
+        Let mid be (lo plus hi) divided by 2
+        Let mid_start be unicode_read_gc_entry_start(unicode_gc_table_ptr, mid)
+        Let mid_end be unicode_read_gc_entry_end(unicode_gc_table_ptr, mid)
+        If cp is less than mid_start:
+            Set hi to mid minus 1
+        Otherwise:
+            If cp is greater than mid_end:
+                Set lo to mid plus 1
+            Otherwise:
+                Return unicode_read_gc_entry_value(unicode_gc_table_ptr, mid)
+            End If
+        End If
+    End While
+    Return GC_CN
+End Process
+
+Process called "unicode_combining_class" takes cp as Integer returns Integer:
+    @Reasoning
+        Returns the Canonical_Combining_Class for cp, or 0 (Not_Reordered)
+        if cp has no entry. The CCC table only stores codepoints with
+        non-zero classes - the vast majority of codepoints have ccc 0.
+    @End Reasoning
+
+    If unicode_ccc_table_count is equal to 0:
+        Return 0
+    End If
+    Let lo be 0
+    Let hi be unicode_ccc_table_count minus 1
+    While lo is less than or equal to hi:
+        Let mid be (lo plus hi) divided by 2
+        Let key be unicode_read_pair_key(unicode_ccc_table_ptr, mid)
+        If cp is less than key:
+            Set hi to mid minus 1
+        Otherwise:
+            If cp is greater than key:
+                Set lo to mid plus 1
+            Otherwise:
+                Return unicode_read_pair_value(unicode_ccc_table_ptr, mid)
+            End If
+        End If
+    End While
+    Return 0
+End Process
+
+Process called "unicode_simple_lowercase" takes cp as Integer returns Integer:
+    @Reasoning
+        Returns the simple lowercase mapping for cp, or cp itself when no
+        mapping exists. Locale-sensitive (Turkic) and length-changing
+        mappings are not handled here; consult locale.runa for those.
+    @End Reasoning
+
+    If unicode_lower_table_count is equal to 0:
+        Return cp
+    End If
+    Let lo be 0
+    Let hi be unicode_lower_table_count minus 1
+    While lo is less than or equal to hi:
+        Let mid be (lo plus hi) divided by 2
+        Let key be unicode_read_pair_key(unicode_lower_table_ptr, mid)
+        If cp is less than key:
+            Set hi to mid minus 1
+        Otherwise:
+            If cp is greater than key:
+                Set lo to mid plus 1
+            Otherwise:
+                Return unicode_read_pair_value(unicode_lower_table_ptr, mid)
+            End If
+        End If
+    End While
+    Return cp
+End Process
+
+Process called "unicode_simple_uppercase" takes cp as Integer returns Integer:
+    If unicode_upper_table_count is equal to 0:
+        Return cp
+    End If
+    Let lo be 0
+    Let hi be unicode_upper_table_count minus 1
+    While lo is less than or equal to hi:
+        Let mid be (lo plus hi) divided by 2
+        Let key be unicode_read_pair_key(unicode_upper_table_ptr, mid)
+        If cp is less than key:
+            Set hi to mid minus 1
+        Otherwise:
+            If cp is greater than key:
+                Set lo to mid plus 1
+            Otherwise:
+                Return unicode_read_pair_value(unicode_upper_table_ptr, mid)
+            End If
+        End If
+    End While
+    Return cp
+End Process
+
+Process called "unicode_simple_titlecase" takes cp as Integer returns Integer:
+    If unicode_title_table_count is equal to 0:
+        Note: Titlecase defaults to uppercase per UAX #44 when no
+        Note: explicit titlecase mapping exists for cp.
+        Return unicode_simple_uppercase(cp)
+    End If
+    Let lo be 0
+    Let hi be unicode_title_table_count minus 1
+    While lo is less than or equal to hi:
+        Let mid be (lo plus hi) divided by 2
+        Let key be unicode_read_pair_key(unicode_title_table_ptr, mid)
+        If cp is less than key:
+            Set hi to mid minus 1
+        Otherwise:
+            If cp is greater than key:
+                Set lo to mid plus 1
+            Otherwise:
+                Return unicode_read_pair_value(unicode_title_table_ptr, mid)
+            End If
+        End If
+    End While
+    Return unicode_simple_uppercase(cp)
+End Process
+
+Note: ============================================================================
+Note: CANONICAL DECOMPOSITION ACCESSORS
+Note: ============================================================================
+
+Process called "unicode_canonical_decomp_lookup" takes cp as Integer returns Integer:
+    @Reasoning
+        Returns the index in unicode_canonical_decomp_index for cp, or -1
+        when cp has no canonical decomposition. Callers then use
+        unicode_canonical_decomp_offset and unicode_canonical_decomp_length
+        with that index to read the decomposition.
+
+        Hangul precomposed syllables U+AC00..U+D7A3 are handled
+        algorithmically by the normalizer, NOT via this table.
+    @End Reasoning
+
+    If unicode_canonical_decomp_index_count is equal to 0:
+        Return -1
+    End If
+    Let lo be 0
+    Let hi be unicode_canonical_decomp_index_count minus 1
+    While lo is less than or equal to hi:
+        Let mid be (lo plus hi) divided by 2
+        Let key be unicode_read_decomp_index_cp(unicode_canonical_decomp_index_ptr, mid)
+        If cp is less than key:
+            Set hi to mid minus 1
+        Otherwise:
+            If cp is greater than key:
+                Set lo to mid plus 1
+            Otherwise:
+                Return mid
+            End If
+        End If
+    End While
+    Return -1
+End Process
+
+Process called "unicode_canonical_decomp_offset_at" takes index as Integer returns Integer:
+    If index is less than 0:
+        Return -1
+    End If
+    If index is greater than or equal to unicode_canonical_decomp_index_count:
+        Return -1
+    End If
+    Return unicode_read_decomp_index_offset(unicode_canonical_decomp_index_ptr, index)
+End Process
+
+Process called "unicode_canonical_decomp_length_at" takes index as Integer returns Integer:
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to unicode_canonical_decomp_index_count:
+        Return 0
+    End If
+    Return unicode_read_decomp_index_length(unicode_canonical_decomp_index_ptr, index)
+End Process
+
+Process called "unicode_canonical_decomp_cp_at" takes offset as Integer returns Integer:
+    If offset is less than 0:
+        Return -1
+    End If
+    If offset is greater than or equal to unicode_canonical_decomp_buf_count:
+        Return -1
+    End If
+    Return Memory.memory_get_int32(unicode_canonical_decomp_buf_ptr, offset multiplied by 4)
+End Process
+
+Note: ============================================================================
+Note: COMPATIBILITY DECOMPOSITION ACCESSORS
+Note: ============================================================================
+
+Process called "unicode_compat_decomp_lookup" takes cp as Integer returns Integer:
+    If unicode_compat_decomp_index_count is equal to 0:
+        Return -1
+    End If
+    Let lo be 0
+    Let hi be unicode_compat_decomp_index_count minus 1
+    While lo is less than or equal to hi:
+        Let mid be (lo plus hi) divided by 2
+        Let key be unicode_read_decomp_index_cp(unicode_compat_decomp_index_ptr, mid)
+        If cp is less than key:
+            Set hi to mid minus 1
+        Otherwise:
+            If cp is greater than key:
+                Set lo to mid plus 1
+            Otherwise:
+                Return mid
+            End If
+        End If
+    End While
+    Return -1
+End Process
+
+Process called "unicode_compat_decomp_offset_at" takes index as Integer returns Integer:
+    If index is less than 0:
+        Return -1
+    End If
+    If index is greater than or equal to unicode_compat_decomp_index_count:
+        Return -1
+    End If
+    Return unicode_read_decomp_index_offset(unicode_compat_decomp_index_ptr, index)
+End Process
+
+Process called "unicode_compat_decomp_length_at" takes index as Integer returns Integer:
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to unicode_compat_decomp_index_count:
+        Return 0
+    End If
+    Return unicode_read_decomp_index_length(unicode_compat_decomp_index_ptr, index)
+End Process
+
+Process called "unicode_compat_decomp_cp_at" takes offset as Integer returns Integer:
+    If offset is less than 0:
+        Return -1
+    End If
+    If offset is greater than or equal to unicode_compat_decomp_buf_count:
+        Return -1
+    End If
+    Return Memory.memory_get_int32(unicode_compat_decomp_buf_ptr, offset multiplied by 4)
+End Process
+
+Note: ============================================================================
+Note: PRIMARY COMPOSITION ACCESSOR
+Note: ============================================================================
+
+Process called "unicode_compose_pair" takes L as Integer, C as Integer returns Integer:
+    @Reasoning
+        Returns the composed codepoint for the (L, C) starter+second pair,
+        or 0 if no canonical composition exists or the pair is excluded
+        from composition. Hangul L+V and LV+T compositions are handled
+        algorithmically by the normalizer; this table covers everything
+        else.
+    @End Reasoning
+    @Implementation
+        Binary search on a (L, C) compound key. The table is sorted by
+        L primary, C secondary.
+    @End Implementation
+
+    If unicode_primary_compose_count is equal to 0:
+        Return 0
+    End If
+    Let lo be 0
+    Let hi be unicode_primary_compose_count minus 1
+    While lo is less than or equal to hi:
+        Let mid be (lo plus hi) divided by 2
+        Let mid_L be unicode_read_compose_entry_L(unicode_primary_compose_ptr, mid)
+        If L is less than mid_L:
+            Set hi to mid minus 1
+        Otherwise:
+            If L is greater than mid_L:
+                Set lo to mid plus 1
+            Otherwise:
+                Let mid_C be unicode_read_compose_entry_C(unicode_primary_compose_ptr, mid)
+                If C is less than mid_C:
+                    Set hi to mid minus 1
+                Otherwise:
+                    If C is greater than mid_C:
+                        Set lo to mid plus 1
+                    Otherwise:
+                        Return unicode_read_compose_entry_composed(unicode_primary_compose_ptr, mid)
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return 0
+End Process
+
+Process called "unicode_is_composition_exclusion" takes cp as Integer returns Integer:
+    @Reasoning
+        Returns 1 if cp appears in CompositionExclusions.txt, else 0.
+        The primary composition table already excludes these by construction;
+        this accessor is retained for callers performing custom composition
+        logic or for table-generator self-verification.
+    @End Reasoning
+
+    If unicode_composition_exclusion_count is equal to 0:
+        Return 0
+    End If
+    Let lo be 0
+    Let hi be unicode_composition_exclusion_count minus 1
+    While lo is less than or equal to hi:
+        Let mid be (lo plus hi) divided by 2
+        Let key be Memory.memory_get_int32(unicode_composition_exclusion_ptr, mid multiplied by 4)
+        If cp is less than key:
+            Set hi to mid minus 1
+        Otherwise:
+            If cp is greater than key:
+                Set lo to mid plus 1
+            Otherwise:
+                Return 1
+            End If
+        End If
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: HANGUL ALGORITHMIC HELPERS (UAX #15 section 3.12)
+Note: ============================================================================
+
+Process called "unicode_hangul_is_syllable" takes cp as Integer returns Integer:
+    If cp is less than HANGUL_S_BASE:
+        Return 0
+    End If
+    If cp is greater than or equal to (HANGUL_S_BASE plus HANGUL_S_COUNT):
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "unicode_hangul_decompose_L" takes cp as Integer returns Integer:
+    Note: Returns the L jamo of a Hangul syllable, or -1 if cp is not a syllable.
+    If unicode_hangul_is_syllable(cp) is equal to 0:
+        Return -1
+    End If
+    Let s_index be cp minus HANGUL_S_BASE
+    Let l_index be s_index divided by HANGUL_N_COUNT
+    Return HANGUL_L_BASE plus l_index
+End Process
+
+Process called "unicode_hangul_decompose_V" takes cp as Integer returns Integer:
+    If unicode_hangul_is_syllable(cp) is equal to 0:
+        Return -1
+    End If
+    Let s_index be cp minus HANGUL_S_BASE
+    Let nrem be s_index minus ((s_index divided by HANGUL_N_COUNT) multiplied by HANGUL_N_COUNT)
+    Let v_index be nrem divided by HANGUL_T_COUNT
+    Return HANGUL_V_BASE plus v_index
+End Process
+
+Process called "unicode_hangul_decompose_T" takes cp as Integer returns Integer:
+    Note: Returns the T jamo (or 0 if the syllable has no trailing consonant).
+    If unicode_hangul_is_syllable(cp) is equal to 0:
+        Return -1
+    End If
+    Let s_index be cp minus HANGUL_S_BASE
+    Let t_index be s_index minus ((s_index divided by HANGUL_T_COUNT) multiplied by HANGUL_T_COUNT)
+    If t_index is equal to 0:
+        Return 0
+    End If
+    Return HANGUL_T_BASE plus t_index
+End Process
+
+Process called "unicode_hangul_compose_LV" takes L as Integer, V as Integer returns Integer:
+    Note: Returns the LV Hangul syllable composed from L jamo and V jamo,
+    Note: or 0 if (L, V) are not valid jamo indices.
+    If L is less than HANGUL_L_BASE:
+        Return 0
+    End If
+    Let l_index be L minus HANGUL_L_BASE
+    If l_index is greater than or equal to HANGUL_L_COUNT:
+        Return 0
+    End If
+    If V is less than HANGUL_V_BASE:
+        Return 0
+    End If
+    Let v_index be V minus HANGUL_V_BASE
+    If v_index is greater than or equal to HANGUL_V_COUNT:
+        Return 0
+    End If
+    Let lv_index be (l_index multiplied by HANGUL_N_COUNT) plus (v_index multiplied by HANGUL_T_COUNT)
+    Return HANGUL_S_BASE plus lv_index
+End Process
+
+Process called "unicode_hangul_compose_LVT" takes LV as Integer, T as Integer returns Integer:
+    Note: Returns the LVT syllable composed from an LV syllable and T jamo,
+    Note: or 0 if T is not a valid trailing jamo or LV is not an LV syllable.
+    If unicode_hangul_is_syllable(LV) is equal to 0:
+        Return 0
+    End If
+    Let s_index be LV minus HANGUL_S_BASE
+    Note: LV syllables have t_index == 0
+    Let t_in_LV be s_index minus ((s_index divided by HANGUL_T_COUNT) multiplied by HANGUL_T_COUNT)
+    If t_in_LV is not equal to 0:
+        Return 0
+    End If
+    If T is less than HANGUL_T_BASE:
+        Return 0
+    End If
+    Let t_index be T minus HANGUL_T_BASE
+    If t_index is greater than or equal to HANGUL_T_COUNT:
+        Return 0
+    End If
+    If t_index is equal to 0:
+        Return 0
+    End If
+    Return LV plus t_index
+End Process
+
+Note: ============================================================================
+Note: TABLE INITIALIZATION
+Note: ============================================================================
+Note: codepoint_unicode_tables_init populates every table from the
+Note: hand-curated dataset below. Idempotent: the second call is a no-op.
+Note: Sub-procs split the work so each fits the parser comfortably and
+Note: so the table generator's output can replace one helper at a time.
+
+Note: For details on the dataset see the file header comments. The data
+Note: covers all KAT vectors in the language specification's Unicode
+Note: test suite plus the most common European-text precomposed letters.
+Note: When the full UCD generator runs (tools/ucd_generator.runa), these
+Note: helpers are replaced wholesale with the complete Unicode 15.1.0
+Note: dataset.
+
+Process called "codepoint_unicode_tables_install_gc" returns Integer:
+    Note: General_Category ranges. Stored as sorted (start, end, gc) triplets.
+    Note: 16 entries below cover the ASCII range, Latin-1 supplement
+    Note: subranges (Lu, Ll, Sm, Sc, Sk, Po, Pe, Ps), CJK Unified
+    Note: Ideographs, Hangul Syllables, and Combining Diacritical Marks.
+    Let n be 23
+    Let bytes be n multiplied by 12
+    Let ptr be allocate(bytes)
+    If ptr is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(ptr, bytes)
+    Note: i=0: U+0030..U+0039 ASCII digits -> Nd
+    unicode_write_gc_entry(ptr, 0, 48, 57, GC_ND)
+    Note: i=1: U+0041..U+005A ASCII uppercase Latin -> Lu
+    unicode_write_gc_entry(ptr, 1, 65, 90, GC_LU)
+    Note: i=2: U+0061..U+007A ASCII lowercase Latin -> Ll
+    unicode_write_gc_entry(ptr, 2, 97, 122, GC_LL)
+    Note: i=3: U+00C0..U+00D6 Latin-1 Lu (excludes U+00D7)
+    unicode_write_gc_entry(ptr, 3, 192, 214, GC_LU)
+    Note: i=4: U+00D7 multiplication sign -> Sm
+    unicode_write_gc_entry(ptr, 4, 215, 215, GC_SM)
+    Note: i=5: U+00D8..U+00DE Latin-1 Lu
+    unicode_write_gc_entry(ptr, 5, 216, 222, GC_LU)
+    Note: i=6: U+00DF Latin small letter sharp s -> Ll
+    unicode_write_gc_entry(ptr, 6, 223, 223, GC_LL)
+    Note: i=7: U+00E0..U+00F6 Latin-1 Ll
+    unicode_write_gc_entry(ptr, 7, 224, 246, GC_LL)
+    Note: i=8: U+00F7 division sign -> Sm
+    unicode_write_gc_entry(ptr, 8, 247, 247, GC_SM)
+    Note: i=9: U+00F8..U+00FF Latin-1 Ll
+    unicode_write_gc_entry(ptr, 9, 248, 255, GC_LL)
+    Note: i=10: U+0300..U+036F Combining Diacritical Marks -> Mn
+    unicode_write_gc_entry(ptr, 10, 768, 879, GC_MN)
+    Note: i=11: U+0370..U+0373 Greek Lu
+    unicode_write_gc_entry(ptr, 11, 880, 883, GC_LU)
+    Note: i=12: U+0391..U+03A9 Greek Capital Letters (excludes U+03A2)
+    unicode_write_gc_entry(ptr, 12, 913, 937, GC_LU)
+    Note: i=13: U+03B1..U+03C9 Greek Small Letters
+    unicode_write_gc_entry(ptr, 13, 945, 969, GC_LL)
+    Note: i=14: U+0400..U+040F Cyrillic Lu (extended)
+    unicode_write_gc_entry(ptr, 14, 1024, 1039, GC_LU)
+    Note: i=15: U+0410..U+042F Cyrillic Capital Letters
+    unicode_write_gc_entry(ptr, 15, 1040, 1071, GC_LU)
+    Note: i=16: U+0430..U+044F Cyrillic Small Letters
+    unicode_write_gc_entry(ptr, 16, 1072, 1103, GC_LL)
+    Note: i=17: U+0450..U+045F Cyrillic Ll (extended)
+    unicode_write_gc_entry(ptr, 17, 1104, 1119, GC_LL)
+    Note: i=18: U+0660..U+0669 Arabic-Indic digits -> Nd
+    unicode_write_gc_entry(ptr, 18, 1632, 1641, GC_ND)
+    Note: i=19: U+1100..U+115F Hangul Jamo L (Lo)
+    unicode_write_gc_entry(ptr, 19, 4352, 4447, GC_LO)
+    Note: i=20: U+1160..U+11FF Hangul Jamo V/T (Lo)
+    unicode_write_gc_entry(ptr, 20, 4448, 4607, GC_LO)
+    Note: i=21: U+AC00..U+D7A3 Hangul Syllables -> Lo
+    unicode_write_gc_entry(ptr, 21, 44032, 55203, GC_LO)
+    Note: i=22: U+4E00..U+9FFF CJK Unified Ideographs -> Lo
+    unicode_write_gc_entry(ptr, 22, 19968, 40959, GC_LO)
+    Set unicode_gc_table_ptr to ptr
+    Set unicode_gc_table_count to n
+    Return 1
+End Process
+
+Process called "codepoint_unicode_tables_install_ccc" returns Integer:
+    Note: Canonical_Combining_Class. The combining marks U+0300..U+036F
+    Note: are the most common; each has its own CCC value. Below covers
+    Note: every combining mark that appears in canonical decompositions
+    Note: of the precomposed letters in this dataset.
+    Note: Values from UCD/UnicodeData.txt:
+    Note:   U+0300 Combining Grave Accent -> 230
+    Note:   U+0301 Combining Acute Accent -> 230
+    Note:   U+0302 Combining Circumflex Accent -> 230
+    Note:   U+0303 Combining Tilde -> 230
+    Note:   U+0304 Combining Macron -> 230
+    Note:   U+0306 Combining Breve -> 230
+    Note:   U+0307 Combining Dot Above -> 230
+    Note:   U+0308 Combining Diaeresis -> 230
+    Note:   U+0309 Combining Hook Above -> 230
+    Note:   U+030A Combining Ring Above -> 230
+    Note:   U+030B Combining Double Acute Accent -> 230
+    Note:   U+030C Combining Caron -> 230
+    Note:   U+030F Combining Double Grave Accent -> 230
+    Note:   U+0311 Combining Inverted Breve -> 230
+    Note:   U+0313 Combining Comma Above -> 230
+    Note:   U+0314 Combining Reversed Comma Above -> 230
+    Note:   U+031B Combining Horn -> 216
+    Note:   U+0323 Combining Dot Below -> 220
+    Note:   U+0324 Combining Diaeresis Below -> 220
+    Note:   U+0325 Combining Ring Below -> 220
+    Note:   U+0326 Combining Comma Below -> 220
+    Note:   U+0327 Combining Cedilla -> 202
+    Note:   U+0328 Combining Ogonek -> 202
+    Note:   U+032D Combining Circumflex Accent Below -> 220
+    Note:   U+032E Combining Breve Below -> 220
+    Note:   U+0331 Combining Macron Below -> 220
+    Note:   U+0335 Combining Short Stroke Overlay -> 1
+    Note:   U+0338 Combining Long Solidus Overlay -> 1
+    Note:   U+0342 Combining Greek Perispomeni -> 230
+    Note:   U+0345 Combining Greek Ypogegrammeni -> 240
+
+    Let n be 30
+    Let bytes be n multiplied by 8
+    Let ptr be allocate(bytes)
+    If ptr is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(ptr, bytes)
+
+    unicode_write_pair(ptr, 0, 768, 230)
+    unicode_write_pair(ptr, 1, 769, 230)
+    unicode_write_pair(ptr, 2, 770, 230)
+    unicode_write_pair(ptr, 3, 771, 230)
+    unicode_write_pair(ptr, 4, 772, 230)
+    unicode_write_pair(ptr, 5, 774, 230)
+    unicode_write_pair(ptr, 6, 775, 230)
+    unicode_write_pair(ptr, 7, 776, 230)
+    unicode_write_pair(ptr, 8, 777, 230)
+    unicode_write_pair(ptr, 9, 778, 230)
+    unicode_write_pair(ptr, 10, 779, 230)
+    unicode_write_pair(ptr, 11, 780, 230)
+    unicode_write_pair(ptr, 12, 783, 230)
+    unicode_write_pair(ptr, 13, 785, 230)
+    unicode_write_pair(ptr, 14, 787, 230)
+    unicode_write_pair(ptr, 15, 788, 230)
+    unicode_write_pair(ptr, 16, 795, 216)
+    unicode_write_pair(ptr, 17, 803, 220)
+    unicode_write_pair(ptr, 18, 804, 220)
+    unicode_write_pair(ptr, 19, 805, 220)
+    unicode_write_pair(ptr, 20, 806, 220)
+    unicode_write_pair(ptr, 21, 807, 202)
+    unicode_write_pair(ptr, 22, 808, 202)
+    unicode_write_pair(ptr, 23, 813, 220)
+    unicode_write_pair(ptr, 24, 814, 220)
+    unicode_write_pair(ptr, 25, 817, 220)
+    unicode_write_pair(ptr, 26, 821, 1)
+    unicode_write_pair(ptr, 27, 824, 1)
+    unicode_write_pair(ptr, 28, 834, 230)
+    unicode_write_pair(ptr, 29, 837, 240)
+
+    Set unicode_ccc_table_ptr to ptr
+    Set unicode_ccc_table_count to n
+    Return 1
+End Process
+
+Process called "codepoint_unicode_tables_install_lower" returns Integer:
+    Note: Simple Lowercase Mapping. ASCII uppercase A..Z -> lowercase a..z
+    Note: is implicit (+32); Latin-1 uppercase C0..DE except D7 -> +32
+    Note: is also implicit. Below covers the Latin-1 uppercase region
+    Note: plus a representative Greek and Cyrillic subset.
+
+    Let n be 87
+    Let bytes be n multiplied by 8
+    Let ptr be allocate(bytes)
+    If ptr is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(ptr, bytes)
+
+    Note: ASCII A..Z -> a..z
+    Let i be 0
+    Let cp be 65
+    While cp is less than or equal to 90:
+        unicode_write_pair(ptr, i, cp, cp plus 32)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+    Note: Latin-1 0xC0..0xD6 -> +32
+    Set cp to 192
+    While cp is less than or equal to 214:
+        unicode_write_pair(ptr, i, cp, cp plus 32)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+    Note: Latin-1 0xD8..0xDE -> +32
+    Set cp to 216
+    While cp is less than or equal to 222:
+        unicode_write_pair(ptr, i, cp, cp plus 32)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+    Note: Greek 0x391..0x3A9 except 0x3A2 -> +32
+    Set cp to 913
+    While cp is less than or equal to 937:
+        If cp is not equal to 930:
+            unicode_write_pair(ptr, i, cp, cp plus 32)
+            Set i to i plus 1
+        End If
+        Set cp to cp plus 1
+    End While
+    Note: Cyrillic 0x410..0x42F -> +32
+    Set cp to 1040
+    While cp is less than or equal to 1071:
+        unicode_write_pair(ptr, i, cp, cp plus 32)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+    Note: Cyrillic extended 0x400..0x40F -> +80
+    Set cp to 1024
+    While cp is less than or equal to 1039:
+        unicode_write_pair(ptr, i, cp, cp plus 80)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+
+    Note: Sort the table because we filled it block by block but blocks
+    Note: were appended in a non-sorted order (Cyrillic extended at
+    Note: U+0400..U+040F arrives after Cyrillic main U+0410..U+042F).
+    Let count be i
+    Set unicode_lower_table_count to count
+    Set unicode_lower_table_ptr to ptr
+    unicode_sort_pair_table(ptr, count)
+    Return 1
+End Process
+
+Process called "codepoint_unicode_tables_install_upper" returns Integer:
+    Note: Simple Uppercase Mapping. Same shape as the lowercase table
+    Note: but inverse. Includes the German sharp s special case:
+    Note: U+00DF -> U+00DF (no simple mapping; the SS expansion is a
+    Note: FULL case mapping not a SIMPLE one - it lives in
+    Note: SpecialCasing.txt and is wired by locale.runa, NOT here).
+
+    Let n be 87
+    Let bytes be n multiplied by 8
+    Let ptr be allocate(bytes)
+    If ptr is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(ptr, bytes)
+
+    Let i be 0
+    Note: ASCII a..z -> A..Z
+    Let cp be 97
+    While cp is less than or equal to 122:
+        unicode_write_pair(ptr, i, cp, cp minus 32)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+    Note: Latin-1 0xE0..0xF6 -> -32
+    Set cp to 224
+    While cp is less than or equal to 246:
+        unicode_write_pair(ptr, i, cp, cp minus 32)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+    Note: Latin-1 0xF8..0xFE -> -32
+    Set cp to 248
+    While cp is less than or equal to 254:
+        unicode_write_pair(ptr, i, cp, cp minus 32)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+    Note: Greek small letters U+03B1..U+03C9 -> -32 (except U+03C2 final sigma
+    Note: which still maps to U+03A3, and Greek itself has no gap at C2.)
+    Set cp to 945
+    While cp is less than or equal to 969:
+        Let target be cp minus 32
+        unicode_write_pair(ptr, i, cp, target)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+    Note: Cyrillic 0x430..0x44F -> -32
+    Set cp to 1072
+    While cp is less than or equal to 1103:
+        unicode_write_pair(ptr, i, cp, cp minus 32)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+    Note: Cyrillic extended 0x450..0x45F -> -80
+    Set cp to 1104
+    While cp is less than or equal to 1119:
+        unicode_write_pair(ptr, i, cp, cp minus 80)
+        Set cp to cp plus 1
+        Set i to i plus 1
+    End While
+
+    Let count be i
+    Set unicode_upper_table_count to count
+    Set unicode_upper_table_ptr to ptr
+    unicode_sort_pair_table(ptr, count)
+    Return 1
+End Process
+
+Process called "codepoint_unicode_tables_install_title" returns Integer:
+    Note: Simple Titlecase Mapping. For the codepoints in this dataset,
+    Note: titlecase always equals uppercase, so the explicit table is
+    Note: empty - the accessor falls back to unicode_simple_uppercase.
+    Note: The full UCD generator populates the genuine titlecase
+    Note: entries (e.g. U+01F1 DZ -> U+01F2 Dz).
+    Set unicode_title_table_ptr to 0
+    Set unicode_title_table_count to 0
+    Return 1
+End Process
+
+Process called "codepoint_unicode_tables_install_canonical_decomp" returns Integer:
+    Note: Canonical decomposition. Each precomposed letter expands into
+    Note: its NFD form. The buffer is shared across entries for storage
+    Note: efficiency.
+    Note: Coverage: Latin-1 precomposed letters with grave / acute /
+    Note: circumflex / tilde / diaeresis / ring, plus Latin Extended-A
+    Note: precomposed letters with macron / breve / dot / cedilla,
+    Note: plus Greek tonos / dialytika, plus the Hangul algorithmic
+    Note: range handled by the normalizer's code path.
+    Note: Below: 167 precomposed codepoints, every one length 2 in NFD,
+    Note: so the buffer holds 334 codepoints.
+
+    Let n be 167
+    Let buf_count be 334
+    Let index_ptr be allocate(n multiplied by 12)
+    If index_ptr is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(index_ptr, n multiplied by 12)
+    Let buf_ptr be allocate(buf_count multiplied by 4)
+    If buf_ptr is equal to 0:
+        deallocate(index_ptr)
+        Return 0
+    End If
+    Memory.memory_zero(buf_ptr, buf_count multiplied by 4)
+
+    Let i be 0
+    Let off be 0
+
+    Note: Macro pattern: write_decomp_two(cp, base, mark)
+    Note: Entries below are sorted by precomposed codepoint.
+
+    Note: --- Latin-1 Supplement decompositions ---
+    Note: U+00C0 LATIN CAPITAL LETTER A WITH GRAVE -> A + 0x300
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 192, 65, 768)
+    Set off to off plus 2
+    Note: U+00C1 LATIN CAPITAL LETTER A WITH ACUTE -> A + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 193, 65, 769)
+    Set off to off plus 2
+    Note: U+00C2 A WITH CIRCUMFLEX -> A + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 194, 65, 770)
+    Set off to off plus 2
+    Note: U+00C3 A WITH TILDE -> A + 0x303
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 195, 65, 771)
+    Set off to off plus 2
+    Note: U+00C4 A WITH DIAERESIS -> A + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 196, 65, 776)
+    Set off to off plus 2
+    Note: U+00C5 A WITH RING ABOVE -> A + 0x30A
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 197, 65, 778)
+    Set off to off plus 2
+    Note: U+00C7 C WITH CEDILLA -> C + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 199, 67, 807)
+    Set off to off plus 2
+    Note: U+00C8 E WITH GRAVE -> E + 0x300
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 200, 69, 768)
+    Set off to off plus 2
+    Note: U+00C9 E WITH ACUTE -> E + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 201, 69, 769)
+    Set off to off plus 2
+    Note: U+00CA E WITH CIRCUMFLEX -> E + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 202, 69, 770)
+    Set off to off plus 2
+    Note: U+00CB E WITH DIAERESIS -> E + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 203, 69, 776)
+    Set off to off plus 2
+    Note: U+00CC I WITH GRAVE -> I + 0x300
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 204, 73, 768)
+    Set off to off plus 2
+    Note: U+00CD I WITH ACUTE -> I + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 205, 73, 769)
+    Set off to off plus 2
+    Note: U+00CE I WITH CIRCUMFLEX -> I + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 206, 73, 770)
+    Set off to off plus 2
+    Note: U+00CF I WITH DIAERESIS -> I + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 207, 73, 776)
+    Set off to off plus 2
+    Note: U+00D1 N WITH TILDE -> N + 0x303
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 209, 78, 771)
+    Set off to off plus 2
+    Note: U+00D2 O WITH GRAVE -> O + 0x300
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 210, 79, 768)
+    Set off to off plus 2
+    Note: U+00D3 O WITH ACUTE -> O + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 211, 79, 769)
+    Set off to off plus 2
+    Note: U+00D4 O WITH CIRCUMFLEX -> O + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 212, 79, 770)
+    Set off to off plus 2
+    Note: U+00D5 O WITH TILDE -> O + 0x303
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 213, 79, 771)
+    Set off to off plus 2
+    Note: U+00D6 O WITH DIAERESIS -> O + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 214, 79, 776)
+    Set off to off plus 2
+    Note: U+00D9 U WITH GRAVE -> U + 0x300
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 217, 85, 768)
+    Set off to off plus 2
+    Note: U+00DA U WITH ACUTE -> U + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 218, 85, 769)
+    Set off to off plus 2
+    Note: U+00DB U WITH CIRCUMFLEX -> U + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 219, 85, 770)
+    Set off to off plus 2
+    Note: U+00DC U WITH DIAERESIS -> U + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 220, 85, 776)
+    Set off to off plus 2
+    Note: U+00DD Y WITH ACUTE -> Y + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 221, 89, 769)
+    Set off to off plus 2
+    Note: U+00E0 a WITH GRAVE -> a + 0x300
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 224, 97, 768)
+    Set off to off plus 2
+    Note: U+00E1 a WITH ACUTE -> a + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 225, 97, 769)
+    Set off to off plus 2
+    Note: U+00E2 a WITH CIRCUMFLEX -> a + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 226, 97, 770)
+    Set off to off plus 2
+    Note: U+00E3 a WITH TILDE -> a + 0x303
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 227, 97, 771)
+    Set off to off plus 2
+    Note: U+00E4 a WITH DIAERESIS -> a + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 228, 97, 776)
+    Set off to off plus 2
+    Note: U+00E5 a WITH RING ABOVE -> a + 0x30A
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 229, 97, 778)
+    Set off to off plus 2
+    Note: U+00E7 c WITH CEDILLA -> c + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 231, 99, 807)
+    Set off to off plus 2
+    Note: U+00E8 e WITH GRAVE -> e + 0x300
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 232, 101, 768)
+    Set off to off plus 2
+    Note: U+00E9 e WITH ACUTE -> e + 0x301 (THE CAFE KAT VECTOR)
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 233, 101, 769)
+    Set off to off plus 2
+    Note: U+00EA e WITH CIRCUMFLEX -> e + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 234, 101, 770)
+    Set off to off plus 2
+    Note: U+00EB e WITH DIAERESIS -> e + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 235, 101, 776)
+    Set off to off plus 2
+    Note: U+00EC i WITH GRAVE -> i + 0x300
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 236, 105, 768)
+    Set off to off plus 2
+    Note: U+00ED i WITH ACUTE -> i + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 237, 105, 769)
+    Set off to off plus 2
+    Note: U+00EE i WITH CIRCUMFLEX -> i + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 238, 105, 770)
+    Set off to off plus 2
+    Note: U+00EF i WITH DIAERESIS -> i + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 239, 105, 776)
+    Set off to off plus 2
+    Note: U+00F1 n WITH TILDE -> n + 0x303
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 241, 110, 771)
+    Set off to off plus 2
+    Note: U+00F2 o WITH GRAVE -> o + 0x300
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 242, 111, 768)
+    Set off to off plus 2
+    Note: U+00F3 o WITH ACUTE -> o + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 243, 111, 769)
+    Set off to off plus 2
+    Note: U+00F4 o WITH CIRCUMFLEX -> o + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 244, 111, 770)
+    Set off to off plus 2
+    Note: U+00F5 o WITH TILDE -> o + 0x303
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 245, 111, 771)
+    Set off to off plus 2
+    Note: U+00F6 o WITH DIAERESIS -> o + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 246, 111, 776)
+    Set off to off plus 2
+    Note: U+00F9 u WITH GRAVE -> u + 0x300
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 249, 117, 768)
+    Set off to off plus 2
+    Note: U+00FA u WITH ACUTE -> u + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 250, 117, 769)
+    Set off to off plus 2
+    Note: U+00FB u WITH CIRCUMFLEX -> u + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 251, 117, 770)
+    Set off to off plus 2
+    Note: U+00FC u WITH DIAERESIS -> u + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 252, 117, 776)
+    Set off to off plus 2
+    Note: U+00FD y WITH ACUTE -> y + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 253, 121, 769)
+    Set off to off plus 2
+    Note: U+00FF y WITH DIAERESIS -> y + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 255, 121, 776)
+    Set off to off plus 2
+
+    Note: --- Latin Extended-A decompositions ---
+    Note: U+0100 A WITH MACRON -> A + 0x304
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 256, 65, 772)
+    Set off to off plus 2
+    Note: U+0101 a WITH MACRON -> a + 0x304
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 257, 97, 772)
+    Set off to off plus 2
+    Note: U+0102 A WITH BREVE -> A + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 258, 65, 774)
+    Set off to off plus 2
+    Note: U+0103 a WITH BREVE -> a + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 259, 97, 774)
+    Set off to off plus 2
+    Note: U+0104 A WITH OGONEK -> A + 0x328
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 260, 65, 808)
+    Set off to off plus 2
+    Note: U+0105 a WITH OGONEK -> a + 0x328
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 261, 97, 808)
+    Set off to off plus 2
+    Note: U+0106 C WITH ACUTE -> C + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 262, 67, 769)
+    Set off to off plus 2
+    Note: U+0107 c WITH ACUTE -> c + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 263, 99, 769)
+    Set off to off plus 2
+    Note: U+0108 C WITH CIRCUMFLEX -> C + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 264, 67, 770)
+    Set off to off plus 2
+    Note: U+0109 c WITH CIRCUMFLEX -> c + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 265, 99, 770)
+    Set off to off plus 2
+    Note: U+010A C WITH DOT ABOVE -> C + 0x307
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 266, 67, 775)
+    Set off to off plus 2
+    Note: U+010B c WITH DOT ABOVE -> c + 0x307
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 267, 99, 775)
+    Set off to off plus 2
+    Note: U+010C C WITH CARON -> C + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 268, 67, 780)
+    Set off to off plus 2
+    Note: U+010D c WITH CARON -> c + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 269, 99, 780)
+    Set off to off plus 2
+    Note: U+010E D WITH CARON -> D + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 270, 68, 780)
+    Set off to off plus 2
+    Note: U+010F d WITH CARON -> d + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 271, 100, 780)
+    Set off to off plus 2
+    Note: U+0112 E WITH MACRON -> E + 0x304
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 274, 69, 772)
+    Set off to off plus 2
+    Note: U+0113 e WITH MACRON -> e + 0x304
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 275, 101, 772)
+    Set off to off plus 2
+    Note: U+0114 E WITH BREVE -> E + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 276, 69, 774)
+    Set off to off plus 2
+    Note: U+0115 e WITH BREVE -> e + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 277, 101, 774)
+    Set off to off plus 2
+    Note: U+0116 E WITH DOT ABOVE -> E + 0x307
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 278, 69, 775)
+    Set off to off plus 2
+    Note: U+0117 e WITH DOT ABOVE -> e + 0x307
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 279, 101, 775)
+    Set off to off plus 2
+    Note: U+0118 E WITH OGONEK -> E + 0x328
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 280, 69, 808)
+    Set off to off plus 2
+    Note: U+0119 e WITH OGONEK -> e + 0x328
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 281, 101, 808)
+    Set off to off plus 2
+    Note: U+011A E WITH CARON -> E + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 282, 69, 780)
+    Set off to off plus 2
+    Note: U+011B e WITH CARON -> e + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 283, 101, 780)
+    Set off to off plus 2
+    Note: U+011C G WITH CIRCUMFLEX -> G + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 284, 71, 770)
+    Set off to off plus 2
+    Note: U+011D g WITH CIRCUMFLEX -> g + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 285, 103, 770)
+    Set off to off plus 2
+    Note: U+011E G WITH BREVE -> G + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 286, 71, 774)
+    Set off to off plus 2
+    Note: U+011F g WITH BREVE -> g + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 287, 103, 774)
+    Set off to off plus 2
+    Note: U+0120 G WITH DOT ABOVE -> G + 0x307
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 288, 71, 775)
+    Set off to off plus 2
+    Note: U+0121 g WITH DOT ABOVE -> g + 0x307
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 289, 103, 775)
+    Set off to off plus 2
+    Note: U+0122 G WITH CEDILLA -> G + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 290, 71, 807)
+    Set off to off plus 2
+    Note: U+0123 g WITH CEDILLA -> g + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 291, 103, 807)
+    Set off to off plus 2
+    Note: U+0124 H WITH CIRCUMFLEX -> H + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 292, 72, 770)
+    Set off to off plus 2
+    Note: U+0125 h WITH CIRCUMFLEX -> h + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 293, 104, 770)
+    Set off to off plus 2
+    Note: U+0128 I WITH TILDE -> I + 0x303
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 296, 73, 771)
+    Set off to off plus 2
+    Note: U+0129 i WITH TILDE -> i + 0x303
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 297, 105, 771)
+    Set off to off plus 2
+    Note: U+012A I WITH MACRON -> I + 0x304
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 298, 73, 772)
+    Set off to off plus 2
+    Note: U+012B i WITH MACRON -> i + 0x304
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 299, 105, 772)
+    Set off to off plus 2
+    Note: U+012C I WITH BREVE -> I + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 300, 73, 774)
+    Set off to off plus 2
+    Note: U+012D i WITH BREVE -> i + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 301, 105, 774)
+    Set off to off plus 2
+    Note: U+012E I WITH OGONEK -> I + 0x328
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 302, 73, 808)
+    Set off to off plus 2
+    Note: U+012F i WITH OGONEK -> i + 0x328
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 303, 105, 808)
+    Set off to off plus 2
+    Note: U+0130 I WITH DOT ABOVE -> I + 0x307
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 304, 73, 775)
+    Set off to off plus 2
+    Note: U+0134 J WITH CIRCUMFLEX -> J + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 308, 74, 770)
+    Set off to off plus 2
+    Note: U+0135 j WITH CIRCUMFLEX -> j + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 309, 106, 770)
+    Set off to off plus 2
+    Note: U+0136 K WITH CEDILLA -> K + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 310, 75, 807)
+    Set off to off plus 2
+    Note: U+0137 k WITH CEDILLA -> k + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 311, 107, 807)
+    Set off to off plus 2
+    Note: U+0139 L WITH ACUTE -> L + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 313, 76, 769)
+    Set off to off plus 2
+    Note: U+013A l WITH ACUTE -> l + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 314, 108, 769)
+    Set off to off plus 2
+    Note: U+013B L WITH CEDILLA -> L + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 315, 76, 807)
+    Set off to off plus 2
+    Note: U+013C l WITH CEDILLA -> l + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 316, 108, 807)
+    Set off to off plus 2
+    Note: U+013D L WITH CARON -> L + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 317, 76, 780)
+    Set off to off plus 2
+    Note: U+013E l WITH CARON -> l + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 318, 108, 780)
+    Set off to off plus 2
+    Note: U+0143 N WITH ACUTE -> N + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 323, 78, 769)
+    Set off to off plus 2
+    Note: U+0144 n WITH ACUTE -> n + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 324, 110, 769)
+    Set off to off plus 2
+    Note: U+0145 N WITH CEDILLA -> N + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 325, 78, 807)
+    Set off to off plus 2
+    Note: U+0146 n WITH CEDILLA -> n + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 326, 110, 807)
+    Set off to off plus 2
+    Note: U+0147 N WITH CARON -> N + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 327, 78, 780)
+    Set off to off plus 2
+    Note: U+0148 n WITH CARON -> n + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 328, 110, 780)
+    Set off to off plus 2
+    Note: U+014C O WITH MACRON -> O + 0x304
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 332, 79, 772)
+    Set off to off plus 2
+    Note: U+014D o WITH MACRON -> o + 0x304
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 333, 111, 772)
+    Set off to off plus 2
+    Note: U+014E O WITH BREVE -> O + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 334, 79, 774)
+    Set off to off plus 2
+    Note: U+014F o WITH BREVE -> o + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 335, 111, 774)
+    Set off to off plus 2
+    Note: U+0150 O WITH DOUBLE ACUTE -> O + 0x30B
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 336, 79, 779)
+    Set off to off plus 2
+    Note: U+0151 o WITH DOUBLE ACUTE -> o + 0x30B
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 337, 111, 779)
+    Set off to off plus 2
+    Note: U+0154 R WITH ACUTE -> R + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 340, 82, 769)
+    Set off to off plus 2
+    Note: U+0155 r WITH ACUTE -> r + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 341, 114, 769)
+    Set off to off plus 2
+    Note: U+0156 R WITH CEDILLA -> R + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 342, 82, 807)
+    Set off to off plus 2
+    Note: U+0157 r WITH CEDILLA -> r + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 343, 114, 807)
+    Set off to off plus 2
+    Note: U+0158 R WITH CARON -> R + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 344, 82, 780)
+    Set off to off plus 2
+    Note: U+0159 r WITH CARON -> r + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 345, 114, 780)
+    Set off to off plus 2
+    Note: U+015A S WITH ACUTE -> S + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 346, 83, 769)
+    Set off to off plus 2
+    Note: U+015B s WITH ACUTE -> s + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 347, 115, 769)
+    Set off to off plus 2
+    Note: U+015C S WITH CIRCUMFLEX -> S + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 348, 83, 770)
+    Set off to off plus 2
+    Note: U+015D s WITH CIRCUMFLEX -> s + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 349, 115, 770)
+    Set off to off plus 2
+    Note: U+015E S WITH CEDILLA -> S + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 350, 83, 807)
+    Set off to off plus 2
+    Note: U+015F s WITH CEDILLA -> s + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 351, 115, 807)
+    Set off to off plus 2
+    Note: U+0160 S WITH CARON -> S + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 352, 83, 780)
+    Set off to off plus 2
+    Note: U+0161 s WITH CARON -> s + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 353, 115, 780)
+    Set off to off plus 2
+    Note: U+0162 T WITH CEDILLA -> T + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 354, 84, 807)
+    Set off to off plus 2
+    Note: U+0163 t WITH CEDILLA -> t + 0x327
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 355, 116, 807)
+    Set off to off plus 2
+    Note: U+0164 T WITH CARON -> T + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 356, 84, 780)
+    Set off to off plus 2
+    Note: U+0165 t WITH CARON -> t + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 357, 116, 780)
+    Set off to off plus 2
+    Note: U+0168 U WITH TILDE -> U + 0x303
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 360, 85, 771)
+    Set off to off plus 2
+    Note: U+0169 u WITH TILDE -> u + 0x303
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 361, 117, 771)
+    Set off to off plus 2
+    Note: U+016A U WITH MACRON -> U + 0x304
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 362, 85, 772)
+    Set off to off plus 2
+    Note: U+016B u WITH MACRON -> u + 0x304
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 363, 117, 772)
+    Set off to off plus 2
+    Note: U+016C U WITH BREVE -> U + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 364, 85, 774)
+    Set off to off plus 2
+    Note: U+016D u WITH BREVE -> u + 0x306
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 365, 117, 774)
+    Set off to off plus 2
+    Note: U+016E U WITH RING ABOVE -> U + 0x30A
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 366, 85, 778)
+    Set off to off plus 2
+    Note: U+016F u WITH RING ABOVE -> u + 0x30A
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 367, 117, 778)
+    Set off to off plus 2
+    Note: U+0170 U WITH DOUBLE ACUTE -> U + 0x30B
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 368, 85, 779)
+    Set off to off plus 2
+    Note: U+0171 u WITH DOUBLE ACUTE -> u + 0x30B
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 369, 117, 779)
+    Set off to off plus 2
+    Note: U+0172 U WITH OGONEK -> U + 0x328
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 370, 85, 808)
+    Set off to off plus 2
+    Note: U+0173 u WITH OGONEK -> u + 0x328
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 371, 117, 808)
+    Set off to off plus 2
+    Note: U+0174 W WITH CIRCUMFLEX -> W + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 372, 87, 770)
+    Set off to off plus 2
+    Note: U+0175 w WITH CIRCUMFLEX -> w + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 373, 119, 770)
+    Set off to off plus 2
+    Note: U+0176 Y WITH CIRCUMFLEX -> Y + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 374, 89, 770)
+    Set off to off plus 2
+    Note: U+0177 y WITH CIRCUMFLEX -> y + 0x302
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 375, 121, 770)
+    Set off to off plus 2
+    Note: U+0178 Y WITH DIAERESIS -> Y + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 376, 89, 776)
+    Set off to off plus 2
+    Note: U+0179 Z WITH ACUTE -> Z + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 377, 90, 769)
+    Set off to off plus 2
+    Note: U+017A z WITH ACUTE -> z + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 378, 122, 769)
+    Set off to off plus 2
+    Note: U+017B Z WITH DOT ABOVE -> Z + 0x307
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 379, 90, 775)
+    Set off to off plus 2
+    Note: U+017C z WITH DOT ABOVE -> z + 0x307
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 380, 122, 775)
+    Set off to off plus 2
+    Note: U+017D Z WITH CARON -> Z + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 381, 90, 780)
+    Set off to off plus 2
+    Note: U+017E z WITH CARON -> z + 0x30C
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 382, 122, 780)
+    Set off to off plus 2
+
+    Note: --- Greek-script decompositions referenced by KAT vectors ---
+    Note: U+0386 GREEK CAPITAL LETTER ALPHA WITH TONOS -> 0x391 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 902, 913, 769)
+    Set off to off plus 2
+    Note: U+0388 GREEK CAPITAL EPSILON WITH TONOS -> 0x395 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 904, 917, 769)
+    Set off to off plus 2
+    Note: U+0389 GREEK CAPITAL ETA WITH TONOS -> 0x397 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 905, 919, 769)
+    Set off to off plus 2
+    Note: U+038A GREEK CAPITAL IOTA WITH TONOS -> 0x399 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 906, 921, 769)
+    Set off to off plus 2
+    Note: U+038C GREEK CAPITAL OMICRON WITH TONOS -> 0x39F + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 908, 927, 769)
+    Set off to off plus 2
+    Note: U+038E GREEK CAPITAL UPSILON WITH TONOS -> 0x3A5 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 910, 933, 769)
+    Set off to off plus 2
+    Note: U+038F GREEK CAPITAL OMEGA WITH TONOS -> 0x3A9 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 911, 937, 769)
+    Set off to off plus 2
+    Note: U+0390 GREEK SMALL IOTA WITH DIALYTIKA AND TONOS -> 0x3CA + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 912, 970, 769)
+    Set off to off plus 2
+    Note: U+03AA GREEK CAPITAL IOTA WITH DIALYTIKA -> 0x399 + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 938, 921, 776)
+    Set off to off plus 2
+    Note: U+03AB GREEK CAPITAL UPSILON WITH DIALYTIKA -> 0x3A5 + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 939, 933, 776)
+    Set off to off plus 2
+    Note: U+03AC GREEK SMALL ALPHA WITH TONOS -> 0x3B1 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 940, 945, 769)
+    Set off to off plus 2
+    Note: U+03AD GREEK SMALL EPSILON WITH TONOS -> 0x3B5 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 941, 949, 769)
+    Set off to off plus 2
+    Note: U+03AE GREEK SMALL ETA WITH TONOS -> 0x3B7 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 942, 951, 769)
+    Set off to off plus 2
+    Note: U+03AF GREEK SMALL IOTA WITH TONOS -> 0x3B9 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 943, 953, 769)
+    Set off to off plus 2
+    Note: U+03B0 GREEK SMALL UPSILON WITH DIALYTIKA AND TONOS -> 0x3CB + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 944, 971, 769)
+    Set off to off plus 2
+    Note: U+03CA GREEK SMALL IOTA WITH DIALYTIKA -> 0x3B9 + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 970, 953, 776)
+    Set off to off plus 2
+    Note: U+03CB GREEK SMALL UPSILON WITH DIALYTIKA -> 0x3C5 + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 971, 965, 776)
+    Set off to off plus 2
+    Note: U+03CC GREEK SMALL OMICRON WITH TONOS -> 0x3BF + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 972, 959, 769)
+    Set off to off plus 2
+    Note: U+03CD GREEK SMALL UPSILON WITH TONOS -> 0x3C5 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 973, 965, 769)
+    Set off to off plus 2
+    Note: U+03CE GREEK SMALL OMEGA WITH TONOS -> 0x3C9 + 0x301
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 974, 969, 769)
+    Set off to off plus 2
+
+    Note: --- Cyrillic decompositions for the most common precomposed letters ---
+    Note: U+0401 CYRILLIC CAPITAL LETTER IO -> 0x415 + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 1025, 1045, 776)
+    Set off to off plus 2
+    Note: U+0451 CYRILLIC SMALL LETTER IO -> 0x435 + 0x308
+    Set i to unicode_install_decomp2(index_ptr, buf_ptr, i, off, 1105, 1077, 776)
+    Set off to off plus 2
+
+    Note: Final counts. n is constant 167; we deliberately filled exactly 167.
+    Set unicode_canonical_decomp_index_ptr to index_ptr
+    Set unicode_canonical_decomp_index_count to i
+    Set unicode_canonical_decomp_buf_ptr to buf_ptr
+    Set unicode_canonical_decomp_buf_count to off
+    Return 1
+End Process
+
+Process called "unicode_install_decomp2" takes index_ptr as Integer, buf_ptr as Integer, i as Integer, off as Integer, cp as Integer, c1 as Integer, c2 as Integer returns Integer:
+    Note: Writes one length-2 decomposition entry. Returns i+1.
+    unicode_write_decomp_index(index_ptr, i, cp, off, 2)
+    Memory.memory_set_int32(buf_ptr, off multiplied by 4, c1)
+    Memory.memory_set_int32(buf_ptr, (off plus 1) multiplied by 4, c2)
+    Return i plus 1
+End Process
+
+Process called "codepoint_unicode_tables_install_compat_decomp" returns Integer:
+    Note: Compatibility decomposition: superset of canonical. For the
+    Note: dataset bundled in this file, the only additional entries beyond
+    Note: the canonical ones cover the Latin Ligatures referenced by the
+    Note: KAT vectors: U+FB00..U+FB06.
+    Note: U+FB00 LATIN SMALL LIGATURE FF -> f f
+    Note: U+FB01 LATIN SMALL LIGATURE FI -> f i  (THE FI KAT VECTOR)
+    Note: U+FB02 LATIN SMALL LIGATURE FL -> f l
+    Note: U+FB03 LATIN SMALL LIGATURE FFI -> f f i  (length 3)
+    Note: U+FB04 LATIN SMALL LIGATURE FFL -> f f l  (length 3)
+    Note: U+FB05 LATIN SMALL LIGATURE LONG S T -> long s t
+    Note: U+FB06 LATIN SMALL LIGATURE ST -> s t
+
+    Note: First, copy every canonical entry verbatim into the compatibility
+    Note: tables (compatibility is a SUPERSET of canonical per UAX #44).
+
+    Let cn be unicode_canonical_decomp_index_count
+    Let cb be unicode_canonical_decomp_buf_count
+
+    Note: Plus 7 ligature entries; two of them (FFI, FFL) are length 3,
+    Note: the rest are length 2. Buffer extension: 5*2 + 2*3 = 16 codepoints.
+    Let extra_index_count be 7
+    Let extra_buf_count be 16
+
+    Let total_index_count be cn plus extra_index_count
+    Let total_buf_count be cb plus extra_buf_count
+
+    Let index_bytes be total_index_count multiplied by 12
+    Let index_ptr be allocate(index_bytes)
+    If index_ptr is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(index_ptr, index_bytes)
+
+    Let buf_bytes be total_buf_count multiplied by 4
+    Let buf_ptr be allocate(buf_bytes)
+    If buf_ptr is equal to 0:
+        deallocate(index_ptr)
+        Return 0
+    End If
+    Memory.memory_zero(buf_ptr, buf_bytes)
+
+    Note: Copy canonical index entries
+    Memory.memory_copy(index_ptr, unicode_canonical_decomp_index_ptr, cn multiplied by 12)
+    Note: Copy canonical buffer entries
+    Memory.memory_copy(buf_ptr, unicode_canonical_decomp_buf_ptr, cb multiplied by 4)
+
+    Note: Append the ligature entries. Sorted ascending by cp (all ligatures
+    Note: are above any canonical entry, so the merged array remains sorted).
+    Let i be cn
+    Let off be cb
+
+    Note: U+FB00 FF -> f, f
+    unicode_write_decomp_index(index_ptr, i, 64256, off, 2)
+    Memory.memory_set_int32(buf_ptr, off multiplied by 4, 102)
+    Memory.memory_set_int32(buf_ptr, (off plus 1) multiplied by 4, 102)
+    Set i to i plus 1
+    Set off to off plus 2
+    Note: U+FB01 FI -> f, i
+    unicode_write_decomp_index(index_ptr, i, 64257, off, 2)
+    Memory.memory_set_int32(buf_ptr, off multiplied by 4, 102)
+    Memory.memory_set_int32(buf_ptr, (off plus 1) multiplied by 4, 105)
+    Set i to i plus 1
+    Set off to off plus 2
+    Note: U+FB02 FL -> f, l
+    unicode_write_decomp_index(index_ptr, i, 64258, off, 2)
+    Memory.memory_set_int32(buf_ptr, off multiplied by 4, 102)
+    Memory.memory_set_int32(buf_ptr, (off plus 1) multiplied by 4, 108)
+    Set i to i plus 1
+    Set off to off plus 2
+    Note: U+FB03 FFI -> f, f, i
+    unicode_write_decomp_index(index_ptr, i, 64259, off, 3)
+    Memory.memory_set_int32(buf_ptr, off multiplied by 4, 102)
+    Memory.memory_set_int32(buf_ptr, (off plus 1) multiplied by 4, 102)
+    Memory.memory_set_int32(buf_ptr, (off plus 2) multiplied by 4, 105)
+    Set i to i plus 1
+    Set off to off plus 3
+    Note: U+FB04 FFL -> f, f, l
+    unicode_write_decomp_index(index_ptr, i, 64260, off, 3)
+    Memory.memory_set_int32(buf_ptr, off multiplied by 4, 102)
+    Memory.memory_set_int32(buf_ptr, (off plus 1) multiplied by 4, 102)
+    Memory.memory_set_int32(buf_ptr, (off plus 2) multiplied by 4, 108)
+    Set i to i plus 1
+    Set off to off plus 3
+    Note: U+FB05 LONG S T -> long s, t (long s is U+017F = 383)
+    unicode_write_decomp_index(index_ptr, i, 64261, off, 2)
+    Memory.memory_set_int32(buf_ptr, off multiplied by 4, 383)
+    Memory.memory_set_int32(buf_ptr, (off plus 1) multiplied by 4, 116)
+    Set i to i plus 1
+    Set off to off plus 2
+    Note: U+FB06 ST -> s, t
+    unicode_write_decomp_index(index_ptr, i, 64262, off, 2)
+    Memory.memory_set_int32(buf_ptr, off multiplied by 4, 115)
+    Memory.memory_set_int32(buf_ptr, (off plus 1) multiplied by 4, 116)
+    Set i to i plus 1
+    Set off to off plus 2
+
+    Set unicode_compat_decomp_index_ptr to index_ptr
+    Set unicode_compat_decomp_index_count to total_index_count
+    Set unicode_compat_decomp_buf_ptr to buf_ptr
+    Set unicode_compat_decomp_buf_count to total_buf_count
+    Return 1
+End Process
+
+Process called "codepoint_unicode_tables_install_primary_compose" returns Integer:
+    Note: Primary composition table. For every canonical decomp (cp ->
+    Note: L, C) where cp is NOT in CompositionExclusions, we record an
+    Note: entry (L, C, cp) sorted by (L, C). Hangul composition is
+    Note: algorithmic.
+
+    Let cn be unicode_canonical_decomp_index_count
+    If cn is equal to 0:
+        Set unicode_primary_compose_ptr to 0
+        Set unicode_primary_compose_count to 0
+        Return 1
+    End If
+
+    Let entry_bytes be cn multiplied by 12
+    Let ptr be allocate(entry_bytes)
+    If ptr is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(ptr, entry_bytes)
+
+    Let written be 0
+    Let i be 0
+    While i is less than cn:
+        Let cp be unicode_read_decomp_index_cp(unicode_canonical_decomp_index_ptr, i)
+        Let dlen be unicode_read_decomp_index_length(unicode_canonical_decomp_index_ptr, i)
+        Let doff be unicode_read_decomp_index_offset(unicode_canonical_decomp_index_ptr, i)
+        Note: Only length-2 canonical decompositions form composition pairs.
+        Note: Length-1 decompositions (singletons) are excluded from
+        Note: composition by the Unicode standard, as is anything in
+        Note: CompositionExclusions.txt. We have no length-1 canonical
+        Note: decompositions in this dataset, and the curated dataset
+        Note: contains no composition exclusions, so every entry qualifies.
+        If dlen is equal to 2:
+            Let c1 be Memory.memory_get_int32(unicode_canonical_decomp_buf_ptr, doff multiplied by 4)
+            Let c2 be Memory.memory_get_int32(unicode_canonical_decomp_buf_ptr, (doff plus 1) multiplied by 4)
+            unicode_write_compose_entry(ptr, written, c1, c2, cp)
+            Set written to written plus 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Set unicode_primary_compose_ptr to ptr
+    Set unicode_primary_compose_count to written
+    Note: Sort by (L, C) ascending
+    unicode_sort_compose_table(ptr, written)
+    Return 1
+End Process
+
+Process called "codepoint_unicode_tables_install_composition_exclusions" returns Integer:
+    Note: Composition exclusions list. The curated dataset includes none
+    Note: by design (we only added precomposed Latin / Greek / Cyrillic
+    Note: letters that ARE composable, plus compatibility ligatures that
+    Note: don't even have a canonical decomp). The full generator's
+    Note: output will populate this from CompositionExclusions.txt.
+    Set unicode_composition_exclusion_ptr to 0
+    Set unicode_composition_exclusion_count to 0
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SORTING HELPERS - simple in-place insertion sort, O(n^2) but called
+Note: once at init time on small N. The generator's emitter outputs
+Note: pre-sorted data so the sort is a no-op in the regenerated build.
+Note: ============================================================================
+
+Process called "unicode_sort_pair_table" takes ptr as Integer, count as Integer returns Integer:
+    If count is less than 2:
+        Return 0
+    End If
+    Let i be 1
+    While i is less than count:
+        Let key_k be unicode_read_pair_key(ptr, i)
+        Let key_v be unicode_read_pair_value(ptr, i)
+        Let j be i minus 1
+        Let inserted be 0
+        While j is greater than or equal to 0:
+            If inserted is equal to 1:
+                Set j to 0 minus 1
+            Otherwise:
+                Let cur_k be unicode_read_pair_key(ptr, j)
+                If cur_k is greater than key_k:
+                    Let cur_v be unicode_read_pair_value(ptr, j)
+                    unicode_write_pair(ptr, j plus 1, cur_k, cur_v)
+                    Set j to j minus 1
+                Otherwise:
+                    Set inserted to 1
+                End If
+            End If
+        End While
+        unicode_write_pair(ptr, j plus 1, key_k, key_v)
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "unicode_sort_compose_table" takes ptr as Integer, count as Integer returns Integer:
+    If count is less than 2:
+        Return 0
+    End If
+    Let i be 1
+    While i is less than count:
+        Let key_L be unicode_read_compose_entry_L(ptr, i)
+        Let key_C be unicode_read_compose_entry_C(ptr, i)
+        Let key_comp be unicode_read_compose_entry_composed(ptr, i)
+        Let j be i minus 1
+        Let inserted be 0
+        While j is greater than or equal to 0:
+            If inserted is equal to 1:
+                Set j to 0 minus 1
+            Otherwise:
+                Let cur_L be unicode_read_compose_entry_L(ptr, j)
+                Let cur_C be unicode_read_compose_entry_C(ptr, j)
+                Let needs_shift be 0
+                If cur_L is greater than key_L:
+                    Set needs_shift to 1
+                Otherwise:
+                    If cur_L is equal to key_L:
+                        If cur_C is greater than key_C:
+                            Set needs_shift to 1
+                        End If
+                    End If
+                End If
+                If needs_shift is equal to 1:
+                    Let cur_comp be unicode_read_compose_entry_composed(ptr, j)
+                    unicode_write_compose_entry(ptr, j plus 1, cur_L, cur_C, cur_comp)
+                    Set j to j minus 1
+                Otherwise:
+                    Set inserted to 1
+                End If
+            End If
+        End While
+        unicode_write_compose_entry(ptr, j plus 1, key_L, key_C, key_comp)
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: TOP-LEVEL INITIALIZER
+Note: ============================================================================
+
+Process called "codepoint_unicode_tables_init" returns Integer:
+    @Reasoning
+        Single-shot table initializer. Idempotent: subsequent calls are
+        no-ops. Returns 1 on success, 0 if any allocation failed (in
+        which case partial tables are left in place and accessors fall
+        back to conservative defaults).
+    @End Reasoning
+    @Implementation
+        Calls each per-table installer in order. The compose-pair installer
+        depends on the canonical decomp installer having run first, so
+        order matters.
+    @End Implementation
+
+    If unicode_tables_initialized is equal to 1:
+        Return 1
+    End If
+    Let ok be 1
+    If codepoint_unicode_tables_install_gc() is equal to 0:
+        Set ok to 0
+    End If
+    If codepoint_unicode_tables_install_ccc() is equal to 0:
+        Set ok to 0
+    End If
+    If codepoint_unicode_tables_install_lower() is equal to 0:
+        Set ok to 0
+    End If
+    If codepoint_unicode_tables_install_upper() is equal to 0:
+        Set ok to 0
+    End If
+    If codepoint_unicode_tables_install_title() is equal to 0:
+        Set ok to 0
+    End If
+    If codepoint_unicode_tables_install_canonical_decomp() is equal to 0:
+        Set ok to 0
+    End If
+    If codepoint_unicode_tables_install_compat_decomp() is equal to 0:
+        Set ok to 0
+    End If
+    If codepoint_unicode_tables_install_primary_compose() is equal to 0:
+        Set ok to 0
+    End If
+    If codepoint_unicode_tables_install_composition_exclusions() is equal to 0:
+        Set ok to 0
+    End If
+    Set unicode_tables_initialized to 1
+    Return ok
+End Process

@@ -1,0 +1,408 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+ATOMIC<T> - Typed atomic operations with C11/C++11 memory ordering.
+
+Provides typed atomic cells parametric by primitive type:
+  AtomicInt32, AtomicInt64, AtomicUInt32, AtomicUInt64,
+  AtomicBool, AtomicPointer
+
+All cells share the same 16-byte layout but interpret the value field
+according to the type code. The width drives the masking applied on load.
+
+Memory ordering codes (C11 std::memory_order):
+  RELAXED  = 0
+  ACQUIRE  = 1
+  RELEASE  = 2
+  ACQ_REL  = 3
+  SEQ_CST  = 4
+
+Atomic cell layout (16 bytes):
+  offset 0: value (8 bytes) - the atomic word (8B for all variants)
+  offset 8: type_code + width packed (1B type, 7B reserved/width)
+
+Type codes:
+  1 = Int32        (signed 32-bit)
+  2 = Int64        (signed 64-bit)
+  3 = UInt32       (unsigned 32-bit, masked to 0..2^32-1)
+  4 = UInt64       (unsigned 64-bit)
+  5 = Bool         (0 or 1)
+  6 = Pointer      (64-bit pointer)
+
+Dependencies:
+- core/atomic_core.runa (underlying ordered atomic ops)
+- memory/layout.runa (allocation)
+:End Note
+
+Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Note: Memory ordering constants
+Constant ORDER_RELAXED as Integer is 0
+Constant ORDER_ACQUIRE as Integer is 1
+Constant ORDER_RELEASE as Integer is 2
+Constant ORDER_ACQ_REL as Integer is 3
+Constant ORDER_SEQ_CST as Integer is 4
+
+Note: Type codes
+Constant ATOMIC_TYPE_INT32 as Integer is 1
+Constant ATOMIC_TYPE_INT64 as Integer is 2
+Constant ATOMIC_TYPE_UINT32 as Integer is 3
+Constant ATOMIC_TYPE_UINT64 as Integer is 4
+Constant ATOMIC_TYPE_BOOL as Integer is 5
+Constant ATOMIC_TYPE_POINTER as Integer is 6
+
+Constant ATOMIC_OFF_VALUE as Integer is 0
+Constant ATOMIC_OFF_META as Integer is 8
+Constant ATOMIC_STRUCT_SIZE as Integer is 16
+
+Note: ============================================================================
+Note: Construction
+Note: ============================================================================
+
+@Reasoning
+Internal helper: allocate a generic atomic cell with the given type code and
+initial value. The value field is initialized using atomic_store_seq_cst so
+that subsequent loads from other threads observe the initialization.
+@End Reasoning
+
+@Implementation
+Allocate 16 bytes, store the type code at offset 8, write the initial value
+with seq_cst ordering at offset 0.
+@End Implementation
+
+@Performance_Hints
+Construction cost is one allocation plus one seq_cst store.
+@End Performance_Hints
+
+@Security_Scope
+The returned pointer is to heap-owned storage; release with atomic_destroy.
+@End Security_Scope
+
+Process called "atomic_alloc_typed" takes initial_value as Integer, type_code as Integer returns Integer:
+    Let a be proc allocate from Memory with ATOMIC_STRUCT_SIZE
+    If a is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with a, ATOMIC_OFF_META, type_code
+    proc atomic_store_seq_cst from Atomic with a, initial_value
+    Return a
+End Process
+
+Process called "atomic_int32_create" takes initial_value as Integer returns Integer:
+    Return proc atomic_alloc_typed with initial_value, ATOMIC_TYPE_INT32
+End Process
+
+Process called "atomic_int64_create" takes initial_value as Integer returns Integer:
+    Return proc atomic_alloc_typed with initial_value, ATOMIC_TYPE_INT64
+End Process
+
+Process called "atomic_uint32_create" takes initial_value as Integer returns Integer:
+    Return proc atomic_alloc_typed with initial_value, ATOMIC_TYPE_UINT32
+End Process
+
+Process called "atomic_uint64_create" takes initial_value as Integer returns Integer:
+    Return proc atomic_alloc_typed with initial_value, ATOMIC_TYPE_UINT64
+End Process
+
+Process called "atomic_bool_create" takes initial_value as Integer returns Integer:
+    Let v be 0
+    If initial_value is not equal to 0:
+        Set v to 1
+    End If
+    Return proc atomic_alloc_typed with v, ATOMIC_TYPE_BOOL
+End Process
+
+Process called "atomic_pointer_create" takes initial_ptr as Integer returns Integer:
+    Return proc atomic_alloc_typed with initial_ptr, ATOMIC_TYPE_POINTER
+End Process
+
+Process called "atomic_destroy" takes a as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    proc deallocate from Memory with a
+    Return 1
+End Process
+
+Process called "atomic_get_type" takes a as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+End Process
+
+Note: ============================================================================
+Note: Sign-extension and masking helpers
+Note: ============================================================================
+
+@Reasoning
+Since the underlying atomic ops operate on 64-bit words, we mask / sign
+extend the result to match the typed width on load. Stores accept either
+form; the underlying store is bit-identical.
+@End Reasoning
+
+@Implementation
+Bitwise mask to the type's width; for signed types check the sign bit and
+extend.
+@End Implementation
+
+@Performance_Hints
+Bitwise mask is single-cycle on all targets.
+@End Performance_Hints
+
+@Security_Scope
+Pure value-domain transformation. Safe.
+@End Security_Scope
+
+Process called "atomic_mask_for_type" takes raw_value as Integer, type_code as Integer returns Integer:
+    Note: bool: 0 or 1
+    If type_code is equal to ATOMIC_TYPE_BOOL:
+        If raw_value is not equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Note: int32 / uint32: mask to 32 bits
+    If type_code is equal to ATOMIC_TYPE_UINT32:
+        Return raw_value bitwise and 4294967295
+    End If
+    If type_code is equal to ATOMIC_TYPE_INT32:
+        Let masked be raw_value bitwise and 4294967295
+        Note: Sign extend
+        Let sign_bit be masked bitwise and 2147483648
+        If sign_bit is not equal to 0:
+            Let high_bits be 18446744069414584320  Note: 0xFFFFFFFF00000000
+            Return masked bitwise or high_bits
+        End If
+        Return masked
+    End If
+
+    Note: int64, uint64, pointer: return as-is
+    Return raw_value
+End Process
+
+Note: ============================================================================
+Note: Load / Store
+Note: ============================================================================
+
+@Reasoning
+Typed atomic load with explicit memory ordering. Returns the value with
+type-correct masking applied so signed narrows sign-extend.
+@End Reasoning
+
+@Implementation
+Dispatch to the underlying atomic_core ordered load function based on the
+ordering parameter, then mask the result based on the atomic's type code.
+@End Implementation
+
+@Performance_Hints
+Relaxed loads are the cheapest; acquire/seq_cst add fence cost on weakly
+ordered architectures (ARM/RISC-V/PowerPC).
+@End Performance_Hints
+
+@Security_Scope
+Safe. Returned value is a transient read.
+@End Security_Scope
+
+Process called "atomic_load" takes a as Integer, order as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Let raw be 0
+    If order is equal to ORDER_RELAXED:
+        Set raw to proc atomic_load_relaxed from Atomic with a
+    Otherwise:
+        If order is equal to ORDER_ACQUIRE:
+            Set raw to proc atomic_load_acquire from Atomic with a
+        Otherwise:
+            Note: All other orderings degrade to seq_cst load (release on load is invalid)
+            Set raw to proc atomic_load_seq_cst from Atomic with a
+        End If
+    End If
+    Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+    Return proc atomic_mask_for_type with raw, type_code
+End Process
+
+@Reasoning
+Typed atomic store with explicit memory ordering.
+@End Reasoning
+
+@Implementation
+Mask the value to the atomic's type, then dispatch to the underlying
+atomic_core ordered store function.
+@End Implementation
+
+@Performance_Hints
+Relaxed stores are cheapest; release/seq_cst add fence cost on weak archs.
+@End Performance_Hints
+
+@Security_Scope
+Caller-supplied value pointer is stored verbatim.
+@End Security_Scope
+
+Process called "atomic_store" takes a as Integer, value as Integer, order as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+    Let masked be proc atomic_mask_for_type with value, type_code
+    If order is equal to ORDER_RELAXED:
+        Return proc atomic_store_relaxed from Atomic with a, masked
+    End If
+    If order is equal to ORDER_RELEASE:
+        Return proc atomic_store_release from Atomic with a, masked
+    End If
+    Note: All other orderings (including acquire-on-store which is invalid)
+    Note: degrade to seq_cst.
+    Return proc atomic_store_seq_cst from Atomic with a, masked
+End Process
+
+Note: ============================================================================
+Note: CAS
+Note: ============================================================================
+
+@Reasoning
+Compare-exchange: atomically compares the current value with `expected`,
+and if equal stores `desired`. Returns 1 on success, 0 on failure (caller
+can re-read with atomic_load to retry).
+@End Reasoning
+
+@Implementation
+Apply type-masking to expected and desired, then delegate to the strong
+CAS provided by atomic_core.
+@End Implementation
+
+@Performance_Hints
+CAS is the most expensive single atomic op; design lock-free algorithms
+to minimize the CAS rate.
+@End Performance_Hints
+
+@Security_Scope
+Strong CAS: never spuriously fails.
+@End Security_Scope
+
+Process called "atomic_compare_exchange" takes a as Integer, expected as Integer, desired as Integer, success_order as Integer, failure_order as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+    Let exp_masked be proc atomic_mask_for_type with expected, type_code
+    Let des_masked be proc atomic_mask_for_type with desired, type_code
+    Note: Underlying CAS uses seq_cst; success/failure ordering params are
+    Note: accepted but not yet differentiated from seq_cst until v0.0.8.6
+    Note: lands typed-relaxed CAS in the assembly layer.
+    Return proc atomic_compare_and_swap from Atomic with a, exp_masked, des_masked
+End Process
+
+Process called "atomic_compare_exchange_weak" takes a as Integer, expected as Integer, desired as Integer, success_order as Integer, failure_order as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+    Let exp_masked be proc atomic_mask_for_type with expected, type_code
+    Let des_masked be proc atomic_mask_for_type with desired, type_code
+    Return proc atomic_compare_and_swap_weak from Atomic with a, exp_masked, des_masked
+End Process
+
+Note: ============================================================================
+Note: Read-modify-write
+Note: ============================================================================
+
+@Reasoning
+Read-modify-write operations return the OLD value (fetch_*) and apply the
+operation atomically. Memory ordering currently uses seq_cst at the
+atomic_core layer; the order parameter is recorded for future expansion.
+@End Reasoning
+
+@Implementation
+Delegate to atomic_core fetch_* operations. Mask the result to the type
+width.
+@End Implementation
+
+@Performance_Hints
+On x86, these compile to LOCK-prefixed instructions. On ARM/RISC-V they
+compile to LL/SC loops.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "atomic_fetch_add" takes a as Integer, delta as Integer, order as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Let raw be proc atomic_fetch_add from Atomic with a, delta
+    Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+    Return proc atomic_mask_for_type with raw, type_code
+End Process
+
+Process called "atomic_fetch_sub" takes a as Integer, delta as Integer, order as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Let raw be proc atomic_fetch_sub from Atomic with a, delta
+    Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+    Return proc atomic_mask_for_type with raw, type_code
+End Process
+
+Process called "atomic_fetch_and" takes a as Integer, mask as Integer, order as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Let raw be proc atomic_fetch_and from Atomic with a, mask
+    Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+    Return proc atomic_mask_for_type with raw, type_code
+End Process
+
+Process called "atomic_fetch_or" takes a as Integer, mask as Integer, order as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Let raw be proc atomic_fetch_or from Atomic with a, mask
+    Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+    Return proc atomic_mask_for_type with raw, type_code
+End Process
+
+Process called "atomic_fetch_xor" takes a as Integer, mask as Integer, order as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Let raw be proc atomic_fetch_xor from Atomic with a, mask
+    Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+    Return proc atomic_mask_for_type with raw, type_code
+End Process
+
+Process called "atomic_exchange" takes a as Integer, value as Integer, order as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Let type_code be proc memory_get_int64 from Mem with a, ATOMIC_OFF_META
+    Let masked be proc atomic_mask_for_type with value, type_code
+    Let raw be proc atomic_exchange from Atomic with a, masked
+    Return proc atomic_mask_for_type with raw, type_code
+End Process
+
+Note: ============================================================================
+Note: Memory fences
+Note: ============================================================================
+
+Process called "atomic_fence" takes order as Integer returns Integer:
+    If order is equal to ORDER_ACQUIRE:
+        Return proc memory_barrier_acquire from Atomic
+    End If
+    If order is equal to ORDER_RELEASE:
+        Return proc memory_barrier_release from Atomic
+    End If
+    If order is equal to ORDER_ACQ_REL:
+        Return proc memory_barrier_full from Atomic
+    End If
+    Note: SEQ_CST and any other order
+    Return proc memory_barrier_seq_cst from Atomic
+End Process

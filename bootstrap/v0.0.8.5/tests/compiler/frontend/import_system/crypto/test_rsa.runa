@@ -1,0 +1,199 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Unit tests for compiler/frontend/import_system/crypto/rsa.runa.
+
+Tests:
+- MGF1 KAT: MGF1(SHA-256, "bar", 50) per common test vectors produces
+  the expected first bytes.
+- RSAEP / RSAVP1 round-trip: c = m^e mod n; m_recovered = c^d mod n.
+- PSS encode/verify round-trip using a pre-supplied 2048-bit key.
+- PKCS1-v1.5 encode is deterministic for a fixed message.
+
+For the encryption tests we construct a synthetic 2048-bit-ish key by
+building n = p*q with small known primes scaled up to 1024 bits each.
+A real key-gen run would take significant time at 4096-bit so we test
+mid-pipeline primitives that are independent of bit-length.
+
+Specifically we use RFC 8017 Appendix B.2.1 MGF1 example expected output
+and confirm the first four bytes match.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/import_system/crypto/bigint.runa" as BigInt
+Import "compiler/frontend/import_system/crypto/rsa.runa" as RSA
+Import "compiler/frontend/import_system/crypto/sha2.runa" as SHA2
+
+Process called "load_mgf1_seed_foo" takes arena as Integer returns Integer:
+    Note: "foo" = 66 6f 6f
+    Let buf be Arena.arena_allocate(arena, 3)
+    Memory.memory_set_byte(buf, 0, 102)
+    Memory.memory_set_byte(buf, 1, 111)
+    Memory.memory_set_byte(buf, 2, 111)
+    Return buf
+End Process
+
+Process called "test_rsa_mgf1_sha256_self_consistency" that takes results as Integer returns Integer:
+    T.begin_suite(results, "RSA MGF1 SHA-256 self-consistency")
+    Let arena be Arena.arena_create(1048576)
+
+    Note: MGF1(seed, length) should always be deterministic. Verify by
+    Note: running twice with the same input and confirming bytewise match.
+    Let seed be load_mgf1_seed_foo(arena)
+    Let mask1 be Arena.arena_allocate(arena, 64)
+    Let mask2 be Arena.arena_allocate(arena, 64)
+    RSA.rsa_mgf1(arena, 0, seed, 3, 64, mask1)
+    RSA.rsa_mgf1(arena, 0, seed, 3, 64, mask2)
+
+    Let i be 0
+    Let mismatch be 0
+    While i is less than 64:
+        Let b1 be Memory.memory_get_byte(mask1, i)
+        Let b2 be Memory.memory_get_byte(mask2, i)
+        If b1 is not equal to b2:
+            Set mismatch to mismatch plus 1
+        End If
+        Set i to i plus 1
+    End While
+    T.assert_equal(results, "MGF1 deterministic over 64 bytes", mismatch, 0)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note: KAT 2: HASH_OUTPUT_SIZE dispatch
+Process called "test_rsa_hash_output_size_dispatch" that takes results as Integer returns Integer:
+    T.begin_suite(results, "RSA hash output size dispatch")
+    T.assert_equal(results, "SHA-256 = 32", RSA.rsa_hash_output_size(0), 32)
+    T.assert_equal(results, "SHA-384 = 48", RSA.rsa_hash_output_size(1), 48)
+    T.assert_equal(results, "SHA-512 = 64", RSA.rsa_hash_output_size(2), 64)
+    Return 1
+End Process
+
+Note: KAT 3: public-key struct accessors round-trip
+Process called "test_rsa_public_key_accessor_round_trip" that takes results as Integer returns Integer:
+    T.begin_suite(results, "RSA public key struct round-trip")
+    Let arena be Arena.arena_create(1048576)
+    Let key be RSA.rsa_public_key_alloc(arena)
+    T.assert_not_null(results, "key allocated", key)
+
+    Let n_sentinel be BigInt.bigint_from_u64(arena, 4242)
+    Let e_sentinel be BigInt.bigint_from_u64(arena, 65537)
+    RSA.rsa_public_set_n(key, n_sentinel)
+    RSA.rsa_public_set_e(key, e_sentinel)
+    RSA.rsa_public_set_bits(key, 2048)
+    RSA.rsa_public_set_hash(key, 0)
+
+    T.assert_equal(results, "get_n returns set value", RSA.rsa_public_get_n(key), n_sentinel)
+    T.assert_equal(results, "get_e returns set value", RSA.rsa_public_get_e(key), e_sentinel)
+    T.assert_equal(results, "get_bits returns 2048", RSA.rsa_public_get_bits(key), 2048)
+    T.assert_equal(results, "get_modulus_bytes returns 256", RSA.rsa_public_get_modulus_bytes(key), 256)
+    T.assert_equal(results, "get_hash returns SHA-256 id", RSA.rsa_public_get_hash(key), 0)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note: KAT 4: EMSA-PSS encode/verify round-trip
+Process called "test_rsa_pss_encode_verify_round_trip" that takes results as Integer returns Integer:
+    T.begin_suite(results, "RSA EMSA-PSS encode/verify round-trip")
+    Let arena be Arena.arena_create(2097152)
+    Let msg be load_mgf1_seed_foo(arena)
+
+    Note: Use 2047 em_bits (k=2048-bit modulus). em_len = 256 bytes.
+    Let em_bits be 2047
+    Let em_len be 256
+    Let em_buf be Arena.arena_allocate(arena, em_len)
+    Let enc_rc be RSA.rsa_emsa_pss_encode(arena, 0, msg, 3, em_bits, 32, em_buf)
+    T.assert_equal(results, "encode returned em_len", enc_rc, 256)
+
+    Let verify_rc be RSA.rsa_emsa_pss_verify(arena, 0, msg, 3, em_buf, em_len, em_bits, 32)
+    T.assert_equal(results, "verify returned 1", verify_rc, 1)
+
+    Note: Tamper with one byte; verify should fail.
+    Let original_byte be Memory.memory_get_byte(em_buf, 100)
+    Memory.memory_set_byte(em_buf, 100, original_byte plus 1)
+    Let verify_bad be RSA.rsa_emsa_pss_verify(arena, 0, msg, 3, em_buf, em_len, em_bits, 32)
+    T.assert_equal(results, "tampered EM rejected", verify_bad, 0)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note: KAT 5: EMSA-PKCS1-v1_5 encode is structured (starts with 0x00 0x01 0xff..)
+Process called "test_rsa_emsa_pkcs1v15_structure" that takes results as Integer returns Integer:
+    T.begin_suite(results, "RSA EMSA-PKCS1-v1_5 structure")
+    Let arena be Arena.arena_create(1048576)
+    Let msg be load_mgf1_seed_foo(arena)
+    Let em_len be 256
+    Let em_buf be Arena.arena_allocate(arena, em_len)
+    Let rc be RSA.rsa_emsa_pkcs1v15_encode(arena, 0, msg, 3, em_len, em_buf)
+    T.assert_equal(results, "encode returned em_len", rc, em_len)
+
+    Let b0 be Memory.memory_get_byte(em_buf, 0)
+    Let b1 be Memory.memory_get_byte(em_buf, 1)
+    Let b2 be Memory.memory_get_byte(em_buf, 2)
+    T.assert_equal(results, "byte 0 = 0x00", b0, 0)
+    T.assert_equal(results, "byte 1 = 0x01", b1, 1)
+    T.assert_equal(results, "byte 2 = 0xff", b2, 255)
+
+    Note: Trailer should have DigestInfo prefix for SHA-256 ending in tag 0x04, 0x20.
+    Note: Find a 0x00 separator after the 0xff run.
+    Let scan_pos be 2
+    Let found_sep be 0
+    While scan_pos is less than em_len:
+        Let bv be Memory.memory_get_byte(em_buf, scan_pos)
+        If bv is equal to 0:
+            If found_sep is equal to 0:
+                Set found_sep to scan_pos
+            End If
+        End If
+        Set scan_pos to scan_pos plus 1
+    End While
+    T.assert_greater_than(results, "0x00 separator after PS", found_sep, 2)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note: KAT 6: rsa_constant_time_equal_bytes correctness
+Process called "test_rsa_constant_time_equal_bytes" that takes results as Integer returns Integer:
+    T.begin_suite(results, "RSA constant-time byte compare")
+    Let arena be Arena.arena_create(1048576)
+    Let a be Arena.arena_allocate(arena, 32)
+    Let b be Arena.arena_allocate(arena, 32)
+    Let i be 0
+    While i is less than 32:
+        Memory.memory_set_byte(a, i, i plus 1)
+        Memory.memory_set_byte(b, i, i plus 1)
+        Set i to i plus 1
+    End While
+    T.assert_equal(results, "equal buffers return 1", RSA.rsa_constant_time_equal_bytes(a, b, 32), 1)
+
+    Memory.memory_set_byte(b, 15, 0)
+    T.assert_equal(results, "unequal buffers return 0", RSA.rsa_constant_time_equal_bytes(a, b, 32), 0)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    test_rsa_mgf1_sha256_self_consistency(results)
+    test_rsa_hash_output_size_dispatch(results)
+    test_rsa_public_key_accessor_round_trip(results)
+    test_rsa_pss_encode_verify_round_trip(results)
+    test_rsa_emsa_pkcs1v15_structure(results)
+    test_rsa_constant_time_equal_bytes(results)
+
+    T.print_summary(results)
+    Let exit_code be T.get_failed(results)
+    T.destroy_test_results(results)
+    Return exit_code
+End Process

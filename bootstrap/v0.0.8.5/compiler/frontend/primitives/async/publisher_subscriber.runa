@@ -1,0 +1,437 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+PUBLISHER<T> / SUBSCRIBER<T> - Multicast pub/sub with backpressure.
+
+A Publisher fans out values to multiple Subscribers. Each Subscriber has
+its own bounded channel (backpressure: slow subscribers can be dropped or
+back the publisher up depending on policy).
+
+Publisher layout (40 bytes):
+  offset 0:  subscribers_list_head (8 bytes) - linked list of subscriber records
+  offset 8:  subscriber_count      (8 bytes)
+  offset 16: mutex_ptr             (8 bytes) - protects subscribers list
+  offset 24: state                 (8 bytes) (0=open, 1=closed)
+  offset 32: policy                (8 bytes) (0=block, 1=drop_oldest, 2=drop_newest)
+
+Subscriber list node (32 bytes):
+  offset 0:  next_ptr            (8 bytes)
+  offset 8:  channel_ptr         (8 bytes)
+  offset 16: subscription_id     (8 bytes)
+  offset 24: active_flag         (8 bytes)
+
+Subscription handle (16 bytes):
+  offset 0: publisher_ptr  (8 bytes)
+  offset 8: subscription_id (8 bytes)
+
+Dependencies:
+- concurrency/channel.runa
+- threading/sync_core.runa
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/concurrency/channel.runa" as Chan
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Constant PUB_OFF_HEAD as Integer is 0
+Constant PUB_OFF_COUNT as Integer is 8
+Constant PUB_OFF_MUTEX as Integer is 16
+Constant PUB_OFF_STATE as Integer is 24
+Constant PUB_OFF_POLICY as Integer is 32
+Constant PUB_STRUCT_SIZE as Integer is 40
+
+Constant SUB_NODE_NEXT as Integer is 0
+Constant SUB_NODE_CHAN as Integer is 8
+Constant SUB_NODE_ID as Integer is 16
+Constant SUB_NODE_ACTIVE as Integer is 24
+Constant SUB_NODE_SIZE as Integer is 32
+
+Constant HANDLE_PUB as Integer is 0
+Constant HANDLE_ID as Integer is 8
+Constant HANDLE_SIZE as Integer is 16
+
+Constant PUB_STATE_OPEN as Integer is 0
+Constant PUB_STATE_CLOSED as Integer is 1
+
+Constant POLICY_BLOCK as Integer is 0
+Constant POLICY_DROP_OLDEST as Integer is 1
+Constant POLICY_DROP_NEWEST as Integer is 2
+
+Constant PUBSUB_OK as Integer is 1
+Constant PUBSUB_ERR_INVALID as Integer is 0
+Constant PUBSUB_ERR_CLOSED as Integer is -1
+
+@Reasoning
+Create a publisher with the specified backpressure policy.
+@End Reasoning
+
+@Implementation
+Allocate the publisher record + its mutex.
+@End Implementation
+
+@Performance_Hints
+One alloc + one mutex create.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "publisher_create" takes policy as Integer returns Integer:
+    Let p be proc allocate from Memory with PUB_STRUCT_SIZE
+    If p is equal to 0:
+        Return 0
+    End If
+    Let mutex_ptr be proc mutex_create from Sync
+    If mutex_ptr is equal to 0:
+        proc deallocate from Memory with p
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with p, PUB_OFF_HEAD, 0
+    proc memory_set_int64 from Mem with p, PUB_OFF_COUNT, 0
+    proc memory_set_int64 from Mem with p, PUB_OFF_MUTEX, mutex_ptr
+    proc memory_set_int64 from Mem with p, PUB_OFF_STATE, PUB_STATE_OPEN
+    proc memory_set_int64 from Mem with p, PUB_OFF_POLICY, policy
+    Return p
+End Process
+
+@Reasoning
+Subscribe with a chosen buffer capacity. Returns an opaque subscription
+handle whose channel can be read via subscriber_receive.
+@End Reasoning
+
+@Implementation
+Allocate a subscriber node and per-subscriber channel, push the node onto
+the publisher's subscribers list under the lock. Allocate and return a
+handle.
+@End Implementation
+
+@Performance_Hints
+One alloc per subscriber + one channel create + lock acquire.
+@End Performance_Hints
+
+@Security_Scope
+Subscription handle must be released via subscriber_destroy.
+@End Security_Scope
+
+Process called "publisher_subscribe" takes pub as Integer, buffer_capacity as Integer returns Integer:
+    If pub is equal to 0:
+        Return 0
+    End If
+
+    Let node be proc allocate from Memory with SUB_NODE_SIZE
+    If node is equal to 0:
+        Return 0
+    End If
+    Let ch be proc channel_create from Chan with buffer_capacity
+    If ch is equal to 0:
+        proc deallocate from Memory with node
+        Return 0
+    End If
+
+    Let mutex_ptr be proc memory_get_int64 from Mem with pub, PUB_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let count be proc memory_get_int64 from Mem with pub, PUB_OFF_COUNT
+    Let new_count be count plus 1
+    Let sub_id be new_count
+
+    proc memory_set_int64 from Mem with node, SUB_NODE_CHAN, ch
+    proc memory_set_int64 from Mem with node, SUB_NODE_ID, sub_id
+    proc memory_set_int64 from Mem with node, SUB_NODE_ACTIVE, 1
+    Let head be proc memory_get_int64 from Mem with pub, PUB_OFF_HEAD
+    proc memory_set_int64 from Mem with node, SUB_NODE_NEXT, head
+    proc memory_set_int64 from Mem with pub, PUB_OFF_HEAD, node
+    proc memory_set_int64 from Mem with pub, PUB_OFF_COUNT, new_count
+
+    proc mutex_unlock from Sync with mutex_ptr
+
+    Let h be proc allocate from Memory with HANDLE_SIZE
+    If h is equal to 0:
+        Note: Roll back addition
+        proc mutex_lock from Sync with mutex_ptr
+        proc memory_set_int64 from Mem with pub, PUB_OFF_HEAD, head
+        proc memory_set_int64 from Mem with pub, PUB_OFF_COUNT, count
+        proc mutex_unlock from Sync with mutex_ptr
+        proc channel_destroy from Chan with ch
+        proc deallocate from Memory with node
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with h, HANDLE_PUB, pub
+    proc memory_set_int64 from Mem with h, HANDLE_ID, sub_id
+    Return h
+End Process
+
+@Reasoning
+Find a subscriber node by id under the publisher's lock. Returns the node
+pointer or 0.
+@End Reasoning
+
+@Implementation
+Walk the linked list.
+@End Implementation
+
+@Performance_Hints
+O(n) in subscriber count. For pub/sub typically small.
+@End Performance_Hints
+
+@Security_Scope
+Caller MUST hold the publisher's mutex.
+@End Security_Scope
+
+Process called "publisher_find_subscriber_locked" takes pub as Integer, sub_id as Integer returns Integer:
+    Let cur be proc memory_get_int64 from Mem with pub, PUB_OFF_HEAD
+    While cur is not equal to 0:
+        Let id be proc memory_get_int64 from Mem with cur, SUB_NODE_ID
+        If id is equal to sub_id:
+            Return cur
+        End If
+        Set cur to proc memory_get_int64 from Mem with cur, SUB_NODE_NEXT
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Publish a value to all active subscribers. Backpressure handled per the
+publisher's policy: POLICY_BLOCK uses channel_send (blocks), POLICY_DROP_*
+uses try_send and either drops the new or oldest value.
+@End Reasoning
+
+@Implementation
+Under the publisher's mutex, walk the subscriber list and send to each.
+For POLICY_DROP_OLDEST, on try_send=FULL, drain one then retry.
+@End Implementation
+
+@Performance_Hints
+O(subscribers) per publish.
+@End Performance_Hints
+
+@Security_Scope
+The value pointer is delivered as-is to all subscribers; caller manages
+its lifetime accordingly.
+@End Security_Scope
+
+Process called "publisher_publish" takes pub as Integer, value_ptr as Integer returns Integer:
+    If pub is equal to 0:
+        Return PUBSUB_ERR_INVALID
+    End If
+    Let state be proc memory_get_int64 from Mem with pub, PUB_OFF_STATE
+    If state is equal to PUB_STATE_CLOSED:
+        Return PUBSUB_ERR_CLOSED
+    End If
+
+    Let mutex_ptr be proc memory_get_int64 from Mem with pub, PUB_OFF_MUTEX
+    Let policy be proc memory_get_int64 from Mem with pub, PUB_OFF_POLICY
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let cur be proc memory_get_int64 from Mem with pub, PUB_OFF_HEAD
+    While cur is not equal to 0:
+        Let active be proc memory_get_int64 from Mem with cur, SUB_NODE_ACTIVE
+        If active is equal to 1:
+            Let ch be proc memory_get_int64 from Mem with cur, SUB_NODE_CHAN
+            If policy is equal to POLICY_BLOCK:
+                proc channel_send from Chan with ch, value_ptr
+            Otherwise:
+                Let rc be proc channel_try_send from Chan with ch, value_ptr
+                If rc is not equal to 1:
+                    If policy is equal to POLICY_DROP_OLDEST:
+                        Note: Discard one buffered value to make room
+                        Let dump_holder be proc allocate from Memory with 8
+                        If dump_holder is not equal to 0:
+                            proc channel_try_receive from Chan with ch, dump_holder
+                            proc deallocate from Memory with dump_holder
+                            proc channel_try_send from Chan with ch, value_ptr
+                        End If
+                    End If
+                    Note: POLICY_DROP_NEWEST: silently discard
+                End If
+            End If
+        End If
+        Set cur to proc memory_get_int64 from Mem with cur, SUB_NODE_NEXT
+    End While
+
+    proc mutex_unlock from Sync with mutex_ptr
+    Return PUBSUB_OK
+End Process
+
+@Reasoning
+Subscriber pulls the next value from its own channel.
+@End Reasoning
+
+@Implementation
+Look up the subscriber's node and channel, channel_receive.
+@End Implementation
+
+@Performance_Hints
+One mutex acquire + one channel receive.
+@End Performance_Hints
+
+@Security_Scope
+out_value_holder must point to writable storage.
+@End Security_Scope
+
+Process called "subscriber_receive" takes handle as Integer, out_value_holder as Integer returns Integer:
+    If handle is equal to 0:
+        Return PUBSUB_ERR_INVALID
+    End If
+    If out_value_holder is equal to 0:
+        Return PUBSUB_ERR_INVALID
+    End If
+    Let pub be proc memory_get_int64 from Mem with handle, HANDLE_PUB
+    Let sub_id be proc memory_get_int64 from Mem with handle, HANDLE_ID
+    Let mutex_ptr be proc memory_get_int64 from Mem with pub, PUB_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    Let node be proc publisher_find_subscriber_locked with pub, sub_id
+    proc mutex_unlock from Sync with mutex_ptr
+
+    If node is equal to 0:
+        Return PUBSUB_ERR_INVALID
+    End If
+    Let ch be proc memory_get_int64 from Mem with node, SUB_NODE_CHAN
+    Let rc be proc channel_receive from Chan with ch, out_value_holder
+    If rc is equal to 1:
+        Return PUBSUB_OK
+    End If
+    Return PUBSUB_ERR_CLOSED
+End Process
+
+Process called "subscriber_try_receive" takes handle as Integer, out_value_holder as Integer returns Integer:
+    If handle is equal to 0:
+        Return PUBSUB_ERR_INVALID
+    End If
+    Let pub be proc memory_get_int64 from Mem with handle, HANDLE_PUB
+    Let sub_id be proc memory_get_int64 from Mem with handle, HANDLE_ID
+    Let mutex_ptr be proc memory_get_int64 from Mem with pub, PUB_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    Let node be proc publisher_find_subscriber_locked with pub, sub_id
+    proc mutex_unlock from Sync with mutex_ptr
+
+    If node is equal to 0:
+        Return PUBSUB_ERR_INVALID
+    End If
+    Let ch be proc memory_get_int64 from Mem with node, SUB_NODE_CHAN
+    Let rc be proc channel_try_receive from Chan with ch, out_value_holder
+    If rc is equal to 1:
+        Return PUBSUB_OK
+    End If
+    Return PUBSUB_ERR_CLOSED
+End Process
+
+@Reasoning
+Cancel a subscription. Removes the subscriber node from the publisher's
+list and closes its channel.
+@End Reasoning
+
+@Implementation
+Walk the list under the mutex, unlink the node by id, close its channel,
+free the node and handle.
+@End Implementation
+
+@Performance_Hints
+O(subscribers).
+@End Performance_Hints
+
+@Security_Scope
+The handle becomes invalid after this call.
+@End Security_Scope
+
+Process called "subscriber_destroy" takes handle as Integer returns Integer:
+    If handle is equal to 0:
+        Return PUBSUB_ERR_INVALID
+    End If
+    Let pub be proc memory_get_int64 from Mem with handle, HANDLE_PUB
+    Let sub_id be proc memory_get_int64 from Mem with handle, HANDLE_ID
+    Let mutex_ptr be proc memory_get_int64 from Mem with pub, PUB_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let prev be 0
+    Let cur be proc memory_get_int64 from Mem with pub, PUB_OFF_HEAD
+    Let found be 0
+    While cur is not equal to 0:
+        Let id be proc memory_get_int64 from Mem with cur, SUB_NODE_ID
+        Let next be proc memory_get_int64 from Mem with cur, SUB_NODE_NEXT
+        If id is equal to sub_id:
+            If prev is equal to 0:
+                proc memory_set_int64 from Mem with pub, PUB_OFF_HEAD, next
+            Otherwise:
+                proc memory_set_int64 from Mem with prev, SUB_NODE_NEXT, next
+            End If
+            Let count be proc memory_get_int64 from Mem with pub, PUB_OFF_COUNT
+            proc memory_set_int64 from Mem with pub, PUB_OFF_COUNT, (count minus 1)
+            Let ch be proc memory_get_int64 from Mem with cur, SUB_NODE_CHAN
+            proc channel_close from Chan with ch
+            proc channel_destroy from Chan with ch
+            proc deallocate from Memory with cur
+            Set found to 1
+            Set cur to 0
+        Otherwise:
+            Set prev to cur
+            Set cur to next
+        End If
+    End While
+
+    proc mutex_unlock from Sync with mutex_ptr
+    proc deallocate from Memory with handle
+    If found is equal to 1:
+        Return PUBSUB_OK
+    End If
+    Return PUBSUB_ERR_INVALID
+End Process
+
+Process called "publisher_close" takes pub as Integer returns Integer:
+    If pub is equal to 0:
+        Return PUBSUB_ERR_INVALID
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with pub, PUB_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    proc memory_set_int64 from Mem with pub, PUB_OFF_STATE, PUB_STATE_CLOSED
+    Let cur be proc memory_get_int64 from Mem with pub, PUB_OFF_HEAD
+    While cur is not equal to 0:
+        Let ch be proc memory_get_int64 from Mem with cur, SUB_NODE_CHAN
+        If ch is not equal to 0:
+            proc channel_close from Chan with ch
+        End If
+        Set cur to proc memory_get_int64 from Mem with cur, SUB_NODE_NEXT
+    End While
+    proc mutex_unlock from Sync with mutex_ptr
+    Return PUBSUB_OK
+End Process
+
+Process called "publisher_destroy" takes pub as Integer returns Integer:
+    If pub is equal to 0:
+        Return PUBSUB_ERR_INVALID
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with pub, PUB_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    Let cur be proc memory_get_int64 from Mem with pub, PUB_OFF_HEAD
+    While cur is not equal to 0:
+        Let next be proc memory_get_int64 from Mem with cur, SUB_NODE_NEXT
+        Let ch be proc memory_get_int64 from Mem with cur, SUB_NODE_CHAN
+        If ch is not equal to 0:
+            proc channel_close from Chan with ch
+            proc channel_destroy from Chan with ch
+        End If
+        proc deallocate from Memory with cur
+        Set cur to next
+    End While
+    proc mutex_unlock from Sync with mutex_ptr
+    proc mutex_destroy from Sync with mutex_ptr
+    proc deallocate from Memory with pub
+    Return PUBSUB_OK
+End Process
+
+Process called "publisher_subscriber_count" takes pub as Integer returns Integer:
+    If pub is equal to 0:
+        Return 0
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with pub, PUB_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    Let n be proc memory_get_int64 from Mem with pub, PUB_OFF_COUNT
+    proc mutex_unlock from Sync with mutex_ptr
+    Return n
+End Process

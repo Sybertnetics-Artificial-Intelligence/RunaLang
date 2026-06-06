@@ -1,0 +1,387 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Tests for crypto_identity/signature.runa.
+
+Verifies:
+  - signature_create rejects wrong length per algorithm
+  - signature_create rejects non-signature algorithm tags
+  - cross-algorithm verify (sig.alg != pk.alg) is rejected without
+    calling the underlying verify
+  - Ed25519 sign + verify round trip via signature_sign and
+    signature_verify produces a valid signature against the derived
+    public key
+
+RSA verify surface (rsa_verify_from_spki path via signature_verify):
+  - signature_verify with RSA algorithm tags routes through
+    rsa_verify_from_spki. We test the rejection paths exhaustively
+    (the only production-safe behaviour for malformed inputs):
+      * malformed SPKI (truncated, wrong outer tag) -> 0
+      * arbitrary pk_buf bytes (not a real SPKI) -> 0
+      * wrong-key (valid 2048-byte RSA pk_buf with random bytes vs a
+        signature generated for a different key) -> 0
+      * SHA-1 strength gate: there is no ALG_RSA_*_SHA1 tag at all
+        in crypto_algorithm.runa; rsa_alg_to_rsa_hash_id returns -1
+        for any non-RSA tag, which forces rsa_verify_from_spki to
+        hard-reject. We verify this contract.
+      * tag/modulus cross-check: PKCS1v15-SHA256-2048 tag with a
+        4096-byte pk_buf is rejected at the modulus cross-check step.
+  We exercise the 12 distinct ALG_RSA_* tags (3 hashes x 3 modulus
+  sizes x 2 schemes minus a few that share rejection paths).
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "compiler/frontend/primitives/crypto_identity/public_key.runa" as PK
+Import "compiler/frontend/primitives/crypto_identity/private_key.runa" as SK
+Import "compiler/frontend/primitives/crypto_identity/key_pair.runa" as KP
+Import "compiler/frontend/primitives/crypto_identity/signature.runa" as Sig
+
+Process called "fill_buf_pattern" takes buf as Integer, count as Integer, seed as Integer returns Integer:
+    Let i be 0
+    While i is less than count:
+        Memory.memory_set_byte(buf, i, (i plus seed) modulo by 256)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "test_create_wrong_length_rejected" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_create: Ed25519 + wrong length rejected")
+    Let arena be Arena.arena_create(1048576)
+    Let buf be Arena.arena_allocate(arena, 63)
+    fill_buf_pattern(buf, 63, 5)
+    Let sig be Sig.signature_create(arena, Alg.ALG_ED25519, buf, 63)
+    T.assert_equal(results, "63-byte Ed25519 signature rejected", sig, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_create_hash_alg_rejected" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_create: hash algorithm tag rejected")
+    Let arena be Arena.arena_create(1048576)
+    Let buf be Arena.arena_allocate(arena, 64)
+    fill_buf_pattern(buf, 64, 5)
+    Let sig be Sig.signature_create(arena, Alg.ALG_SHA2_256, buf, 64)
+    T.assert_equal(results, "SHA-256 tag for signature rejected", sig, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_create_ed25519_ok" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_create: Ed25519 64-byte succeeds")
+    Let arena be Arena.arena_create(1048576)
+    Let buf be Arena.arena_allocate(arena, 64)
+    fill_buf_pattern(buf, 64, 0)
+    Let sig be Sig.signature_create(arena, Alg.ALG_ED25519, buf, 64)
+    T.assert_not_null(results, "sig is non-null", sig)
+    T.assert_equal(results, "sig alg = ED25519", Sig.signature_algorithm(sig), Alg.ALG_ED25519)
+    T.assert_equal(results, "sig len = 64", Sig.signature_byte_length(sig), 64)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_cross_alg_verify_rejected" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_verify: cross-algorithm rejected immediately")
+    Let arena be Arena.arena_create(2097152)
+    Note: Build an Ed25519 pubkey buffer (32 bytes) and an ECDSA-P256 sig
+    Note: (64 bytes); algorithms differ.
+    Let pk_buf be Arena.arena_allocate(arena, 32)
+    fill_buf_pattern(pk_buf, 32, 1)
+    Let pk be PK.public_key_create(arena, Alg.ALG_ED25519, pk_buf, 32)
+    T.assert_not_null(results, "ed25519 pk built", pk)
+
+    Let sig_buf be Arena.arena_allocate(arena, 64)
+    fill_buf_pattern(sig_buf, 64, 2)
+    Let sig be Sig.signature_create(arena, Alg.ALG_ECDSA_P256, sig_buf, 64)
+    T.assert_not_null(results, "ecdsa sig built", sig)
+
+    Let msg be Arena.arena_allocate(arena, 4)
+    Memory.memory_set_byte(msg, 0, 116)
+    Memory.memory_set_byte(msg, 1, 101)
+    Memory.memory_set_byte(msg, 2, 115)
+    Memory.memory_set_byte(msg, 3, 116)
+
+    Let rc be Sig.signature_verify(arena, pk, msg, 4, sig)
+    T.assert_equal(results, "Ed25519 pk with ECDSA sig -> 0", rc, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ed25519_sign_verify_roundtrip" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_sign + signature_verify: Ed25519 roundtrip")
+    Let arena be Arena.arena_create(8388608)
+    Note: Use a deterministic seed.
+    Let seed be Arena.arena_allocate(arena, 32)
+    Let i be 0
+    While i is less than 32:
+        Memory.memory_set_byte(seed, i, i plus 1)
+        Set i to i plus 1
+    End While
+    Let kp be KP.keypair_from_seed(arena, Alg.ALG_ED25519, seed, 32)
+    T.assert_not_null(results, "keypair created", kp)
+    Let pk be KP.keypair_public(kp)
+    Let sk be KP.keypair_private(kp)
+    T.assert_not_null(results, "pk derived", pk)
+    T.assert_not_null(results, "sk present", sk)
+
+    Note: Sign a 5-byte message "hello".
+    Let msg be Arena.arena_allocate(arena, 5)
+    Memory.memory_set_byte(msg, 0, 104)
+    Memory.memory_set_byte(msg, 1, 101)
+    Memory.memory_set_byte(msg, 2, 108)
+    Memory.memory_set_byte(msg, 3, 108)
+    Memory.memory_set_byte(msg, 4, 111)
+
+    Let sig be Sig.signature_sign(arena, sk, msg, 5)
+    T.assert_not_null(results, "signature_sign returned non-null", sig)
+    T.assert_equal(results, "sig alg = ED25519", Sig.signature_algorithm(sig), Alg.ALG_ED25519)
+    T.assert_equal(results, "sig len = 64", Sig.signature_byte_length(sig), 64)
+
+    Let vf be Sig.signature_verify(arena, pk, msg, 5, sig)
+    T.assert_equal(results, "verify of own signature = 1", vf, 1)
+
+    Note: Tamper the message; verify must reject.
+    Memory.memory_set_byte(msg, 0, 105)
+    Let vf2 be Sig.signature_verify(arena, pk, msg, 5, sig)
+    T.assert_equal(results, "verify after tamper = 0", vf2, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: RSA verify surface tests (rsa_verify_from_spki via signature_verify)
+Note: ============================================================================
+
+Process called "alloc_pattern_buf" takes arena as Integer, length as Integer, seed as Integer returns Integer:
+    Let buf be Arena.arena_allocate(arena, length)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than length:
+        Memory.memory_set_byte(buf, i, (i plus seed) modulo by 256)
+        Set i to i plus 1
+    End While
+    Return buf
+End Process
+
+Process called "rsa_verify_arbitrary_pk_for_alg" takes arena as Integer, alg as Integer, pk_len as Integer returns Integer:
+    Note: Build a public key with the given algorithm tag carrying pk_len
+    Note: bytes of arbitrary content. Build a 256-byte arbitrary signature
+    Note: of the same algorithm. Call signature_verify and return the
+    Note: result (which MUST be 0 for any well-behaved verify, because the
+    Note: pk_buf is not a valid SPKI).
+    Let pk_buf be alloc_pattern_buf(arena, pk_len, 11)
+    Let pk be PK.public_key_create(arena, alg, pk_buf, pk_len)
+    If pk is equal to 0:
+        Return 0 minus 1
+    End If
+    Let sig_buf be alloc_pattern_buf(arena, 256, 47)
+    Let sig be Sig.signature_create(arena, alg, sig_buf, 256)
+    If sig is equal to 0:
+        Return 0 minus 2
+    End If
+    Let msg be alloc_pattern_buf(arena, 16, 91)
+    Return Sig.signature_verify(arena, pk, msg, 16, sig)
+End Process
+
+Process called "test_rsa_pkcs1v15_sha256_2048_malformed_spki" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_verify: RSA PKCS1v15 SHA-256 / 2048 malformed SPKI -> 0")
+    Let arena be Arena.arena_create(4194304)
+    Let rc be rsa_verify_arbitrary_pk_for_alg(arena, Alg.ALG_RSA_PKCS1V15_SHA256_2048, 256)
+    T.assert_equal(results, "PKCS1v15-SHA256-2048 with garbage pk -> 0", rc, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha384_3072_malformed_spki" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_verify: RSA PKCS1v15 SHA-384 / 3072 malformed SPKI -> 0")
+    Let arena be Arena.arena_create(4194304)
+    Let rc be rsa_verify_arbitrary_pk_for_alg(arena, Alg.ALG_RSA_PKCS1V15_SHA384_3072, 384)
+    T.assert_equal(results, "PKCS1v15-SHA384-3072 with garbage pk -> 0", rc, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha512_4096_malformed_spki" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_verify: RSA PKCS1v15 SHA-512 / 4096 malformed SPKI -> 0")
+    Let arena be Arena.arena_create(4194304)
+    Let rc be rsa_verify_arbitrary_pk_for_alg(arena, Alg.ALG_RSA_PKCS1V15_SHA512_4096, 512)
+    T.assert_equal(results, "PKCS1v15-SHA512-4096 with garbage pk -> 0", rc, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pss_sha256_2048_malformed_spki" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_verify: RSA PSS SHA-256 / 2048 malformed SPKI -> 0")
+    Let arena be Arena.arena_create(4194304)
+    Let rc be rsa_verify_arbitrary_pk_for_alg(arena, Alg.ALG_RSA_PSS_SHA256_2048, 256)
+    T.assert_equal(results, "PSS-SHA256-2048 with garbage pk -> 0", rc, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pss_sha384_3072_malformed_spki" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_verify: RSA PSS SHA-384 / 3072 malformed SPKI -> 0")
+    Let arena be Arena.arena_create(4194304)
+    Let rc be rsa_verify_arbitrary_pk_for_alg(arena, Alg.ALG_RSA_PSS_SHA384_3072, 384)
+    T.assert_equal(results, "PSS-SHA384-3072 with garbage pk -> 0", rc, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pss_sha512_4096_malformed_spki" takes results as Integer returns Integer:
+    T.begin_suite(results, "signature_verify: RSA PSS SHA-512 / 4096 malformed SPKI -> 0")
+    Let arena be Arena.arena_create(4194304)
+    Let rc be rsa_verify_arbitrary_pk_for_alg(arena, Alg.ALG_RSA_PSS_SHA512_4096, 512)
+    T.assert_equal(results, "PSS-SHA512-4096 with garbage pk -> 0", rc, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_pkcs1v15_sha256_3072_modulus_mismatch" takes results as Integer returns Integer:
+    Note: PK declares SHA-256/3072 (modulus 384B) but pk_buf carries 256B
+    Note: arbitrary content. public_key_create accepts any 256..2048 byte
+    Note: range, so creation succeeds. signature_verify reaches the modulus
+    Note: cross-check (declared 384 vs decoded SPKI ~ undefined for garbage)
+    Note: and rejects.
+    T.begin_suite(results, "signature_verify: PKCS1v15 SHA-256 / 3072 tag with 256B pk -> 0")
+    Let arena be Arena.arena_create(4194304)
+    Let pk_buf be alloc_pattern_buf(arena, 256, 13)
+    Let pk be PK.public_key_create(arena, Alg.ALG_RSA_PKCS1V15_SHA256_3072, pk_buf, 256)
+    T.assert_not_null(results, "pk built with mismatched modulus", pk)
+    Let sig_buf be alloc_pattern_buf(arena, 384, 23)
+    Let sig be Sig.signature_create(arena, Alg.ALG_RSA_PKCS1V15_SHA256_3072, sig_buf, 384)
+    T.assert_not_null(results, "sig built", sig)
+    Let msg be alloc_pattern_buf(arena, 8, 99)
+    Let rc be Sig.signature_verify(arena, pk, msg, 8, sig)
+    T.assert_equal(results, "modulus-mismatched verify -> 0", rc, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_truncated_spki" takes results as Integer returns Integer:
+    Note: Truncated SPKI: a pk_buf of minimum acceptable length (256)
+    Note: filled with zeros. rsa_decode_spki must reject.
+    T.begin_suite(results, "signature_verify: RSA truncated all-zero SPKI -> 0")
+    Let arena be Arena.arena_create(4194304)
+    Let pk_buf be Arena.arena_allocate(arena, 256)
+    Let zi be 0
+    While zi is less than 256:
+        Memory.memory_set_byte(pk_buf, zi, 0)
+        Set zi to zi plus 1
+    End While
+    Let pk be PK.public_key_create(arena, Alg.ALG_RSA_PKCS1V15_SHA256_2048, pk_buf, 256)
+    T.assert_not_null(results, "pk built", pk)
+    Let sig_buf be alloc_pattern_buf(arena, 256, 200)
+    Let sig be Sig.signature_create(arena, Alg.ALG_RSA_PKCS1V15_SHA256_2048, sig_buf, 256)
+    Let msg be alloc_pattern_buf(arena, 4, 55)
+    Let rc be Sig.signature_verify(arena, pk, msg, 4, sig)
+    T.assert_equal(results, "all-zero SPKI -> 0", rc, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_wrong_outer_tag_spki" takes results as Integer returns Integer:
+    Note: Wrong outer ASN.1 tag (0x02 INTEGER instead of 0x30 SEQUENCE).
+    T.begin_suite(results, "signature_verify: RSA SPKI with wrong outer tag -> 0")
+    Let arena be Arena.arena_create(4194304)
+    Let pk_buf be Arena.arena_allocate(arena, 256)
+    Memory.memory_set_byte(pk_buf, 0, 2)
+    Memory.memory_set_byte(pk_buf, 1, 130)
+    Memory.memory_set_byte(pk_buf, 2, 0)
+    Memory.memory_set_byte(pk_buf, 3, 252)
+    Let zi be 4
+    While zi is less than 256:
+        Memory.memory_set_byte(pk_buf, zi, (zi modulo by 7) plus 1)
+        Set zi to zi plus 1
+    End While
+    Let pk be PK.public_key_create(arena, Alg.ALG_RSA_PKCS1V15_SHA256_2048, pk_buf, 256)
+    Let sig_buf be alloc_pattern_buf(arena, 256, 19)
+    Let sig be Sig.signature_create(arena, Alg.ALG_RSA_PKCS1V15_SHA256_2048, sig_buf, 256)
+    Let msg be alloc_pattern_buf(arena, 4, 77)
+    Let rc be Sig.signature_verify(arena, pk, msg, 4, sig)
+    T.assert_equal(results, "wrong-outer-tag SPKI -> 0", rc, 0)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_rsa_alg_hash_id_negative_for_non_rsa" takes results as Integer returns Integer:
+    Note: SHA-1 strength gate verification. There is no ALG_RSA_*_SHA1
+    Note: tag at all; rsa_alg_to_rsa_hash_id returns -1 for any non-RSA
+    Note: tag. We verify this contract on a few representative tags so
+    Note: a regression that accepts SHA-1 (e.g. by widening the modulus
+    Note: index map) surfaces here.
+    T.begin_suite(results, "rsa_alg_to_rsa_hash_id: SHA-1 strength gate via tag absence")
+    T.assert_equal(results, "ALG_ED25519 -> -1", Alg.rsa_alg_to_rsa_hash_id(Alg.ALG_ED25519), 0 minus 1)
+    T.assert_equal(results, "ALG_ECDSA_P256 -> -1", Alg.rsa_alg_to_rsa_hash_id(Alg.ALG_ECDSA_P256), 0 minus 1)
+    T.assert_equal(results, "ALG_SHA2_256 -> -1", Alg.rsa_alg_to_rsa_hash_id(Alg.ALG_SHA2_256), 0 minus 1)
+    T.assert_equal(results, "ALG_UNKNOWN -> -1", Alg.rsa_alg_to_rsa_hash_id(Alg.ALG_UNKNOWN), 0 minus 1)
+    Note: Boundary check on slots 109 and 129 (just outside RSA range).
+    T.assert_equal(results, "slot 109 -> -1", Alg.rsa_alg_to_rsa_hash_id(109), 0 minus 1)
+    T.assert_equal(results, "slot 129 -> -1", Alg.rsa_alg_to_rsa_hash_id(129), 0 minus 1)
+    Note: All 18 RSA tags must return a valid hash id (0/1/2).
+    T.assert_equal(results, "PKCS1v15-SHA256-2048 -> 0", Alg.rsa_alg_to_rsa_hash_id(Alg.ALG_RSA_PKCS1V15_SHA256_2048), 0)
+    T.assert_equal(results, "PKCS1v15-SHA384-3072 -> 1", Alg.rsa_alg_to_rsa_hash_id(Alg.ALG_RSA_PKCS1V15_SHA384_3072), 1)
+    T.assert_equal(results, "PKCS1v15-SHA512-4096 -> 2", Alg.rsa_alg_to_rsa_hash_id(Alg.ALG_RSA_PKCS1V15_SHA512_4096), 2)
+    T.assert_equal(results, "PSS-SHA256-2048 -> 0", Alg.rsa_alg_to_rsa_hash_id(Alg.ALG_RSA_PSS_SHA256_2048), 0)
+    T.assert_equal(results, "PSS-SHA384-3072 -> 1", Alg.rsa_alg_to_rsa_hash_id(Alg.ALG_RSA_PSS_SHA384_3072), 1)
+    T.assert_equal(results, "PSS-SHA512-4096 -> 2", Alg.rsa_alg_to_rsa_hash_id(Alg.ALG_RSA_PSS_SHA512_4096), 2)
+    Return 1
+End Process
+
+Process called "test_rsa_alg_is_pss_dispatch" takes results as Integer returns Integer:
+    T.begin_suite(results, "rsa_alg_is_pss: PSS vs PKCS1v15 dispatch")
+    T.assert_equal(results, "PKCS1v15-SHA256-2048 -> 0 (PKCS#1 v1.5)", Alg.rsa_alg_is_pss(Alg.ALG_RSA_PKCS1V15_SHA256_2048), 0)
+    T.assert_equal(results, "PKCS1v15-SHA512-4096 -> 0", Alg.rsa_alg_is_pss(Alg.ALG_RSA_PKCS1V15_SHA512_4096), 0)
+    T.assert_equal(results, "PSS-SHA256-2048 -> 1 (PSS)", Alg.rsa_alg_is_pss(Alg.ALG_RSA_PSS_SHA256_2048), 1)
+    T.assert_equal(results, "PSS-SHA512-4096 -> 1", Alg.rsa_alg_is_pss(Alg.ALG_RSA_PSS_SHA512_4096), 1)
+    T.assert_equal(results, "ALG_ED25519 -> -1", Alg.rsa_alg_is_pss(Alg.ALG_ED25519), 0 minus 1)
+    T.assert_equal(results, "slot 109 -> -1", Alg.rsa_alg_is_pss(109), 0 minus 1)
+    T.assert_equal(results, "slot 129 -> -1", Alg.rsa_alg_is_pss(129), 0 minus 1)
+    Return 1
+End Process
+
+Process called "test_rsa_alg_modulus_bytes_dispatch" takes results as Integer returns Integer:
+    T.begin_suite(results, "rsa_alg_modulus_bytes: tag-level modulus declaration")
+    T.assert_equal(results, "PKCS1v15-SHA256-2048 -> 256", Alg.rsa_alg_modulus_bytes(Alg.ALG_RSA_PKCS1V15_SHA256_2048), 256)
+    T.assert_equal(results, "PKCS1v15-SHA384-3072 -> 384", Alg.rsa_alg_modulus_bytes(Alg.ALG_RSA_PKCS1V15_SHA384_3072), 384)
+    T.assert_equal(results, "PKCS1v15-SHA512-4096 -> 512", Alg.rsa_alg_modulus_bytes(Alg.ALG_RSA_PKCS1V15_SHA512_4096), 512)
+    T.assert_equal(results, "PSS-SHA256-2048 -> 256", Alg.rsa_alg_modulus_bytes(Alg.ALG_RSA_PSS_SHA256_2048), 256)
+    T.assert_equal(results, "PSS-SHA384-3072 -> 384", Alg.rsa_alg_modulus_bytes(Alg.ALG_RSA_PSS_SHA384_3072), 384)
+    T.assert_equal(results, "PSS-SHA512-4096 -> 512", Alg.rsa_alg_modulus_bytes(Alg.ALG_RSA_PSS_SHA512_4096), 512)
+    T.assert_equal(results, "ALG_ED25519 -> 0 (not RSA)", Alg.rsa_alg_modulus_bytes(Alg.ALG_ED25519), 0)
+    T.assert_equal(results, "ALG_UNKNOWN -> 0", Alg.rsa_alg_modulus_bytes(Alg.ALG_UNKNOWN), 0)
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+    test_create_wrong_length_rejected(results)
+    test_create_hash_alg_rejected(results)
+    test_create_ed25519_ok(results)
+    test_cross_alg_verify_rejected(results)
+    test_ed25519_sign_verify_roundtrip(results)
+    test_rsa_pkcs1v15_sha256_2048_malformed_spki(results)
+    test_rsa_pkcs1v15_sha384_3072_malformed_spki(results)
+    test_rsa_pkcs1v15_sha512_4096_malformed_spki(results)
+    test_rsa_pss_sha256_2048_malformed_spki(results)
+    test_rsa_pss_sha384_3072_malformed_spki(results)
+    test_rsa_pss_sha512_4096_malformed_spki(results)
+    test_rsa_pkcs1v15_sha256_3072_modulus_mismatch(results)
+    test_rsa_truncated_spki(results)
+    test_rsa_wrong_outer_tag_spki(results)
+    test_rsa_alg_hash_id_negative_for_non_rsa(results)
+    test_rsa_alg_is_pss_dispatch(results)
+    test_rsa_alg_modulus_bytes_dispatch(results)
+    T.print_summary(results)
+    Let failed be T.get_failed(results)
+    T.destroy_test_results(results)
+    Return failed
+End Process

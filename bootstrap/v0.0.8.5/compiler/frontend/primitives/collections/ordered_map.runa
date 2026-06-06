@@ -1,0 +1,576 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+ORDERED MAP - Insertion-Order Preserving HashMap Tier 0 Primitive
+
+This file implements an OrderedMap by overlaying a doubly-linked list
+on top of a chained hash table. Each entry carries forward/backward
+pointers in addition to its hash chain pointer, so iteration in
+insertion order is O(n) (no sort step) while lookup remains O(1) average.
+
+Entry structure (48 bytes):
+  offset 0:  key (8 bytes)
+  offset 8:  value (8 bytes)
+  offset 16: hash chain next (8 bytes)
+  offset 24: order list prev (8 bytes)
+  offset 32: order list next (8 bytes)
+  offset 40: hash (8 bytes; cached for resize)
+
+OrderedMap header (48 bytes):
+  offset 0:  buckets (pointer to bucket array of capacity entries)
+  offset 8:  capacity (power of two)
+  offset 16: count
+  offset 24: order_head (first inserted, still present)
+  offset 32: order_tail (most recently inserted)
+  offset 40: seed (hash seed)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Let OMAP_ENTRY_SIZE be 48
+Let OMAP_HEADER_SIZE be 48
+Let OMAP_INITIAL_CAPACITY be 16
+
+@Reasoning
+Hash an integer key to a bucket index using splitmix64-style mix.
+@End Reasoning
+
+@Implementation
+Same mix routine as hashmap.runa, kept inline so this file does not
+depend on hashmap.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-cryptographic.
+@End Security_Scope
+Process called "omap_hash" takes key as Integer returns Integer:
+    Let h be key
+    Set h to h bitwise xor (h shifted right by 33)
+    Set h to h multiplied by 18397679294719823053
+    Set h to h bitwise xor (h shifted right by 33)
+    Set h to h multiplied by 14181476777654086739
+    Set h to h bitwise xor (h shifted right by 33)
+    If h is less than 0:
+        Set h to 0 minus h
+    End If
+    Return h
+End Process
+
+@Reasoning
+Allocate a new entry with prev/next/chain pointers zeroed.
+@End Reasoning
+
+@Implementation
+48-byte alloc, fields set.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: 48 bytes.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "omap_entry_create" takes key as Integer, value as Integer, hash as Integer returns Integer:
+    Let entry be proc allocate from Layout with OMAP_ENTRY_SIZE
+    If entry is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with entry, 0, key
+    proc memory_set_int64 from Memory with entry, 8, value
+    proc memory_set_int64 from Memory with entry, 16, 0
+    proc memory_set_int64 from Memory with entry, 24, 0
+    proc memory_set_int64 from Memory with entry, 32, 0
+    proc memory_set_int64 from Memory with entry, 40, hash
+    Return entry
+End Process
+
+@Reasoning
+Create empty OrderedMap.
+@End Reasoning
+
+@Implementation
+Allocate header + bucket array (zero-init for null bucket heads).
+@End Implementation
+
+@Performance_Hints
+Time: O(capacity).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "omap_create" returns Integer:
+    Let om be proc allocate from Layout with OMAP_HEADER_SIZE
+    If om is equal to 0:
+        Return 0
+    End If
+    Let buckets_bytes be OMAP_INITIAL_CAPACITY multiplied by 8
+    Let buckets be proc allocate from Layout with buckets_bytes
+    If buckets is equal to 0:
+        proc deallocate from Layout with om
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than buckets_bytes:
+        proc memory_set_byte from Memory with buckets, zi, 0
+        Set zi to zi plus 1
+    End While
+    proc memory_set_int64 from Memory with om, 0, buckets
+    proc memory_set_int64 from Memory with om, 8, OMAP_INITIAL_CAPACITY
+    proc memory_set_int64 from Memory with om, 16, 0
+    proc memory_set_int64 from Memory with om, 24, 0
+    proc memory_set_int64 from Memory with om, 32, 0
+    proc memory_set_int64 from Memory with om, 40, 2654435761
+    Return om
+End Process
+
+@Reasoning
+Destroy ordered map. Walks the insertion-order list freeing each
+entry (which incidentally visits every entry exactly once with no
+duplicates because each entry sits in exactly one bucket chain).
+@End Reasoning
+
+@Implementation
+Walk from order_head following next pointers, freeing each entry.
+Then free buckets, then header.
+@End Implementation
+
+@Performance_Hints
+Time: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "omap_destroy" takes om as Integer returns Integer:
+    If om is equal to 0:
+        Return 0
+    End If
+    Let cur be proc memory_get_int64 from Memory with om, 24
+    While cur is not equal to 0:
+        Let next be proc memory_get_int64 from Memory with cur, 32
+        proc deallocate from Layout with cur
+        Set cur to next
+    End While
+    Let buckets be proc memory_get_int64 from Memory with om, 0
+    If buckets is not equal to 0:
+        proc deallocate from Layout with buckets
+    End If
+    proc deallocate from Layout with om
+    Return 1
+End Process
+
+@Reasoning
+Find existing entry by key. Walks the bucket chain.
+@End Reasoning
+
+@Implementation
+1) Compute hash and bucket index = hash AND (capacity - 1).
+2) Walk the bucket chain comparing key fields.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "omap_find_entry" takes om as Integer, key as Integer returns Integer:
+    Let buckets be proc memory_get_int64 from Memory with om, 0
+    Let capacity be proc memory_get_int64 from Memory with om, 8
+    Let mask be capacity minus 1
+    Let h be proc omap_hash with key
+    Let idx be h bitwise and mask
+    Let head_addr be buckets plus (idx multiplied by 8)
+    Let cur be proc memory_get_int64 from Memory with head_addr, 0
+    While cur is not equal to 0:
+        Let ck be proc memory_get_int64 from Memory with cur, 0
+        If ck is equal to key:
+            Return cur
+        End If
+        Set cur to proc memory_get_int64 from Memory with cur, 16
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Resize buckets to 2x capacity, rebucketing every entry. Insertion-order
+linked list is unchanged because each entry's order pointers do not
+depend on bucket index.
+@End Reasoning
+
+@Implementation
+1) Allocate new bucket array (zero-init).
+2) Walk insertion-order list; for each entry recompute new bucket and
+   prepend to new bucket chain.
+3) Free old bucket array.
+@End Implementation
+
+@Performance_Hints
+Time: O(n + new_capacity).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "omap_resize" takes om as Integer returns Integer:
+    Let old_buckets be proc memory_get_int64 from Memory with om, 0
+    Let old_capacity be proc memory_get_int64 from Memory with om, 8
+    Let new_capacity be old_capacity multiplied by 2
+    Let new_bytes be new_capacity multiplied by 8
+    Let new_buckets be proc allocate from Layout with new_bytes
+    If new_buckets is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than new_bytes:
+        proc memory_set_byte from Memory with new_buckets, zi, 0
+        Set zi to zi plus 1
+    End While
+    Let new_mask be new_capacity minus 1
+    Let cur be proc memory_get_int64 from Memory with om, 24
+    While cur is not equal to 0:
+        Let next_in_order be proc memory_get_int64 from Memory with cur, 32
+        Let h be proc memory_get_int64 from Memory with cur, 40
+        Let new_idx be h bitwise and new_mask
+        Let head_addr be new_buckets plus (new_idx multiplied by 8)
+        Let existing_head be proc memory_get_int64 from Memory with head_addr, 0
+        proc memory_set_int64 from Memory with cur, 16, existing_head
+        proc memory_set_int64 from Memory with head_addr, 0, cur
+        Set cur to next_in_order
+    End While
+    proc deallocate from Layout with old_buckets
+    proc memory_set_int64 from Memory with om, 0, new_buckets
+    proc memory_set_int64 from Memory with om, 8, new_capacity
+    Return 1
+End Process
+
+@Reasoning
+Insert or update. If the key exists, update value (insertion order
+unchanged). Otherwise append a new entry to the order list and prepend
+to the bucket chain.
+@End Reasoning
+
+@Implementation
+1) If load >= 75%, resize.
+2) Find existing entry; if found, set value, return 1.
+3) Else allocate new entry, link into bucket chain head, link into
+   order list at the tail, increment count.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "omap_set" takes om as Integer, key as Integer, value as Integer returns Integer:
+    If om is equal to 0:
+        Return 0
+    End If
+    Let count be proc memory_get_int64 from Memory with om, 16
+    Let capacity be proc memory_get_int64 from Memory with om, 8
+    Let threshold be (capacity multiplied by 75) divided by 100
+    If count is greater than or equal to threshold:
+        Let r be proc omap_resize with om
+        If r is equal to 0:
+            Return 0
+        End If
+    End If
+    Let existing be proc omap_find_entry with om, key
+    If existing is not equal to 0:
+        proc memory_set_int64 from Memory with existing, 8, value
+        Return 1
+    End If
+    Let h be proc omap_hash with key
+    Let entry be proc omap_entry_create with key, value, h
+    If entry is equal to 0:
+        Return 0
+    End If
+    Let buckets be proc memory_get_int64 from Memory with om, 0
+    Let new_capacity be proc memory_get_int64 from Memory with om, 8
+    Let mask be new_capacity minus 1
+    Let idx be h bitwise and mask
+    Let head_addr be buckets plus (idx multiplied by 8)
+    Let existing_head be proc memory_get_int64 from Memory with head_addr, 0
+    proc memory_set_int64 from Memory with entry, 16, existing_head
+    proc memory_set_int64 from Memory with head_addr, 0, entry
+    Let old_tail be proc memory_get_int64 from Memory with om, 32
+    If old_tail is equal to 0:
+        proc memory_set_int64 from Memory with om, 24, entry
+    Otherwise:
+        proc memory_set_int64 from Memory with old_tail, 32, entry
+        proc memory_set_int64 from Memory with entry, 24, old_tail
+    End If
+    proc memory_set_int64 from Memory with om, 32, entry
+    proc memory_set_int64 from Memory with om, 16, count plus 1
+    Return 1
+End Process
+
+@Reasoning
+Lookup value.
+@End Reasoning
+
+@Implementation
+Find entry; return value field if found.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "omap_get" takes om as Integer, key as Integer returns Integer:
+    If om is equal to 0:
+        Return 0
+    End If
+    Let entry be proc omap_find_entry with om, key
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with entry, 8
+End Process
+
+@Reasoning
+Containment predicate.
+@End Reasoning
+
+@Implementation
+Returns 1 if find_entry returns non-zero.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "omap_contains" takes om as Integer, key as Integer returns Integer:
+    If om is equal to 0:
+        Return 0
+    End If
+    Let entry be proc omap_find_entry with om, key
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+@Reasoning
+Remove key, unlinking from both bucket chain and order list.
+@End Reasoning
+
+@Implementation
+1) Find entry. If not found return 0.
+2) Walk bucket chain again to find prev pointer in chain; splice.
+3) Unlink from order list (handling head/tail cases).
+4) Free entry, decrement count.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if not present.
+@End Security_Scope
+Process called "omap_remove" takes om as Integer, key as Integer returns Integer:
+    If om is equal to 0:
+        Return 0
+    End If
+    Let buckets be proc memory_get_int64 from Memory with om, 0
+    Let capacity be proc memory_get_int64 from Memory with om, 8
+    Let mask be capacity minus 1
+    Let h be proc omap_hash with key
+    Let idx be h bitwise and mask
+    Let head_addr be buckets plus (idx multiplied by 8)
+    Let prev be 0
+    Let cur be proc memory_get_int64 from Memory with head_addr, 0
+    While cur is not equal to 0:
+        Let ck be proc memory_get_int64 from Memory with cur, 0
+        If ck is equal to key:
+            Let next_chain be proc memory_get_int64 from Memory with cur, 16
+            If prev is equal to 0:
+                proc memory_set_int64 from Memory with head_addr, 0, next_chain
+            Otherwise:
+                proc memory_set_int64 from Memory with prev, 16, next_chain
+            End If
+            Let order_prev be proc memory_get_int64 from Memory with cur, 24
+            Let order_next be proc memory_get_int64 from Memory with cur, 32
+            If order_prev is equal to 0:
+                proc memory_set_int64 from Memory with om, 24, order_next
+            Otherwise:
+                proc memory_set_int64 from Memory with order_prev, 32, order_next
+            End If
+            If order_next is equal to 0:
+                proc memory_set_int64 from Memory with om, 32, order_prev
+            Otherwise:
+                proc memory_set_int64 from Memory with order_next, 24, order_prev
+            End If
+            proc deallocate from Layout with cur
+            Let count be proc memory_get_int64 from Memory with om, 16
+            proc memory_set_int64 from Memory with om, 16, count minus 1
+            Return 1
+        End If
+        Set prev to cur
+        Set cur to proc memory_get_int64 from Memory with cur, 16
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Size accessor.
+@End Reasoning
+
+@Implementation
+Read count field.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "omap_size" takes om as Integer returns Integer:
+    If om is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with om, 16
+End Process
+
+@Reasoning
+First (oldest insertion) entry pointer.
+@End Reasoning
+
+@Implementation
+Return order_head field.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "omap_first" takes om as Integer returns Integer:
+    If om is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with om, 24
+End Process
+
+@Reasoning
+Last (most recent insertion) entry pointer.
+@End Reasoning
+
+@Implementation
+Return order_tail field.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "omap_last" takes om as Integer returns Integer:
+    If om is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with om, 32
+End Process
+
+@Reasoning
+Next entry in insertion order following 'entry'.
+@End Reasoning
+
+@Implementation
+Returns the order-next pointer field at offset 32.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "omap_entry_next" takes entry as Integer returns Integer:
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with entry, 32
+End Process
+
+@Reasoning
+Key of entry pointer.
+@End Reasoning
+
+@Implementation
+Read offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "omap_entry_key" takes entry as Integer returns Integer:
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with entry, 0
+End Process
+
+@Reasoning
+Value of entry pointer.
+@End Reasoning
+
+@Implementation
+Read offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "omap_entry_value" takes entry as Integer returns Integer:
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with entry, 8
+End Process

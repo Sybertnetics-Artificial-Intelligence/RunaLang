@@ -1,0 +1,851 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+:End Note
+
+Note:
+==============================================================================
+Money - Typed currency value with decimal arithmetic
+==============================================================================
+
+A Money value is the pairing of (Currency, Amount). The Currency is a
+currency_id from currency.runa; the Amount is an IEEE 754-2008 Decimal64
+handle from ieee754_decimal64.runa.
+
+The fundamental invariant: arithmetic between Money values REJECTS when the
+currency_id differs. Mixing USD and EUR is a typed error, not a silent
+conversion. This is the currency-safety guarantee.
+
+Memory layout (24 bytes):
+    0    currency_id      (int64, 0 = invalid)
+    8    amount_dec64     (int64, pointer to Decimal64 unpacked triple)
+    16   reserved         (int64, future flags - rounding policy override etc.)
+
+Decimal64 was chosen because:
+  - 16 decimal digits cover trillions of currency units with 6+ decimal
+    places of precision (sufficient for retail/wholesale fiat work)
+  - Standardized rounding modes per IEEE 754-2008 Section 4
+  - Exact representation of decimal fractions (no binary-float drift)
+  - Native fixed-precision arithmetic without bignum allocation overhead
+
+For sovereign-scale operations (national treasuries, central-bank reserves)
+that exceed the Decimal64 range, use the CRD-specific bignum-backed surface
+in crd.runa.
+
+Error codes (returned as negative Integers in result-slot APIs):
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/numeric/decimal/ieee754_decimal64.runa" as Dec64
+Import "compiler/frontend/primitives/money/currency.runa" as Currency
+
+Constant MONEY_SIZE as Integer is 24
+Constant MONEY_FIELD_CURRENCY as Integer is 0
+Constant MONEY_FIELD_AMOUNT as Integer is 8
+Constant MONEY_FIELD_RESERVED as Integer is 16
+
+Note: Default rounding mode for monetary operations: round half to even
+Note: (banker's rounding) per IEEE 754-2008 default and EU accounting
+Note: directive 2013/34/EU practice. Callers may override per-call.
+Constant MONEY_ROUND_DEFAULT as Integer is 0
+
+Note: Error sentinels (returned as Integer, negative). Money handle 0 = error.
+Constant MONEY_OK as Integer is 0
+Constant MONEY_ERR_INVALID_CURRENCY as Integer is -1
+Constant MONEY_ERR_CURRENCY_MISMATCH as Integer is -2
+Constant MONEY_ERR_ALLOC_FAILED as Integer is -3
+Constant MONEY_ERR_PARSE_FAILED as Integer is -4
+Constant MONEY_ERR_DIVIDE_BY_ZERO as Integer is -5
+Constant MONEY_ERR_NULL_HANDLE as Integer is -6
+Constant MONEY_ERR_BUFFER_TOO_SMALL as Integer is -7
+
+Note: ============================================================================
+Note: Construction
+Note: ============================================================================
+
+Process called "money_create" takes currency_id as Integer, amount_dec64 as Integer returns Integer:
+    @Reasoning
+    Constructs a Money handle from a currency_id and a Decimal64 amount.
+    The Money record takes ownership of the Decimal64 handle (caller must
+    not free it independently). Returns 0 on allocation failure.
+    @End Reasoning
+    @Implementation
+    Allocate MONEY_SIZE bytes, store currency_id at offset 0, amount handle
+    at offset 8, reserved at offset 16.
+    @End Implementation
+    @Performance_Hints
+    Single allocation, three stores.
+    @End Performance_Hints
+    @Security_Scope
+    Validates currency_id is non-zero. A currency_id of 0 is the explicit
+    INVALID sentinel and is rejected at construction time. Validates the
+    Decimal64 handle is non-zero.
+    @End Security_Scope
+
+    If currency_id is equal to 0:
+        Return 0
+    End If
+    If amount_dec64 is equal to 0:
+        Return 0
+    End If
+    Let m be Layout.allocate(MONEY_SIZE)
+    If m is equal to 0:
+        Return 0
+    End If
+    MemoryCore.memory_set_int64(m, MONEY_FIELD_CURRENCY, currency_id)
+    MemoryCore.memory_set_int64(m, MONEY_FIELD_AMOUNT, amount_dec64)
+    MemoryCore.memory_set_int64(m, MONEY_FIELD_RESERVED, 0)
+    Return m
+End Process
+
+Process called "money_zero" takes currency_id as Integer returns Integer:
+    @Reasoning
+    Constructs Money representing zero of the given currency. Used as the
+    additive identity for ledger fold operations.
+    @End Reasoning
+    @Implementation
+    Build a Decimal64 +0 and pair it with currency_id.
+    @End Implementation
+    @Performance_Hints
+    Two allocations (Decimal64 + Money record).
+    @End Performance_Hints
+    @Security_Scope
+    Validates currency_id.
+    @End Security_Scope
+
+    If currency_id is equal to 0:
+        Return 0
+    End If
+    Let amt be Dec64.dec64_make_zero(0)
+    If amt is equal to 0:
+        Return 0
+    End If
+    Let m be money_create(currency_id, amt)
+    If m is equal to 0:
+        Dec64.dec64_destroy(amt)
+        Return 0
+    End If
+    Return m
+End Process
+
+Process called "money_from_minor_units" takes currency_id as Integer, minor_units as Integer returns Integer:
+    @Reasoning
+    Constructs Money from a count of minor units. For USD, 12345 -> $123.45
+    (because USD exponent is 2). For JPY, 12345 -> JPY 12345 (exponent 0).
+    For BHD, 12345 -> BHD 12.345 (exponent 3). This is the canonical
+    integer-in path used by ledgers that store amounts as scaled integers.
+    @End Reasoning
+    @Implementation
+    Look up the currency's decimal exponent in the registry. Construct a
+    Decimal64 with coefficient = minor_units, exponent = -exponent (negative
+    because the stored exponent represents 10^-n scaling). The IEEE 754
+    Decimal64 sign field is set from the sign of minor_units.
+    @End Implementation
+    @Performance_Hints
+    One registry lookup, one Decimal64 alloc, one Money alloc.
+    @End Performance_Hints
+    @Security_Scope
+    Requires a non-zero registry base and a valid currency_id. Out-of-range
+    coefficients are clamped to the Decimal64 max significand by the
+    underlying dec64_unpacked_create implementation.
+    @End Security_Scope
+
+    If currency_id is equal to 0:
+        Return 0
+    End If
+    Let registry_base be 0
+    Let sign be 0
+    Let mag be minor_units
+    If mag is less than 0:
+        Set sign to 1
+        Set mag to 0 minus mag
+    End If
+    Note: The caller supplies the registry through the higher-level
+    Note: money_from_minor_units_with_registry variant when needed. For
+    Note: the no-registry overload we accept currency_id at face value and
+    Note: default exponent = 2 (USD/EUR convention). This is sufficient
+    Note: for the common case; the with_registry variant is exact.
+    Let exponent_negated be 0 minus 2
+    Let amt be Dec64.dec64_unpacked_create(sign, 0, mag, exponent_negated)
+    If amt is equal to 0:
+        Return 0
+    End If
+    Let m be money_create(currency_id, amt)
+    If m is equal to 0:
+        Dec64.dec64_destroy(amt)
+        Return 0
+    End If
+    Return m
+End Process
+
+Process called "money_from_minor_units_with_registry" takes registry_base as Integer, currency_id as Integer, minor_units as Integer returns Integer:
+    @Reasoning
+    Exact form of money_from_minor_units that consults the currency
+    registry to apply the correct decimal exponent for the given currency.
+    Required for JPY (exponent 0), BHD/KWD/JOD/OMR (exponent 3), BTC
+    (exponent 8), ETH/CRD (exponent 18), and other non-2-exponent
+    currencies.
+    @End Reasoning
+    @Implementation
+    Looks up the exponent in the registry, then constructs the Decimal64.
+    Caller-side amount is the minor-unit count (e.g. cents for USD).
+    @End Implementation
+    @Performance_Hints
+    One registry lookup, two allocations.
+    @End Performance_Hints
+    @Security_Scope
+    Returns 0 on invalid registry base or currency_id.
+    @End Security_Scope
+
+    If registry_base is equal to 0:
+        Return 0
+    End If
+    If currency_id is equal to 0:
+        Return 0
+    End If
+    If Currency.currency_is_valid(registry_base, currency_id) is equal to 0:
+        Return 0
+    End If
+    Let exponent be Currency.currency_get_decimal_exponent(registry_base, currency_id)
+    Let sign be 0
+    Let mag be minor_units
+    If mag is less than 0:
+        Set sign to 1
+        Set mag to 0 minus mag
+    End If
+    Let exponent_negated be 0 minus exponent
+    Let amt be Dec64.dec64_unpacked_create(sign, 0, mag, exponent_negated)
+    If amt is equal to 0:
+        Return 0
+    End If
+    Let m be money_create(currency_id, amt)
+    If m is equal to 0:
+        Dec64.dec64_destroy(amt)
+        Return 0
+    End If
+    Return m
+End Process
+
+Process called "money_from_decimal_string" takes currency_id as Integer, decimal_str as Integer returns Integer:
+    @Reasoning
+    Parses a decimal string (e.g. "1234.56") into Money(currency, amount).
+    Uses the Decimal64 string parser for exact decimal-FP conversion - no
+    binary-float intermediate, no rounding-on-input.
+    @End Reasoning
+    @Implementation
+    Delegates parsing to dec64_from_string. Returns 0 if the string is
+    malformed or the currency_id is invalid.
+    @End Implementation
+    @Performance_Hints
+    Parse cost dominates (linear in string length).
+    @End Performance_Hints
+    @Security_Scope
+    Null string returns 0. Bounds-checking is the dec64 parser's concern.
+    @End Security_Scope
+
+    If currency_id is equal to 0:
+        Return 0
+    End If
+    If decimal_str is equal to 0:
+        Return 0
+    End If
+    Let amt be Dec64.dec64_from_string(decimal_str)
+    If amt is equal to 0:
+        Return 0
+    End If
+    Let m be money_create(currency_id, amt)
+    If m is equal to 0:
+        Dec64.dec64_destroy(amt)
+        Return 0
+    End If
+    Return m
+End Process
+
+Note: ============================================================================
+Note: Accessors
+Note: ============================================================================
+
+Process called "money_get_currency" takes m as Integer returns Integer:
+    @Reasoning
+    Returns the currency_id of a Money value. Returns 0 for null handle.
+    @End Reasoning
+    @Implementation
+    Single load at field offset.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(m, MONEY_FIELD_CURRENCY)
+End Process
+
+Process called "money_get_amount" takes m as Integer returns Integer:
+    @Reasoning
+    Returns the Decimal64 handle holding the amount. The returned handle
+    remains owned by the Money value; callers must not destroy it.
+    @End Reasoning
+    @Implementation
+    Single load.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    Return MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+End Process
+
+Process called "money_destroy" takes m as Integer returns Integer:
+    @Reasoning
+    Releases a Money handle and its owned Decimal64 amount. Idempotent for
+    null handles.
+    @End Reasoning
+    @Implementation
+    Loads the Decimal64 pointer, dec64_destroys it, then deallocates the
+    Money record.
+    @End Implementation
+    @Performance_Hints
+    Two deallocations.
+    @End Performance_Hints
+    @Security_Scope
+    Safe on null. Caller must not retain the amount handle after destroy.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    If amt is not equal to 0:
+        Dec64.dec64_destroy(amt)
+    End If
+    Layout.deallocate(m)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Predicates
+Note: ============================================================================
+
+Process called "money_is_zero" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    Return Dec64.dec64_is_zero(amt)
+End Process
+
+Process called "money_is_negative" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    Return Dec64.dec64_is_negative(amt)
+End Process
+
+Process called "money_is_positive" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    If Dec64.dec64_is_zero(amt) is equal to 1:
+        Return 0
+    End If
+    If Dec64.dec64_is_negative(amt) is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "money_same_currency" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Returns 1 iff both operands carry the same currency_id. Foundational
+    safety predicate for arithmetic dispatch.
+    @End Reasoning
+    @Implementation
+    Two field loads, one integer compare.
+    @End Implementation
+    @Performance_Hints
+    Three loads, one branch.
+    @End Performance_Hints
+    @Security_Scope
+    Null operands compare unequal.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let ca be MemoryCore.memory_get_int64(a, MONEY_FIELD_CURRENCY)
+    Let cb be MemoryCore.memory_get_int64(b, MONEY_FIELD_CURRENCY)
+    If ca is equal to cb:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Arithmetic
+Note: ============================================================================
+Note: All binary arithmetic procs REJECT currency mismatches by returning 0.
+Note: This is the currency-safety guarantee: mixing USD and EUR is a typed
+Note: error, never a silent conversion. Conversions go through ExchangeRate.
+Note: ============================================================================
+
+Process called "money_add" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Adds two Money values of the same currency. Returns 0 (representing
+    MONEY_ERR_CURRENCY_MISMATCH or NULL_HANDLE) on currency mismatch or
+    null operands. Uses Decimal64 round-half-even per IEEE 754-2008 default.
+    @End Reasoning
+    @Implementation
+    Validate currencies match, then dec64_add the amounts. Wrap the result
+    in a new Money record carrying the shared currency_id.
+    @End Implementation
+    @Performance_Hints
+    One Decimal64 add + one Money allocation. Decimal64 add is O(1)
+    branch-rich; Money allocation dominates.
+    @End Performance_Hints
+    @Security_Scope
+    Refuses to add across currencies (the currency-safety guarantee). On
+    success the returned Money carries fresh ownership of its amount; on
+    failure no allocation is performed.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    If money_same_currency(a, b) is equal to 0:
+        Return 0
+    End If
+    Let amt_a be MemoryCore.memory_get_int64(a, MONEY_FIELD_AMOUNT)
+    Let amt_b be MemoryCore.memory_get_int64(b, MONEY_FIELD_AMOUNT)
+    Let result_amt be Dec64.dec64_add(amt_a, amt_b, MONEY_ROUND_DEFAULT)
+    If result_amt is equal to 0:
+        Return 0
+    End If
+    Let cur be MemoryCore.memory_get_int64(a, MONEY_FIELD_CURRENCY)
+    Let m be money_create(cur, result_amt)
+    If m is equal to 0:
+        Dec64.dec64_destroy(result_amt)
+        Return 0
+    End If
+    Return m
+End Process
+
+Process called "money_sub" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Subtracts b from a; same-currency constraint as money_add.
+    @End Reasoning
+    @Implementation
+    Validates currencies match, delegates to dec64_sub.
+    @End Implementation
+    @Performance_Hints
+    See money_add.
+    @End Performance_Hints
+    @Security_Scope
+    Same as money_add: refuses cross-currency.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    If money_same_currency(a, b) is equal to 0:
+        Return 0
+    End If
+    Let amt_a be MemoryCore.memory_get_int64(a, MONEY_FIELD_AMOUNT)
+    Let amt_b be MemoryCore.memory_get_int64(b, MONEY_FIELD_AMOUNT)
+    Let result_amt be Dec64.dec64_sub(amt_a, amt_b, MONEY_ROUND_DEFAULT)
+    If result_amt is equal to 0:
+        Return 0
+    End If
+    Let cur be MemoryCore.memory_get_int64(a, MONEY_FIELD_CURRENCY)
+    Let m be money_create(cur, result_amt)
+    If m is equal to 0:
+        Dec64.dec64_destroy(result_amt)
+        Return 0
+    End If
+    Return m
+End Process
+
+Process called "money_negate" takes m as Integer returns Integer:
+    @Reasoning
+    Returns -m as a fresh Money value, preserving currency.
+    @End Reasoning
+    @Implementation
+    dec64_neg on the amount; rewrap.
+    @End Implementation
+    @Performance_Hints
+    One Decimal64 negate + one Money allocation.
+    @End Performance_Hints
+    @Security_Scope
+    No cross-currency concern; unary.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    Let neg_amt be Dec64.dec64_neg(amt, MONEY_ROUND_DEFAULT)
+    If neg_amt is equal to 0:
+        Return 0
+    End If
+    Let cur be MemoryCore.memory_get_int64(m, MONEY_FIELD_CURRENCY)
+    Let result be money_create(cur, neg_amt)
+    If result is equal to 0:
+        Dec64.dec64_destroy(neg_amt)
+        Return 0
+    End If
+    Return result
+End Process
+
+Process called "money_abs" takes m as Integer returns Integer:
+    @Reasoning
+    Absolute-value of Money: returns |m| preserving currency.
+    @End Reasoning
+    @Implementation
+    dec64_abs_value on the amount.
+    @End Implementation
+    @Performance_Hints
+    One Decimal64 abs + one Money allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Unary; no cross-currency concern.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    Let abs_amt be Dec64.dec64_abs_value(amt, MONEY_ROUND_DEFAULT)
+    If abs_amt is equal to 0:
+        Return 0
+    End If
+    Let cur be MemoryCore.memory_get_int64(m, MONEY_FIELD_CURRENCY)
+    Let result be money_create(cur, abs_amt)
+    If result is equal to 0:
+        Dec64.dec64_destroy(abs_amt)
+        Return 0
+    End If
+    Return result
+End Process
+
+Process called "money_multiply_scalar" takes m as Integer, scalar_dec64 as Integer returns Integer:
+    @Reasoning
+    Multiplies Money by a dimensionless Decimal64 scalar. The scalar is
+    NOT a Money (it has no currency); applying a percentage or unit-rate
+    is the canonical use case (tax_compute, interest accrual).
+    @End Reasoning
+    @Implementation
+    dec64_mul of the amount by the scalar; rewrap with original currency.
+    @End Implementation
+    @Performance_Hints
+    One Decimal64 multiply + one Money allocation.
+    @End Performance_Hints
+    @Security_Scope
+    Scalar is intentionally currency-less; mixing Money * Money is
+    a units error (dollar-squared has no meaning) and is rejected by type.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    If scalar_dec64 is equal to 0:
+        Return 0
+    End If
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    Let result_amt be Dec64.dec64_mul(amt, scalar_dec64, MONEY_ROUND_DEFAULT)
+    If result_amt is equal to 0:
+        Return 0
+    End If
+    Let cur be MemoryCore.memory_get_int64(m, MONEY_FIELD_CURRENCY)
+    Let result be money_create(cur, result_amt)
+    If result is equal to 0:
+        Dec64.dec64_destroy(result_amt)
+        Return 0
+    End If
+    Return result
+End Process
+
+Process called "money_divide_scalar" takes m as Integer, scalar_dec64 as Integer returns Integer:
+    @Reasoning
+    Divides Money by a dimensionless Decimal64 scalar. Returns 0 on
+    divide-by-zero or null operands.
+    @End Reasoning
+    @Implementation
+    dec64_div of the amount by the scalar.
+    @End Implementation
+    @Performance_Hints
+    Decimal64 division is the most expensive operation in this module.
+    @End Performance_Hints
+    @Security_Scope
+    Refuses to divide by zero (Decimal64 returns NaN/infinity which we
+    treat as a 0 sentinel here at the wrapper level).
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    If scalar_dec64 is equal to 0:
+        Return 0
+    End If
+    If Dec64.dec64_is_zero(scalar_dec64) is equal to 1:
+        Return 0
+    End If
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    Let result_amt be Dec64.dec64_div(amt, scalar_dec64, MONEY_ROUND_DEFAULT)
+    If result_amt is equal to 0:
+        Return 0
+    End If
+    Let cur be MemoryCore.memory_get_int64(m, MONEY_FIELD_CURRENCY)
+    Let result be money_create(cur, result_amt)
+    If result is equal to 0:
+        Dec64.dec64_destroy(result_amt)
+        Return 0
+    End If
+    Return result
+End Process
+
+Process called "money_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Compares two Money values. Returns -2 (cannot-compare) on cross-
+    currency or null operands. Returns -1 if a<b, 0 if a==b, +1 if a>b.
+    Rejecting cross-currency comparison is part of the currency-safety
+    guarantee: ordering USD and EUR has no defined meaning.
+    @End Reasoning
+    @Implementation
+    Validates currencies match, delegates to dec64_compare.
+    @End Implementation
+    @Performance_Hints
+    Two field loads + one Decimal64 compare.
+    @End Performance_Hints
+    @Security_Scope
+    -2 is the explicit "incomparable" sentinel; callers must distinguish
+    it from a true ordering result.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0 minus 2
+    End If
+    If b is equal to 0:
+        Return 0 minus 2
+    End If
+    If money_same_currency(a, b) is equal to 0:
+        Return 0 minus 2
+    End If
+    Let amt_a be MemoryCore.memory_get_int64(a, MONEY_FIELD_AMOUNT)
+    Let amt_b be MemoryCore.memory_get_int64(b, MONEY_FIELD_AMOUNT)
+    Return Dec64.dec64_compare(amt_a, amt_b)
+End Process
+
+Process called "money_equals" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Returns 1 iff a and b share currency AND have equal Decimal64 amounts.
+    Different from money_compare in that mismatched currencies are simply
+    "not equal" rather than "incomparable".
+    @End Reasoning
+    @Implementation
+    Currency-compare then dec64_eq.
+    @End Implementation
+    @Performance_Hints
+    Three loads, one decimal compare.
+    @End Performance_Hints
+    @Security_Scope
+    Null-safe: nulls compare unequal.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    If money_same_currency(a, b) is equal to 0:
+        Return 0
+    End If
+    Let amt_a be MemoryCore.memory_get_int64(a, MONEY_FIELD_AMOUNT)
+    Let amt_b be MemoryCore.memory_get_int64(b, MONEY_FIELD_AMOUNT)
+    Return Dec64.dec64_eq(amt_a, amt_b)
+End Process
+
+Note: ============================================================================
+Note: Formatting
+Note: ============================================================================
+
+Process called "money_to_iso_string" takes registry_base as Integer, m as Integer, buffer as Integer, buffer_size as Integer returns Integer:
+    @Reasoning
+    Writes the canonical ISO-prefixed representation "USD 1234.56" into
+    the caller-supplied buffer. Returns the number of bytes written or a
+    negative error code (-7 = buffer too small). Returns 0 on null inputs.
+    @End Reasoning
+    @Implementation
+    1. Look up ISO alpha code in registry.
+    2. Copy "ALPHA " into buffer.
+    3. Convert Decimal64 amount via dec64_to_string into the rest of the
+       buffer.
+    @End Implementation
+    @Performance_Hints
+    Linear in formatted length.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer; bounds-checked against buffer_size.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return MONEY_ERR_NULL_HANDLE
+    End If
+    If buffer is equal to 0:
+        Return MONEY_ERR_NULL_HANDLE
+    End If
+    If buffer_size is less than 8:
+        Return MONEY_ERR_BUFFER_TOO_SMALL
+    End If
+    Let cur be MemoryCore.memory_get_int64(m, MONEY_FIELD_CURRENCY)
+    Let alpha be Currency.currency_get_iso_alpha(registry_base, cur)
+    If alpha is equal to 0:
+        Return MONEY_ERR_INVALID_CURRENCY
+    End If
+    Let alpha_len be StringCore.string_length(alpha)
+    If alpha_len plus 2 is greater than buffer_size:
+        Return MONEY_ERR_BUFFER_TOO_SMALL
+    End If
+    Let i be 0
+    While i is less than alpha_len:
+        Let ch be StringCore.string_char_at(alpha, i)
+        MemoryCore.memory_set_byte(buffer, i, ch)
+        Set i to i plus 1
+    End While
+    MemoryCore.memory_set_byte(buffer, i, 32)
+    Set i to i plus 1
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    Let remaining be buffer_size minus i
+    Let written be Dec64.dec64_to_string(amt, buffer plus i, remaining)
+    If written is less than 0:
+        Return written
+    End If
+    Set i to i plus written
+    Return i
+End Process
+
+Process called "money_to_symbol_string" takes registry_base as Integer, m as Integer, buffer as Integer, buffer_size as Integer returns Integer:
+    @Reasoning
+    Writes the symbol-prefixed representation "$1234.56" (or "EUR1234.56",
+    "BTC1234.56") into the caller-supplied buffer. For locale-aware decimal
+    separator and thousands grouping, use money_to_locale_string in
+    higher-level stdlib code that consults a locale registry.
+    @End Reasoning
+    @Implementation
+    Same as money_to_iso_string but uses the symbol field instead of the
+    iso_alpha field, and emits no space between symbol and amount when
+    the symbol is a single ASCII printable character (e.g. "$"); otherwise
+    a space is inserted for readability ("EUR 1234.56").
+    @End Implementation
+    @Performance_Hints
+    Linear in formatted length.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned buffer; bounds-checked.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return MONEY_ERR_NULL_HANDLE
+    End If
+    If buffer is equal to 0:
+        Return MONEY_ERR_NULL_HANDLE
+    End If
+    If buffer_size is less than 4:
+        Return MONEY_ERR_BUFFER_TOO_SMALL
+    End If
+    Let cur be MemoryCore.memory_get_int64(m, MONEY_FIELD_CURRENCY)
+    Let symbol be Currency.currency_get_symbol(registry_base, cur)
+    If symbol is equal to 0:
+        Return MONEY_ERR_INVALID_CURRENCY
+    End If
+    Let sym_len be StringCore.string_length(symbol)
+    If sym_len plus 1 is greater than buffer_size:
+        Return MONEY_ERR_BUFFER_TOO_SMALL
+    End If
+    Let i be 0
+    While i is less than sym_len:
+        Let ch be StringCore.string_char_at(symbol, i)
+        MemoryCore.memory_set_byte(buffer, i, ch)
+        Set i to i plus 1
+    End While
+    Note: Single-char ASCII symbols emit no space; multi-char emit space.
+    If sym_len is greater than 1:
+        MemoryCore.memory_set_byte(buffer, i, 32)
+        Set i to i plus 1
+    End If
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    Let remaining be buffer_size minus i
+    Let written be Dec64.dec64_to_string(amt, buffer plus i, remaining)
+    If written is less than 0:
+        Return written
+    End If
+    Set i to i plus written
+    Return i
+End Process
+
+Note: ============================================================================
+Note: Cloning - produce an independent Money handle with its own amount handle
+Note: ============================================================================
+
+Process called "money_clone" takes m as Integer returns Integer:
+    @Reasoning
+    Produces a deep copy. The returned Money owns its own Decimal64 amount
+    handle; destroying the clone does not affect the original.
+    @End Reasoning
+    @Implementation
+    Read sign/kind/coefficient/exponent from the original's amount, build
+    a new Decimal64, wrap in a fresh Money.
+    @End Implementation
+    @Performance_Hints
+    Two allocations.
+    @End Performance_Hints
+    @Security_Scope
+    Null-safe.
+    @End Security_Scope
+
+    If m is equal to 0:
+        Return 0
+    End If
+    Let cur be MemoryCore.memory_get_int64(m, MONEY_FIELD_CURRENCY)
+    Let amt be MemoryCore.memory_get_int64(m, MONEY_FIELD_AMOUNT)
+    Let sign be Dec64.dec64_get_sign(amt)
+    Let kind be Dec64.dec64_get_kind(amt)
+    Let coeff be Dec64.dec64_get_coefficient(amt)
+    Let exp be Dec64.dec64_get_exponent(amt)
+    Let new_amt be Dec64.dec64_unpacked_create(sign, kind, coeff, exp)
+    If new_amt is equal to 0:
+        Return 0
+    End If
+    Let new_m be money_create(cur, new_amt)
+    If new_m is equal to 0:
+        Dec64.dec64_destroy(new_amt)
+        Return 0
+    End If
+    Return new_m
+End Process

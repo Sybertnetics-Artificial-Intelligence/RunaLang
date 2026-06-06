@@ -1,0 +1,259 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+==============================================================================
+Wave F1 — Native SSE2 Float64 codegen smoke test.
+
+Verifies that stage1's codegen emits hardware-native IEEE 754 binary64
+scalar SSE2 instructions through the Float type. Each test exercises a
+distinct instruction path:
+
+  Test 1  ADDSD  - (1.5 + 2.5) is equal to 4.0 (exact)
+  Test 2  CVTSI2SDQ + DIVSD - from_integer(7) / from_integer(2) == 3.5
+  Test 3  SQRTSD + MULSD - sqrt(2.0) squared != 2.0 (binary FP truth)
+  Test 4  SQRTSD bit-exact - sqrt(2.0) bits == 0x3FF6A09E667F3BCD
+  Test 5  Cross-call ABI - 4 Float args + 1 Integer arg, mixed
+  Test 6  CVTTSD2SIQ - float_to_int(3.5) truncates to 3
+  Test 7  UCOMISD - 0.5 < 1.5 (ordered less-than)
+  Test 8  UCOMISD NaN - sqrt(-1.0) is NaN, NaN != NaN per IEEE 754
+
+The native conversion + sqrt paths are implemented as inline AT&T
+helpers that the bootstrap codegen carries through verbatim.  The
+arithmetic and comparison paths (ADDSD/SUBSD/MULSD/DIVSD/UCOMISD) are
+emitted directly by the stage1 binary-op and comparison codegen
+routines when both operands are Float-typed.
+
+Exit code is the bit-or of failing test indices (1, 2, 4, 8, 16, 32,
+64, 128).  Zero means all tests passed.
+==============================================================================
+:End Note
+
+Process called "add_floats" that takes a as Float, b as Float returns Float:
+    @Reasoning
+    Drives stage1's codegen ADDSD path.
+    @End Reasoning
+    Return a plus b
+End Process
+
+Process called "mul_floats" that takes a as Float, b as Float returns Float:
+    @Reasoning
+    Drives stage1's codegen MULSD path.
+    @End Reasoning
+    Return a multiplied by b
+End Process
+
+Process called "div_floats" that takes a as Float, b as Float returns Float:
+    @Reasoning
+    Drives stage1's codegen DIVSD path.
+    @End Reasoning
+    Return a divided by b
+End Process
+
+Process called "feq_bits" that takes a as Float, b as Float returns Integer:
+    @Reasoning
+    Bit-pattern equality on Float values.  Compares the 64-bit IEEE 754
+    encodings directly via integer cmpq — this is exact-equality even
+    for NaN encodings (whereas UCOMISD-based equality treats NaN as
+    unordered and returns false).
+    @End Reasoning
+    @Implementation
+    a at -8(%rbp), b at -16(%rbp), result at -24(%rbp).  cmpq + sete.
+    @End Implementation
+    Let r be 0
+    Inline Assembly att:
+        movq -8(%rbp), %rax
+        movq -16(%rbp), %rcx
+        cmpq %rcx, %rax
+        sete %al
+        movzbq %al, %rax
+        movq %rax, -24(%rbp)
+    End Assembly
+    Return r
+End Process
+
+Process called "sqrt_f" that takes x as Float returns Float:
+    @Reasoning
+    Native scalar double SQRTSD.
+    @End Reasoning
+    @Implementation
+    x at -8(%rbp), result at -16(%rbp).  Load to xmm0, sqrtsd, store.
+    @End Implementation
+    @Performance_Hints
+    Single instruction on the hot path (latency ~14-20 cyc, fully
+    pipelined throughput on modern x86).
+    @End Performance_Hints
+    Let r be 0.0
+    Inline Assembly att:
+        movq -8(%rbp), %xmm0
+        sqrtsd %xmm0, %xmm0
+        movq %xmm0, -16(%rbp)
+    End Assembly
+    Return r
+End Process
+
+Process called "int_to_float_native" that takes n as Integer returns Float:
+    @Reasoning
+    Native CVTSI2SDQ - convert int64 to IEEE 754 binary64 in one
+    instruction.  Replaces the runtime PLT call for the test's
+    conversion path.
+    @End Reasoning
+    @Implementation
+    n at -8(%rbp), result at -16(%rbp).
+    @End Implementation
+    Let r be 0.0
+    Inline Assembly att:
+        movq -8(%rbp), %rax
+        cvtsi2sdq %rax, %xmm0
+        movq %xmm0, -16(%rbp)
+    End Assembly
+    Return r
+End Process
+
+Process called "float_to_int_native" that takes x as Float returns Integer:
+    @Reasoning
+    Native CVTTSD2SIQ - convert IEEE 754 binary64 to int64 via
+    truncation toward zero.  Matches C's (int64_t)double cast semantics
+    and IEEE 754's roundTowardZero direction.
+    @End Reasoning
+    @Implementation
+    x at -8(%rbp), result at -16(%rbp).
+    @End Implementation
+    Let r be 0
+    Inline Assembly att:
+        movq -8(%rbp), %xmm0
+        cvttsd2siq %xmm0, %rax
+        movq %rax, -16(%rbp)
+    End Assembly
+    Return r
+End Process
+
+Process called "bits_as_float" that takes b as Integer returns Float:
+    @Reasoning
+    Bit-cast a 64-bit Integer to its Float interpretation - identical
+    semantics to bits_to_float_pal in compiler/frontend/primitives/color/
+    palette.runa, repeated here so the test is self-contained.
+    @End Reasoning
+    @Implementation
+    b at -8(%rbp), result at -16(%rbp).  Single movq.
+    @End Implementation
+    Let r be 0.0
+    Inline Assembly att:
+        movq -8(%rbp), %rax
+        movq %rax, -16(%rbp)
+    End Assembly
+    Return r
+End Process
+
+Process called "cross_call_mixed" that takes a as Float, b as Float, c as Float, n as Integer, d as Float returns Float:
+    @Reasoning
+    Exercises Runa-internal calling convention with mixed Float/Integer
+    arguments.  Stage1 carries Float values as their int64 bit pattern
+    in GPRs (%rdi/%rsi/%rdx/%rcx/%r8/%r9).  This is binary-identical
+    to passing the IEEE 754 encoding directly and works because every
+    Float operation in stage1 bit-casts to %xmm0/%xmm1 at the use
+    site (see compiler/frontend/codegen.runa's `bop_is_float` path).
+
+    Computes a*b + c + d + n*2 = 1*2 + 3 + 4 + 5*2 = 19.0 for the
+    test caller.
+    @End Reasoning
+    Let prod be mul_floats(a, b)
+    Let s1 be add_floats(prod, c)
+    Let s2 be add_floats(s1, d)
+    Let n_f be int_to_float_native(n)
+    Let two_f be int_to_float_native(2)
+    Let n_times_two be mul_floats(n_f, two_f)
+    Let final be add_floats(s2, n_times_two)
+    Return final
+End Process
+
+Process called "main" returns Integer:
+    @Reasoning
+    Bit-or of failing test indices is returned as the exit code; zero
+    means every native SSE2 path produced the IEEE 754-correct result.
+    @End Reasoning
+    Let fails be 0
+
+    Note: Test 1: ADDSD via codegen on Float-typed operands.
+    Let one_half be 1.5
+    Let two_half be 2.5
+    Let four be 4.0
+    Let sum be add_floats(one_half, two_half)
+    If feq_bits(sum, four) is not equal to 1:
+        Set fails to fails plus 1
+    End If
+
+    Note: Test 2: CVTSI2SDQ + DIVSD chain (7 / 2 == 3.5 exactly).
+    Let seven_f be int_to_float_native(7)
+    Let two_f be int_to_float_native(2)
+    Let three_half be 3.5
+    Let q be div_floats(seven_f, two_f)
+    If feq_bits(q, three_half) is not equal to 1:
+        Set fails to fails plus 2
+    End If
+
+    Note: Test 3: Binary FP truth - sqrt(2.0)*sqrt(2.0) != 2.0.
+    Note: SQRTSD on 2.0 yields 0x3FF6A09E667F3BCD (1.41421356...); its
+    Note: square rounds to 2.0000000000000004 which is one ulp above 2.0.
+    Let two_f2 be 2.0
+    Let r2 be sqrt_f(two_f2)
+    Let r2_sq be mul_floats(r2, r2)
+    If feq_bits(r2_sq, two_f2) is equal to 1:
+        Set fails to fails plus 4
+    End If
+
+    Note: Test 4: SQRTSD bit-exact reference.  IEEE 754 binary64 sqrt(2)
+    Note: is exactly 0x3FF6A09E667F3BCD = 4609047870845172685.
+    Let want_s_bits be 4609047870845172685
+    Let want_s be bits_as_float(want_s_bits)
+    If feq_bits(r2, want_s) is not equal to 1:
+        Set fails to fails plus 8
+    End If
+
+    Note: Test 5: Cross-call ABI with 4 Float args + 1 Integer.
+    Let one_f be 1.0
+    Let two_f3 be 2.0
+    Let three_f be 3.0
+    Let four_f be 4.0
+    Let nineteen_f be int_to_float_native(19)
+    Let result be cross_call_mixed(one_f, two_f3, three_f, 5, four_f)
+    If feq_bits(result, nineteen_f) is not equal to 1:
+        Set fails to fails plus 16
+    End If
+
+    Note: Test 6: CVTTSD2SIQ truncation (3.5 -> 3, not 4).
+    Let n_back be float_to_int_native(three_half)
+    If n_back is not equal to 3:
+        Set fails to fails plus 32
+    End If
+
+    Note: Test 7: UCOMISD-driven less-than on Float-typed operands
+    Note: (codegen routes "is less than" through the cmp_is_float path).
+    Let small be 0.5
+    Let big be 1.5
+    Let lt be 0
+    If small is less than big:
+        Set lt to 1
+    End If
+    If lt is not equal to 1:
+        Set fails to fails plus 64
+    End If
+
+    Note: Test 8: NaN-ordered equality.  sqrt(-1.0) is qNaN; per IEEE
+    Note: 754 every ordered comparison with NaN returns false (UCOMISD
+    Note: sets PF=1, and the stage1 codegen ANDs setp into the sete path
+    Note: so that NaN is equal to NaN evaluates to 0).
+    Let neg_one be 0.0 minus 1.0
+    Let nan_val be sqrt_f(neg_one)
+    Let nan_eq_nan be 0
+    If nan_val is equal to nan_val:
+        Set nan_eq_nan to 1
+    End If
+    If nan_eq_nan is not equal to 0:
+        Set fails to fails plus 128
+    End If
+
+    Return fails
+End Process

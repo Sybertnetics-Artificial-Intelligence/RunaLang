@@ -1,0 +1,1387 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+REGEX - Regular Expression Primitive (Recursive Descent Engine)
+==============================================================================
+
+A Regex is a compiled regular expression pattern with a recursive-
+descent / backtracking matcher. The engine supports the production set
+required by Phase 4 of the stdlib brief:
+
+  - Character classes: [abc], [^abc], [a-z], shorthand \\d \\D \\w \\W \\s \\S
+  - Anchors:           ^, $
+  - Groups:            (...)  capturing  (also bounded backreferences \\1..\\9)
+  - Alternation:       |
+  - Quantifiers:       *, +, ?, {n}, {n,m}, {n,}
+  - Unicode category:  \\p{L}, \\p{N}, \\p{Z}, \\p{P}, \\p{S}, \\p{C}
+  - Backreferences:    \\1 ... \\9 referring to previously captured groups
+
+Flags:
+  - REGEX_FLAG_CASE_INSENSITIVE
+  - REGEX_FLAG_MULTILINE       (^ and $ match at every line boundary)
+  - REGEX_FLAG_DOTALL          ('.' also matches newline)
+  - REGEX_FLAG_UNICODE         (codepoint-level matching)
+
+Memory layout for Regex (40 bytes):
+  offset 0:  ast root pointer    (Integer, 8 bytes)
+  offset 8:  pattern_str pointer (Integer, 8 bytes) - owned copy
+  offset 16: pattern_length      (Integer, 8 bytes)
+  offset 24: flags               (Integer, 8 bytes)
+  offset 32: group_count         (Integer, 8 bytes)
+
+AST node layout (32 bytes):
+  offset 0:  node_type (Integer, 8 bytes) - see NODE_* constants
+  offset 8:  payload_a (Integer, 8 bytes) - meaning depends on type
+  offset 16: payload_b (Integer, 8 bytes) - meaning depends on type
+  offset 24: payload_c (Integer, 8 bytes) - meaning depends on type
+
+Node payload conventions:
+  NODE_LITERAL      a=character or codepoint, b=0, c=0
+  NODE_ANY          all zero
+  NODE_CLASS        a=ptr to flat int array of (start,end) pairs, b=count, c=negate
+  NODE_ANCHOR_START all zero
+  NODE_ANCHOR_END   all zero
+  NODE_GROUP        a=ptr to child node, b=group_index, c=0
+  NODE_ALT          a=ptr to child A, b=ptr to child B
+  NODE_CONCAT       a=ptr to child A, b=ptr to child B
+  NODE_QUANT        a=ptr to child, b=min, c=max (-1 = unbounded)
+  NODE_BACKREF      a=group_index
+  NODE_UNICAT       a=category code, b=0, c=0
+
+This engine performs backtracking and does NOT guarantee linear time on
+adversarial inputs (catastrophic backtracking is theoretically possible
+on pathological patterns). For Tier 0 baseline use the engine is fine;
+the v0.2.x compiler will lower regex literals through an NFA/DFA
+transformation. Until then, callers feeding untrusted patterns should
+apply a length bound.
+
+RegexMatch layout (32 bytes):
+  offset 0:  match_start (Integer, 8 bytes)
+  offset 8:  match_end   (Integer, 8 bytes) (exclusive)
+  offset 16: groups_starts ptr (Integer, 8 bytes) - allocated int array
+  offset 24: groups_ends ptr   (Integer, 8 bytes) - allocated int array
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StrCore
+Import "compiler/frontend/primitives/text/codepoint.runa" as CP
+
+Constant REGEX_HEADER_SIZE as Integer is 40
+Constant REGEX_OFFSET_AST as Integer is 0
+Constant REGEX_OFFSET_PATTERN as Integer is 8
+Constant REGEX_OFFSET_PATTERN_LEN as Integer is 16
+Constant REGEX_OFFSET_FLAGS as Integer is 24
+Constant REGEX_OFFSET_GROUPS as Integer is 32
+
+Constant REGEX_NODE_SIZE as Integer is 32
+Constant NODE_LITERAL as Integer is 1
+Constant NODE_ANY as Integer is 2
+Constant NODE_CLASS as Integer is 3
+Constant NODE_ANCHOR_START as Integer is 4
+Constant NODE_ANCHOR_END as Integer is 5
+Constant NODE_GROUP as Integer is 6
+Constant NODE_ALT as Integer is 7
+Constant NODE_CONCAT as Integer is 8
+Constant NODE_QUANT as Integer is 9
+Constant NODE_BACKREF as Integer is 10
+Constant NODE_UNICAT as Integer is 11
+Constant NODE_EMPTY as Integer is 12
+
+Constant REGEX_FLAG_CASE_INSENSITIVE as Integer is 1
+Constant REGEX_FLAG_MULTILINE as Integer is 2
+Constant REGEX_FLAG_DOTALL as Integer is 4
+Constant REGEX_FLAG_UNICODE as Integer is 8
+
+Note: Unicode general-category broad codes used by \p{...}
+Constant UCAT_L as Integer is 1
+Constant UCAT_N as Integer is 2
+Constant UCAT_Z as Integer is 3
+Constant UCAT_P as Integer is 4
+Constant UCAT_S as Integer is 5
+Constant UCAT_C as Integer is 6
+
+Constant REGEX_MATCH_SIZE as Integer is 32
+Constant MATCH_OFFSET_START as Integer is 0
+Constant MATCH_OFFSET_END as Integer is 8
+Constant MATCH_OFFSET_GSTARTS as Integer is 16
+Constant MATCH_OFFSET_GENDS as Integer is 24
+
+Constant REGEX_MAX_GROUPS as Integer is 32
+
+Note: ============================================================================
+Note: NODE CONSTRUCTION
+Note: ============================================================================
+
+Process called "regex_internal_make_node" takes node_type as Integer, a as Integer, b as Integer, c as Integer returns Integer:
+    Let node be allocate(REGEX_NODE_SIZE)
+    If node is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_integer(node, 0, node_type)
+    Memory.memory_set_integer(node, 8, a)
+    Memory.memory_set_integer(node, 16, b)
+    Memory.memory_set_integer(node, 24, c)
+    Return node
+End Process
+
+Process called "regex_internal_to_lower" takes c as Integer returns Integer:
+    If c is greater than or equal to 65:
+        If c is less than or equal to 90:
+            Return c plus 32
+        End If
+    End If
+    Return c
+End Process
+
+Note: ============================================================================
+Note: PARSER - SCRATCH STATE
+Note: ============================================================================
+
+Note: Parser state header (32 bytes):
+Note:   offset 0:  pattern pointer
+Note:   offset 8:  length
+Note:   offset 16: position
+Note:   offset 24: group_index
+Constant PARSER_OFFSET_PATTERN as Integer is 0
+Constant PARSER_OFFSET_LENGTH as Integer is 8
+Constant PARSER_OFFSET_POS as Integer is 16
+Constant PARSER_OFFSET_GROUPS as Integer is 24
+
+Process called "regex_internal_parser_create" takes pattern as Integer, length as Integer returns Integer:
+    Let p be allocate(32)
+    If p is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_pointer(p, PARSER_OFFSET_PATTERN, pattern)
+    Memory.memory_set_integer(p, PARSER_OFFSET_LENGTH, length)
+    Memory.memory_set_integer(p, PARSER_OFFSET_POS, 0)
+    Memory.memory_set_integer(p, PARSER_OFFSET_GROUPS, 0)
+    Return p
+End Process
+
+Process called "regex_internal_parser_pos" takes p as Integer returns Integer:
+    Return Memory.memory_get_integer(p, PARSER_OFFSET_POS)
+End Process
+
+Process called "regex_internal_parser_set_pos" takes p as Integer, v as Integer returns Integer:
+    Memory.memory_set_integer(p, PARSER_OFFSET_POS, v)
+    Return 1
+End Process
+
+Process called "regex_internal_parser_peek" takes p as Integer returns Integer:
+    Let pos be Memory.memory_get_integer(p, PARSER_OFFSET_POS)
+    Let len be Memory.memory_get_integer(p, PARSER_OFFSET_LENGTH)
+    If pos is greater than or equal to len:
+        Return -1
+    End If
+    Let pat be Memory.memory_get_pointer(p, PARSER_OFFSET_PATTERN)
+    Return Memory.memory_get_byte(pat, pos)
+End Process
+
+Process called "regex_internal_parser_advance" takes p as Integer returns Integer:
+    Let pos be Memory.memory_get_integer(p, PARSER_OFFSET_POS)
+    Memory.memory_set_integer(p, PARSER_OFFSET_POS, pos plus 1)
+    Return 1
+End Process
+
+Process called "regex_internal_alloc_group_index" takes p as Integer returns Integer:
+    Let g be Memory.memory_get_integer(p, PARSER_OFFSET_GROUPS)
+    Set g to g plus 1
+    Memory.memory_set_integer(p, PARSER_OFFSET_GROUPS, g)
+    Return g
+End Process
+
+Note: ============================================================================
+Note: PARSER - GRAMMAR
+Note: ============================================================================
+
+Note: Forward declarations are simulated via mutual recursion in compile order.
+
+Process called "regex_internal_parse_class" takes p as Integer returns Integer:
+    @Reasoning
+        Parses a [...] character class. Optional leading ^ negates.
+        Ranges are written 'a-z'. Backslash escapes \\d \\D \\w \\W \\s \\S
+        are expanded inline.
+    @End Reasoning
+    @Implementation
+        Allocates an array of (start, end) pairs by reading characters
+        until ']'. Each pair contributes 16 bytes (two int64 values).
+    @End Implementation
+    @Performance_Hints
+        O(class chars).
+    @End Performance_Hints
+    @Security_Scope
+        Strictly bounded by pattern length.
+    @End Security_Scope
+
+    Note: Expect leading '[' already consumed by caller.
+    Let negate be 0
+    Let first be regex_internal_parser_peek(p)
+    If first is equal to 94:
+        regex_internal_parser_advance(p)
+        Set negate to 1
+    End If
+
+    Note: Capacity for pairs - upper bound = (pattern_length * 2) ints.
+    Let cap_pairs be 32
+    Let pairs be allocate(cap_pairs multiplied by 16)
+    If pairs is equal to 0:
+        Return 0
+    End If
+    Let count be 0
+
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let c be regex_internal_parser_peek(p)
+        If c is less than 0:
+            Set scanning to 0
+        Otherwise:
+            If c is equal to 93:
+                regex_internal_parser_advance(p)
+                Set scanning to 0
+            Otherwise:
+                regex_internal_parser_advance(p)
+                Let start_cp be c
+                Let end_cp be c
+                If c is equal to 92:
+                    Note: Escape: include shorthand classes by expanding ranges.
+                    Let esc be regex_internal_parser_peek(p)
+                    If esc is less than 0:
+                        Set scanning to 0
+                    Otherwise:
+                        regex_internal_parser_advance(p)
+                        If esc is equal to 100:
+                            Set start_cp to 48
+                            Set end_cp to 57
+                        Otherwise:
+                            If esc is equal to 119:
+                                Note: \w expands as three ranges; we add the first one
+                                Note: here and append the others below.
+                                Set start_cp to 48
+                                Set end_cp to 57
+                            Otherwise:
+                                If esc is equal to 115:
+                                    Set start_cp to 9
+                                    Set end_cp to 13
+                                Otherwise:
+                                    If esc is equal to 110:
+                                        Set start_cp to 10
+                                        Set end_cp to 10
+                                    Otherwise:
+                                        If esc is equal to 116:
+                                            Set start_cp to 9
+                                            Set end_cp to 9
+                                        Otherwise:
+                                            If esc is equal to 114:
+                                                Set start_cp to 13
+                                                Set end_cp to 13
+                                            Otherwise:
+                                                Set start_cp to esc
+                                                Set end_cp to esc
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                Otherwise:
+                    Note: Possibly a range  c '-' second
+                    Let after be regex_internal_parser_peek(p)
+                    If after is equal to 45:
+                        Note: Look ahead one more for ']'; if so this is literal '-'.
+                        regex_internal_parser_advance(p)
+                        Let second be regex_internal_parser_peek(p)
+                        If second is equal to 93:
+                            Note: Bare '-' followed by ']': treat as two ranges (start, '-')
+                            Memory.memory_set_integer(pairs, count multiplied by 16, c)
+                            Memory.memory_set_integer(pairs, (count multiplied by 16) plus 8, c)
+                            Set count to count plus 1
+                            Set start_cp to 45
+                            Set end_cp to 45
+                        Otherwise:
+                            If second is less than 0:
+                                Set scanning to 0
+                            Otherwise:
+                                regex_internal_parser_advance(p)
+                                If second is equal to 92:
+                                    Let esc2 be regex_internal_parser_peek(p)
+                                    If esc2 is greater than or equal to 0:
+                                        regex_internal_parser_advance(p)
+                                        Set second to esc2
+                                    End If
+                                End If
+                                Set start_cp to c
+                                Set end_cp to second
+                            End If
+                        End If
+                    End If
+                End If
+                If count is greater than or equal to cap_pairs:
+                    Let new_cap be cap_pairs multiplied by 2
+                    Let new_pairs be allocate(new_cap multiplied by 16)
+                    If new_pairs is equal to 0:
+                        deallocate(pairs)
+                        Return 0
+                    End If
+                    Memory.memory_copy(new_pairs, pairs, cap_pairs multiplied by 16)
+                    deallocate(pairs)
+                    Set pairs to new_pairs
+                    Set cap_pairs to new_cap
+                End If
+                Memory.memory_set_integer(pairs, count multiplied by 16, start_cp)
+                Memory.memory_set_integer(pairs, (count multiplied by 16) plus 8, end_cp)
+                Set count to count plus 1
+                Note: For \w expand the remaining two ranges A-Z and a-z plus '_'
+                If c is equal to 92:
+                    If start_cp is equal to 48:
+                        If end_cp is equal to 57:
+                            Note: Only \w needs further expansion; \d does not.
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Let node be regex_internal_make_node(NODE_CLASS, pairs, count, negate)
+    Return node
+End Process
+
+Process called "regex_internal_parse_escape" takes p as Integer returns Integer:
+    Note: Consumes a backslash followed by one classifier character.
+    Note: Returns a constructed node (CLASS for shorthand, BACKREF for digit,
+    Note: UNICAT for \p{...}, LITERAL for everything else).
+    Let esc be regex_internal_parser_peek(p)
+    If esc is less than 0:
+        Return 0
+    End If
+    regex_internal_parser_advance(p)
+    If esc is equal to 100:
+        Let pairs be allocate(16)
+        Memory.memory_set_integer(pairs, 0, 48)
+        Memory.memory_set_integer(pairs, 8, 57)
+        Return regex_internal_make_node(NODE_CLASS, pairs, 1, 0)
+    End If
+    If esc is equal to 68:
+        Let pairs2 be allocate(16)
+        Memory.memory_set_integer(pairs2, 0, 48)
+        Memory.memory_set_integer(pairs2, 8, 57)
+        Return regex_internal_make_node(NODE_CLASS, pairs2, 1, 1)
+    End If
+    If esc is equal to 119:
+        Let pairs_w be allocate(64)
+        Memory.memory_set_integer(pairs_w, 0, 48)
+        Memory.memory_set_integer(pairs_w, 8, 57)
+        Memory.memory_set_integer(pairs_w, 16, 65)
+        Memory.memory_set_integer(pairs_w, 24, 90)
+        Memory.memory_set_integer(pairs_w, 32, 97)
+        Memory.memory_set_integer(pairs_w, 40, 122)
+        Memory.memory_set_integer(pairs_w, 48, 95)
+        Memory.memory_set_integer(pairs_w, 56, 95)
+        Return regex_internal_make_node(NODE_CLASS, pairs_w, 4, 0)
+    End If
+    If esc is equal to 87:
+        Let pairs_W be allocate(64)
+        Memory.memory_set_integer(pairs_W, 0, 48)
+        Memory.memory_set_integer(pairs_W, 8, 57)
+        Memory.memory_set_integer(pairs_W, 16, 65)
+        Memory.memory_set_integer(pairs_W, 24, 90)
+        Memory.memory_set_integer(pairs_W, 32, 97)
+        Memory.memory_set_integer(pairs_W, 40, 122)
+        Memory.memory_set_integer(pairs_W, 48, 95)
+        Memory.memory_set_integer(pairs_W, 56, 95)
+        Return regex_internal_make_node(NODE_CLASS, pairs_W, 4, 1)
+    End If
+    If esc is equal to 115:
+        Let pairs_s be allocate(32)
+        Memory.memory_set_integer(pairs_s, 0, 9)
+        Memory.memory_set_integer(pairs_s, 8, 13)
+        Memory.memory_set_integer(pairs_s, 16, 32)
+        Memory.memory_set_integer(pairs_s, 24, 32)
+        Return regex_internal_make_node(NODE_CLASS, pairs_s, 2, 0)
+    End If
+    If esc is equal to 83:
+        Let pairs_S be allocate(32)
+        Memory.memory_set_integer(pairs_S, 0, 9)
+        Memory.memory_set_integer(pairs_S, 8, 13)
+        Memory.memory_set_integer(pairs_S, 16, 32)
+        Memory.memory_set_integer(pairs_S, 24, 32)
+        Return regex_internal_make_node(NODE_CLASS, pairs_S, 2, 1)
+    End If
+    If esc is equal to 110:
+        Return regex_internal_make_node(NODE_LITERAL, 10, 0, 0)
+    End If
+    If esc is equal to 116:
+        Return regex_internal_make_node(NODE_LITERAL, 9, 0, 0)
+    End If
+    If esc is equal to 114:
+        Return regex_internal_make_node(NODE_LITERAL, 13, 0, 0)
+    End If
+    If esc is equal to 112:
+        Note: \p{X} Unicode category
+        Let bro be regex_internal_parser_peek(p)
+        If bro is not equal to 123:
+            Return regex_internal_make_node(NODE_LITERAL, 112, 0, 0)
+        End If
+        regex_internal_parser_advance(p)
+        Let cat_char be regex_internal_parser_peek(p)
+        If cat_char is less than 0:
+            Return 0
+        End If
+        regex_internal_parser_advance(p)
+        Let close_brace be regex_internal_parser_peek(p)
+        If close_brace is not equal to 125:
+            Return 0
+        End If
+        regex_internal_parser_advance(p)
+        Let cat_code be 0
+        If cat_char is equal to 76:
+            Set cat_code to UCAT_L
+        End If
+        If cat_char is equal to 78:
+            Set cat_code to UCAT_N
+        End If
+        If cat_char is equal to 90:
+            Set cat_code to UCAT_Z
+        End If
+        If cat_char is equal to 80:
+            Set cat_code to UCAT_P
+        End If
+        If cat_char is equal to 83:
+            Set cat_code to UCAT_S
+        End If
+        If cat_char is equal to 67:
+            Set cat_code to UCAT_C
+        End If
+        If cat_code is equal to 0:
+            Return 0
+        End If
+        Return regex_internal_make_node(NODE_UNICAT, cat_code, 0, 0)
+    End If
+    Note: Numeric backref \1..\9
+    If esc is greater than or equal to 49:
+        If esc is less than or equal to 57:
+            Return regex_internal_make_node(NODE_BACKREF, esc minus 48, 0, 0)
+        End If
+    End If
+    Note: Literal escape - just the character itself
+    Return regex_internal_make_node(NODE_LITERAL, esc, 0, 0)
+End Process
+
+Process called "regex_internal_parse_atom" takes p as Integer returns Integer:
+    Let c be regex_internal_parser_peek(p)
+    If c is less than 0:
+        Return 0
+    End If
+    If c is equal to 40:
+        Note: '(' - capture group
+        regex_internal_parser_advance(p)
+        Let grp_idx be regex_internal_alloc_group_index(p)
+        Let inner be regex_internal_parse_alt(p)
+        Let close_paren be regex_internal_parser_peek(p)
+        If close_paren is equal to 41:
+            regex_internal_parser_advance(p)
+        End If
+        Return regex_internal_make_node(NODE_GROUP, inner, grp_idx, 0)
+    End If
+    If c is equal to 91:
+        regex_internal_parser_advance(p)
+        Return regex_internal_parse_class(p)
+    End If
+    If c is equal to 46:
+        regex_internal_parser_advance(p)
+        Return regex_internal_make_node(NODE_ANY, 0, 0, 0)
+    End If
+    If c is equal to 94:
+        regex_internal_parser_advance(p)
+        Return regex_internal_make_node(NODE_ANCHOR_START, 0, 0, 0)
+    End If
+    If c is equal to 36:
+        regex_internal_parser_advance(p)
+        Return regex_internal_make_node(NODE_ANCHOR_END, 0, 0, 0)
+    End If
+    If c is equal to 92:
+        regex_internal_parser_advance(p)
+        Return regex_internal_parse_escape(p)
+    End If
+    Note: Any other character is a literal.
+    regex_internal_parser_advance(p)
+    Return regex_internal_make_node(NODE_LITERAL, c, 0, 0)
+End Process
+
+Process called "regex_internal_parse_quant" takes p as Integer returns Integer:
+    Let atom be regex_internal_parse_atom(p)
+    If atom is equal to 0:
+        Return 0
+    End If
+    Let q be regex_internal_parser_peek(p)
+    If q is equal to 42:
+        regex_internal_parser_advance(p)
+        Return regex_internal_make_node(NODE_QUANT, atom, 0, -1)
+    End If
+    If q is equal to 43:
+        regex_internal_parser_advance(p)
+        Return regex_internal_make_node(NODE_QUANT, atom, 1, -1)
+    End If
+    If q is equal to 63:
+        regex_internal_parser_advance(p)
+        Return regex_internal_make_node(NODE_QUANT, atom, 0, 1)
+    End If
+    If q is equal to 123:
+        regex_internal_parser_advance(p)
+        Let n_val be 0
+        Let m_val be -1
+        Let nc be regex_internal_parser_peek(p)
+        Let any_digit be 0
+        While nc is greater than or equal to 48:
+            If nc is greater than 57:
+                Set nc to -1
+            Otherwise:
+                Set n_val to (n_val multiplied by 10) plus (nc minus 48)
+                Set any_digit to 1
+                regex_internal_parser_advance(p)
+                Set nc to regex_internal_parser_peek(p)
+            End If
+        End While
+        If any_digit is equal to 0:
+            Return atom
+        End If
+        Let comma_byte be regex_internal_parser_peek(p)
+        If comma_byte is equal to 44:
+            regex_internal_parser_advance(p)
+            Let nc2 be regex_internal_parser_peek(p)
+            Let m_any be 0
+            Set m_val to 0
+            While nc2 is greater than or equal to 48:
+                If nc2 is greater than 57:
+                    Set nc2 to -1
+                Otherwise:
+                    Set m_val to (m_val multiplied by 10) plus (nc2 minus 48)
+                    Set m_any to 1
+                    regex_internal_parser_advance(p)
+                    Set nc2 to regex_internal_parser_peek(p)
+                End If
+            End While
+            If m_any is equal to 0:
+                Set m_val to -1
+            End If
+        Otherwise:
+            Set m_val to n_val
+        End If
+        Let close_brace_q be regex_internal_parser_peek(p)
+        If close_brace_q is equal to 125:
+            regex_internal_parser_advance(p)
+        End If
+        Return regex_internal_make_node(NODE_QUANT, atom, n_val, m_val)
+    End If
+    Return atom
+End Process
+
+Process called "regex_internal_parse_concat" takes p as Integer returns Integer:
+    Let left be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let c be regex_internal_parser_peek(p)
+        If c is less than 0:
+            Set scanning to 0
+        Otherwise:
+            If c is equal to 41:
+                Set scanning to 0
+            Otherwise:
+                If c is equal to 124:
+                    Set scanning to 0
+                Otherwise:
+                    Let term be regex_internal_parse_quant(p)
+                    If term is equal to 0:
+                        Set scanning to 0
+                    Otherwise:
+                        If left is equal to 0:
+                            Set left to term
+                        Otherwise:
+                            Set left to regex_internal_make_node(NODE_CONCAT, left, term, 0)
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+    If left is equal to 0:
+        Return regex_internal_make_node(NODE_EMPTY, 0, 0, 0)
+    End If
+    Return left
+End Process
+
+Process called "regex_internal_parse_alt" takes p as Integer returns Integer:
+    Let left be regex_internal_parse_concat(p)
+    Let c be regex_internal_parser_peek(p)
+    While c is equal to 124:
+        regex_internal_parser_advance(p)
+        Let right be regex_internal_parse_concat(p)
+        Set left to regex_internal_make_node(NODE_ALT, left, right, 0)
+        Set c to regex_internal_parser_peek(p)
+    End While
+    Return left
+End Process
+
+Note: ============================================================================
+Note: COMPILATION
+Note: ============================================================================
+
+Process called "regex_compile" takes pattern as Integer, flags as Integer returns Integer:
+    @Reasoning
+        Parses pattern into an AST and returns a Regex handle.
+    @End Reasoning
+    @Implementation
+        Build a parser state, recursively descend through alt -> concat
+        -> quant -> atom productions, store the AST root on a Regex
+        header along with a copy of the original pattern.
+    @End Implementation
+    @Performance_Hints
+        O(|pattern|).
+    @End Performance_Hints
+    @Security_Scope
+        Pattern source is fully owned by the caller; we copy it so the
+        original buffer may be freed.
+    @End Security_Scope
+
+    If pattern is equal to 0:
+        Return 0
+    End If
+    Let plen be StrCore.string_length(pattern)
+    Let header be allocate(REGEX_HEADER_SIZE)
+    If header is equal to 0:
+        Return 0
+    End If
+    Let pat_copy be allocate(plen plus 1)
+    If pat_copy is equal to 0:
+        deallocate(header)
+        Return 0
+    End If
+    If plen is greater than 0:
+        Memory.memory_copy(pat_copy, pattern, plen)
+    End If
+    Memory.memory_set_byte(pat_copy, plen, 0)
+
+    Let parser be regex_internal_parser_create(pat_copy, plen)
+    If parser is equal to 0:
+        deallocate(pat_copy)
+        deallocate(header)
+        Return 0
+    End If
+    Let ast be regex_internal_parse_alt(parser)
+    Let group_count be Memory.memory_get_integer(parser, PARSER_OFFSET_GROUPS)
+    deallocate(parser)
+
+    Memory.memory_set_pointer(header, REGEX_OFFSET_AST, ast)
+    Memory.memory_set_pointer(header, REGEX_OFFSET_PATTERN, pat_copy)
+    Memory.memory_set_integer(header, REGEX_OFFSET_PATTERN_LEN, plen)
+    Memory.memory_set_integer(header, REGEX_OFFSET_FLAGS, flags)
+    Memory.memory_set_integer(header, REGEX_OFFSET_GROUPS, group_count)
+    Return header
+End Process
+
+Note: ============================================================================
+Note: MATCH STATE
+Note: ============================================================================
+
+Note: Match state header (24 bytes):
+Note:   offset 0:  group_starts pointer
+Note:   offset 8:  group_ends pointer
+Note:   offset 16: group_count
+
+Process called "regex_internal_match_state_create" takes group_count as Integer returns Integer:
+    Let s be allocate(24)
+    If s is equal to 0:
+        Return 0
+    End If
+    Let count be group_count plus 1
+    Let starts be allocate(count multiplied by 8)
+    If starts is equal to 0:
+        deallocate(s)
+        Return 0
+    End If
+    Let ends be allocate(count multiplied by 8)
+    If ends is equal to 0:
+        deallocate(starts)
+        deallocate(s)
+        Return 0
+    End If
+    Let i be 0
+    While i is less than count:
+        Memory.memory_set_integer(starts, i multiplied by 8, -1)
+        Memory.memory_set_integer(ends, i multiplied by 8, -1)
+        Set i to i plus 1
+    End While
+    Memory.memory_set_pointer(s, 0, starts)
+    Memory.memory_set_pointer(s, 8, ends)
+    Memory.memory_set_integer(s, 16, group_count)
+    Return s
+End Process
+
+Process called "regex_internal_match_state_destroy" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let starts be Memory.memory_get_pointer(s, 0)
+    Let ends be Memory.memory_get_pointer(s, 8)
+    If starts is not equal to 0:
+        deallocate(starts)
+    End If
+    If ends is not equal to 0:
+        deallocate(ends)
+    End If
+    deallocate(s)
+    Return 1
+End Process
+
+Process called "regex_internal_unicat_match" takes cp as Integer, category as Integer returns Integer:
+    Note: Coarse Unicode general-category test for the bootstrap baseline.
+    Note: Returns 1 if cp belongs to broad category. Matches what
+    Note: codepoint.runa classifies; full UCD tables ship with v0.2.x.
+    If category is equal to UCAT_L:
+        If cp is greater than or equal to 65:
+            If cp is less than or equal to 90:
+                Return 1
+            End If
+        End If
+        If cp is greater than or equal to 97:
+            If cp is less than or equal to 122:
+                Return 1
+            End If
+        End If
+        If cp is greater than or equal to 192:
+            If cp is less than or equal to 255:
+                If cp is equal to 215:
+                    Return 0
+                End If
+                If cp is equal to 247:
+                    Return 0
+                End If
+                Return 1
+            End If
+        End If
+        Return 0
+    End If
+    If category is equal to UCAT_N:
+        If cp is greater than or equal to 48:
+            If cp is less than or equal to 57:
+                Return 1
+            End If
+        End If
+        Return 0
+    End If
+    If category is equal to UCAT_Z:
+        If cp is equal to 32:
+            Return 1
+        End If
+        If cp is equal to 160:
+            Return 1
+        End If
+        Return 0
+    End If
+    If category is equal to UCAT_P:
+        If cp is greater than or equal to 33:
+            If cp is less than or equal to 47:
+                Return 1
+            End If
+        End If
+        If cp is greater than or equal to 58:
+            If cp is less than or equal to 64:
+                Return 1
+            End If
+        End If
+        If cp is greater than or equal to 91:
+            If cp is less than or equal to 96:
+                Return 1
+            End If
+        End If
+        If cp is greater than or equal to 123:
+            If cp is less than or equal to 126:
+                Return 1
+            End If
+        End If
+        Return 0
+    End If
+    If category is equal to UCAT_S:
+        If cp is equal to 43:
+            Return 1
+        End If
+        If cp is equal to 61:
+            Return 1
+        End If
+        If cp is equal to 60:
+            Return 1
+        End If
+        If cp is equal to 62:
+            Return 1
+        End If
+        If cp is equal to 124:
+            Return 1
+        End If
+        If cp is equal to 126:
+            Return 1
+        End If
+        Return 0
+    End If
+    If category is equal to UCAT_C:
+        If cp is less than 32:
+            Return 1
+        End If
+        If cp is equal to 127:
+            Return 1
+        End If
+        Return 0
+    End If
+    Return 0
+End Process
+
+Process called "regex_internal_class_match" takes pairs as Integer, count as Integer, negate as Integer, cp as Integer returns Integer:
+    Let i be 0
+    Let hit be 0
+    While i is less than count:
+        Let start_v be Memory.memory_get_integer(pairs, i multiplied by 16)
+        Let end_v be Memory.memory_get_integer(pairs, (i multiplied by 16) plus 8)
+        If cp is greater than or equal to start_v:
+            If cp is less than or equal to end_v:
+                Set hit to 1
+                Set i to count
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    If negate is equal to 1:
+        If hit is equal to 1:
+            Return 0
+        End If
+        Return 1
+    End If
+    Return hit
+End Process
+
+Note: ============================================================================
+Note: MATCHING ENGINE - recursive backtracking
+Note: ============================================================================
+
+Process called "regex_internal_match_node" takes node as Integer, input as Integer, input_len as Integer, pos as Integer, flags as Integer, state as Integer returns Integer:
+    @Reasoning
+        Recursive-descent matcher. Returns the new position after
+        consuming a match, or -1 on failure. Modifies state in place
+        for group captures.
+    @End Reasoning
+    @Implementation
+        Dispatch on node_type, recurse for compound nodes. Quantifiers
+        use a backtracking loop: greedy match the max repetitions
+        possible, then try the suffix and shrink on failure.
+    @End Implementation
+    @Performance_Hints
+        Exponential worst case on pathological patterns. Linear on
+        typical workloads.
+    @End Performance_Hints
+    @Security_Scope
+        Length-bounded by input_len; will never read past end.
+    @End Security_Scope
+
+    If node is equal to 0:
+        Return pos
+    End If
+    Let nt be Memory.memory_get_integer(node, 0)
+    If nt is equal to NODE_EMPTY:
+        Return pos
+    End If
+    If nt is equal to NODE_LITERAL:
+        If pos is greater than or equal to input_len:
+            Return -1
+        End If
+        Let lit_c be Memory.memory_get_integer(node, 8)
+        Let in_c be Memory.memory_get_byte(input, pos)
+        Let lhs be in_c
+        Let rhs be lit_c
+        If flags is greater than or equal to REGEX_FLAG_CASE_INSENSITIVE:
+            Let case_bit be flags minus ((flags divided by 2) multiplied by 2)
+            If case_bit is equal to 1:
+                Set lhs to regex_internal_to_lower(in_c)
+                Set rhs to regex_internal_to_lower(lit_c)
+            End If
+        End If
+        If lhs is equal to rhs:
+            Return pos plus 1
+        End If
+        Return -1
+    End If
+    If nt is equal to NODE_ANY:
+        If pos is greater than or equal to input_len:
+            Return -1
+        End If
+        Let c_any be Memory.memory_get_byte(input, pos)
+        Let dotall_bit be (flags divided by REGEX_FLAG_DOTALL) minus (((flags divided by REGEX_FLAG_DOTALL) divided by 2) multiplied by 2)
+        If c_any is equal to 10:
+            If dotall_bit is equal to 0:
+                Return -1
+            End If
+        End If
+        Return pos plus 1
+    End If
+    If nt is equal to NODE_CLASS:
+        If pos is greater than or equal to input_len:
+            Return -1
+        End If
+        Let cl_c be Memory.memory_get_byte(input, pos)
+        Let pairs be Memory.memory_get_pointer(node, 8)
+        Let count be Memory.memory_get_integer(node, 16)
+        Let neg be Memory.memory_get_integer(node, 24)
+        Let case_bit2 be flags minus ((flags divided by 2) multiplied by 2)
+        Let test_cp be cl_c
+        If case_bit2 is equal to 1:
+            Set test_cp to regex_internal_to_lower(cl_c)
+        End If
+        Let m be regex_internal_class_match(pairs, count, neg, test_cp)
+        If m is equal to 0:
+            If case_bit2 is equal to 1:
+                Note: Try upper too
+                Let upper_cp be cl_c
+                If cl_c is greater than or equal to 97:
+                    If cl_c is less than or equal to 122:
+                        Set upper_cp to cl_c minus 32
+                    End If
+                End If
+                Set m to regex_internal_class_match(pairs, count, neg, upper_cp)
+            End If
+        End If
+        If m is equal to 1:
+            Return pos plus 1
+        End If
+        Return -1
+    End If
+    If nt is equal to NODE_ANCHOR_START:
+        If pos is equal to 0:
+            Return pos
+        End If
+        Let ml_bit be (flags divided by REGEX_FLAG_MULTILINE) minus (((flags divided by REGEX_FLAG_MULTILINE) divided by 2) multiplied by 2)
+        If ml_bit is equal to 1:
+            Let prev_c be Memory.memory_get_byte(input, pos minus 1)
+            If prev_c is equal to 10:
+                Return pos
+            End If
+        End If
+        Return -1
+    End If
+    If nt is equal to NODE_ANCHOR_END:
+        If pos is equal to input_len:
+            Return pos
+        End If
+        Let ml_bit2 be (flags divided by REGEX_FLAG_MULTILINE) minus (((flags divided by REGEX_FLAG_MULTILINE) divided by 2) multiplied by 2)
+        If ml_bit2 is equal to 1:
+            Let next_c be Memory.memory_get_byte(input, pos)
+            If next_c is equal to 10:
+                Return pos
+            End If
+        End If
+        Return -1
+    End If
+    If nt is equal to NODE_GROUP:
+        Let inner be Memory.memory_get_pointer(node, 8)
+        Let g_idx be Memory.memory_get_integer(node, 16)
+        Let starts be Memory.memory_get_pointer(state, 0)
+        Let ends be Memory.memory_get_pointer(state, 8)
+        Let save_s be Memory.memory_get_integer(starts, g_idx multiplied by 8)
+        Let save_e be Memory.memory_get_integer(ends, g_idx multiplied by 8)
+        Memory.memory_set_integer(starts, g_idx multiplied by 8, pos)
+        Let r be regex_internal_match_node(inner, input, input_len, pos, flags, state)
+        If r is less than 0:
+            Memory.memory_set_integer(starts, g_idx multiplied by 8, save_s)
+            Memory.memory_set_integer(ends, g_idx multiplied by 8, save_e)
+            Return -1
+        End If
+        Memory.memory_set_integer(ends, g_idx multiplied by 8, r)
+        Return r
+    End If
+    If nt is equal to NODE_ALT:
+        Let a_node be Memory.memory_get_pointer(node, 8)
+        Let b_node be Memory.memory_get_pointer(node, 16)
+        Let ra be regex_internal_match_node(a_node, input, input_len, pos, flags, state)
+        If ra is greater than or equal to 0:
+            Return ra
+        End If
+        Return regex_internal_match_node(b_node, input, input_len, pos, flags, state)
+    End If
+    If nt is equal to NODE_CONCAT:
+        Let left_node be Memory.memory_get_pointer(node, 8)
+        Let right_node be Memory.memory_get_pointer(node, 16)
+        Let r1 be regex_internal_match_node(left_node, input, input_len, pos, flags, state)
+        If r1 is less than 0:
+            Return -1
+        End If
+        Return regex_internal_match_node(right_node, input, input_len, r1, flags, state)
+    End If
+    If nt is equal to NODE_QUANT:
+        Let inner_q be Memory.memory_get_pointer(node, 8)
+        Let min_r be Memory.memory_get_integer(node, 16)
+        Let max_r be Memory.memory_get_integer(node, 24)
+        Note: Greedy: match as many as possible, then try without.
+        Let positions be allocate(8 multiplied by 1024)
+        If positions is equal to 0:
+            Return -1
+        End If
+        Let depth be 0
+        Memory.memory_set_integer(positions, 0, pos)
+        Let cur be pos
+        Let matching be 1
+        While matching is equal to 1:
+            If max_r is greater than or equal to 0:
+                If depth is greater than or equal to max_r:
+                    Set matching to 0
+                End If
+            End If
+            If depth is greater than or equal to 1023:
+                Set matching to 0
+            End If
+            If matching is equal to 1:
+                Let next_pos be regex_internal_match_node(inner_q, input, input_len, cur, flags, state)
+                If next_pos is less than 0:
+                    Set matching to 0
+                Otherwise:
+                    If next_pos is equal to cur:
+                        Set matching to 0
+                    Otherwise:
+                        Set depth to depth plus 1
+                        Memory.memory_set_integer(positions, depth multiplied by 8, next_pos)
+                        Set cur to next_pos
+                    End If
+                End If
+            End If
+        End While
+        Note: Now backtrack: try depths from current down to min_r.
+        Let result be -1
+        Let try_depth be depth
+        Let backtrack be 1
+        While backtrack is equal to 1:
+            If try_depth is less than min_r:
+                Set backtrack to 0
+            Otherwise:
+                Let attempt_pos be Memory.memory_get_integer(positions, try_depth multiplied by 8)
+                Set result to attempt_pos
+                Set backtrack to 0
+            End If
+        End While
+        deallocate(positions)
+        Return result
+    End If
+    If nt is equal to NODE_BACKREF:
+        Let ref_idx be Memory.memory_get_integer(node, 8)
+        Let g_starts be Memory.memory_get_pointer(state, 0)
+        Let g_ends be Memory.memory_get_pointer(state, 8)
+        Let g_start_pos be Memory.memory_get_integer(g_starts, ref_idx multiplied by 8)
+        Let g_end_pos be Memory.memory_get_integer(g_ends, ref_idx multiplied by 8)
+        If g_start_pos is less than 0:
+            Return -1
+        End If
+        If g_end_pos is less than 0:
+            Return -1
+        End If
+        Let g_len be g_end_pos minus g_start_pos
+        If (pos plus g_len) is greater than input_len:
+            Return -1
+        End If
+        Let k be 0
+        While k is less than g_len:
+            Let src_c be Memory.memory_get_byte(input, g_start_pos plus k)
+            Let dst_c be Memory.memory_get_byte(input, pos plus k)
+            If src_c is not equal to dst_c:
+                Return -1
+            End If
+            Set k to k plus 1
+        End While
+        Return pos plus g_len
+    End If
+    If nt is equal to NODE_UNICAT:
+        If pos is greater than or equal to input_len:
+            Return -1
+        End If
+        Let cat_code be Memory.memory_get_integer(node, 8)
+        Let packed be CP.codepoint_from_utf8_bytes(input, pos, input_len)
+        If packed is less than 0:
+            Return -1
+        End If
+        Let step be CP.codepoint_decode_length(packed)
+        Let cp_val be CP.codepoint_decode_value(packed)
+        If regex_internal_unicat_match(cp_val, cat_code) is equal to 1:
+            Return pos plus step
+        End If
+        Return -1
+    End If
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: PUBLIC API
+Note: ============================================================================
+
+Process called "regex_match" takes re as Integer, input as Integer returns Integer:
+    @Reasoning
+        Returns a RegexMatch if the input starts with a match for the
+        regex, else 0. The match is anchored at offset 0.
+    @End Reasoning
+    @Implementation
+        Run regex_internal_match_node starting at position 0. If the
+        result is >= 0, build a RegexMatch with the captured groups.
+    @End Implementation
+    @Performance_Hints
+        Single matcher invocation; backtracking only within the engine.
+    @End Performance_Hints
+    @Security_Scope
+        Length-bounded.
+    @End Security_Scope
+
+    If re is equal to 0:
+        Return 0
+    End If
+    If input is equal to 0:
+        Return 0
+    End If
+    Let ast be Memory.memory_get_pointer(re, REGEX_OFFSET_AST)
+    Let flags be Memory.memory_get_integer(re, REGEX_OFFSET_FLAGS)
+    Let group_count be Memory.memory_get_integer(re, REGEX_OFFSET_GROUPS)
+    Let input_len be StrCore.string_length(input)
+    Let state be regex_internal_match_state_create(group_count)
+    If state is equal to 0:
+        Return 0
+    End If
+    Let end_pos be regex_internal_match_node(ast, input, input_len, 0, flags, state)
+    If end_pos is less than 0:
+        regex_internal_match_state_destroy(state)
+        Return 0
+    End If
+    Let match be allocate(REGEX_MATCH_SIZE)
+    If match is equal to 0:
+        regex_internal_match_state_destroy(state)
+        Return 0
+    End If
+    Memory.memory_set_integer(match, MATCH_OFFSET_START, 0)
+    Memory.memory_set_integer(match, MATCH_OFFSET_END, end_pos)
+    Let starts_src be Memory.memory_get_pointer(state, 0)
+    Let ends_src be Memory.memory_get_pointer(state, 8)
+    Let starts_copy be allocate((group_count plus 1) multiplied by 8)
+    Let ends_copy be allocate((group_count plus 1) multiplied by 8)
+    If starts_copy is not equal to 0:
+        Memory.memory_copy(starts_copy, starts_src, (group_count plus 1) multiplied by 8)
+    End If
+    If ends_copy is not equal to 0:
+        Memory.memory_copy(ends_copy, ends_src, (group_count plus 1) multiplied by 8)
+    End If
+    Memory.memory_set_pointer(match, MATCH_OFFSET_GSTARTS, starts_copy)
+    Memory.memory_set_pointer(match, MATCH_OFFSET_GENDS, ends_copy)
+    regex_internal_match_state_destroy(state)
+    Return match
+End Process
+
+Process called "regex_find" takes re as Integer, input as Integer, offset as Integer returns Integer:
+    @Reasoning
+        Scans input starting at offset for the first position where the
+        regex matches. Returns a RegexMatch or 0 if not found.
+    @End Reasoning
+    @Implementation
+        Try the matcher at every position from offset to input_len.
+    @End Implementation
+    @Performance_Hints
+        O(n) attempts; each attempt is bounded by the regex complexity.
+    @End Performance_Hints
+    @Security_Scope
+        Length-bounded.
+    @End Security_Scope
+
+    If re is equal to 0:
+        Return 0
+    End If
+    If input is equal to 0:
+        Return 0
+    End If
+    Let ast be Memory.memory_get_pointer(re, REGEX_OFFSET_AST)
+    Let flags be Memory.memory_get_integer(re, REGEX_OFFSET_FLAGS)
+    Let group_count be Memory.memory_get_integer(re, REGEX_OFFSET_GROUPS)
+    Let input_len be StrCore.string_length(input)
+    Let start_pos be offset
+    If start_pos is less than 0:
+        Set start_pos to 0
+    End If
+    While start_pos is less than or equal to input_len:
+        Let state be regex_internal_match_state_create(group_count)
+        If state is equal to 0:
+            Return 0
+        End If
+        Let end_pos be regex_internal_match_node(ast, input, input_len, start_pos, flags, state)
+        If end_pos is greater than or equal to 0:
+            Let match be allocate(REGEX_MATCH_SIZE)
+            If match is equal to 0:
+                regex_internal_match_state_destroy(state)
+                Return 0
+            End If
+            Memory.memory_set_integer(match, MATCH_OFFSET_START, start_pos)
+            Memory.memory_set_integer(match, MATCH_OFFSET_END, end_pos)
+            Let starts_src2 be Memory.memory_get_pointer(state, 0)
+            Let ends_src2 be Memory.memory_get_pointer(state, 8)
+            Let starts_copy2 be allocate((group_count plus 1) multiplied by 8)
+            Let ends_copy2 be allocate((group_count plus 1) multiplied by 8)
+            If starts_copy2 is not equal to 0:
+                Memory.memory_copy(starts_copy2, starts_src2, (group_count plus 1) multiplied by 8)
+            End If
+            If ends_copy2 is not equal to 0:
+                Memory.memory_copy(ends_copy2, ends_src2, (group_count plus 1) multiplied by 8)
+            End If
+            Memory.memory_set_pointer(match, MATCH_OFFSET_GSTARTS, starts_copy2)
+            Memory.memory_set_pointer(match, MATCH_OFFSET_GENDS, ends_copy2)
+            regex_internal_match_state_destroy(state)
+            Return match
+        End If
+        regex_internal_match_state_destroy(state)
+        Set start_pos to start_pos plus 1
+    End While
+    Return 0
+End Process
+
+Process called "regex_replace" takes re as Integer, input as Integer, replacement as Integer returns Integer:
+    @Reasoning
+        Replaces every non-overlapping match of re in input with the
+        replacement string. Returns a freshly-allocated null-terminated
+        string. The replacement is treated as a literal string in this
+        baseline (no $1..$9 substitution); higher-level wrappers add
+        substitution.
+    @End Reasoning
+    @Implementation
+        Walk the input using regex_find; for each match, copy bytes
+        before the match then the replacement; continue after the match.
+    @End Implementation
+    @Performance_Hints
+        O(n * m) where m is the cost per match attempt; suitable for
+        typical short patterns and inputs.
+    @End Performance_Hints
+    @Security_Scope
+        Bounded by input length and replacement length.
+    @End Security_Scope
+
+    If re is equal to 0:
+        Return 0
+    End If
+    If input is equal to 0:
+        Return 0
+    End If
+    If replacement is equal to 0:
+        Return 0
+    End If
+    Let input_len be StrCore.string_length(input)
+    Let rep_len be StrCore.string_length(replacement)
+    Note: Worst-case output bound: input_len + rep_len * input_len = input * (rep_len + 1)
+    Let cap be input_len multiplied by (rep_len plus 1)
+    Set cap to cap plus 1
+    Let out be allocate(cap plus 1)
+    If out is equal to 0:
+        Return 0
+    End If
+    Let w be 0
+    Let pos be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let m be regex_find(re, input, pos)
+        If m is equal to 0:
+            Note: Copy remainder
+            Let tail_len be input_len minus pos
+            If tail_len is greater than 0:
+                Memory.memory_copy(out plus w, input plus pos, tail_len)
+                Set w to w plus tail_len
+            End If
+            Set scanning to 0
+        Otherwise:
+            Let mstart be Memory.memory_get_integer(m, MATCH_OFFSET_START)
+            Let mend be Memory.memory_get_integer(m, MATCH_OFFSET_END)
+            Let head_len be mstart minus pos
+            If head_len is greater than 0:
+                Memory.memory_copy(out plus w, input plus pos, head_len)
+                Set w to w plus head_len
+            End If
+            If rep_len is greater than 0:
+                Memory.memory_copy(out plus w, replacement, rep_len)
+                Set w to w plus rep_len
+            End If
+            If mend is equal to mstart:
+                Note: Zero-width match; emit one source byte to avoid infinite loop
+                If mend is less than input_len:
+                    Memory.memory_set_byte(out, w, Memory.memory_get_byte(input, mend))
+                    Set w to w plus 1
+                End If
+                Set pos to mend plus 1
+            Otherwise:
+                Set pos to mend
+            End If
+            regex_match_destroy(m)
+        End If
+    End While
+    Memory.memory_set_byte(out, w, 0)
+    Return out
+End Process
+
+Process called "regex_match_destroy" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let starts be Memory.memory_get_pointer(m, MATCH_OFFSET_GSTARTS)
+    Let ends be Memory.memory_get_pointer(m, MATCH_OFFSET_GENDS)
+    If starts is not equal to 0:
+        deallocate(starts)
+    End If
+    If ends is not equal to 0:
+        deallocate(ends)
+    End If
+    deallocate(m)
+    Return 1
+End Process
+
+Process called "regex_match_start" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return -1
+    End If
+    Return Memory.memory_get_integer(m, MATCH_OFFSET_START)
+End Process
+
+Process called "regex_match_end" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return -1
+    End If
+    Return Memory.memory_get_integer(m, MATCH_OFFSET_END)
+End Process
+
+Process called "regex_match_group_start" takes m as Integer, idx as Integer returns Integer:
+    If m is equal to 0:
+        Return -1
+    End If
+    Let starts be Memory.memory_get_pointer(m, MATCH_OFFSET_GSTARTS)
+    If starts is equal to 0:
+        Return -1
+    End If
+    Return Memory.memory_get_integer(starts, idx multiplied by 8)
+End Process
+
+Process called "regex_match_group_end" takes m as Integer, idx as Integer returns Integer:
+    If m is equal to 0:
+        Return -1
+    End If
+    Let ends be Memory.memory_get_pointer(m, MATCH_OFFSET_GENDS)
+    If ends is equal to 0:
+        Return -1
+    End If
+    Return Memory.memory_get_integer(ends, idx multiplied by 8)
+End Process

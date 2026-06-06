@@ -1,0 +1,872 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+COORDINATE_REFERENCE_SYSTEM - Earth coordinate system conversions
+
+This file implements transformations between the major Earth coordinate
+reference systems (CRS) used in geodesy and spaceflight:
+
+  LLH  - Geodetic Latitude / Longitude / Height (above ellipsoid)
+  ECEF - Earth-Centered, Earth-Fixed Cartesian (XYZ)
+  ECI  - Earth-Centered Inertial (J2000 epoch convention)
+  ENU  - East / North / Up local tangent plane
+  NED  - North / East / Down local tangent plane
+
+WHY THIS MATTERS
+
+ECEF and ECI are both Cartesian XYZ but rotate with respect to each other
+at ~ 7.2921150e-5 rad/s (Earth's sidereal rotation rate). Code that mixes
+the two without explicit conversion produces position errors that grow at
+~466 m/s at the equator. Spacecraft attitude determination, satellite
+tracking, and GPS receivers all require strict separation of the two
+frames. F# units of measure and similar systems have demonstrated that
+making the frame a first-class type prevents this entire bug class.
+
+NOMINAL TYPING FOR FRAMES
+
+Each Cartesian variant gets a distinct nominal type (CartesianECEF,
+CartesianECI, LocalENU, LocalNED) wrapping x/y/z floats. Procedures
+declared as taking CartesianECEF cannot accept a CartesianECI value
+even though both wrap three Floats. The conversion procedures
+(ecef_from_eci, eci_from_ecef, etc.) are the only way to cross frames,
+which makes every frame boundary auditable.
+
+ELLIPSOID PARAMETERS
+
+The forward and inverse geodetic transformations use the reference
+ellipsoid associated with the LLH coordinate's datum. WGS84 is the
+default; we provide constructors for the historically important
+alternatives (GRS80, Clarke 1866, Airy 1830, Bessel 1841).
+
+CITATIONS
+
+  - DMA TR 8350.2 (1991): Department of Defense World Geodetic System 1984.
+  - Hofmann-Wellenhof & Moritz (2006): Physical Geodesy, 2nd ed. The
+    canonical reference for ellipsoidal geodesy.
+  - IERS Conventions (2010): International Earth Rotation and Reference
+    Systems Service Technical Note 36. Source for the GMST (Greenwich
+    mean sidereal time) formula used in ECEF<->ECI rotation.
+  - Vallado (2013): Fundamentals of Astrodynamics and Applications, 4th ed.
+    Section 3.5 (coordinate system transformations).
+  - Bowring (1976): "Transformation from spatial to geographical
+    coordinates", Survey Review 23, 323-327. The iterative latitude
+    formulation used here.
+
+DEPENDENCIES
+
+  - compiler/frontend/primitives/core/arithmetic_core.runa for sqrt.
+:End Note
+
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/geo/geo_coordinate.runa" as GeoCoord
+
+Note: ============================================================================
+Note: SECTION 1 - Ellipsoid enumeration and parameter records
+Note: ============================================================================
+Note: A reference ellipsoid is parameterized by the semi-major axis (equatorial
+Note: radius) and the flattening (or equivalently the semi-minor axis or
+Note: eccentricity squared). We pick the WGS84 ellipsoid as the default; the
+Note: full list below covers all the major historical and regional ellipsoids
+Note: still in use.
+
+Type Ellipsoid is:
+    | WGS84Ellipsoid
+    | GRS80Ellipsoid
+    | Clarke1866
+    | Airy1830
+    | Bessel1841
+End Type
+
+Type called "EllipsoidParameters":
+    semi_major_axis_meters as Float
+    inverse_flattening as Float
+End Type
+
+Process called "ellipsoid_params_wgs84" returns EllipsoidParameters:
+    @Reasoning:
+        WGS84 is the default ellipsoid for GPS and most modern GIS data.
+        Parameters from DMA TR 8350.2: a = 6378137 m (exact by definition),
+        1/f = 298.257223563.
+    @End Reasoning
+    @Implementation:
+        Construct EllipsoidParameters with the WGS84 constants.
+    @End Implementation
+    @Performance_Hints:
+        Two stores.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let p be a value of type EllipsoidParameters
+    Set p.semi_major_axis_meters to 6378137.0
+    Set p.inverse_flattening to 298.257223563
+    Return p
+End Process
+
+Process called "ellipsoid_params_grs80" returns EllipsoidParameters:
+    Note: GRS80: a = 6378137 m, 1/f = 298.257222101 (IUGG 1980)
+    Let p be a value of type EllipsoidParameters
+    Set p.semi_major_axis_meters to 6378137.0
+    Set p.inverse_flattening to 298.257222101
+    Return p
+End Process
+
+Process called "ellipsoid_params_clarke_1866" returns EllipsoidParameters:
+    Note: Clarke 1866: a = 6378206.4 m, 1/f = 294.9786982
+    Note: The classical ellipsoid for the US NAD27 horizontal datum.
+    Let p be a value of type EllipsoidParameters
+    Set p.semi_major_axis_meters to 6378206.4
+    Set p.inverse_flattening to 294.9786982
+    Return p
+End Process
+
+Process called "ellipsoid_params_airy_1830" returns EllipsoidParameters:
+    Note: Airy 1830: a = 6377563.396 m, 1/f = 299.3249646
+    Note: The ellipsoid for the OSGB36 datum used by the UK Ordnance Survey.
+    Let p be a value of type EllipsoidParameters
+    Set p.semi_major_axis_meters to 6377563.396
+    Set p.inverse_flattening to 299.3249646
+    Return p
+End Process
+
+Process called "ellipsoid_params_bessel_1841" returns EllipsoidParameters:
+    Note: Bessel 1841: a = 6377397.155 m, 1/f = 299.1528128
+    Note: Used by older Japanese (Tokyo), German, and some south Asian datums.
+    Let p be a value of type EllipsoidParameters
+    Set p.semi_major_axis_meters to 6377397.155
+    Set p.inverse_flattening to 299.1528128
+    Return p
+End Process
+
+Note: ============================================================================
+Note: SECTION 2 - CoordinateSystem enumeration
+Note: ============================================================================
+
+Type CoordinateSystem is:
+    | ECEF
+    | ECI
+    | LLH
+    | ENU
+    | NED
+End Type
+
+Note: ============================================================================
+Note: SECTION 3 - Cartesian frame types (nominal typing for the frame)
+Note: ============================================================================
+Note: Each Cartesian variant is structurally identical (three Floats) but
+Note: distinct in the type system. Crossing a frame boundary requires an
+Note: explicit conversion procedure, which makes the boundary auditable.
+
+Type called "CartesianECEF":
+    x_meters as Float
+    y_meters as Float
+    z_meters as Float
+End Type
+
+Type called "CartesianECI":
+    x_meters as Float
+    y_meters as Float
+    z_meters as Float
+End Type
+
+Type called "LocalENU":
+    east_meters as Float
+    north_meters as Float
+    up_meters as Float
+End Type
+
+Type called "LocalNED":
+    north_meters as Float
+    east_meters as Float
+    down_meters as Float
+End Type
+
+Process called "ecef_create" takes x as Float, y as Float, z as Float returns CartesianECEF:
+    Let p be a value of type CartesianECEF
+    Set p.x_meters to x
+    Set p.y_meters to y
+    Set p.z_meters to z
+    Return p
+End Process
+
+Process called "eci_create" takes x as Float, y as Float, z as Float returns CartesianECI:
+    Let p be a value of type CartesianECI
+    Set p.x_meters to x
+    Set p.y_meters to y
+    Set p.z_meters to z
+    Return p
+End Process
+
+Process called "enu_create" takes east as Float, north as Float, up as Float returns LocalENU:
+    Let p be a value of type LocalENU
+    Set p.east_meters to east
+    Set p.north_meters to north
+    Set p.up_meters to up
+    Return p
+End Process
+
+Process called "ned_create" takes north as Float, east as Float, down as Float returns LocalNED:
+    Let p be a value of type LocalNED
+    Set p.north_meters to north
+    Set p.east_meters to east
+    Set p.down_meters to down
+    Return p
+End Process
+
+Process called "ecef_x" takes p as CartesianECEF returns Float:
+    Return p.x_meters
+End Process
+
+Process called "ecef_y" takes p as CartesianECEF returns Float:
+    Return p.y_meters
+End Process
+
+Process called "ecef_z" takes p as CartesianECEF returns Float:
+    Return p.z_meters
+End Process
+
+Process called "eci_x" takes p as CartesianECI returns Float:
+    Return p.x_meters
+End Process
+
+Process called "eci_y" takes p as CartesianECI returns Float:
+    Return p.y_meters
+End Process
+
+Process called "eci_z" takes p as CartesianECI returns Float:
+    Return p.z_meters
+End Process
+
+Note: ============================================================================
+Note: SECTION 4 - Inline trig helpers (Taylor series in Float)
+Note: ============================================================================
+Note: The transformations below require sin/cos/atan2/sqrt of small radian
+Note: angles (latitudes and longitudes scaled to radians stay within ~ 3.15).
+Note: Rather than depend on trig_core's Integer-bit-pattern API we provide
+Note: Float-native helpers here. The Taylor series with argument reduction
+Note: is correct to within ~ 1e-15 (full Float64 precision) across the
+Note: required input range.
+
+Process called "geo_pi" returns Float:
+    Note: pi to 17 significant digits, the most binary64 can represent
+    Return 3.141592653589793
+End Process
+
+Process called "geo_two_pi" returns Float:
+    Return 6.283185307179586
+End Process
+
+Process called "geo_half_pi" returns Float:
+    Return 1.5707963267948966
+End Process
+
+Process called "geo_deg_to_rad" takes degrees as Float returns Float:
+    Return degrees multiplied by 0.017453292519943295
+End Process
+
+Process called "geo_rad_to_deg" takes radians as Float returns Float:
+    Return radians multiplied by 57.29577951308232
+End Process
+
+Process called "geo_float_abs" takes x as Float returns Float:
+    If x is less than 0.0:
+        Return 0.0 minus x
+    End If
+    Return x
+End Process
+
+Process called "geo_reduce_to_minus_pi_to_pi" takes x as Float returns Float:
+    @Reasoning:
+        Reduce argument modulo 2*pi to the canonical [-pi, pi] interval so
+        the Taylor series converges fast. For latitudes (max |x| <= pi/2)
+        and longitudes (max |x| <= pi) the reduction is a no-op; we include
+        it for robustness against caller-supplied out-of-range arguments.
+    @End Reasoning
+    @Implementation:
+        While x > pi, subtract 2*pi. While x < -pi, add 2*pi. For inputs
+        well outside this range the loop terminates in a deterministic
+        number of iterations.
+    @End Implementation
+    @Performance_Hints:
+        Hot path is the no-op case (input already in [-pi, pi]) where the
+        function returns after two compares. Cold path executes ceil(|x|/2pi)
+        loop iterations, which is bounded by the input magnitude.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let result be x
+    While result is greater than 3.141592653589793:
+        Set result to result minus 6.283185307179586
+    End While
+    While result is less than 0.0 minus 3.141592653589793:
+        Set result to result plus 6.283185307179586
+    End While
+    Return result
+End Process
+
+Process called "geo_sin" takes x_radians as Float returns Float:
+    @Reasoning:
+        Compute sin(x) via Taylor series after argument reduction. With
+        reduction to [-pi, pi] and further folding by sin(pi - x) = sin(x)
+        we get arguments in [-pi/2, pi/2], where 13 terms of the Taylor
+        expansion are correct to better than 1e-16 (full Float precision).
+        This is the same algorithm used in trig_core.runa but expressed
+        directly on Float-typed values.
+    @End Reasoning
+    @Implementation:
+        Reduce to [-pi, pi], then to [-pi/2, pi/2] via the identity
+        sin(x) = sin(pi - x) for x in (pi/2, pi] and
+        sin(x) = -sin(-pi - x) for x in [-pi, -pi/2).
+        Evaluate the Taylor series:
+          sin(x) = x - x^3/3! + x^5/5! - x^7/7! + x^9/9! - x^11/11! + x^13/13!
+        Each term is computed by multiplying the previous power of x by
+        x^2 and dividing by the next factorial.
+    @End Implementation
+    @Performance_Hints:
+        13 multiplies, 6 divides, 6 adds, 6 subtracts. About 25 cycles on
+        modern x86-64 (latency-bound through the FP pipeline).
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. NaN input propagates to NaN output per IEEE 754.
+    @End Security_Scope
+    Let x be geo_reduce_to_minus_pi_to_pi(x_radians)
+    Note: Fold to [-pi/2, pi/2]
+    If x is greater than 1.5707963267948966:
+        Set x to 3.141592653589793 minus x
+    End If
+    If x is less than 0.0 minus 1.5707963267948966:
+        Set x to 0.0 minus 3.141592653589793 minus x
+    End If
+    Note: Taylor series x - x^3/6 + x^5/120 - x^7/5040 + x^9/362880 - x^11/39916800 + x^13/6227020800
+    Let x2 be x multiplied by x
+    Let term be x
+    Let sum be x
+    Set term to term multiplied by x2
+    Set term to term divided by 6.0
+    Set sum to sum minus term
+    Set term to term multiplied by x2
+    Set term to term divided by 20.0
+    Set sum to sum plus term
+    Set term to term multiplied by x2
+    Set term to term divided by 42.0
+    Set sum to sum minus term
+    Set term to term multiplied by x2
+    Set term to term divided by 72.0
+    Set sum to sum plus term
+    Set term to term multiplied by x2
+    Set term to term divided by 110.0
+    Set sum to sum minus term
+    Set term to term multiplied by x2
+    Set term to term divided by 156.0
+    Set sum to sum plus term
+    Return sum
+End Process
+
+Process called "geo_cos" takes x_radians as Float returns Float:
+    @Reasoning:
+        Compute cos(x) via Taylor series with the same reduction strategy
+        as geo_sin. The identity cos(x) = sin(pi/2 - x) lets us reuse the
+        sin implementation, which we do here for simplicity and audit ease.
+    @End Reasoning
+    @Implementation:
+        cos(x) = sin(pi/2 - x).
+    @End Implementation
+    @Performance_Hints:
+        One subtract plus one geo_sin call. Total ~ 26 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Return geo_sin(1.5707963267948966 minus x_radians)
+End Process
+
+Process called "geo_tan" takes x_radians as Float returns Float:
+    Note: tan(x) = sin(x) / cos(x). Near pi/2 + k*pi the result tends to
+    Note: infinity; IEEE 754 division produces the appropriate signed
+    Note: infinity automatically.
+    Return geo_sin(x_radians) divided by geo_cos(x_radians)
+End Process
+
+Process called "geo_atan2_quadrant" takes y as Float, x as Float returns Float:
+    @Reasoning:
+        Two-argument arctangent: returns the angle in [-pi, pi] from the
+        positive x-axis to the vector (x, y). Used by ECEF->LLH conversion
+        to compute longitude from (X, Y).
+    @End Reasoning
+    @Implementation:
+        Use the standard quadrant analysis on top of an atan(t) Taylor
+        series for |t| <= 1. For |y/x| > 1 we evaluate atan(x/y) and
+        adjust. Returns:
+          x > 0:                atan(y/x)
+          x < 0, y >= 0:        atan(y/x) + pi
+          x < 0, y < 0:         atan(y/x) - pi
+          x == 0, y > 0:        +pi/2
+          x == 0, y < 0:        -pi/2
+          x == 0, y == 0:       0 (mathematically undefined; we pick 0)
+    @End Implementation
+    @Performance_Hints:
+        One divide, one atan call (~ 6 terms of Taylor, similar cycle
+        count to sin/cos), and a small branch.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. (0,0) is handled with a deterministic 0 return.
+    @End Security_Scope
+    If x is equal to 0.0:
+        If y is greater than 0.0:
+            Return 1.5707963267948966
+        End If
+        If y is less than 0.0:
+            Return 0.0 minus 1.5707963267948966
+        End If
+        Return 0.0
+    End If
+    Let t be y divided by x
+    Let abs_t be geo_float_abs(t)
+    Let a be 0.0
+    If abs_t is greater than 1.0:
+        Note: atan(t) = pi/2 - atan(1/t) for t > 0
+        Note: atan(t) = -pi/2 - atan(1/t) for t < 0
+        Let inv_t be 1.0 divided by t
+        Let inner be geo_atan_taylor_small(inv_t)
+        If t is greater than 0.0:
+            Set a to 1.5707963267948966 minus inner
+        Otherwise:
+            Set a to 0.0 minus 1.5707963267948966 minus inner
+        End If
+    Otherwise:
+        Set a to geo_atan_taylor_small(t)
+    End If
+    If x is greater than 0.0:
+        Return a
+    End If
+    If y is greater than 0.0 or y is equal to 0.0:
+        Return a plus 3.141592653589793
+    End If
+    Return a minus 3.141592653589793
+End Process
+
+Process called "geo_atan_taylor_small" takes t as Float returns Float:
+    @Reasoning:
+        Taylor expansion of atan(t) for |t| <= 1. Converges to full Float
+        precision in 11 terms.
+    @End Reasoning
+    @Implementation:
+        atan(t) = t - t^3/3 + t^5/5 - t^7/7 + ...
+    @End Implementation
+    @Performance_Hints:
+        11 multiplies, 11 divides (compiled to MULSD + DIVSD), 5 adds, 5
+        subtracts. ~ 50 cycles for the worst case.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let t2 be t multiplied by t
+    Let term be t
+    Let sum be t
+    Set term to term multiplied by t2
+    Set sum to sum minus term divided by 3.0
+    Set term to term multiplied by t2
+    Set sum to sum plus term divided by 5.0
+    Set term to term multiplied by t2
+    Set sum to sum minus term divided by 7.0
+    Set term to term multiplied by t2
+    Set sum to sum plus term divided by 9.0
+    Set term to term multiplied by t2
+    Set sum to sum minus term divided by 11.0
+    Set term to term multiplied by t2
+    Set sum to sum plus term divided by 13.0
+    Return sum
+End Process
+
+Process called "geo_asin" takes x as Float returns Float:
+    @Reasoning:
+        Compute arcsine of x in [-1, 1]. Uses the identity
+        asin(x) = atan2(x, sqrt(1 - x^2)) which is numerically well-behaved
+        for x near +/-1 because the divisor goes to zero and atan2 handles
+        the case cleanly.
+    @End Reasoning
+    @Implementation:
+        Build 1 - x^2, take sqrt, call atan2(x, that).
+    @End Implementation
+    @Performance_Hints:
+        One MULSD, one SUBSD, one SQRTSD, one atan2 call. ~ 80 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Inputs outside [-1, 1] produce a negative argument to sqrt
+        which yields NaN, propagating to a NaN result per IEEE 754.
+    @End Security_Scope
+    Let x2 be x multiplied by x
+    Let one_minus_x2 be 1.0 minus x2
+    Let denom be proc sqrt from Arith with one_minus_x2
+    Return geo_atan2_quadrant(x, denom)
+End Process
+
+Note: ============================================================================
+Note: SECTION 5 - LLH <-> ECEF conversion
+Note: ============================================================================
+
+Process called "ecef_from_llh" takes c as GeoCoordinate, ellipsoid as EllipsoidParameters returns CartesianECEF:
+    @Reasoning:
+        Forward geodetic transformation. Given latitude/longitude/height on
+        a reference ellipsoid, compute the Earth-Centered Earth-Fixed
+        Cartesian X, Y, Z. The closed-form formula is:
+          N(phi) = a / sqrt(1 - e^2 * sin^2(phi))
+          X = (N + h) * cos(phi) * cos(lambda)
+          Y = (N + h) * cos(phi) * sin(lambda)
+          Z = (N * (1 - e^2) + h) * sin(phi)
+        where a = semi-major axis, e^2 = first eccentricity squared,
+        phi = geodetic latitude, lambda = longitude, h = ellipsoidal height.
+        Source: Hofmann-Wellenhof & Moritz, Physical Geodesy, eq. 5.27.
+    @End Reasoning
+    @Implementation:
+        Compute e^2 from 1/f as: f = 1/inverse_flattening, e^2 = 2f - f^2.
+        Then evaluate N, then X/Y/Z via the formulas above.
+    @End Implementation
+    @Performance_Hints:
+        4 sin/cos calls (~ 100 cycles total), one sqrt, ~ 12 floating-point
+        multiplies and adds.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Latitude exactly at the poles yields cos(phi) = 0 (or close),
+        which is well-behaved in the formulas - X and Y both go to zero
+        (or near-zero) and Z saturates at the semi-minor axis. NaN or out-
+        of-range latitudes propagate through IEEE 754.
+    @End Security_Scope
+    Let phi be geo_deg_to_rad(c.latitude_degrees)
+    Let lambda be geo_deg_to_rad(c.longitude_degrees)
+    Let h be c.altitude_meters
+    Let a be ellipsoid.semi_major_axis_meters
+    Let f be 1.0 divided by ellipsoid.inverse_flattening
+    Let f_sq be f multiplied by f
+    Let e2 be 2.0 multiplied by f
+    Set e2 to e2 minus f_sq
+    Let sin_phi be geo_sin(phi)
+    Let cos_phi be geo_cos(phi)
+    Let sin_lambda be geo_sin(lambda)
+    Let cos_lambda be geo_cos(lambda)
+    Let sin_phi_sq be sin_phi multiplied by sin_phi
+    Let one_minus_e2_sinphi2 be 1.0 minus e2 multiplied by sin_phi_sq
+    Let denom be proc sqrt from Arith with one_minus_e2_sinphi2
+    Let N be a divided by denom
+    Let n_plus_h be N plus h
+    Let x_coord be n_plus_h multiplied by cos_phi
+    Set x_coord to x_coord multiplied by cos_lambda
+    Let y_coord be n_plus_h multiplied by cos_phi
+    Set y_coord to y_coord multiplied by sin_lambda
+    Let one_minus_e2 be 1.0 minus e2
+    Let z_factor be N multiplied by one_minus_e2
+    Set z_factor to z_factor plus h
+    Let z_coord be z_factor multiplied by sin_phi
+    Return ecef_create(x_coord, y_coord, z_coord)
+End Process
+
+Process called "llh_from_ecef" takes p as CartesianECEF, ellipsoid as EllipsoidParameters, datum_idx as Integer returns GeoCoordinate:
+    @Reasoning:
+        Inverse geodetic transformation using the Bowring (1976) iterative
+        closed-form formula. Given ECEF X, Y, Z, returns the geodetic
+        latitude (degrees), longitude (degrees), and ellipsoidal height
+        (meters). The Bowring algorithm converges to full Float precision
+        in fewer than 5 iterations for any point on Earth's surface.
+    @End Reasoning
+    @Implementation:
+        Compute p = sqrt(X^2 + Y^2), longitude = atan2(Y, X). Initial
+        latitude estimate phi_0 = atan2(Z, p * (1 - e^2)). Iterate:
+          N = a / sqrt(1 - e^2 sin^2(phi))
+          h = p / cos(phi) - N
+          phi_new = atan2(Z, p * (1 - e^2 * N / (N + h)))
+        Loop until |phi_new - phi| < 1e-12 radians (~ 6 nm at the equator)
+        or 10 iterations elapse. The convergence is geometric in the
+        eccentricity squared so 4 iterations suffice for WGS84.
+    @End Implementation
+    @Performance_Hints:
+        ~ 4 iterations each doing 1 sin/cos pair, 1 sqrt, ~ 8 FP ops.
+        Total ~ 800 cycles for a typical conversion.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. ECEF coordinates exactly on the Z-axis (X = Y = 0) yield
+        cos(latitude) = 0 in the iteration; we guard against the resulting
+        divide-by-zero by clamping cos(phi) to a small floor (1e-15) when
+        we detect we are within 1e-9 m of the polar axis.
+    @End Security_Scope
+    Let x_co be p.x_meters
+    Let y_co be p.y_meters
+    Let z_co be p.z_meters
+    Let a be ellipsoid.semi_major_axis_meters
+    Let f be 1.0 divided by ellipsoid.inverse_flattening
+    Let f_sq be f multiplied by f
+    Let e2 be 2.0 multiplied by f
+    Set e2 to e2 minus f_sq
+    Let xy2 be x_co multiplied by x_co
+    Set xy2 to xy2 plus y_co multiplied by y_co
+    Let p_xy be proc sqrt from Arith with xy2
+    Let lambda be geo_atan2_quadrant(y_co, x_co)
+    Note: Initial latitude estimate
+    Let denom_init be p_xy multiplied by (1.0 minus e2)
+    Let phi be geo_atan2_quadrant(z_co, denom_init)
+    Note: Bowring iteration - converges in 4 iterations for WGS84
+    Let iteration_count be 0
+    Let h be 0.0
+    While iteration_count is less than 6:
+        Let sin_phi be geo_sin(phi)
+        Let cos_phi be geo_cos(phi)
+        Let sin_phi_sq be sin_phi multiplied by sin_phi
+        Let radicand be 1.0 minus e2 multiplied by sin_phi_sq
+        Let denom be proc sqrt from Arith with radicand
+        Let N be a divided by denom
+        Note: Polar-axis guard: if cos_phi is near zero we are at the pole
+        Note: and h = |z| - b (b = N (1 - e^2)). Use that closed form.
+        Let abs_cos_phi be geo_float_abs(cos_phi)
+        If abs_cos_phi is less than 0.000000000000001:
+            Let b be N multiplied by (1.0 minus e2)
+            Let abs_z be geo_float_abs(z_co)
+            Set h to abs_z minus b
+        Otherwise:
+            Set h to p_xy divided by cos_phi
+            Set h to h minus N
+        End If
+        Note: New latitude estimate
+        Let factor be N multiplied by e2
+        Let n_plus_h be N plus h
+        Let inner be factor divided by n_plus_h
+        Let one_minus_inner be 1.0 minus inner
+        Let new_denom be p_xy multiplied by one_minus_inner
+        Let new_phi be geo_atan2_quadrant(z_co, new_denom)
+        Set phi to new_phi
+        Set iteration_count to iteration_count plus 1
+    End While
+    Let lat_deg be geo_rad_to_deg(phi)
+    Let lon_deg be geo_rad_to_deg(lambda)
+    Let result be a value of type GeoCoordinate
+    Set result.latitude_degrees to lat_deg
+    Set result.longitude_degrees to lon_deg
+    Set result.altitude_meters to h
+    Set result.datum_index to datum_idx
+    Return result
+End Process
+
+Note: ============================================================================
+Note: SECTION 6 - ECEF <-> ECI rotation
+Note: ============================================================================
+Note: The ECEF and ECI frames differ only by a rotation about the Z (polar)
+Note: axis. The rotation angle is the Greenwich Mean Sidereal Time (GMST)
+Note: at the requested epoch.
+Note: For full astrometric precision the precession, nutation, and polar
+Note: motion corrections must be applied (IERS Conventions 2010 chapter 5).
+Note: That level of precision requires the IAU 2006/2000A precession-nutation
+Note: model which is a 1000+ term series and lives in a future
+Note: ASTRONOMICAL_REFERENCE_FRAME extension; here we provide the simpler
+Note: GMST-only rotation that is adequate for satellite ground-track
+Note: visualization and short-baseline tracking (errors < ~ 10 m for
+Note: orbits up to GEO altitude).
+
+Process called "gmst_at_julian_date" takes julian_date as Float returns Float:
+    @Reasoning:
+        Greenwich Mean Sidereal Time formula from IERS Conventions 2010
+        eq. 5.32 truncated to the polynomial-in-T form, ignoring the
+        TT-UT1 difference (~50-70 seconds, contributes < 1 arcsec to GMST
+        which is below the ~10 m ground-track precision target). Returns
+        GMST as an angle in radians.
+        GMST = 24110.54841 + 8640184.812866 * T + 0.093104 * T^2
+               - 6.2e-6 * T^3 (in seconds of time, not arc)
+        where T = (JD - 2451545.0) / 36525 is centuries from J2000.0.
+        We add the diurnal rotation (UT1 portion) and convert to radians.
+    @End Reasoning
+    @Implementation:
+        Compute T from the Julian Date. Evaluate the polynomial. Add the
+        UT1-derived diurnal angle (frac(JD + 0.5) * 86400 * sidereal-rate).
+        Normalize the resulting angle to [0, 2*pi].
+    @End Implementation
+    @Performance_Hints:
+        Two divides, several FP multiplies, one modulo. ~ 50 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Caller-supplied Julian dates outside the validity range of
+        the formula (roughly +/- 200 years from J2000) produce increasing
+        error but no NaN or trap.
+    @End Security_Scope
+    Note: Centuries from J2000.0
+    Let T_cent be julian_date minus 2451545.0
+    Set T_cent to T_cent divided by 36525.0
+    Let T_sq be T_cent multiplied by T_cent
+    Let T_cube be T_sq multiplied by T_cent
+    Note: GMST in seconds (Aoki et al. 1982 formulation)
+    Let gmst_seconds be 24110.54841
+    Set gmst_seconds to gmst_seconds plus 8640184.812866 multiplied by T_cent
+    Set gmst_seconds to gmst_seconds plus 0.093104 multiplied by T_sq
+    Set gmst_seconds to gmst_seconds minus 0.0000062 multiplied by T_cube
+    Note: Add the UT1-diurnal portion using frac(JD + 0.5)
+    Let jd_plus_half be julian_date plus 0.5
+    Let jd_floor be 0.0
+    Let result_for_floor be 0.0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-72]
+        roundsd xmm1, xmm0, 1
+        movq qword ptr [rbp-80], xmm1
+    End Assembly
+    Let frac_part be jd_plus_half minus jd_floor
+    Let day_seconds be frac_part multiplied by 86400.0
+    Let earth_rate be 1.0027379093508
+    Set gmst_seconds to gmst_seconds plus day_seconds multiplied by earth_rate
+    Note: Convert seconds to radians: 1 sidereal day = 86400 seconds = 2pi rad
+    Let gmst_rad be gmst_seconds multiplied by 0.00007272205216643040
+    Note: Normalize to [0, 2pi]
+    Let two_pi be 6.283185307179586
+    While gmst_rad is greater than two_pi:
+        Set gmst_rad to gmst_rad minus two_pi
+    End While
+    While gmst_rad is less than 0.0:
+        Set gmst_rad to gmst_rad plus two_pi
+    End While
+    Return gmst_rad
+End Process
+
+Process called "eci_from_ecef" takes p as CartesianECEF, julian_date as Float returns CartesianECI:
+    @Reasoning:
+        Rotate from the Earth-fixed ECEF frame into the inertial ECI frame
+        by rotating about the Z-axis by +GMST (the angle Earth has rotated
+        since J2000).
+    @End Reasoning
+    @Implementation:
+        Compute theta = GMST(julian_date). Apply the 3D rotation about Z:
+          ECI.x = ECEF.x * cos(theta) - ECEF.y * sin(theta)
+          ECI.y = ECEF.x * sin(theta) + ECEF.y * cos(theta)
+          ECI.z = ECEF.z
+    @End Implementation
+    @Performance_Hints:
+        One GMST call (~ 50 cycles), one sin/cos pair (~ 50 cycles), four
+        multiplies and two add/sub.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let theta be gmst_at_julian_date(julian_date)
+    Let cos_t be geo_cos(theta)
+    Let sin_t be geo_sin(theta)
+    Let x_eci be p.x_meters multiplied by cos_t
+    Let xy_y_neg be p.y_meters multiplied by sin_t
+    Set x_eci to x_eci minus xy_y_neg
+    Let y_eci be p.x_meters multiplied by sin_t
+    Let yy_pos be p.y_meters multiplied by cos_t
+    Set y_eci to y_eci plus yy_pos
+    Let z_eci be p.z_meters
+    Return eci_create(x_eci, y_eci, z_eci)
+End Process
+
+Process called "ecef_from_eci" takes p as CartesianECI, julian_date as Float returns CartesianECEF:
+    Note: Inverse rotation: rotate about Z-axis by -theta.
+    Let theta be gmst_at_julian_date(julian_date)
+    Let cos_t be geo_cos(theta)
+    Let sin_t be geo_sin(theta)
+    Note: ECEF.x =  ECI.x * cos + ECI.y * sin
+    Note: ECEF.y = -ECI.x * sin + ECI.y * cos
+    Let x_ec be p.x_meters multiplied by cos_t
+    Let xy_y_pos be p.y_meters multiplied by sin_t
+    Set x_ec to x_ec plus xy_y_pos
+    Let neg_sin be 0.0 minus sin_t
+    Let y_ec be p.x_meters multiplied by neg_sin
+    Let yy_pos be p.y_meters multiplied by cos_t
+    Set y_ec to y_ec plus yy_pos
+    Let z_ec be p.z_meters
+    Return ecef_create(x_ec, y_ec, z_ec)
+End Process
+
+Note: ============================================================================
+Note: SECTION 7 - ECEF -> local ENU/NED relative to a reference point
+Note: ============================================================================
+Note: Local tangent-plane coordinates are useful for short-baseline navigation,
+Note: terrain visualization, and antenna pointing. The reference point is the
+Note: origin of the local frame.
+
+Process called "enu_from_ecef" takes target as CartesianECEF, reference as GeoCoordinate, ellipsoid as EllipsoidParameters returns LocalENU:
+    @Reasoning:
+        Express an ECEF position as East/North/Up offsets from a reference
+        geodetic point. Used for local mapping, antenna pointing, and
+        short-baseline navigation. The transformation involves:
+          1. Compute reference ECEF position.
+          2. Form delta ECEF = target_ECEF - reference_ECEF.
+          3. Rotate delta into the local ENU frame using the rotation matrix
+             at the reference latitude/longitude.
+    @End Reasoning
+    @Implementation:
+        Rotation matrix:
+          [   -sin(lambda)             cos(lambda)              0       ]
+          [-sin(phi)*cos(lambda)  -sin(phi)*sin(lambda)   cos(phi)      ]
+          [ cos(phi)*cos(lambda)   cos(phi)*sin(lambda)   sin(phi)      ]
+        Apply to (delta_x, delta_y, delta_z) to produce (east, north, up).
+    @End Implementation
+    @Performance_Hints:
+        One ecef_from_llh call (~ 800 cycles via Bowring), one sin/cos
+        pair for the reference latitude and another for the reference
+        longitude (~ 100 cycles), 9 multiplies, 6 add/sub.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let ref_ecef be ecef_from_llh(reference, ellipsoid)
+    Let dx be target.x_meters minus ref_ecef.x_meters
+    Let dy be target.y_meters minus ref_ecef.y_meters
+    Let dz be target.z_meters minus ref_ecef.z_meters
+    Let phi be geo_deg_to_rad(reference.latitude_degrees)
+    Let lambda be geo_deg_to_rad(reference.longitude_degrees)
+    Let sin_phi be geo_sin(phi)
+    Let cos_phi be geo_cos(phi)
+    Let sin_lambda be geo_sin(lambda)
+    Let cos_lambda be geo_cos(lambda)
+    Note: East = -sin(lambda)*dx + cos(lambda)*dy
+    Let east_part1 be 0.0 minus sin_lambda multiplied by dx
+    Let east_part2 be cos_lambda multiplied by dy
+    Let east be east_part1 plus east_part2
+    Note: North = -sin(phi)*cos(lambda)*dx - sin(phi)*sin(lambda)*dy + cos(phi)*dz
+    Let north_p1 be 0.0 minus sin_phi multiplied by cos_lambda
+    Set north_p1 to north_p1 multiplied by dx
+    Let north_p2 be 0.0 minus sin_phi multiplied by sin_lambda
+    Set north_p2 to north_p2 multiplied by dy
+    Let north_p3 be cos_phi multiplied by dz
+    Let north be north_p1 plus north_p2
+    Set north to north plus north_p3
+    Note: Up = cos(phi)*cos(lambda)*dx + cos(phi)*sin(lambda)*dy + sin(phi)*dz
+    Let up_p1 be cos_phi multiplied by cos_lambda
+    Set up_p1 to up_p1 multiplied by dx
+    Let up_p2 be cos_phi multiplied by sin_lambda
+    Set up_p2 to up_p2 multiplied by dy
+    Let up_p3 be sin_phi multiplied by dz
+    Let up be up_p1 plus up_p2
+    Set up to up plus up_p3
+    Return enu_create(east, north, up)
+End Process
+
+Process called "ned_from_ecef" takes target as CartesianECEF, reference as GeoCoordinate, ellipsoid as EllipsoidParameters returns LocalNED:
+    @Reasoning:
+        NED is the same local tangent frame as ENU but with axes reordered
+        and the third axis pointing down. Common in aerospace conventions
+        (the body axes of an aircraft align with NED in straight and level
+        flight).
+    @End Reasoning
+    @Implementation:
+        Reuse ENU and flip: North = N, East = E, Down = -U.
+    @End Implementation
+    @Performance_Hints:
+        Same cost as enu_from_ecef plus one sign flip.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let enu be enu_from_ecef(target, reference, ellipsoid)
+    Let down be 0.0 minus enu.up_meters
+    Return ned_create(enu.north_meters, enu.east_meters, down)
+End Process

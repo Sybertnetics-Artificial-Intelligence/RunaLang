@@ -1,0 +1,1218 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Foundational error / option / either / try types for the Runa numeric
+primitive layer.
+
+This module exposes four parametric value types implemented uniformly
+as Integer-tagged-pointer ADTs.  Each value is a 24-byte heap header
+encoded as:
+
+    offset 0:  tag        (Integer; type-specific discriminant)
+    offset 8:  payload_a  (Integer or pointer; meaning depends on tag)
+    offset 16: payload_b  (Integer or pointer; meaning depends on tag)
+
+The bootstrap stage1 parser does not provide first-class generic-type
+parameter syntax (no `Result<T, E>` form is recognized), so we represent
+parametricity by storing arbitrary Integer-sized payloads.  Higher
+layers must agree on the payload encoding for their T / E / L / R
+types; primitives such as BigInts are already passed as opaque Integer
+pointers, so the convention threads through directly.
+
+CONSTRUCTION
+
+For each type, the constructor procs (e.g. ok, err, some, none, left,
+right, try_ok, try_err) allocate the 24-byte header and write the
+discriminant and payloads.  Every constructor returns the header
+pointer; the caller owns the header and the payloads it embeds.
+
+OWNERSHIP
+
+The Result / Option / Either / Try wrappers DO NOT take ownership of
+their payload pointers.  Releasing the wrapper via result_free /
+option_free / either_free / try_free deallocates the 24-byte header
+ONLY.  Payloads must be freed separately by their original owner if
+they require it; this is consistent with the BigInt and UInt64 buffer
+conventions used throughout the numeric primitive layer.
+
+PARAMETRIC POLYMORPHISM PATTERN
+
+Because Runa stage1 has no generic-parameter syntax, the parametric T
+in Result<T, E> is represented as an Integer-shaped slot.  When T is a
+primitive Integer (e.g. a 64-bit count), the slot holds the value
+directly.  When T is a heap object (e.g. a BigInt header pointer),
+the slot holds the pointer.  Callers wishing to dispatch on T must do
+so externally (the Result type itself is type-erased).
+
+This convention is identical to the one used by string_core,
+io_core, and the BigInt limb-buffer layer: an Integer slot is the
+universal payload carrier in stage1.  Once stage1 receives generic-
+parameter syntax this module's @Reasoning blocks will be updated to
+make T / E / L / R the parser-recognised parameters; the runtime
+representation will not change.
+
+HIGHER-ORDER OPERATION DISPATCH
+
+The functor / monadic helpers (map, map_err, and_then, or_else, fold,
+recover) take an Integer-shaped function-pointer argument and invoke
+it through the __builtin_call_indirect_1 intrinsic.  The intrinsic is
+defined in compiler/frontend/primitives/intrinsics/builtins.runa as a
+type-checking stub whose codegen path is intentionally rerouted to an
+indirect-call instruction sequence (CALL %rax / BLR X9 / etc.) once
+the bootstrap codegen wires up EXPR_INDIRECT_CALL dispatch by name.
+
+In stage1 today the intrinsic resolves to the stub (which returns 0),
+so map/and_then mappers that do real work will not be invoked until
+the codegen rewrite lands.  The control-flow shape of these procs is
+already correct, so callers can adopt them today and the closures
+will activate transparently in the next stage1 update.  Callers that
+need guaranteed dispatch in stage1 should use the explicit
+is_ok / unwrap pattern instead of map.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/intrinsics/builtins.runa" as Builtins
+
+Note: ============================================================================
+Note: Layout offsets and tag values
+Note: ============================================================================
+
+Constant ADT_HEADER_SIZE as Integer is 24
+Constant ADT_TAG_OFF as Integer is 0
+Constant ADT_PAYLOAD_A_OFF as Integer is 8
+Constant ADT_PAYLOAD_B_OFF as Integer is 16
+
+Note: Result discriminants
+Constant RESULT_TAG_OK as Integer is 1
+Constant RESULT_TAG_ERR as Integer is 2
+
+Note: Option / Maybe discriminants
+Constant OPTION_TAG_SOME as Integer is 1
+Constant OPTION_TAG_NONE as Integer is 2
+
+Note: Either discriminants
+Constant EITHER_TAG_LEFT as Integer is 1
+Constant EITHER_TAG_RIGHT as Integer is 2
+
+Note: Try discriminants.  Carries an optional cause pointer in payload_b
+Note: when tag == TRY_TAG_ERR so that exception chaining is supported.
+Constant TRY_TAG_OK as Integer is 1
+Constant TRY_TAG_ERR as Integer is 2
+
+Note: ============================================================================
+Note: Allocator helpers
+Note: ============================================================================
+
+Process called "adt_alloc" returns Integer:
+    @Reasoning
+    Allocates a 24-byte ADT header used by all four parametric types in
+    this module.  Returned in a zero-initialized state.
+    @End Reasoning
+
+    @Implementation
+    Single Layout.allocate followed by explicit zero of all three slots.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) constant-size allocation.  Frequently called on hot paths.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0 (NULL); callers MUST check.
+    @End Security_Scope
+
+    Let buf be Layout.allocate(ADT_HEADER_SIZE)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(buf, ADT_TAG_OFF, 0)
+    Memory.memory_set_int64(buf, ADT_PAYLOAD_A_OFF, 0)
+    Memory.memory_set_int64(buf, ADT_PAYLOAD_B_OFF, 0)
+    Return buf
+End Process
+
+Process called "adt_free" takes header as Integer returns Integer:
+    @Reasoning
+    Releases an ADT header.  Does NOT release the payload pointer(s);
+    payload ownership is the caller's responsibility per the module
+    contract.
+    @End Reasoning
+
+    @Implementation
+    Layout.deallocate guarded by a NULL check.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Double-free triggers the allocator canary.
+    @End Security_Scope
+
+    If header is equal to 0:
+        Return 0
+    End If
+    Layout.deallocate(header)
+    Return 1
+End Process
+
+Process called "adt_get_tag" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int64(header, ADT_TAG_OFF)
+End Process
+
+Process called "adt_get_payload_a" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int64(header, ADT_PAYLOAD_A_OFF)
+End Process
+
+Process called "adt_get_payload_b" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int64(header, ADT_PAYLOAD_B_OFF)
+End Process
+
+Note: ============================================================================
+Note: Result<T, E>
+Note: ============================================================================
+
+Process called "ok" takes value as Integer returns Integer:
+    @Reasoning
+    Constructs a Result in the success state carrying `value`.  The
+    value's underlying type is opaque from the Result's perspective; it
+    is treated as an Integer-sized payload (which for stage1 covers
+    both raw 64-bit Integer values and 64-bit pointers to richer
+    objects).
+    @End Reasoning
+
+    @Implementation
+    Allocate a fresh ADT header, set the discriminant to RESULT_TAG_OK,
+    and store the payload at slot A.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0 (NULL); callers MUST check.
+    @End Security_Scope
+
+    Let header be adt_alloc()
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(header, ADT_TAG_OFF, RESULT_TAG_OK)
+    Memory.memory_set_int64(header, ADT_PAYLOAD_A_OFF, value)
+    Return header
+End Process
+
+Process called "err" takes error as Integer returns Integer:
+    @Reasoning
+    Constructs a Result in the error state carrying `error`.  Like
+    ok(), the error's underlying type is opaque to the Result.
+    @End Reasoning
+
+    @Implementation
+    Allocate header, set discriminant to RESULT_TAG_ERR, store the
+    error payload in slot A.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let header be adt_alloc()
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(header, ADT_TAG_OFF, RESULT_TAG_ERR)
+    Memory.memory_set_int64(header, ADT_PAYLOAD_A_OFF, error)
+    Return header
+End Process
+
+Process called "is_ok" takes result as Integer returns Integer:
+    @Reasoning
+    Predicate: 1 if the Result is in the success state, 0 otherwise.
+    @End Reasoning
+
+    @Implementation
+    Inspect the discriminant.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL result is treated as not-ok (returns 0).
+    @End Security_Scope
+
+    If result is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
+    If tag is equal to RESULT_TAG_OK:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "is_err" takes result as Integer returns Integer:
+    @Reasoning
+    Predicate: 1 if the Result is in the error state, 0 otherwise.
+    @End Reasoning
+
+    @Implementation
+    Inspect the discriminant.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL result is treated as not-err (returns 0).
+    @End Security_Scope
+
+    If result is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
+    If tag is equal to RESULT_TAG_ERR:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "result_unwrap" takes result as Integer returns Integer:
+    @Reasoning
+    Extracts the success payload.  If the Result is in the error state
+    the caller has violated the contract; we return 0 to remain total,
+    but production code must guard with is_ok first.
+    @End Reasoning
+
+    @Implementation
+    Read slot A when tag is OK.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL result returns 0.  Error-state result returns 0; not a panic.
+    @End Security_Scope
+
+    If result is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
+    If tag is equal to RESULT_TAG_OK:
+        Return Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+    End If
+    Return 0
+End Process
+
+Process called "result_unwrap_or" takes result as Integer, default_value as Integer returns Integer:
+    @Reasoning
+    Extracts the success payload when present, otherwise returns the
+    caller-supplied default.  This is the safe, no-panic alternative
+    to unwrap.
+    @End Reasoning
+
+    @Implementation
+    Inspect tag; return slot A on OK, else the default.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Total.
+    @End Security_Scope
+
+    If result is equal to 0:
+        Return default_value
+    End If
+    Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
+    If tag is equal to RESULT_TAG_OK:
+        Return Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+    End If
+    Return default_value
+End Process
+
+Process called "result_unwrap_err" takes result as Integer returns Integer:
+    @Reasoning
+    Symmetric counterpart to unwrap: extracts the error payload.
+    @End Reasoning
+
+    @Implementation
+    Read slot A when tag is ERR.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL result returns 0; OK-state result returns 0.
+    @End Security_Scope
+
+    If result is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
+    If tag is equal to RESULT_TAG_ERR:
+        Return Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+    End If
+    Return 0
+End Process
+
+Process called "result_map" takes result as Integer, mapper as Integer returns Integer:
+    @Reasoning
+    Functor map: if the Result is OK, apply `mapper` to the success
+    payload and wrap the result in a fresh OK Result.  Error Results
+    pass through unchanged (with a fresh allocation to preserve
+    ownership symmetry).
+
+    The `mapper` parameter is an Integer-typed function pointer.  The
+    bootstrap-stage1 dispatch is via the indirect-call primitive
+    __builtin_call_indirect_1 with one Integer-sized argument and one Integer-
+    sized return.  Higher layers wrap this in a typed closure once
+    closure syntax becomes available.
+    @End Reasoning
+
+    @Implementation
+    Dispatch on the discriminant; OK -> call mapper, rebuild OK.
+    ERR -> copy the existing error payload into a fresh ERR.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus the mapper's own cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Mapper pointer must be valid; we do not validate it.
+    @End Security_Scope
+
+    If result is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
+    If tag is equal to RESULT_TAG_OK:
+        Let value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+        Let new_value be __builtin_call_indirect_1(mapper, value)
+        Return ok(new_value)
+    End If
+    Let error be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+    Return err(error)
+End Process
+
+Process called "result_map_err" takes result as Integer, mapper as Integer returns Integer:
+    @Reasoning
+    Functor map over the error channel: if the Result is ERR, apply
+    `mapper` to the error payload and wrap in a fresh ERR.  OK passes
+    through unchanged.
+    @End Reasoning
+
+    @Implementation
+    Dispatch on the discriminant.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus the mapper's own cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Mapper pointer must be valid.
+    @End Security_Scope
+
+    If result is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
+    If tag is equal to RESULT_TAG_ERR:
+        Let error_value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+        Let new_error be __builtin_call_indirect_1(mapper, error_value)
+        Return err(new_error)
+    End If
+    Let value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+    Return ok(value)
+End Process
+
+Process called "result_and_then" takes result as Integer, mapper as Integer returns Integer:
+    @Reasoning
+    Monadic bind ("flat-map"): if the Result is OK, call `mapper` on
+    the success payload to produce a NEW Result and return it directly.
+    Error Results propagate unchanged.
+
+    `mapper` is a function-pointer that takes an Integer and returns
+    an Integer (which the caller must interpret as a new Result
+    header).
+    @End Reasoning
+
+    @Implementation
+    Dispatch on discriminant; on OK, the mapper's return value IS the
+    new Result.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus mapper cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Mapper pointer must be valid; mapper must return a valid Result.
+    @End Security_Scope
+
+    If result is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
+    If tag is equal to RESULT_TAG_OK:
+        Let value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+        Return __builtin_call_indirect_1(mapper, value)
+    End If
+    Let error be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+    Return err(error)
+End Process
+
+Process called "result_or_else" takes result as Integer, recovery as Integer returns Integer:
+    @Reasoning
+    Error-channel monadic bind: if the Result is ERR, call `recovery`
+    with the error payload to produce a NEW Result.  OK passes through.
+    @End Reasoning
+
+    @Implementation
+    Dispatch on discriminant; on ERR, the recovery's return IS the new
+    Result.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus recovery cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Recovery pointer must be valid; recovery must return a valid Result.
+    @End Security_Scope
+
+    If result is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(result, ADT_TAG_OFF)
+    If tag is equal to RESULT_TAG_ERR:
+        Let error_value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+        Return __builtin_call_indirect_1(recovery, error_value)
+    End If
+    Let value be Memory.memory_get_int64(result, ADT_PAYLOAD_A_OFF)
+    Return ok(value)
+End Process
+
+Process called "result_free" takes result as Integer returns Integer:
+    Return adt_free(result)
+End Process
+
+Note: ============================================================================
+Note: Option<T> / Maybe<T>
+Note: Maybe is exposed as an alias for Option below.
+Note: ============================================================================
+
+Process called "some" takes value as Integer returns Integer:
+    @Reasoning
+    Constructs an Option holding `value`.
+    @End Reasoning
+
+    @Implementation
+    Allocate header, set tag = SOME, payload A = value.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let header be adt_alloc()
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(header, ADT_TAG_OFF, OPTION_TAG_SOME)
+    Memory.memory_set_int64(header, ADT_PAYLOAD_A_OFF, value)
+    Return header
+End Process
+
+Process called "none" returns Integer:
+    @Reasoning
+    Constructs an empty Option.
+    @End Reasoning
+
+    @Implementation
+    Allocate header, set tag = NONE; payload slots remain zero.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0 (a NULL OptIon is treated as NONE by
+    is_none, so this is observationally compatible with the desired
+    semantics on OOM).
+    @End Security_Scope
+
+    Let header be adt_alloc()
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(header, ADT_TAG_OFF, OPTION_TAG_NONE)
+    Return header
+End Process
+
+Process called "is_some" takes option as Integer returns Integer:
+    If option is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(option, ADT_TAG_OFF)
+    If tag is equal to OPTION_TAG_SOME:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "is_none" takes option as Integer returns Integer:
+    If option is equal to 0:
+        Return 1
+    End If
+    Let tag be Memory.memory_get_int64(option, ADT_TAG_OFF)
+    If tag is equal to OPTION_TAG_NONE:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "option_unwrap" takes option as Integer returns Integer:
+    If option is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(option, ADT_TAG_OFF)
+    If tag is equal to OPTION_TAG_SOME:
+        Return Memory.memory_get_int64(option, ADT_PAYLOAD_A_OFF)
+    End If
+    Return 0
+End Process
+
+Process called "option_unwrap_or" takes option as Integer, default_value as Integer returns Integer:
+    If option is equal to 0:
+        Return default_value
+    End If
+    Let tag be Memory.memory_get_int64(option, ADT_TAG_OFF)
+    If tag is equal to OPTION_TAG_SOME:
+        Return Memory.memory_get_int64(option, ADT_PAYLOAD_A_OFF)
+    End If
+    Return default_value
+End Process
+
+Process called "option_map" takes option as Integer, mapper as Integer returns Integer:
+    @Reasoning
+    Functor map: applies `mapper` to the inner value when present.
+    @End Reasoning
+
+    @Implementation
+    Tag dispatch; on SOME, call mapper and rewrap.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus mapper cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Mapper pointer must be valid.
+    @End Security_Scope
+
+    If option is equal to 0:
+        Return none()
+    End If
+    Let tag be Memory.memory_get_int64(option, ADT_TAG_OFF)
+    If tag is equal to OPTION_TAG_SOME:
+        Let value be Memory.memory_get_int64(option, ADT_PAYLOAD_A_OFF)
+        Let new_value be __builtin_call_indirect_1(mapper, value)
+        Return some(new_value)
+    End If
+    Return none()
+End Process
+
+Process called "option_and_then" takes option as Integer, mapper as Integer returns Integer:
+    @Reasoning
+    Monadic bind: `mapper` returns a new Option that is propagated
+    directly.
+    @End Reasoning
+
+    @Implementation
+    Tag dispatch.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus mapper cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Mapper pointer must be valid; mapper must return a valid Option.
+    @End Security_Scope
+
+    If option is equal to 0:
+        Return none()
+    End If
+    Let tag be Memory.memory_get_int64(option, ADT_TAG_OFF)
+    If tag is equal to OPTION_TAG_SOME:
+        Let value be Memory.memory_get_int64(option, ADT_PAYLOAD_A_OFF)
+        Return __builtin_call_indirect_1(mapper, value)
+    End If
+    Return none()
+End Process
+
+Process called "option_or_else" takes option as Integer, fallback as Integer returns Integer:
+    @Reasoning
+    Replaces a NONE Option with whatever the `fallback` function
+    produces.  SOME passes through.
+    @End Reasoning
+
+    @Implementation
+    Tag dispatch; on NONE, call fallback with no useful argument (we
+    pass 0).
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus fallback cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Fallback pointer must be valid; must return a valid Option.
+    @End Security_Scope
+
+    If option is equal to 0:
+        Return __builtin_call_indirect_1(fallback, 0)
+    End If
+    Let tag be Memory.memory_get_int64(option, ADT_TAG_OFF)
+    If tag is equal to OPTION_TAG_NONE:
+        Return __builtin_call_indirect_1(fallback, 0)
+    End If
+    Let value be Memory.memory_get_int64(option, ADT_PAYLOAD_A_OFF)
+    Return some(value)
+End Process
+
+Process called "option_free" takes option as Integer returns Integer:
+    Return adt_free(option)
+End Process
+
+Note: Maybe<T> aliases mirror Option<T> verbatim.
+
+Process called "maybe_some" takes value as Integer returns Integer:
+    Return some(value)
+End Process
+
+Process called "maybe_none" returns Integer:
+    Return none()
+End Process
+
+Process called "maybe_is_some" takes maybe as Integer returns Integer:
+    Return is_some(maybe)
+End Process
+
+Process called "maybe_is_none" takes maybe as Integer returns Integer:
+    Return is_none(maybe)
+End Process
+
+Process called "maybe_unwrap" takes maybe as Integer returns Integer:
+    Return option_unwrap(maybe)
+End Process
+
+Process called "maybe_unwrap_or" takes maybe as Integer, default_value as Integer returns Integer:
+    Return option_unwrap_or(maybe, default_value)
+End Process
+
+Process called "maybe_map" takes maybe as Integer, mapper as Integer returns Integer:
+    Return option_map(maybe, mapper)
+End Process
+
+Process called "maybe_and_then" takes maybe as Integer, mapper as Integer returns Integer:
+    Return option_and_then(maybe, mapper)
+End Process
+
+Process called "maybe_or_else" takes maybe as Integer, fallback as Integer returns Integer:
+    Return option_or_else(maybe, fallback)
+End Process
+
+Process called "maybe_free" takes maybe as Integer returns Integer:
+    Return option_free(maybe)
+End Process
+
+Note: ============================================================================
+Note: Either<L, R>
+Note: ============================================================================
+
+Process called "left" takes value as Integer returns Integer:
+    @Reasoning
+    Constructs an Either carrying a Left payload.  Left and Right are
+    structurally symmetric; the convention in functional programming
+    treats Left as the "error" or "fallback" side and Right as the
+    "success" side, but this module places no semantics on the choice.
+    @End Reasoning
+
+    @Implementation
+    Allocate header, set tag = LEFT, payload A = value.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let header be adt_alloc()
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(header, ADT_TAG_OFF, EITHER_TAG_LEFT)
+    Memory.memory_set_int64(header, ADT_PAYLOAD_A_OFF, value)
+    Return header
+End Process
+
+Process called "right" takes value as Integer returns Integer:
+    @Reasoning
+    Constructs an Either carrying a Right payload.
+    @End Reasoning
+
+    @Implementation
+    Allocate header, set tag = RIGHT, payload A = value.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let header be adt_alloc()
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(header, ADT_TAG_OFF, EITHER_TAG_RIGHT)
+    Memory.memory_set_int64(header, ADT_PAYLOAD_A_OFF, value)
+    Return header
+End Process
+
+Process called "is_left" takes either as Integer returns Integer:
+    If either is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(either, ADT_TAG_OFF)
+    If tag is equal to EITHER_TAG_LEFT:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "is_right" takes either as Integer returns Integer:
+    If either is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(either, ADT_TAG_OFF)
+    If tag is equal to EITHER_TAG_RIGHT:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "either_unwrap_left" takes either as Integer returns Integer:
+    @Reasoning
+    Extracts the Left payload.  Returns 0 if the Either is in the Right
+    state or NULL.
+    @End Reasoning
+
+    @Implementation
+    Tag check then slot A read.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Total.
+    @End Security_Scope
+
+    If either is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(either, ADT_TAG_OFF)
+    If tag is equal to EITHER_TAG_LEFT:
+        Return Memory.memory_get_int64(either, ADT_PAYLOAD_A_OFF)
+    End If
+    Return 0
+End Process
+
+Process called "either_unwrap_right" takes either as Integer returns Integer:
+    If either is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(either, ADT_TAG_OFF)
+    If tag is equal to EITHER_TAG_RIGHT:
+        Return Memory.memory_get_int64(either, ADT_PAYLOAD_A_OFF)
+    End If
+    Return 0
+End Process
+
+Process called "either_swap" takes either as Integer returns Integer:
+    @Reasoning
+    Swaps the Left/Right discriminant of the Either, returning a fresh
+    Either whose payload is preserved but whose side is flipped.
+    @End Reasoning
+
+    @Implementation
+    Inspect tag, allocate a new header with the opposite tag.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0; NULL input returns 0.
+    @End Security_Scope
+
+    If either is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(either, ADT_TAG_OFF)
+    Let value be Memory.memory_get_int64(either, ADT_PAYLOAD_A_OFF)
+    If tag is equal to EITHER_TAG_LEFT:
+        Return right(value)
+    End If
+    If tag is equal to EITHER_TAG_RIGHT:
+        Return left(value)
+    End If
+    Return 0
+End Process
+
+Process called "either_fold" takes either as Integer, left_fn as Integer, right_fn as Integer returns Integer:
+    @Reasoning
+    Eliminates an Either by dispatching to one of two functions
+    depending on which side it carries.  Each function takes the
+    payload and returns an Integer-shaped result.
+    @End Reasoning
+
+    @Implementation
+    Tag dispatch.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus the chosen function's cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Both function pointers must be valid.
+    @End Security_Scope
+
+    If either is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(either, ADT_TAG_OFF)
+    Let value be Memory.memory_get_int64(either, ADT_PAYLOAD_A_OFF)
+    If tag is equal to EITHER_TAG_LEFT:
+        Return __builtin_call_indirect_1(left_fn, value)
+    End If
+    If tag is equal to EITHER_TAG_RIGHT:
+        Return __builtin_call_indirect_1(right_fn, value)
+    End If
+    Return 0
+End Process
+
+Process called "either_free" takes either as Integer returns Integer:
+    Return adt_free(either)
+End Process
+
+Note: ============================================================================
+Note: Try<T>
+Note: Try wraps the Result interface with a "panic/exception" overlay
+Note: that supports cause-chaining; payload_a holds the success value or
+Note: error message pointer, and payload_b holds an optional cause Try
+Note: header for the error path.
+Note: ============================================================================
+
+Process called "try_ok" takes value as Integer returns Integer:
+    @Reasoning
+    Constructs a Try in the success state with `value`.  Payload B
+    is left zero (no cause chain on the success path).
+    @End Reasoning
+
+    @Implementation
+    Allocate header, set tag = TRY_TAG_OK, payload A = value.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let header be adt_alloc()
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(header, ADT_TAG_OFF, TRY_TAG_OK)
+    Memory.memory_set_int64(header, ADT_PAYLOAD_A_OFF, value)
+    Memory.memory_set_int64(header, ADT_PAYLOAD_B_OFF, 0)
+    Return header
+End Process
+
+Process called "try_err" takes message as Integer, cause_optional as Integer returns Integer:
+    @Reasoning
+    Constructs a Try in the error state.  `message` is an Integer-shaped
+    payload (typically a pointer to a null-terminated string allocated
+    elsewhere).  `cause_optional` is either 0 (no inner cause) or a
+    pointer to another Try header that triggered this failure, enabling
+    exception-style cause chains across FFI / runtime boundaries.
+    @End Reasoning
+
+    @Implementation
+    Allocate header, set tag, payload A = message, payload B = cause.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.  The cause pointer is NOT validated;
+    callers must guarantee its lifetime exceeds this Try's lifetime.
+    @End Security_Scope
+
+    Let header be adt_alloc()
+    If header is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_int64(header, ADT_TAG_OFF, TRY_TAG_ERR)
+    Memory.memory_set_int64(header, ADT_PAYLOAD_A_OFF, message)
+    Memory.memory_set_int64(header, ADT_PAYLOAD_B_OFF, cause_optional)
+    Return header
+End Process
+
+Process called "try_is_ok" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(t, ADT_TAG_OFF)
+    If tag is equal to TRY_TAG_OK:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "try_is_err" takes t as Integer returns Integer:
+    If t is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(t, ADT_TAG_OFF)
+    If tag is equal to TRY_TAG_ERR:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "try_get_value" takes t as Integer returns Integer:
+    @Reasoning
+    Extracts the success value when the Try is in the OK state.
+    @End Reasoning
+
+    @Implementation
+    Tag check, then slot A.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL or ERR-state Try returns 0.
+    @End Security_Scope
+
+    If t is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(t, ADT_TAG_OFF)
+    If tag is equal to TRY_TAG_OK:
+        Return Memory.memory_get_int64(t, ADT_PAYLOAD_A_OFF)
+    End If
+    Return 0
+End Process
+
+Process called "try_get_message" takes t as Integer returns Integer:
+    @Reasoning
+    Extracts the error message (typically a string pointer) when the
+    Try is in the ERR state.
+    @End Reasoning
+
+    @Implementation
+    Tag check, then slot A.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL or OK-state Try returns 0.
+    @End Security_Scope
+
+    If t is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(t, ADT_TAG_OFF)
+    If tag is equal to TRY_TAG_ERR:
+        Return Memory.memory_get_int64(t, ADT_PAYLOAD_A_OFF)
+    End If
+    Return 0
+End Process
+
+Process called "try_get_cause" takes t as Integer returns Integer:
+    @Reasoning
+    Extracts the optional cause-chain pointer when the Try is in the
+    ERR state.
+    @End Reasoning
+
+    @Implementation
+    Tag check, then slot B.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL or OK-state Try returns 0.  Returning 0 in the absence of a
+    cause is by design.
+    @End Security_Scope
+
+    If t is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(t, ADT_TAG_OFF)
+    If tag is equal to TRY_TAG_ERR:
+        Return Memory.memory_get_int64(t, ADT_PAYLOAD_B_OFF)
+    End If
+    Return 0
+End Process
+
+Process called "try_recover" takes t as Integer, recovery as Integer returns Integer:
+    @Reasoning
+    If the Try is in the ERR state, invoke `recovery` with the error
+    message to produce a new Try.  OK passes through unchanged.
+    @End Reasoning
+
+    @Implementation
+    Tag dispatch.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) plus recovery cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Recovery pointer must be valid.
+    @End Security_Scope
+
+    If t is equal to 0:
+        Return 0
+    End If
+    Let tag be Memory.memory_get_int64(t, ADT_TAG_OFF)
+    If tag is equal to TRY_TAG_ERR:
+        Let message be Memory.memory_get_int64(t, ADT_PAYLOAD_A_OFF)
+        Return __builtin_call_indirect_1(recovery, message)
+    End If
+    Let value be Memory.memory_get_int64(t, ADT_PAYLOAD_A_OFF)
+    Return try_ok(value)
+End Process
+
+Process called "try_or_else" takes t as Integer, default_value as Integer returns Integer:
+    @Reasoning
+    Yields the success value when present, otherwise returns the
+    caller-supplied default.  Mirrors result_unwrap_or.
+    @End Reasoning
+
+    @Implementation
+    Tag dispatch.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Total.
+    @End Security_Scope
+
+    If t is equal to 0:
+        Return default_value
+    End If
+    Let tag be Memory.memory_get_int64(t, ADT_TAG_OFF)
+    If tag is equal to TRY_TAG_OK:
+        Return Memory.memory_get_int64(t, ADT_PAYLOAD_A_OFF)
+    End If
+    Return default_value
+End Process
+
+Process called "try_free" takes t as Integer returns Integer:
+    @Reasoning
+    Releases a Try header.  Does NOT release the cause chain in
+    payload_b automatically; callers that built a chain must free
+    each Try individually to preserve composability.
+    @End Reasoning
+
+    @Implementation
+    Layout.deallocate on the header.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Double-free triggers the allocator canary.
+    @End Security_Scope
+
+    Return adt_free(t)
+End Process

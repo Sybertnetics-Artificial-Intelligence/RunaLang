@@ -1,0 +1,381 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+MULTI MAP - Map Allowing Duplicate Keys Tier 0 Primitive
+
+This file implements a multi-map: an unordered associative container
+that supports multiple values per key. The internal representation is
+a chained hash table where each bucket points to a linked list of
+(key, value, next) records. Lookup returns ALL values for a key as a
+List, retaining insertion order within a key.
+
+Entry structure (32 bytes):
+  offset 0:  key (8 bytes)
+  offset 8:  value (8 bytes)
+  offset 16: chain next (8 bytes; same-bucket chain)
+  offset 24: same_key_next (8 bytes; next entry with same key)
+
+Header (32 bytes):
+  offset 0:  buckets pointer
+  offset 8:  capacity
+  offset 16: count (total values, not distinct keys)
+  offset 24: distinct_keys (count of unique keys)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Let MMAP_ENTRY_SIZE be 32
+Let MMAP_HEADER_SIZE be 32
+Let MMAP_INITIAL_CAPACITY be 16
+
+@Reasoning
+Integer mix to bucket index.
+@End Reasoning
+
+@Implementation
+splitmix64-style mix.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-cryptographic.
+@End Security_Scope
+Process called "mmap_hash" takes key as Integer returns Integer:
+    Let h be key
+    Set h to h bitwise xor (h shifted right by 33)
+    Set h to h multiplied by 18397679294719823053
+    Set h to h bitwise xor (h shifted right by 33)
+    Set h to h multiplied by 14181476777654086739
+    Set h to h bitwise xor (h shifted right by 33)
+    If h is less than 0:
+        Set h to 0 minus h
+    End If
+    Return h
+End Process
+
+@Reasoning
+Create empty multi-map.
+@End Reasoning
+
+@Implementation
+Allocate header + bucket array (zero-init).
+@End Implementation
+
+@Performance_Hints
+Time: O(capacity).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "mmap_create" returns Integer:
+    Let mm be proc allocate from Layout with MMAP_HEADER_SIZE
+    If mm is equal to 0:
+        Return 0
+    End If
+    Let bytes be MMAP_INITIAL_CAPACITY multiplied by 8
+    Let buckets be proc allocate from Layout with bytes
+    If buckets is equal to 0:
+        proc deallocate from Layout with mm
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than bytes:
+        proc memory_set_byte from Memory with buckets, zi, 0
+        Set zi to zi plus 1
+    End While
+    proc memory_set_int64 from Memory with mm, 0, buckets
+    proc memory_set_int64 from Memory with mm, 8, MMAP_INITIAL_CAPACITY
+    proc memory_set_int64 from Memory with mm, 16, 0
+    proc memory_set_int64 from Memory with mm, 24, 0
+    Return mm
+End Process
+
+@Reasoning
+Destroy multi-map. Walks each bucket chain freeing entries.
+@End Reasoning
+
+@Implementation
+For each bucket, walk chain freeing each entry; then free buckets and
+header.
+@End Implementation
+
+@Performance_Hints
+Time: O(n + capacity).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "mmap_destroy" takes mm as Integer returns Integer:
+    If mm is equal to 0:
+        Return 0
+    End If
+    Let buckets be proc memory_get_int64 from Memory with mm, 0
+    Let capacity be proc memory_get_int64 from Memory with mm, 8
+    Let i be 0
+    While i is less than capacity:
+        Let head_addr be buckets plus (i multiplied by 8)
+        Let cur be proc memory_get_int64 from Memory with head_addr, 0
+        While cur is not equal to 0:
+            Let nx be proc memory_get_int64 from Memory with cur, 16
+            proc deallocate from Layout with cur
+            Set cur to nx
+        End While
+        Set i to i plus 1
+    End While
+    If buckets is not equal to 0:
+        proc deallocate from Layout with buckets
+    End If
+    proc deallocate from Layout with mm
+    Return 1
+End Process
+
+@Reasoning
+Find the first entry for a key (a "key head") in the bucket chain.
+@End Reasoning
+
+@Implementation
+Hash, walk chain, compare keys. Note: multiple entries with the same
+key form a "same_key_next" sub-chain rooted at one bucket-chain head.
+We return only that head.
+@End Implementation
+
+@Performance_Hints
+Time: O(B / capacity) where B is bucket-chain length.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "mmap_find_head" takes mm as Integer, key as Integer returns Integer:
+    Let buckets be proc memory_get_int64 from Memory with mm, 0
+    Let capacity be proc memory_get_int64 from Memory with mm, 8
+    Let mask be capacity minus 1
+    Let h be proc mmap_hash with key
+    Let idx be h bitwise and mask
+    Let head_addr be buckets plus (idx multiplied by 8)
+    Let cur be proc memory_get_int64 from Memory with head_addr, 0
+    While cur is not equal to 0:
+        Let ck be proc memory_get_int64 from Memory with cur, 0
+        If ck is equal to key:
+            Return cur
+        End If
+        Set cur to proc memory_get_int64 from Memory with cur, 16
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Insert (key, value). If key not present, create a new entry and
+increment distinct_keys. If key present, append value as a new entry
+linked via same_key_next chain.
+@End Reasoning
+
+@Implementation
+1) Resize if needed (load on distinct keys).
+2) Allocate new entry.
+3) Find key head; if absent, insert at bucket-chain head.
+4) Else walk same_key_next to its tail, append new entry at tail.
+5) Increment count (and distinct_keys if new key).
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "mmap_insert" takes mm as Integer, key as Integer, value as Integer returns Integer:
+    If mm is equal to 0:
+        Return 0
+    End If
+    Let entry be proc allocate from Layout with MMAP_ENTRY_SIZE
+    If entry is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with entry, 0, key
+    proc memory_set_int64 from Memory with entry, 8, value
+    proc memory_set_int64 from Memory with entry, 16, 0
+    proc memory_set_int64 from Memory with entry, 24, 0
+    Let head be proc mmap_find_head with mm, key
+    If head is equal to 0:
+        Note: New key - insert at bucket-chain head
+        Let buckets be proc memory_get_int64 from Memory with mm, 0
+        Let capacity be proc memory_get_int64 from Memory with mm, 8
+        Let mask be capacity minus 1
+        Let h be proc mmap_hash with key
+        Let idx be h bitwise and mask
+        Let head_addr be buckets plus (idx multiplied by 8)
+        Let existing be proc memory_get_int64 from Memory with head_addr, 0
+        proc memory_set_int64 from Memory with entry, 16, existing
+        proc memory_set_int64 from Memory with head_addr, 0, entry
+        Let dk be proc memory_get_int64 from Memory with mm, 24
+        proc memory_set_int64 from Memory with mm, 24, dk plus 1
+    Otherwise:
+        Note: Walk same_key_next from head to its tail, append entry there.
+        Let tail be head
+        Let nx be proc memory_get_int64 from Memory with tail, 24
+        While nx is not equal to 0:
+            Set tail to nx
+            Set nx to proc memory_get_int64 from Memory with tail, 24
+        End While
+        proc memory_set_int64 from Memory with tail, 24, entry
+    End If
+    Let count be proc memory_get_int64 from Memory with mm, 16
+    proc memory_set_int64 from Memory with mm, 16, count plus 1
+    Return 1
+End Process
+
+@Reasoning
+Get the number of values for a key. Walks the same_key_next sub-chain
+counting entries.
+@End Reasoning
+
+@Implementation
+Find head; if null return 0. Otherwise walk same_key_next counting.
+@End Implementation
+
+@Performance_Hints
+Time: O(values_for_key).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "mmap_count_for_key" takes mm as Integer, key as Integer returns Integer:
+    If mm is equal to 0:
+        Return 0
+    End If
+    Let head be proc mmap_find_head with mm, key
+    Let count be 0
+    Let cur be head
+    While cur is not equal to 0:
+        Set count to count plus 1
+        Set cur to proc memory_get_int64 from Memory with cur, 24
+    End While
+    Return count
+End Process
+
+@Reasoning
+Append all values for a key into a caller-supplied List in insertion
+order.
+@End Reasoning
+
+@Implementation
+Walk same_key_next chain; append each value to the list.
+@End Implementation
+
+@Performance_Hints
+Time: O(values_for_key).
+@End Performance_Hints
+
+@Security_Scope
+Read-only on the multi-map. Mutates the caller-supplied list.
+@End Security_Scope
+Process called "mmap_get_all" takes mm as Integer, key as Integer, out_list as Integer returns Integer:
+    If mm is equal to 0:
+        Return 0
+    End If
+    If out_list is equal to 0:
+        Return 0
+    End If
+    Let head be proc mmap_find_head with mm, key
+    Let cur be head
+    While cur is not equal to 0:
+        Let v be proc memory_get_int64 from Memory with cur, 8
+        proc list_append from List with out_list, v
+        Set cur to proc memory_get_int64 from Memory with cur, 24
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Total value count (not distinct keys).
+@End Reasoning
+
+@Implementation
+Read count field at offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "mmap_size" takes mm as Integer returns Integer:
+    If mm is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with mm, 16
+End Process
+
+@Reasoning
+Distinct-key count.
+@End Reasoning
+
+@Implementation
+Read distinct_keys field at offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "mmap_key_count" takes mm as Integer returns Integer:
+    If mm is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with mm, 24
+End Process
+
+@Reasoning
+Containment predicate (any value for key).
+@End Reasoning
+
+@Implementation
+Returns 1 if find_head non-zero.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "mmap_contains" takes mm as Integer, key as Integer returns Integer:
+    If mm is equal to 0:
+        Return 0
+    End If
+    Let head be proc mmap_find_head with mm, key
+    If head is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process

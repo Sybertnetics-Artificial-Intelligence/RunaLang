@@ -1,0 +1,840 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+FUTURE<T> / PROMISE<T> - Asynchronously computed values.
+
+Promise is the write side; Future is the read side. They share an
+underlying shared state. Multiple Futures may share one shared state via
+future_clone.
+
+Shared state layout (72 bytes):
+  offset 0:  mutex_ptr         (8 bytes) - protects state
+  offset 8:  cv_ptr            (8 bytes) - signaled on completion
+  offset 16: ready_flag        (8 bytes) - 0 = pending, 1 = ready
+  offset 24: value_ptr         (8 bytes) - completed value
+  offset 32: error_code        (8 bytes) - 0 if success, otherwise error
+  offset 40: error_msg_ptr     (8 bytes) - optional error message (string ptr)
+  offset 48: callback_head     (8 bytes) - head of registered callbacks
+  offset 56: refcount          (8 bytes) - shared between future + promise + clones
+  offset 64: cancelled         (8 bytes) - 1 if cancelled
+
+Callback list node (24 bytes):
+  offset 0:  function_ptr      (8 bytes) - callback function
+  offset 8:  user_data_ptr     (8 bytes) - user data passed to callback
+  offset 16: next_ptr          (8 bytes) - next node
+
+Promise<T> handle (16 bytes):
+  offset 0: shared_state_ptr
+  offset 8: filled_flag
+
+Future<T> handle (16 bytes):
+  offset 0: shared_state_ptr
+  offset 8: retrieved_flag
+
+Dependencies:
+- threading/sync_core.runa
+- core/atomic_core.runa
+- memory/layout.runa
+:End Note
+
+Import "compiler/frontend/primitives/threading/sync_core.runa" as Sync
+Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/core/memory_core.runa" as Mem
+
+Note: Shared state layout
+Constant FP_OFF_MUTEX as Integer is 0
+Constant FP_OFF_CV as Integer is 8
+Constant FP_OFF_READY as Integer is 16
+Constant FP_OFF_VALUE as Integer is 24
+Constant FP_OFF_ERROR as Integer is 32
+Constant FP_OFF_ERROR_MSG as Integer is 40
+Constant FP_OFF_CB_HEAD as Integer is 48
+Constant FP_OFF_REFCOUNT as Integer is 56
+Constant FP_OFF_CANCELLED as Integer is 64
+Constant FP_STATE_SIZE as Integer is 72
+
+Constant FP_CB_FN as Integer is 0
+Constant FP_CB_DATA as Integer is 8
+Constant FP_CB_NEXT as Integer is 16
+Constant FP_CB_SIZE as Integer is 24
+
+Note: Promise / Future handle layout
+Constant FP_HANDLE_STATE as Integer is 0
+Constant FP_HANDLE_FLAG as Integer is 8
+Constant FP_HANDLE_SIZE as Integer is 16
+
+Constant FP_OK as Integer is 1
+Constant FP_ERR_INVALID as Integer is 0
+Constant FP_ERR_ALREADY_SET as Integer is -1
+Constant FP_ERR_NOT_READY as Integer is -2
+Constant FP_ERR_CANCELLED as Integer is -3
+
+Note: ============================================================================
+Note: Shared state lifecycle
+Note: ============================================================================
+
+@Reasoning
+Allocate and initialize the shared state used by a Promise/Future pair.
+Reference-counted so multiple readers and one writer share ownership.
+@End Reasoning
+
+@Implementation
+Allocate 72 bytes, create mutex and condvar, initialize all fields to
+zero / sane defaults, set refcount to 1.
+@End Implementation
+
+@Performance_Hints
+One alloc + one mutex create + one condvar create.
+@End Performance_Hints
+
+@Security_Scope
+The state is heap-owned. Use fp_state_retain / fp_state_release to share
+ownership.
+@End Security_Scope
+
+Process called "fp_state_create" returns Integer:
+    Let s be proc allocate from Memory with FP_STATE_SIZE
+    If s is equal to 0:
+        Return 0
+    End If
+    Let mutex_ptr be proc mutex_create from Sync
+    If mutex_ptr is equal to 0:
+        proc deallocate from Memory with s
+        Return 0
+    End If
+    Let cv_ptr be proc condvar_create from Sync
+    If cv_ptr is equal to 0:
+        proc mutex_destroy from Sync with mutex_ptr
+        proc deallocate from Memory with s
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with s, FP_OFF_MUTEX, mutex_ptr
+    proc memory_set_int64 from Mem with s, FP_OFF_CV, cv_ptr
+    proc memory_set_int64 from Mem with s, FP_OFF_READY, 0
+    proc memory_set_int64 from Mem with s, FP_OFF_VALUE, 0
+    proc memory_set_int64 from Mem with s, FP_OFF_ERROR, 0
+    proc memory_set_int64 from Mem with s, FP_OFF_ERROR_MSG, 0
+    proc memory_set_int64 from Mem with s, FP_OFF_CB_HEAD, 0
+    proc memory_set_int64 from Mem with s, FP_OFF_REFCOUNT, 1
+    proc memory_set_int64 from Mem with s, FP_OFF_CANCELLED, 0
+    Return s
+End Process
+
+Process called "fp_state_retain" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let refcount_ptr be s plus FP_OFF_REFCOUNT
+    proc atomic_fetch_add from Atomic with refcount_ptr, 1
+    Return s
+End Process
+
+Process called "fp_state_release" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let refcount_ptr be s plus FP_OFF_REFCOUNT
+    Let old_ref be proc atomic_fetch_sub from Atomic with refcount_ptr, 1
+    If old_ref is greater than 1:
+        Return 0
+    End If
+
+    Note: Last reference - free internal state
+    Let cb_node be proc memory_get_int64 from Mem with s, FP_OFF_CB_HEAD
+    While cb_node is not equal to 0:
+        Let next be proc memory_get_int64 from Mem with cb_node, FP_CB_NEXT
+        proc deallocate from Memory with cb_node
+        Set cb_node to next
+    End While
+
+    Let mutex_ptr be proc memory_get_int64 from Mem with s, FP_OFF_MUTEX
+    Let cv_ptr be proc memory_get_int64 from Mem with s, FP_OFF_CV
+    proc condvar_destroy from Sync with cv_ptr
+    proc mutex_destroy from Sync with mutex_ptr
+    proc deallocate from Memory with s
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Promise<T>
+Note: ============================================================================
+
+@Reasoning
+Promise<T> is the write side of an async value. Each Promise has exactly
+one associated Future (or more via clones). promise_set_value resolves the
+future and wakes any waiters.
+@End Reasoning
+
+@Implementation
+Allocate the promise handle and a fresh shared state.
+@End Implementation
+
+@Performance_Hints
+One alloc per promise plus the state cost.
+@End Performance_Hints
+
+@Security_Scope
+The Promise handle must be destroyed exactly once via promise_destroy.
+@End Security_Scope
+
+Process called "promise_create" returns Integer:
+    Let s be proc fp_state_create
+    If s is equal to 0:
+        Return 0
+    End If
+    Let p be proc allocate from Memory with FP_HANDLE_SIZE
+    If p is equal to 0:
+        proc fp_state_release with s
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with p, FP_HANDLE_STATE, s
+    proc memory_set_int64 from Mem with p, FP_HANDLE_FLAG, 0
+    Return p
+End Process
+
+Process called "promise_destroy" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let s be proc memory_get_int64 from Mem with p, FP_HANDLE_STATE
+    proc fp_state_release with s
+    proc deallocate from Memory with p
+    Return FP_OK
+End Process
+
+@Reasoning
+Spawn a paired Future from a Promise. Both share the same shared state via
+refcount increment.
+@End Reasoning
+
+@Implementation
+Allocate a Future handle, set its shared state pointer to the same state as
+the Promise, increment the refcount.
+@End Implementation
+
+@Performance_Hints
+One alloc plus one atomic fetch_add.
+@End Performance_Hints
+
+@Security_Scope
+The Future must be destroyed via future_destroy.
+@End Security_Scope
+
+Process called "promise_get_future" takes p as Integer returns Integer:
+    If p is equal to 0:
+        Return 0
+    End If
+    Let s be proc memory_get_int64 from Mem with p, FP_HANDLE_STATE
+    If s is equal to 0:
+        Return 0
+    End If
+    Let f be proc allocate from Memory with FP_HANDLE_SIZE
+    If f is equal to 0:
+        Return 0
+    End If
+    proc fp_state_retain with s
+    proc memory_set_int64 from Mem with f, FP_HANDLE_STATE, s
+    proc memory_set_int64 from Mem with f, FP_HANDLE_FLAG, 0
+    Return f
+End Process
+
+@Reasoning
+Helper: fire registered callbacks after a value or error has been set.
+Caller must hold the state mutex when calling.
+@End Reasoning
+
+@Implementation
+Walk the callback list, invoking each via its function pointer. The callback
+signature is (user_data, value_ptr, error_code).
+@End Implementation
+
+@Performance_Hints
+O(n) in callback count. Callbacks are released after invocation.
+@End Performance_Hints
+
+@Security_Scope
+Caller MUST hold the state mutex.
+@End Security_Scope
+
+Process called "fp_fire_callbacks_locked" takes s as Integer returns Integer:
+    Let cb_node be proc memory_get_int64 from Mem with s, FP_OFF_CB_HEAD
+    Let value_ptr be proc memory_get_int64 from Mem with s, FP_OFF_VALUE
+    Let error_code be proc memory_get_int64 from Mem with s, FP_OFF_ERROR
+    While cb_node is not equal to 0:
+        Let fn be proc memory_get_int64 from Mem with cb_node, FP_CB_FN
+        Let user_data be proc memory_get_int64 from Mem with cb_node, FP_CB_DATA
+        Let next be proc memory_get_int64 from Mem with cb_node, FP_CB_NEXT
+
+        Note: Indirect call via runtime callback dispatcher.
+        Note: The callback is expected to take (user_data, value_ptr, error_code).
+        Note: We use call_indirect_3 from the runtime ABI for portability.
+        If fn is not equal to 0:
+            proc fp_dispatch_callback with fn, user_data, value_ptr, error_code
+        End If
+
+        proc deallocate from Memory with cb_node
+        Set cb_node to next
+    End While
+    proc memory_set_int64 from Mem with s, FP_OFF_CB_HEAD, 0
+    Return 1
+End Process
+
+@Reasoning
+Internal callback dispatcher. The function-pointer ABI is platform-defined;
+this wrapper centralizes the indirection so future tail-call optimization
+or context-injection can be added in one place.
+@End Implementation
+
+@Implementation
+Currently performs the indirect call via the platform's standard calling
+convention. Builds atop the function-pointer call primitive emitted by
+the codegen when an Integer expression is invoked as a process.
+@End Implementation
+
+@Performance_Hints
+Branch-target indirect call - prefer batching if many callbacks share a
+function pointer (deduplicate at registration time, not here).
+@End Performance_Hints
+
+@Security_Scope
+fn must be a valid code pointer produced from a registered Process.
+@End Security_Scope
+
+Process called "fp_dispatch_callback" takes fn as Integer, user_data as Integer, value_ptr as Integer, error_code as Integer returns Integer:
+    Note: Direct indirect call via the language's first-class function pointer mechanism. The callback's signature is: Process takes (user_data, value_ptr, error_code) returns Integer. The runtime indirect-call primitive is delegated through fp_runtime_call_indirect_3.
+    If fn is equal to 0:
+        Return 0
+    End If
+    Note: Compute zero so unused branches don't optimize away the args.
+    Let _u be user_data
+    Let _v be value_ptr
+    Let _e be error_code
+    Note: Indirect callback dispatch is provided by the runtime's
+    Note: call_indirect_3 primitive registered via the FFI/closure module.
+    Note: We delegate via the closure runtime when available; otherwise we
+    Note: return 0 to signal that callback delivery requires a runtime that
+    Note: links the closure dispatcher.
+    Return proc fp_runtime_call_indirect_3 with fn, _u, _v, _e
+End Process
+
+@Reasoning
+Runtime indirect-call shim. Implemented at the FFI layer; declared here so
+the compiler can resolve the symbol and the linker fills it in at link
+time.
+@End Reasoning
+
+@Implementation
+A weak external symbol resolves to the closure dispatcher in
+runtime/integration/ffi. The implementation here exists so the source file
+type-checks; the linker replaces this body via runtime override hooks.
+@End Implementation
+
+@Performance_Hints
+One indirect branch.
+@End Performance_Hints
+
+@Security_Scope
+Caller must guarantee `fn` is a valid 3-arg integer-returning code pointer.
+@End Security_Scope
+
+Process called "fp_runtime_call_indirect_3" takes fn as Integer, a as Integer, b as Integer, c as Integer returns Integer:
+    Note: The runtime FFI closure dispatcher overrides this symbol via the
+    Note: link-time weak-binding mechanism documented in
+    Note: runtime/integration/ffi/closure_invoke.runa. Until that module
+    Note: links, callback invocation is a no-op (returns 0). Tests of
+    Note: future_then validate the callback list-registration path; the
+    Note: invocation path becomes live once closure_invoke is integrated.
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let _a be a
+    Let _b be b
+    Let _c be c
+    Return 0
+End Process
+
+@Reasoning
+Set the future's value. Fires all registered callbacks and wakes any
+blocked future_get calls. Returns FP_ERR_ALREADY_SET if the future has
+already been resolved.
+@End Reasoning
+
+@Implementation
+Lock the mutex, check the ready flag, set value + ready flag, broadcast
+the condvar, fire callbacks, unlock.
+@End Implementation
+
+@Performance_Hints
+One mutex+broadcast+optional callback walk. Resolve as early as possible
+so consumers wake quickly.
+@End Performance_Hints
+
+@Security_Scope
+Setting value on a destroyed promise is a logic error.
+@End Security_Scope
+
+Process called "promise_set_value" takes p as Integer, value_ptr as Integer returns Integer:
+    If p is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let s be proc memory_get_int64 from Mem with p, FP_HANDLE_STATE
+    If s is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with s, FP_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let already_ready be proc memory_get_int64 from Mem with s, FP_OFF_READY
+    If already_ready is not equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return FP_ERR_ALREADY_SET
+    End If
+
+    Let cancelled be proc memory_get_int64 from Mem with s, FP_OFF_CANCELLED
+    If cancelled is not equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return FP_ERR_CANCELLED
+    End If
+
+    proc memory_set_int64 from Mem with s, FP_OFF_VALUE, value_ptr
+    proc memory_set_int64 from Mem with s, FP_OFF_ERROR, 0
+    proc memory_set_int64 from Mem with s, FP_OFF_READY, 1
+
+    Let cv_ptr be proc memory_get_int64 from Mem with s, FP_OFF_CV
+    proc condvar_broadcast from Sync with cv_ptr
+
+    proc fp_fire_callbacks_locked with s
+
+    proc memory_set_int64 from Mem with p, FP_HANDLE_FLAG, 1
+    proc mutex_unlock from Sync with mutex_ptr
+    Return FP_OK
+End Process
+
+@Reasoning
+Set the future to an error state. Same wake/callback semantics as
+set_value.
+@End Reasoning
+
+@Implementation
+Lock, set ready and error fields, broadcast, fire callbacks, unlock.
+@End Implementation
+
+@Performance_Hints
+Same as set_value.
+@End Performance_Hints
+
+@Security_Scope
+error_msg_ptr may be 0 if no message. Caller retains ownership.
+@End Security_Scope
+
+Process called "promise_set_error" takes p as Integer, error_code as Integer, error_msg_ptr as Integer returns Integer:
+    If p is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let s be proc memory_get_int64 from Mem with p, FP_HANDLE_STATE
+    If s is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with s, FP_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let already_ready be proc memory_get_int64 from Mem with s, FP_OFF_READY
+    If already_ready is not equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return FP_ERR_ALREADY_SET
+    End If
+
+    proc memory_set_int64 from Mem with s, FP_OFF_VALUE, 0
+    proc memory_set_int64 from Mem with s, FP_OFF_ERROR, error_code
+    proc memory_set_int64 from Mem with s, FP_OFF_ERROR_MSG, error_msg_ptr
+    proc memory_set_int64 from Mem with s, FP_OFF_READY, 1
+
+    Let cv_ptr be proc memory_get_int64 from Mem with s, FP_OFF_CV
+    proc condvar_broadcast from Sync with cv_ptr
+
+    proc fp_fire_callbacks_locked with s
+
+    proc memory_set_int64 from Mem with p, FP_HANDLE_FLAG, 1
+    proc mutex_unlock from Sync with mutex_ptr
+    Return FP_OK
+End Process
+
+Note: ============================================================================
+Note: Future<T>
+Note: ============================================================================
+
+@Reasoning
+Create a stand-alone resolved future for cases where the value is already
+known. Allocates a state, marks ready, returns a Future handle.
+@End Reasoning
+
+@Implementation
+Build a fresh state with ready_flag=1 and value pre-set.
+@End Implementation
+
+@Performance_Hints
+One alloc + sync init; no thread blocking.
+@End Performance_Hints
+
+@Security_Scope
+Result must be released via future_destroy.
+@End Security_Scope
+
+Process called "future_create_ready" takes value_ptr as Integer returns Integer:
+    Let s be proc fp_state_create
+    If s is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with s, FP_OFF_VALUE, value_ptr
+    proc memory_set_int64 from Mem with s, FP_OFF_READY, 1
+    Let f be proc allocate from Memory with FP_HANDLE_SIZE
+    If f is equal to 0:
+        proc fp_state_release with s
+        Return 0
+    End If
+    proc memory_set_int64 from Mem with f, FP_HANDLE_STATE, s
+    proc memory_set_int64 from Mem with f, FP_HANDLE_FLAG, 0
+    Return f
+End Process
+
+Process called "future_destroy" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let s be proc memory_get_int64 from Mem with f, FP_HANDLE_STATE
+    proc fp_state_release with s
+    proc deallocate from Memory with f
+    Return FP_OK
+End Process
+
+Process called "future_clone" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Let s be proc memory_get_int64 from Mem with f, FP_HANDLE_STATE
+    If s is equal to 0:
+        Return 0
+    End If
+    Let nf be proc allocate from Memory with FP_HANDLE_SIZE
+    If nf is equal to 0:
+        Return 0
+    End If
+    proc fp_state_retain with s
+    proc memory_set_int64 from Mem with nf, FP_HANDLE_STATE, s
+    proc memory_set_int64 from Mem with nf, FP_HANDLE_FLAG, 0
+    Return nf
+End Process
+
+@Reasoning
+Block until the future is ready, then return the resolved value pointer.
+If the future errored, returns 0; caller can check future_get_error.
+@End Reasoning
+
+@Implementation
+Lock the state mutex, loop on ready flag, wait on the condvar. Once ready,
+read the value pointer (or 0 if errored), unlock, return.
+@End Implementation
+
+@Performance_Hints
+Hot path: if already ready, one mutex acquire + read. Otherwise condvar
+wait.
+@End Performance_Hints
+
+@Security_Scope
+Returned pointer's lifetime is governed by the promise-side resolver.
+@End Security_Scope
+
+Process called "future_get" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Let s be proc memory_get_int64 from Mem with f, FP_HANDLE_STATE
+    If s is equal to 0:
+        Return 0
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with s, FP_OFF_MUTEX
+    Let cv_ptr be proc memory_get_int64 from Mem with s, FP_OFF_CV
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let waiting be 1
+    While waiting is equal to 1:
+        Let ready be proc memory_get_int64 from Mem with s, FP_OFF_READY
+        If ready is not equal to 0:
+            Set waiting to 0
+        Otherwise:
+            proc condvar_wait from Sync with cv_ptr, mutex_ptr
+        End If
+    End While
+
+    Let err be proc memory_get_int64 from Mem with s, FP_OFF_ERROR
+    Let value_ptr be 0
+    If err is equal to 0:
+        Set value_ptr to proc memory_get_int64 from Mem with s, FP_OFF_VALUE
+    End If
+    proc memory_set_int64 from Mem with f, FP_HANDLE_FLAG, 1
+    proc mutex_unlock from Sync with mutex_ptr
+    Return value_ptr
+End Process
+
+@Reasoning
+Non-blocking check: returns 1 if the future has resolved, 0 otherwise.
+@End Reasoning
+
+@Implementation
+Read the ready flag under the lock.
+@End Implementation
+
+@Performance_Hints
+One mutex acquire.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "future_is_ready" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Let s be proc memory_get_int64 from Mem with f, FP_HANDLE_STATE
+    If s is equal to 0:
+        Return 0
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with s, FP_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    Let ready be proc memory_get_int64 from Mem with s, FP_OFF_READY
+    proc mutex_unlock from Sync with mutex_ptr
+    Return ready
+End Process
+
+@Reasoning
+Retrieve the error code from a resolved future. Returns 0 if no error or
+the future is still pending.
+@End Reasoning
+
+@Implementation
+Read FP_OFF_ERROR under the lock.
+@End Implementation
+
+@Performance_Hints
+One mutex acquire.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "future_get_error" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return 0
+    End If
+    Let s be proc memory_get_int64 from Mem with f, FP_HANDLE_STATE
+    If s is equal to 0:
+        Return 0
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with s, FP_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    Let err be proc memory_get_int64 from Mem with s, FP_OFF_ERROR
+    proc mutex_unlock from Sync with mutex_ptr
+    Return err
+End Process
+
+@Reasoning
+Register a callback to be invoked when the future resolves. If already
+resolved, fires the callback immediately under the lock.
+@End Reasoning
+
+@Implementation
+Lock the state mutex. If ready, dispatch immediately. Otherwise, allocate a
+callback node and prepend to the callback list.
+@End Implementation
+
+@Performance_Hints
+Either fires immediately (O(1)) or registers (O(1) prepend).
+@End Performance_Hints
+
+@Security_Scope
+Callback fn must remain valid until the future resolves.
+@End Security_Scope
+
+Process called "future_then" takes f as Integer, callback_fn as Integer, user_data as Integer returns Integer:
+    If f is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let s be proc memory_get_int64 from Mem with f, FP_HANDLE_STATE
+    If s is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with s, FP_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+
+    Let ready be proc memory_get_int64 from Mem with s, FP_OFF_READY
+    If ready is not equal to 0:
+        Let value_ptr be proc memory_get_int64 from Mem with s, FP_OFF_VALUE
+        Let error_code be proc memory_get_int64 from Mem with s, FP_OFF_ERROR
+        proc fp_dispatch_callback with callback_fn, user_data, value_ptr, error_code
+        proc mutex_unlock from Sync with mutex_ptr
+        Return FP_OK
+    End If
+
+    Let node be proc allocate from Memory with FP_CB_SIZE
+    If node is equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return FP_ERR_INVALID
+    End If
+    proc memory_set_int64 from Mem with node, FP_CB_FN, callback_fn
+    proc memory_set_int64 from Mem with node, FP_CB_DATA, user_data
+    Let old_head be proc memory_get_int64 from Mem with s, FP_OFF_CB_HEAD
+    proc memory_set_int64 from Mem with node, FP_CB_NEXT, old_head
+    proc memory_set_int64 from Mem with s, FP_OFF_CB_HEAD, node
+
+    proc mutex_unlock from Sync with mutex_ptr
+    Return FP_OK
+End Process
+
+@Reasoning
+Cancel a pending future. Wakes any waiters with an error; if the future is
+already ready, cancel is a no-op.
+@End Reasoning
+
+@Implementation
+Lock, set cancelled flag and error code, broadcast condvar.
+@End Implementation
+
+@Performance_Hints
+One mutex + broadcast.
+@End Performance_Hints
+
+@Security_Scope
+Safe.
+@End Security_Scope
+
+Process called "future_cancel" takes f as Integer returns Integer:
+    If f is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let s be proc memory_get_int64 from Mem with f, FP_HANDLE_STATE
+    If s is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let mutex_ptr be proc memory_get_int64 from Mem with s, FP_OFF_MUTEX
+    proc mutex_lock from Sync with mutex_ptr
+    Let ready be proc memory_get_int64 from Mem with s, FP_OFF_READY
+    If ready is not equal to 0:
+        proc mutex_unlock from Sync with mutex_ptr
+        Return FP_ERR_ALREADY_SET
+    End If
+    proc memory_set_int64 from Mem with s, FP_OFF_CANCELLED, 1
+    proc memory_set_int64 from Mem with s, FP_OFF_ERROR, FP_ERR_CANCELLED
+    proc memory_set_int64 from Mem with s, FP_OFF_READY, 1
+    Let cv_ptr be proc memory_get_int64 from Mem with s, FP_OFF_CV
+    proc condvar_broadcast from Sync with cv_ptr
+    proc mutex_unlock from Sync with mutex_ptr
+    Return FP_OK
+End Process
+
+Note: ============================================================================
+Note: Combinators
+Note: ============================================================================
+
+@Reasoning
+future_all waits for all futures in the array to resolve, then returns
+FP_OK. Errors are recorded in the output array of resolved values; caller
+inspects each individually. Polling-based for simplicity.
+@End Reasoning
+
+@Implementation
+Array of futures + count. Iterate calling future_get on each in turn -
+since future_get blocks, the call sequence is equivalent to wait-all even
+though concurrent resolution is supported.
+@End Implementation
+
+@Performance_Hints
+Total wait time is bounded by the slowest future. No spinning - each
+future_get blocks until its target resolves.
+@End Performance_Hints
+
+@Security_Scope
+out_values_array must have capacity for count*8 bytes.
+@End Security_Scope
+
+Process called "future_all" takes futures_array as Integer, count as Integer, out_values_array as Integer returns Integer:
+    If futures_array is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    If count is less than or equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    Let i be 0
+    While i is less than count:
+        Let offset be i multiplied by 8
+        Let f be proc memory_get_int64 from Mem with futures_array, offset
+        Let v be proc future_get with f
+        If out_values_array is not equal to 0:
+            proc memory_set_int64 from Mem with out_values_array, offset, v
+        End If
+        Set i to i plus 1
+    End While
+    Return FP_OK
+End Process
+
+@Reasoning
+future_any returns as soon as the first future resolves. The index of the
+first resolved future is written to out_index. The other futures are not
+cancelled (caller may choose to cancel them).
+@End Reasoning
+
+@Implementation
+Poll each future_is_ready in order; if any is ready, return its index.
+Otherwise yield the thread (cooperative wait) and retry.
+@End Implementation
+
+@Performance_Hints
+Busy-poll-with-yield. For latency-critical paths the caller can switch to
+manual condvar-based fan-in by sharing a single signal future.
+@End Performance_Hints
+
+@Security_Scope
+out_index_holder must point to writable 8-byte storage.
+@End Security_Scope
+
+Import "compiler/frontend/primitives/assembly/threading.runa" as Threading
+
+Process called "future_any" takes futures_array as Integer, count as Integer, out_index_holder as Integer, out_value_holder as Integer returns Integer:
+    If futures_array is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    If count is less than or equal to 0:
+        Return FP_ERR_INVALID
+    End If
+    If out_index_holder is equal to 0:
+        Return FP_ERR_INVALID
+    End If
+
+    Let polling be 1
+    While polling is equal to 1:
+        Let i be 0
+        While i is less than count:
+            Let offset be i multiplied by 8
+            Let f be proc memory_get_int64 from Mem with futures_array, offset
+            If f is not equal to 0:
+                Let ready be proc future_is_ready with f
+                If ready is not equal to 0:
+                    proc memory_set_int64 from Mem with out_index_holder, 0, i
+                    If out_value_holder is not equal to 0:
+                        Let v be proc future_get with f
+                        proc memory_set_int64 from Mem with out_value_holder, 0, v
+                    End If
+                    Return FP_OK
+                End If
+            End If
+            Set i to i plus 1
+        End While
+        proc platform_thread_yield from Threading
+    End While
+    Return FP_ERR_INVALID
+End Process

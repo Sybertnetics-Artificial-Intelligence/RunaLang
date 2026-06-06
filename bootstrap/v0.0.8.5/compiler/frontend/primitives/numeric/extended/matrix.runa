@@ -1,0 +1,1270 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+Fixed-size Float64 row-major matrices (Matrix2x2, Matrix3x3, Matrix4x4).
+
+Memory layout (heap-allocated, row-major):
+  Matrix2x2:  32 bytes  (4 Float64 lanes)
+  Matrix3x3:  72 bytes  (9 Float64 lanes)
+  Matrix4x4: 128 bytes  (16 Float64 lanes)
+
+Row-major is the convention used by C, mathematics textbooks, and the
+Runa graphics/numeric stack. Element (row r, col c) lives at byte offset
+8 * (r * N + c) for an NxN matrix.
+
+Operations implemented per dimension:
+  - allocate / free / set_element / get_element / copy
+  - identity / zero
+  - add / sub / scalar_mul
+  - matrix_mul (square NxN times NxN)
+  - transpose (out-of-place; aliasing not permitted with self)
+  - determinant (closed form: 2x2 ad-bc; 3x3 cofactor; 4x4 Laplace)
+  - inverse (via adjugate / determinant)
+  - trace
+  - matrix_apply_vector (matrix-vector product, NxN times Nx1)
+  - 4x4 transform constructors: translation, rotation_x/y/z, scale,
+    perspective_projection, look_at
+
+@Reasoning
+Heap-backed flat buffers match the Vector module pattern, simplify
+serialization, and keep memory ops uniform. Determinant + adjugate
+inverse is chosen over LU/QR decomposition because at N <= 4 the closed
+form is faster and bit-exact relative to the same hardware fma sequence.
+@End Reasoning
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/core/trig_core.runa" as Trig
+Import "compiler/frontend/primitives/numeric/extended/vector.runa" as Vector
+
+Note: ============================================================================
+Note: Constants
+Note: ============================================================================
+
+Constant MATRIX2X2_SIZE_BYTES as Integer is 32
+Constant MATRIX3X3_SIZE_BYTES as Integer is 72
+Constant MATRIX4X4_SIZE_BYTES as Integer is 128
+
+Note: ============================================================================
+Note: Bit-cast helpers (same idiom as vector.runa)
+Note: ============================================================================
+
+Process called "mat_float_to_bits" takes x as Float returns Integer:
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "mat_bits_to_float" takes b as Integer returns Float:
+    Let result be 0.0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "mat_store" takes ptr as Integer, offset as Integer, value as Float returns Integer:
+    Let bits be proc mat_float_to_bits with value
+    Let _w be proc memory_set_int64 from Memory with ptr, offset, bits
+    Return 0
+End Process
+
+Process called "mat_load" takes ptr as Integer, offset as Integer returns Float:
+    Let bits be proc memory_get_int64 from Memory with ptr, offset
+    Return proc mat_bits_to_float with bits
+End Process
+
+Note: ============================================================================
+Note: Matrix2x2 - 2x2 matrix
+Note: ============================================================================
+
+Process called "matrix2x2_allocate" returns Integer:
+    @Reasoning
+        Allocate 32-byte zeroed 2x2 matrix.
+    @End Reasoning
+    @Implementation
+        Layout.allocate zero-initializes.
+    @End Implementation
+    @Performance_Hints
+        O(1) fast path.
+    @End Performance_Hints
+    @Security_Scope
+        Zeroed buffer.
+    @End Security_Scope
+    Let p be proc allocate from Layout with MATRIX2X2_SIZE_BYTES
+    Return p
+End Process
+
+Process called "matrix2x2_free" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let _d be proc deallocate from Layout with m
+    Return 0
+End Process
+
+Process called "matrix2x2_set_element" takes m as Integer, r as Integer, c as Integer, v as Float returns Integer:
+    Let off be ((r multiplied by 2) plus c) multiplied by 8
+    Let _w be proc mat_store with m, off, v
+    Return 0
+End Process
+
+Process called "matrix2x2_get_element" takes m as Integer, r as Integer, c as Integer returns Float:
+    Let off be ((r multiplied by 2) plus c) multiplied by 8
+    Return proc mat_load with m, off
+End Process
+
+Process called "matrix2x2_copy" takes src as Integer, dst as Integer returns Integer:
+    Let _c be proc memory_copy from Memory with dst, src, MATRIX2X2_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "matrix2x2_identity" takes m as Integer returns Integer:
+    @Reasoning
+        Set m = [[1,0],[0,1]].
+    @End Reasoning
+    @Implementation
+        Direct 4-lane writes.
+    @End Implementation
+    @Performance_Hints
+        Two stores 1.0 + two stores 0.0.
+    @End Performance_Hints
+    @Security_Scope
+        No special concerns.
+    @End Security_Scope
+    Let _a be proc mat_store with m, 0, 1.0
+    Let _b be proc mat_store with m, 8, 0.0
+    Let _c be proc mat_store with m, 16, 0.0
+    Let _d be proc mat_store with m, 24, 1.0
+    Return 0
+End Process
+
+Process called "matrix2x2_zero" takes m as Integer returns Integer:
+    Let _z be proc memory_zero from Memory with m, MATRIX2X2_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "matrix2x2_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let i be 0
+    While i is less than 4:
+        Let off be i multiplied by 8
+        Let av be proc mat_load with a, off
+        Let bv be proc mat_load with b, off
+        Let _w be proc mat_store with result, off, av plus bv
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "matrix2x2_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let i be 0
+    While i is less than 4:
+        Let off be i multiplied by 8
+        Let av be proc mat_load with a, off
+        Let bv be proc mat_load with b, off
+        Let _w be proc mat_store with result, off, av minus bv
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "matrix2x2_scalar_mul" takes m as Integer, s as Float, result as Integer returns Integer:
+    Let i be 0
+    While i is less than 4:
+        Let off be i multiplied by 8
+        Let v be proc mat_load with m, off
+        Let _w be proc mat_store with result, off, v multiplied by s
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "matrix2x2_mul" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        result[r][c] = sum over k of a[r][k] * b[k][c]. For 2x2 we
+        unroll the 8 fused multiply-adds. Snapshots all 8 inputs to
+        permit aliasing of result with a or b.
+    @End Reasoning
+    @Implementation
+        Closed-form unroll.
+    @End Implementation
+    @Performance_Hints
+        8 mulsd + 4 addsd + 4 writes.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let a00 be proc mat_load with a, 0
+    Let a01 be proc mat_load with a, 8
+    Let a10 be proc mat_load with a, 16
+    Let a11 be proc mat_load with a, 24
+    Let b00 be proc mat_load with b, 0
+    Let b01 be proc mat_load with b, 8
+    Let b10 be proc mat_load with b, 16
+    Let b11 be proc mat_load with b, 24
+    Let r00 be (a00 multiplied by b00) plus (a01 multiplied by b10)
+    Let r01 be (a00 multiplied by b01) plus (a01 multiplied by b11)
+    Let r10 be (a10 multiplied by b00) plus (a11 multiplied by b10)
+    Let r11 be (a10 multiplied by b01) plus (a11 multiplied by b11)
+    Let _0 be proc mat_store with result, 0, r00
+    Let _1 be proc mat_store with result, 8, r01
+    Let _2 be proc mat_store with result, 16, r10
+    Let _3 be proc mat_store with result, 24, r11
+    Return 0
+End Process
+
+Process called "matrix2x2_transpose" takes m as Integer, result as Integer returns Integer:
+    @Reasoning
+        result[c][r] = m[r][c]. Snapshot all four lanes first.
+    @End Reasoning
+    @Implementation
+        Pure permutation.
+    @End Implementation
+    @Performance_Hints
+        Four loads + four stores.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe via snapshot.
+    @End Security_Scope
+    Let a00 be proc mat_load with m, 0
+    Let a01 be proc mat_load with m, 8
+    Let a10 be proc mat_load with m, 16
+    Let a11 be proc mat_load with m, 24
+    Let _0 be proc mat_store with result, 0, a00
+    Let _1 be proc mat_store with result, 8, a10
+    Let _2 be proc mat_store with result, 16, a01
+    Let _3 be proc mat_store with result, 24, a11
+    Return 0
+End Process
+
+Process called "matrix2x2_determinant" takes m as Integer returns Float:
+    @Reasoning
+        det([[a,b],[c,d]]) = ad - bc. Closed form.
+    @End Reasoning
+    @Implementation
+        Two multiplies and one subtract.
+    @End Implementation
+    @Performance_Hints
+        Minimal cost.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let a00 be proc mat_load with m, 0
+    Let a01 be proc mat_load with m, 8
+    Let a10 be proc mat_load with m, 16
+    Let a11 be proc mat_load with m, 24
+    Return (a00 multiplied by a11) minus (a01 multiplied by a10)
+End Process
+
+Process called "matrix2x2_trace" takes m as Integer returns Float:
+    @Reasoning
+        trace = sum of diagonal entries.
+    @End Reasoning
+    @Implementation
+        Two loads + one add.
+    @End Implementation
+    @Performance_Hints
+        Trivial.
+    @End Performance_Hints
+    @Security_Scope
+        N/A.
+    @End Security_Scope
+    Let a00 be proc mat_load with m, 0
+    Let a11 be proc mat_load with m, 24
+    Return a00 plus a11
+End Process
+
+Process called "matrix2x2_inverse" takes m as Integer, result as Integer returns Integer:
+    @Reasoning
+        Inverse of a 2x2:
+          m^-1 = (1/det) * [[d, -b], [-c, a]]
+        Returns -1 if det = 0 (singular).
+    @End Reasoning
+    @Implementation
+        Compute determinant first, branch on zero, then write adjugate
+        scaled by 1/det.
+    @End Implementation
+    @Performance_Hints
+        4 multiplies + 1 subtract + 1 division + 4 multiplies.
+    @End Performance_Hints
+    @Security_Scope
+        Caller checks return code.
+    @End Security_Scope
+    Let a00 be proc mat_load with m, 0
+    Let a01 be proc mat_load with m, 8
+    Let a10 be proc mat_load with m, 16
+    Let a11 be proc mat_load with m, 24
+    Let det be (a00 multiplied by a11) minus (a01 multiplied by a10)
+    If det is equal to 0.0:
+        Return 0 minus 1
+    End If
+    Let inv_det be 1.0 divided by det
+    Let neg_one be 0.0 minus 1.0
+    Let _0 be proc mat_store with result, 0, a11 multiplied by inv_det
+    Let _1 be proc mat_store with result, 8, (neg_one multiplied by a01) multiplied by inv_det
+    Let _2 be proc mat_store with result, 16, (neg_one multiplied by a10) multiplied by inv_det
+    Let _3 be proc mat_store with result, 24, a00 multiplied by inv_det
+    Return 0
+End Process
+
+Process called "matrix2x2_apply_vector" takes m as Integer, v as Integer, result as Integer returns Integer:
+    @Reasoning
+        2x2 matrix times 2x1 vector. result[i] = sum over j of m[i][j]*v[j].
+    @End Reasoning
+    @Implementation
+        Snapshot the 2 lanes of v, then 2-fma rows.
+    @End Implementation
+    @Performance_Hints
+        4 mulsd + 2 addsd.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let a00 be proc mat_load with m, 0
+    Let a01 be proc mat_load with m, 8
+    Let a10 be proc mat_load with m, 16
+    Let a11 be proc mat_load with m, 24
+    Let vx be proc vec_load_lane from Vector with v, 0
+    Let vy be proc vec_load_lane from Vector with v, 8
+    Let r0 be (a00 multiplied by vx) plus (a01 multiplied by vy)
+    Let r1 be (a10 multiplied by vx) plus (a11 multiplied by vy)
+    Let _0 be proc vec_store_lane from Vector with result, 0, r0
+    Let _1 be proc vec_store_lane from Vector with result, 8, r1
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Matrix3x3 - 3x3 matrix
+Note: ============================================================================
+
+Process called "matrix3x3_allocate" returns Integer:
+    Let p be proc allocate from Layout with MATRIX3X3_SIZE_BYTES
+    Return p
+End Process
+
+Process called "matrix3x3_free" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let _d be proc deallocate from Layout with m
+    Return 0
+End Process
+
+Process called "matrix3x3_set_element" takes m as Integer, r as Integer, c as Integer, v as Float returns Integer:
+    Let off be ((r multiplied by 3) plus c) multiplied by 8
+    Let _w be proc mat_store with m, off, v
+    Return 0
+End Process
+
+Process called "matrix3x3_get_element" takes m as Integer, r as Integer, c as Integer returns Float:
+    Let off be ((r multiplied by 3) plus c) multiplied by 8
+    Return proc mat_load with m, off
+End Process
+
+Process called "matrix3x3_copy" takes src as Integer, dst as Integer returns Integer:
+    Let _c be proc memory_copy from Memory with dst, src, MATRIX3X3_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "matrix3x3_identity" takes m as Integer returns Integer:
+    Let _z be proc memory_zero from Memory with m, MATRIX3X3_SIZE_BYTES
+    Let _0 be proc matrix3x3_set_element with m, 0, 0, 1.0
+    Let _1 be proc matrix3x3_set_element with m, 1, 1, 1.0
+    Let _2 be proc matrix3x3_set_element with m, 2, 2, 1.0
+    Return 0
+End Process
+
+Process called "matrix3x3_zero" takes m as Integer returns Integer:
+    Let _z be proc memory_zero from Memory with m, MATRIX3X3_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "matrix3x3_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let i be 0
+    While i is less than 9:
+        Let off be i multiplied by 8
+        Let av be proc mat_load with a, off
+        Let bv be proc mat_load with b, off
+        Let _w be proc mat_store with result, off, av plus bv
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "matrix3x3_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let i be 0
+    While i is less than 9:
+        Let off be i multiplied by 8
+        Let av be proc mat_load with a, off
+        Let bv be proc mat_load with b, off
+        Let _w be proc mat_store with result, off, av minus bv
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "matrix3x3_scalar_mul" takes m as Integer, s as Float, result as Integer returns Integer:
+    Let i be 0
+    While i is less than 9:
+        Let off be i multiplied by 8
+        Let v be proc mat_load with m, off
+        Let _w be proc mat_store with result, off, v multiplied by s
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "matrix3x3_mul" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        3x3 matrix product, fully unrolled into a temporary buffer so
+        result may alias a or b. Each entry result[r][c] is dot of
+        a's row r with b's column c.
+    @End Reasoning
+    @Implementation
+        Computes into a 9-Float stack of locals, then writes out.
+    @End Implementation
+    @Performance_Hints
+        27 mulsd + 18 addsd.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe via locals snapshot.
+    @End Security_Scope
+    Let a00 be proc mat_load with a, 0
+    Let a01 be proc mat_load with a, 8
+    Let a02 be proc mat_load with a, 16
+    Let a10 be proc mat_load with a, 24
+    Let a11 be proc mat_load with a, 32
+    Let a12 be proc mat_load with a, 40
+    Let a20 be proc mat_load with a, 48
+    Let a21 be proc mat_load with a, 56
+    Let a22 be proc mat_load with a, 64
+    Let b00 be proc mat_load with b, 0
+    Let b01 be proc mat_load with b, 8
+    Let b02 be proc mat_load with b, 16
+    Let b10 be proc mat_load with b, 24
+    Let b11 be proc mat_load with b, 32
+    Let b12 be proc mat_load with b, 40
+    Let b20 be proc mat_load with b, 48
+    Let b21 be proc mat_load with b, 56
+    Let b22 be proc mat_load with b, 64
+    Let r00 be ((a00 multiplied by b00) plus (a01 multiplied by b10)) plus (a02 multiplied by b20)
+    Let r01 be ((a00 multiplied by b01) plus (a01 multiplied by b11)) plus (a02 multiplied by b21)
+    Let r02 be ((a00 multiplied by b02) plus (a01 multiplied by b12)) plus (a02 multiplied by b22)
+    Let r10 be ((a10 multiplied by b00) plus (a11 multiplied by b10)) plus (a12 multiplied by b20)
+    Let r11 be ((a10 multiplied by b01) plus (a11 multiplied by b11)) plus (a12 multiplied by b21)
+    Let r12 be ((a10 multiplied by b02) plus (a11 multiplied by b12)) plus (a12 multiplied by b22)
+    Let r20 be ((a20 multiplied by b00) plus (a21 multiplied by b10)) plus (a22 multiplied by b20)
+    Let r21 be ((a20 multiplied by b01) plus (a21 multiplied by b11)) plus (a22 multiplied by b21)
+    Let r22 be ((a20 multiplied by b02) plus (a21 multiplied by b12)) plus (a22 multiplied by b22)
+    Let _00 be proc mat_store with result, 0, r00
+    Let _01 be proc mat_store with result, 8, r01
+    Let _02 be proc mat_store with result, 16, r02
+    Let _10 be proc mat_store with result, 24, r10
+    Let _11 be proc mat_store with result, 32, r11
+    Let _12 be proc mat_store with result, 40, r12
+    Let _20 be proc mat_store with result, 48, r20
+    Let _21 be proc mat_store with result, 56, r21
+    Let _22 be proc mat_store with result, 64, r22
+    Return 0
+End Process
+
+Process called "matrix3x3_transpose" takes m as Integer, result as Integer returns Integer:
+    @Reasoning
+        Swap m[i][j] and m[j][i] for i != j, leave diagonal.
+    @End Reasoning
+    @Implementation
+        Snapshot all 9 lanes for aliasing safety.
+    @End Implementation
+    @Performance_Hints
+        Pure permutation, no arithmetic.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let a00 be proc mat_load with m, 0
+    Let a01 be proc mat_load with m, 8
+    Let a02 be proc mat_load with m, 16
+    Let a10 be proc mat_load with m, 24
+    Let a11 be proc mat_load with m, 32
+    Let a12 be proc mat_load with m, 40
+    Let a20 be proc mat_load with m, 48
+    Let a21 be proc mat_load with m, 56
+    Let a22 be proc mat_load with m, 64
+    Let _00 be proc mat_store with result, 0, a00
+    Let _01 be proc mat_store with result, 8, a10
+    Let _02 be proc mat_store with result, 16, a20
+    Let _10 be proc mat_store with result, 24, a01
+    Let _11 be proc mat_store with result, 32, a11
+    Let _12 be proc mat_store with result, 40, a21
+    Let _20 be proc mat_store with result, 48, a02
+    Let _21 be proc mat_store with result, 56, a12
+    Let _22 be proc mat_store with result, 64, a22
+    Return 0
+End Process
+
+Process called "matrix3x3_determinant" takes m as Integer returns Float:
+    @Reasoning
+        det = a(ei - fh) - b(di - fg) + c(dh - eg) using cofactor
+        expansion along the first row. Standard 3x3 formula.
+    @End Reasoning
+    @Implementation
+        Direct evaluation.
+    @End Implementation
+    @Performance_Hints
+        9 mulsd + 5 add/sub.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let a be proc mat_load with m, 0
+    Let b be proc mat_load with m, 8
+    Let c be proc mat_load with m, 16
+    Let d be proc mat_load with m, 24
+    Let e be proc mat_load with m, 32
+    Let f be proc mat_load with m, 40
+    Let g be proc mat_load with m, 48
+    Let h be proc mat_load with m, 56
+    Let i be proc mat_load with m, 64
+    Let m1 be (e multiplied by i) minus (f multiplied by h)
+    Let m2 be (d multiplied by i) minus (f multiplied by g)
+    Let m3 be (d multiplied by h) minus (e multiplied by g)
+    Return ((a multiplied by m1) minus (b multiplied by m2)) plus (c multiplied by m3)
+End Process
+
+Process called "matrix3x3_trace" takes m as Integer returns Float:
+    Let a00 be proc mat_load with m, 0
+    Let a11 be proc mat_load with m, 32
+    Let a22 be proc mat_load with m, 64
+    Return (a00 plus a11) plus a22
+End Process
+
+Process called "matrix3x3_inverse" takes m as Integer, result as Integer returns Integer:
+    @Reasoning
+        Adjugate-based inverse: M^-1 = adj(M) / det(M). The adjugate is
+        the transpose of the cofactor matrix. Returns -1 if singular.
+    @End Reasoning
+    @Implementation
+        Compute all 9 cofactors, place them transposed into result,
+        then scale by 1/det.
+    @End Implementation
+    @Performance_Hints
+        9 cofactor 2x2 dets + 1 det + 1 division + 9 multiplies.
+    @End Performance_Hints
+    @Security_Scope
+        Caller checks return code; constant-time aside from det test.
+    @End Security_Scope
+    Let a be proc mat_load with m, 0
+    Let b be proc mat_load with m, 8
+    Let c be proc mat_load with m, 16
+    Let d be proc mat_load with m, 24
+    Let e be proc mat_load with m, 32
+    Let f be proc mat_load with m, 40
+    Let g be proc mat_load with m, 48
+    Let h be proc mat_load with m, 56
+    Let i be proc mat_load with m, 64
+    Let c00 be (e multiplied by i) minus (f multiplied by h)
+    Let c01 be (d multiplied by i) minus (f multiplied by g)
+    Let c02 be (d multiplied by h) minus (e multiplied by g)
+    Let c10 be (b multiplied by i) minus (c multiplied by h)
+    Let c11 be (a multiplied by i) minus (c multiplied by g)
+    Let c12 be (a multiplied by h) minus (b multiplied by g)
+    Let c20 be (b multiplied by f) minus (c multiplied by e)
+    Let c21 be (a multiplied by f) minus (c multiplied by d)
+    Let c22 be (a multiplied by e) minus (b multiplied by d)
+    Let det be ((a multiplied by c00) minus (b multiplied by c01)) plus (c multiplied by c02)
+    If det is equal to 0.0:
+        Return 0 minus 1
+    End If
+    Let inv_det be 1.0 divided by det
+    Let neg_inv be 0.0 minus inv_det
+    Note: adj = transpose(cofactor with checkerboard signs).
+    Let _00 be proc mat_store with result, 0, c00 multiplied by inv_det
+    Let _01 be proc mat_store with result, 8, c10 multiplied by neg_inv
+    Let _02 be proc mat_store with result, 16, c20 multiplied by inv_det
+    Let _10 be proc mat_store with result, 24, c01 multiplied by neg_inv
+    Let _11 be proc mat_store with result, 32, c11 multiplied by inv_det
+    Let _12 be proc mat_store with result, 40, c21 multiplied by neg_inv
+    Let _20 be proc mat_store with result, 48, c02 multiplied by inv_det
+    Let _21 be proc mat_store with result, 56, c12 multiplied by neg_inv
+    Let _22 be proc mat_store with result, 64, c22 multiplied by inv_det
+    Return 0
+End Process
+
+Process called "matrix3x3_apply_vector" takes m as Integer, v as Integer, result as Integer returns Integer:
+    @Reasoning
+        3x3 matrix-vector product.
+    @End Reasoning
+    @Implementation
+        Three dot products of rows with vector.
+    @End Implementation
+    @Performance_Hints
+        9 mulsd + 6 addsd.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let a00 be proc mat_load with m, 0
+    Let a01 be proc mat_load with m, 8
+    Let a02 be proc mat_load with m, 16
+    Let a10 be proc mat_load with m, 24
+    Let a11 be proc mat_load with m, 32
+    Let a12 be proc mat_load with m, 40
+    Let a20 be proc mat_load with m, 48
+    Let a21 be proc mat_load with m, 56
+    Let a22 be proc mat_load with m, 64
+    Let vx be proc vec_load_lane from Vector with v, 0
+    Let vy be proc vec_load_lane from Vector with v, 8
+    Let vz be proc vec_load_lane from Vector with v, 16
+    Let r0 be ((a00 multiplied by vx) plus (a01 multiplied by vy)) plus (a02 multiplied by vz)
+    Let r1 be ((a10 multiplied by vx) plus (a11 multiplied by vy)) plus (a12 multiplied by vz)
+    Let r2 be ((a20 multiplied by vx) plus (a21 multiplied by vy)) plus (a22 multiplied by vz)
+    Let _0 be proc vec_store_lane from Vector with result, 0, r0
+    Let _1 be proc vec_store_lane from Vector with result, 8, r1
+    Let _2 be proc vec_store_lane from Vector with result, 16, r2
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Matrix4x4 - 4x4 matrix (the workhorse for 3D graphics)
+Note: ============================================================================
+
+Process called "matrix4x4_allocate" returns Integer:
+    Let p be proc allocate from Layout with MATRIX4X4_SIZE_BYTES
+    Return p
+End Process
+
+Process called "matrix4x4_free" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let _d be proc deallocate from Layout with m
+    Return 0
+End Process
+
+Process called "matrix4x4_set_element" takes m as Integer, r as Integer, c as Integer, v as Float returns Integer:
+    Let off be ((r multiplied by 4) plus c) multiplied by 8
+    Let _w be proc mat_store with m, off, v
+    Return 0
+End Process
+
+Process called "matrix4x4_get_element" takes m as Integer, r as Integer, c as Integer returns Float:
+    Let off be ((r multiplied by 4) plus c) multiplied by 8
+    Return proc mat_load with m, off
+End Process
+
+Process called "matrix4x4_copy" takes src as Integer, dst as Integer returns Integer:
+    Let _c be proc memory_copy from Memory with dst, src, MATRIX4X4_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "matrix4x4_identity" takes m as Integer returns Integer:
+    Let _z be proc memory_zero from Memory with m, MATRIX4X4_SIZE_BYTES
+    Let _0 be proc matrix4x4_set_element with m, 0, 0, 1.0
+    Let _1 be proc matrix4x4_set_element with m, 1, 1, 1.0
+    Let _2 be proc matrix4x4_set_element with m, 2, 2, 1.0
+    Let _3 be proc matrix4x4_set_element with m, 3, 3, 1.0
+    Return 0
+End Process
+
+Process called "matrix4x4_zero" takes m as Integer returns Integer:
+    Let _z be proc memory_zero from Memory with m, MATRIX4X4_SIZE_BYTES
+    Return 0
+End Process
+
+Process called "matrix4x4_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let i be 0
+    While i is less than 16:
+        Let off be i multiplied by 8
+        Let av be proc mat_load with a, off
+        Let bv be proc mat_load with b, off
+        Let _w be proc mat_store with result, off, av plus bv
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "matrix4x4_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let i be 0
+    While i is less than 16:
+        Let off be i multiplied by 8
+        Let av be proc mat_load with a, off
+        Let bv be proc mat_load with b, off
+        Let _w be proc mat_store with result, off, av minus bv
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "matrix4x4_scalar_mul" takes m as Integer, s as Float, result as Integer returns Integer:
+    Let i be 0
+    While i is less than 16:
+        Let off be i multiplied by 8
+        Let v be proc mat_load with m, off
+        Let _w be proc mat_store with result, off, v multiplied by s
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "mat4_get" takes m as Integer, r as Integer, c as Integer returns Float:
+    Let off be ((r multiplied by 4) plus c) multiplied by 8
+    Return proc mat_load with m, off
+End Process
+
+Process called "matrix4x4_mul" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        4x4 matrix product. Uses an intermediate 128-byte scratch buffer
+        so result may alias a or b.
+    @End Reasoning
+    @Implementation
+        Triple-nested loop over r, c, k.
+    @End Implementation
+    @Performance_Hints
+        64 mulsd + 48 addsd.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe via temp buffer.
+    @End Security_Scope
+    Let tmp be proc allocate from Layout with MATRIX4X4_SIZE_BYTES
+    If tmp is equal to 0:
+        Return 0 minus 1
+    End If
+    Let r be 0
+    While r is less than 4:
+        Let c be 0
+        While c is less than 4:
+            Let sum be 0.0
+            Let k be 0
+            While k is less than 4:
+                Let av be proc mat4_get with a, r, k
+                Let bv be proc mat4_get with b, k, c
+                Set sum to sum plus (av multiplied by bv)
+                Set k to k plus 1
+            End While
+            Let off be ((r multiplied by 4) plus c) multiplied by 8
+            Let _w be proc mat_store with tmp, off, sum
+            Set c to c plus 1
+        End While
+        Set r to r plus 1
+    End While
+    Let _c be proc memory_copy from Memory with result, tmp, MATRIX4X4_SIZE_BYTES
+    Let _d be proc deallocate from Layout with tmp
+    Return 0
+End Process
+
+Process called "matrix4x4_transpose" takes m as Integer, result as Integer returns Integer:
+    @Reasoning
+        result[c][r] = m[r][c]. Uses a 128-byte temp for aliasing safety.
+    @End Reasoning
+    @Implementation
+        Two passes: read into temp, copy out.
+    @End Implementation
+    @Performance_Hints
+        32 loads/stores.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let tmp be proc allocate from Layout with MATRIX4X4_SIZE_BYTES
+    If tmp is equal to 0:
+        Return 0 minus 1
+    End If
+    Let r be 0
+    While r is less than 4:
+        Let c be 0
+        While c is less than 4:
+            Let v be proc mat4_get with m, r, c
+            Let off be ((c multiplied by 4) plus r) multiplied by 8
+            Let _w be proc mat_store with tmp, off, v
+            Set c to c plus 1
+        End While
+        Set r to r plus 1
+    End While
+    Let _c be proc memory_copy from Memory with result, tmp, MATRIX4X4_SIZE_BYTES
+    Let _d be proc deallocate from Layout with tmp
+    Return 0
+End Process
+
+Process called "matrix4x4_trace" takes m as Integer returns Float:
+    Let m00 be proc mat4_get with m, 0, 0
+    Let m11 be proc mat4_get with m, 1, 1
+    Let m22 be proc mat4_get with m, 2, 2
+    Let m33 be proc mat4_get with m, 3, 3
+    Return ((m00 plus m11) plus m22) plus m33
+End Process
+
+Process called "mat4_det3" takes a as Float, b as Float, c as Float, d as Float, e as Float, f as Float, g as Float, h as Float, i as Float returns Float:
+    @Reasoning
+        Internal: determinant of a 3x3 specified by 9 explicit Floats.
+        Used by 4x4 cofactor expansion.
+    @End Reasoning
+    @Implementation
+        Standard 3x3 closed form.
+    @End Implementation
+    @Performance_Hints
+        9 mulsd + 5 add/sub.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let m1 be (e multiplied by i) minus (f multiplied by h)
+    Let m2 be (d multiplied by i) minus (f multiplied by g)
+    Let m3 be (d multiplied by h) minus (e multiplied by g)
+    Return ((a multiplied by m1) minus (b multiplied by m2)) plus (c multiplied by m3)
+End Process
+
+Process called "matrix4x4_determinant" takes m as Integer returns Float:
+    @Reasoning
+        Laplace expansion along the first row of the 4x4. Each 3x3 minor
+        is computed via mat4_det3.
+    @End Reasoning
+    @Implementation
+        det = m00*M00 - m01*M01 + m02*M02 - m03*M03 where Mij is the 3x3
+        minor obtained by deleting row i and column j.
+    @End Implementation
+    @Performance_Hints
+        4 * (9 mulsd + 5 add/sub) + 4 multiplies + 3 add/sub.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let m00 be proc mat4_get with m, 0, 0
+    Let m01 be proc mat4_get with m, 0, 1
+    Let m02 be proc mat4_get with m, 0, 2
+    Let m03 be proc mat4_get with m, 0, 3
+    Let m10 be proc mat4_get with m, 1, 0
+    Let m11 be proc mat4_get with m, 1, 1
+    Let m12 be proc mat4_get with m, 1, 2
+    Let m13 be proc mat4_get with m, 1, 3
+    Let m20 be proc mat4_get with m, 2, 0
+    Let m21 be proc mat4_get with m, 2, 1
+    Let m22 be proc mat4_get with m, 2, 2
+    Let m23 be proc mat4_get with m, 2, 3
+    Let m30 be proc mat4_get with m, 3, 0
+    Let m31 be proc mat4_get with m, 3, 1
+    Let m32 be proc mat4_get with m, 3, 2
+    Let m33 be proc mat4_get with m, 3, 3
+    Let minor00 be proc mat4_det3 with m11, m12, m13, m21, m22, m23, m31, m32, m33
+    Let minor01 be proc mat4_det3 with m10, m12, m13, m20, m22, m23, m30, m32, m33
+    Let minor02 be proc mat4_det3 with m10, m11, m13, m20, m21, m23, m30, m31, m33
+    Let minor03 be proc mat4_det3 with m10, m11, m12, m20, m21, m22, m30, m31, m32
+    Let t1 be m00 multiplied by minor00
+    Let t2 be m01 multiplied by minor01
+    Let t3 be m02 multiplied by minor02
+    Let t4 be m03 multiplied by minor03
+    Return ((t1 minus t2) plus t3) minus t4
+End Process
+
+Process called "matrix4x4_inverse" takes m as Integer, result as Integer returns Integer:
+    @Reasoning
+        Inverse via adjugate / determinant. All 16 cofactors are 3x3
+        minors with checkerboard sign. The adjugate is the transpose of
+        the cofactor matrix; result[i][j] = cofactor[j][i] / det.
+    @End Reasoning
+    @Implementation
+        Read all 16 entries, compute all 16 cofactors (each a 3x3 det),
+        check det non-zero, scale and transpose into result.
+    @End Implementation
+    @Performance_Hints
+        Roughly 16 * 9 + 16 fma + 1 division + 16 multiplies.
+    @End Performance_Hints
+    @Security_Scope
+        Caller checks return code.
+    @End Security_Scope
+    Let m00 be proc mat4_get with m, 0, 0
+    Let m01 be proc mat4_get with m, 0, 1
+    Let m02 be proc mat4_get with m, 0, 2
+    Let m03 be proc mat4_get with m, 0, 3
+    Let m10 be proc mat4_get with m, 1, 0
+    Let m11 be proc mat4_get with m, 1, 1
+    Let m12 be proc mat4_get with m, 1, 2
+    Let m13 be proc mat4_get with m, 1, 3
+    Let m20 be proc mat4_get with m, 2, 0
+    Let m21 be proc mat4_get with m, 2, 1
+    Let m22 be proc mat4_get with m, 2, 2
+    Let m23 be proc mat4_get with m, 2, 3
+    Let m30 be proc mat4_get with m, 3, 0
+    Let m31 be proc mat4_get with m, 3, 1
+    Let m32 be proc mat4_get with m, 3, 2
+    Let m33 be proc mat4_get with m, 3, 3
+
+    Note: Cofactor C[i][j] = (-1)^(i+j) * minor(i,j).
+    Let cof00 be proc mat4_det3 with m11, m12, m13, m21, m22, m23, m31, m32, m33
+    Let cof01_pos be proc mat4_det3 with m10, m12, m13, m20, m22, m23, m30, m32, m33
+    Let cof01 be 0.0 minus cof01_pos
+    Let cof02 be proc mat4_det3 with m10, m11, m13, m20, m21, m23, m30, m31, m33
+    Let cof03_pos be proc mat4_det3 with m10, m11, m12, m20, m21, m22, m30, m31, m32
+    Let cof03 be 0.0 minus cof03_pos
+    Let cof10_pos be proc mat4_det3 with m01, m02, m03, m21, m22, m23, m31, m32, m33
+    Let cof10 be 0.0 minus cof10_pos
+    Let cof11 be proc mat4_det3 with m00, m02, m03, m20, m22, m23, m30, m32, m33
+    Let cof12_pos be proc mat4_det3 with m00, m01, m03, m20, m21, m23, m30, m31, m33
+    Let cof12 be 0.0 minus cof12_pos
+    Let cof13 be proc mat4_det3 with m00, m01, m02, m20, m21, m22, m30, m31, m32
+    Let cof20 be proc mat4_det3 with m01, m02, m03, m11, m12, m13, m31, m32, m33
+    Let cof21_pos be proc mat4_det3 with m00, m02, m03, m10, m12, m13, m30, m32, m33
+    Let cof21 be 0.0 minus cof21_pos
+    Let cof22 be proc mat4_det3 with m00, m01, m03, m10, m11, m13, m30, m31, m33
+    Let cof23_pos be proc mat4_det3 with m00, m01, m02, m10, m11, m12, m30, m31, m32
+    Let cof23 be 0.0 minus cof23_pos
+    Let cof30_pos be proc mat4_det3 with m01, m02, m03, m11, m12, m13, m21, m22, m23
+    Let cof30 be 0.0 minus cof30_pos
+    Let cof31 be proc mat4_det3 with m00, m02, m03, m10, m12, m13, m20, m22, m23
+    Let cof32_pos be proc mat4_det3 with m00, m01, m03, m10, m11, m13, m20, m21, m23
+    Let cof32 be 0.0 minus cof32_pos
+    Let cof33 be proc mat4_det3 with m00, m01, m02, m10, m11, m12, m20, m21, m22
+
+    Let det be (((m00 multiplied by cof00) plus (m01 multiplied by cof01)) plus (m02 multiplied by cof02)) plus (m03 multiplied by cof03)
+    If det is equal to 0.0:
+        Return 0 minus 1
+    End If
+    Let inv_det be 1.0 divided by det
+
+    Note: result[i][j] = cof[j][i] * inv_det (transpose of cofactor matrix).
+    Let _00 be proc matrix4x4_set_element with result, 0, 0, cof00 multiplied by inv_det
+    Let _01 be proc matrix4x4_set_element with result, 0, 1, cof10 multiplied by inv_det
+    Let _02 be proc matrix4x4_set_element with result, 0, 2, cof20 multiplied by inv_det
+    Let _03 be proc matrix4x4_set_element with result, 0, 3, cof30 multiplied by inv_det
+    Let _10 be proc matrix4x4_set_element with result, 1, 0, cof01 multiplied by inv_det
+    Let _11 be proc matrix4x4_set_element with result, 1, 1, cof11 multiplied by inv_det
+    Let _12 be proc matrix4x4_set_element with result, 1, 2, cof21 multiplied by inv_det
+    Let _13 be proc matrix4x4_set_element with result, 1, 3, cof31 multiplied by inv_det
+    Let _20 be proc matrix4x4_set_element with result, 2, 0, cof02 multiplied by inv_det
+    Let _21 be proc matrix4x4_set_element with result, 2, 1, cof12 multiplied by inv_det
+    Let _22 be proc matrix4x4_set_element with result, 2, 2, cof22 multiplied by inv_det
+    Let _23 be proc matrix4x4_set_element with result, 2, 3, cof32 multiplied by inv_det
+    Let _30 be proc matrix4x4_set_element with result, 3, 0, cof03 multiplied by inv_det
+    Let _31 be proc matrix4x4_set_element with result, 3, 1, cof13 multiplied by inv_det
+    Let _32 be proc matrix4x4_set_element with result, 3, 2, cof23 multiplied by inv_det
+    Let _33 be proc matrix4x4_set_element with result, 3, 3, cof33 multiplied by inv_det
+    Return 0
+End Process
+
+Process called "matrix4x4_apply_vector" takes m as Integer, v as Integer, result as Integer returns Integer:
+    @Reasoning
+        4x4 times 4-vector. Used for homogeneous-coordinate transforms.
+    @End Reasoning
+    @Implementation
+        Four dot products over rows.
+    @End Implementation
+    @Performance_Hints
+        16 mulsd + 12 addsd.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let vx be proc vec_load_lane from Vector with v, 0
+    Let vy be proc vec_load_lane from Vector with v, 8
+    Let vz be proc vec_load_lane from Vector with v, 16
+    Let vw be proc vec_load_lane from Vector with v, 24
+    Let m00 be proc mat4_get with m, 0, 0
+    Let m01 be proc mat4_get with m, 0, 1
+    Let m02 be proc mat4_get with m, 0, 2
+    Let m03 be proc mat4_get with m, 0, 3
+    Let m10 be proc mat4_get with m, 1, 0
+    Let m11 be proc mat4_get with m, 1, 1
+    Let m12 be proc mat4_get with m, 1, 2
+    Let m13 be proc mat4_get with m, 1, 3
+    Let m20 be proc mat4_get with m, 2, 0
+    Let m21 be proc mat4_get with m, 2, 1
+    Let m22 be proc mat4_get with m, 2, 2
+    Let m23 be proc mat4_get with m, 2, 3
+    Let m30 be proc mat4_get with m, 3, 0
+    Let m31 be proc mat4_get with m, 3, 1
+    Let m32 be proc mat4_get with m, 3, 2
+    Let m33 be proc mat4_get with m, 3, 3
+    Let r0 be (((m00 multiplied by vx) plus (m01 multiplied by vy)) plus (m02 multiplied by vz)) plus (m03 multiplied by vw)
+    Let r1 be (((m10 multiplied by vx) plus (m11 multiplied by vy)) plus (m12 multiplied by vz)) plus (m13 multiplied by vw)
+    Let r2 be (((m20 multiplied by vx) plus (m21 multiplied by vy)) plus (m22 multiplied by vz)) plus (m23 multiplied by vw)
+    Let r3 be (((m30 multiplied by vx) plus (m31 multiplied by vy)) plus (m32 multiplied by vz)) plus (m33 multiplied by vw)
+    Let _0 be proc vec_store_lane from Vector with result, 0, r0
+    Let _1 be proc vec_store_lane from Vector with result, 8, r1
+    Let _2 be proc vec_store_lane from Vector with result, 16, r2
+    Let _3 be proc vec_store_lane from Vector with result, 24, r3
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: 4x4 affine and projective construction helpers
+Note: ============================================================================
+
+Process called "matrix4x4_translation" takes m as Integer, t as Integer returns Integer:
+    @Reasoning
+        Affine translation matrix:
+          [ 1  0  0  tx ]
+          [ 0  1  0  ty ]
+          [ 0  0  1  tz ]
+          [ 0  0  0  1  ]
+        Apply to a homogeneous point (x,y,z,1) shifts it by (tx,ty,tz).
+    @End Reasoning
+    @Implementation
+        Identity + override the translation column.
+    @End Implementation
+    @Performance_Hints
+        Zero + 7 stores.
+    @End Performance_Hints
+    @Security_Scope
+        No special concerns.
+    @End Security_Scope
+    Let _i be proc matrix4x4_identity with m
+    Let tx be proc vec_load_lane from Vector with t, 0
+    Let ty be proc vec_load_lane from Vector with t, 8
+    Let tz be proc vec_load_lane from Vector with t, 16
+    Let _x be proc matrix4x4_set_element with m, 0, 3, tx
+    Let _y be proc matrix4x4_set_element with m, 1, 3, ty
+    Let _z be proc matrix4x4_set_element with m, 2, 3, tz
+    Return 0
+End Process
+
+Process called "matrix4x4_scale" takes m as Integer, s as Integer returns Integer:
+    @Reasoning
+        Anisotropic scale matrix (independent per-axis factors):
+          [ sx 0  0  0 ]
+          [ 0  sy 0  0 ]
+          [ 0  0  sz 0 ]
+          [ 0  0  0  1 ]
+    @End Reasoning
+    @Implementation
+        Zero + 4 diagonal stores.
+    @End Implementation
+    @Performance_Hints
+        Zero + 4 stores.
+    @End Performance_Hints
+    @Security_Scope
+        No special concerns.
+    @End Security_Scope
+    Let _z be proc matrix4x4_zero with m
+    Let sx be proc vec_load_lane from Vector with s, 0
+    Let sy be proc vec_load_lane from Vector with s, 8
+    Let sz be proc vec_load_lane from Vector with s, 16
+    Let _x be proc matrix4x4_set_element with m, 0, 0, sx
+    Let _y be proc matrix4x4_set_element with m, 1, 1, sy
+    Let _zz be proc matrix4x4_set_element with m, 2, 2, sz
+    Let _w be proc matrix4x4_set_element with m, 3, 3, 1.0
+    Return 0
+End Process
+
+Process called "matrix4x4_rotation_x" takes m as Integer, angle as Float returns Integer:
+    @Reasoning
+        Rotation about the x-axis by angle (radians, right-hand rule):
+          [ 1  0   0   0 ]
+          [ 0  c  -s   0 ]
+          [ 0  s   c   0 ]
+          [ 0  0   0   1 ]
+        where c = cos(angle), s = sin(angle).
+    @End Reasoning
+    @Implementation
+        Bit-cast angle to Integer bits, route through trig_core.
+    @End Implementation
+    @Performance_Hints
+        One sin + one cos + 5 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time within trig_core's reduction.
+    @End Security_Scope
+    Let bits be proc mat_float_to_bits with angle
+    Let cos_bits be proc cos_radians from Trig with bits
+    Let sin_bits be proc sin_radians from Trig with bits
+    Let c be proc mat_bits_to_float with cos_bits
+    Let s be proc mat_bits_to_float with sin_bits
+    Let _i be proc matrix4x4_identity with m
+    Let _11 be proc matrix4x4_set_element with m, 1, 1, c
+    Let _12 be proc matrix4x4_set_element with m, 1, 2, 0.0 minus s
+    Let _21 be proc matrix4x4_set_element with m, 2, 1, s
+    Let _22 be proc matrix4x4_set_element with m, 2, 2, c
+    Return 0
+End Process
+
+Process called "matrix4x4_rotation_y" takes m as Integer, angle as Float returns Integer:
+    @Reasoning
+        Rotation about the y-axis by angle:
+          [  c  0   s  0 ]
+          [  0  1   0  0 ]
+          [ -s  0   c  0 ]
+          [  0  0   0  1 ]
+    @End Reasoning
+    @Implementation
+        Same as rotation_x but rows 0 and 2.
+    @End Implementation
+    @Performance_Hints
+        One sin + one cos + 5 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let bits be proc mat_float_to_bits with angle
+    Let cos_bits be proc cos_radians from Trig with bits
+    Let sin_bits be proc sin_radians from Trig with bits
+    Let c be proc mat_bits_to_float with cos_bits
+    Let s be proc mat_bits_to_float with sin_bits
+    Let _i be proc matrix4x4_identity with m
+    Let _00 be proc matrix4x4_set_element with m, 0, 0, c
+    Let _02 be proc matrix4x4_set_element with m, 0, 2, s
+    Let _20 be proc matrix4x4_set_element with m, 2, 0, 0.0 minus s
+    Let _22 be proc matrix4x4_set_element with m, 2, 2, c
+    Return 0
+End Process
+
+Process called "matrix4x4_rotation_z" takes m as Integer, angle as Float returns Integer:
+    @Reasoning
+        Rotation about the z-axis:
+          [  c -s   0  0 ]
+          [  s  c   0  0 ]
+          [  0  0   1  0 ]
+          [  0  0   0  1 ]
+    @End Reasoning
+    @Implementation
+        Same as rotation_x but rows 0 and 1.
+    @End Implementation
+    @Performance_Hints
+        One sin + one cos + 5 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let bits be proc mat_float_to_bits with angle
+    Let cos_bits be proc cos_radians from Trig with bits
+    Let sin_bits be proc sin_radians from Trig with bits
+    Let c be proc mat_bits_to_float with cos_bits
+    Let s be proc mat_bits_to_float with sin_bits
+    Let _i be proc matrix4x4_identity with m
+    Let _00 be proc matrix4x4_set_element with m, 0, 0, c
+    Let _01 be proc matrix4x4_set_element with m, 0, 1, 0.0 minus s
+    Let _10 be proc matrix4x4_set_element with m, 1, 0, s
+    Let _11 be proc matrix4x4_set_element with m, 1, 1, c
+    Return 0
+End Process
+
+Process called "matrix4x4_perspective_projection" takes m as Integer, fov_y as Float, aspect as Float, near as Float, far as Float returns Integer:
+    @Reasoning
+        Right-handed OpenGL-style perspective projection matrix mapping
+        the view frustum onto the canonical clip volume [-1, 1]^3.
+          f = 1 / tan(fov_y / 2)
+          [ f/aspect  0     0                     0                       ]
+          [    0      f     0                     0                       ]
+          [    0      0   (far+near)/(near-far)   (2*far*near)/(near-far) ]
+          [    0      0    -1                     0                       ]
+        Returns -1 if aspect is 0 or near = far.
+    @End Reasoning
+    @Implementation
+        Compute f = cot(fov_y/2) via tan_radians composed with reciprocal.
+    @End Implementation
+    @Performance_Hints
+        One tan + division + 5 multiplies + 5 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Caller checks return code.
+    @End Security_Scope
+    If aspect is equal to 0.0:
+        Return 0 minus 1
+    End If
+    Let denom_z be near minus far
+    If denom_z is equal to 0.0:
+        Return 0 minus 1
+    End If
+    Let half_fov be fov_y divided by 2.0
+    Let hf_bits be proc mat_float_to_bits with half_fov
+    Let tan_bits be proc tan_radians from Trig with hf_bits
+    Let tan_val be proc mat_bits_to_float with tan_bits
+    If tan_val is equal to 0.0:
+        Return 0 minus 1
+    End If
+    Let f be 1.0 divided by tan_val
+    Let _z be proc matrix4x4_zero with m
+    Let _00 be proc matrix4x4_set_element with m, 0, 0, f divided by aspect
+    Let _11 be proc matrix4x4_set_element with m, 1, 1, f
+    Let _22 be proc matrix4x4_set_element with m, 2, 2, (far plus near) divided by denom_z
+    Let _23 be proc matrix4x4_set_element with m, 2, 3, ((2.0 multiplied by far) multiplied by near) divided by denom_z
+    Let _32 be proc matrix4x4_set_element with m, 3, 2, 0.0 minus 1.0
+    Return 0
+End Process
+
+Process called "matrix4x4_look_at" takes m as Integer, eye as Integer, target as Integer, up as Integer returns Integer:
+    @Reasoning
+        Right-handed view matrix mapping world space to camera space.
+          f = normalize(target - eye)       (forward)
+          s = normalize(cross(f, up))       (right)
+          u = cross(s, f)                   (up, re-orthogonalized)
+          M = [  s.x  s.y  s.z  -dot(s, eye) ]
+              [  u.x  u.y  u.z  -dot(u, eye) ]
+              [ -f.x -f.y -f.z   dot(f, eye) ]
+              [   0    0    0          1     ]
+    @End Reasoning
+    @Implementation
+        Allocate 3 temporary Vector3s for s, u, f.
+    @End Implementation
+    @Performance_Hints
+        Two crosses + three normalizes + nine multiplies for the
+        translation column.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 on allocation failure.
+    @End Security_Scope
+    Let f be proc vector3_allocate from Vector
+    If f is equal to 0:
+        Return 0 minus 1
+    End If
+    Let s be proc vector3_allocate from Vector
+    If s is equal to 0:
+        Let _fr be proc vector3_free from Vector with f
+        Return 0 minus 1
+    End If
+    Let u be proc vector3_allocate from Vector
+    If u is equal to 0:
+        Let _fr1 be proc vector3_free from Vector with f
+        Let _fr2 be proc vector3_free from Vector with s
+        Return 0 minus 1
+    End If
+    Let raw_f be proc vector3_allocate from Vector
+    Let _sub be proc vector3_sub from Vector with target, eye, raw_f
+    Let _nf be proc vector3_normalize from Vector with raw_f, f
+    Let raw_s be proc vector3_allocate from Vector
+    Let _cr1 be proc vector3_cross from Vector with f, up, raw_s
+    Let _ns be proc vector3_normalize from Vector with raw_s, s
+    Let _cr2 be proc vector3_cross from Vector with s, f, u
+    Let sx be proc vector3_get_x from Vector with s
+    Let sy be proc vector3_get_y from Vector with s
+    Let sz be proc vector3_get_z from Vector with s
+    Let ux be proc vector3_get_x from Vector with u
+    Let uy be proc vector3_get_y from Vector with u
+    Let uz be proc vector3_get_z from Vector with u
+    Let fx be proc vector3_get_x from Vector with f
+    Let fy be proc vector3_get_y from Vector with f
+    Let fz be proc vector3_get_z from Vector with f
+    Let ex be proc vector3_get_x from Vector with eye
+    Let ey be proc vector3_get_y from Vector with eye
+    Let ez be proc vector3_get_z from Vector with eye
+    Let dot_se be ((sx multiplied by ex) plus (sy multiplied by ey)) plus (sz multiplied by ez)
+    Let dot_ue be ((ux multiplied by ex) plus (uy multiplied by ey)) plus (uz multiplied by ez)
+    Let dot_fe be ((fx multiplied by ex) plus (fy multiplied by ey)) plus (fz multiplied by ez)
+    Let _z be proc matrix4x4_zero with m
+    Let _00 be proc matrix4x4_set_element with m, 0, 0, sx
+    Let _01 be proc matrix4x4_set_element with m, 0, 1, sy
+    Let _02 be proc matrix4x4_set_element with m, 0, 2, sz
+    Let _03 be proc matrix4x4_set_element with m, 0, 3, 0.0 minus dot_se
+    Let _10 be proc matrix4x4_set_element with m, 1, 0, ux
+    Let _11 be proc matrix4x4_set_element with m, 1, 1, uy
+    Let _12 be proc matrix4x4_set_element with m, 1, 2, uz
+    Let _13 be proc matrix4x4_set_element with m, 1, 3, 0.0 minus dot_ue
+    Let _20 be proc matrix4x4_set_element with m, 2, 0, 0.0 minus fx
+    Let _21 be proc matrix4x4_set_element with m, 2, 1, 0.0 minus fy
+    Let _22 be proc matrix4x4_set_element with m, 2, 2, 0.0 minus fz
+    Let _23 be proc matrix4x4_set_element with m, 2, 3, dot_fe
+    Let _33 be proc matrix4x4_set_element with m, 3, 3, 1.0
+    Let _fa be proc vector3_free from Vector with f
+    Let _fb be proc vector3_free from Vector with s
+    Let _fc be proc vector3_free from Vector with u
+    Let _fd be proc vector3_free from Vector with raw_f
+    Let _fe be proc vector3_free from Vector with raw_s
+    Return 0
+End Process

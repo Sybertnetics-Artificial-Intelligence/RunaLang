@@ -1,0 +1,383 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+MULTI SET - Bag / Counter Tier 0 Primitive
+
+This file implements a multi-set (a.k.a. "bag" or Python Counter) using
+a chained hash table whose entries store a value and a count. Repeated
+insertion increments the count rather than allocating a new entry.
+
+Entry structure (24 bytes):
+  offset 0:  value (8 bytes)
+  offset 8:  count (8 bytes)
+  offset 16: chain next (8 bytes)
+
+Header (32 bytes):
+  offset 0:  buckets pointer
+  offset 8:  capacity
+  offset 16: distinct_count (number of distinct values)
+  offset 24: total_count (sum of all counts)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Let MSET_ENTRY_SIZE be 24
+Let MSET_HEADER_SIZE be 32
+Let MSET_INITIAL_CAPACITY be 16
+
+@Reasoning
+splitmix64 mix on value.
+@End Reasoning
+
+@Implementation
+Same routine used elsewhere.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-cryptographic.
+@End Security_Scope
+Process called "mset_hash" takes v as Integer returns Integer:
+    Let h be v
+    Set h to h bitwise xor (h shifted right by 33)
+    Set h to h multiplied by 18397679294719823053
+    Set h to h bitwise xor (h shifted right by 33)
+    Set h to h multiplied by 14181476777654086739
+    Set h to h bitwise xor (h shifted right by 33)
+    If h is less than 0:
+        Set h to 0 minus h
+    End If
+    Return h
+End Process
+
+@Reasoning
+Create empty multi-set.
+@End Reasoning
+
+@Implementation
+Allocate header + bucket array.
+@End Implementation
+
+@Performance_Hints
+Time: O(capacity).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "mset_create" returns Integer:
+    Let ms be proc allocate from Layout with MSET_HEADER_SIZE
+    If ms is equal to 0:
+        Return 0
+    End If
+    Let bytes be MSET_INITIAL_CAPACITY multiplied by 8
+    Let buckets be proc allocate from Layout with bytes
+    If buckets is equal to 0:
+        proc deallocate from Layout with ms
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than bytes:
+        proc memory_set_byte from Memory with buckets, zi, 0
+        Set zi to zi plus 1
+    End While
+    proc memory_set_int64 from Memory with ms, 0, buckets
+    proc memory_set_int64 from Memory with ms, 8, MSET_INITIAL_CAPACITY
+    proc memory_set_int64 from Memory with ms, 16, 0
+    proc memory_set_int64 from Memory with ms, 24, 0
+    Return ms
+End Process
+
+@Reasoning
+Free all entries and the multi-set.
+@End Reasoning
+
+@Implementation
+Walk each bucket chain freeing entries, then free buckets + header.
+@End Implementation
+
+@Performance_Hints
+Time: O(n + capacity).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "mset_destroy" takes ms as Integer returns Integer:
+    If ms is equal to 0:
+        Return 0
+    End If
+    Let buckets be proc memory_get_int64 from Memory with ms, 0
+    Let capacity be proc memory_get_int64 from Memory with ms, 8
+    Let i be 0
+    While i is less than capacity:
+        Let head_addr be buckets plus (i multiplied by 8)
+        Let cur be proc memory_get_int64 from Memory with head_addr, 0
+        While cur is not equal to 0:
+            Let nx be proc memory_get_int64 from Memory with cur, 16
+            proc deallocate from Layout with cur
+            Set cur to nx
+        End While
+        Set i to i plus 1
+    End While
+    If buckets is not equal to 0:
+        proc deallocate from Layout with buckets
+    End If
+    proc deallocate from Layout with ms
+    Return 1
+End Process
+
+@Reasoning
+Find entry for value; return entry pointer or 0.
+@End Reasoning
+
+@Implementation
+Hash, walk chain comparing value.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "mset_find" takes ms as Integer, value as Integer returns Integer:
+    Let buckets be proc memory_get_int64 from Memory with ms, 0
+    Let capacity be proc memory_get_int64 from Memory with ms, 8
+    Let mask be capacity minus 1
+    Let h be proc mset_hash with value
+    Let idx be h bitwise and mask
+    Let head_addr be buckets plus (idx multiplied by 8)
+    Let cur be proc memory_get_int64 from Memory with head_addr, 0
+    While cur is not equal to 0:
+        Let v be proc memory_get_int64 from Memory with cur, 0
+        If v is equal to value:
+            Return cur
+        End If
+        Set cur to proc memory_get_int64 from Memory with cur, 16
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Add one occurrence of value. If new, allocate entry and link into
+bucket chain; otherwise increment existing entry's count.
+@End Reasoning
+
+@Implementation
+1) Find existing entry. If found, increment count.
+2) Else allocate new entry with count = 1, link at bucket head,
+   increment distinct_count.
+3) Increment total_count.
+@End Implementation
+
+@Performance_Hints
+Time: amortized O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "mset_add" takes ms as Integer, value as Integer returns Integer:
+    If ms is equal to 0:
+        Return 0
+    End If
+    Let existing be proc mset_find with ms, value
+    If existing is not equal to 0:
+        Let cnt be proc memory_get_int64 from Memory with existing, 8
+        proc memory_set_int64 from Memory with existing, 8, cnt plus 1
+    Otherwise:
+        Let entry be proc allocate from Layout with MSET_ENTRY_SIZE
+        If entry is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with entry, 0, value
+        proc memory_set_int64 from Memory with entry, 8, 1
+        Let buckets be proc memory_get_int64 from Memory with ms, 0
+        Let capacity be proc memory_get_int64 from Memory with ms, 8
+        Let mask be capacity minus 1
+        Let h be proc mset_hash with value
+        Let idx be h bitwise and mask
+        Let head_addr be buckets plus (idx multiplied by 8)
+        Let existing_head be proc memory_get_int64 from Memory with head_addr, 0
+        proc memory_set_int64 from Memory with entry, 16, existing_head
+        proc memory_set_int64 from Memory with head_addr, 0, entry
+        Let dc be proc memory_get_int64 from Memory with ms, 16
+        proc memory_set_int64 from Memory with ms, 16, dc plus 1
+    End If
+    Let tc be proc memory_get_int64 from Memory with ms, 24
+    proc memory_set_int64 from Memory with ms, 24, tc plus 1
+    Return 1
+End Process
+
+@Reasoning
+Return the multiplicity (count) of a value. Zero if absent.
+@End Reasoning
+
+@Implementation
+Find entry; return count field.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "mset_count" takes ms as Integer, value as Integer returns Integer:
+    If ms is equal to 0:
+        Return 0
+    End If
+    Let e be proc mset_find with ms, value
+    If e is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with e, 8
+End Process
+
+@Reasoning
+Remove one occurrence of value. If count reaches 0, unlink and free
+the entry; decrement distinct_count.
+@End Reasoning
+
+@Implementation
+Walk bucket chain. On match: decrement count. If new count is 0,
+unlink entry from chain, free it, decrement distinct_count.
+Decrement total_count.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if absent.
+@End Security_Scope
+Process called "mset_remove" takes ms as Integer, value as Integer returns Integer:
+    If ms is equal to 0:
+        Return 0
+    End If
+    Let buckets be proc memory_get_int64 from Memory with ms, 0
+    Let capacity be proc memory_get_int64 from Memory with ms, 8
+    Let mask be capacity minus 1
+    Let h be proc mset_hash with value
+    Let idx be h bitwise and mask
+    Let head_addr be buckets plus (idx multiplied by 8)
+    Let prev be 0
+    Let cur be proc memory_get_int64 from Memory with head_addr, 0
+    While cur is not equal to 0:
+        Let cv be proc memory_get_int64 from Memory with cur, 0
+        If cv is equal to value:
+            Let cnt be proc memory_get_int64 from Memory with cur, 8
+            Let new_cnt be cnt minus 1
+            proc memory_set_int64 from Memory with cur, 8, new_cnt
+            Let tc be proc memory_get_int64 from Memory with ms, 24
+            proc memory_set_int64 from Memory with ms, 24, tc minus 1
+            If new_cnt is equal to 0:
+                Let nx be proc memory_get_int64 from Memory with cur, 16
+                If prev is equal to 0:
+                    proc memory_set_int64 from Memory with head_addr, 0, nx
+                Otherwise:
+                    proc memory_set_int64 from Memory with prev, 16, nx
+                End If
+                proc deallocate from Layout with cur
+                Let dc be proc memory_get_int64 from Memory with ms, 16
+                proc memory_set_int64 from Memory with ms, 16, dc minus 1
+            End If
+            Return 1
+        End If
+        Set prev to cur
+        Set cur to proc memory_get_int64 from Memory with cur, 16
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Total count (sum of all multiplicities).
+@End Reasoning
+
+@Implementation
+Read total_count at offset 24.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "mset_size" takes ms as Integer returns Integer:
+    If ms is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with ms, 24
+End Process
+
+@Reasoning
+Distinct value count.
+@End Reasoning
+
+@Implementation
+Read distinct_count at offset 16.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "mset_distinct_count" takes ms as Integer returns Integer:
+    If ms is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with ms, 16
+End Process
+
+@Reasoning
+Containment predicate.
+@End Reasoning
+
+@Implementation
+Returns 1 if count > 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) average.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "mset_contains" takes ms as Integer, value as Integer returns Integer:
+    If ms is equal to 0:
+        Return 0
+    End If
+    Let c be proc mset_count with ms, value
+    If c is greater than 0:
+        Return 1
+    End If
+    Return 0
+End Process

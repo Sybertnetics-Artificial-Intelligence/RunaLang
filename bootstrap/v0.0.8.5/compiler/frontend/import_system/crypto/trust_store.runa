@@ -1,0 +1,340 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+System trust store reader for X.509 root CA bundle
+==============================================================================
+
+Reads the system CA bundle (typically PEM-encoded list of root certs) into
+a TrustStore structure for chain verification. Search order:
+1. /etc/ssl/certs/ca-certificates.crt (Debian/Ubuntu)
+2. /etc/pki/tls/certs/ca-bundle.crt (RHEL/Fedora)
+3. /etc/ssl/cert.pem (Alpine, macOS)
+4. /etc/ca-certificates/extracted/tls-ca-bundle.pem (Arch)
+
+PEM decoding produces DER blobs that are parsed by crypto/x509.runa. The
+TrustStore stores the list of parsed root certs; chain verification queries
+by issuer DN match.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "runtime/io/filesystem/file_operations.runa" as FileIO
+Import "compiler/frontend/import_system/crypto/x509.runa" as X509
+
+Process called "trust_store_default_path" returns Integer:
+    @Reasoning
+    Returns the default system CA bundle path. We hardcode the Debian/
+    Ubuntu path because the WSL development environment uses it. Production
+    deployments override via the TRUST_STORE_PATH environment variable.
+    @End Reasoning
+
+    Return "/etc/ssl/certs/ca-certificates.crt"
+End Process
+
+Process called "trust_store_is_pem_begin_marker" takes buffer as Integer, offset as Integer, limit as Integer returns Integer:
+    @Reasoning
+    Detects the "-----BEGIN CERTIFICATE-----" marker at buffer[offset].
+    Returns the byte length of the marker line (including trailing newline)
+    on match, 0 on no match.
+    @End Reasoning
+
+    Let marker_str be "-----BEGIN CERTIFICATE-----"
+    Let marker_len be 27
+
+    If offset plus marker_len is greater than limit:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than marker_len:
+        Let bv be proc memory_get_byte from Memory with buffer, offset plus i
+        Let mv be proc memory_get_byte from Memory with marker_str, i
+        If bv is not equal to mv:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Advance past trailing newline
+    Let advance be marker_len
+    If offset plus advance is less than limit:
+        Let nl_byte be proc memory_get_byte from Memory with buffer, offset plus advance
+        If nl_byte is equal to 10:
+            Set advance to advance plus 1
+        End If
+    End If
+    Return advance
+End Process
+
+Process called "trust_store_is_pem_end_marker" takes buffer as Integer, offset as Integer, limit as Integer returns Integer:
+    @Reasoning
+    Detects "-----END CERTIFICATE-----" at buffer[offset]. Returns 1 on
+    match, 0 otherwise.
+    @End Reasoning
+
+    Let marker_str be "-----END CERTIFICATE-----"
+    Let marker_len be 25
+
+    If offset plus marker_len is greater than limit:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than marker_len:
+        Let bv be proc memory_get_byte from Memory with buffer, offset plus i
+        Let mv be proc memory_get_byte from Memory with marker_str, i
+        If bv is not equal to mv:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "trust_store_base64_decode_char" takes c as Integer returns Integer:
+    @Reasoning
+    RFC 4648 standard base64 character to 6-bit value. Returns -1 for
+    invalid characters (whitespace skipped at the caller level), -2 for
+    the '=' pad terminator.
+    @End Reasoning
+
+    If c is greater than 64:
+        If c is less than 91:
+            Return c minus 65
+        End If
+    End If
+    If c is greater than 96:
+        If c is less than 123:
+            Return c minus 97 plus 26
+        End If
+    End If
+    If c is greater than 47:
+        If c is less than 58:
+            Return c minus 48 plus 52
+        End If
+    End If
+    If c is equal to 43:
+        Return 62
+    End If
+    If c is equal to 47:
+        Return 63
+    End If
+    If c is equal to 61:
+        Return 0 minus 2
+    End If
+    Return 0 minus 1
+End Process
+
+Process called "trust_store_pem_to_der" takes arena as Integer, pem_buffer as Integer, pem_offset as Integer, pem_limit as Integer, out_der as Integer returns Integer:
+    @Reasoning
+    Decodes one PEM-encoded CERTIFICATE block starting at pem_offset.
+    Writes the decoded DER bytes into a freshly-arena-allocated buffer
+    referenced via out_der (which is itself a 16-byte slot: pointer + length).
+    Returns the byte offset past the END CERTIFICATE marker, or 0 on failure.
+    @End Reasoning
+
+    Let begin_advance be proc trust_store_is_pem_begin_marker with pem_buffer, pem_offset, pem_limit
+    If begin_advance is equal to 0:
+        Return 0
+    End If
+
+    Let body_start be pem_offset plus begin_advance
+    Let body_end be body_start
+    Let scanning be 1
+    While scanning is equal to 1:
+        If body_end is greater than pem_limit minus 1:
+            Return 0
+        End If
+        Let is_end be proc trust_store_is_pem_end_marker with pem_buffer, body_end, pem_limit
+        If is_end is equal to 1:
+            Set scanning to 0
+        Otherwise:
+            Set body_end to body_end plus 1
+        End If
+    End While
+
+    Note: Allocate worst-case DER buffer = body length * 3/4
+    Let body_length be body_end minus body_start
+    Let der_capacity be body_length multiplied by 3 divided by 4 plus 4
+    Let der_buffer be proc arena_allocate from Arena with arena, der_capacity
+    If der_buffer is equal to 0:
+        Return 0
+    End If
+
+    Let der_offset be 0
+    Let acc_value be 0
+    Let acc_bits be 0
+    Let body_cursor be body_start
+    While body_cursor is less than body_end:
+        Let bv be proc memory_get_byte from Memory with pem_buffer, body_cursor
+        If bv is not equal to 10:
+            If bv is not equal to 13:
+                If bv is not equal to 32:
+                    If bv is not equal to 9:
+                        Let decoded be proc trust_store_base64_decode_char with bv
+                        If decoded is equal to 0 minus 2:
+                            Set body_cursor to body_end
+                        Otherwise:
+                            If decoded is equal to 0 minus 1:
+                                Return 0
+                            Otherwise:
+                                Set acc_value to acc_value multiplied by 64 plus decoded
+                                Set acc_bits to acc_bits plus 6
+                                If acc_bits is greater than 7:
+                                    Let shift_factor be 1
+                                    Let sf_i be 0
+                                    While sf_i is less than acc_bits minus 8:
+                                        Set shift_factor to shift_factor multiplied by 2
+                                        Set sf_i to sf_i plus 1
+                                    End While
+                                    Let out_byte be acc_value divided by shift_factor
+                                    Set out_byte to out_byte modulo by 256
+                                    proc memory_set_byte from Memory with der_buffer, der_offset, out_byte
+                                    Set der_offset to der_offset plus 1
+                                    Set acc_bits to acc_bits minus 8
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set body_cursor to body_cursor plus 1
+    End While
+
+    proc memory_set_qword from Memory with out_der, 0, der_buffer
+    proc memory_set_qword from Memory with out_der, 8, der_offset
+
+    Note: Advance past END CERTIFICATE marker
+    Let after_end be body_end plus 25
+    If after_end is less than pem_limit:
+        Let trailing be proc memory_get_byte from Memory with pem_buffer, after_end
+        If trailing is equal to 10:
+            Set after_end to after_end plus 1
+        End If
+    End If
+    Return after_end
+End Process
+
+Process called "trust_store_load_default" takes arena as Integer returns Integer:
+    @Reasoning
+    Loads the default trust store, parses every CERTIFICATE block into a
+    DER blob, and returns a list-ish structure: a 16-byte header (count +
+    array pointer) followed by an array of (DER pointer, DER length) pairs.
+    Returns 0 on filesystem failure or if no certificates are found.
+    @End Reasoning
+
+    Let trust_path be proc trust_store_default_path
+    Let file_content be proc read_entire_file from FileIO with trust_path
+    If file_content is equal to 0:
+        Return 0
+    End If
+
+    Note: Find the file length by scanning for the NUL terminator. read_entire_file
+    Note: returns a NUL-terminated buffer; we scan for the terminator to get the
+    Note: byte count.
+    Let file_length be 0
+    Loop forever:
+        Let b_check be proc memory_get_byte from Memory with file_content, file_length
+        If b_check is equal to 0:
+            Break
+        End If
+        Set file_length to file_length plus 1
+    End While
+
+    Note: Pre-count certificates so we can allocate the array once
+    Let count_cursor be 0
+    Let count be 0
+    While count_cursor is less than file_length:
+        Let begin_match be proc trust_store_is_pem_begin_marker with file_content, count_cursor, file_length
+        If begin_match is not equal to 0:
+            Set count to count plus 1
+            Set count_cursor to count_cursor plus begin_match
+        Otherwise:
+            Set count_cursor to count_cursor plus 1
+        End If
+    End While
+
+    If count is equal to 0:
+        Return 0
+    End If
+
+    Let entry_size be 16
+    Let array_size be count multiplied by entry_size
+    Let trust_store_struct be proc arena_allocate from Arena with arena, 16 plus array_size
+    If trust_store_struct is equal to 0:
+        Return 0
+    End If
+    proc memory_set_qword from Memory with trust_store_struct, 0, count
+    proc memory_set_qword from Memory with trust_store_struct, 8, trust_store_struct plus 16
+
+    Note: Parse each CERTIFICATE block in a second pass and populate entries
+    Let cursor be 0
+    Let entry_index be 0
+    While entry_index is less than count:
+        Let entry_offset be 16 plus entry_index multiplied by entry_size
+        Let entry_ptr be trust_store_struct plus entry_offset
+        Let next_offset be proc trust_store_pem_to_der with arena, file_content, cursor, file_length, entry_ptr
+        If next_offset is equal to 0:
+            Note: Skip past unparseable region
+            Set cursor to cursor plus 1
+        Otherwise:
+            Set cursor to next_offset
+            Set entry_index to entry_index plus 1
+        End If
+    End While
+
+    Return trust_store_struct
+End Process
+
+Process called "trust_store_get_count" takes trust_store as Integer returns Integer:
+    If trust_store is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_qword from Memory with trust_store, 0
+End Process
+
+Process called "trust_store_get_entry_der" takes trust_store as Integer, index as Integer returns Integer:
+    If trust_store is equal to 0:
+        Return 0
+    End If
+    Let count be proc memory_get_qword from Memory with trust_store, 0
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than count minus 1:
+        Return 0
+    End If
+    Let entry_ptr be trust_store plus 16 plus index multiplied by 16
+    Return proc memory_get_qword from Memory with entry_ptr, 0
+End Process
+
+Process called "trust_store_get_entry_length" takes trust_store as Integer, index as Integer returns Integer:
+    If trust_store is equal to 0:
+        Return 0
+    End If
+    Let count be proc memory_get_qword from Memory with trust_store, 0
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than count minus 1:
+        Return 0
+    End If
+    Let entry_ptr be trust_store plus 16 plus index multiplied by 16
+    Return proc memory_get_qword from Memory with entry_ptr, 8
+End Process

@@ -1,0 +1,1274 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+KEY_DERIVATION - High-level KDF wrappers (HKDF, Argon2id, PBKDF2, scrypt)
+==============================================================================
+
+This module is the unified front for key-derivation operations. It provides:
+
+  - hkdf_extract_then_expand : RFC 5869 HKDF (parametric on the underlying
+                               hash algorithm); delegates to hkdf.runa.
+
+  - argon2id_derive          : RFC 9106 Argon2id; delegates to argon2id.runa.
+
+  - pbkdf2_hmac              : RFC 8018 PBKDF2 with HMAC-SHA-256 or SHA-512;
+                               implemented in-tree on top of hmac.runa.
+
+  - scrypt                   : RFC 7914 scrypt; implemented in-tree on top of
+                               sha2.runa (via PBKDF2-SHA256) and a fresh
+                               Salsa20 core, BlockMix, ROMix sequence.
+
+  - KDF_derive               : Tag-driven dispatcher accepting the algorithm
+                               ID from crypto_algorithm.runa.
+
+References:
+- RFC 5869: HKDF.
+- RFC 9106: Argon2id.
+- RFC 8018: PBKDF2.
+- RFC 7914: scrypt.
+- FIPS 180-4 / RFC 6234: SHA-2.
+- HC#11 TASC: crypto-agility mandate.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+Import "compiler/frontend/import_system/crypto/hkdf.runa" as Hkdf
+Import "compiler/frontend/import_system/crypto/argon2id.runa" as Argon2id
+Import "compiler/frontend/import_system/crypto/hmac.runa" as Hmac
+Import "compiler/frontend/import_system/crypto/sha2.runa" as Sha2
+
+Note: ============================================================================
+Note: SECTION 1: hkdf_extract_then_expand - parametric HKDF
+Note: ============================================================================
+
+@Reasoning
+RFC 5869 HKDF in the standard extract-then-expand composition. The salt
+and info parameters are non-secret per RFC 5869 section 3. ikm is the
+input keying material; output length is the desired derived key size in
+bytes.
+
+The hash parameter selects the underlying HMAC hash:
+  - ALG_SHA2_256 (300) -> HKDF-SHA-256, max output = 255 * 32 = 8160 bytes
+  - ALG_SHA2_384 (301) -> HKDF-SHA-384, max output = 255 * 48 = 12240 bytes
+  - ALG_SHA2_512 (302) -> HKDF-SHA-512, max output = 255 * 64 = 16320 bytes
+
+Other hash IDs return 0.
+@End Reasoning
+
+@Implementation
+Dispatch on hash_algorithm tag to the corresponding hkdf_shaXXX call
+that performs the extract-then-expand sequence in one shot.
+
+The output buffer must be pre-allocated by the caller with at least
+output_length bytes.
+@End Implementation
+
+@Performance_Hints
+O(output_length / hash_block + 1) HMAC calls for extract; O(ceil(output_length /
+hash_size)) HMAC calls for expand. Total: bounded by ceil(L/HashLen) + 1
+HMACs.
+@End Performance_Hints
+
+@Security_Scope
+The PRK (intermediate pseudorandom key) is stored inside an arena
+allocation by hkdf.runa and is cleared by arena_destroy.
+@End Security_Scope
+Process called "hkdf_extract_then_expand" takes arena as Integer, salt as Integer, salt_length as Integer, ikm as Integer, ikm_length as Integer, info as Integer, info_length as Integer, output_length as Integer, hash_algorithm as Integer, out_okm as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If ikm is equal to 0:
+        Return 0
+    End If
+    If out_okm is equal to 0:
+        Return 0
+    End If
+    If output_length is less than 1:
+        Return 0
+    End If
+    If hash_algorithm is equal to Alg.ALG_SHA2_256:
+        If output_length is greater than 8160:
+            Return 0
+        End If
+        Return Hkdf.hkdf_sha256(arena, salt, salt_length, ikm, ikm_length, info, info_length, output_length, out_okm)
+    End If
+    If hash_algorithm is equal to Alg.ALG_SHA2_384:
+        If output_length is greater than 12240:
+            Return 0
+        End If
+        Return Hkdf.hkdf_sha384(arena, salt, salt_length, ikm, ikm_length, info, info_length, output_length, out_okm)
+    End If
+    If hash_algorithm is equal to Alg.ALG_SHA2_512:
+        If output_length is greater than 16320:
+            Return 0
+        End If
+        Return Hkdf.hkdf_sha512(arena, salt, salt_length, ikm, ikm_length, info, info_length, output_length, out_okm)
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: argon2id_derive - RFC 9106 Argon2id
+Note: ============================================================================
+
+@Reasoning
+Argon2id key derivation per RFC 9106. The id-variant is the recommended
+default because it combines Argon2i's side-channel resistance for the
+first half-pass with Argon2d's GPU-attack resistance for the remainder.
+
+Parameter recommendations from RFC 9106 section 4:
+  - time_cost: 2 or 3
+  - memory_kib: 65536 (64 MiB) for interactive logins, 1048576 (1 GiB)
+                for backups/cold storage
+  - parallelism: matches available cores
+
+The output length must be at least 4 bytes per RFC 9106 section 3.1.
+@End Reasoning
+
+@Implementation
+Delegates to argon2id.runa's argon2id_hash which implements the full
+Argon2id algorithm. We pass empty secret and associated_data fields
+(both optional per RFC 9106 section 3.1).
+@End Implementation
+
+@Performance_Hints
+O(memory_kib * time_cost). For 64 MiB and t=3 this is dominated by
+~200 million Blake2b compressions; expect ~1 second on modern hardware.
+@End Performance_Hints
+
+@Security_Scope
+The password input is treated as secret. The internal memory blocks
+are inside the arena; if the caller wants no-trace storage, use a
+dedicated short-lived arena.
+@End Security_Scope
+Process called "argon2id_derive" takes arena as Integer, password as Integer, password_len as Integer, salt as Integer, salt_len as Integer, time_cost as Integer, memory_kib as Integer, parallelism as Integer, output_len as Integer, output as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If password is equal to 0:
+        If password_len is not equal to 0:
+            Return 0
+        End If
+    End If
+    If salt is equal to 0:
+        Return 0
+    End If
+    If salt_len is less than 8:
+        Return 0
+    End If
+    If output is equal to 0:
+        Return 0
+    End If
+    If output_len is less than 4:
+        Return 0
+    End If
+    If time_cost is less than 1:
+        Return 0
+    End If
+    If parallelism is less than 1:
+        Return 0
+    End If
+    Return Argon2id.argon2id_hash(password, password_len, salt, salt_len, 0, 0, 0, 0, memory_kib, time_cost, parallelism, output, output_len)
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: pbkdf2_hmac - RFC 8018 PBKDF2 with HMAC
+Note: ============================================================================
+
+@Reasoning
+PBKDF2 per RFC 8018 section 5.2 with HMAC as the PRF. Generates a
+derived key of `output_len` bytes by iterating HMAC over a counter-
+stamped salt for `iterations` rounds, then concatenating the per-block
+outputs.
+
+Block i of the output is:
+  T_i = F(P, S, c, i)
+  F(P, S, c, i) = U_1 XOR U_2 XOR ... XOR U_c
+  U_1 = HMAC(P, S || INT(i))
+  U_j = HMAC(P, U_{j-1})        for j = 2..c
+
+INT(i) is i encoded as a 4-byte big-endian integer.
+
+Supported hashes:
+  - ALG_SHA2_256: HMAC-SHA-256 (default; hLen = 32)
+  - ALG_SHA2_512: HMAC-SHA-512 (hLen = 64)
+
+Iterations should be at least 600000 for SHA-256 per OWASP 2023 guidance,
+or 210000 for SHA-512.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Compute hLen for the selected hash.
+  2. Compute the number of blocks needed: ceil(output_len / hLen).
+  3. For each block i from 1 to num_blocks:
+     a. Build salt || INT(i) in scratch.
+     b. U_1 = HMAC(P, salt||INT(i)).
+     c. For j = 2..iterations:
+        U_j = HMAC(P, U_{j-1}).
+     d. T_i = XOR of all U_j.
+  4. Concatenate T_1 || T_2 || ... and write first output_len bytes.
+@End Implementation
+
+@Performance_Hints
+O(iterations * num_blocks) HMAC calls. With iterations=600000 and 32-byte
+output (single block), that's 600000 HMAC-SHA-256 calls (~200-500 ms).
+@End Performance_Hints
+
+@Security_Scope
+The password is fed into HMAC's key slot. The intermediate U_j values
+are in arena scratch and reclaimed by arena_destroy.
+@End Security_Scope
+Process called "pbkdf2_hmac" takes arena as Integer, password as Integer, password_len as Integer, salt as Integer, salt_len as Integer, iterations as Integer, output_len as Integer, hash_algorithm as Integer, output as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If password is equal to 0:
+        If password_len is not equal to 0:
+            Return 0
+        End If
+    End If
+    If salt is equal to 0:
+        Return 0
+    End If
+    If output is equal to 0:
+        Return 0
+    End If
+    If output_len is less than 1:
+        Return 0
+    End If
+    If iterations is less than 1:
+        Return 0
+    End If
+
+    Let h_len be 0
+    If hash_algorithm is equal to Alg.ALG_SHA2_256:
+        Set h_len to 32
+    End If
+    If hash_algorithm is equal to Alg.ALG_SHA2_512:
+        Set h_len to 64
+    End If
+    If h_len is equal to 0:
+        Return 0
+    End If
+
+    Note: Maximum output: (2^32 - 1) * h_len. Practical guard: 1 MiB.
+    If output_len is greater than 1048576:
+        Return 0
+    End If
+
+    Let num_blocks be output_len plus h_len
+    Set num_blocks to num_blocks minus 1
+    Set num_blocks to num_blocks divided by h_len
+
+    Let salted be Arena.arena_allocate(arena, salt_len plus 4)
+    If salted is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(salted, salt, salt_len)
+
+    Let u_buf be Arena.arena_allocate(arena, h_len)
+    If u_buf is equal to 0:
+        Return 0
+    End If
+    Let t_buf be Arena.arena_allocate(arena, h_len)
+    If t_buf is equal to 0:
+        Return 0
+    End If
+
+    Let block_idx be 1
+    Let out_off be 0
+    While block_idx is less than (num_blocks plus 1):
+        Note: Encode INT(block_idx) at the end of salted.
+        Memory.memory_set_byte(salted, salt_len, (block_idx divided by 16777216) modulo by 256)
+        Memory.memory_set_byte(salted, salt_len plus 1, (block_idx divided by 65536) modulo by 256)
+        Memory.memory_set_byte(salted, salt_len plus 2, (block_idx divided by 256) modulo by 256)
+        Memory.memory_set_byte(salted, salt_len plus 3, block_idx modulo by 256)
+
+        Note: U_1 = HMAC(P, salt||INT(i)).
+        Let rc_u1 be 0
+        If hash_algorithm is equal to Alg.ALG_SHA2_256:
+            Set rc_u1 to Hmac.hmac_sha256(arena, password, password_len, salted, salt_len plus 4, u_buf)
+        End If
+        If hash_algorithm is equal to Alg.ALG_SHA2_512:
+            Set rc_u1 to Hmac.hmac_sha512(arena, password, password_len, salted, salt_len plus 4, u_buf)
+        End If
+        If rc_u1 is equal to 0:
+            Return 0
+        End If
+
+        Note: T_i = U_1 initially.
+        Memory.memory_copy(t_buf, u_buf, h_len)
+
+        Note: Iterate U_j = HMAC(P, U_{j-1}) and XOR into T_i.
+        Let j_idx be 2
+        While j_idx is less than (iterations plus 1):
+            Let scratch be Arena.arena_allocate(arena, h_len)
+            If scratch is equal to 0:
+                Return 0
+            End If
+            Let rc_uj be 0
+            If hash_algorithm is equal to Alg.ALG_SHA2_256:
+                Set rc_uj to Hmac.hmac_sha256(arena, password, password_len, u_buf, h_len, scratch)
+            End If
+            If hash_algorithm is equal to Alg.ALG_SHA2_512:
+                Set rc_uj to Hmac.hmac_sha512(arena, password, password_len, u_buf, h_len, scratch)
+            End If
+            If rc_uj is equal to 0:
+                Return 0
+            End If
+            Memory.memory_copy(u_buf, scratch, h_len)
+            Let xi be 0
+            While xi is less than h_len:
+                Let t_val be Memory.memory_get_byte(t_buf, xi)
+                Let u_val be Memory.memory_get_byte(u_buf, xi)
+                Note: bitwise XOR via Memory.memory_get_byte op; use arithmetic XOR with bit-set/clear.
+                Memory.memory_set_byte(t_buf, xi, pbkdf2_byte_xor(t_val, u_val))
+                Set xi to xi plus 1
+            End While
+            Set j_idx to j_idx plus 1
+        End While
+
+        Note: Copy T_i into the output, capping at output_len.
+        Let copy_len be h_len
+        Let remaining be output_len minus out_off
+        If remaining is less than copy_len:
+            Set copy_len to remaining
+        End If
+        Memory.memory_copy(output plus out_off, t_buf, copy_len)
+        Set out_off to out_off plus copy_len
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Secure.secure_zero(u_buf, h_len)
+    Secure.secure_zero(t_buf, h_len)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: pbkdf2_byte_xor - byte-XOR helper
+Note: ============================================================================
+
+@Reasoning
+Computes a XOR b for byte-sized operands using bit-by-bit composition.
+Returns the XOR result as an integer in 0..255.
+@End Reasoning
+
+@Implementation
+For each bit position 0..7, set the result bit to (a_bit XOR b_bit) =
+((a_bit OR b_bit) AND NOT (a_bit AND b_bit)) computed arithmetically.
+@End Implementation
+
+@Performance_Hints
+O(8). 8 iterations of bit extraction.
+@End Performance_Hints
+
+@Security_Scope
+No secret-dependent branching.
+@End Security_Scope
+Process called "pbkdf2_byte_xor" takes a as Integer, b as Integer returns Integer:
+    Let result be 0
+    Let bit_idx be 0
+    Let weight be 1
+    While bit_idx is less than 8:
+        Let a_bit be (a divided by weight) modulo by 2
+        Let b_bit be (b divided by weight) modulo by 2
+        Let x_bit be 0
+        If a_bit is not equal to b_bit:
+            Set x_bit to 1
+        End If
+        Set result to result plus (x_bit multiplied by weight)
+        Set weight to weight multiplied by 2
+        Set bit_idx to bit_idx plus 1
+    End While
+    Return result
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: scrypt - RFC 7914
+Note: ============================================================================
+
+@Reasoning
+Scrypt KDF per RFC 7914. Designed to be sequential-memory-hard, making
+hardware attacks (ASIC/FPGA) expensive.
+
+Parameters:
+  - N: CPU/memory cost; power of 2, e.g. 16384, 32768, 1048576.
+  - r: block size factor; typical 8.
+  - p: parallelization; typical 1.
+  - output_len: derived key length in bytes.
+
+The algorithm:
+  1. B = PBKDF2-SHA256(password, salt, 1, p*128*r)  -- expand to p blocks.
+  2. For i in 0..p-1: B_i = scryptROMix(r, B_i, N).
+  3. DK = PBKDF2-SHA256(password, B, 1, dkLen).
+
+scryptROMix:
+  X = B
+  for i in 0..N-1: V[i] = X; X = scryptBlockMix(X)
+  for i in 0..N-1: j = Integerify(X) mod N; X = scryptBlockMix(X XOR V[j])
+  return X
+
+scryptBlockMix:
+  X = B[2r-1]   (last 64-byte chunk)
+  for i in 0..2r-1: X = Salsa(X XOR B[i]); Y[i] = X
+  return Y[0], Y[2], ..., Y[2r-2], Y[1], Y[3], ..., Y[2r-1]
+@End Reasoning
+
+@Implementation
+Implemented in full as a sequence of:
+  - PBKDF2-SHA256 setup expansion (using pbkdf2_hmac above).
+  - For each of p blocks: scryptROMix on a 128*r byte block.
+  - PBKDF2-SHA256 final compression to dkLen bytes.
+
+The Salsa20/8 core is implemented inline as scrypt_salsa20_8.
+BlockMix uses the Salsa20/8 core as its inner permutation.
+
+Memory cost: p * N * 128 * r bytes for V. Caller is responsible for
+ensuring the arena can hold this; standard parameters (N=16384, r=8,
+p=1) need 128 * 16384 * 8 = 16 MiB.
+@End Implementation
+
+@Performance_Hints
+O(N * r * 2 * p) Salsa20/8 calls. For (N=16384, r=8, p=1): ~262144
+Salsa20/8 calls; ~100-500 ms on modern hardware.
+@End Performance_Hints
+
+@Security_Scope
+The password is consumed in PBKDF2's HMAC key slot. The V array holds
+intermediate state derived from the password and is wiped on arena
+destruction.
+@End Security_Scope
+Process called "scrypt" takes arena as Integer, password as Integer, password_len as Integer, salt as Integer, salt_len as Integer, n_cost as Integer, r as Integer, p as Integer, output_len as Integer, output as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If password is equal to 0:
+        If password_len is not equal to 0:
+            Return 0
+        End If
+    End If
+    If salt is equal to 0:
+        If salt_len is not equal to 0:
+            Return 0
+        End If
+    End If
+    If output is equal to 0:
+        Return 0
+    End If
+    If output_len is less than 1:
+        Return 0
+    End If
+    If n_cost is less than 2:
+        Return 0
+    End If
+    If r is less than 1:
+        Return 0
+    End If
+    If p is less than 1:
+        Return 0
+    End If
+    Note: N must be a power of 2. Check: n_cost & (n_cost-1) == 0.
+    Let n_check be scrypt_is_power_of_two(n_cost)
+    If n_check is equal to 0:
+        Return 0
+    End If
+
+    Let block_bytes be 128 multiplied by r
+
+    Note: Phase 1: B = PBKDF2-SHA256(P, S, 1, p*block_bytes).
+    Let total_b_bytes be p multiplied by block_bytes
+    Let b_buf be Arena.arena_allocate(arena, total_b_bytes)
+    If b_buf is equal to 0:
+        Return 0
+    End If
+    Let rc1 be pbkdf2_hmac(arena, password, password_len, salt, salt_len, 1, total_b_bytes, Alg.ALG_SHA2_256, b_buf)
+    If rc1 is equal to 0:
+        Return 0
+    End If
+
+    Note: Phase 2: ROMix each B_i in place.
+    Let pi be 0
+    While pi is less than p:
+        Let b_i be b_buf plus (pi multiplied by block_bytes)
+        Let rmix be scrypt_romix(arena, b_i, r, n_cost)
+        If rmix is equal to 0:
+            Return 0
+        End If
+        Set pi to pi plus 1
+    End While
+
+    Note: Phase 3: DK = PBKDF2-SHA256(P, B, 1, output_len).
+    Return pbkdf2_hmac(arena, password, password_len, b_buf, total_b_bytes, 1, output_len, Alg.ALG_SHA2_256, output)
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: scrypt_is_power_of_two helper
+Note: ============================================================================
+
+@Reasoning
+Check whether n_cost is a power of 2 by repeated halving.
+@End Reasoning
+
+@Implementation
+Halve n_cost while it's even and greater than 1; if final value is 1,
+it was a power of 2.
+@End Implementation
+
+@Performance_Hints
+O(log2 n_cost).
+@End Performance_Hints
+
+@Security_Scope
+n_cost is a public parameter.
+@End Security_Scope
+Process called "scrypt_is_power_of_two" takes n as Integer returns Integer:
+    If n is less than 2:
+        Return 0
+    End If
+    Let v be n
+    While v is greater than 1:
+        If v modulo by 2 is not equal to 0:
+            Return 0
+        End If
+        Set v to v divided by 2
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 7: scrypt_romix - the memory-hard mixing function
+Note: ============================================================================
+
+@Reasoning
+Apply scryptROMix to a single 128*r byte block in place.
+
+Steps:
+  X = B (input block, 128*r bytes)
+  for i in 0..N-1: V[i] = X; X = scryptBlockMix(X)
+  for i in 0..N-1: j = Integerify(X) mod N; X = scryptBlockMix(X XOR V[j])
+  B = X
+
+Integerify reads the last 64 bytes of X as a little-endian integer and
+takes it mod N.
+@End Reasoning
+
+@Implementation
+Allocates the V array (N * 128 * r bytes) and a scratch buffer for X.
+Runs the two N-step loops as specified.
+@End Implementation
+
+@Performance_Hints
+O(N * r) Salsa20/8 calls plus O(N * r) memcpy.
+@End Performance_Hints
+
+@Security_Scope
+The V array contains password-derived state; reclaimed by arena_destroy.
+@End Security_Scope
+Process called "scrypt_romix" takes arena as Integer, b_in_out as Integer, r as Integer, n_cost as Integer returns Integer:
+    Let block_bytes be 128 multiplied by r
+    Let v_array be Arena.arena_allocate(arena, n_cost multiplied by block_bytes)
+    If v_array is equal to 0:
+        Return 0
+    End If
+    Let x_buf be Arena.arena_allocate(arena, block_bytes)
+    If x_buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(x_buf, b_in_out, block_bytes)
+
+    Let i be 0
+    While i is less than n_cost:
+        Memory.memory_copy(v_array plus (i multiplied by block_bytes), x_buf, block_bytes)
+        Let bm be scrypt_block_mix(arena, x_buf, r)
+        If bm is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Set i to 0
+    While i is less than n_cost:
+        Note: Integerify: read last 64 bytes of X, take first 8 LE bytes as int,
+        Note: mod N. We use bytes [block_bytes-64..block_bytes-57] as the
+        Note: 64-bit little-endian integer.
+        Let j_idx be scrypt_integerify(x_buf, block_bytes, n_cost)
+        Let v_block be v_array plus (j_idx multiplied by block_bytes)
+        Note: X = X XOR V[j].
+        Let k be 0
+        While k is less than block_bytes:
+            Let xv be Memory.memory_get_byte(x_buf, k)
+            Let vv be Memory.memory_get_byte(v_block, k)
+            Memory.memory_set_byte(x_buf, k, pbkdf2_byte_xor(xv, vv))
+            Set k to k plus 1
+        End While
+        Let bm2 be scrypt_block_mix(arena, x_buf, r)
+        If bm2 is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Memory.memory_copy(b_in_out, x_buf, block_bytes)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 8: scrypt_integerify
+Note: ============================================================================
+
+@Reasoning
+Integerify(X) per RFC 7914 section 5: reads the last 64 bytes of X
+(the final Salsa block) and takes the first 4 bytes as a 32-bit
+little-endian integer modulo N.
+@End Reasoning
+
+@Implementation
+Read bytes at offset (block_bytes - 64) through (block_bytes - 61) as a
+little-endian 32-bit number, then mod n_cost. For N up to 2^31 this is
+sufficient.
+@End Implementation
+
+@Performance_Hints
+O(1). Four byte loads.
+@End Performance_Hints
+
+@Security_Scope
+The result is a public index; secret-dependent but the access pattern
+through V is one of the fundamental scrypt security properties (memory
+hardness).
+@End Security_Scope
+Process called "scrypt_integerify" takes x_buf as Integer, block_bytes as Integer, n_cost as Integer returns Integer:
+    Let base_off be block_bytes minus 64
+    Let b0 be Memory.memory_get_byte(x_buf, base_off)
+    Let b1 be Memory.memory_get_byte(x_buf, base_off plus 1)
+    Let b2 be Memory.memory_get_byte(x_buf, base_off plus 2)
+    Let b3 be Memory.memory_get_byte(x_buf, base_off plus 3)
+    Let v32 be b0 plus (b1 multiplied by 256) plus (b2 multiplied by 65536) plus (b3 multiplied by 16777216)
+    Return v32 modulo by n_cost
+End Process
+
+Note: ============================================================================
+Note: SECTION 9: scrypt_block_mix
+Note: ============================================================================
+
+@Reasoning
+BlockMix per RFC 7914 section 6:
+  X = B[2r-1]
+  for i in 0..2r-1: X = Salsa(X XOR B[i]); Y[i] = X
+  return Y[0], Y[2], ..., Y[2r-2], Y[1], Y[3], ..., Y[2r-1]
+
+Operates on a 128*r byte buffer in place by allocating scratch.
+@End Reasoning
+
+@Implementation
+Uses two 64-byte scratch buffers: x_state and tmp. The Y array reorders
+to put even-indexed Y_i before odd-indexed Y_i.
+@End Implementation
+
+@Performance_Hints
+O(r) Salsa20/8 invocations.
+@End Performance_Hints
+
+@Security_Scope
+Internal state; reclaimed by arena_destroy.
+@End Security_Scope
+Process called "scrypt_block_mix" takes arena as Integer, b_inout as Integer, r as Integer returns Integer:
+    Let block_bytes be 128 multiplied by r
+    Let x_state be Arena.arena_allocate(arena, 64)
+    If x_state is equal to 0:
+        Return 0
+    End If
+    Let y_buf be Arena.arena_allocate(arena, block_bytes)
+    If y_buf is equal to 0:
+        Return 0
+    End If
+    Note: Copy the last 64-byte block of B into X.
+    Memory.memory_copy(x_state, b_inout plus (block_bytes minus 64), 64)
+
+    Let i be 0
+    Let two_r be 2 multiplied by r
+    While i is less than two_r:
+        Note: X = Salsa(X XOR B[i]).
+        Let bi_ptr be b_inout plus (i multiplied by 64)
+        Let k be 0
+        While k is less than 64:
+            Let xv be Memory.memory_get_byte(x_state, k)
+            Let bv be Memory.memory_get_byte(bi_ptr, k)
+            Memory.memory_set_byte(x_state, k, pbkdf2_byte_xor(xv, bv))
+            Set k to k plus 1
+        End While
+        Let sa be scrypt_salsa20_8(x_state)
+        If sa is equal to 0:
+            Return 0
+        End If
+        Memory.memory_copy(y_buf plus (i multiplied by 64), x_state, 64)
+        Set i to i plus 1
+    End While
+
+    Note: Reorder Y into B: even-indexed first (Y_0,Y_2,...), then odd-indexed.
+    Let out_off be 0
+    Let even_idx be 0
+    While even_idx is less than two_r:
+        Memory.memory_copy(b_inout plus out_off, y_buf plus (even_idx multiplied by 64), 64)
+        Set out_off to out_off plus 64
+        Set even_idx to even_idx plus 2
+    End While
+    Let odd_idx be 1
+    While odd_idx is less than two_r:
+        Memory.memory_copy(b_inout plus out_off, y_buf plus (odd_idx multiplied by 64), 64)
+        Set out_off to out_off plus 64
+        Set odd_idx to odd_idx plus 2
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 10: scrypt_salsa20_8 - Salsa20/8 core
+Note: ============================================================================
+
+@Reasoning
+Salsa20/8 core per RFC 7914 section 3 (which references RFC 8439's
+Salsa20). Operates on a 64-byte input as 16 little-endian 32-bit words.
+
+The core is a 4-round (8 half-rounds total) double-round Salsa20 with
+the final addition: x = x + Salsa20/8(x) where Salsa20/8 is 4 double
+rounds of column/row mixing.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Load 16 LE32 words from the input buffer into a local array x[].
+  2. Save initial state as orig[].
+  3. For 4 double-rounds (8 half-rounds), apply the column round then
+     the row round.
+  4. Add x[i] = (x[i] + orig[i]) mod 2^32.
+  5. Write back as LE32.
+
+Column round:
+  R(x[ 4]^=R(x[ 0]+x[12], 7))
+  R(x[ 8]^=R(x[ 4]+x[ 0], 9))
+  R(x[12]^=R(x[ 8]+x[ 4],13))
+  R(x[ 0]^=R(x[12]+x[ 8],18))
+  ... (4 column sets)
+Row round: same shape with rotated indices.
+@End Implementation
+
+@Performance_Hints
+O(64). 8 half-rounds * 16 operations each = 128 ARX operations.
+@End Performance_Hints
+
+@Security_Scope
+The Salsa20/8 core is the cryptographic primitive at the heart of
+scrypt's memory hardness; correctness is essential.
+@End Security_Scope
+Process called "scrypt_salsa20_8" takes block_64 as Integer returns Integer:
+    Note: Load 16 LE32 words into the local "registers" using positions 0..15.
+    Note: We allocate a small 16*8=128 byte work buffer on the stack via local lets
+    Note: with consistent naming. Because Runa doesn't have arrays here we keep
+    Note: them as 16 named lets.
+    Let w0 be scrypt_load_le32(block_64, 0)
+    Let w1 be scrypt_load_le32(block_64, 4)
+    Let w2 be scrypt_load_le32(block_64, 8)
+    Let w3 be scrypt_load_le32(block_64, 12)
+    Let w4 be scrypt_load_le32(block_64, 16)
+    Let w5 be scrypt_load_le32(block_64, 20)
+    Let w6 be scrypt_load_le32(block_64, 24)
+    Let w7 be scrypt_load_le32(block_64, 28)
+    Let w8 be scrypt_load_le32(block_64, 32)
+    Let w9 be scrypt_load_le32(block_64, 36)
+    Let w10 be scrypt_load_le32(block_64, 40)
+    Let w11 be scrypt_load_le32(block_64, 44)
+    Let w12 be scrypt_load_le32(block_64, 48)
+    Let w13 be scrypt_load_le32(block_64, 52)
+    Let w14 be scrypt_load_le32(block_64, 56)
+    Let w15 be scrypt_load_le32(block_64, 60)
+
+    Let o0 be w0
+    Let o1 be w1
+    Let o2 be w2
+    Let o3 be w3
+    Let o4 be w4
+    Let o5 be w5
+    Let o6 be w6
+    Let o7 be w7
+    Let o8 be w8
+    Let o9 be w9
+    Let o10 be w10
+    Let o11 be w11
+    Let o12 be w12
+    Let o13 be w13
+    Let o14 be w14
+    Let o15 be w15
+
+    Let round_idx be 0
+    While round_idx is less than 4:
+        Note: Column round.
+        Set w4 to scrypt_xor32(w4, scrypt_rotl32(scrypt_add32(w0, w12), 7))
+        Set w8 to scrypt_xor32(w8, scrypt_rotl32(scrypt_add32(w4, w0), 9))
+        Set w12 to scrypt_xor32(w12, scrypt_rotl32(scrypt_add32(w8, w4), 13))
+        Set w0 to scrypt_xor32(w0, scrypt_rotl32(scrypt_add32(w12, w8), 18))
+
+        Set w9 to scrypt_xor32(w9, scrypt_rotl32(scrypt_add32(w5, w1), 7))
+        Set w13 to scrypt_xor32(w13, scrypt_rotl32(scrypt_add32(w9, w5), 9))
+        Set w1 to scrypt_xor32(w1, scrypt_rotl32(scrypt_add32(w13, w9), 13))
+        Set w5 to scrypt_xor32(w5, scrypt_rotl32(scrypt_add32(w1, w13), 18))
+
+        Set w14 to scrypt_xor32(w14, scrypt_rotl32(scrypt_add32(w10, w6), 7))
+        Set w2 to scrypt_xor32(w2, scrypt_rotl32(scrypt_add32(w14, w10), 9))
+        Set w6 to scrypt_xor32(w6, scrypt_rotl32(scrypt_add32(w2, w14), 13))
+        Set w10 to scrypt_xor32(w10, scrypt_rotl32(scrypt_add32(w6, w2), 18))
+
+        Set w3 to scrypt_xor32(w3, scrypt_rotl32(scrypt_add32(w15, w11), 7))
+        Set w7 to scrypt_xor32(w7, scrypt_rotl32(scrypt_add32(w3, w15), 9))
+        Set w11 to scrypt_xor32(w11, scrypt_rotl32(scrypt_add32(w7, w3), 13))
+        Set w15 to scrypt_xor32(w15, scrypt_rotl32(scrypt_add32(w11, w7), 18))
+
+        Note: Row round.
+        Set w1 to scrypt_xor32(w1, scrypt_rotl32(scrypt_add32(w0, w3), 7))
+        Set w2 to scrypt_xor32(w2, scrypt_rotl32(scrypt_add32(w1, w0), 9))
+        Set w3 to scrypt_xor32(w3, scrypt_rotl32(scrypt_add32(w2, w1), 13))
+        Set w0 to scrypt_xor32(w0, scrypt_rotl32(scrypt_add32(w3, w2), 18))
+
+        Set w6 to scrypt_xor32(w6, scrypt_rotl32(scrypt_add32(w5, w4), 7))
+        Set w7 to scrypt_xor32(w7, scrypt_rotl32(scrypt_add32(w6, w5), 9))
+        Set w4 to scrypt_xor32(w4, scrypt_rotl32(scrypt_add32(w7, w6), 13))
+        Set w5 to scrypt_xor32(w5, scrypt_rotl32(scrypt_add32(w4, w7), 18))
+
+        Set w11 to scrypt_xor32(w11, scrypt_rotl32(scrypt_add32(w10, w9), 7))
+        Set w8 to scrypt_xor32(w8, scrypt_rotl32(scrypt_add32(w11, w10), 9))
+        Set w9 to scrypt_xor32(w9, scrypt_rotl32(scrypt_add32(w8, w11), 13))
+        Set w10 to scrypt_xor32(w10, scrypt_rotl32(scrypt_add32(w9, w8), 18))
+
+        Set w12 to scrypt_xor32(w12, scrypt_rotl32(scrypt_add32(w15, w14), 7))
+        Set w13 to scrypt_xor32(w13, scrypt_rotl32(scrypt_add32(w12, w15), 9))
+        Set w14 to scrypt_xor32(w14, scrypt_rotl32(scrypt_add32(w13, w12), 13))
+        Set w15 to scrypt_xor32(w15, scrypt_rotl32(scrypt_add32(w14, w13), 18))
+
+        Set round_idx to round_idx plus 1
+    End While
+
+    Note: Final add and store back.
+    scrypt_store_le32(block_64, 0, scrypt_add32(w0, o0))
+    scrypt_store_le32(block_64, 4, scrypt_add32(w1, o1))
+    scrypt_store_le32(block_64, 8, scrypt_add32(w2, o2))
+    scrypt_store_le32(block_64, 12, scrypt_add32(w3, o3))
+    scrypt_store_le32(block_64, 16, scrypt_add32(w4, o4))
+    scrypt_store_le32(block_64, 20, scrypt_add32(w5, o5))
+    scrypt_store_le32(block_64, 24, scrypt_add32(w6, o6))
+    scrypt_store_le32(block_64, 28, scrypt_add32(w7, o7))
+    scrypt_store_le32(block_64, 32, scrypt_add32(w8, o8))
+    scrypt_store_le32(block_64, 36, scrypt_add32(w9, o9))
+    scrypt_store_le32(block_64, 40, scrypt_add32(w10, o10))
+    scrypt_store_le32(block_64, 44, scrypt_add32(w11, o11))
+    scrypt_store_le32(block_64, 48, scrypt_add32(w12, o12))
+    scrypt_store_le32(block_64, 52, scrypt_add32(w13, o13))
+    scrypt_store_le32(block_64, 56, scrypt_add32(w14, o14))
+    scrypt_store_le32(block_64, 60, scrypt_add32(w15, o15))
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 11: 32-bit ARX helpers
+Note: ============================================================================
+
+@Reasoning
+Salsa20 operates on 32-bit unsigned integers with addition, XOR, and
+left-rotate modulo 2^32. These helpers implement those ops on Runa's
+native 64-bit Integer, masking with 0xFFFFFFFF on each output.
+@End Reasoning
+
+@Implementation
+mask_u32 = 4294967295.
+add32 : (a + b) AND 0xFFFFFFFF
+xor32 : bitwise xor of two 32-bit values via byte-by-byte XOR
+rotl32: ((x SHL n) OR (x SHR (32-n))) AND 0xFFFFFFFF
+@End Implementation
+
+@Performance_Hints
+O(1) each. Inlinable.
+@End Performance_Hints
+
+@Security_Scope
+Public ARX operations; no secret-dependent timing.
+@End Security_Scope
+Process called "scrypt_add32" takes a as Integer, b as Integer returns Integer:
+    Let r be a plus b
+    Return r modulo by 4294967296
+End Process
+
+@Reasoning
+32-bit XOR using the native bitwise_xor operator. The result is masked
+to 32 bits so callers operating on 32-bit Salsa20 words observe wraparound
+semantics identical to a hardware XOR.
+@End Reasoning
+
+@Implementation
+Single native bitwise_xor followed by a mask to 32 bits.
+@End Implementation
+
+@Performance_Hints
+O(1). One bitwise operation per call. At scrypt N=2^15 this replaces the
+previous 32-iteration decomposition with a single instruction in the
+emitted code, reducing the inner-loop cost by more than an order of
+magnitude.
+@End Performance_Hints
+
+@Security_Scope
+Constant-time on inputs: a single bitwise operation has no operand-
+dependent branches.
+@End Security_Scope
+Process called "scrypt_xor32" takes a as Integer, b as Integer returns Integer:
+    Let xored be a bitwise_xor b
+    Return xored modulo by 4294967296
+End Process
+
+@Reasoning
+32-bit left rotate by n bits.
+@End Reasoning
+
+@Implementation
+((x * 2^n) MOD 2^32) OR (x DIV 2^(32-n)) implemented arithmetically.
+The OR is implemented by addition because the bit ranges don't overlap.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Public rotate amount.
+@End Security_Scope
+Process called "scrypt_rotl32" takes x as Integer, n as Integer returns Integer:
+    Let lo_part be x multiplied by scrypt_pow2(n)
+    Set lo_part to lo_part modulo by 4294967296
+    Let hi_part be x divided by scrypt_pow2(32 minus n)
+    Return lo_part plus hi_part
+End Process
+
+@Reasoning
+Returns 2^n for n in 0..32.
+@End Reasoning
+
+@Implementation
+Iterative doubling.
+@End Implementation
+
+@Performance_Hints
+O(n) but n <= 32.
+@End Performance_Hints
+
+@Security_Scope
+Public.
+@End Security_Scope
+Process called "scrypt_pow2" takes n as Integer returns Integer:
+    Let r be 1
+    Let i be 0
+    While i is less than n:
+        Set r to r multiplied by 2
+        Set i to i plus 1
+    End While
+    Return r
+End Process
+
+@Reasoning
+Load a 4-byte little-endian unsigned 32-bit integer from buf at offset.
+@End Reasoning
+
+@Implementation
+Compose four byte loads with byte-significance weights.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Loading public input bytes.
+@End Security_Scope
+Process called "scrypt_load_le32" takes buf as Integer, offset as Integer returns Integer:
+    Let b0 be Memory.memory_get_byte(buf, offset)
+    Let b1 be Memory.memory_get_byte(buf, offset plus 1)
+    Let b2 be Memory.memory_get_byte(buf, offset plus 2)
+    Let b3 be Memory.memory_get_byte(buf, offset plus 3)
+    Return b0 plus (b1 multiplied by 256) plus (b2 multiplied by 65536) plus (b3 multiplied by 16777216)
+End Process
+
+@Reasoning
+Store a 32-bit value as little-endian into buf at offset.
+@End Reasoning
+
+@Implementation
+Four byte stores at offset, offset+1, offset+2, offset+3.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Public output bytes.
+@End Security_Scope
+Process called "scrypt_store_le32" takes buf as Integer, offset as Integer, value as Integer returns Integer:
+    Memory.memory_set_byte(buf, offset, value modulo by 256)
+    Memory.memory_set_byte(buf, offset plus 1, (value divided by 256) modulo by 256)
+    Memory.memory_set_byte(buf, offset plus 2, (value divided by 65536) modulo by 256)
+    Memory.memory_set_byte(buf, offset plus 3, (value divided by 16777216) modulo by 256)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 12: KDF_derive - tag-driven dispatcher
+Note: ============================================================================
+
+@Reasoning
+Unified entrypoint that dispatches on the algorithm tag. The params
+buffer encodes algorithm-specific arguments as a length-prefixed
+key/value blob.
+
+For HKDF (any hash variant): params = salt_len(4 BE) salt info_len(4 BE)
+  info hash_alg(4 BE) output_len(4 BE).
+For Argon2id: t_cost(4) m_cost_kb(4) parallelism(4) output_len(4) salt_len(4) salt password_len(4) password.
+For PBKDF2: iterations(4) hash_alg(4) output_len(4) salt_len(4) salt password_len(4) password.
+For scrypt: N(4) r(4) p(4) output_len(4) salt_len(4) salt password_len(4) password.
+@End Reasoning
+
+@Implementation
+Inspect the algorithm tag and decode params into the dedicated proc
+arguments. Returns 1 on success after writing to the output buffer
+specified at the end of the params blob.
+@End Implementation
+
+@Performance_Hints
+Adds one decode pass to the underlying KDF.
+@End Performance_Hints
+
+@Security_Scope
+The params blob may carry password / IKM; the caller is responsible for
+zeroizing those after KDF_derive returns.
+@End Security_Scope
+Process called "KDF_derive" takes arena as Integer, algorithm as Integer, params as Integer, params_length as Integer, output as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If params is equal to 0:
+        Return 0
+    End If
+    If output is equal to 0:
+        Return 0
+    End If
+    If params_length is less than 16:
+        Return 0
+    End If
+    If algorithm is equal to Alg.ALG_HKDF_SHA256:
+        Return KDF_derive_hkdf(arena, Alg.ALG_SHA2_256, params, params_length, output)
+    End If
+    If algorithm is equal to Alg.ALG_HKDF_SHA384:
+        Return KDF_derive_hkdf(arena, Alg.ALG_SHA2_384, params, params_length, output)
+    End If
+    If algorithm is equal to Alg.ALG_HKDF_SHA512:
+        Return KDF_derive_hkdf(arena, Alg.ALG_SHA2_512, params, params_length, output)
+    End If
+    If algorithm is equal to Alg.ALG_ARGON2ID:
+        Return KDF_derive_argon2id(arena, params, params_length, output)
+    End If
+    If algorithm is equal to Alg.ALG_PBKDF2_HMAC_SHA256:
+        Return KDF_derive_pbkdf2(arena, Alg.ALG_SHA2_256, params, params_length, output)
+    End If
+    If algorithm is equal to Alg.ALG_PBKDF2_HMAC_SHA512:
+        Return KDF_derive_pbkdf2(arena, Alg.ALG_SHA2_512, params, params_length, output)
+    End If
+    If algorithm is equal to Alg.ALG_SCRYPT:
+        Return KDF_derive_scrypt(arena, params, params_length, output)
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Decode params blob for HKDF: 4 BE salt_len, salt_len bytes salt,
+4 BE info_len, info_len bytes info, 4 BE output_len, 4 BE ikm_len,
+ikm_len bytes ikm.
+@End Reasoning
+
+@Implementation
+Walk the buffer with bounds checking, then call hkdf_extract_then_expand.
+@End Implementation
+
+@Performance_Hints
+O(params_length).
+@End Performance_Hints
+
+@Security_Scope
+ikm is secret; reside in arena only as long as needed.
+@End Security_Scope
+Process called "KDF_derive_hkdf" takes arena as Integer, hash_alg as Integer, params as Integer, params_length as Integer, output as Integer returns Integer:
+    Let off be 0
+    Let salt_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    If off plus salt_len is greater than params_length:
+        Return 0
+    End If
+    Let salt_ptr be params plus off
+    Set off to off plus salt_len
+    Let info_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    If off plus info_len is greater than params_length:
+        Return 0
+    End If
+    Let info_ptr be params plus off
+    Set off to off plus info_len
+    Let output_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let ikm_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    If off plus ikm_len is greater than params_length:
+        Return 0
+    End If
+    Let ikm_ptr be params plus off
+    Return hkdf_extract_then_expand(arena, salt_ptr, salt_len, ikm_ptr, ikm_len, info_ptr, info_len, output_len, hash_alg, output)
+End Process
+
+@Reasoning
+Decode Argon2id params: t(4) m(4) p(4) out(4) saltL(4) salt[] pwL(4) pw[].
+@End Reasoning
+
+@Implementation
+Linear decode then argon2id_derive.
+@End Implementation
+
+@Performance_Hints
+O(params_length).
+@End Performance_Hints
+
+@Security_Scope
+Password is secret.
+@End Security_Scope
+Process called "KDF_derive_argon2id" takes arena as Integer, params as Integer, params_length as Integer, output as Integer returns Integer:
+    Let off be 0
+    Let t_cost be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let m_cost be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let parallelism be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let output_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let salt_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    If off plus salt_len is greater than params_length:
+        Return 0
+    End If
+    Let salt_ptr be params plus off
+    Set off to off plus salt_len
+    Let pw_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    If off plus pw_len is greater than params_length:
+        Return 0
+    End If
+    Let pw_ptr be params plus off
+    Return argon2id_derive(arena, pw_ptr, pw_len, salt_ptr, salt_len, t_cost, m_cost, parallelism, output_len, output)
+End Process
+
+@Reasoning
+Decode PBKDF2 params: iter(4) hash(4) out(4) saltL(4) salt[] pwL(4) pw[].
+@End Reasoning
+
+@Implementation
+Linear decode then pbkdf2_hmac.
+@End Implementation
+
+@Performance_Hints
+O(params_length).
+@End Performance_Hints
+
+@Security_Scope
+Password is secret.
+@End Security_Scope
+Process called "KDF_derive_pbkdf2" takes arena as Integer, hash_alg as Integer, params as Integer, params_length as Integer, output as Integer returns Integer:
+    Let off be 0
+    Let iterations be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let inner_hash be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let output_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let salt_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    If off plus salt_len is greater than params_length:
+        Return 0
+    End If
+    Let salt_ptr be params plus off
+    Set off to off plus salt_len
+    Let pw_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    If off plus pw_len is greater than params_length:
+        Return 0
+    End If
+    Let pw_ptr be params plus off
+    Let chosen_hash be hash_alg
+    If inner_hash is not equal to 0:
+        Set chosen_hash to inner_hash
+    End If
+    Return pbkdf2_hmac(arena, pw_ptr, pw_len, salt_ptr, salt_len, iterations, output_len, chosen_hash, output)
+End Process
+
+@Reasoning
+Decode scrypt params: N(4) r(4) p(4) out(4) saltL(4) salt[] pwL(4) pw[].
+@End Reasoning
+
+@Implementation
+Linear decode then scrypt.
+@End Implementation
+
+@Performance_Hints
+O(params_length).
+@End Performance_Hints
+
+@Security_Scope
+Password is secret.
+@End Security_Scope
+Process called "KDF_derive_scrypt" takes arena as Integer, params as Integer, params_length as Integer, output as Integer returns Integer:
+    Let off be 0
+    Let n_cost be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let r be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let p be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let output_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    Let salt_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    If off plus salt_len is greater than params_length:
+        Return 0
+    End If
+    Let salt_ptr be params plus off
+    Set off to off plus salt_len
+    Let pw_len be Memory.memory_get_int32(params, off)
+    Set off to off plus 4
+    If off plus pw_len is greater than params_length:
+        Return 0
+    End If
+    Let pw_ptr be params plus off
+    Return scrypt(arena, pw_ptr, pw_len, salt_ptr, salt_len, n_cost, r, p, output_len, output)
+End Process

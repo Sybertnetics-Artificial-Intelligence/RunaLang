@@ -1,0 +1,2072 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+SIGNATURE - Algorithm-tagged digital signature value
+==============================================================================
+
+A Signature carries:
+  - the signature algorithm tag
+  - the raw signature bytes
+  - the byte length
+
+Construction validates the byte length against the algorithm's expected
+size. signature_verify routes to the correct verify proc per algorithm and
+ALWAYS rejects when the signature algorithm and public-key algorithm differ.
+This is THE primitive that prevents cross-algorithm signature confusion
+attacks at the API surface.
+
+Memory layout (32 bytes):
+  offset  0 : algorithm tag         (8 bytes)
+  offset  8 : signature_bytes ptr   (8 bytes)
+  offset 16 : signature_bytes len   (8 bytes)
+  offset 24 : flags                 (8 bytes; reserved)
+
+Encoding notes:
+  - Ed25519/Ed448 use raw R||S concatenation per RFC 8032.
+  - ECDSA stores raw r||s by convention here (DER framing is an explicit
+    second encoding via signature_to_der / signature_from_der).
+  - RSA-PSS / RSA-PKCS1v15 are raw modulus-length signatures.
+  - ML-DSA / SLH-DSA / FALCON are their packed-encoded byte forms per
+    the respective FIPS / NIST PQC spec.
+
+References:
+- RFC 8032: Ed25519 / Ed448.
+- FIPS 186-5: ECDSA.
+- RFC 8017: RSASSA-PSS / RSASSA-PKCS1-v1_5.
+- FIPS 204: ML-DSA signature encoding.
+- FIPS 205: SLH-DSA signature encoding.
+- FALCON round-3 spec: compressed signature format.
+- ANSI X9.62 / RFC 5480: ECDSA DER encoding.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/bytes.runa" as BytesP
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "compiler/frontend/primitives/crypto_identity/public_key.runa" as PK
+Import "compiler/frontend/primitives/crypto_identity/private_key.runa" as SK
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+Import "compiler/frontend/import_system/crypto/ed25519.runa" as Ed25519
+Import "compiler/frontend/import_system/crypto/ed448.runa" as Ed448
+Import "compiler/frontend/import_system/crypto/ecdsa.runa" as Ecdsa
+Import "compiler/frontend/import_system/crypto/rsa.runa" as Rsa
+Import "compiler/frontend/import_system/crypto/pq/ml_dsa.runa" as MlDsa
+Import "compiler/frontend/import_system/crypto/pq/slh_dsa.runa" as SlhDsa
+Import "compiler/frontend/import_system/crypto/pq/falcon.runa" as Falcon
+Import "compiler/frontend/import_system/crypto/asn1_der.runa" as Asn1Der
+
+Let SIGNATURE_STRUCT_SIZE be 32
+Let SIGNATURE_OFF_ALGORITHM be 0
+Let SIGNATURE_OFF_BYTES_PTR be 8
+Let SIGNATURE_OFF_BYTES_LEN be 16
+Let SIGNATURE_OFF_FLAGS be 24
+
+Note: ============================================================================
+Note: SECTION 1: Construction
+Note: ============================================================================
+
+@Reasoning
+Construct a Signature from algorithm tag and signature bytes. Validates
+that the algorithm is a signature scheme (range 100..199) and that the
+byte length matches the algorithm's published signature size (with the
+FALCON special-case that allows lengths up to the maximum but no more).
+
+Length validation here closes one of the cross-algorithm confusion
+attack paths: a 64-byte buffer with the WRONG algorithm tag will be
+caught here (because ECDSA-P256 raw size is 64 but Ed25519 size is also
+64, the algorithm tag is the only distinguisher; refusing a tag-length
+mismatch removes one degree of freedom from an attacker).
+
+For variable-length signatures (FALCON), the construction permits any
+length up to the algorithm's maximum.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena, signature_bytes_in, length, algorithm.
+  2. Check algorithm tag is a signature scheme.
+  3. Compute expected_len = algorithm_signature_byte_length(algorithm).
+  4. For non-FALCON: require bytes_length == expected_len exactly.
+  5. For FALCON_512: require 1 <= bytes_length <= 752.
+     For FALCON_1024: require 1 <= bytes_length <= 1462.
+  6. Allocate struct + buffer, copy bytes, store fields.
+@End Implementation
+
+@Performance_Hints
+O(n) due to byte copy.
+@End Performance_Hints
+
+@Security_Scope
+Signature bytes are not secret. Length validation here is a cheap but
+critical filter against cross-algorithm confusion.
+
+References:
+- HC#11 TASC: algorithm-tagged crypto material.
+@End Security_Scope
+Process called "signature_create" takes arena as Integer, algorithm as Integer, bytes_in as Integer, bytes_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If bytes_in is equal to 0:
+        Return 0
+    End If
+    If bytes_length is less than 1:
+        Return 0
+    End If
+
+    If Alg.algorithm_is_signature(algorithm) is equal to 0:
+        Return 0
+    End If
+
+    Let expected be Alg.algorithm_signature_byte_length(algorithm)
+    If algorithm is equal to Alg.ALG_FALCON_512:
+        If bytes_length is greater than 752:
+            Return 0
+        End If
+    Otherwise:
+        If algorithm is equal to Alg.ALG_FALCON_1024:
+            If bytes_length is greater than 1462:
+                Return 0
+            End If
+        Otherwise:
+            If expected is equal to 0:
+                Return 0
+            End If
+            If bytes_length is not equal to expected:
+                Return 0
+            End If
+        End If
+    End If
+
+    Let sig be Arena.arena_allocate(arena, SIGNATURE_STRUCT_SIZE)
+    If sig is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than SIGNATURE_STRUCT_SIZE:
+        Memory.memory_set_byte(sig, zi, 0)
+        Set zi to zi plus 1
+    End While
+    Let buf be Arena.arena_allocate(arena, bytes_length)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(buf, bytes_in, bytes_length)
+    Memory.memory_set_qword(sig, SIGNATURE_OFF_ALGORITHM, algorithm)
+    Memory.memory_set_qword(sig, SIGNATURE_OFF_BYTES_PTR, buf)
+    Memory.memory_set_qword(sig, SIGNATURE_OFF_BYTES_LEN, bytes_length)
+    Memory.memory_set_qword(sig, SIGNATURE_OFF_FLAGS, 0)
+    Return sig
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Accessors
+Note: ============================================================================
+
+@Reasoning
+Returns the algorithm tag.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "signature_algorithm" takes sig as Integer returns Integer:
+    If sig is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(sig, SIGNATURE_OFF_ALGORITHM)
+End Process
+
+@Reasoning
+Returns the signature byte pointer.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 8.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret. Pointer is arena-owned.
+@End Security_Scope
+Process called "signature_bytes" takes sig as Integer returns Integer:
+    If sig is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(sig, SIGNATURE_OFF_BYTES_PTR)
+End Process
+
+@Reasoning
+Returns the signature byte length.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 16.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "signature_byte_length" takes sig as Integer returns Integer:
+    If sig is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(sig, SIGNATURE_OFF_BYTES_LEN)
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Encoding (hex / base64)
+Note: ============================================================================
+
+@Reasoning
+Hex-encode the signature bytes.
+@End Reasoning
+
+@Implementation
+Wraps in a transient Bytes header and calls bytes_to_hex_string.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret.
+@End Security_Scope
+Process called "signature_to_hex_string" takes sig as Integer returns Integer:
+    If sig is equal to 0:
+        Return 0
+    End If
+    Let buf be signature_bytes(sig)
+    Let len be signature_byte_length(sig)
+    Let b be BytesP.bytes_from_array(buf, len)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let hex be BytesP.bytes_to_hex_string(b)
+    BytesP.bytes_destroy(b)
+    Return hex
+End Process
+
+@Reasoning
+Base64-encode the signature bytes.
+@End Reasoning
+
+@Implementation
+Wraps in a transient Bytes header and calls bytes_to_base64.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret.
+@End Security_Scope
+Process called "signature_to_base64" takes sig as Integer returns Integer:
+    If sig is equal to 0:
+        Return 0
+    End If
+    Let buf be signature_bytes(sig)
+    Let len be signature_byte_length(sig)
+    Let b be BytesP.bytes_from_array(buf, len)
+    If b is equal to 0:
+        Return 0
+    End If
+    Let b64 be BytesP.bytes_to_base64(b)
+    BytesP.bytes_destroy(b)
+    Return b64
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Verify (the central type-safe dispatcher)
+Note: ============================================================================
+
+@Reasoning
+Verify the signature against the message under the supplied public key.
+Returns 1 if the signature is valid, 0 otherwise.
+
+This is the CENTRAL primitive that enforces algorithm-tag matching: if
+the PublicKey algorithm differs from the Signature algorithm, the call
+returns 0 WITHOUT attempting verification. This single check is the
+runtime expression of HC#11's "no cross-algorithm dispatch" rule.
+
+The verify procs themselves run in the constant-time configuration
+provided by the underlying crypto modules; in particular, Ed25519 verify
+is fully constant-time per RFC 8032 and ed25519.runa's implementation,
+while ECDSA verify uses constant-time scalar arithmetic via ecdsa.runa.
+
+Dispatch table:
+  ALG_ED25519                       -> ed25519_verify
+  ALG_ED448                         -> ed448_verify
+  ALG_ECDSA_P256                    -> ecdsa_p256_verify (raw r||s split)
+  ALG_ECDSA_P384                    -> ecdsa_p384_verify
+  ALG_ECDSA_P521                    -> ecdsa_p521_verify
+  ALG_RSA_PSS_SHA{256,384,512}_*    -> rsa_pss_verify
+  ALG_RSA_PKCS1V15_SHA{256,384,512}_* -> rsa_pkcs1v15_verify
+  ALG_ML_DSA_44/65/87               -> ml_dsa_44/65/87_verify
+  ALG_SLH_DSA_SHA2_*                -> slh_dsa_*_verify
+  ALG_FALCON_512/1024               -> falcon_verify_internal (level 1 or 5)
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena, pk, message_in (unless length=0), sig.
+  2. Check signature_algorithm(sig) == public_key_algorithm(pk).
+     If not, return 0. THIS IS THE TYPE-CONFUSION GATE.
+  3. Dispatch on the matched algorithm.
+  4. For RSA, the public-key bytes are interpreted as the
+     SubjectPublicKeyInfo (SPKI) blob per RFC 5280 4.1. This proc routes
+     PSS and PKCS1v15 dispatch through rsa_verify_from_spki, which
+     decodes SPKI -> AlgorithmIdentifier + RSAPublicKey, extracts the
+     (n, e) pair, derives the hash and padding-mode from the signature
+     algorithm tag combined with the SPKI AlgorithmIdentifier
+     parameters, and calls rsa_pss_verify / rsa_pkcs1v15_verify with
+     the decoded inputs.
+  5. ECDSA: split raw 2*N-byte r||s into r and s bigints, call verify.
+@End Implementation
+
+@Performance_Hints
+O(verify) for the underlying scheme. No additional allocations beyond
+the temporary scratch needed by the underlying verify proc.
+@End Performance_Hints
+
+@Security_Scope
+The algorithm-tag check is the single line that prevents the most common
+cross-algorithm confusion bug (Ed25519 key with ECDSA verify, ECDSA
+P-256 key with ECDSA P-384 verify, etc.). DO NOT remove or refactor this
+check; it is the entire reason this primitive exists.
+
+Constant-time properties are inherited from the underlying verify procs,
+documented per algorithm in ed25519.runa, ecdsa.runa, rsa.runa,
+ml_dsa.runa, slh_dsa.runa, falcon.runa.
+
+References:
+- HC#11 TASC.
+- RFC 8032 5.1.7 (Ed25519 verify), 5.2.7 (Ed448 verify).
+- FIPS 186-5 6.4 (ECDSA verify).
+- RFC 8017 8.1.2 (PSS verify), 8.2.2 (PKCS1v15 verify).
+- FIPS 204 5.3 (ML-DSA verify).
+- FIPS 205 9.1 (SLH-DSA verify).
+- FALCON spec section 3.10 (verify).
+@End Security_Scope
+Process called "signature_verify" takes arena as Integer, pk as Integer, message_in as Integer, message_length as Integer, sig as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If pk is equal to 0:
+        Return 0
+    End If
+    If sig is equal to 0:
+        Return 0
+    End If
+    If message_length is less than 0:
+        Return 0
+    End If
+
+    Let pk_alg be PK.public_key_algorithm(pk)
+    Let sig_alg be signature_algorithm(sig)
+    If pk_alg is not equal to sig_alg:
+        Return 0
+    End If
+
+    Let pk_buf be PK.public_key_bytes(pk)
+    Let sig_buf be signature_bytes(sig)
+    Let sig_len be signature_byte_length(sig)
+
+    If sig_alg is equal to Alg.ALG_ED25519:
+        Return Ed25519.ed25519_verify(arena, pk_buf, message_in, message_length, sig_buf)
+    End If
+    If sig_alg is equal to Alg.ALG_ED448:
+        Note: ed448_verify signature in tree takes (arena, pk, msg, msg_len, ctx, ctx_len, sig).
+        Note: We dispatch with empty context (length 0).
+        Return ed448_verify_dispatch(arena, pk_buf, message_in, message_length, sig_buf, sig_len)
+    End If
+
+    If sig_alg is equal to Alg.ALG_ECDSA_P256:
+        Return ecdsa_verify_dispatch_p256(arena, pk_buf, message_in, message_length, sig_buf, sig_len)
+    End If
+    If sig_alg is equal to Alg.ALG_ECDSA_P384:
+        Return ecdsa_verify_dispatch_p384(arena, pk_buf, message_in, message_length, sig_buf, sig_len)
+    End If
+    If sig_alg is equal to Alg.ALG_ECDSA_P521:
+        Return ecdsa_verify_dispatch_p521(arena, pk_buf, message_in, message_length, sig_buf, sig_len)
+    End If
+
+    If sig_alg is equal to Alg.ALG_ML_DSA_44:
+        Return MlDsa.ml_dsa_44_verify(arena, pk_buf, message_in, message_length, sig_buf)
+    End If
+    If sig_alg is equal to Alg.ALG_ML_DSA_65:
+        Return MlDsa.ml_dsa_65_verify(arena, pk_buf, message_in, message_length, sig_buf)
+    End If
+    If sig_alg is equal to Alg.ALG_ML_DSA_87:
+        Return MlDsa.ml_dsa_87_verify(arena, pk_buf, message_in, message_length, sig_buf)
+    End If
+
+    If sig_alg is equal to Alg.ALG_FALCON_512:
+        Return Falcon.falcon_verify_internal(arena, pk_buf, message_in, message_length, sig_buf, sig_len, 1)
+    End If
+    If sig_alg is equal to Alg.ALG_FALCON_1024:
+        Return Falcon.falcon_verify_internal(arena, pk_buf, message_in, message_length, sig_buf, sig_len, 5)
+    End If
+
+    Note: SLH-DSA dispatch by level/variant.
+    Let slh_rc be slh_dsa_verify_dispatch(arena, sig_alg, pk_buf, message_in, message_length, sig_buf, sig_len)
+    If slh_rc is not equal to 0 minus 1:
+        Return slh_rc
+    End If
+
+    Note: RSA branches: PSS and PKCS1v15. The public-key bytes carry a
+    Note: SubjectPublicKeyInfo (SPKI) DER blob per RFC 5280 4.1. The
+    Note: rsa_verify_from_spki helper decodes the SPKI to recover the
+    Note: (n, e) pair, reads hash + modulus from the signature algorithm
+    Note: tag, cross-checks against the SPKI, and dispatches to
+    Note: rsa_pss_verify or rsa_pkcs1v15_verify.
+    If Alg.rsa_alg_modulus_bytes(sig_alg) is not equal to 0:
+        Return rsa_verify_from_spki(arena, sig_alg, pk_buf, PK.public_key_byte_length(pk), message_in, message_length, sig_buf, sig_len)
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Internal dispatch helpers
+Note: ============================================================================
+
+@Reasoning
+Internal dispatcher for Ed448 verify. The ed448_verify signature in tree
+takes a context (RFC 8032 Ed448ph and Ed448 with context). We pass an
+empty context (Ed448 "pure" variant per RFC 8032 5.2.6).
+@End Reasoning
+
+@Implementation
+Wraps ed448_verify with a NULL context pointer and zero context length.
+@End Implementation
+
+@Performance_Hints
+O(verify).
+@End Performance_Hints
+
+@Security_Scope
+Context-less Ed448 is the default; callers needing context support call
+ed448_verify directly.
+@End Security_Scope
+Process called "ed448_verify_dispatch" takes arena as Integer, pk_buf as Integer, msg as Integer, msg_len as Integer, sig_buf as Integer, sig_len as Integer returns Integer:
+    If sig_len is not equal to 114:
+        Return 0
+    End If
+    Return ed448_verify_with_context(arena, pk_buf, msg, msg_len, sig_buf)
+End Process
+
+@Reasoning
+Forward to ed448 verify primitive. Some ed448 verify procs in tree expose
+the context-bearing form; this helper hides that detail.
+@End Reasoning
+
+@Implementation
+Calls ed448_verify with arena, pk_57, msg, msg_len, sig_114 and an
+empty context. If the in-tree symbol uses a different positional layout,
+this helper is the single point of repair.
+@End Implementation
+
+@Performance_Hints
+O(verify).
+@End Performance_Hints
+
+@Security_Scope
+Pure Ed448 (empty context, phflag=0) per RFC 8032 5.2.6.
+@End Security_Scope
+Process called "ed448_verify_with_context" takes arena as Integer, pk_57 as Integer, msg as Integer, msg_len as Integer, sig_114 as Integer returns Integer:
+    Note: Dispatch to in-tree ed448 verify symbol with empty context.
+    Note: This wrapper exists so the in-tree symbol name can evolve
+    Note: without touching the public signature_verify dispatch.
+    Return Ed448.ed448_verify(arena, pk_57, msg, msg_len, 0, 0, sig_114)
+End Process
+
+@Reasoning
+ECDSA-P256 verify expects raw 64-byte r||s. Split into r (32) and s (32)
+bigints and call ecdsa_p256_verify.
+@End Reasoning
+
+@Implementation
+1. Verify sig_len == 64.
+2. Allocate two 32-byte buffers in the arena, copy r and s.
+3. The ecdsa.runa primitives operate on bigint values; convert via
+   bigint_from_be_bytes (or local equivalent). For v0.0.8.5 the public
+   ECDSA verify takes raw byte pointers; we use that surface directly.
+@End Implementation
+
+@Performance_Hints
+O(ECDSA verify) = ~1-2 ms on modern hardware for P-256.
+@End Performance_Hints
+
+@Security_Scope
+ECDSA verify itself runs in constant-time inside ecdsa.runa.
+@End Security_Scope
+Process called "ecdsa_verify_dispatch_p256" takes arena as Integer, pk_buf as Integer, msg as Integer, msg_len as Integer, sig_buf as Integer, sig_len as Integer returns Integer:
+    If sig_len is not equal to 64:
+        Return 0
+    End If
+    Return ecdsa_verify_raw(arena, pk_buf, msg, msg_len, sig_buf, sig_len, Alg.ALG_ECDSA_P256)
+End Process
+
+@Reasoning
+ECDSA-P384 verify expects raw 96-byte r||s.
+@End Reasoning
+
+@Implementation
+Validate sig_len == 96 then delegate.
+@End Implementation
+
+@Performance_Hints
+O(ECDSA verify).
+@End Performance_Hints
+
+@Security_Scope
+Constant-time inside ecdsa.runa.
+@End Security_Scope
+Process called "ecdsa_verify_dispatch_p384" takes arena as Integer, pk_buf as Integer, msg as Integer, msg_len as Integer, sig_buf as Integer, sig_len as Integer returns Integer:
+    If sig_len is not equal to 96:
+        Return 0
+    End If
+    Return ecdsa_verify_raw(arena, pk_buf, msg, msg_len, sig_buf, sig_len, Alg.ALG_ECDSA_P384)
+End Process
+
+@Reasoning
+ECDSA-P521 verify expects raw 132-byte r||s.
+@End Reasoning
+
+@Implementation
+Validate sig_len == 132 then delegate.
+@End Implementation
+
+@Performance_Hints
+O(ECDSA verify).
+@End Performance_Hints
+
+@Security_Scope
+Constant-time inside ecdsa.runa.
+@End Security_Scope
+Process called "ecdsa_verify_dispatch_p521" takes arena as Integer, pk_buf as Integer, msg as Integer, msg_len as Integer, sig_buf as Integer, sig_len as Integer returns Integer:
+    If sig_len is not equal to 132:
+        Return 0
+    End If
+    Return ecdsa_verify_raw(arena, pk_buf, msg, msg_len, sig_buf, sig_len, Alg.ALG_ECDSA_P521)
+End Process
+
+@Reasoning
+ECDSA verify on raw r||s for a given curve. The in-tree ecdsa primitives
+require r and s as separate bigint handles. This helper allocates two
+arena buffers and constructs bigints from the half-buffers, then routes
+to the curve-specific verify proc.
+
+Curves and sizes:
+  P-256: r=32, s=32
+  P-384: r=48, s=48
+  P-521: r=66, s=66
+
+Pending v0.0.8.5 wire-up of bigint_from_be_bytes, this helper interfaces
+with the verify procs that accept raw byte pointers. The in-tree
+ecdsa_p256_verify, ecdsa_p384_verify, ecdsa_p521_verify take sig_r and
+sig_s as bigint pointers; we construct them via bigint_init_be from
+bigint.runa.
+@End Implementation
+
+@Implementation
+1. Determine half_len for the curve.
+2. Allocate r_bn and s_bn via bigint primitives, init from r-half and
+   s-half byte buffers.
+3. Call curve-specific verify.
+@End Implementation
+
+@Performance_Hints
+O(ECDSA verify) + O(2 * bigint allocations).
+@End Performance_Hints
+
+@Security_Scope
+The bigint values r and s are non-secret (the signature is public).
+@End Security_Scope
+Process called "ecdsa_verify_raw" takes arena as Integer, pk_buf as Integer, msg as Integer, msg_len as Integer, sig_buf as Integer, sig_len as Integer, curve_alg as Integer returns Integer:
+    Let half_len be sig_len divided by 2
+    Let r_buf be Arena.arena_allocate(arena, half_len)
+    If r_buf is equal to 0:
+        Return 0
+    End If
+    Let s_buf be Arena.arena_allocate(arena, half_len)
+    If s_buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(r_buf, sig_buf, half_len)
+    Memory.memory_copy(s_buf, sig_buf plus half_len, half_len)
+
+    Let r_bn be ecdsa_make_bn_from_be(arena, r_buf, half_len)
+    If r_bn is equal to 0:
+        Return 0
+    End If
+    Let s_bn be ecdsa_make_bn_from_be(arena, s_buf, half_len)
+    If s_bn is equal to 0:
+        Return 0
+    End If
+
+    If curve_alg is equal to Alg.ALG_ECDSA_P256:
+        Return Ecdsa.ecdsa_p256_verify(arena, pk_buf, msg, msg_len, r_bn, s_bn)
+    End If
+    If curve_alg is equal to Alg.ALG_ECDSA_P384:
+        Return Ecdsa.ecdsa_p384_verify(arena, pk_buf, msg, msg_len, r_bn, s_bn)
+    End If
+    If curve_alg is equal to Alg.ALG_ECDSA_P521:
+        Return Ecdsa.ecdsa_p521_verify(arena, pk_buf, msg, msg_len, r_bn, s_bn)
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Construct an ECDSA bigint from a big-endian byte buffer. Delegates to
+the bigint primitives shipped in tree (bigint.runa exposes bigint_init
+and bigint_from_be_bytes).
+@End Reasoning
+
+@Implementation
+Allocate a bigint, initialize from be bytes. The bigint module is
+referenced via the ecdsa module's internal helpers because ecdsa.runa
+re-exports the bigint surface it needs.
+@End Implementation
+
+@Performance_Hints
+O(n / 8) limbs.
+@End Performance_Hints
+
+@Security_Scope
+Non-secret value (signature component).
+@End Security_Scope
+Process called "ecdsa_make_bn_from_be" takes arena as Integer, be_bytes as Integer, byte_len as Integer returns Integer:
+    Note: Delegate via the ecdsa surface. For raw conversion, ecdsa.runa
+    Note: provides ecdsa_bits_to_int which reads bit-length bits from a
+    Note: big-endian buffer and produces a bigint reduced into the
+    Note: appropriate field. For r and s we want the literal integer
+    Note: value (not reduced). The ecdsa internal helper sufficient for
+    Note: this is ecdsa_bits_to_int with qlen = byte_len * 8.
+    Let qlen be byte_len multiplied by 8
+    Return Ecdsa.ecdsa_bits_to_int(arena, be_bytes, byte_len, qlen)
+End Process
+
+@Reasoning
+SLH-DSA verify dispatcher. Routes by algorithm tag to the correct
+slh_dsa_*_verify symbol. Returns -1 if the tag is not an SLH-DSA tag
+so signature_verify knows to continue dispatch; returns 0 or 1
+otherwise as the verify result.
+@End Reasoning
+
+@Implementation
+Selects param set by tag, calls slh_dsa.runa verify.
+@End Implementation
+
+@Performance_Hints
+SLH-DSA verify is O(seconds) for "S" variants and O(milliseconds) for
+"F" variants per FIPS 205 performance notes.
+@End Performance_Hints
+
+@Security_Scope
+SLH-DSA is constant-time by hash-based construction (no secret-
+dependent branching). Per FIPS 205 9.1.
+@End Security_Scope
+Process called "slh_dsa_verify_dispatch" takes arena as Integer, alg as Integer, pk_buf as Integer, msg as Integer, msg_len as Integer, sig_buf as Integer, sig_len as Integer returns Integer:
+    If alg is equal to Alg.ALG_SLH_DSA_SHA2_128S:
+        Return SlhDsa.slh_dsa_sha2_128s_verify(arena, pk_buf, msg, msg_len, sig_buf)
+    End If
+    If alg is equal to Alg.ALG_SLH_DSA_SHA2_128F:
+        Return SlhDsa.slh_dsa_sha2_128f_verify(arena, pk_buf, msg, msg_len, sig_buf)
+    End If
+    If alg is equal to Alg.ALG_SLH_DSA_SHA2_192S:
+        Return SlhDsa.slh_dsa_sha2_192s_verify(arena, pk_buf, msg, msg_len, sig_buf)
+    End If
+    If alg is equal to Alg.ALG_SLH_DSA_SHA2_192F:
+        Return SlhDsa.slh_dsa_sha2_192f_verify(arena, pk_buf, msg, msg_len, sig_buf)
+    End If
+    If alg is equal to Alg.ALG_SLH_DSA_SHA2_256S:
+        Return SlhDsa.slh_dsa_sha2_256s_verify(arena, pk_buf, msg, msg_len, sig_buf)
+    End If
+    If alg is equal to Alg.ALG_SLH_DSA_SHA2_256F:
+        Return SlhDsa.slh_dsa_sha2_256f_verify(arena, pk_buf, msg, msg_len, sig_buf)
+    End If
+    Return 0 minus 1
+End Process
+
+@Reasoning
+Construct a DER-encoded OID byte buffer on the arena for use with
+asn1_oid_equals. The PKCS#1 family OIDs share the OID arc
+{1, 2, 840, 113549, 1, 1, X} which DER-encodes as
+0x2A 0x86 0x48 0x86 0xF7 0x0D 0x01 0x01 X (9 bytes); helpers below
+build each specific OID by varying the trailing byte. Other algorithm
+OIDs use their own helpers.
+@End Reasoning
+
+@Implementation
+Allocate 9 bytes, write the shared prefix, write the trailing byte.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure byte construction, no secret data involved.
+@End Security_Scope
+Process called "rsa_oid_pkcs1_alloc" takes arena as Integer, trailing as Integer returns Integer:
+    Let buf be Arena.arena_allocate(arena, 9)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 134)
+    Memory.memory_set_byte(buf, 4, 247)
+    Memory.memory_set_byte(buf, 5, 13)
+    Memory.memory_set_byte(buf, 6, 1)
+    Memory.memory_set_byte(buf, 7, 1)
+    Memory.memory_set_byte(buf, 8, trailing)
+    Return buf
+End Process
+
+@Reasoning
+DER-encoded OID for the SHA-2 family from {2, 16, 840, 1, 101, 3, 4, 2, X}.
+The shared prefix is 0x60 0x86 0x48 0x01 0x65 0x03 0x04 0x02 (8 bytes);
+trailing byte selects the digest size (0x01 = SHA-256, 0x02 = SHA-384,
+0x03 = SHA-512). Used by PSS parameter parsing to identify the hash and
+MGF1 hash OIDs that appear inside the AlgorithmIdentifier parameters
+SEQUENCE per RFC 4055 section 3.1.
+@End Reasoning
+
+@Implementation
+Allocate 9 bytes, write the shared prefix, write the trailing byte.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure byte construction, no secret data involved.
+@End Security_Scope
+Process called "rsa_oid_sha2_alloc" takes arena as Integer, trailing as Integer returns Integer:
+    Let buf be Arena.arena_allocate(arena, 9)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(buf, 0, 96)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 1)
+    Memory.memory_set_byte(buf, 4, 101)
+    Memory.memory_set_byte(buf, 5, 3)
+    Memory.memory_set_byte(buf, 6, 4)
+    Memory.memory_set_byte(buf, 7, 2)
+    Memory.memory_set_byte(buf, 8, trailing)
+    Return buf
+End Process
+
+@Reasoning
+DER-encoded SHA-1 OID 1.3.14.3.2.26 = bytes 2B 0E 03 02 1A (length 5).
+The 5-byte encoding is the result of OID encoding starting from
+node*40+subnode for the first two arcs: 1*40+3=43=0x2B, then 14=0x0E,
+3=0x03, 2=0x02, 26=0x1A. Allocated here so PSS parameter parsing can
+match it (RFC 4055 §3.1 names sha1Identifier as the PSS DEFAULT
+hashAlgorithm; we parse the OID faithfully and apply the hash-strength
+gate at verify time per the production crypto policy).
+@End Reasoning
+
+@Implementation
+Allocate 5 bytes, write the OID arcs.
+@End Implementation
+
+@Performance_Hints
+O(1). 5 bytes written.
+@End Performance_Hints
+
+@Security_Scope
+Pure byte construction. The SHA-1 OID is never used to ACCEPT a
+signature; the verify path rejects it at the hash-strength gate.
+@End Security_Scope
+Process called "rsa_oid_sha1_alloc" takes arena as Integer returns Integer:
+    Let buf be Arena.arena_allocate(arena, 5)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(buf, 0, 43)
+    Memory.memory_set_byte(buf, 1, 14)
+    Memory.memory_set_byte(buf, 2, 3)
+    Memory.memory_set_byte(buf, 3, 2)
+    Memory.memory_set_byte(buf, 4, 26)
+    Return buf
+End Process
+
+@Reasoning
+DER-encoded MD5 OID 1.2.840.113549.2.5 = bytes 2A 86 48 86 F7 0D 02 05
+(length 8). The 8-byte encoding uses the standard PKCS#1 prefix
+2A 86 48 86 F7 0D = 1.2.840.113549, then 02 = digestAlgorithm, 05 = MD5.
+Allocated here for completeness so PSS parameter parsing rejects MD5
+identifiers at the hash-strength gate.
+@End Reasoning
+
+@Implementation
+Allocate 8 bytes, write the OID arcs.
+@End Implementation
+
+@Performance_Hints
+O(1). 8 bytes written.
+@End Performance_Hints
+
+@Security_Scope
+Pure byte construction. The MD5 OID is never used to ACCEPT a
+signature; the verify path rejects it at the hash-strength gate.
+@End Security_Scope
+Process called "rsa_oid_md5_alloc" takes arena as Integer returns Integer:
+    Let buf be Arena.arena_allocate(arena, 8)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 134)
+    Memory.memory_set_byte(buf, 4, 247)
+    Memory.memory_set_byte(buf, 5, 13)
+    Memory.memory_set_byte(buf, 6, 2)
+    Memory.memory_set_byte(buf, 7, 5)
+    Return buf
+End Process
+
+@Reasoning
+Map a hashAlgorithm OID TLV (carried inside the PSS parameters
+SEQUENCE) to the Rsa hash_id constant. Returns one of:
+  RSA_HASH_SHA256 (0)  -- SHA-256, accepted.
+  RSA_HASH_SHA384 (1)  -- SHA-384, accepted.
+  RSA_HASH_SHA512 (2)  -- SHA-512, accepted.
+  RSA_HASH_SHA1   (100) -- SHA-1, parsed but REJECTED at strength gate.
+  RSA_HASH_MD5    (101) -- MD5,   parsed but REJECTED at strength gate.
+  -1                    -- unrecognized OID, hard reject by caller.
+
+The split between "parsed but rejected" and "unknown" mirrors RFC 4055
+§3.1, which names sha1Identifier as the RSASSA-PSS DEFAULT. The Runa
+crypto policy rejects SHA-1 (and any legacy hash) at the strength gate;
+this routine reports them as recognized so the rsa_decode_pss_parameters
+proc can report RFC-conformant input that fails Runa policy distinctly
+from genuinely malformed input.
+@End Reasoning
+
+@Implementation
+Build candidate OIDs for SHA-256/384/512 (length 9), SHA-1 (length 5),
+and MD5 (length 8); compare each via Asn1Der.asn1_oid_equals.
+@End Implementation
+
+@Performance_Hints
+At most five short byte comparisons.
+@End Performance_Hints
+
+@Security_Scope
+Public dispatch; controls hash algorithm selection. Recognized-but-
+rejected hashes are returned with their RSA_HASH_SHA1 / RSA_HASH_MD5
+sentinel so the caller can decline rather than silently dropping to a
+default; unsupported OIDs return -1.
+@End Security_Scope
+Process called "rsa_sha2_oid_to_hash_id" takes arena as Integer, oid_tlv as Integer returns Integer:
+    Let sha256_oid be rsa_oid_sha2_alloc(arena, 1)
+    If sha256_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, sha256_oid, 9) is equal to 1:
+            Return Rsa.RSA_HASH_SHA256
+        End If
+    End If
+    Let sha384_oid be rsa_oid_sha2_alloc(arena, 2)
+    If sha384_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, sha384_oid, 9) is equal to 1:
+            Return Rsa.RSA_HASH_SHA384
+        End If
+    End If
+    Let sha512_oid be rsa_oid_sha2_alloc(arena, 3)
+    If sha512_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, sha512_oid, 9) is equal to 1:
+            Return Rsa.RSA_HASH_SHA512
+        End If
+    End If
+    Let sha1_oid be rsa_oid_sha1_alloc(arena)
+    If sha1_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, sha1_oid, 5) is equal to 1:
+            Return Rsa.RSA_HASH_SHA1
+        End If
+    End If
+    Let md5_oid be rsa_oid_md5_alloc(arena)
+    If md5_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, md5_oid, 8) is equal to 1:
+            Return Rsa.RSA_HASH_MD5
+        End If
+    End If
+    Return 0 minus 1
+End Process
+
+@Reasoning
+Extract (n, e, modulus_bits) from a SubjectPublicKeyInfo DER blob whose
+algorithm is rsaEncryption (1.2.840.113549.1.1.1) or id-RSASSA-PSS
+(1.2.840.113549.1.1.10), and the subjectPublicKey BIT STRING contains a
+DER-encoded RSAPublicKey SEQUENCE { modulus INTEGER, publicExponent
+INTEGER }. The decoded values are written into the supplied
+rsa_public_key struct via rsa_public_set_n/e/bits.
+
+The SPKI structure (RFC 5280 4.1) is:
+  SubjectPublicKeyInfo  ::=  SEQUENCE  {
+      algorithm        AlgorithmIdentifier,
+      subjectPublicKey BIT STRING
+  }
+The BIT STRING content begins with a single byte counting unused bits
+(0 for SPKI), then the encapsulated DER bytes.
+@End Reasoning
+
+@Implementation
+1. Parse top SPKI SEQUENCE; require constructed SEQUENCE tag (0x30).
+2. Skip algorithm AlgorithmIdentifier (first child).
+3. Read subjectPublicKey BIT STRING (second child); require BIT STRING
+   tag (0x03) and content_length >= 1.
+4. Skip the leading unused-bits byte; parse the contained RSAPublicKey
+   SEQUENCE inside the remaining bytes.
+5. Read modulus INTEGER (first child of RSAPublicKey). Strip a leading
+   0x00 sign byte if present (DER positive-integer padding).
+6. Read publicExponent INTEGER (next sibling).
+7. Convert each big-endian INTEGER content byte sequence to a bigint
+   via Ecdsa.ecdsa_bits_to_int; this is the same conversion ecdsa.runa
+   uses for hash-to-int and field-element decoding.
+8. Compute modulus_bits = modulus_byte_length * 8 (an upper bound; the
+   precise bit count is at most modulus_byte_length*8 and not less than
+   (modulus_byte_length - 1)*8 + 1). rsa.runa stores this value in the
+   key struct for downstream encode-block sizing.
+9. Store n, e, bits on the rsa_public_key struct. Return 1 on success,
+   0 on any parse, allocation, or conversion failure.
+
+Returns the parsed AlgorithmIdentifier TLV pointer via out_alg_id_tlv
+when out_alg_id_tlv is non-zero, so the caller can inspect PSS
+parameters; the parameter is written as a qword at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(SPKI size) DER walk; a handful of arena allocations.
+@End Performance_Hints
+
+@Security_Scope
+Strict tag and length checks per DER (no indefinite length, no
+constructed primitives where prohibited). Caller must validate the
+returned modulus_bits against the signature length before verifying.
+References:
+- RFC 5280 4.1 SubjectPublicKeyInfo.
+- RFC 8017 A.1.1 RSAPublicKey ASN.1.
+- RFC 4055 section 1.2 PKCS#1 v2.1 algorithm identifiers.
+@End Security_Scope
+Process called "rsa_decode_spki" takes arena as Integer, spki_bytes as Integer, spki_length as Integer, rsa_pub as Integer, out_alg_id_tlv as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If spki_bytes is equal to 0:
+        Return 0
+    End If
+    If spki_length is less than 8:
+        Return 0
+    End If
+    If rsa_pub is equal to 0:
+        Return 0
+    End If
+
+    Let spki_seq be Asn1Der.asn1_parse_tlv(arena, spki_bytes, 0, spki_length)
+    If spki_seq is equal to 0:
+        Return 0
+    End If
+    If Asn1Der.asn1_tlv_get_tag(spki_seq) is not equal to 48:
+        Return 0
+    End If
+
+    Let alg_id_tlv be Asn1Der.asn1_iter_first_child(arena, spki_seq)
+    If alg_id_tlv is equal to 0:
+        Return 0
+    End If
+    If Asn1Der.asn1_tlv_get_tag(alg_id_tlv) is not equal to 48:
+        Return 0
+    End If
+    If out_alg_id_tlv is not equal to 0:
+        Memory.memory_set_qword(out_alg_id_tlv, 0, alg_id_tlv)
+    End If
+
+    Let spk_bit_string be Asn1Der.asn1_iter_next_sibling(arena, spki_seq, alg_id_tlv)
+    If spk_bit_string is equal to 0:
+        Return 0
+    End If
+    If Asn1Der.asn1_tlv_get_tag(spk_bit_string) is not equal to 3:
+        Return 0
+    End If
+    Let bit_string_buffer be Asn1Der.asn1_tlv_get_buffer(spk_bit_string)
+    Let bit_string_content_offset be Asn1Der.asn1_tlv_get_content_offset(spk_bit_string)
+    Let bit_string_content_length be Asn1Der.asn1_tlv_get_content_length(spk_bit_string)
+    If bit_string_content_length is less than 2:
+        Return 0
+    End If
+
+    Note: BIT STRING content layout: 1 byte unused-bits-count, then bytes.
+    Let unused_bits be Memory.memory_get_byte(bit_string_buffer, bit_string_content_offset)
+    If unused_bits is not equal to 0:
+        Return 0
+    End If
+    Let rsa_pubkey_offset be bit_string_content_offset plus 1
+    Let rsa_pubkey_limit be bit_string_content_offset plus bit_string_content_length
+
+    Let rsa_pubkey_seq be Asn1Der.asn1_parse_tlv(arena, bit_string_buffer, rsa_pubkey_offset, rsa_pubkey_limit)
+    If rsa_pubkey_seq is equal to 0:
+        Return 0
+    End If
+    If Asn1Der.asn1_tlv_get_tag(rsa_pubkey_seq) is not equal to 48:
+        Return 0
+    End If
+
+    Let modulus_int be Asn1Der.asn1_iter_first_child(arena, rsa_pubkey_seq)
+    If modulus_int is equal to 0:
+        Return 0
+    End If
+    If Asn1Der.asn1_tlv_get_tag(modulus_int) is not equal to 2:
+        Return 0
+    End If
+    Let exponent_int be Asn1Der.asn1_iter_next_sibling(arena, rsa_pubkey_seq, modulus_int)
+    If exponent_int is equal to 0:
+        Return 0
+    End If
+    If Asn1Der.asn1_tlv_get_tag(exponent_int) is not equal to 2:
+        Return 0
+    End If
+
+    Note: Materialize modulus bytes. DER-encoded positive INTEGER MAY
+    Note: have a single leading 0x00 sign byte when the high bit of the
+    Note: most significant data byte is set; strip it for big-endian
+    Note: numeric interpretation.
+    Let modulus_buffer be Asn1Der.asn1_tlv_get_buffer(modulus_int)
+    Let modulus_content_offset be Asn1Der.asn1_tlv_get_content_offset(modulus_int)
+    Let modulus_content_length be Asn1Der.asn1_tlv_get_content_length(modulus_int)
+    Let modulus_start be modulus_content_offset
+    Let modulus_length be modulus_content_length
+    If modulus_content_length is greater than 1:
+        If Memory.memory_get_byte(modulus_buffer, modulus_content_offset) is equal to 0:
+            Set modulus_start to modulus_content_offset plus 1
+            Set modulus_length to modulus_content_length minus 1
+        End If
+    End If
+    If modulus_length is less than 1:
+        Return 0
+    End If
+
+    Let exponent_buffer be Asn1Der.asn1_tlv_get_buffer(exponent_int)
+    Let exponent_content_offset be Asn1Der.asn1_tlv_get_content_offset(exponent_int)
+    Let exponent_content_length be Asn1Der.asn1_tlv_get_content_length(exponent_int)
+    Let exponent_start be exponent_content_offset
+    Let exponent_length be exponent_content_length
+    If exponent_content_length is greater than 1:
+        If Memory.memory_get_byte(exponent_buffer, exponent_content_offset) is equal to 0:
+            Set exponent_start to exponent_content_offset plus 1
+            Set exponent_length to exponent_content_length minus 1
+        End If
+    End If
+    If exponent_length is less than 1:
+        Return 0
+    End If
+
+    Note: Copy modulus and exponent into fresh arena buffers so the bigint
+    Note: conversion sees contiguous big-endian byte arrays starting at
+    Note: offset 0.
+    Let modulus_copy be Arena.arena_allocate(arena, modulus_length)
+    If modulus_copy is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(modulus_copy, modulus_buffer plus modulus_start, modulus_length)
+    Let exponent_copy be Arena.arena_allocate(arena, exponent_length)
+    If exponent_copy is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(exponent_copy, exponent_buffer plus exponent_start, exponent_length)
+
+    Let modulus_bits be modulus_length multiplied by 8
+    Let exponent_bits be exponent_length multiplied by 8
+
+    Let n_bn be Ecdsa.ecdsa_bits_to_int(arena, modulus_copy, modulus_length, modulus_bits)
+    If n_bn is equal to 0:
+        Return 0
+    End If
+    Let e_bn be Ecdsa.ecdsa_bits_to_int(arena, exponent_copy, exponent_length, exponent_bits)
+    If e_bn is equal to 0:
+        Return 0
+    End If
+
+    Rsa.rsa_public_set_n(rsa_pub, n_bn)
+    Rsa.rsa_public_set_e(rsa_pub, e_bn)
+    Rsa.rsa_public_set_bits(rsa_pub, modulus_bits)
+    Return 1
+End Process
+
+@Reasoning
+Decode the PSS-parameters AlgorithmIdentifier per RFC 4055 §3.1.
+This proc parses the encoded parameters FAITHFULLY — including the
+RFC 4055-mandated SHA-1 defaults for absent fields — and applies the
+Runa hash-strength policy at the strength gate. SHA-1 and MD5
+are PARSED so the result distinguishes "RFC-conformant input that
+fails Runa policy" from "malformed input", but verification is
+REJECTED at the strength gate (Return 0).
+
+Rationale (Postel's Law for security parsers):
+  - On the parsing axis, accept what RFC 4055 mandates: an absent
+    hashAlgorithm field defaults to sha1Identifier, an absent
+    maskGenAlgorithm defaults to mgf1SHA1Identifier, an absent
+    saltLength defaults to 20.
+  - On the policy axis, reject what the Runa crypto policy
+    forbids: SHA-1 and MD5 are below the minimum hash strength for
+    PSS verification.
+This separation lets the implementation be RFC-conformant in its
+input-acceptance characterization while still enforcing the strength
+policy correctly. Callers that see a Return 0 know either that the
+parameters are malformed OR that the parameters demand a hash below
+the strength gate; in both cases the correct response is to refuse
+the signature.
+
+The PSS parameters SEQUENCE is:
+  RSASSA-PSS-params ::= SEQUENCE {
+      hashAlgorithm      [0] HashAlgorithm    DEFAULT sha1Identifier,
+      maskGenAlgorithm   [1] MaskGenAlgorithm DEFAULT mgf1SHA1Identifier,
+      saltLength         [2] INTEGER          DEFAULT 20,
+      trailerField       [3] INTEGER          DEFAULT 1
+  }
+Each named field is wrapped in an EXPLICIT context-specific tag.
+
+This proc writes:
+  - hash_id (one of Rsa.RSA_HASH_SHA256, RSA_HASH_SHA384, RSA_HASH_SHA512)
+    into hash_out[0]
+  - salt_length into salt_length_out[0]
+Returns 1 on success. Returns 0 on:
+  - malformed encoding;
+  - hash-strength rejection (parsed hash is SHA-1 or MD5);
+  - MGF1 hash != PSS hashAlgorithm (RFC 8017 PSS mandate);
+  - trailerField present and != 1 (RFC 4055).
+@End Reasoning
+
+@Implementation
+1. Default pss_hash_id to RSA_HASH_SHA1, pss_salt_length to 20,
+   mgf_hash_id to RSA_HASH_SHA1 — the RFC 4055 §3.1 defaults.
+2. If alg_id_tlv has no parameters child (only the OID), the defaults
+   stand; flow to the strength gate.
+3. Otherwise, parse the parameters SEQUENCE; walk explicit context
+   tags [0], [1], [2], [3].
+4. [0] HashAlgorithm SEQUENCE; first child is OID -> map to hash_id
+      via rsa_sha2_oid_to_hash_id. Unknown OIDs -> Return 0.
+5. [1] MGF1 AlgorithmIdentifier; the inner hash OID -> mgf hash id.
+      Per RFC 8017 PSS, MGF1 hash MUST equal the message hash; reject
+      mismatch.
+6. [2] saltLength INTEGER; bounded 0..512.
+7. [3] trailerField INTEGER; must be 1 (RFC 4055 only defines 1).
+8. Strength gate: if pss_hash_id is RSA_HASH_SHA1 or RSA_HASH_MD5,
+   Return 0. Same for mgf_hash_id (the MGF1=hash check above implies
+   this once the hashAlgorithm side is gated, but we belt-and-braces).
+9. Write hash_id and salt_length and Return 1.
+@End Implementation
+
+@Performance_Hints
+O(parameters size). At most a few short DER walks and OID compares.
+@End Performance_Hints
+
+@Security_Scope
+PSS parameters carry signature-binding hash and salt-length values; an
+attacker-controlled mismatch (e.g. claiming SHA-512 hash but using
+SHA-256 MGF1 internally) MUST be rejected. The MGF1 hash equality
+check enforces this.
+
+The SHA-1 / MD5 strength gate matters because RFC 4055 explicitly
+permits a signer to OMIT the hashAlgorithm field, which historically
+caused implementations to silently fall back to SHA-1. Once SHA-1
+collision and length-extension attacks became practical, that fall-
+back became a signature-forgery vector. Runa policy:
+SHA-1 / MD5 are PARSED faithfully (so the caller can distinguish
+RFC-conformant-but-weak signatures from malformed ones) but never
+permitted to verify.
+
+Salt length is bounded by 0..512 as a sanity cap. RFC 8017 allows
+salt-length 0; in that case PSS reduces to a deterministic scheme
+with reduced concrete security but not zero security, and we accept
+it for compatibility with FIPS 186-5 deterministic PSS profiles.
+
+References:
+- RFC 4055 §3.1 RSASSA-PSS-params (DEFAULTs).
+- RFC 8017 §9.1 EMSA-PSS encoding (MGF1 = message hash constraint).
+- NIST SP 800-131A: hash deprecation schedule (SHA-1 disallowed for
+  digital signatures since 2014).
+@End Security_Scope
+Process called "rsa_decode_pss_parameters" takes arena as Integer, alg_id_tlv as Integer, hash_out as Integer, salt_length_out as Integer returns Integer:
+    Note: Apply RFC 4055 §3.1 DEFAULTs faithfully. The strength gate
+    Note: at the end of this proc rejects them; we parse them so a
+    Note: caller can tell apart "RFC-conformant absent fields"
+    Note: (which we reject by policy) and "malformed encoding"
+    Note: (which we also reject, with the same Return 0 code).
+    Let pss_hash_id be Rsa.RSA_HASH_SHA1
+    Let pss_salt_length be 20
+    Let mgf_hash_id be Rsa.RSA_HASH_SHA1
+    Let mgf_hash_set be 0
+
+    Note: alg_id_tlv contains: SEQUENCE { OID, parameters (optional) }.
+    Let oid_child be Asn1Der.asn1_iter_first_child(arena, alg_id_tlv)
+    If oid_child is equal to 0:
+        Note: Even with no OID, we still apply the strength gate so
+        Note: that an empty SPKI never produces an accepted signature.
+        Return rsa_pss_apply_strength_gate(pss_hash_id, mgf_hash_id, mgf_hash_set, pss_salt_length, pss_hash_id, hash_out, salt_length_out)
+    End If
+    Let params_child be Asn1Der.asn1_iter_next_sibling(arena, alg_id_tlv, oid_child)
+    If params_child is equal to 0:
+        Note: Parameters absent. RFC 4055 §3.1 defaults stand.
+        Return rsa_pss_apply_strength_gate(pss_hash_id, mgf_hash_id, mgf_hash_set, pss_salt_length, pss_hash_id, hash_out, salt_length_out)
+    End If
+    Note: Parameters tag must be SEQUENCE (0x30) per RFC 4055.
+    If Asn1Der.asn1_tlv_get_tag(params_child) is not equal to 48:
+        Return 0
+    End If
+
+    Let field be Asn1Der.asn1_iter_first_child(arena, params_child)
+    While field is not equal to 0:
+        Let field_tag be Asn1Der.asn1_tlv_get_tag(field)
+        Note: Context-specific explicit tag [0]: hashAlgorithm.
+        If field_tag is equal to 160:
+            Let hash_alg be Asn1Der.asn1_iter_first_child(arena, field)
+            If hash_alg is not equal to 0:
+                Let hash_oid be Asn1Der.asn1_iter_first_child(arena, hash_alg)
+                If hash_oid is not equal to 0:
+                    Let id be rsa_sha2_oid_to_hash_id(arena, hash_oid)
+                    If id is less than 0:
+                        Return 0
+                    End If
+                    Set pss_hash_id to id
+                End If
+            End If
+        End If
+        Note: Context-specific explicit tag [1]: maskGenAlgorithm (MGF1).
+        If field_tag is equal to 161:
+            Let mgf_alg be Asn1Der.asn1_iter_first_child(arena, field)
+            If mgf_alg is not equal to 0:
+                Let mgf_hash_alg be Asn1Der.asn1_iter_next_sibling(arena, mgf_alg, Asn1Der.asn1_iter_first_child(arena, mgf_alg))
+                If mgf_hash_alg is not equal to 0:
+                    Let mgf_inner_oid be Asn1Der.asn1_iter_first_child(arena, mgf_hash_alg)
+                    If mgf_inner_oid is not equal to 0:
+                        Let mid be rsa_sha2_oid_to_hash_id(arena, mgf_inner_oid)
+                        If mid is less than 0:
+                            Return 0
+                        End If
+                        Set mgf_hash_id to mid
+                        Set mgf_hash_set to 1
+                    End If
+                End If
+            End If
+        End If
+        Note: Context-specific explicit tag [2]: saltLength INTEGER.
+        If field_tag is equal to 162:
+            Let salt_int be Asn1Der.asn1_iter_first_child(arena, field)
+            If salt_int is not equal to 0:
+                If Asn1Der.asn1_tlv_get_tag(salt_int) is equal to 2:
+                    Let salt_buffer be Asn1Der.asn1_tlv_get_buffer(salt_int)
+                    Let salt_content_offset be Asn1Der.asn1_tlv_get_content_offset(salt_int)
+                    Let salt_content_length be Asn1Der.asn1_tlv_get_content_length(salt_int)
+                    Let salt_value be 0
+                    Let si be 0
+                    While si is less than salt_content_length:
+                        Set salt_value to salt_value multiplied by 256
+                        Set salt_value to salt_value plus Memory.memory_get_byte(salt_buffer, salt_content_offset plus si)
+                        Set si to si plus 1
+                    End While
+                    If salt_value is less than 0:
+                        Return 0
+                    End If
+                    If salt_value is greater than 512:
+                        Return 0
+                    End If
+                    Set pss_salt_length to salt_value
+                End If
+            End If
+        End If
+        Note: Context-specific explicit tag [3]: trailerField INTEGER.
+        Note: RFC 4055 only defines trailerField=1; any other value is
+        Note: a hard reject (no signature scheme is defined for it).
+        If field_tag is equal to 163:
+            Let trailer_int be Asn1Der.asn1_iter_first_child(arena, field)
+            If trailer_int is not equal to 0:
+                If Asn1Der.asn1_tlv_get_tag(trailer_int) is equal to 2:
+                    Let trailer_buffer be Asn1Der.asn1_tlv_get_buffer(trailer_int)
+                    Let trailer_content_offset be Asn1Der.asn1_tlv_get_content_offset(trailer_int)
+                    Let trailer_content_length be Asn1Der.asn1_tlv_get_content_length(trailer_int)
+                    Let trailer_value be 0
+                    Let ti be 0
+                    While ti is less than trailer_content_length:
+                        Set trailer_value to trailer_value multiplied by 256
+                        Set trailer_value to trailer_value plus Memory.memory_get_byte(trailer_buffer, trailer_content_offset plus ti)
+                        Set ti to ti plus 1
+                    End While
+                    If trailer_value is not equal to 1:
+                        Return 0
+                    End If
+                End If
+            End If
+        End If
+        Set field to Asn1Der.asn1_iter_next_sibling(arena, params_child, field)
+    End While
+
+    Note: Per RFC 8017 PSS, MGF1 hash MUST equal the message hash when
+    Note: an explicit MGF1 hash is present. Reject mismatches BEFORE the
+    Note: strength gate so that a SHA-256-msg-hash + SHA-1-MGF1 attempt
+    Note: is reported as a mismatch (the structural fault) rather than
+    Note: silently subsumed into the strength rejection.
+    If mgf_hash_set is equal to 1:
+        If mgf_hash_id is not equal to pss_hash_id:
+            Return 0
+        End If
+    End If
+
+    Return rsa_pss_apply_strength_gate(pss_hash_id, mgf_hash_id, mgf_hash_set, pss_salt_length, pss_hash_id, hash_out, salt_length_out)
+End Process
+
+@Reasoning
+Runa crypto-policy hash-strength gate. Rejects any PSS hash
+that has been deprecated for digital-signature use:
+  - SHA-1: NIST SP 800-131A disallowed since 2014; collisions
+    practical (SHAttered 2017, sha1ime 2020).
+  - MD5: collisions practical since 2004 (Wang, Feng, Lai, Yu);
+    forbidden for any signature use.
+
+The gate runs AFTER faithful RFC 4055 parsing (including the DEFAULT
+sha1Identifier substitution for an absent hashAlgorithm field). This
+arrangement is important: the parser does not silently translate
+SHA-1 into SHA-256 (which would mask malicious omission of the
+hashAlgorithm field as a valid SHA-256 PSS), but the verifier still
+refuses to verify under the parsed (weak) hash.
+
+The implicit MGF1 case (mgf_hash_set=0) inherits the same hash id as
+pss_hash_id per the RFC 4055 default; the strength gate on
+pss_hash_id therefore covers it.
+
+The expected_mgf_hash parameter is the value mgf_hash_id should equal
+when mgf_hash_set is 0 (i.e., the implicit-MGF case); supplied as
+pss_hash_id by the caller. This is asserted defensively here in case
+the caller passes something else by accident.
+@End Reasoning
+
+@Implementation
+Three checks:
+  1. pss_hash_id MUST NOT be RSA_HASH_SHA1 or RSA_HASH_MD5.
+  2. If MGF was explicit, mgf_hash_id MUST NOT be RSA_HASH_SHA1/MD5.
+  3. If MGF was implicit, RFC 4055 inherits pss_hash_id; covered.
+On pass, write hash_id/salt and Return 1. On any fail, Return 0.
+@End Implementation
+
+@Performance_Hints
+O(1). Two integer compares plus stores.
+@End Performance_Hints
+
+@Security_Scope
+This is the single check that prevents SHA-1 RSA-PSS signatures from
+verifying. Removing it reintroduces the omitted-hashAlgorithm attack
+class (RFC 4055 §3.1 ambiguity exploitation).
+@End Security_Scope
+Process called "rsa_pss_apply_strength_gate" takes pss_hash_id as Integer, mgf_hash_id as Integer, mgf_hash_set as Integer, pss_salt_length as Integer, expected_mgf_hash as Integer, hash_out as Integer, salt_length_out as Integer returns Integer:
+    If pss_hash_id is equal to Rsa.RSA_HASH_SHA1:
+        Return 0
+    End If
+    If pss_hash_id is equal to Rsa.RSA_HASH_MD5:
+        Return 0
+    End If
+    If mgf_hash_set is equal to 1:
+        If mgf_hash_id is equal to Rsa.RSA_HASH_SHA1:
+            Return 0
+        End If
+        If mgf_hash_id is equal to Rsa.RSA_HASH_MD5:
+            Return 0
+        End If
+    End If
+    Note: Defensive: if the caller asserts implicit-MGF, the inherited
+    Note: hash MUST match the explicit pss_hash_id; an inconsistency
+    Note: here implies caller error and is a hard reject.
+    If mgf_hash_set is equal to 0:
+        If expected_mgf_hash is not equal to pss_hash_id:
+            Return 0
+        End If
+    End If
+    Memory.memory_set_qword(hash_out, 0, pss_hash_id)
+    Memory.memory_set_qword(salt_length_out, 0, pss_salt_length)
+    Return 1
+End Process
+
+@Reasoning
+The unified RSA verify path that takes a SubjectPublicKeyInfo DER blob
+and dispatches to rsa_pss_verify or rsa_pkcs1v15_verify based on the
+signature algorithm tag and the SPKI AlgorithmIdentifier contents.
+
+Hash selection:
+  - The hash algorithm is encoded directly in the sig_alg tag (one of
+    ALG_RSA_PKCS1V15_SHA256_*, ALG_RSA_PKCS1V15_SHA384_*,
+    ALG_RSA_PKCS1V15_SHA512_*, ALG_RSA_PSS_SHA256_*, ALG_RSA_PSS_SHA384_*,
+    or ALG_RSA_PSS_SHA512_*). Alg.rsa_alg_to_rsa_hash_id maps to the
+    RSA module's internal hash id (0=SHA-256, 1=SHA-384, 2=SHA-512);
+    any other tag returns -1 which is treated as a hard reject.
+  - For PSS, the PSS parameters (when id-RSASSA-PSS is the SPKI OID)
+    are still parsed and cross-checked against the tag's hash id;
+    mismatch -> reject. When the SPKI OID is rsaEncryption, the tag's
+    hash id is authoritative and the salt length default (per RFC 4055
+    handling in rsa_decode_pss_parameters) is honoured.
+  - For PKCS1v15, the digestAlgorithm OID inside the EM block is
+    checked by rsa_pkcs1v15_verify against rsa_pub.hash_id; we set
+    rsa_pub.hash_id from the tag, so any embedded digest-OID mismatch
+    is caught by the underlying verify routine.
+  - Modulus length is cross-checked: the tag declares a modulus size,
+    and the decoded SPKI exposes the actual modulus_bits. A mismatch
+    -> reject (prevents accepting a 2048-bit signature under a 4096-bit
+    tag, which would corrupt the security claim).
+
+References:
+- RFC 8017 8.1.2 (PSS verify), 8.2.2 (PKCS1v15 verify).
+- RFC 5280 4.1 SubjectPublicKeyInfo.
+- RFC 4055 3.1 RSASSA-PSS parameter syntax.
+@End Reasoning
+
+@Implementation
+1. Allocate rsa_public_key and an out-parameter slot for the
+   AlgorithmIdentifier TLV.
+2. Call rsa_decode_spki to populate (n, e, modulus_bits) and capture
+   the AlgorithmIdentifier TLV.
+3. Resolve hash_id from sig_alg via Alg.rsa_alg_to_rsa_hash_id.
+4. Cross-check declared modulus (Alg.rsa_alg_modulus_bytes) against
+   actual modulus_bits from rsa_decode_spki.
+5. Set rsa_pub.hash_id from the tag.
+6. If sig_alg is PSS-tagged, resolve the effective saltLength via
+   rsa_pss_resolve_salt_length (which also enforces the
+   tag-vs-parameters hash binding) and dispatch to Rsa.rsa_pss_verify.
+7. If sig_alg is PKCS1v15-tagged, dispatch directly to
+   rsa_pkcs1v15_verify with the tag-derived hash_id already set.
+@End Implementation
+
+@Performance_Hints
+O(SPKI parse) + O(RSA verify). The SPKI decode is microseconds; the
+verify itself dominates.
+@End Performance_Hints
+
+@Security_Scope
+- Strict OID checks; unknown hash OIDs cause rejection rather than
+  silent default substitution.
+- Tag-vs-SPKI hash and modulus cross-checks prevent algorithm
+  confusion (a 4096-bit key with a 2048-bit tag, or a SHA-384 PSS
+  signature verified against SHA-256, are both hard-rejected).
+- Modulus length is taken from the decoded SPKI rather than the byte
+  length of pk_buf (which is the encoded blob length, not the modulus
+  length).
+@End Security_Scope
+
+@Reasoning
+Helper that resolves the effective PSS saltLength from the
+AlgorithmIdentifier slot populated by rsa_decode_spki, while also
+enforcing the RFC 8017 tag-vs-parameters hash binding.
+
+Extracted as a 3-parameter helper so the PSS dispatch path can be
+inlined into rsa_verify_from_spki without producing a downstream
+8-parameter wrapper Process; the wrapper form has been factored
+out for that reason.
+@End Reasoning
+
+@Implementation
+Returns:
+  >= 0  : effective salt length (in bytes) to use for PSS verify.
+          When the AlgorithmIdentifier carries id-RSASSA-PSS
+          parameters, the returned salt_length is the saltLength
+          field they encode; otherwise it is the modern PSS default
+          sLen = hash output length.
+  -1    : hard reject. Either:
+            (a) the supplied tag_hash_id has no known output size
+                (an unsupported hash family), or
+            (b) the PSS parameters cannot be decoded, or
+            (c) the parameters carry a hash id that does NOT match
+                tag_hash_id (RFC 8017 PSS tag-vs-parameters hash
+                binding violation; algorithm-confusion guard).
+@End Implementation
+
+@Performance_Hints
+O(parameters parse) only when the AlgorithmIdentifier carries the
+id-RSASSA-PSS OID. The non-PSS-parameters case is a constant-time
+OID compare followed by a hash-size lookup.
+@End Performance_Hints
+
+@Security_Scope
+- The hash binding check (param_hash_id vs tag_hash_id) is the
+  security-critical guard against PSS algorithm confusion; this
+  helper preserves that check exactly.
+- Unknown PSS hash OIDs propagate as a hard reject (rsa_decode_pss
+  _parameters returns 0), never as a silent default substitution.
+- Salt length is bounded by rsa_decode_pss_parameters (0..512).
+- A zero tag_hash_id (or any unknown hash) is rejected at entry
+  rather than silently defaulting to a hash output size of zero.
+@End Security_Scope
+Process called "rsa_pss_resolve_salt_length" takes arena as Integer, alg_id_slot as Integer, tag_hash_id as Integer returns Integer:
+    Note: Default salt_length to the hash output size (modern PSS convention).
+    Let salt_length be Rsa.rsa_hash_output_size(tag_hash_id)
+    If salt_length is equal to 0:
+        Return -1
+    End If
+
+    Let alg_id_tlv be Memory.memory_get_qword(alg_id_slot, 0)
+    If alg_id_tlv is equal to 0:
+        Return salt_length
+    End If
+
+    Let oid_child be Asn1Der.asn1_iter_first_child(arena, alg_id_tlv)
+    If oid_child is equal to 0:
+        Return salt_length
+    End If
+
+    Note: id-RSASSA-PSS OID = 1.2.840.113549.1.1.10 (trailing 0x0A).
+    Let pss_oid be rsa_oid_pkcs1_alloc(arena, 10)
+    If pss_oid is equal to 0:
+        Return salt_length
+    End If
+
+    If Asn1Der.asn1_oid_equals(oid_child, pss_oid, 9) is not equal to 1:
+        Return salt_length
+    End If
+
+    Let hash_slot be Arena.arena_allocate(arena, 8)
+    If hash_slot is equal to 0:
+        Return -1
+    End If
+    Let salt_slot be Arena.arena_allocate(arena, 8)
+    If salt_slot is equal to 0:
+        Return -1
+    End If
+
+    Let pss_rc be rsa_decode_pss_parameters(arena, alg_id_tlv, hash_slot, salt_slot)
+    If pss_rc is equal to 0:
+        Return -1
+    End If
+
+    Let param_hash_id be Memory.memory_get_qword(hash_slot, 0)
+    Note: Tag-vs-parameters hash binding (RFC 8017 PSS):
+    Note: a signer that disagrees with the verifier-expected
+    Note: hash is a hard reject, never a silent override.
+    If param_hash_id is not equal to tag_hash_id:
+        Return -1
+    End If
+
+    Set salt_length to Memory.memory_get_qword(salt_slot, 0)
+    Return salt_length
+End Process
+
+Process called "rsa_verify_from_spki" takes arena as Integer, sig_alg as Integer, spki_bytes as Integer, spki_length as Integer, msg as Integer, msg_len as Integer, sig_buf as Integer, sig_len as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If spki_bytes is equal to 0:
+        Return 0
+    End If
+    If spki_length is less than 8:
+        Return 0
+    End If
+    If sig_buf is equal to 0:
+        Return 0
+    End If
+    If sig_len is less than 1:
+        Return 0
+    End If
+
+    Note: Resolve hash id and modulus declaration from the tag.
+    Note: -1 means "not an RSA signature tag"; reject hard.
+    Let tag_hash_id be Alg.rsa_alg_to_rsa_hash_id(sig_alg)
+    If tag_hash_id is less than 0:
+        Return 0
+    End If
+    Let tag_family be Alg.rsa_alg_is_pss(sig_alg)
+    If tag_family is less than 0:
+        Return 0
+    End If
+    Let tag_modulus_bytes be Alg.rsa_alg_modulus_bytes(sig_alg)
+    If tag_modulus_bytes is equal to 0:
+        Return 0
+    End If
+
+    Let rsa_pub be Rsa.rsa_public_key_alloc(arena)
+    If rsa_pub is equal to 0:
+        Return 0
+    End If
+
+    Let alg_id_slot be Arena.arena_allocate(arena, 8)
+    If alg_id_slot is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_qword(alg_id_slot, 0, 0)
+
+    Let decode_rc be rsa_decode_spki(arena, spki_bytes, spki_length, rsa_pub, alg_id_slot)
+    If decode_rc is equal to 0:
+        Return 0
+    End If
+
+    Note: Modulus cross-check: tag-declared vs actual SPKI modulus.
+    Let actual_modulus_bytes be Rsa.rsa_public_get_modulus_bytes(rsa_pub)
+    If actual_modulus_bytes is not equal to tag_modulus_bytes:
+        Return 0
+    End If
+
+    Note: Bind the tag's hash id onto the key before dispatch.
+    Rsa.rsa_public_set_hash(rsa_pub, tag_hash_id)
+
+    If tag_family is equal to 1:
+        Note: PSS dispatch. The PSS-specific parameters (saltLength + the
+        Note: signer-encoded hash id) are resolved by the helper, which
+        Note: also enforces the RFC 8017 tag-vs-parameters hash binding.
+        Note: A negative return is a hard reject (binding mismatch, unknown
+        Note: hash, or parameter decode failure).
+        Let pss_salt_length be rsa_pss_resolve_salt_length(arena, alg_id_slot, tag_hash_id)
+        If pss_salt_length is less than 0:
+            Return 0
+        End If
+        Return Rsa.rsa_pss_verify(arena, rsa_pub, msg, msg_len, pss_salt_length, sig_buf, sig_len)
+    End If
+
+    Note: PKCS1v15 dispatch. The digest OID inside the EM block is
+    Note: checked by rsa_pkcs1v15_verify against rsa_pub.hash_id, which
+    Note: we set above from the tag.
+    Return Rsa.rsa_pkcs1v15_verify(arena, rsa_pub, msg, msg_len, sig_buf, sig_len)
+End Process
+
+Note: ============================================================================
+Note: SECTION 6: Sign (the constructor path that produces a Signature from
+Note:            a PrivateKey + message)
+Note: ============================================================================
+
+@Reasoning
+Sign a message under the supplied private key. Returns a Signature value
+that carries the same algorithm tag as the private key.
+
+Dispatch on private_key_algorithm(sk). The complete set of supported
+algorithm tags in this signing surface is:
+  ALG_ED25519              -> ed25519_sign
+  ALG_ED448                -> ed448_sign
+  ALG_ECDSA_P256/384/521   -> ecdsa_*_sign  (raw r||s output)
+  ALG_ML_DSA_44/65/87      -> ml_dsa_*_sign
+Any other algorithm tag returns 0; callers MUST pre-check the private
+key algorithm against this set and route RSA, SLH-DSA, and FALCON
+signing through the primitive APIs in their respective modules
+(rsa.runa, slh_dsa.runa, falcon.runa), which carry the algorithm-
+specific parameter surface that does not fit the unified signing
+contract here.
+
+This proc is the production path for signing in Runa. The Signature
+result is independent of the private key's lifetime (it carries copied
+bytes).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena, sk, message_in (msg_len >= 0).
+  2. Check the private key is not wiped.
+  3. Look up algorithm; allocate signature output buffer with the
+     appropriate size.
+  4. Dispatch to sign primitive.
+  5. Wrap raw bytes as Signature via signature_create.
+@End Implementation
+
+@Performance_Hints
+O(sign) for the underlying scheme. One signature_create allocation.
+@End Performance_Hints
+
+@Security_Scope
+The PRIVATE key is dereferenced via private_key_secret_bytes_internal,
+which is the audited path. After the underlying sign primitive returns,
+the temporary output buffer is in the arena; it contains the signature
+(public) so no wipe is needed.
+
+Sign procs in the underlying modules are constant-time per their own
+documentation; refer to ed25519.runa, ecdsa.runa, etc.
+@End Security_Scope
+Process called "signature_sign" takes arena as Integer, sk as Integer, message_in as Integer, message_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If sk is equal to 0:
+        Return 0
+    End If
+    If message_length is less than 0:
+        Return 0
+    End If
+    If SK.private_key_is_wiped(sk) is equal to 1:
+        Return 0
+    End If
+
+    Let alg be SK.private_key_algorithm(sk)
+    Let sk_buf be SK.private_key_secret_bytes_internal(sk)
+    If sk_buf is equal to 0:
+        Return 0
+    End If
+
+    If alg is equal to Alg.ALG_ED25519:
+        Note: ed25519_sign expects secret_key_64; private_key carries 32
+        Note: bytes (the seed). Expand to 64 bytes via ed25519_keygen.
+        Let exp_pub be Arena.arena_allocate(arena, 32)
+        If exp_pub is equal to 0:
+            Return 0
+        End If
+        Let exp_sec be Arena.arena_allocate(arena, 64)
+        If exp_sec is equal to 0:
+            Return 0
+        End If
+        Let kg be Ed25519.ed25519_keygen(arena, sk_buf, exp_pub, exp_sec)
+        If kg is equal to 0:
+            Return 0
+        End If
+        Let sig_buf be Arena.arena_allocate(arena, 64)
+        If sig_buf is equal to 0:
+            Return 0
+        End If
+        Let rc be Ed25519.ed25519_sign(arena, exp_sec, message_in, message_length, sig_buf)
+        Secure.secure_zero(exp_sec, 64)
+        If rc is equal to 0:
+            Return 0
+        End If
+        Return signature_create(arena, alg, sig_buf, 64)
+    End If
+
+    If alg is equal to Alg.ALG_ED448:
+        Let exp_pub448 be Arena.arena_allocate(arena, 57)
+        If exp_pub448 is equal to 0:
+            Return 0
+        End If
+        Let exp_sec448 be Arena.arena_allocate(arena, 114)
+        If exp_sec448 is equal to 0:
+            Return 0
+        End If
+        Let kg448 be Ed448.ed448_keygen(arena, sk_buf, exp_pub448, exp_sec448)
+        If kg448 is equal to 0:
+            Return 0
+        End If
+        Let sig_buf448 be Arena.arena_allocate(arena, 114)
+        If sig_buf448 is equal to 0:
+            Return 0
+        End If
+        Let rc448 be Ed448.ed448_sign(arena, exp_sec448, message_in, message_length, 0, 0, sig_buf448)
+        Secure.secure_zero(exp_sec448, 114)
+        If rc448 is equal to 0:
+            Return 0
+        End If
+        Return signature_create(arena, alg, sig_buf448, 114)
+    End If
+
+    If alg is equal to Alg.ALG_ML_DSA_44:
+        Let sig_44 be Arena.arena_allocate(arena, 2420)
+        If sig_44 is equal to 0:
+            Return 0
+        End If
+        Let rcm be MlDsa.ml_dsa_44_sign(arena, sk_buf, message_in, message_length, sig_44)
+        If rcm is equal to 0:
+            Return 0
+        End If
+        Return signature_create(arena, alg, sig_44, 2420)
+    End If
+    If alg is equal to Alg.ALG_ML_DSA_65:
+        Let sig_65 be Arena.arena_allocate(arena, 3309)
+        If sig_65 is equal to 0:
+            Return 0
+        End If
+        Let rcm65 be MlDsa.ml_dsa_65_sign(arena, sk_buf, message_in, message_length, sig_65)
+        If rcm65 is equal to 0:
+            Return 0
+        End If
+        Return signature_create(arena, alg, sig_65, 3309)
+    End If
+    If alg is equal to Alg.ALG_ML_DSA_87:
+        Let sig_87 be Arena.arena_allocate(arena, 4627)
+        If sig_87 is equal to 0:
+            Return 0
+        End If
+        Let rcm87 be MlDsa.ml_dsa_87_sign(arena, sk_buf, message_in, message_length, sig_87)
+        If rcm87 is equal to 0:
+            Return 0
+        End If
+        Return signature_create(arena, alg, sig_87, 4627)
+    End If
+
+    If alg is equal to Alg.ALG_ECDSA_P256:
+        Return ecdsa_sign_dispatch(arena, sk_buf, message_in, message_length, alg)
+    End If
+    If alg is equal to Alg.ALG_ECDSA_P384:
+        Return ecdsa_sign_dispatch(arena, sk_buf, message_in, message_length, alg)
+    End If
+    If alg is equal to Alg.ALG_ECDSA_P521:
+        Return ecdsa_sign_dispatch(arena, sk_buf, message_in, message_length, alg)
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+ECDSA sign dispatcher. The ecdsa_*_sign procs in tree output r and s as
+bigint handles; we then encode them as raw r||s (big-endian, fixed-width
+per curve) into a single Signature buffer.
+
+Curve byte widths:
+  P-256: 32 bytes per scalar, 64 total.
+  P-384: 48 bytes per scalar, 96 total.
+  P-521: 66 bytes per scalar, 132 total.
+
+The big-endian-with-leading-zeros encoding matches X9.62 / RFC 5480
+for raw signature format (the DER variant adds a SEQUENCE wrapper; see
+signature_to_der below).
+@End Reasoning
+
+@Implementation
+1. Determine width from alg.
+2. Call ecdsa_*_sign to produce r_bn and s_bn.
+3. Encode each via ecdsa_int_to_octets into the appropriate half of the
+   signature buffer.
+4. Wrap as Signature.
+@End Implementation
+
+@Performance_Hints
+O(ECDSA sign).
+@End Performance_Hints
+
+@Security_Scope
+ECDSA sign in ecdsa.runa is constant-time (RFC 6979 deterministic k or
+constant-time randomized k).
+@End Security_Scope
+Process called "ecdsa_sign_dispatch" takes arena as Integer, sk_buf as Integer, msg as Integer, msg_len as Integer, alg as Integer returns Integer:
+    Let width be 0
+    If alg is equal to Alg.ALG_ECDSA_P256:
+        Set width to 32
+    End If
+    If alg is equal to Alg.ALG_ECDSA_P384:
+        Set width to 48
+    End If
+    If alg is equal to Alg.ALG_ECDSA_P521:
+        Set width to 66
+    End If
+    If width is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate output buffers for r and s as bigint handles; the
+    Note: ecdsa primitives' sign signatures accept output bigint pointers
+    Note: that they fill in. We pre-allocate empty bigints via the
+    Note: ecdsa_bits_to_int seed-from-zero trick: any unused short buffer
+    Note: produces a bigint of value 0.
+    Let zero3 be Arena.arena_allocate(arena, 1)
+    If zero3 is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(zero3, 0, 0)
+    Let r_bn be Ecdsa.ecdsa_bits_to_int(arena, zero3, 1, 8)
+    If r_bn is equal to 0:
+        Return 0
+    End If
+    Let s_bn be Ecdsa.ecdsa_bits_to_int(arena, zero3, 1, 8)
+    If s_bn is equal to 0:
+        Return 0
+    End If
+
+    Let rc be 0
+    If alg is equal to Alg.ALG_ECDSA_P256:
+        Set rc to Ecdsa.ecdsa_p256_sign(arena, sk_buf, msg, msg_len, r_bn, s_bn)
+    End If
+    If alg is equal to Alg.ALG_ECDSA_P384:
+        Set rc to Ecdsa.ecdsa_p384_sign(arena, sk_buf, msg, msg_len, r_bn, s_bn)
+    End If
+    If alg is equal to Alg.ALG_ECDSA_P521:
+        Set rc to Ecdsa.ecdsa_p521_sign(arena, sk_buf, msg, msg_len, r_bn, s_bn)
+    End If
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Let two_w be width multiplied by 2
+    Let raw_buf be Arena.arena_allocate(arena, two_w)
+    If raw_buf is equal to 0:
+        Return 0
+    End If
+    Let z be 0
+    While z is less than two_w:
+        Memory.memory_set_byte(raw_buf, z, 0)
+        Set z to z plus 1
+    End While
+    Ecdsa.ecdsa_int_to_octets(r_bn, width, raw_buf)
+    Ecdsa.ecdsa_int_to_octets(s_bn, width, raw_buf plus width)
+    Return signature_create(arena, alg, raw_buf, two_w)
+End Process
+
+Note: ============================================================================
+Note: SECTION 7: ECDSA DER encoding helpers
+Note: ============================================================================
+
+@Reasoning
+Convert a raw ECDSA Signature (algorithm = ALG_ECDSA_P256/P384/P521,
+bytes are r||s big-endian fixed-width) into DER-encoded form per
+ANSI X9.62 / RFC 5480 / RFC 3279:
+
+  Ecdsa-Sig-Value ::= SEQUENCE {
+    r INTEGER,
+    s INTEGER
+  }
+
+The output bytes are written into out_buffer; out_capacity must be at
+least the maximum DER length for the curve (which exceeds raw length by
+at most 8 bytes for the SEQUENCE / INTEGER headers and 2 sign-bit-zero
+pad bytes).
+
+Returns the actual DER byte length on success, 0 on failure.
+@End Reasoning
+
+@Implementation
+Delegate to ecdsa.runa's ecdsa_signature_to_der. That helper takes
+r_bn and s_bn bigint handles; we reconstruct those from the raw r||s
+halves of the Signature.
+@End Implementation
+
+@Performance_Hints
+O(curve scalar bytes).
+@End Performance_Hints
+
+@Security_Scope
+DER framing is non-secret. Output length is variable (because INTEGER
+encoding strips leading zeros and may prepend one zero for sign bit).
+@End Security_Scope
+Process called "signature_to_der" takes arena as Integer, sig as Integer, out_buffer as Integer, out_capacity as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If sig is equal to 0:
+        Return 0
+    End If
+    If out_buffer is equal to 0:
+        Return 0
+    End If
+    Let alg be signature_algorithm(sig)
+    If alg is equal to Alg.ALG_ECDSA_P256:
+        Note: continue
+    Otherwise:
+        If alg is equal to Alg.ALG_ECDSA_P384:
+            Note: continue
+        Otherwise:
+            If alg is equal to Alg.ALG_ECDSA_P521:
+                Note: continue
+            Otherwise:
+                Return 0
+            End If
+        End If
+    End If
+    Let raw_buf be signature_bytes(sig)
+    Let raw_len be signature_byte_length(sig)
+    Let half_len be raw_len divided by 2
+    Let r_bn be Ecdsa.ecdsa_bits_to_int(arena, raw_buf, half_len, half_len multiplied by 8)
+    If r_bn is equal to 0:
+        Return 0
+    End If
+    Let s_bn be Ecdsa.ecdsa_bits_to_int(arena, raw_buf plus half_len, half_len, half_len multiplied by 8)
+    If s_bn is equal to 0:
+        Return 0
+    End If
+    Return Ecdsa.ecdsa_signature_to_der(arena, r_bn, s_bn, out_buffer, out_capacity)
+End Process
+
+@Reasoning
+Construct an ECDSA Signature from DER-encoded bytes by parsing the
+SEQUENCE { r, s } and serializing as raw r||s for the given curve.
+@End Reasoning
+
+@Implementation
+1. Decode r_bn, s_bn via ecdsa_signature_from_der.
+2. Encode each via ecdsa_int_to_octets into a fixed-width 2N buffer.
+3. Wrap as Signature with the supplied algorithm tag.
+@End Implementation
+
+@Performance_Hints
+O(curve scalar bytes).
+@End Performance_Hints
+
+@Security_Scope
+DER parsing must reject malformed input. The ecdsa_signature_from_der
+helper validates lengths and INTEGER tags per X9.62.
+@End Security_Scope
+Process called "signature_from_der" takes arena as Integer, algorithm as Integer, der_bytes as Integer, der_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If der_bytes is equal to 0:
+        Return 0
+    End If
+    Let width be 0
+    If algorithm is equal to Alg.ALG_ECDSA_P256:
+        Set width to 32
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P384:
+        Set width to 48
+    End If
+    If algorithm is equal to Alg.ALG_ECDSA_P521:
+        Set width to 66
+    End If
+    If width is equal to 0:
+        Return 0
+    End If
+
+    Let zero3 be Arena.arena_allocate(arena, 1)
+    If zero3 is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(zero3, 0, 0)
+    Let r_bn be Ecdsa.ecdsa_bits_to_int(arena, zero3, 1, 8)
+    If r_bn is equal to 0:
+        Return 0
+    End If
+    Let s_bn be Ecdsa.ecdsa_bits_to_int(arena, zero3, 1, 8)
+    If s_bn is equal to 0:
+        Return 0
+    End If
+    Let rc be Ecdsa.ecdsa_signature_from_der(arena, der_bytes, der_length, r_bn, s_bn)
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Let two_w be width multiplied by 2
+    Let raw_buf be Arena.arena_allocate(arena, two_w)
+    If raw_buf is equal to 0:
+        Return 0
+    End If
+    Let z be 0
+    While z is less than two_w:
+        Memory.memory_set_byte(raw_buf, z, 0)
+        Set z to z plus 1
+    End While
+    Ecdsa.ecdsa_int_to_octets(r_bn, width, raw_buf)
+    Ecdsa.ecdsa_int_to_octets(s_bn, width, raw_buf plus width)
+    Return signature_create(arena, algorithm, raw_buf, two_w)
+End Process

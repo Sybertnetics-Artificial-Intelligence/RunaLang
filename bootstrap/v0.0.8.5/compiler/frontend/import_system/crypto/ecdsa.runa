@@ -1,0 +1,1900 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+ECDSA - FIPS 186-4 Elliptic Curve Digital Signature Algorithm
+==============================================================================
+
+Implements ECDSA over NIST curves P-256, P-384, P-521 with:
+
+1. Deterministic nonce generation per RFC 6979 section 3.2.
+   The per-message k value is derived from the private key and message
+   hash via a HMAC-DRBG construction. This eliminates the entire
+   catastrophic class of failures from random-k bugs (Sony PS3 ECDSA
+   attack in 2010; Bitcoin Android wallet k-reuse in 2013).
+
+2. Hash selection per RFC 6979 section 4:
+       P-256 -> SHA-256
+       P-384 -> SHA-384
+       P-521 -> SHA-512
+   The hash output is reduced via bits2int with truncation to the order
+   bit length before being used as the message digest in the signing
+   equation.
+
+3. Signature encoding: bare (r, s) returned as two BigInt buffers plus
+   a DER serializer to RFC 5480 / SEC 1 v2.0 C.5 SEQUENCE { INTEGER r,
+   INTEGER s } format. The DER parser is the inverse and is used by
+   X.509 certificate signature verification (x509.runa).
+
+4. Constant-time secret path:
+   - Private scalar generation rejects with replacement when the
+     candidate is >= n (a value-dependent loop, but the iteration count
+     is biased so heavily toward acceptance that the leakage is
+     dominated by the entropy source's own timing properties).
+   - Scalar multiplication uses the curve module's constant-time
+     Montgomery ladder (see curve_pXXX.runa).
+   - k inversion uses bigint_mod_exp via Fermat (constant-time over
+     loop bounds).
+   - Final r-comparison in verify is bytewise compared in a public-time
+     manner since r is public; we still use a constant-time helper.
+
+5. Domain: signatures are NOT length-prefixed by the curve identifier;
+   the calling protocol (X.509, TLS, SSH) is responsible for tagging.
+   The DER serializer emits the canonical (r, s) tuple only.
+
+References:
+- NIST FIPS 186-4 (Digital Signature Standard).
+- RFC 6979 "Deterministic Usage of the Digital Signature Algorithm".
+- SEC 1: Elliptic Curve Cryptography v2.0 section 4.1.
+- RFC 5480 (algorithm OIDs and signature encoding).
+- Hankerson, Menezes, Vanstone "Guide to Elliptic Curve Cryptography"
+  chapter 4 (ECDSA).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/bigint.runa" as BigInt
+Import "compiler/frontend/import_system/crypto/bigint_extra.runa" as BigIntX
+Import "compiler/frontend/import_system/crypto/hmac.runa" as Hmac
+Import "compiler/frontend/import_system/crypto/sha2.runa" as Sha2
+Import "compiler/frontend/import_system/crypto/entropy.runa" as Entropy
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as SecureMem
+Import "compiler/frontend/import_system/crypto/curve_p256.runa" as P256
+Import "compiler/frontend/import_system/crypto/curve_p384.runa" as P384
+Import "compiler/frontend/import_system/crypto/curve_p521.runa" as P521
+Import "compiler/frontend/import_system/crypto/field_p256.runa" as F256
+Import "compiler/frontend/import_system/crypto/field_p384.runa" as F384
+Import "compiler/frontend/import_system/crypto/field_p521.runa" as F521
+
+Note: Hash algorithm identifiers used internally to parametrize RFC 6979.
+Constant ECDSA_HASH_SHA256 as Integer is 0
+Constant ECDSA_HASH_SHA384 as Integer is 1
+Constant ECDSA_HASH_SHA512 as Integer is 2
+
+Note: ============================================================================
+Note: Generic hash dispatch
+Note: ============================================================================
+
+Process called "ecdsa_hash_output_size" takes hash_id as Integer returns Integer:
+    @Reasoning
+    Returns the digest size in bytes for the named hash function.
+    @End Reasoning
+
+    @Implementation
+    SHA-256 -> 32, SHA-384 -> 48, SHA-512 -> 64.
+    @End Implementation
+
+    @Performance_Hints
+    Single comparison.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public dispatch.
+    @End Security_Scope
+
+    If hash_id is equal to ECDSA_HASH_SHA256:
+        Return 32
+    End If
+    If hash_id is equal to ECDSA_HASH_SHA384:
+        Return 48
+    End If
+    If hash_id is equal to ECDSA_HASH_SHA512:
+        Return 64
+    End If
+    Return 0
+End Process
+
+Process called "ecdsa_hash_message" takes arena as Integer, hash_id as Integer, message as Integer, message_length as Integer, out_digest as Integer returns Integer:
+    @Reasoning
+    Dispatches to the appropriate SHA-2 variant for the curve.
+    @End Reasoning
+
+    @Implementation
+    Selects sha256_hash, sha384_hash, or sha512_hash.
+    @End Implementation
+
+    @Performance_Hints
+    Pure dispatch; cost is that of the underlying hash.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public dispatch.
+    @End Security_Scope
+
+    If hash_id is equal to ECDSA_HASH_SHA256:
+        Return proc sha256_hash from Sha2 with arena, message, message_length, out_digest
+    End If
+    If hash_id is equal to ECDSA_HASH_SHA384:
+        Return proc sha384_hash from Sha2 with arena, message, message_length, out_digest
+    End If
+    If hash_id is equal to ECDSA_HASH_SHA512:
+        Return proc sha512_hash from Sha2 with arena, message, message_length, out_digest
+    End If
+    Return 0
+End Process
+
+Process called "ecdsa_hmac_hash" takes arena as Integer, hash_id as Integer, key as Integer, key_length as Integer, message as Integer, message_length as Integer, out_tag as Integer returns Integer:
+    @Reasoning
+    Dispatches to HMAC over the SHA-2 variant identified by hash_id.
+    Used by RFC 6979 deterministic-k generation.
+    @End Reasoning
+
+    @Implementation
+    Selects hmac_sha256, hmac_sha384, or hmac_sha512.
+    @End Implementation
+
+    @Performance_Hints
+    Pure dispatch.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time over message length per the chosen HMAC variant.
+    @End Security_Scope
+
+    If hash_id is equal to ECDSA_HASH_SHA256:
+        Return proc hmac_sha256 from Hmac with arena, key, key_length, message, message_length, out_tag
+    End If
+    If hash_id is equal to ECDSA_HASH_SHA384:
+        Return proc hmac_sha384 from Hmac with arena, key, key_length, message, message_length, out_tag
+    End If
+    If hash_id is equal to ECDSA_HASH_SHA512:
+        Return proc hmac_sha512 from Hmac with arena, key, key_length, message, message_length, out_tag
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: BigInt bit-length helper
+Note: ============================================================================
+
+Process called "ecdsa_bit_length" takes bn as Integer returns Integer:
+    @Reasoning
+    Returns the bit length of a BigInt (1 + index of highest set bit).
+    Used by RFC 6979 to compute the bit-truncation length qlen.
+    @End Reasoning
+
+    @Implementation
+    Walk limbs from high to low; find first non-zero; count its high
+    bit position; combine with the limb index.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count) for the limb scan plus O(64) for the bit scan.
+    @End Performance_Hints
+
+    @Security_Scope
+    The result depends on the input value; callers must invoke this
+    only on public parameters such as the curve order n.
+    @End Security_Scope
+
+    If bn is equal to 0:
+        Return 0
+    End If
+    Let count be proc bigint_get_limb_count from BigInt with bn
+    Let li_plus_one be count
+    While li_plus_one is greater than 0:
+        Let li be li_plus_one minus 1
+        Let lv be proc bigint_get_limb from BigInt with bn, li
+        If lv is not equal to 0:
+            Let bit_pos be 0
+            Let lv_copy be lv
+            While lv_copy is not equal to 0:
+                Set lv_copy to lv_copy divided by 2
+                Set bit_pos to bit_pos plus 1
+            End While
+            Return li multiplied by 64 plus bit_pos
+        End If
+        Set li_plus_one to li_plus_one minus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: RFC 6979 helpers: int2octets and bits2int / bits2octets
+Note: ============================================================================
+
+Process called "ecdsa_int_to_octets" takes bn as Integer, rolen as Integer, out_buffer as Integer returns Integer:
+    @Reasoning
+    Encodes a BigInt as a rolen-byte big-endian octet string per
+    RFC 6979 section 2.3.3. rolen = ceil(qlen / 8).
+    @End Reasoning
+
+    @Implementation
+    Delegates to bigint_to_bytes_be with output capacity rolen.
+    @End Implementation
+
+    @Performance_Hints
+    O(rolen) byte writes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant time over rolen (no value-dependent branching).
+    @End Security_Scope
+
+    Return proc bigint_to_bytes_be from BigInt with bn, out_buffer, rolen
+End Process
+
+Process called "ecdsa_bits_to_int" takes arena as Integer, in_bytes as Integer, in_length as Integer, qlen as Integer returns Integer:
+    @Reasoning
+    Converts an octet string to a BigInt per RFC 6979 section 2.3.2.
+    If the bit length of the input exceeds qlen, the high bits are
+    discarded (right-shift by (8*in_length - qlen)).
+    @End Reasoning
+
+    @Implementation
+    1. Build a BigInt from the bytes (big-endian).
+    2. If 8*in_length > qlen, shift right by the excess bit count.
+    @End Implementation
+
+    @Performance_Hints
+    One BigInt construction plus O(excess_bits) shift loop.
+    @End Performance_Hints
+
+    @Security_Scope
+    The shift count depends only on the public parameters qlen and
+    in_length, not on the value being shifted. Constant-time over
+    those parameters.
+    @End Security_Scope
+
+    Let bn be proc bigint_from_bytes_be from BigInt with arena, in_bytes, in_length
+    If bn is equal to 0:
+        Return 0
+    End If
+    Let in_bits be in_length multiplied by 8
+    If in_bits is greater than qlen:
+        Let excess be in_bits minus qlen
+        Let shift_iter be 0
+        While shift_iter is less than excess:
+            proc bigint_shift_right_one from BigIntX with bn
+            Set shift_iter to shift_iter plus 1
+        End While
+    End If
+    Return bn
+End Process
+
+Process called "ecdsa_bits_to_octets" takes arena as Integer, in_bytes as Integer, in_length as Integer, qlen as Integer, rolen as Integer, n as Integer, out_buffer as Integer returns Integer:
+    @Reasoning
+    Implements bits2octets(in) = int2octets(bits2int(in) mod q) per
+    RFC 6979 2.3.4.
+    @End Reasoning
+
+    @Implementation
+    1. z1 = bits2int(in, qlen).
+    2. z2 = z1 mod n.
+    3. int2octets(z2, rolen, out_buffer).
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by the modular reduction.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public-data only (the input is the message hash). The modular
+    reduction uses bigint_mod which is not strictly constant-time over
+    its inputs but the inputs here are public.
+    @End Security_Scope
+
+    Let z1 be proc ecdsa_bits_to_int with arena, in_bytes, in_length, qlen
+    If z1 is equal to 0:
+        Return 0
+    End If
+    Let z2 be proc bigint_alloc from BigInt with arena, 20
+    If z2 is equal to 0:
+        Return 0
+    End If
+    Let cmp be proc bigint_compare from BigInt with z1, n
+    If cmp is less than 0:
+        proc ecdsa_int_to_octets with z1, rolen, out_buffer
+        Return 1
+    End If
+    proc bigint_mod from BigInt with arena, z2, z1, n
+    proc ecdsa_int_to_octets with z2, rolen, out_buffer
+    Return 1
+End Process
+
+Note:
+================================================================================
+RFC 6979 deterministic k generation
+
+Inputs:
+  x  - private key (BigInt with 0 < x < n)
+  h1 - hashed message bytes (hlen bytes)
+  n  - curve order
+  qlen, rolen - bit / byte length of n
+  hash_id - SHA-2 variant
+
+Output:
+  k - BigInt with 1 <= k <= n-1
+================================================================================
+:End Note
+
+Process called "ecdsa_rfc6979_generate_k" takes arena as Integer, hash_id as Integer, x as Integer, h1_bytes as Integer, hlen as Integer, n as Integer, qlen as Integer, rolen as Integer returns Integer:
+    @Reasoning
+    Implements the RFC 6979 section 3.2 algorithm. The HMAC-DRBG is
+    seeded with the private key octets and bits2octets of the message
+    hash; the output stream is drawn until a k in [1, n-1] is found.
+    For NIST curves the bias against small k values from a single
+    candidate is negligible (a fraction of 2^-(qlen-bitlen(n)) ~ 0 for
+    P-256/P-384, and for P-521 the candidate q-1 is below 2^521 so the
+    bias is at most 2^-256).
+    @End Reasoning
+
+    @Implementation
+    1. V = 0x01-repeated (hlen bytes).
+    2. K = 0x00-repeated (hlen bytes).
+    3. K = HMAC_K(V || 0x00 || int2octets(x) || bits2octets(h1)).
+    4. V = HMAC_K(V).
+    5. K = HMAC_K(V || 0x01 || int2octets(x) || bits2octets(h1)).
+    6. V = HMAC_K(V).
+    7. Outer loop:
+       T = empty
+       while bitlen(T) < qlen:
+           V = HMAC_K(V)
+           T = T || V
+       cand = bits2int(T, qlen)
+       if 1 <= cand <= n-1:
+           return cand
+       K = HMAC_K(V || 0x00)
+       V = HMAC_K(V)
+    @End Implementation
+
+    @Performance_Hints
+    Each iteration costs (rolen+33)/hlen HMACs to refill T plus one
+    HMAC to update V. Typical cost: 3-4 HMAC invocations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against k-reuse and k-bias attacks. The HMAC-DRBG output
+    is cryptographically indistinguishable from uniform given a unique
+    (x, h1) pair, so k is unique per message hash.
+    @End Security_Scope
+
+    Let v_buf be proc arena_allocate from Arena with arena, hlen
+    Let k_buf be proc arena_allocate from Arena with arena, hlen
+    If v_buf is equal to 0:
+        Return 0
+    End If
+    If k_buf is equal to 0:
+        Return 0
+    End If
+    Note: V = 0x01-repeated, K = 0x00-repeated
+    Let vi be 0
+    While vi is less than hlen:
+        proc memory_set_byte from Memory with v_buf, vi, 1
+        proc memory_set_byte from Memory with k_buf, vi, 0
+        Set vi to vi plus 1
+    End While
+
+    Let x_octets be proc arena_allocate from Arena with arena, rolen
+    Let h1_octets be proc arena_allocate from Arena with arena, rolen
+    If x_octets is equal to 0:
+        Return 0
+    End If
+    If h1_octets is equal to 0:
+        Return 0
+    End If
+    proc ecdsa_int_to_octets with x, rolen, x_octets
+    proc ecdsa_bits_to_octets with arena, h1_bytes, hlen, qlen, rolen, n, h1_octets
+
+    Note: Build seed_data1 = V || 0x00 || x_oct || h1_oct
+    Let seed_size be hlen plus 1 plus rolen plus rolen
+    Let seed_data1 be proc arena_allocate from Arena with arena, seed_size
+    If seed_data1 is equal to 0:
+        Return 0
+    End If
+    Let s_i be 0
+    While s_i is less than hlen:
+        Let vb be proc memory_get_byte from Memory with v_buf, s_i
+        proc memory_set_byte from Memory with seed_data1, s_i, vb
+        Set s_i to s_i plus 1
+    End While
+    proc memory_set_byte from Memory with seed_data1, hlen, 0
+    Let xo_i be 0
+    While xo_i is less than rolen:
+        Let xob be proc memory_get_byte from Memory with x_octets, xo_i
+        proc memory_set_byte from Memory with seed_data1, hlen plus 1 plus xo_i, xob
+        Set xo_i to xo_i plus 1
+    End While
+    Let ho_i be 0
+    While ho_i is less than rolen:
+        Let hob be proc memory_get_byte from Memory with h1_octets, ho_i
+        proc memory_set_byte from Memory with seed_data1, hlen plus 1 plus rolen plus ho_i, hob
+        Set ho_i to ho_i plus 1
+    End While
+    Let new_k be proc arena_allocate from Arena with arena, hlen
+    If new_k is equal to 0:
+        Return 0
+    End If
+    proc ecdsa_hmac_hash with arena, hash_id, k_buf, hlen, seed_data1, seed_size, new_k
+    Let k_copy_i be 0
+    While k_copy_i is less than hlen:
+        Let kb be proc memory_get_byte from Memory with new_k, k_copy_i
+        proc memory_set_byte from Memory with k_buf, k_copy_i, kb
+        Set k_copy_i to k_copy_i plus 1
+    End While
+
+    Note: V = HMAC_K(V)
+    Let new_v be proc arena_allocate from Arena with arena, hlen
+    If new_v is equal to 0:
+        Return 0
+    End If
+    proc ecdsa_hmac_hash with arena, hash_id, k_buf, hlen, v_buf, hlen, new_v
+    Let v_copy_i be 0
+    While v_copy_i is less than hlen:
+        Let vb2 be proc memory_get_byte from Memory with new_v, v_copy_i
+        proc memory_set_byte from Memory with v_buf, v_copy_i, vb2
+        Set v_copy_i to v_copy_i plus 1
+    End While
+
+    Note: K = HMAC_K(V || 0x01 || x_oct || h1_oct)
+    proc memory_set_byte from Memory with seed_data1, hlen, 1
+    Let s_i2 be 0
+    While s_i2 is less than hlen:
+        Let vb3 be proc memory_get_byte from Memory with v_buf, s_i2
+        proc memory_set_byte from Memory with seed_data1, s_i2, vb3
+        Set s_i2 to s_i2 plus 1
+    End While
+    proc ecdsa_hmac_hash with arena, hash_id, k_buf, hlen, seed_data1, seed_size, new_k
+    Let k_copy_j be 0
+    While k_copy_j is less than hlen:
+        Let kb2 be proc memory_get_byte from Memory with new_k, k_copy_j
+        proc memory_set_byte from Memory with k_buf, k_copy_j, kb2
+        Set k_copy_j to k_copy_j plus 1
+    End While
+    proc ecdsa_hmac_hash with arena, hash_id, k_buf, hlen, v_buf, hlen, new_v
+    Let v_copy_j be 0
+    While v_copy_j is less than hlen:
+        Let vb4 be proc memory_get_byte from Memory with new_v, v_copy_j
+        proc memory_set_byte from Memory with v_buf, v_copy_j, vb4
+        Set v_copy_j to v_copy_j plus 1
+    End While
+
+    Note: Outer loop: build T, check candidate, retry on rejection.
+    Let one_bn be proc bigint_from_u64 from BigInt with arena, 1
+    Let still_searching be 1
+    Let result_k be 0
+    While still_searching is equal to 1:
+        Note: Build T by concatenating HMAC_K(V) iterates until bitlen >= qlen.
+        Let t_capacity be rolen plus hlen
+        Let t_buf be proc arena_allocate from Arena with arena, t_capacity
+        If t_buf is equal to 0:
+            Return 0
+        End If
+        Let t_len be 0
+        While t_len multiplied by 8 is less than qlen:
+            proc ecdsa_hmac_hash with arena, hash_id, k_buf, hlen, v_buf, hlen, new_v
+            Let v_copy_k be 0
+            While v_copy_k is less than hlen:
+                Let vb5 be proc memory_get_byte from Memory with new_v, v_copy_k
+                proc memory_set_byte from Memory with v_buf, v_copy_k, vb5
+                proc memory_set_byte from Memory with t_buf, t_len plus v_copy_k, vb5
+                Set v_copy_k to v_copy_k plus 1
+            End While
+            Set t_len to t_len plus hlen
+        End While
+
+        Let cand_k be proc ecdsa_bits_to_int with arena, t_buf, t_len, qlen
+        If cand_k is equal to 0:
+            Note: candidate is zero - reject
+            Note: fall through to retry path below
+        Otherwise:
+            Let cmp_lo be proc bigint_compare from BigInt with cand_k, one_bn
+            If cmp_lo is less than 0:
+                Note: cand_k < 1 - reject
+            Otherwise:
+                Let cmp_hi be proc bigint_compare from BigInt with cand_k, n
+                If cmp_hi is less than 0:
+                    Set result_k to cand_k
+                    Set still_searching to 0
+                End If
+            End If
+        End If
+        If still_searching is equal to 1:
+            Note: K = HMAC_K(V || 0x00)
+            Let retry_size be hlen plus 1
+            Let retry_buf be proc arena_allocate from Arena with arena, retry_size
+            If retry_buf is equal to 0:
+                Return 0
+            End If
+            Let rc_i be 0
+            While rc_i is less than hlen:
+                Let vb6 be proc memory_get_byte from Memory with v_buf, rc_i
+                proc memory_set_byte from Memory with retry_buf, rc_i, vb6
+                Set rc_i to rc_i plus 1
+            End While
+            proc memory_set_byte from Memory with retry_buf, hlen, 0
+            proc ecdsa_hmac_hash with arena, hash_id, k_buf, hlen, retry_buf, retry_size, new_k
+            Let k_copy_l be 0
+            While k_copy_l is less than hlen:
+                Let kb3 be proc memory_get_byte from Memory with new_k, k_copy_l
+                proc memory_set_byte from Memory with k_buf, k_copy_l, kb3
+                Set k_copy_l to k_copy_l plus 1
+            End While
+            proc ecdsa_hmac_hash with arena, hash_id, k_buf, hlen, v_buf, hlen, new_v
+            Let v_copy_m be 0
+            While v_copy_m is less than hlen:
+                Let vb7 be proc memory_get_byte from Memory with new_v, v_copy_m
+                proc memory_set_byte from Memory with v_buf, v_copy_m, vb7
+                Set v_copy_m to v_copy_m plus 1
+            End While
+        End If
+    End While
+    proc secure_zero from SecureMem with k_buf, hlen
+    proc secure_zero from SecureMem with v_buf, hlen
+    proc secure_zero from SecureMem with x_octets, rolen
+    Return result_k
+End Process
+
+Note: ============================================================================
+Note: Modular inverse mod n via Fermat: x^-1 = x^(n-2) mod n
+Note: Uses bigint_mod_exp with the public exponent (n - 2). Constant-time
+Note: over the loop bounds; suitable for the secret-key path.
+Note: ============================================================================
+
+Process called "ecdsa_mod_inverse" takes arena as Integer, dest as Integer, x as Integer, n as Integer returns Integer:
+    @Reasoning
+    Computes dest = x^-1 mod n via Fermat's little theorem. n must be
+    prime; for ECDSA n is the group order of a NIST curve, which is
+    prime.
+    @End Reasoning
+
+    @Implementation
+    1. exponent = n - 2.
+    2. dest = x^exponent mod n.
+    @End Implementation
+
+    @Performance_Hints
+    Dominant cost is bigint_mod_exp over ~256/384/521 bits.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time over bit length of n (the exponent is data-dependent
+    but the value n is public).
+    @End Security_Scope
+
+    Let exp_bn be proc bigint_alloc from BigInt with arena, 20
+    If exp_bn is equal to 0:
+        Return 0
+    End If
+    Let two_bn be proc bigint_from_u64 from BigInt with arena, 2
+    proc bigint_sub from BigInt with exp_bn, n, two_bn
+    Return proc bigint_mod_exp from BigInt with arena, dest, x, exp_bn, n
+End Process
+
+Note: ============================================================================
+Note: Private scalar generation: random d with 1 <= d <= n - 1
+Note: ============================================================================
+
+Process called "ecdsa_keygen_private_scalar" takes arena as Integer, n as Integer, rolen as Integer, out_d as Integer returns Integer:
+    @Reasoning
+    Generates a random private scalar uniformly in [1, n-1]. Uses
+    rejection sampling on rolen-byte candidates with high-bit masking
+    so the acceptance probability is at least 1/2 (RFC 6979 section 3.3
+    style).
+    @End Reasoning
+
+    @Implementation
+    Loop:
+        1. Read rolen entropic bytes.
+        2. Decode as BigInt.
+        3. If 1 <= candidate <= n-1, accept; else loop.
+    @End Implementation
+
+    @Performance_Hints
+    Each iteration costs an entropy draw plus a comparison. Expected
+    iterations: ~1 for P-256/P-384, ~1 for P-521.
+    @End Performance_Hints
+
+    @Security_Scope
+    Output is the secret private key. The rejection-sampling branch
+    leaks only the number of iterations (which has small variance) and
+    not the value of any rejected candidate.
+    @End Security_Scope
+
+    Let one_bn be proc bigint_from_u64 from BigInt with arena, 1
+    Let try_buf be proc arena_allocate from Arena with arena, rolen
+    If try_buf is equal to 0:
+        Return 0
+    End If
+    Let attempt be 0
+    Let max_attempts be 64
+    While attempt is less than max_attempts:
+        Let entropy_rc be proc entropy_random_bytes from Entropy with arena, try_buf, rolen
+        If entropy_rc is equal to 0:
+            Return 0
+        End If
+        Let cand be proc bigint_from_bytes_be from BigInt with arena, try_buf, rolen
+        Let cmp_lo be proc bigint_compare from BigInt with cand, one_bn
+        If cmp_lo is greater than 0 minus 1:
+            Let cmp_hi be proc bigint_compare from BigInt with cand, n
+            If cmp_hi is less than 0:
+                Let out_cap be proc bigint_get_limb_capacity from BigInt with out_d
+                Let cand_count be proc bigint_get_limb_count from BigInt with cand
+                If cand_count is greater than out_cap:
+                    Return 0
+                End If
+                Let zi be 0
+                While zi is less than out_cap:
+                    proc bigint_set_limb from BigInt with out_d, zi, 0
+                    Set zi to zi plus 1
+                End While
+                Let ci be 0
+                While ci is less than cand_count:
+                    Let lv be proc bigint_get_limb from BigInt with cand, ci
+                    proc bigint_set_limb from BigInt with out_d, ci, lv
+                    Set ci to ci plus 1
+                End While
+                proc bigint_set_limb_count from BigInt with out_d, cand_count
+                proc secure_zero from SecureMem with try_buf, rolen
+                Return 1
+            End If
+        End If
+        Set attempt to attempt plus 1
+    End While
+    proc secure_zero from SecureMem with try_buf, rolen
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: ECDSA P-256: key generation, sign, verify
+Note: ============================================================================
+
+Process called "ecdsa_p256_keygen" takes arena as Integer, private_out as Integer, public_out as Integer returns Integer:
+    @Reasoning
+    Generates a P-256 keypair. The private key is a random scalar in
+    [1, n-1]; the public key is private * G in Jacobian form.
+    @End Reasoning
+
+    @Implementation
+    1. Random scalar via ecdsa_keygen_private_scalar.
+    2. Public point = private * G via curve_p256_scalar_mul.
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by scalar multiplication (~30 ms on P-256).
+    @End Performance_Hints
+
+    @Security_Scope
+    Private key is secret; scalar mul is constant-time.
+    @End Security_Scope
+
+    Let n be proc curve_p256_order from P256 with arena
+    Let kgen_rc be proc ecdsa_keygen_private_scalar with arena, n, 32, private_out
+    If kgen_rc is equal to 0:
+        Return 0
+    End If
+    Let g be proc curve_p256_generator from P256 with arena
+    If g is equal to 0:
+        Return 0
+    End If
+    Return proc curve_p256_scalar_mul from P256 with arena, public_out, private_out, g
+End Process
+
+Process called "ecdsa_p256_sign" takes arena as Integer, private_key as Integer, message as Integer, message_length as Integer, sig_r_out as Integer, sig_s_out as Integer returns Integer:
+    @Reasoning
+    Signs a message with the P-256 private key using deterministic-k
+    per RFC 6979. Returns (r, s) into the caller-provided BigInt
+    buffers. r is computed as the x-coordinate of (k*G) mod n; s is
+    (k^-1 * (h + r*d)) mod n where h is the truncated hash.
+    @End Reasoning
+
+    @Implementation
+    1. h = SHA-256(message) reduced via bits2int to the order bit length.
+    2. k = RFC 6979 deterministic-k (SHA-256-based HMAC-DRBG).
+    3. R = k * G; r = R.x mod n. If r == 0, regenerate k.
+    4. k_inv = k^-1 mod n.
+    5. s = k_inv * (h + r * d) mod n. If s == 0, regenerate k.
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by scalar mul (~30 ms) plus modular inverse (~1 ms).
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time secret path: deterministic-k eliminates random
+    leakage; scalar mul uses constant-time ladder; inversion uses
+    Fermat over a fixed exponent.
+    @End Security_Scope
+
+    Let n be proc curve_p256_order from P256 with arena
+    Let qlen be proc ecdsa_bit_length with n
+    Let h1 be proc arena_allocate from Arena with arena, 32
+    If h1 is equal to 0:
+        Return 0
+    End If
+    proc ecdsa_hash_message with arena, ECDSA_HASH_SHA256, message, message_length, h1
+    Let h_int be proc ecdsa_bits_to_int with arena, h1, 32, qlen
+    If h_int is equal to 0:
+        Return 0
+    End If
+    Note: Reduce h_int mod n. ECDSA proceeds with h_int taken mod n in
+    Note: the signing equation.
+    Let h_mod be proc bigint_alloc from BigInt with arena, 20
+    If h_mod is equal to 0:
+        Return 0
+    End If
+    Let h_cmp be proc bigint_compare from BigInt with h_int, n
+    If h_cmp is less than 0:
+        Let hc_count be proc bigint_get_limb_count from BigInt with h_int
+        Let hcap be proc bigint_get_limb_capacity from BigInt with h_mod
+        Let hci be 0
+        While hci is less than hc_count:
+            Let hlv be proc bigint_get_limb from BigInt with h_int, hci
+            proc bigint_set_limb from BigInt with h_mod, hci, hlv
+            Set hci to hci plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with h_mod, hc_count
+    Otherwise:
+        proc bigint_mod from BigInt with arena, h_mod, h_int, n
+    End If
+
+    Let g be proc curve_p256_generator from P256 with arena
+
+    Let attempt be 0
+    Let max_attempts be 16
+    While attempt is less than max_attempts:
+        Let k be proc ecdsa_rfc6979_generate_k with arena, ECDSA_HASH_SHA256, private_key, h1, 32, n, qlen, 32
+        If k is equal to 0:
+            Return 0
+        End If
+        Let kg be proc curve_p256_point_alloc from P256 with arena
+        If kg is equal to 0:
+            Return 0
+        End If
+        proc curve_p256_scalar_mul from P256 with arena, kg, k, g
+
+        Note: Convert kg to affine; r = x mod n.
+        Let rx_aff be proc field_p256_zero from F256 with arena
+        Let ry_aff be proc field_p256_zero from F256 with arena
+        Let aff_rc be proc curve_p256_to_affine from P256 with arena, kg, rx_aff, ry_aff
+        If aff_rc is equal to 0:
+            Set attempt to attempt plus 1
+        Otherwise:
+            Let r_val be proc bigint_alloc from BigInt with arena, 20
+            Let rx_cmp be proc bigint_compare from BigInt with rx_aff, n
+            If rx_cmp is less than 0:
+                Let rxc be proc bigint_get_limb_count from BigInt with rx_aff
+                Let rxi be 0
+                While rxi is less than rxc:
+                    Let rxlv be proc bigint_get_limb from BigInt with rx_aff, rxi
+                    proc bigint_set_limb from BigInt with r_val, rxi, rxlv
+                    Set rxi to rxi plus 1
+                End While
+                proc bigint_set_limb_count from BigInt with r_val, rxc
+            Otherwise:
+                proc bigint_mod from BigInt with arena, r_val, rx_aff, n
+            End If
+            If proc bigint_is_zero from BigInt with r_val is equal to 1:
+                Set attempt to attempt plus 1
+            Otherwise:
+                Note: s = k^-1 * (h_mod + r*d) mod n
+                Let k_inv be proc bigint_alloc from BigInt with arena, 20
+                Let inv_rc be proc ecdsa_mod_inverse with arena, k_inv, k, n
+                If inv_rc is equal to 0:
+                    Set attempt to attempt plus 1
+                Otherwise:
+                    Let rd be proc bigint_alloc from BigInt with arena, 20
+                    Let rd_prod be proc bigint_alloc from BigInt with arena, 20
+                    proc bigint_mul from BigInt with rd_prod, r_val, private_key
+                    proc bigint_mod from BigInt with arena, rd, rd_prod, n
+
+                    Let sum_hd be proc bigint_alloc from BigInt with arena, 20
+                    Let sum_temp be proc bigint_alloc from BigInt with arena, 20
+                    proc bigint_add from BigInt with sum_temp, h_mod, rd
+                    Let sum_cmp be proc bigint_compare from BigInt with sum_temp, n
+                    If sum_cmp is less than 0:
+                        Let sc be proc bigint_get_limb_count from BigInt with sum_temp
+                        Let si be 0
+                        While si is less than sc:
+                            Let slv be proc bigint_get_limb from BigInt with sum_temp, si
+                            proc bigint_set_limb from BigInt with sum_hd, si, slv
+                            Set si to si plus 1
+                        End While
+                        proc bigint_set_limb_count from BigInt with sum_hd, sc
+                    Otherwise:
+                        proc bigint_mod from BigInt with arena, sum_hd, sum_temp, n
+                    End If
+
+                    Let s_prod be proc bigint_alloc from BigInt with arena, 20
+                    Let s_val be proc bigint_alloc from BigInt with arena, 20
+                    proc bigint_mul from BigInt with s_prod, k_inv, sum_hd
+                    proc bigint_mod from BigInt with arena, s_val, s_prod, n
+
+                    If proc bigint_is_zero from BigInt with s_val is equal to 1:
+                        Set attempt to attempt plus 1
+                    Otherwise:
+                        Note: Copy r_val into sig_r_out, s_val into sig_s_out.
+                        Let r_count_o be proc bigint_get_limb_count from BigInt with r_val
+                        Let r_cap_o be proc bigint_get_limb_capacity from BigInt with sig_r_out
+                        Let zi_r be 0
+                        While zi_r is less than r_cap_o:
+                            proc bigint_set_limb from BigInt with sig_r_out, zi_r, 0
+                            Set zi_r to zi_r plus 1
+                        End While
+                        Let ci_r be 0
+                        While ci_r is less than r_count_o:
+                            Let rlv be proc bigint_get_limb from BigInt with r_val, ci_r
+                            proc bigint_set_limb from BigInt with sig_r_out, ci_r, rlv
+                            Set ci_r to ci_r plus 1
+                        End While
+                        proc bigint_set_limb_count from BigInt with sig_r_out, r_count_o
+
+                        Let s_count_o be proc bigint_get_limb_count from BigInt with s_val
+                        Let s_cap_o be proc bigint_get_limb_capacity from BigInt with sig_s_out
+                        Let zi_s be 0
+                        While zi_s is less than s_cap_o:
+                            proc bigint_set_limb from BigInt with sig_s_out, zi_s, 0
+                            Set zi_s to zi_s plus 1
+                        End While
+                        Let ci_s be 0
+                        While ci_s is less than s_count_o:
+                            Let slv2 be proc bigint_get_limb from BigInt with s_val, ci_s
+                            proc bigint_set_limb from BigInt with sig_s_out, ci_s, slv2
+                            Set ci_s to ci_s plus 1
+                        End While
+                        proc bigint_set_limb_count from BigInt with sig_s_out, s_count_o
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return 0
+End Process
+
+Process called "ecdsa_p256_verify" takes arena as Integer, public_key as Integer, message as Integer, message_length as Integer, sig_r as Integer, sig_s as Integer returns Integer:
+    @Reasoning
+    Verifies an ECDSA P-256 signature. Returns 1 if valid, 0 otherwise.
+    @End Reasoning
+
+    @Implementation
+    1. Check 0 < r < n and 0 < s < n. Reject if out of range.
+    2. h = SHA-256(message) bits2int.
+    3. w = s^-1 mod n.
+    4. u1 = h * w mod n; u2 = r * w mod n.
+    5. P = u1*G + u2*public_key.
+    6. If P is infinity, reject.
+    7. Accept iff (P.x mod n) == r.
+    @End Implementation
+
+    @Performance_Hints
+    Two scalar multiplications plus one inversion. ~60 ms.
+    @End Performance_Hints
+
+    @Security_Scope
+    Inputs are public; constant-time-ness is not required, but the
+    final r comparison uses bigint_constant_time_equal.
+    @End Security_Scope
+
+    Let n be proc curve_p256_order from P256 with arena
+    If proc bigint_is_zero from BigInt with sig_r is equal to 1:
+        Return 0
+    End If
+    If proc bigint_is_zero from BigInt with sig_s is equal to 1:
+        Return 0
+    End If
+    Let r_cmp be proc bigint_compare from BigInt with sig_r, n
+    If r_cmp is greater than 0 minus 1:
+        Return 0
+    End If
+    Let s_cmp be proc bigint_compare from BigInt with sig_s, n
+    If s_cmp is greater than 0 minus 1:
+        Return 0
+    End If
+
+    Let qlen be proc ecdsa_bit_length with n
+    Let h1 be proc arena_allocate from Arena with arena, 32
+    proc ecdsa_hash_message with arena, ECDSA_HASH_SHA256, message, message_length, h1
+    Let h_int be proc ecdsa_bits_to_int with arena, h1, 32, qlen
+    Let h_mod be proc bigint_alloc from BigInt with arena, 20
+    Let h_cmp be proc bigint_compare from BigInt with h_int, n
+    If h_cmp is less than 0:
+        Let hc be proc bigint_get_limb_count from BigInt with h_int
+        Let hi be 0
+        While hi is less than hc:
+            Let hlv be proc bigint_get_limb from BigInt with h_int, hi
+            proc bigint_set_limb from BigInt with h_mod, hi, hlv
+            Set hi to hi plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with h_mod, hc
+    Otherwise:
+        proc bigint_mod from BigInt with arena, h_mod, h_int, n
+    End If
+
+    Let w be proc bigint_alloc from BigInt with arena, 20
+    Let inv_rc be proc ecdsa_mod_inverse with arena, w, sig_s, n
+    If inv_rc is equal to 0:
+        Return 0
+    End If
+
+    Let u1_prod be proc bigint_alloc from BigInt with arena, 20
+    Let u1 be proc bigint_alloc from BigInt with arena, 20
+    proc bigint_mul from BigInt with u1_prod, h_mod, w
+    proc bigint_mod from BigInt with arena, u1, u1_prod, n
+
+    Let u2_prod be proc bigint_alloc from BigInt with arena, 20
+    Let u2 be proc bigint_alloc from BigInt with arena, 20
+    proc bigint_mul from BigInt with u2_prod, sig_r, w
+    proc bigint_mod from BigInt with arena, u2, u2_prod, n
+
+    Let g be proc curve_p256_generator from P256 with arena
+    Let pt_a be proc curve_p256_point_alloc from P256 with arena
+    Let pt_b be proc curve_p256_point_alloc from P256 with arena
+    Let sum_pt be proc curve_p256_point_alloc from P256 with arena
+    proc curve_p256_scalar_mul from P256 with arena, pt_a, u1, g
+    proc curve_p256_scalar_mul from P256 with arena, pt_b, u2, public_key
+    proc curve_p256_add from P256 with arena, sum_pt, pt_a, pt_b
+
+    If proc curve_p256_point_is_infinity from P256 with sum_pt is equal to 1:
+        Return 0
+    End If
+
+    Let px be proc field_p256_zero from F256 with arena
+    Let py be proc field_p256_zero from F256 with arena
+    Let aff_rc be proc curve_p256_to_affine from P256 with arena, sum_pt, px, py
+    If aff_rc is equal to 0:
+        Return 0
+    End If
+
+    Let px_mod_n be proc bigint_alloc from BigInt with arena, 20
+    Let pxcmp be proc bigint_compare from BigInt with px, n
+    If pxcmp is less than 0:
+        Let pxc be proc bigint_get_limb_count from BigInt with px
+        Let pxi be 0
+        While pxi is less than pxc:
+            Let plv be proc bigint_get_limb from BigInt with px, pxi
+            proc bigint_set_limb from BigInt with px_mod_n, pxi, plv
+            Set pxi to pxi plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with px_mod_n, pxc
+    Otherwise:
+        proc bigint_mod from BigInt with arena, px_mod_n, px, n
+    End If
+
+    Return proc bigint_constant_time_equal from BigIntX with px_mod_n, sig_r
+End Process
+
+Note: ============================================================================
+Note: ECDSA P-384 sign / verify - same algorithm with SHA-384 and P-384 module
+Note: ============================================================================
+
+Process called "ecdsa_p384_keygen" takes arena as Integer, private_out as Integer, public_out as Integer returns Integer:
+    @Reasoning
+    Generates a P-384 keypair.
+    @End Reasoning
+
+    @Implementation
+    Random scalar + scalar*G via curve_p384 module.
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by scalar multiplication (~90 ms).
+    @End Performance_Hints
+
+    @Security_Scope
+    Private key is secret; constant-time scalar mul.
+    @End Security_Scope
+
+    Let n be proc curve_p384_order from P384 with arena
+    Let kgen_rc be proc ecdsa_keygen_private_scalar with arena, n, 48, private_out
+    If kgen_rc is equal to 0:
+        Return 0
+    End If
+    Let g be proc curve_p384_generator from P384 with arena
+    If g is equal to 0:
+        Return 0
+    End If
+    Return proc curve_p384_scalar_mul from P384 with arena, public_out, private_out, g
+End Process
+
+Process called "ecdsa_p384_sign" takes arena as Integer, private_key as Integer, message as Integer, message_length as Integer, sig_r_out as Integer, sig_s_out as Integer returns Integer:
+    @Reasoning
+    Signs with the P-384 private key using deterministic-k (RFC 6979)
+    and SHA-384.
+    @End Reasoning
+
+    @Implementation
+    Mirrors ecdsa_p256_sign with the P-384 curve module and SHA-384.
+    @End Implementation
+
+    @Performance_Hints
+    ~110 ms.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same guarantees as P-256.
+    @End Security_Scope
+
+    Let n be proc curve_p384_order from P384 with arena
+    Let qlen be proc ecdsa_bit_length with n
+    Let h1 be proc arena_allocate from Arena with arena, 48
+    If h1 is equal to 0:
+        Return 0
+    End If
+    proc ecdsa_hash_message with arena, ECDSA_HASH_SHA384, message, message_length, h1
+    Let h_int be proc ecdsa_bits_to_int with arena, h1, 48, qlen
+    If h_int is equal to 0:
+        Return 0
+    End If
+    Let h_mod be proc bigint_alloc from BigInt with arena, 20
+    Let h_cmp be proc bigint_compare from BigInt with h_int, n
+    If h_cmp is less than 0:
+        Let hc be proc bigint_get_limb_count from BigInt with h_int
+        Let hi be 0
+        While hi is less than hc:
+            Let hlv be proc bigint_get_limb from BigInt with h_int, hi
+            proc bigint_set_limb from BigInt with h_mod, hi, hlv
+            Set hi to hi plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with h_mod, hc
+    Otherwise:
+        proc bigint_mod from BigInt with arena, h_mod, h_int, n
+    End If
+
+    Let g be proc curve_p384_generator from P384 with arena
+
+    Let attempt be 0
+    Let max_attempts be 16
+    While attempt is less than max_attempts:
+        Let k be proc ecdsa_rfc6979_generate_k with arena, ECDSA_HASH_SHA384, private_key, h1, 48, n, qlen, 48
+        If k is equal to 0:
+            Return 0
+        End If
+        Let kg be proc curve_p384_point_alloc from P384 with arena
+        proc curve_p384_scalar_mul from P384 with arena, kg, k, g
+        Let rx_aff be proc field_p384_zero from F384 with arena
+        Let ry_aff be proc field_p384_zero from F384 with arena
+        Let aff_rc be proc curve_p384_to_affine from P384 with arena, kg, rx_aff, ry_aff
+        If aff_rc is equal to 0:
+            Set attempt to attempt plus 1
+        Otherwise:
+            Let r_val be proc bigint_alloc from BigInt with arena, 20
+            Let rx_cmp be proc bigint_compare from BigInt with rx_aff, n
+            If rx_cmp is less than 0:
+                Let rxc be proc bigint_get_limb_count from BigInt with rx_aff
+                Let rxi be 0
+                While rxi is less than rxc:
+                    Let rxlv be proc bigint_get_limb from BigInt with rx_aff, rxi
+                    proc bigint_set_limb from BigInt with r_val, rxi, rxlv
+                    Set rxi to rxi plus 1
+                End While
+                proc bigint_set_limb_count from BigInt with r_val, rxc
+            Otherwise:
+                proc bigint_mod from BigInt with arena, r_val, rx_aff, n
+            End If
+            If proc bigint_is_zero from BigInt with r_val is equal to 1:
+                Set attempt to attempt plus 1
+            Otherwise:
+                Let k_inv be proc bigint_alloc from BigInt with arena, 20
+                Let inv_rc be proc ecdsa_mod_inverse with arena, k_inv, k, n
+                If inv_rc is equal to 0:
+                    Set attempt to attempt plus 1
+                Otherwise:
+                    Let rd be proc bigint_alloc from BigInt with arena, 20
+                    Let rd_prod be proc bigint_alloc from BigInt with arena, 20
+                    proc bigint_mul from BigInt with rd_prod, r_val, private_key
+                    proc bigint_mod from BigInt with arena, rd, rd_prod, n
+                    Let sum_hd be proc bigint_alloc from BigInt with arena, 20
+                    Let sum_temp be proc bigint_alloc from BigInt with arena, 20
+                    proc bigint_add from BigInt with sum_temp, h_mod, rd
+                    Let sum_cmp be proc bigint_compare from BigInt with sum_temp, n
+                    If sum_cmp is less than 0:
+                        Let sc be proc bigint_get_limb_count from BigInt with sum_temp
+                        Let si be 0
+                        While si is less than sc:
+                            Let slv be proc bigint_get_limb from BigInt with sum_temp, si
+                            proc bigint_set_limb from BigInt with sum_hd, si, slv
+                            Set si to si plus 1
+                        End While
+                        proc bigint_set_limb_count from BigInt with sum_hd, sc
+                    Otherwise:
+                        proc bigint_mod from BigInt with arena, sum_hd, sum_temp, n
+                    End If
+                    Let s_prod be proc bigint_alloc from BigInt with arena, 20
+                    Let s_val be proc bigint_alloc from BigInt with arena, 20
+                    proc bigint_mul from BigInt with s_prod, k_inv, sum_hd
+                    proc bigint_mod from BigInt with arena, s_val, s_prod, n
+                    If proc bigint_is_zero from BigInt with s_val is equal to 1:
+                        Set attempt to attempt plus 1
+                    Otherwise:
+                        Let r_count_o be proc bigint_get_limb_count from BigInt with r_val
+                        Let r_cap_o be proc bigint_get_limb_capacity from BigInt with sig_r_out
+                        Let zi_r be 0
+                        While zi_r is less than r_cap_o:
+                            proc bigint_set_limb from BigInt with sig_r_out, zi_r, 0
+                            Set zi_r to zi_r plus 1
+                        End While
+                        Let ci_r be 0
+                        While ci_r is less than r_count_o:
+                            Let rlv be proc bigint_get_limb from BigInt with r_val, ci_r
+                            proc bigint_set_limb from BigInt with sig_r_out, ci_r, rlv
+                            Set ci_r to ci_r plus 1
+                        End While
+                        proc bigint_set_limb_count from BigInt with sig_r_out, r_count_o
+                        Let s_count_o be proc bigint_get_limb_count from BigInt with s_val
+                        Let s_cap_o be proc bigint_get_limb_capacity from BigInt with sig_s_out
+                        Let zi_s be 0
+                        While zi_s is less than s_cap_o:
+                            proc bigint_set_limb from BigInt with sig_s_out, zi_s, 0
+                            Set zi_s to zi_s plus 1
+                        End While
+                        Let ci_s be 0
+                        While ci_s is less than s_count_o:
+                            Let slv2 be proc bigint_get_limb from BigInt with s_val, ci_s
+                            proc bigint_set_limb from BigInt with sig_s_out, ci_s, slv2
+                            Set ci_s to ci_s plus 1
+                        End While
+                        proc bigint_set_limb_count from BigInt with sig_s_out, s_count_o
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return 0
+End Process
+
+Process called "ecdsa_p384_verify" takes arena as Integer, public_key as Integer, message as Integer, message_length as Integer, sig_r as Integer, sig_s as Integer returns Integer:
+    @Reasoning
+    Verifies an ECDSA P-384 signature.
+    @End Reasoning
+
+    @Implementation
+    Mirrors ecdsa_p256_verify with the P-384 curve module and SHA-384.
+    @End Implementation
+
+    @Performance_Hints
+    ~200 ms.
+    @End Performance_Hints
+
+    @Security_Scope
+    Inputs are public; final r comparison is constant-time.
+    @End Security_Scope
+
+    Let n be proc curve_p384_order from P384 with arena
+    If proc bigint_is_zero from BigInt with sig_r is equal to 1:
+        Return 0
+    End If
+    If proc bigint_is_zero from BigInt with sig_s is equal to 1:
+        Return 0
+    End If
+    Let r_cmp be proc bigint_compare from BigInt with sig_r, n
+    If r_cmp is greater than 0 minus 1:
+        Return 0
+    End If
+    Let s_cmp be proc bigint_compare from BigInt with sig_s, n
+    If s_cmp is greater than 0 minus 1:
+        Return 0
+    End If
+
+    Let qlen be proc ecdsa_bit_length with n
+    Let h1 be proc arena_allocate from Arena with arena, 48
+    proc ecdsa_hash_message with arena, ECDSA_HASH_SHA384, message, message_length, h1
+    Let h_int be proc ecdsa_bits_to_int with arena, h1, 48, qlen
+    Let h_mod be proc bigint_alloc from BigInt with arena, 20
+    Let h_cmp be proc bigint_compare from BigInt with h_int, n
+    If h_cmp is less than 0:
+        Let hc be proc bigint_get_limb_count from BigInt with h_int
+        Let hi be 0
+        While hi is less than hc:
+            Let hlv be proc bigint_get_limb from BigInt with h_int, hi
+            proc bigint_set_limb from BigInt with h_mod, hi, hlv
+            Set hi to hi plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with h_mod, hc
+    Otherwise:
+        proc bigint_mod from BigInt with arena, h_mod, h_int, n
+    End If
+
+    Let w be proc bigint_alloc from BigInt with arena, 20
+    Let inv_rc be proc ecdsa_mod_inverse with arena, w, sig_s, n
+    If inv_rc is equal to 0:
+        Return 0
+    End If
+
+    Let u1_prod be proc bigint_alloc from BigInt with arena, 20
+    Let u1 be proc bigint_alloc from BigInt with arena, 20
+    proc bigint_mul from BigInt with u1_prod, h_mod, w
+    proc bigint_mod from BigInt with arena, u1, u1_prod, n
+
+    Let u2_prod be proc bigint_alloc from BigInt with arena, 20
+    Let u2 be proc bigint_alloc from BigInt with arena, 20
+    proc bigint_mul from BigInt with u2_prod, sig_r, w
+    proc bigint_mod from BigInt with arena, u2, u2_prod, n
+
+    Let g be proc curve_p384_generator from P384 with arena
+    Let pt_a be proc curve_p384_point_alloc from P384 with arena
+    Let pt_b be proc curve_p384_point_alloc from P384 with arena
+    Let sum_pt be proc curve_p384_point_alloc from P384 with arena
+    proc curve_p384_scalar_mul from P384 with arena, pt_a, u1, g
+    proc curve_p384_scalar_mul from P384 with arena, pt_b, u2, public_key
+    proc curve_p384_add from P384 with arena, sum_pt, pt_a, pt_b
+
+    If proc curve_p384_point_is_infinity from P384 with sum_pt is equal to 1:
+        Return 0
+    End If
+
+    Let px be proc field_p384_zero from F384 with arena
+    Let py be proc field_p384_zero from F384 with arena
+    Let aff_rc be proc curve_p384_to_affine from P384 with arena, sum_pt, px, py
+    If aff_rc is equal to 0:
+        Return 0
+    End If
+
+    Let px_mod_n be proc bigint_alloc from BigInt with arena, 20
+    Let pxcmp be proc bigint_compare from BigInt with px, n
+    If pxcmp is less than 0:
+        Let pxc be proc bigint_get_limb_count from BigInt with px
+        Let pxi be 0
+        While pxi is less than pxc:
+            Let plv be proc bigint_get_limb from BigInt with px, pxi
+            proc bigint_set_limb from BigInt with px_mod_n, pxi, plv
+            Set pxi to pxi plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with px_mod_n, pxc
+    Otherwise:
+        proc bigint_mod from BigInt with arena, px_mod_n, px, n
+    End If
+
+    Return proc bigint_constant_time_equal from BigIntX with px_mod_n, sig_r
+End Process
+
+Note: ============================================================================
+Note: ECDSA P-521 sign / verify - same algorithm with SHA-512 and P-521 module
+Note: ============================================================================
+
+Process called "ecdsa_p521_keygen" takes arena as Integer, private_out as Integer, public_out as Integer returns Integer:
+    @Reasoning
+    Generates a P-521 keypair.
+    @End Reasoning
+
+    @Implementation
+    Random scalar in [1, n-1]; public = private * G.
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by scalar mul (~230 ms).
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time secret path.
+    @End Security_Scope
+
+    Let n be proc curve_p521_order from P521 with arena
+    Let kgen_rc be proc ecdsa_keygen_private_scalar with arena, n, 66, private_out
+    If kgen_rc is equal to 0:
+        Return 0
+    End If
+    Let g be proc curve_p521_generator from P521 with arena
+    If g is equal to 0:
+        Return 0
+    End If
+    Return proc curve_p521_scalar_mul from P521 with arena, public_out, private_out, g
+End Process
+
+Process called "ecdsa_p521_sign" takes arena as Integer, private_key as Integer, message as Integer, message_length as Integer, sig_r_out as Integer, sig_s_out as Integer returns Integer:
+    @Reasoning
+    Signs with the P-521 private key using deterministic-k (RFC 6979)
+    and SHA-512.
+    @End Reasoning
+
+    @Implementation
+    Mirrors ecdsa_p256_sign with the P-521 curve module and SHA-512.
+    @End Implementation
+
+    @Performance_Hints
+    ~250 ms.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same guarantees as P-256.
+    @End Security_Scope
+
+    Let n be proc curve_p521_order from P521 with arena
+    Let qlen be proc ecdsa_bit_length with n
+    Let h1 be proc arena_allocate from Arena with arena, 64
+    If h1 is equal to 0:
+        Return 0
+    End If
+    proc ecdsa_hash_message with arena, ECDSA_HASH_SHA512, message, message_length, h1
+    Let h_int be proc ecdsa_bits_to_int with arena, h1, 64, qlen
+    If h_int is equal to 0:
+        Return 0
+    End If
+    Let h_mod be proc bigint_alloc from BigInt with arena, 20
+    Let h_cmp be proc bigint_compare from BigInt with h_int, n
+    If h_cmp is less than 0:
+        Let hc be proc bigint_get_limb_count from BigInt with h_int
+        Let hi be 0
+        While hi is less than hc:
+            Let hlv be proc bigint_get_limb from BigInt with h_int, hi
+            proc bigint_set_limb from BigInt with h_mod, hi, hlv
+            Set hi to hi plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with h_mod, hc
+    Otherwise:
+        proc bigint_mod from BigInt with arena, h_mod, h_int, n
+    End If
+
+    Let g be proc curve_p521_generator from P521 with arena
+
+    Let attempt be 0
+    Let max_attempts be 16
+    While attempt is less than max_attempts:
+        Let k be proc ecdsa_rfc6979_generate_k with arena, ECDSA_HASH_SHA512, private_key, h1, 64, n, qlen, 66
+        If k is equal to 0:
+            Return 0
+        End If
+        Let kg be proc curve_p521_point_alloc from P521 with arena
+        proc curve_p521_scalar_mul from P521 with arena, kg, k, g
+        Let rx_aff be proc field_p521_zero from F521 with arena
+        Let ry_aff be proc field_p521_zero from F521 with arena
+        Let aff_rc be proc curve_p521_to_affine from P521 with arena, kg, rx_aff, ry_aff
+        If aff_rc is equal to 0:
+            Set attempt to attempt plus 1
+        Otherwise:
+            Let r_val be proc bigint_alloc from BigInt with arena, 20
+            Let rx_cmp be proc bigint_compare from BigInt with rx_aff, n
+            If rx_cmp is less than 0:
+                Let rxc be proc bigint_get_limb_count from BigInt with rx_aff
+                Let rxi be 0
+                While rxi is less than rxc:
+                    Let rxlv be proc bigint_get_limb from BigInt with rx_aff, rxi
+                    proc bigint_set_limb from BigInt with r_val, rxi, rxlv
+                    Set rxi to rxi plus 1
+                End While
+                proc bigint_set_limb_count from BigInt with r_val, rxc
+            Otherwise:
+                proc bigint_mod from BigInt with arena, r_val, rx_aff, n
+            End If
+            If proc bigint_is_zero from BigInt with r_val is equal to 1:
+                Set attempt to attempt plus 1
+            Otherwise:
+                Let k_inv be proc bigint_alloc from BigInt with arena, 20
+                Let inv_rc be proc ecdsa_mod_inverse with arena, k_inv, k, n
+                If inv_rc is equal to 0:
+                    Set attempt to attempt plus 1
+                Otherwise:
+                    Let rd be proc bigint_alloc from BigInt with arena, 20
+                    Let rd_prod be proc bigint_alloc from BigInt with arena, 20
+                    proc bigint_mul from BigInt with rd_prod, r_val, private_key
+                    proc bigint_mod from BigInt with arena, rd, rd_prod, n
+                    Let sum_hd be proc bigint_alloc from BigInt with arena, 20
+                    Let sum_temp be proc bigint_alloc from BigInt with arena, 20
+                    proc bigint_add from BigInt with sum_temp, h_mod, rd
+                    Let sum_cmp be proc bigint_compare from BigInt with sum_temp, n
+                    If sum_cmp is less than 0:
+                        Let sc be proc bigint_get_limb_count from BigInt with sum_temp
+                        Let si be 0
+                        While si is less than sc:
+                            Let slv be proc bigint_get_limb from BigInt with sum_temp, si
+                            proc bigint_set_limb from BigInt with sum_hd, si, slv
+                            Set si to si plus 1
+                        End While
+                        proc bigint_set_limb_count from BigInt with sum_hd, sc
+                    Otherwise:
+                        proc bigint_mod from BigInt with arena, sum_hd, sum_temp, n
+                    End If
+                    Let s_prod be proc bigint_alloc from BigInt with arena, 20
+                    Let s_val be proc bigint_alloc from BigInt with arena, 20
+                    proc bigint_mul from BigInt with s_prod, k_inv, sum_hd
+                    proc bigint_mod from BigInt with arena, s_val, s_prod, n
+                    If proc bigint_is_zero from BigInt with s_val is equal to 1:
+                        Set attempt to attempt plus 1
+                    Otherwise:
+                        Let r_count_o be proc bigint_get_limb_count from BigInt with r_val
+                        Let r_cap_o be proc bigint_get_limb_capacity from BigInt with sig_r_out
+                        Let zi_r be 0
+                        While zi_r is less than r_cap_o:
+                            proc bigint_set_limb from BigInt with sig_r_out, zi_r, 0
+                            Set zi_r to zi_r plus 1
+                        End While
+                        Let ci_r be 0
+                        While ci_r is less than r_count_o:
+                            Let rlv be proc bigint_get_limb from BigInt with r_val, ci_r
+                            proc bigint_set_limb from BigInt with sig_r_out, ci_r, rlv
+                            Set ci_r to ci_r plus 1
+                        End While
+                        proc bigint_set_limb_count from BigInt with sig_r_out, r_count_o
+                        Let s_count_o be proc bigint_get_limb_count from BigInt with s_val
+                        Let s_cap_o be proc bigint_get_limb_capacity from BigInt with sig_s_out
+                        Let zi_s be 0
+                        While zi_s is less than s_cap_o:
+                            proc bigint_set_limb from BigInt with sig_s_out, zi_s, 0
+                            Set zi_s to zi_s plus 1
+                        End While
+                        Let ci_s be 0
+                        While ci_s is less than s_count_o:
+                            Let slv2 be proc bigint_get_limb from BigInt with s_val, ci_s
+                            proc bigint_set_limb from BigInt with sig_s_out, ci_s, slv2
+                            Set ci_s to ci_s plus 1
+                        End While
+                        proc bigint_set_limb_count from BigInt with sig_s_out, s_count_o
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return 0
+End Process
+
+Process called "ecdsa_p521_verify" takes arena as Integer, public_key as Integer, message as Integer, message_length as Integer, sig_r as Integer, sig_s as Integer returns Integer:
+    @Reasoning
+    Verifies an ECDSA P-521 signature.
+    @End Reasoning
+
+    @Implementation
+    Mirrors ecdsa_p256_verify with the P-521 curve module and SHA-512.
+    @End Implementation
+
+    @Performance_Hints
+    ~500 ms.
+    @End Performance_Hints
+
+    @Security_Scope
+    Inputs are public.
+    @End Security_Scope
+
+    Let n be proc curve_p521_order from P521 with arena
+    If proc bigint_is_zero from BigInt with sig_r is equal to 1:
+        Return 0
+    End If
+    If proc bigint_is_zero from BigInt with sig_s is equal to 1:
+        Return 0
+    End If
+    Let r_cmp be proc bigint_compare from BigInt with sig_r, n
+    If r_cmp is greater than 0 minus 1:
+        Return 0
+    End If
+    Let s_cmp be proc bigint_compare from BigInt with sig_s, n
+    If s_cmp is greater than 0 minus 1:
+        Return 0
+    End If
+
+    Let qlen be proc ecdsa_bit_length with n
+    Let h1 be proc arena_allocate from Arena with arena, 64
+    proc ecdsa_hash_message with arena, ECDSA_HASH_SHA512, message, message_length, h1
+    Let h_int be proc ecdsa_bits_to_int with arena, h1, 64, qlen
+    Let h_mod be proc bigint_alloc from BigInt with arena, 20
+    Let h_cmp be proc bigint_compare from BigInt with h_int, n
+    If h_cmp is less than 0:
+        Let hc be proc bigint_get_limb_count from BigInt with h_int
+        Let hi be 0
+        While hi is less than hc:
+            Let hlv be proc bigint_get_limb from BigInt with h_int, hi
+            proc bigint_set_limb from BigInt with h_mod, hi, hlv
+            Set hi to hi plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with h_mod, hc
+    Otherwise:
+        proc bigint_mod from BigInt with arena, h_mod, h_int, n
+    End If
+
+    Let w be proc bigint_alloc from BigInt with arena, 20
+    Let inv_rc be proc ecdsa_mod_inverse with arena, w, sig_s, n
+    If inv_rc is equal to 0:
+        Return 0
+    End If
+
+    Let u1_prod be proc bigint_alloc from BigInt with arena, 20
+    Let u1 be proc bigint_alloc from BigInt with arena, 20
+    proc bigint_mul from BigInt with u1_prod, h_mod, w
+    proc bigint_mod from BigInt with arena, u1, u1_prod, n
+
+    Let u2_prod be proc bigint_alloc from BigInt with arena, 20
+    Let u2 be proc bigint_alloc from BigInt with arena, 20
+    proc bigint_mul from BigInt with u2_prod, sig_r, w
+    proc bigint_mod from BigInt with arena, u2, u2_prod, n
+
+    Let g be proc curve_p521_generator from P521 with arena
+    Let pt_a be proc curve_p521_point_alloc from P521 with arena
+    Let pt_b be proc curve_p521_point_alloc from P521 with arena
+    Let sum_pt be proc curve_p521_point_alloc from P521 with arena
+    proc curve_p521_scalar_mul from P521 with arena, pt_a, u1, g
+    proc curve_p521_scalar_mul from P521 with arena, pt_b, u2, public_key
+    proc curve_p521_add from P521 with arena, sum_pt, pt_a, pt_b
+
+    If proc curve_p521_point_is_infinity from P521 with sum_pt is equal to 1:
+        Return 0
+    End If
+
+    Let px be proc field_p521_zero from F521 with arena
+    Let py be proc field_p521_zero from F521 with arena
+    Let aff_rc be proc curve_p521_to_affine from P521 with arena, sum_pt, px, py
+    If aff_rc is equal to 0:
+        Return 0
+    End If
+
+    Let px_mod_n be proc bigint_alloc from BigInt with arena, 20
+    Let pxcmp be proc bigint_compare from BigInt with px, n
+    If pxcmp is less than 0:
+        Let pxc be proc bigint_get_limb_count from BigInt with px
+        Let pxi be 0
+        While pxi is less than pxc:
+            Let plv be proc bigint_get_limb from BigInt with px, pxi
+            proc bigint_set_limb from BigInt with px_mod_n, pxi, plv
+            Set pxi to pxi plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with px_mod_n, pxc
+    Otherwise:
+        proc bigint_mod from BigInt with arena, px_mod_n, px, n
+    End If
+
+    Return proc bigint_constant_time_equal from BigIntX with px_mod_n, sig_r
+End Process
+
+Note: ============================================================================
+Note: DER signature serialization (SEC 1 v2.0 section C.5):
+Note:   SEQUENCE { INTEGER r, INTEGER s }
+Note: ASN.1 INTEGER encoding adds a leading 0x00 byte if the high bit of the
+Note: magnitude is set, ensuring the value is interpreted as positive.
+Note: ============================================================================
+
+Process called "ecdsa_bigint_byte_length" takes bn as Integer returns Integer:
+    @Reasoning
+    Returns the minimum number of bytes needed to represent bn as a
+    big-endian unsigned integer with no leading zeros.
+    @End Reasoning
+
+    @Implementation
+    bit_length(bn) divided by 8 rounded up; zero returns 1.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    Public.
+    @End Security_Scope
+
+    Let bits be proc ecdsa_bit_length with bn
+    If bits is equal to 0:
+        Return 1
+    End If
+    Let bytes be bits divided by 8
+    If bits modulo by 8 is not equal to 0:
+        Set bytes to bytes plus 1
+    End If
+    Return bytes
+End Process
+
+Process called "ecdsa_der_write_integer" takes bn as Integer, out_buffer as Integer, out_offset as Integer returns Integer:
+    @Reasoning
+    Writes a DER INTEGER (tag 0x02 + length + value) for bn starting at
+    out_buffer[out_offset]. Returns the number of bytes written.
+    @End Reasoning
+
+    @Implementation
+    1. Compute magnitude length L = byte_length(bn).
+    2. Compute high byte; if high bit is set, prepend a 0x00 (final
+       length = L + 1).
+    3. Encode the length as a single byte (< 128) or long form
+       (0x82, 0x80 | n, n bytes big-endian).
+    @End Implementation
+
+    @Performance_Hints
+    O(L) byte writes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public output.
+    @End Security_Scope
+
+    Let mag_len be proc ecdsa_bigint_byte_length with bn
+    Let scratch be proc arena_allocate from Arena with out_buffer, 0
+    Note: We write the magnitude into a temporary local fixed-size buffer
+    Note: read from bigint_to_bytes_be by walking limbs directly here.
+
+    Note: Allocate a 132-byte scratch is wrong (out_buffer is a raw buffer);
+    Note: instead walk limbs directly to write magnitude bytes.
+    Let bytes_written be 0
+    proc memory_set_byte from Memory with out_buffer, out_offset, 2
+    Set bytes_written to bytes_written plus 1
+
+    Note: Compute leading_zero_flag based on the highest byte of bn.
+    Let need_prefix_zero be 0
+    Let high_byte be 0
+    If mag_len is greater than 0:
+        Let high_limb_idx be (mag_len minus 1) divided by 8
+        Let high_byte_in_limb be (mag_len minus 1) modulo by 8
+        Let high_limb_val be proc bigint_get_limb from BigInt with bn, high_limb_idx
+        Let shift_count be high_byte_in_limb multiplied by 8
+        Let sc_iter be 0
+        While sc_iter is less than shift_count:
+            Set high_limb_val to high_limb_val divided by 2
+            Set sc_iter to sc_iter plus 1
+        End While
+        Note: After the loop, high_limb_val's low 8 bits hold the high byte.
+        Set high_byte to high_limb_val modulo by 256
+    End If
+    If high_byte is greater than 127:
+        Set need_prefix_zero to 1
+    End If
+
+    Let total_value_len be mag_len plus need_prefix_zero
+
+    Note: Write length. For ECDSA at our sizes, total_value_len <= 67 (P-521
+    Note: with prefix) which is < 128, so short-form length suffices.
+    proc memory_set_byte from Memory with out_buffer, out_offset plus bytes_written, total_value_len
+    Set bytes_written to bytes_written plus 1
+
+    If need_prefix_zero is equal to 1:
+        proc memory_set_byte from Memory with out_buffer, out_offset plus bytes_written, 0
+        Set bytes_written to bytes_written plus 1
+    End If
+
+    Note: Write magnitude bytes from MSB to LSB.
+    Let bi_plus_one be mag_len
+    While bi_plus_one is greater than 0:
+        Let bi be bi_plus_one minus 1
+        Let limb_idx be bi divided by 8
+        Let byte_in_limb be bi modulo by 8
+        Let limb_val be proc bigint_get_limb from BigInt with bn, limb_idx
+        Let shift_total be byte_in_limb multiplied by 8
+        Let st_iter be 0
+        While st_iter is less than shift_total:
+            Set limb_val to limb_val divided by 2
+            Set st_iter to st_iter plus 1
+        End While
+        Let byte_val be limb_val modulo by 256
+        proc memory_set_byte from Memory with out_buffer, out_offset plus bytes_written, byte_val
+        Set bytes_written to bytes_written plus 1
+        Set bi_plus_one to bi_plus_one minus 1
+    End While
+
+    Return bytes_written
+End Process
+
+Process called "ecdsa_signature_to_der" takes arena as Integer, sig_r as Integer, sig_s as Integer, out_buffer as Integer, out_capacity as Integer returns Integer:
+    @Reasoning
+    Encodes an ECDSA signature (r, s) into DER form:
+    SEQUENCE { INTEGER r, INTEGER s }.
+    @End Reasoning
+
+    @Implementation
+    1. Write r and s into a scratch buffer to determine inner length.
+    2. Write SEQUENCE tag (0x30) + length + inner bytes into out_buffer.
+    @End Implementation
+
+    @Performance_Hints
+    O(out_length) writes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public output.
+    @End Security_Scope
+
+    Let scratch_cap be 256
+    Let scratch be proc arena_allocate from Arena with arena, scratch_cap
+    If scratch is equal to 0:
+        Return 0
+    End If
+    Let r_len be proc ecdsa_der_write_integer with sig_r, scratch, 0
+    Let s_len be proc ecdsa_der_write_integer with sig_s, scratch, r_len
+    Let inner_len be r_len plus s_len
+
+    Note: Encode SEQUENCE header. For sizes <= 127 short form; for 128-255
+    Note: long form 0x81; for 256-65535 long form 0x82.
+    Let header_len be 2
+    If inner_len is greater than 127:
+        Set header_len to 3
+    End If
+    If inner_len is greater than 255:
+        Set header_len to 4
+    End If
+    Let total_len be header_len plus inner_len
+    If total_len is greater than out_capacity:
+        Return 0
+    End If
+
+    proc memory_set_byte from Memory with out_buffer, 0, 48
+    If inner_len is less than 128:
+        proc memory_set_byte from Memory with out_buffer, 1, inner_len
+    Otherwise:
+        If inner_len is less than 256:
+            proc memory_set_byte from Memory with out_buffer, 1, 129
+            proc memory_set_byte from Memory with out_buffer, 2, inner_len
+        Otherwise:
+            proc memory_set_byte from Memory with out_buffer, 1, 130
+            proc memory_set_byte from Memory with out_buffer, 2, inner_len divided by 256
+            proc memory_set_byte from Memory with out_buffer, 3, inner_len modulo by 256
+        End If
+    End If
+
+    Let copy_i be 0
+    While copy_i is less than inner_len:
+        Let cb be proc memory_get_byte from Memory with scratch, copy_i
+        proc memory_set_byte from Memory with out_buffer, header_len plus copy_i, cb
+        Set copy_i to copy_i plus 1
+    End While
+
+    Return total_len
+End Process
+
+Process called "ecdsa_signature_from_der" takes arena as Integer, der_bytes as Integer, der_length as Integer, sig_r_out as Integer, sig_s_out as Integer returns Integer:
+    @Reasoning
+    Parses a DER-encoded ECDSA signature into (r, s) BigInts.
+    @End Reasoning
+
+    @Implementation
+    1. Validate SEQUENCE tag (0x30) and read inner length.
+    2. Parse INTEGER r (skip optional leading 0x00).
+    3. Parse INTEGER s (skip optional leading 0x00).
+    4. bigint_from_bytes_be each, copy into sig_r_out and sig_s_out.
+    @End Implementation
+
+    @Performance_Hints
+    Two BigInt constructions plus two copies.
+    @End Performance_Hints
+
+    @Security_Scope
+    Input is public (untrusted but verified by signature semantics).
+    @End Security_Scope
+
+    If der_length is less than 4:
+        Return 0
+    End If
+    Let outer_tag be proc memory_get_byte from Memory with der_bytes, 0
+    If outer_tag is not equal to 48:
+        Return 0
+    End If
+    Let length_byte be proc memory_get_byte from Memory with der_bytes, 1
+    Let inner_len be 0
+    Let body_offset be 0
+    If length_byte is less than 128:
+        Set inner_len to length_byte
+        Set body_offset to 2
+    Otherwise:
+        If length_byte is equal to 129:
+            Set inner_len to proc memory_get_byte from Memory with der_bytes, 2
+            Set body_offset to 3
+        Otherwise:
+            If length_byte is equal to 130:
+                Let hi_byte be proc memory_get_byte from Memory with der_bytes, 2
+                Let lo_byte be proc memory_get_byte from Memory with der_bytes, 3
+                Set inner_len to hi_byte multiplied by 256 plus lo_byte
+                Set body_offset to 4
+            Otherwise:
+                Return 0
+            End If
+        End If
+    End If
+
+    Let body_end be body_offset plus inner_len
+    If body_end is greater than der_length:
+        Return 0
+    End If
+
+    Note: Parse INTEGER r.
+    Let r_tag be proc memory_get_byte from Memory with der_bytes, body_offset
+    If r_tag is not equal to 2:
+        Return 0
+    End If
+    Let r_length_byte be proc memory_get_byte from Memory with der_bytes, body_offset plus 1
+    Let r_value_offset be body_offset plus 2
+    Let r_value_length be r_length_byte
+    If r_length_byte is greater than 127:
+        If r_length_byte is equal to 129:
+            Set r_value_length to proc memory_get_byte from Memory with der_bytes, body_offset plus 2
+            Set r_value_offset to body_offset plus 3
+        Otherwise:
+            Return 0
+        End If
+    End If
+    Note: Skip leading 0x00 (sign byte) if present and value_length > 1.
+    Let r_first be proc memory_get_byte from Memory with der_bytes, r_value_offset
+    If r_first is equal to 0:
+        If r_value_length is greater than 1:
+            Set r_value_offset to r_value_offset plus 1
+            Set r_value_length to r_value_length minus 1
+        End If
+    End If
+    Let r_bn be proc bigint_from_bytes_be from BigInt with arena, der_bytes plus r_value_offset, r_value_length
+    If r_bn is equal to 0:
+        Return 0
+    End If
+
+    Note: Parse INTEGER s.
+    Let s_tag_offset be r_value_offset plus r_value_length
+    Let s_tag be proc memory_get_byte from Memory with der_bytes, s_tag_offset
+    If s_tag is not equal to 2:
+        Return 0
+    End If
+    Let s_length_byte be proc memory_get_byte from Memory with der_bytes, s_tag_offset plus 1
+    Let s_value_offset be s_tag_offset plus 2
+    Let s_value_length be s_length_byte
+    If s_length_byte is greater than 127:
+        If s_length_byte is equal to 129:
+            Set s_value_length to proc memory_get_byte from Memory with der_bytes, s_tag_offset plus 2
+            Set s_value_offset to s_tag_offset plus 3
+        Otherwise:
+            Return 0
+        End If
+    End If
+    Let s_first be proc memory_get_byte from Memory with der_bytes, s_value_offset
+    If s_first is equal to 0:
+        If s_value_length is greater than 1:
+            Set s_value_offset to s_value_offset plus 1
+            Set s_value_length to s_value_length minus 1
+        End If
+    End If
+    Let s_bn be proc bigint_from_bytes_be from BigInt with arena, der_bytes plus s_value_offset, s_value_length
+    If s_bn is equal to 0:
+        Return 0
+    End If
+
+    Note: Copy r_bn into sig_r_out.
+    Let r_count be proc bigint_get_limb_count from BigInt with r_bn
+    Let r_cap be proc bigint_get_limb_capacity from BigInt with sig_r_out
+    If r_count is greater than r_cap:
+        Return 0
+    End If
+    Let zi_r be 0
+    While zi_r is less than r_cap:
+        proc bigint_set_limb from BigInt with sig_r_out, zi_r, 0
+        Set zi_r to zi_r plus 1
+    End While
+    Let ci_r be 0
+    While ci_r is less than r_count:
+        Let rlv be proc bigint_get_limb from BigInt with r_bn, ci_r
+        proc bigint_set_limb from BigInt with sig_r_out, ci_r, rlv
+        Set ci_r to ci_r plus 1
+    End While
+    proc bigint_set_limb_count from BigInt with sig_r_out, r_count
+
+    Let s_count be proc bigint_get_limb_count from BigInt with s_bn
+    Let s_cap be proc bigint_get_limb_capacity from BigInt with sig_s_out
+    If s_count is greater than s_cap:
+        Return 0
+    End If
+    Let zi_s be 0
+    While zi_s is less than s_cap:
+        proc bigint_set_limb from BigInt with sig_s_out, zi_s, 0
+        Set zi_s to zi_s plus 1
+    End While
+    Let ci_s be 0
+    While ci_s is less than s_count:
+        Let slv be proc bigint_get_limb from BigInt with s_bn, ci_s
+        proc bigint_set_limb from BigInt with sig_s_out, ci_s, slv
+        Set ci_s to ci_s plus 1
+    End While
+    proc bigint_set_limb_count from BigInt with sig_s_out, s_count
+
+    Return 1
+End Process

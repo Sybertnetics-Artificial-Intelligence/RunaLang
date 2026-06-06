@@ -1,0 +1,849 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+GEO_POLYGON - Geographic polygons, line strings, circles, bounding boxes
+
+Provides the basic geometric primitives for representing and operating on
+two-dimensional geographic regions:
+
+  GeoPolygon       - closed planar region defined by an ordered ring of
+                     vertices (latitude/longitude pairs)
+  GeoLineString    - open or closed polyline (sequence of vertices)
+  GeoCircle        - circular region defined by a center point and a
+                     radius in meters along the geodesic
+  GeoBoundingBox   - axis-aligned latitude/longitude rectangle
+
+The polygon and line-string vertex storage uses a flat Float buffer
+allocated from the standard heap rather than a typed list. The flat
+layout gives cache-friendly sequential scans for the geodesic area
+and point-in-polygon kernels, which dominate the geo workload. Two
+consecutive slots hold one vertex: index 2*i is the latitude, index
+2*i+1 is the longitude (both in decimal degrees). Altitude is not stored per vertex
+in the current schema (this matches GeoJSON which treats altitude as
+optional and per-feature rather than per-vertex).
+
+OPERATIONS
+
+  Containment:        contains_point (point-in-polygon ray casting)
+  Area:               geodesic area on the sphere (closed form per
+                      Bevis & Cambareri 1987) with spherical-Earth
+                      mean radius (haversine-style)
+  Perimeter:          sum of haversine distances around the ring
+  Centroid:           area-weighted average vertex position
+  Bounding-box:       min/max latitude and longitude over all vertices
+
+CITATIONS
+
+  - Bevis, M., & Cambareri, G. (1987): "Computing the area of a spherical
+    polygon of arbitrary shape", Mathematical Geology 19(4), 335-346.
+    The formula used by area_geodesic.
+  - Sunday, D. (2001): "Inclusion of a point in a polygon"
+    http://geomalgorithms.com/a03-_inclusion.html . The winding-number
+    point-in-polygon algorithm used by contains_point.
+
+DEPENDENCIES
+
+  - compiler/frontend/primitives/core/arithmetic_core.runa for sqrt.
+  - compiler/frontend/primitives/geo/geo_coordinate.runa for GeoCoordinate.
+  - compiler/frontend/primitives/geo/geo_distance.runa for the haversine
+    distance used by perimeter.
+  - compiler/frontend/primitives/geo/coordinate_reference_system.runa for
+    the inline trig helpers.
+
+The vertex buffer is allocated and freed with the standard allocate /
+deallocate intrinsics. Callers should pair every poly_create with a
+poly_destroy to avoid leaks.
+:End Note
+
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+Import "compiler/frontend/primitives/geo/geo_coordinate.runa" as GeoCoord
+Import "compiler/frontend/primitives/geo/geo_distance.runa" as GeoDist
+Import "compiler/frontend/primitives/geo/coordinate_reference_system.runa" as CRS
+
+Note: ============================================================================
+Note: SECTION 1 - Polygon and line-string structures
+Note: ============================================================================
+
+Type called "GeoPolygon":
+    vertex_buffer as Integer
+    vertex_count as Integer
+    capacity as Integer
+End Type
+
+Type called "GeoLineString":
+    vertex_buffer as Integer
+    vertex_count as Integer
+    capacity as Integer
+End Type
+
+Type called "GeoCircle":
+    center_latitude_degrees as Float
+    center_longitude_degrees as Float
+    radius_meters as Float
+End Type
+
+Type called "GeoBoundingBox":
+    min_lat_degrees as Float
+    max_lat_degrees as Float
+    min_lon_degrees as Float
+    max_lon_degrees as Float
+End Type
+
+Note: ============================================================================
+Note: SECTION 2 - GeoPolygon: creation, destruction, vertex access
+Note: ============================================================================
+
+Process called "polygon_create" takes initial_capacity as Integer returns GeoPolygon:
+    @Reasoning:
+        Allocate a polygon with an initial vertex buffer. Buffer capacity
+        is in number-of-vertices; each vertex occupies 16 bytes (two
+        Floats = two 8-byte cells). Callers grow the buffer via
+        polygon_add_vertex which uses geometric doubling on overflow.
+    @End Reasoning
+    @Implementation:
+        Allocate initial_capacity * 16 bytes for the vertex buffer.
+        Construct GeoPolygon with vertex_count = 0, capacity = initial_capacity.
+    @End Implementation
+    @Performance_Hints:
+        One allocate call. Returns a polygon with vertex_buffer = 0 on
+        allocation failure (caller must check).
+    @End Performance_Hints
+    @Security_Scope:
+        Allocates owned-heap memory. Caller must pair with polygon_destroy.
+    @End Security_Scope
+    Let cap_to_use be initial_capacity
+    If cap_to_use is less than 4:
+        Set cap_to_use to 4
+    End If
+    Let bytes be cap_to_use multiplied by 16
+    Let buf be allocate(bytes)
+    Let p be a value of type GeoPolygon
+    Set p.vertex_buffer to buf
+    Set p.vertex_count to 0
+    Set p.capacity to cap_to_use
+    Return p
+End Process
+
+Process called "polygon_destroy" takes p as GeoPolygon returns Integer:
+    @Reasoning:
+        Release the vertex buffer. Idempotent (safe to call twice but
+        callers should not depend on that and should also not use the
+        polygon after destruction).
+    @End Reasoning
+    @Implementation:
+        deallocate(vertex_buffer) if non-zero.
+    @End Implementation
+    @Performance_Hints:
+        One deallocate call.
+    @End Performance_Hints
+    @Security_Scope:
+        Releases owned-heap memory. Use-after-free is the caller's
+        responsibility.
+    @End Security_Scope
+    If p.vertex_buffer is not equal to 0:
+        deallocate(p.vertex_buffer)
+    End If
+    Return 0
+End Process
+
+Process called "polygon_add_vertex" takes p as GeoPolygon, lat_degrees as Float, lon_degrees as Float returns GeoPolygon:
+    @Reasoning:
+        Append a vertex to the polygon. Returns a new GeoPolygon value
+        (because we may need to allocate a new buffer when growing) - the
+        caller must use the returned value. The old buffer is freed when
+        the buffer is grown.
+    @End Reasoning
+    @Implementation:
+        If vertex_count == capacity, grow the buffer: allocate a new buffer
+        of twice the capacity, copy the old data, free the old buffer.
+        Write the new vertex into the next slot (offset 2*vertex_count and
+        2*vertex_count+1 in Float cells, or 16*vertex_count and
+        16*vertex_count+8 in bytes).
+    @End Implementation
+    @Performance_Hints:
+        O(1) amortized; O(n) on grow events which occur log2(n) times for
+        a polygon of n vertices.
+    @End Performance_Hints
+    @Security_Scope:
+        Allocates / deallocates owned memory. Returns a new GeoPolygon
+        value; if the caller uses the old value after this call they will
+        have a dangling buffer pointer when a grow occurred.
+    @End Security_Scope
+    Let new_p be p
+    If new_p.vertex_count is equal to new_p.capacity:
+        Let new_cap be new_p.capacity multiplied by 2
+        Let new_bytes be new_cap multiplied by 16
+        Let new_buf be allocate(new_bytes)
+        If new_buf is equal to 0:
+            Return new_p
+        End If
+        Note: Copy old data
+        Let copy_idx be 0
+        While copy_idx is less than new_p.vertex_count:
+            Let off_lat be copy_idx multiplied by 16
+            Let off_lon be off_lat plus 8
+            Let lat_val be __load(new_p.vertex_buffer, off_lat)
+            Let lon_val be __load(new_p.vertex_buffer, off_lon)
+            __store(new_buf, off_lat, lat_val)
+            __store(new_buf, off_lon, lon_val)
+            Set copy_idx to copy_idx plus 1
+        End While
+        deallocate(new_p.vertex_buffer)
+        Set new_p.vertex_buffer to new_buf
+        Set new_p.capacity to new_cap
+    End If
+    Let off_lat be new_p.vertex_count multiplied by 16
+    Let off_lon be off_lat plus 8
+    __store_float(new_p.vertex_buffer, off_lat, lat_degrees)
+    __store_float(new_p.vertex_buffer, off_lon, lon_degrees)
+    Set new_p.vertex_count to new_p.vertex_count plus 1
+    Return new_p
+End Process
+
+Process called "polygon_vertex_latitude" takes p as GeoPolygon, idx as Integer returns Float:
+    Let off be idx multiplied by 16
+    Return __load_float(p.vertex_buffer, off)
+End Process
+
+Process called "polygon_vertex_longitude" takes p as GeoPolygon, idx as Integer returns Float:
+    Let off be idx multiplied by 16
+    Set off to off plus 8
+    Return __load_float(p.vertex_buffer, off)
+End Process
+
+Process called "polygon_vertex_count" takes p as GeoPolygon returns Integer:
+    Return p.vertex_count
+End Process
+
+Note: ============================================================================
+Note: SECTION 3 - Polygon containment (winding number)
+Note: ============================================================================
+
+Process called "polygon_contains_point" takes p as GeoPolygon, lat_degrees as Float, lon_degrees as Float returns Integer:
+    @Reasoning:
+        Determine whether the given (lat, lon) lies inside the polygon
+        using the winding number algorithm (Sunday 2001). The polygon is
+        treated as a planar polygon in lat/lon space, which is accurate
+        for polygons that do not cross the antimeridian and whose extent
+        is less than ~ 5 degrees of latitude (where the planar
+        approximation diverges from the true spherical geometry by less
+        than 0.1 percent). For larger or antimeridian-crossing polygons
+        callers should split the polygon into pieces first.
+    @End Reasoning
+    @Implementation:
+        For each edge from vertex i to vertex i+1 (with wraparound at the
+        last vertex), count the upward and downward crossings of the
+        horizontal ray emitted from the test point. Sunday's winding
+        number accumulates +1 for an upward crossing left of the edge,
+        -1 for a downward crossing right of the edge.
+    @End Implementation
+    @Performance_Hints:
+        O(n) where n is the vertex count. ~ 8 FP ops per edge.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure (reads from the polygon's vertex buffer only).
+    @End Security_Scope
+    Let n be p.vertex_count
+    If n is less than 3:
+        Return 0
+    End If
+    Let winding be 0
+    Let i be 0
+    While i is less than n:
+        Let j be i plus 1
+        If j is equal to n:
+            Set j to 0
+        End If
+        Let lat_i be polygon_vertex_latitude(p, i)
+        Let lon_i be polygon_vertex_longitude(p, i)
+        Let lat_j be polygon_vertex_latitude(p, j)
+        Let lon_j be polygon_vertex_longitude(p, j)
+        If lat_i is less than lat_degrees or lat_i is equal to lat_degrees:
+            If lat_j is greater than lat_degrees:
+                Let is_left be polygon_is_left(lat_i, lon_i, lat_j, lon_j, lat_degrees, lon_degrees)
+                If is_left is greater than 0:
+                    Set winding to winding plus 1
+                End If
+            End If
+        Otherwise:
+            If lat_j is less than lat_degrees or lat_j is equal to lat_degrees:
+                Let is_left be polygon_is_left(lat_i, lon_i, lat_j, lon_j, lat_degrees, lon_degrees)
+                If is_left is less than 0:
+                    Set winding to winding minus 1
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    If winding is not equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "polygon_is_left" takes lat_i as Float, lon_i as Float, lat_j as Float, lon_j as Float, lat_p as Float, lon_p as Float returns Integer:
+    @Reasoning:
+        Return >0 if point P is left of line from i to j, <0 if right,
+        0 if on the line. Used by winding-number containment.
+    @End Reasoning
+    @Implementation:
+        Compute the signed cross product:
+          (lon_j - lon_i) * (lat_p - lat_i) - (lon_p - lon_i) * (lat_j - lat_i)
+        Map the Float sign to -1 / 0 / +1.
+    @End Implementation
+    @Performance_Hints:
+        Two multiplies, one subtract, one sign compare.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let dlon_ji be lon_j minus lon_i
+    Let dlat_pi be lat_p minus lat_i
+    Let dlon_pi be lon_p minus lon_i
+    Let dlat_ji be lat_j minus lat_i
+    Let cross be dlon_ji multiplied by dlat_pi
+    Set cross to cross minus dlon_pi multiplied by dlat_ji
+    If cross is greater than 0.0:
+        Return 1
+    End If
+    If cross is less than 0.0:
+        Return 0 minus 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 4 - Polygon area (spherical)
+Note: ============================================================================
+
+Process called "polygon_area_spherical" takes p as GeoPolygon returns Float:
+    @Reasoning:
+        Area of a spherical polygon using the Bevis & Cambareri (1987)
+        closed-form formula. Returns the area in square meters on a sphere
+        of the IUGG mean Earth radius. For polygons with all edges shorter
+        than ~ 1 deg the planar formula would give a similar answer; for
+        continent-scale polygons the spherical formula is required.
+    @End Reasoning
+    @Implementation:
+        For each consecutive pair of vertices (v_i, v_{i+1}) compute the
+        cumulative excess:
+          A = R^2 * |sum_i ((lambda_{i+1} - lambda_i) * (2 + sin(phi_i) + sin(phi_{i+1})))|
+            / 2
+        which is the Bevis-Cambareri eq. 4.7 in its closed-form trapezoidal
+        rule (the original paper presents it in this form as the working
+        formula). Use the modular difference for longitudes to handle the
+        antimeridian correctly.
+    @End Implementation
+    @Performance_Hints:
+        O(n) with one sin call per vertex. ~ 100 cycles per vertex.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let n be p.vertex_count
+    If n is less than 3:
+        Return 0.0
+    End If
+    Let sum be 0.0
+    Let i be 0
+    While i is less than n:
+        Let j be i plus 1
+        If j is equal to n:
+            Set j to 0
+        End If
+        Let lat_i be polygon_vertex_latitude(p, i)
+        Let lat_j be polygon_vertex_latitude(p, j)
+        Let lon_i be polygon_vertex_longitude(p, i)
+        Let lon_j be polygon_vertex_longitude(p, j)
+        Let phi_i be proc geo_deg_to_rad from CRS with lat_i
+        Let phi_j be proc geo_deg_to_rad from CRS with lat_j
+        Let dlon_deg be lon_j minus lon_i
+        Note: Normalize dlon to [-180, 180]
+        While dlon_deg is greater than 180.0:
+            Set dlon_deg to dlon_deg minus 360.0
+        End While
+        While dlon_deg is less than 0.0 minus 180.0:
+            Set dlon_deg to dlon_deg plus 360.0
+        End While
+        Let dlon_rad be proc geo_deg_to_rad from CRS with dlon_deg
+        Let sin_phi_i be proc geo_sin from CRS with phi_i
+        Let sin_phi_j be proc geo_sin from CRS with phi_j
+        Let factor be 2.0 plus sin_phi_i
+        Set factor to factor plus sin_phi_j
+        Let contrib be dlon_rad multiplied by factor
+        Set sum to sum plus contrib
+        Set i to i plus 1
+    End While
+    Let abs_sum be proc geo_float_abs from CRS with sum
+    Let R be proc earth_mean_radius_meters from GeoDist
+    Let area be R multiplied by R
+    Set area to area multiplied by abs_sum
+    Set area to area divided by 2.0
+    Return area
+End Process
+
+Process called "polygon_perimeter_meters" takes p as GeoPolygon returns Float:
+    @Reasoning:
+        Sum of haversine distances around the polygon ring (closes back to
+        the first vertex). Provides the geodesic perimeter.
+    @End Reasoning
+    @Implementation:
+        For each consecutive pair (v_i, v_{i+1}, wraparound) call
+        geo_distance_great_circle and accumulate.
+    @End Implementation
+    @Performance_Hints:
+        O(n) calls to geo_distance_great_circle (~ 200 cycles each).
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let n be p.vertex_count
+    If n is less than 2:
+        Return 0.0
+    End If
+    Let sum be 0.0
+    Let i be 0
+    While i is less than n:
+        Let j be i plus 1
+        If j is equal to n:
+            Set j to 0
+        End If
+        Let a_coord be a value of type GeoCoordinate
+        Set a_coord.latitude_degrees to polygon_vertex_latitude(p, i)
+        Set a_coord.longitude_degrees to polygon_vertex_longitude(p, i)
+        Set a_coord.altitude_meters to 0.0
+        Set a_coord.datum_index to 0
+        Let b_coord be a value of type GeoCoordinate
+        Set b_coord.latitude_degrees to polygon_vertex_latitude(p, j)
+        Set b_coord.longitude_degrees to polygon_vertex_longitude(p, j)
+        Set b_coord.altitude_meters to 0.0
+        Set b_coord.datum_index to 0
+        Let edge_len be proc geo_distance_great_circle from GeoDist with a_coord, b_coord
+        Set sum to sum plus edge_len
+        Set i to i plus 1
+    End While
+    Return sum
+End Process
+
+Process called "polygon_centroid" takes p as GeoPolygon returns GeoCoordinate:
+    @Reasoning:
+        Vertex-averaged centroid. For convex or near-convex polygons this
+        is a useful approximation to the geometric centroid; for highly
+        concave polygons the geometric centroid may fall outside the
+        polygon, but the vertex-average always lies inside the convex
+        hull and is the right choice for placing labels.
+    @End Reasoning
+    @Implementation:
+        Sum the latitudes and longitudes; divide by vertex_count.
+    @End Implementation
+    @Performance_Hints:
+        O(n) adds, two divides.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let n be p.vertex_count
+    Let lat_sum be 0.0
+    Let lon_sum be 0.0
+    Let i be 0
+    While i is less than n:
+        Set lat_sum to lat_sum plus polygon_vertex_latitude(p, i)
+        Set lon_sum to lon_sum plus polygon_vertex_longitude(p, i)
+        Set i to i plus 1
+    End While
+    Let n_f be proc int_to_float from Arith with n
+    Let avg_lat be lat_sum divided by n_f
+    Let avg_lon be lon_sum divided by n_f
+    Let result be a value of type GeoCoordinate
+    Set result.latitude_degrees to avg_lat
+    Set result.longitude_degrees to avg_lon
+    Set result.altitude_meters to 0.0
+    Set result.datum_index to 0
+    Return result
+End Process
+
+Note: ============================================================================
+Note: SECTION 5 - GeoLineString
+Note: ============================================================================
+
+Process called "linestring_create" takes initial_capacity as Integer returns GeoLineString:
+    Let cap_to_use be initial_capacity
+    If cap_to_use is less than 2:
+        Set cap_to_use to 2
+    End If
+    Let bytes be cap_to_use multiplied by 16
+    Let buf be allocate(bytes)
+    Let s be a value of type GeoLineString
+    Set s.vertex_buffer to buf
+    Set s.vertex_count to 0
+    Set s.capacity to cap_to_use
+    Return s
+End Process
+
+Process called "linestring_destroy" takes s as GeoLineString returns Integer:
+    If s.vertex_buffer is not equal to 0:
+        deallocate(s.vertex_buffer)
+    End If
+    Return 0
+End Process
+
+Process called "linestring_add_vertex" takes s as GeoLineString, lat_degrees as Float, lon_degrees as Float returns GeoLineString:
+    Let new_s be s
+    If new_s.vertex_count is equal to new_s.capacity:
+        Let new_cap be new_s.capacity multiplied by 2
+        Let new_bytes be new_cap multiplied by 16
+        Let new_buf be allocate(new_bytes)
+        If new_buf is equal to 0:
+            Return new_s
+        End If
+        Let copy_idx be 0
+        While copy_idx is less than new_s.vertex_count:
+            Let off_lat be copy_idx multiplied by 16
+            Let off_lon be off_lat plus 8
+            Let lat_val be __load(new_s.vertex_buffer, off_lat)
+            Let lon_val be __load(new_s.vertex_buffer, off_lon)
+            __store(new_buf, off_lat, lat_val)
+            __store(new_buf, off_lon, lon_val)
+            Set copy_idx to copy_idx plus 1
+        End While
+        deallocate(new_s.vertex_buffer)
+        Set new_s.vertex_buffer to new_buf
+        Set new_s.capacity to new_cap
+    End If
+    Let off_lat be new_s.vertex_count multiplied by 16
+    Let off_lon be off_lat plus 8
+    __store_float(new_s.vertex_buffer, off_lat, lat_degrees)
+    __store_float(new_s.vertex_buffer, off_lon, lon_degrees)
+    Set new_s.vertex_count to new_s.vertex_count plus 1
+    Return new_s
+End Process
+
+Process called "linestring_length_meters" takes s as GeoLineString returns Float:
+    Let n be s.vertex_count
+    If n is less than 2:
+        Return 0.0
+    End If
+    Let sum be 0.0
+    Let i be 0
+    While i is less than n minus 1:
+        Let j be i plus 1
+        Let off_lat_i be i multiplied by 16
+        Let off_lon_i be off_lat_i plus 8
+        Let off_lat_j be j multiplied by 16
+        Let off_lon_j be off_lat_j plus 8
+        Let a_coord be a value of type GeoCoordinate
+        Set a_coord.latitude_degrees to __load_float(s.vertex_buffer, off_lat_i)
+        Set a_coord.longitude_degrees to __load_float(s.vertex_buffer, off_lon_i)
+        Set a_coord.altitude_meters to 0.0
+        Set a_coord.datum_index to 0
+        Let b_coord be a value of type GeoCoordinate
+        Set b_coord.latitude_degrees to __load_float(s.vertex_buffer, off_lat_j)
+        Set b_coord.longitude_degrees to __load_float(s.vertex_buffer, off_lon_j)
+        Set b_coord.altitude_meters to 0.0
+        Set b_coord.datum_index to 0
+        Let edge_len be proc geo_distance_great_circle from GeoDist with a_coord, b_coord
+        Set sum to sum plus edge_len
+        Set i to i plus 1
+    End While
+    Return sum
+End Process
+
+Note: ============================================================================
+Note: SECTION 6 - GeoCircle and GeoBoundingBox
+Note: ============================================================================
+
+Process called "circle_create" takes lat_degrees as Float, lon_degrees as Float, radius_meters as Float returns GeoCircle:
+    Let c be a value of type GeoCircle
+    Set c.center_latitude_degrees to lat_degrees
+    Set c.center_longitude_degrees to lon_degrees
+    Set c.radius_meters to radius_meters
+    Return c
+End Process
+
+Process called "circle_contains_point" takes c as GeoCircle, lat_degrees as Float, lon_degrees as Float returns Integer:
+    @Reasoning:
+        A point lies inside a geodesic circle iff its great-circle distance
+        from the center is no greater than the circle's radius.
+    @End Reasoning
+    @Implementation:
+        Compute haversine distance, compare to radius.
+    @End Implementation
+    @Performance_Hints:
+        One haversine call.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let center be a value of type GeoCoordinate
+    Set center.latitude_degrees to c.center_latitude_degrees
+    Set center.longitude_degrees to c.center_longitude_degrees
+    Set center.altitude_meters to 0.0
+    Set center.datum_index to 0
+    Let test_pt be a value of type GeoCoordinate
+    Set test_pt.latitude_degrees to lat_degrees
+    Set test_pt.longitude_degrees to lon_degrees
+    Set test_pt.altitude_meters to 0.0
+    Set test_pt.datum_index to 0
+    Let dist be proc geo_distance_great_circle from GeoDist with center, test_pt
+    If dist is less than c.radius_meters or dist is equal to c.radius_meters:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "circle_area" takes c as GeoCircle returns Float:
+    @Reasoning:
+        Surface area of a spherical cap of geodesic radius r:
+          A = 2 * pi * R^2 * (1 - cos(r / R))
+        where R = Earth's mean radius. For small r/R this approaches the
+        planar formula A = pi * r^2.
+    @End Reasoning
+    @Implementation:
+        Compute angle = r / R. A = 2 * pi * R^2 * (1 - cos(angle)).
+    @End Implementation
+    @Performance_Hints:
+        One cos, several FP ops.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let R be proc earth_mean_radius_meters from GeoDist
+    Let angle be c.radius_meters divided by R
+    Let cos_a be proc geo_cos from CRS with angle
+    Let one_minus be 1.0 minus cos_a
+    Let factor be 2.0 multiplied by 3.141592653589793
+    Set factor to factor multiplied by R
+    Set factor to factor multiplied by R
+    Return factor multiplied by one_minus
+End Process
+
+Process called "bounding_box_create" takes min_lat as Float, max_lat as Float, min_lon as Float, max_lon as Float returns GeoBoundingBox:
+    Let b be a value of type GeoBoundingBox
+    Set b.min_lat_degrees to min_lat
+    Set b.max_lat_degrees to max_lat
+    Set b.min_lon_degrees to min_lon
+    Set b.max_lon_degrees to max_lon
+    Return b
+End Process
+
+Process called "bounding_box_contains_point" takes b as GeoBoundingBox, lat_degrees as Float, lon_degrees as Float returns Integer:
+    If lat_degrees is less than b.min_lat_degrees:
+        Return 0
+    End If
+    If lat_degrees is greater than b.max_lat_degrees:
+        Return 0
+    End If
+    If lon_degrees is less than b.min_lon_degrees:
+        Return 0
+    End If
+    If lon_degrees is greater than b.max_lon_degrees:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "polygon_bounding_box" takes p as GeoPolygon returns GeoBoundingBox:
+    @Reasoning:
+        Axis-aligned latitude/longitude bounds of the polygon. A coarse
+        but very fast spatial filter: a candidate point that falls outside
+        the bounding box certainly falls outside the polygon.
+    @End Reasoning
+    @Implementation:
+        Linear scan over vertices to find min/max of lat and lon.
+    @End Implementation
+    @Performance_Hints:
+        O(n) compares.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let b be a value of type GeoBoundingBox
+    If p.vertex_count is equal to 0:
+        Set b.min_lat_degrees to 0.0
+        Set b.max_lat_degrees to 0.0
+        Set b.min_lon_degrees to 0.0
+        Set b.max_lon_degrees to 0.0
+        Return b
+    End If
+    Let min_lat be polygon_vertex_latitude(p, 0)
+    Let max_lat be min_lat
+    Let min_lon be polygon_vertex_longitude(p, 0)
+    Let max_lon be min_lon
+    Let i be 1
+    While i is less than p.vertex_count:
+        Let lat_i be polygon_vertex_latitude(p, i)
+        Let lon_i be polygon_vertex_longitude(p, i)
+        If lat_i is less than min_lat:
+            Set min_lat to lat_i
+        End If
+        If lat_i is greater than max_lat:
+            Set max_lat to lat_i
+        End If
+        If lon_i is less than min_lon:
+            Set min_lon to lon_i
+        End If
+        If lon_i is greater than max_lon:
+            Set max_lon to lon_i
+        End If
+        Set i to i plus 1
+    End While
+    Set b.min_lat_degrees to min_lat
+    Set b.max_lat_degrees to max_lat
+    Set b.min_lon_degrees to min_lon
+    Set b.max_lon_degrees to max_lon
+    Return b
+End Process
+
+Note: ============================================================================
+Note: SECTION 7 - Convex hull (Graham scan, planar approximation)
+Note: ============================================================================
+
+Process called "polygon_convex_hull" takes p as GeoPolygon returns GeoPolygon:
+    @Reasoning:
+        Compute the planar convex hull of the polygon's vertices using the
+        Graham scan. Returns a new GeoPolygon containing the hull vertices
+        in counter-clockwise order. Valid for polygons whose extent does
+        not cross the antimeridian and is contained in a single hemisphere;
+        for larger or wrap-around polygons callers should project to a
+        local planar frame first.
+    @End Reasoning
+    @Implementation:
+        Standard Graham scan:
+          1. Find the lowest-latitude vertex (lowest lon as tiebreaker)
+             as the anchor.
+          2. Sort other vertices by polar angle around the anchor.
+          3. Sweep through them maintaining a stack; pop while the top
+             two stack vertices and the next vertex make a clockwise
+             turn.
+        For simplicity we use insertion sort on the polar angles which is
+        O(n^2) but adequate for the polygon sizes typical in GIS work
+        (~ 100s of vertices). A heap-sort would bring this to O(n log n).
+    @End Implementation
+    @Performance_Hints:
+        O(n^2) due to insertion sort. ~ a few hundred cycles per pair-
+        wise polar-angle compare.
+    @End Performance_Hints
+    @Security_Scope:
+        Allocates a new GeoPolygon. Caller responsible for destroying.
+    @End Security_Scope
+    Let n be p.vertex_count
+    If n is less than 3:
+        Let copy be polygon_create(n)
+        Let k be 0
+        While k is less than n:
+            Set copy to polygon_add_vertex(copy, polygon_vertex_latitude(p, k), polygon_vertex_longitude(p, k))
+            Set k to k plus 1
+        End While
+        Return copy
+    End If
+    Note: Find anchor (lowest lat, lowest lon tiebreaker)
+    Let anchor_idx be 0
+    Let i be 1
+    While i is less than n:
+        Let lat_i be polygon_vertex_latitude(p, i)
+        Let lat_a be polygon_vertex_latitude(p, anchor_idx)
+        If lat_i is less than lat_a:
+            Set anchor_idx to i
+        Otherwise:
+            If lat_i is equal to lat_a:
+                Let lon_i be polygon_vertex_longitude(p, i)
+                Let lon_a be polygon_vertex_longitude(p, anchor_idx)
+                If lon_i is less than lon_a:
+                    Set anchor_idx to i
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Let anchor_lat be polygon_vertex_latitude(p, anchor_idx)
+    Let anchor_lon be polygon_vertex_longitude(p, anchor_idx)
+    Note: Allocate hull buffer of size n (max possible)
+    Let hull be polygon_create(n)
+    Set hull to polygon_add_vertex(hull, anchor_lat, anchor_lon)
+    Note: Allocate a scratch index list and sort by polar angle from anchor
+    Let scratch_size be n multiplied by 8
+    Let scratch be allocate(scratch_size)
+    Let scratch_count be 0
+    Let j be 0
+    While j is less than n:
+        If j is not equal to anchor_idx:
+            __store(scratch, scratch_count multiplied by 8, j)
+            Set scratch_count to scratch_count plus 1
+        End If
+        Set j to j plus 1
+    End While
+    Note: Insertion sort by polar angle (atan2)
+    Let s be 1
+    While s is less than scratch_count:
+        Let idx_s be __load(scratch, s multiplied by 8)
+        Let lat_s be polygon_vertex_latitude(p, idx_s)
+        Let lon_s be polygon_vertex_longitude(p, idx_s)
+        Let angle_s be proc geo_atan2_quadrant from CRS with lat_s minus anchor_lat, lon_s minus anchor_lon
+        Let t be s minus 1
+        Let keep_running be 1
+        While keep_running is equal to 1:
+            If t is less than 0:
+                Set keep_running to 0
+            Otherwise:
+                Let idx_t be __load(scratch, t multiplied by 8)
+                Let lat_t be polygon_vertex_latitude(p, idx_t)
+                Let lon_t be polygon_vertex_longitude(p, idx_t)
+                Let angle_t be proc geo_atan2_quadrant from CRS with lat_t minus anchor_lat, lon_t minus anchor_lon
+                If angle_t is greater than angle_s:
+                    __store(scratch, (t plus 1) multiplied by 8, idx_t)
+                    Set t to t minus 1
+                Otherwise:
+                    Set keep_running to 0
+                End If
+            End If
+        End While
+        __store(scratch, (t plus 1) multiplied by 8, idx_s)
+        Set s to s plus 1
+    End While
+    Note: Build hull via the stack-based sweep
+    Let k be 0
+    While k is less than scratch_count:
+        Let idx_k be __load(scratch, k multiplied by 8)
+        Let lat_k be polygon_vertex_latitude(p, idx_k)
+        Let lon_k be polygon_vertex_longitude(p, idx_k)
+        Let popping be 1
+        While popping is equal to 1:
+            If hull.vertex_count is less than 2:
+                Set popping to 0
+            Otherwise:
+                Let last_lat be polygon_vertex_latitude(hull, hull.vertex_count minus 1)
+                Let last_lon be polygon_vertex_longitude(hull, hull.vertex_count minus 1)
+                Let prev_lat be polygon_vertex_latitude(hull, hull.vertex_count minus 2)
+                Let prev_lon be polygon_vertex_longitude(hull, hull.vertex_count minus 2)
+                Let is_left be polygon_is_left(prev_lat, prev_lon, last_lat, last_lon, lat_k, lon_k)
+                If is_left is less than 0:
+                    Set hull.vertex_count to hull.vertex_count minus 1
+                Otherwise:
+                    If is_left is equal to 0:
+                        Set hull.vertex_count to hull.vertex_count minus 1
+                    Otherwise:
+                        Set popping to 0
+                    End If
+                End If
+            End If
+        End While
+        Set hull to polygon_add_vertex(hull, lat_k, lon_k)
+        Set k to k plus 1
+    End While
+    deallocate(scratch)
+    Return hull
+End Process

@@ -1,0 +1,726 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+CASCADE - CSS Cascade Resolution + Computed-Style Builder
+==============================================================================
+
+Implements the CSS cascade and computed-style assembly per CSS Cascade
+and Inheritance Level 5 (https://www.w3.org/TR/css-cascade-5/).
+
+Resolution order (CSS Cascade 5 section 6):
+
+  1. Origin and importance
+        - !important user-agent
+        - !important user
+        - !important author
+        - animations
+        - author normal
+        - user normal
+        - user-agent normal
+        - transitions
+  2. Specificity (a, b, c, d): higher wins
+  3. Source order: later wins
+
+Inherited-property resolution: if a property is inherited and the
+element has no declared value, take the parent's computed value;
+otherwise use the property's initial value.
+
+Custom-property (--name) handling: cascade in their own substitution
+phase, then substitute via var(--name, fallback) in later property
+values.
+
+Records:
+
+  MatchedDeclaration (48 bytes):
+    off  0  property name      (NUL-terminated)
+    off  8  value string       (NUL-terminated)
+    off 16  important          0 or 1
+    off 24  origin             ORIGIN_*
+    off 32  specificity ptr    (24-byte buffer from selector.specificity)
+    off 40  source_order       integer
+
+  ComputedStyle (16 bytes):
+    off  0  properties dict    (Dictionary[name -> value string])
+    off  8  source             (element pointer or 0)
+
+The cascade builds a list of MatchedDeclarations for the element by
+walking the stylesheet rules and checking selector matches, then sorts
+the list by (importance, origin, specificity, source-order), then
+materializes the final ComputedStyle by overlaying declarations in
+sorted order.
+
+References:
+  - CSS Cascade 5:        https://www.w3.org/TR/css-cascade-5/
+  - CSS Selectors 4 spec: https://www.w3.org/TR/selectors-4/
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/style/selector.runa" as Sel
+Import "compiler/frontend/primitives/style/style_rule.runa" as Rule
+Import "compiler/frontend/primitives/style/property.runa" as Prop
+Import "compiler/frontend/primitives/markup/element.runa" as Elem
+Import "compiler/frontend/primitives/markup/selector.runa" as MS
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Constant ORIGIN_USER_AGENT as Integer is 0
+Constant ORIGIN_USER as Integer is 1
+Constant ORIGIN_AUTHOR as Integer is 2
+Constant ORIGIN_ANIMATION as Integer is 3
+Constant ORIGIN_TRANSITION as Integer is 4
+
+Constant MATCHED_SIZE as Integer is 48
+Constant MATCHED_OFF_NAME as Integer is 0
+Constant MATCHED_OFF_VALUE as Integer is 8
+Constant MATCHED_OFF_IMPORTANT as Integer is 16
+Constant MATCHED_OFF_ORIGIN as Integer is 24
+Constant MATCHED_OFF_SPEC as Integer is 32
+Constant MATCHED_OFF_ORDER as Integer is 40
+
+Constant COMPUTED_SIZE as Integer is 16
+Constant COMPUTED_OFF_PROPS as Integer is 0
+Constant COMPUTED_OFF_SOURCE as Integer is 8
+
+Note: ============================================================================
+Note: MATCHED DECLARATION
+Note: ============================================================================
+
+@Reasoning
+Construct a MatchedDeclaration record capturing a declaration's text,
+importance flag, origin, specificity, and source-order index.  These
+records are sorted by the cascade before being applied to the computed
+style.
+@End Reasoning
+@Implementation
+Layout.allocate 48 bytes; write all six slots.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Caller owns specificity buffer; name/value strings are borrowed.
+@End Security_Scope
+Process called "matched_create" takes name as Integer, value as Integer, important as Integer, origin as Integer, spec as Integer, order as Integer returns Integer:
+    Let record be proc allocate from Layout with MATCHED_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, MATCHED_OFF_NAME, name
+    proc memory_set_int64 from Memory with record, MATCHED_OFF_VALUE, value
+    proc memory_set_int64 from Memory with record, MATCHED_OFF_IMPORTANT, important
+    proc memory_set_int64 from Memory with record, MATCHED_OFF_ORIGIN, origin
+    proc memory_set_int64 from Memory with record, MATCHED_OFF_SPEC, spec
+    proc memory_set_int64 from Memory with record, MATCHED_OFF_ORDER, order
+    Return record
+End Process
+
+Process called "matched_destroy" takes m as Integer returns Integer:
+    If m is equal to 0:
+        Return 0
+    End If
+    Let spec be proc memory_get_int64 from Memory with m, MATCHED_OFF_SPEC
+    If spec is not equal to 0:
+        proc specificity_destroy from Sel with spec
+    End If
+    proc deallocate from Layout with m
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: CASCADE ORDERING
+Note: ============================================================================
+
+@Reasoning
+Compare two MatchedDeclarations by the cascade order defined in CSS
+Cascade Level 5 section 6.  Returns -1 if A precedes B (A loses), 1 if
+A succeeds B (A wins), 0 if equal.
+@End Reasoning
+@Implementation
+Origin weight: important flips author/user origins to high-priority
+slots.  Specifically the comparison uses an "effective importance"
+score: 0 for normal author/user/user-agent, 100 for !important
+user-agent, 200 for !important user, 300 for !important author, 50 for
+animations, 25 for transitions.  Then compare specificity: a > a, b > b,
+c > c.  Then source order: later wins.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Pure function; no allocation.
+@End Security_Scope
+Process called "matched_effective_priority" takes m as Integer returns Integer:
+    Let important be proc memory_get_int64 from Memory with m, MATCHED_OFF_IMPORTANT
+    Let origin be proc memory_get_int64 from Memory with m, MATCHED_OFF_ORIGIN
+    If important is equal to 1:
+        If origin is equal to ORIGIN_USER_AGENT:
+            Return 100
+        End If
+        If origin is equal to ORIGIN_USER:
+            Return 200
+        End If
+        If origin is equal to ORIGIN_AUTHOR:
+            Return 300
+        End If
+    End If
+    If origin is equal to ORIGIN_TRANSITION:
+        Return 25
+    End If
+    If origin is equal to ORIGIN_ANIMATION:
+        Return 50
+    End If
+    If origin is equal to ORIGIN_USER_AGENT:
+        Return 1
+    End If
+    If origin is equal to ORIGIN_USER:
+        Return 2
+    End If
+    Return 3
+End Process
+
+Process called "matched_compare" takes a as Integer, b as Integer returns Integer:
+    Let pa be proc matched_effective_priority with a
+    Let pb be proc matched_effective_priority with b
+    If pa is less than pb:
+        Return -1
+    End If
+    If pa is greater than pb:
+        Return 1
+    End If
+    Let sa be proc memory_get_int64 from Memory with a, MATCHED_OFF_SPEC
+    Let sb be proc memory_get_int64 from Memory with b, MATCHED_OFF_SPEC
+    If sa is not equal to 0:
+        If sb is not equal to 0:
+            Let cmp be proc specificity_compare from Sel with sa, sb
+            If cmp is not equal to 0:
+                Return cmp
+            End If
+        End If
+    End If
+    Let oa be proc memory_get_int64 from Memory with a, MATCHED_OFF_ORDER
+    Let ob be proc memory_get_int64 from Memory with b, MATCHED_OFF_ORDER
+    If oa is less than ob:
+        Return -1
+    End If
+    If oa is greater than ob:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Insertion-sort the matched list in place using matched_compare.  Sort
+is stable and O(n^2) — acceptable because per-element cascade lists are
+typically small (under 100 entries).
+@End Reasoning
+@Implementation
+Standard insertion-sort over the underlying List, swapping pointers via
+list_set.
+@End Implementation
+@Performance_Hints
+O(n^2) worst case; O(n) on near-sorted input.
+@End Performance_Hints
+@Security_Scope
+Pure; no allocation beyond what list_set / list_get already use.
+@End Security_Scope
+Process called "matched_sort" takes matched as Integer returns Integer:
+    Let n be proc list_length from List with matched
+    Let i be 1
+    While i is less than n:
+        Let cur be proc list_get from List with matched, i
+        Let j be i minus 1
+        While j is greater than or equal to 0:
+            Let head be proc list_get from List with matched, j
+            Let cmp be proc matched_compare with head, cur
+            If cmp is greater than 0:
+                proc list_set from List with matched, j plus 1, head
+                Set j to j minus 1
+            Otherwise:
+                Set j to -1
+            End If
+        End While
+        proc list_set from List with matched, j plus 1, cur
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: COLLECTION FROM STYLESHEETS
+Note: ============================================================================
+
+@Reasoning
+Walk a single stylesheet, matching every rule's selector against the
+target element, and append a MatchedDeclaration for each declaration
+in matching rules.  Source-order counter is updated and returned.
+@End Reasoning
+@Implementation
+For each entry in the stylesheet, dispatch on kind.  Rules with a list
+selector are split into list members, each independently matched
+against the element.  For a match, every declaration in the rule
+produces a MatchedDeclaration.
+@End Implementation
+@Performance_Hints
+O(rules * matcher_cost).  For multi-piece selectors the matcher cost
+dominates.
+@End Performance_Hints
+@Security_Scope
+specificity buffer is owned by the MatchedDeclaration; if the matched
+list is destroyed via matched_destroy_all the buffers are released.
+@End Security_Scope
+Process called "cascade_collect_from_sheet" takes element as Integer, sheet as Integer, origin as Integer, matched as Integer, order_start as Integer returns Integer:
+    If sheet is equal to 0:
+        Return order_start
+    End If
+    Let count be proc stylesheet_entry_count from Rule with sheet
+    Let i be 0
+    Let order be order_start
+    While i is less than count:
+        Let kind be proc stylesheet_get_kind_at from Rule with sheet, i
+        Let entry be proc stylesheet_get_entry_at from Rule with sheet, i
+        If kind is equal to 1:
+            Let sel be proc rule_get_selector from Rule with entry
+            Let decls be proc rule_get_declarations from Rule with entry
+            Let m be proc selector_match from MS with element, sel
+            If m is equal to 1:
+                Let dcount be proc list_length from List with decls
+                Let j be 0
+                While j is less than dcount:
+                    Let decl be proc list_get from List with decls, j
+                    Let dname be proc declaration_get_name from Rule with decl
+                    Let dvalue be proc declaration_get_value from Rule with decl
+                    Let dimp be proc declaration_is_important from Rule with decl
+                    Let spec be proc selector_specificity from Sel with sel
+                    Let mr be proc matched_create with dname, dvalue, dimp, origin, spec, order
+                    If mr is not equal to 0:
+                        proc list_push from List with matched, mr
+                    End If
+                    Set order to order plus 1
+                    Set j to j plus 1
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return order
+End Process
+
+Note: ============================================================================
+Note: COMPUTED STYLE
+Note: ============================================================================
+
+@Reasoning
+Construct a ComputedStyle record backed by a Dictionary mapping
+property name -> raw value string.  The source element pointer is kept
+for downstream computed-value resolution (em-relative lengths, etc).
+@End Reasoning
+@Implementation
+Allocate 16 bytes; create the backing dictionary.
+@End Implementation
+@Performance_Hints
+O(1).
+@End Performance_Hints
+@Security_Scope
+Caller owns the ComputedStyle; computed_destroy releases both record
+and dictionary.
+@End Security_Scope
+Process called "computed_create" takes source_element as Integer returns Integer:
+    Let record be proc allocate from Layout with COMPUTED_SIZE
+    If record is equal to 0:
+        Return 0
+    End If
+    Let props be proc create from Dict
+    If props is equal to 0:
+        proc deallocate from Layout with record
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with record, COMPUTED_OFF_PROPS, props
+    proc memory_set_int64 from Memory with record, COMPUTED_OFF_SOURCE, source_element
+    Return record
+End Process
+
+Process called "computed_get" takes computed as Integer, name as Integer returns Integer:
+    If computed is equal to 0:
+        Return 0
+    End If
+    Let props be proc memory_get_int64 from Memory with computed, COMPUTED_OFF_PROPS
+    Return proc get from Dict with props, name
+End Process
+
+Process called "computed_set" takes computed as Integer, name as Integer, value as Integer returns Integer:
+    If computed is equal to 0:
+        Return 0
+    End If
+    Let props be proc memory_get_int64 from Memory with computed, COMPUTED_OFF_PROPS
+    Return proc set from Dict with props, name, value
+End Process
+
+Process called "computed_destroy" takes computed as Integer returns Integer:
+    If computed is equal to 0:
+        Return 0
+    End If
+    Let props be proc memory_get_int64 from Memory with computed, COMPUTED_OFF_PROPS
+    If props is not equal to 0:
+        proc destroy from Dict with props
+    End If
+    proc deallocate from Layout with computed
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: CASCADE APPLICATION
+Note: ============================================================================
+
+@Reasoning
+Substitute var(--name, fallback) occurrences in a raw value string
+against the custom-property dictionary.  Returns a freshly allocated
+expanded string or the original pointer if no substitution was needed.
+Designed for simple top-level var() references; nested var() is
+handled by re-running expansion on the substituted result up to a
+fixed depth to avoid infinite recursion.
+@End Reasoning
+@Implementation
+Scan the value for the literal "var(--".  When found, capture the
+variable name up to ',' or ')', look it up in the custom-property
+dictionary, substitute its value (or the literal fallback after ',').
+Loop until no further var( substrings appear or a depth ceiling is hit.
+@End Implementation
+@Performance_Hints
+O(length * substitution_count).  Depth ceiling 32 prevents pathological
+input.
+@End Performance_Hints
+@Security_Scope
+Returns a caller-owned string (or the original pointer with caller
+still responsible).
+@End Security_Scope
+Process called "cascade_extract_var_name" takes text as Integer, start as Integer, out_end as Integer, out_fallback_start as Integer returns Integer:
+    Let len be proc string_length from StringCore with text
+    Let i be start
+    Let depth be 0
+    Let fallback_start be -1
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with text, i
+        If ch is equal to 40:
+            Set depth to depth plus 1
+        End If
+        If ch is equal to 41:
+            If depth is equal to 0:
+                proc memory_set_int64 from Memory with out_end, 0, i
+                proc memory_set_int64 from Memory with out_fallback_start, 0, fallback_start
+                Return 1
+            End If
+            Set depth to depth minus 1
+        End If
+        If ch is equal to 44:
+            If depth is equal to 0:
+                If fallback_start is equal to -1:
+                    Set fallback_start to i plus 1
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    proc memory_set_int64 from Memory with out_end, 0, -1
+    proc memory_set_int64 from Memory with out_fallback_start, 0, -1
+    Return 0
+End Process
+
+Process called "cascade_substitute_vars_once" takes value as Integer, custom_props as Integer, out_changed as Integer returns Integer:
+    If value is equal to 0:
+        proc memory_set_int64 from Memory with out_changed, 0, 0
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with value
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        proc memory_set_int64 from Memory with out_changed, 0, 0
+        Return value
+    End If
+    Let i be 0
+    Let changed be 0
+    While i is less than len:
+        Let c0 be proc string_char_at from StringCore with value, i
+        Let remaining be len minus i
+        If c0 is equal to 118:
+            If remaining is greater than or equal to 6:
+                Let c1 be proc string_char_at from StringCore with value, i plus 1
+                Let c2 be proc string_char_at from StringCore with value, i plus 2
+                Let c3 be proc string_char_at from StringCore with value, i plus 3
+                Let c4 be proc string_char_at from StringCore with value, i plus 4
+                Let c5 be proc string_char_at from StringCore with value, i plus 5
+                If c1 is equal to 97:
+                    If c2 is equal to 114:
+                        If c3 is equal to 40:
+                            If c4 is equal to 45:
+                                If c5 is equal to 45:
+                                    Let end_slot be proc allocate from Layout with 8
+                                    Let fb_slot be proc allocate from Layout with 8
+                                    proc memory_set_int64 from Memory with end_slot, 0, 0
+                                    proc memory_set_int64 from Memory with fb_slot, 0, 0
+                                    proc cascade_extract_var_name with value, i plus 4, end_slot, fb_slot
+                                    Let close_pos be proc memory_get_int64 from Memory with end_slot, 0
+                                    Let fb_start be proc memory_get_int64 from Memory with fb_slot, 0
+                                    proc deallocate from Layout with end_slot
+                                    proc deallocate from Layout with fb_slot
+                                    If close_pos is greater than 0:
+                                        Let name_end be close_pos
+                                        If fb_start is greater than 0:
+                                            Set name_end to fb_start minus 1
+                                        End If
+                                        Let name_sb be proc stringbuilder_create from SB
+                                        Let k be i plus 4
+                                        While k is less than name_end:
+                                            Let nch be proc string_char_at from StringCore with value, k
+                                            proc stringbuilder_append_char from SB with name_sb, nch
+                                            Set k to k plus 1
+                                        End While
+                                        Let var_name be proc stringbuilder_to_string from SB with name_sb
+                                        proc stringbuilder_destroy from SB with name_sb
+                                        Let resolved be proc get from Dict with custom_props, var_name
+                                        If resolved is equal to 0:
+                                            If fb_start is greater than 0:
+                                                Let fb_sb be proc stringbuilder_create from SB
+                                                Let f be fb_start
+                                                While f is less than close_pos:
+                                                    Let fch be proc string_char_at from StringCore with value, f
+                                                    proc stringbuilder_append_char from SB with fb_sb, fch
+                                                    Set f to f plus 1
+                                                End While
+                                                Let fallback_val be proc stringbuilder_to_string from SB with fb_sb
+                                                proc stringbuilder_destroy from SB with fb_sb
+                                                proc stringbuilder_append from SB with sb, fallback_val
+                                            End If
+                                        Otherwise:
+                                            proc stringbuilder_append from SB with sb, resolved
+                                        End If
+                                        Set i to close_pos plus 1
+                                        Set changed to 1
+                                    Otherwise:
+                                        proc stringbuilder_append_char from SB with sb, c0
+                                        Set i to i plus 1
+                                    End If
+                                Otherwise:
+                                    proc stringbuilder_append_char from SB with sb, c0
+                                    Set i to i plus 1
+                                End If
+                            Otherwise:
+                                proc stringbuilder_append_char from SB with sb, c0
+                                Set i to i plus 1
+                            End If
+                        Otherwise:
+                            proc stringbuilder_append_char from SB with sb, c0
+                            Set i to i plus 1
+                        End If
+                    Otherwise:
+                        proc stringbuilder_append_char from SB with sb, c0
+                        Set i to i plus 1
+                    End If
+                Otherwise:
+                    proc stringbuilder_append_char from SB with sb, c0
+                    Set i to i plus 1
+                End If
+            Otherwise:
+                proc stringbuilder_append_char from SB with sb, c0
+                Set i to i plus 1
+            End If
+        Otherwise:
+            proc stringbuilder_append_char from SB with sb, c0
+            Set i to i plus 1
+        End If
+    End While
+    proc memory_set_int64 from Memory with out_changed, 0, changed
+    If changed is equal to 0:
+        proc stringbuilder_destroy from SB with sb
+        Return value
+    End If
+    Let out be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return out
+End Process
+
+@Reasoning
+Resolve `var(--name)` substitutions iteratively until stable or a
+depth ceiling.  Nested var() is handled by re-substituting until no
+further var( appears, capping at 32 rounds to break cycles.
+@End Reasoning
+@Implementation
+Loop cascade_substitute_vars_once; halt when no change.
+@End Implementation
+@Performance_Hints
+At most 32 rounds * cost-of-single-pass.
+@End Performance_Hints
+@Security_Scope
+Returns a caller-owned string (possibly the input pointer if no
+substitution).
+@End Security_Scope
+Process called "cascade_resolve_value" takes value as Integer, custom_props as Integer returns Integer:
+    Let current be value
+    Let depth be 0
+    Let changed_slot be proc allocate from Layout with 8
+    If changed_slot is equal to 0:
+        Return value
+    End If
+    While depth is less than 32:
+        proc memory_set_int64 from Memory with changed_slot, 0, 0
+        Let next_val be proc cascade_substitute_vars_once with current, custom_props, changed_slot
+        Let ch be proc memory_get_int64 from Memory with changed_slot, 0
+        If ch is equal to 0:
+            proc deallocate from Layout with changed_slot
+            Return current
+        End If
+        Set current to next_val
+        Set depth to depth plus 1
+    End While
+    proc deallocate from Layout with changed_slot
+    Return current
+End Process
+
+@Reasoning
+Top-level cascade.  Builds the matched-declaration list from each
+supplied stylesheet, sorts by cascade priority, applies in order to
+fill the ComputedStyle, then layers inherited-property fallback (from
+the parent element's computed style if supplied) and initial-value
+fallback (from the property registry).
+@End Reasoning
+@Implementation
+1. For each stylesheet in the supplied lists, run cascade_collect_from_sheet
+   tagged with its origin.
+2. matched_sort.
+3. Build a dictionary of custom-property declarations from the matched
+   list (separating "--name" properties).
+4. For every other matched declaration, var-resolve the value and
+   write it into the ComputedStyle (later writers overwrite earlier
+   per the sort).
+5. For every property in the registry, if not present in the computed
+   style and the property is inherited and the parent_computed supplies
+   it, copy from parent.  Otherwise use the registry's initial value.
+@End Implementation
+@Performance_Hints
+O(stylesheets * rules * matcher_cost + matched^2 + registry).  For
+typical pages all these are small.
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM.  Custom-properties dictionary released before return.
+@End Security_Scope
+Process called "cascade_apply" takes element as Integer, sheets as Integer, origins as Integer, parent_computed as Integer, registry as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    Let matched be proc list_create from List
+    If matched is equal to 0:
+        Return 0
+    End If
+    Let sheet_count be 0
+    If sheets is not equal to 0:
+        Set sheet_count to proc list_length from List with sheets
+    End If
+    Let i be 0
+    Let order be 0
+    While i is less than sheet_count:
+        Let sheet be proc list_get from List with sheets, i
+        Let origin be ORIGIN_AUTHOR
+        If origins is not equal to 0:
+            Let provided_origin be proc list_get from List with origins, i
+            Set origin to provided_origin
+        End If
+        Set order to proc cascade_collect_from_sheet with element, sheet, origin, matched, order
+        Set i to i plus 1
+    End While
+    proc matched_sort with matched
+    Let computed be proc computed_create with element
+    If computed is equal to 0:
+        proc list_destroy from List with matched
+        Return 0
+    End If
+    Let custom_props be proc create from Dict
+    If custom_props is equal to 0:
+        proc computed_destroy with computed
+        proc list_destroy from List with matched
+        Return 0
+    End If
+    Let mcount be proc list_length from List with matched
+    Let j be 0
+    While j is less than mcount:
+        Let m be proc list_get from List with matched, j
+        Let pname be proc memory_get_int64 from Memory with m, MATCHED_OFF_NAME
+        Let pvalue be proc memory_get_int64 from Memory with m, MATCHED_OFF_VALUE
+        Let is_custom be proc string_starts_with from StringCore with pname, "--"
+        If is_custom is equal to 1:
+            proc set from Dict with custom_props, pname, pvalue
+        End If
+        Set j to j plus 1
+    End While
+    Set j to 0
+    While j is less than mcount:
+        Let mm be proc list_get from List with matched, j
+        Let pname2 be proc memory_get_int64 from Memory with mm, MATCHED_OFF_NAME
+        Let pvalue2 be proc memory_get_int64 from Memory with mm, MATCHED_OFF_VALUE
+        Let is_custom2 be proc string_starts_with from StringCore with pname2, "--"
+        If is_custom2 is equal to 0:
+            Let resolved be proc cascade_resolve_value with pvalue2, custom_props
+            proc computed_set with computed, pname2, resolved
+        End If
+        Set j to j plus 1
+    End While
+    If registry is not equal to 0:
+        Let rcount be proc list_length from List with registry
+        Let k be 0
+        While k is less than rcount:
+            Let spec be proc list_get from List with registry, k
+            Let pname3 be proc memory_get_int64 from Memory with spec, 0
+            Let existing be proc computed_get with computed, pname3
+            If existing is equal to 0:
+                Let inherited be proc memory_get_int64 from Memory with spec, 16
+                Let assigned be 0
+                If inherited is equal to 1:
+                    If parent_computed is not equal to 0:
+                        Let parent_val be proc computed_get with parent_computed, pname3
+                        If parent_val is not equal to 0:
+                            proc computed_set with computed, pname3, parent_val
+                            Set assigned to 1
+                        End If
+                    End If
+                End If
+                If assigned is equal to 0:
+                    Let initial be proc memory_get_int64 from Memory with spec, 32
+                    If initial is not equal to 0:
+                        proc computed_set with computed, pname3, initial
+                    End If
+                End If
+            End If
+            Set k to k plus 1
+        End While
+    End If
+    proc destroy from Dict with custom_props
+    Let final_count be proc list_length from List with matched
+    Let q be 0
+    While q is less than final_count:
+        Let entry be proc list_get from List with matched, q
+        proc matched_destroy with entry
+        Set q to q plus 1
+    End While
+    proc list_destroy from List with matched
+    Return computed
+End Process

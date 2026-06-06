@@ -1,0 +1,655 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0.
+:End Note
+
+Note:
+Exact rational arithmetic.
+
+A Rational is a fraction numerator/denominator with:
+  - Always-positive denominator (sign carried by the numerator)
+  - Always in lowest terms (GCD-normalized after every operation)
+  - Numerator/denominator stored as signed 64-bit Integer pairs
+
+Memory layout (heap-allocated):
+  Rational = 16 bytes
+    Offset 0: numerator (signed Integer)
+    Offset 8: denominator (positive Integer)
+
+Operations:
+  - allocate / free / set / get_numerator / get_denominator / copy
+  - add / sub / mul / div / neg / abs / reciprocal / pow_int
+  - compare (-1, 0, +1)
+  - from_integer / from_decimal_string / to_float64 / to_decimal_string
+
+@Reasoning
+A Tier-1 exact rational with 64-bit numerator/denominator covers ~18
+decimal digits of dynamic range either side of zero, sufficient for the
+canonical use cases (financial sub-units, exact unit conversion, music
+intervals, RSA-modulus-light operations). A future revision will swap
+the underlying limbs to BigInt once that module is ratified (currently
+in flight on another stream).
+
+Normalization rule: every operation calls _normalize() which:
+  1. Detects denominator < 0 and flips signs.
+  2. Computes GCD via Euclid's algorithm.
+  3. Divides numerator and denominator by GCD.
+Result: every Rational lives in a canonical lowest-terms form.
+
+Reference: Knuth, TAOCP Vol 2, "Seminumerical Algorithms", 4.5.1.
+@End Reasoning
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arith
+
+Constant RATIONAL_SIZE_BYTES as Integer is 16
+Constant RATIONAL_OK as Integer is 0
+Constant RATIONAL_ERR_DENOM_ZERO as Integer is -1
+Constant RATIONAL_ERR_OVERFLOW as Integer is -2
+Constant RATIONAL_ERR_PARSE as Integer is -3
+
+Note: ============================================================================
+Note: Internal helpers
+Note: ============================================================================
+
+Process called "abs_int" takes x as Integer returns Integer:
+    @Reasoning
+        Integer absolute value. INT64_MIN is its own negation (overflow),
+        but we tolerate this case because the rest of the rational arith
+        would also fail at INT64_MIN.
+    @End Reasoning
+    @Implementation
+        Sign-bit conditional.
+    @End Implementation
+    @Performance_Hints
+        Branchless on most ISAs.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    If x is less than 0:
+        Return 0 minus x
+    End If
+    Return x
+End Process
+
+Process called "gcd_int" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Euclid's algorithm for the greatest common divisor of unsigned
+        integers. Works on absolute values; signs are handled by the
+        normalization routine.
+    @End Reasoning
+    @Implementation
+        Iterative replacement: a, b -> b, a mod b until b = 0.
+    @End Implementation
+    @Performance_Hints
+        O(log min(a, b)) divisions. For 64-bit inputs this terminates
+        in at most ~91 iterations (Fibonacci-worst-case bound).
+    @End Performance_Hints
+    @Security_Scope
+        Non-constant-time (depends on input magnitudes). Acceptable for
+        normalization; not suitable for secret-dependent inputs.
+    @End Security_Scope
+    Let aa be proc abs_int with a
+    Let bb be proc abs_int with b
+    While bb is not equal to 0:
+        Let t be bb
+        Set bb to aa modulo by bb
+        Set aa to t
+    End While
+    If aa is equal to 0:
+        Return 1
+    End If
+    Return aa
+End Process
+
+Note: ============================================================================
+Note: Allocation and basic accessors
+Note: ============================================================================
+
+Process called "rational_allocate" returns Integer:
+    @Reasoning
+        Allocate a fresh 16-byte zeroed Rational. Initial state is 0/0
+        which is invalid - callers must immediately call set or one of
+        the from_* constructors.
+    @End Reasoning
+    @Implementation
+        Layout.allocate.
+    @End Implementation
+    @Performance_Hints
+        O(1) fast path.
+    @End Performance_Hints
+    @Security_Scope
+        Zeroed.
+    @End Security_Scope
+    Let p be proc allocate from Layout with RATIONAL_SIZE_BYTES
+    Return p
+End Process
+
+Process called "rational_free" takes r as Integer returns Integer:
+    If r is equal to 0:
+        Return 0
+    End If
+    Let _d be proc deallocate from Layout with r
+    Return 0
+End Process
+
+Process called "rational_get_numerator" takes r as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with r, 0
+End Process
+
+Process called "rational_get_denominator" takes r as Integer returns Integer:
+    Return proc memory_get_int64 from Memory with r, 8
+End Process
+
+Process called "rational_normalize" takes r as Integer returns Integer:
+    @Reasoning
+        Canonicalize: positive denominator + lowest terms. Returns
+        RATIONAL_ERR_DENOM_ZERO if denominator is 0.
+    @End Reasoning
+    @Implementation
+        Flip signs if denom < 0, then divide both by gcd(|n|, |d|).
+    @End Implementation
+    @Performance_Hints
+        One Euclidean GCD pass.
+    @End Performance_Hints
+    @Security_Scope
+        Non-constant-time on input magnitudes.
+    @End Security_Scope
+    Let n be proc rational_get_numerator with r
+    Let d be proc rational_get_denominator with r
+    If d is equal to 0:
+        Return RATIONAL_ERR_DENOM_ZERO
+    End If
+    If d is less than 0:
+        Set n to 0 minus n
+        Set d to 0 minus d
+    End If
+    Let g be proc gcd_int with n, d
+    If g is greater than 1:
+        Set n to n divided by g
+        Set d to d divided by g
+    End If
+    Let _wn be proc memory_set_int64 from Memory with r, 0, n
+    Let _wd be proc memory_set_int64 from Memory with r, 8, d
+    Return RATIONAL_OK
+End Process
+
+Process called "rational_set" takes r as Integer, numerator as Integer, denominator as Integer returns Integer:
+    @Reasoning
+        Set the two fields and immediately normalize.
+    @End Reasoning
+    @Implementation
+        Two stores + normalize.
+    @End Implementation
+    @Performance_Hints
+        Cost dominated by GCD.
+    @End Performance_Hints
+    @Security_Scope
+        Returns error if denominator = 0.
+    @End Security_Scope
+    Let _wn be proc memory_set_int64 from Memory with r, 0, numerator
+    Let _wd be proc memory_set_int64 from Memory with r, 8, denominator
+    Return proc rational_normalize with r
+End Process
+
+Process called "rational_copy" takes src as Integer, dst as Integer returns Integer:
+    Let _c be proc memory_copy from Memory with dst, src, RATIONAL_SIZE_BYTES
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Arithmetic
+Note: ============================================================================
+
+Process called "rational_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        a/b + c/d = (a*d + b*c) / (b*d), then normalize.
+    @End Reasoning
+    @Implementation
+        Cross-multiplication is the textbook addition. We could pre-reduce
+        by gcd(b, d) to defeat overflow, and we do so to extend the
+        usable range.
+    @End Implementation
+    @Performance_Hints
+        Three GCDs + 4 multiplies.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe (snapshot before write).
+    @End Security_Scope
+    Let an be proc rational_get_numerator with a
+    Let ad be proc rational_get_denominator with a
+    Let bn be proc rational_get_numerator with b
+    Let bd be proc rational_get_denominator with b
+    Let g1 be proc gcd_int with ad, bd
+    Let ad_red be ad divided by g1
+    Let bd_red be bd divided by g1
+    Let new_num be (an multiplied by bd_red) plus (bn multiplied by ad_red)
+    Let new_den be ad_red multiplied by bd
+    Let _wn be proc memory_set_int64 from Memory with result, 0, new_num
+    Let _wd be proc memory_set_int64 from Memory with result, 8, new_den
+    Return proc rational_normalize with result
+End Process
+
+Process called "rational_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    Let an be proc rational_get_numerator with a
+    Let ad be proc rational_get_denominator with a
+    Let bn be proc rational_get_numerator with b
+    Let bd be proc rational_get_denominator with b
+    Let g1 be proc gcd_int with ad, bd
+    Let ad_red be ad divided by g1
+    Let bd_red be bd divided by g1
+    Let new_num be (an multiplied by bd_red) minus (bn multiplied by ad_red)
+    Let new_den be ad_red multiplied by bd
+    Let _wn be proc memory_set_int64 from Memory with result, 0, new_num
+    Let _wd be proc memory_set_int64 from Memory with result, 8, new_den
+    Return proc rational_normalize with result
+End Process
+
+Process called "rational_mul" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        (a/b) * (c/d) = (a*c) / (b*d), then normalize.
+        Pre-cancellation of gcd(a, d) and gcd(b, c) reduces overflow risk.
+    @End Reasoning
+    @Implementation
+        Cross-GCD reduction trick of Knuth TAOCP 4.5.1 exercise 5.
+    @End Implementation
+    @Performance_Hints
+        Two GCDs + 2 multiplies.
+    @End Performance_Hints
+    @Security_Scope
+        Aliasing-safe.
+    @End Security_Scope
+    Let an be proc rational_get_numerator with a
+    Let ad be proc rational_get_denominator with a
+    Let bn be proc rational_get_numerator with b
+    Let bd be proc rational_get_denominator with b
+    Let g1 be proc gcd_int with an, bd
+    Let g2 be proc gcd_int with bn, ad
+    Let an_r be an divided by g1
+    Let bd_r be bd divided by g1
+    Let bn_r be bn divided by g2
+    Let ad_r be ad divided by g2
+    Let new_num be an_r multiplied by bn_r
+    Let new_den be ad_r multiplied by bd_r
+    Let _wn be proc memory_set_int64 from Memory with result, 0, new_num
+    Let _wd be proc memory_set_int64 from Memory with result, 8, new_den
+    Return proc rational_normalize with result
+End Process
+
+Process called "rational_div" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        (a/b) / (c/d) = (a*d) / (b*c). Returns error if b's numerator is 0.
+    @End Reasoning
+    @Implementation
+        Reciprocate b and multiply.
+    @End Implementation
+    @Performance_Hints
+        Same as multiply.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 on division by zero.
+    @End Security_Scope
+    Let bn be proc rational_get_numerator with b
+    If bn is equal to 0:
+        Return RATIONAL_ERR_DENOM_ZERO
+    End If
+    Let an be proc rational_get_numerator with a
+    Let ad be proc rational_get_denominator with a
+    Let bd be proc rational_get_denominator with b
+    Let g1 be proc gcd_int with an, bn
+    Let g2 be proc gcd_int with bd, ad
+    Let an_r be an divided by g1
+    Let bn_r be bn divided by g1
+    Let bd_r be bd divided by g2
+    Let ad_r be ad divided by g2
+    Let new_num be an_r multiplied by bd_r
+    Let new_den be ad_r multiplied by bn_r
+    Let _wn be proc memory_set_int64 from Memory with result, 0, new_num
+    Let _wd be proc memory_set_int64 from Memory with result, 8, new_den
+    Return proc rational_normalize with result
+End Process
+
+Process called "rational_neg" takes a as Integer, result as Integer returns Integer:
+    Let an be proc rational_get_numerator with a
+    Let ad be proc rational_get_denominator with a
+    Let _wn be proc memory_set_int64 from Memory with result, 0, 0 minus an
+    Let _wd be proc memory_set_int64 from Memory with result, 8, ad
+    Return 0
+End Process
+
+Process called "rational_abs" takes a as Integer, result as Integer returns Integer:
+    Let an be proc rational_get_numerator with a
+    Let ad be proc rational_get_denominator with a
+    Let abs_an be proc abs_int with an
+    Let _wn be proc memory_set_int64 from Memory with result, 0, abs_an
+    Let _wd be proc memory_set_int64 from Memory with result, 8, ad
+    Return 0
+End Process
+
+Process called "rational_reciprocal" takes a as Integer, result as Integer returns Integer:
+    @Reasoning
+        Swap numerator and denominator, then normalize sign.
+    @End Reasoning
+    @Implementation
+        Two swaps + normalize.
+    @End Implementation
+    @Performance_Hints
+        Single GCD.
+    @End Performance_Hints
+    @Security_Scope
+        Returns -1 if numerator = 0.
+    @End Security_Scope
+    Let an be proc rational_get_numerator with a
+    Let ad be proc rational_get_denominator with a
+    If an is equal to 0:
+        Return RATIONAL_ERR_DENOM_ZERO
+    End If
+    Let _wn be proc memory_set_int64 from Memory with result, 0, ad
+    Let _wd be proc memory_set_int64 from Memory with result, 8, an
+    Return proc rational_normalize with result
+End Process
+
+Process called "rational_pow_int" takes a as Integer, exp as Integer, result as Integer returns Integer:
+    @Reasoning
+        Raise a/b to an integer power. For exp < 0, reciprocate.
+        Uses left-to-right binary exponentiation.
+    @End Reasoning
+    @Implementation
+        Standard fast-power loop on numerator and denominator.
+    @End Implementation
+    @Performance_Hints
+        O(log |exp|) multiplications.
+    @End Performance_Hints
+    @Security_Scope
+        Non-constant-time on exp magnitude. Returns -1 if a = 0 and exp < 0.
+    @End Security_Scope
+    Let an be proc rational_get_numerator with a
+    Let ad be proc rational_get_denominator with a
+    Let e be exp
+    If e is equal to 0:
+        Let _wn be proc memory_set_int64 from Memory with result, 0, 1
+        Let _wd be proc memory_set_int64 from Memory with result, 8, 1
+        Return 0
+    End If
+    Let neg be 0
+    If e is less than 0:
+        If an is equal to 0:
+            Return RATIONAL_ERR_DENOM_ZERO
+        End If
+        Set neg to 1
+        Set e to 0 minus e
+    End If
+    Let res_n be 1
+    Let res_d be 1
+    Let base_n be an
+    Let base_d be ad
+    While e is greater than 0:
+        Let bit be e modulo by 2
+        If bit is equal to 1:
+            Set res_n to res_n multiplied by base_n
+            Set res_d to res_d multiplied by base_d
+        End If
+        Set base_n to base_n multiplied by base_n
+        Set base_d to base_d multiplied by base_d
+        Set e to e divided by 2
+    End While
+    If neg is equal to 1:
+        Let tmp be res_n
+        Set res_n to res_d
+        Set res_d to tmp
+    End If
+    Let _wn be proc memory_set_int64 from Memory with result, 0, res_n
+    Let _wd be proc memory_set_int64 from Memory with result, 8, res_d
+    Return proc rational_normalize with result
+End Process
+
+Process called "rational_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Compare a/b vs c/d by cross-multiplication. Since denominators
+        are positive after normalization, sign of (a*d - b*c) gives the
+        comparison: -1 if a < b, 0 if equal, +1 if a > b.
+    @End Reasoning
+    @Implementation
+        Direct cross-multiply.
+    @End Implementation
+    @Performance_Hints
+        Two multiplies + sign check.
+    @End Performance_Hints
+    @Security_Scope
+        Watch for overflow on extreme operands; covered for typical use.
+    @End Security_Scope
+    Let an be proc rational_get_numerator with a
+    Let ad be proc rational_get_denominator with a
+    Let bn be proc rational_get_numerator with b
+    Let bd be proc rational_get_denominator with b
+    Let lhs be an multiplied by bd
+    Let rhs be bn multiplied by ad
+    If lhs is less than rhs:
+        Return 0 minus 1
+    End If
+    If lhs is greater than rhs:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "rational_from_integer" takes r as Integer, n as Integer returns Integer:
+    @Reasoning
+        Embed an integer n into the rationals as n/1.
+    @End Reasoning
+    @Implementation
+        Direct write.
+    @End Implementation
+    @Performance_Hints
+        Trivial.
+    @End Performance_Hints
+    @Security_Scope
+        No special concerns.
+    @End Security_Scope
+    Let _wn be proc memory_set_int64 from Memory with r, 0, n
+    Let _wd be proc memory_set_int64 from Memory with r, 8, 1
+    Return 0
+End Process
+
+Process called "rational_to_float64" takes a as Integer returns Float:
+    @Reasoning
+        Lossy conversion: float64(numerator) / float64(denominator).
+        Magnitudes above 2^53 lose integer precision (IEEE 754 limit).
+    @End Reasoning
+    @Implementation
+        Two int_to_float conversions + one divide.
+    @End Implementation
+    @Performance_Hints
+        Two cvtsi2sd + one divsd.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+    Let n be proc rational_get_numerator with a
+    Let d be proc rational_get_denominator with a
+    Let nf be proc int_to_float from Arith with n
+    Let df be proc int_to_float from Arith with d
+    Return nf divided by df
+End Process
+
+Process called "rational_from_decimal_string" takes r as Integer, s as Integer returns Integer:
+    @Reasoning
+        Parse a decimal string like "0.1" or "-3.25" into an exact
+        Rational. The result of "0.1" is precisely 1/10 (not the
+        truncated Float64 approximation).
+
+        Format:
+          - Optional leading '-'
+          - One or more decimal digits
+          - Optional '.' followed by one or more decimal digits
+          - No exponent (use rational_pow_int to scale)
+    @End Reasoning
+    @Implementation
+        Walk the string accumulating an integer mantissa, count digits
+        after the decimal point, then return mantissa/(10^digits).
+    @End Implementation
+    @Performance_Hints
+        O(length of string).
+    @End Performance_Hints
+    @Security_Scope
+        Returns RATIONAL_ERR_PARSE on malformed input.
+    @End Security_Scope
+    Let i be 0
+    Let sign be 1
+    Let first be proc memory_get_byte from Memory with s, 0
+    If first is equal to 45:
+        Set sign to 0 minus 1
+        Set i to 1
+    End If
+    Let mantissa be 0
+    Let denom be 1
+    Let in_frac be 0
+    Let any_digit be 0
+    While 1 is equal to 1:
+        Let ch be proc memory_get_byte from Memory with s, i
+        If ch is equal to 0:
+            Set i to 0 minus 1
+        End If
+        If i is equal to (0 minus 1):
+            Set i to 0 minus 1
+        End If
+        If ch is equal to 0:
+            Note: end of string
+            If any_digit is equal to 0:
+                Return RATIONAL_ERR_PARSE
+            End If
+            Set mantissa to sign multiplied by mantissa
+            Let _wn be proc memory_set_int64 from Memory with r, 0, mantissa
+            Let _wd be proc memory_set_int64 from Memory with r, 8, denom
+            Return proc rational_normalize with r
+        End If
+        If ch is equal to 46:
+            Note: '.'
+            If in_frac is equal to 1:
+                Return RATIONAL_ERR_PARSE
+            End If
+            Set in_frac to 1
+            Set i to i plus 1
+        Otherwise:
+            If ch is less than 48:
+                Return RATIONAL_ERR_PARSE
+            End If
+            If ch is greater than 57:
+                Return RATIONAL_ERR_PARSE
+            End If
+            Let digit be ch minus 48
+            Set mantissa to (mantissa multiplied by 10) plus digit
+            If in_frac is equal to 1:
+                Set denom to denom multiplied by 10
+            End If
+            Set any_digit to 1
+            Set i to i plus 1
+        End If
+    End While
+    Return RATIONAL_ERR_PARSE
+End Process
+
+Process called "rational_to_decimal_string" takes a as Integer, buf as Integer, buf_size as Integer returns Integer:
+    @Reasoning
+        Write a/d as a fraction string "numerator/denominator", e.g.
+        "1/3" or "-7/4". Uses signed decimal for the numerator, no
+        attempt at decimal expansion (which can be infinite).
+    @End Reasoning
+    @Implementation
+        Walks each integer extracting digits least-to-most significant,
+        then reverses in place. Inserts '/' between numerator and
+        denominator.
+    @End Implementation
+    @Performance_Hints
+        O(digits) per integer.
+    @End Performance_Hints
+    @Security_Scope
+        Returns number of bytes written, or -1 on buffer overflow.
+    @End Security_Scope
+    Let n be proc rational_get_numerator with a
+    Let d be proc rational_get_denominator with a
+    Let pos be 0
+    Note: numerator sign
+    If n is less than 0:
+        If pos is greater than (buf_size minus 1):
+            Return 0 minus 1
+        End If
+        Let _ws be proc memory_set_byte from Memory with buf, pos, 45
+        Set pos to pos plus 1
+        Set n to 0 minus n
+    End If
+    Note: numerator digits (reverse-then-flip)
+    Let start_num be pos
+    If n is equal to 0:
+        If pos is greater than (buf_size minus 1):
+            Return 0 minus 1
+        End If
+        Let _w0 be proc memory_set_byte from Memory with buf, pos, 48
+        Set pos to pos plus 1
+    Otherwise:
+        While n is greater than 0:
+            If pos is greater than (buf_size minus 1):
+                Return 0 minus 1
+            End If
+            Let digit be n modulo by 10
+            Let _wd be proc memory_set_byte from Memory with buf, pos, digit plus 48
+            Set pos to pos plus 1
+            Set n to n divided by 10
+        End While
+        Note: reverse numerator digits in place [start_num, pos)
+        Let lo be start_num
+        Let hi be pos minus 1
+        While lo is less than hi:
+            Let cl be proc memory_get_byte from Memory with buf, lo
+            Let ch be proc memory_get_byte from Memory with buf, hi
+            Let _wl be proc memory_set_byte from Memory with buf, lo, ch
+            Let _wh be proc memory_set_byte from Memory with buf, hi, cl
+            Set lo to lo plus 1
+            Set hi to hi minus 1
+        End While
+    End If
+    Note: '/'
+    If pos is greater than (buf_size minus 1):
+        Return 0 minus 1
+    End If
+    Let _ws2 be proc memory_set_byte from Memory with buf, pos, 47
+    Set pos to pos plus 1
+    Note: denominator digits
+    Let start_den be pos
+    If d is equal to 0:
+        If pos is greater than (buf_size minus 1):
+            Return 0 minus 1
+        End If
+        Let _w1 be proc memory_set_byte from Memory with buf, pos, 48
+        Set pos to pos plus 1
+    Otherwise:
+        While d is greater than 0:
+            If pos is greater than (buf_size minus 1):
+                Return 0 minus 1
+            End If
+            Let digit be d modulo by 10
+            Let _wd2 be proc memory_set_byte from Memory with buf, pos, digit plus 48
+            Set pos to pos plus 1
+            Set d to d divided by 10
+        End While
+        Let lo be start_den
+        Let hi be pos minus 1
+        While lo is less than hi:
+            Let cl be proc memory_get_byte from Memory with buf, lo
+            Let ch be proc memory_get_byte from Memory with buf, hi
+            Let _wl be proc memory_set_byte from Memory with buf, lo, ch
+            Let _wh be proc memory_set_byte from Memory with buf, hi, cl
+            Set lo to lo plus 1
+            Set hi to hi minus 1
+        End While
+    End If
+    Note: null terminator (does not count in returned length)
+    If pos is greater than (buf_size minus 1):
+        Return 0 minus 1
+    End If
+    Let _wnull be proc memory_set_byte from Memory with buf, pos, 0
+    Return pos
+End Process

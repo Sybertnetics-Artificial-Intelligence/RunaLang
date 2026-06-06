@@ -1,0 +1,1344 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+PRIORITY QUEUE - Indexable Binary Heap with MIN/MAX Ordering Tier 0 Primitive
+
+This module provides a full-featured priority queue distinct from the
+lightweight priority_queue_ functions exposed by heap.runa. It supports:
+
+  - Independent (value, priority) entries
+  - MIN-heap or MAX-heap ordering selectable at construction
+  - Stable, opaque handles returned from pq_push so callers may
+    update an entry's priority in O(log n) without scanning
+  - update_priority that automatically sifts the entry up or down
+    based on the comparison of old vs new priority
+  - Geometric growth (2x) when capacity is exhausted
+  - Constant-time clear that does not shrink the backing arrays
+
+The implementation uses three parallel arrays indexed 1..size:
+  priorities[i] - the signed Integer priority of the entry in slot i
+  values[i]     - the caller-supplied opaque value of the entry in slot i
+  handles[i]    - the handle id of the entry in slot i
+
+A separate handle table maps handle_id -> slot_index so update_priority
+can locate an entry without scanning. Handle ids are dense integers
+starting from 1; a freed handle is recycled by reusing the slot index
+of the last entry during swap-and-pop and by chaining the freelist
+through the handle table itself when entries are popped.
+
+Layout of priority queue header (56 bytes):
+  offset 0:  priorities array pointer        (8 bytes)
+  offset 8:  values array pointer            (8 bytes)
+  offset 16: handles array pointer (slot->handle_id)  (8 bytes)
+  offset 24: handle_table pointer (handle_id->slot)   (8 bytes)
+  offset 32: size                            (8 bytes)
+  offset 40: capacity                        (8 bytes)
+  offset 48: ordering (0 = MIN, 1 = MAX) low 8 bits;
+             handle_freelist_head in high 56 bits encoded
+             via dedicated cells stored in handle_table[0]
+             actually we keep ordering only here as a single int and
+             store next_handle and freelist head inside handle_table
+             header cells at table[0] and table[1]
+
+The handle table itself is a self-describing structure laid out as:
+  table[0]            = capacity in entries (capacity of pq + 1 reserve)
+  table[1]            = next_handle (monotonically increasing handle id
+                        watermark; handles below this and not on the
+                        freelist are live or in the freelist)
+  table[2]            = freelist_head (chain id, 0 sentinel = empty)
+  table[3..]          = entry[i] for handle_id i where entry encodes
+                        either the slot_index (>0) of the live entry
+                        OR the next freelist link (<= 0 encoded as
+                        negative chain to distinguish). Concretely:
+                          live:    cell = slot_index (positive int)
+                          freed:   cell = 0 minus next_freelist_handle
+                                   (so cell <= 0; 0 means end of chain)
+                        Handle id 0 is reserved as the null/invalid handle.
+
+Slot indexing is 1-based; the 0th slot of priorities/values/handles is
+never used as live storage so internal sift_up's parent(i)=i/2 works
+without special-casing root detection.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let PQ_HEADER_SIZE be 56
+Let PQ_INITIAL_CAPACITY be 16
+Let PQ_GROWTH_FACTOR be 2
+Let PQ_WORD_SIZE be 8
+Let PQ_ORDERING_MIN be 0
+Let PQ_ORDERING_MAX be 1
+Let PQ_TABLE_HEADER_CELLS be 3
+
+Note: ============================================================================
+Note: INTERNAL HELPERS - slot addresses, handle table cells
+Note: ============================================================================
+
+@Reasoning
+Address of priorities[index] given a slot index.
+@End Reasoning
+
+@Implementation
+Returns priorities + index * 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated index; no bounds check.
+@End Security_Scope
+Process called "pq_priority_addr" takes priorities as Integer, index as Integer returns Integer:
+    Return priorities plus (index multiplied by PQ_WORD_SIZE)
+End Process
+
+@Reasoning
+Address of values[index] given a slot index.
+@End Reasoning
+
+@Implementation
+Returns values + index * 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated index.
+@End Security_Scope
+Process called "pq_value_addr" takes values as Integer, index as Integer returns Integer:
+    Return values plus (index multiplied by PQ_WORD_SIZE)
+End Process
+
+@Reasoning
+Address of handles[index] (slot -> handle id mapping).
+@End Reasoning
+
+@Implementation
+Returns handles + index * 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated index.
+@End Security_Scope
+Process called "pq_handle_addr" takes handles as Integer, index as Integer returns Integer:
+    Return handles plus (index multiplied by PQ_WORD_SIZE)
+End Process
+
+@Reasoning
+Address of handle_table cell for a given handle id. The first
+PQ_TABLE_HEADER_CELLS cells are reserved header (capacity, next_handle,
+freelist_head); user handle id k lives at table[k + PQ_TABLE_HEADER_CELLS].
+@End Reasoning
+
+@Implementation
+Returns table + (handle_id + PQ_TABLE_HEADER_CELLS) * 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated handle id.
+@End Security_Scope
+Process called "pq_table_cell_addr" takes table as Integer, handle_id as Integer returns Integer:
+    Let offset_cells be handle_id plus PQ_TABLE_HEADER_CELLS
+    Return table plus (offset_cells multiplied by PQ_WORD_SIZE)
+End Process
+
+@Reasoning
+Read the table cell value for the given handle id. The returned cell
+encodes either the slot_index (positive) for a live entry or the
+freelist next link (non-positive) for a freed handle.
+@End Reasoning
+
+@Implementation
+Computes cell address and loads the int64.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated handle id.
+@End Security_Scope
+Process called "pq_table_get" takes table as Integer, handle_id as Integer returns Integer:
+    Let addr be proc pq_table_cell_addr with table, handle_id
+    Return proc memory_get_int64 from Memory with addr, 0
+End Process
+
+@Reasoning
+Write the table cell for the given handle id.
+@End Reasoning
+
+@Implementation
+Computes cell address and stores the int64.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated handle id.
+@End Security_Scope
+Process called "pq_table_set" takes table as Integer, handle_id as Integer, value as Integer returns Integer:
+    Let addr be proc pq_table_cell_addr with table, handle_id
+    proc memory_set_int64 from Memory with addr, 0, value
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HANDLE TABLE LIFECYCLE
+Note: ============================================================================
+
+@Reasoning
+Allocate the handle table for a given capacity. The table holds 3
+header cells plus capacity + 1 entry cells (handle id 0 reserved).
+The freelist begins empty; next_handle starts at 1.
+@End Reasoning
+
+@Implementation
+1) total_cells = PQ_TABLE_HEADER_CELLS + capacity + 1
+2) bytes = total_cells * 8
+3) Allocate; zero all cells.
+4) Store capacity in cell 0, next_handle = 1 in cell 1, freelist_head = 0 in cell 2.
+@End Implementation
+
+@Performance_Hints
+Time: O(capacity).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pq_handle_table_create" takes capacity as Integer returns Integer:
+    Let total_cells be PQ_TABLE_HEADER_CELLS plus (capacity plus 1)
+    Let bytes be total_cells multiplied by PQ_WORD_SIZE
+    Let table be proc allocate from Layout with bytes
+    If table is equal to 0:
+        Return 0
+    End If
+    proc memory_fill from Memory with table, 0, bytes
+    proc memory_set_int64 from Memory with table, 0, capacity
+    proc memory_set_int64 from Memory with table, 8, 1
+    proc memory_set_int64 from Memory with table, 16, 0
+    Return table
+End Process
+
+@Reasoning
+Grow the handle table to a new capacity. Header cells preserved;
+existing handle cells copied; new cells zeroed.
+@End Reasoning
+
+@Implementation
+1) Allocate new table of new_capacity entries.
+2) Copy header (3 cells) + (old_capacity + 1) entry cells.
+3) Zero remaining new cells.
+4) Update header cell 0 to new_capacity.
+5) Free old table; return new table pointer.
+@End Implementation
+
+@Performance_Hints
+Time: O(new_capacity).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure (caller must still free the original
+table on its own if it wants).
+@End Security_Scope
+Process called "pq_handle_table_grow" takes table as Integer, new_capacity as Integer returns Integer:
+    If table is equal to 0:
+        Return 0
+    End If
+    Let old_capacity be proc memory_get_int64 from Memory with table, 0
+    If new_capacity is less than or equal to old_capacity:
+        Return table
+    End If
+    Let new_total_cells be PQ_TABLE_HEADER_CELLS plus (new_capacity plus 1)
+    Let new_bytes be new_total_cells multiplied by PQ_WORD_SIZE
+    Let new_table be proc allocate from Layout with new_bytes
+    If new_table is equal to 0:
+        Return 0
+    End If
+    proc memory_fill from Memory with new_table, 0, new_bytes
+    Let copy_cells be PQ_TABLE_HEADER_CELLS plus (old_capacity plus 1)
+    Let copy_bytes be copy_cells multiplied by PQ_WORD_SIZE
+    proc memory_copy from Memory with new_table, table, copy_bytes
+    proc memory_set_int64 from Memory with new_table, 0, new_capacity
+    proc deallocate from Layout with table
+    Return new_table
+End Process
+
+@Reasoning
+Acquire a fresh handle id. Pulls from the freelist if non-empty,
+otherwise consumes the next monotonic id.
+@End Reasoning
+
+@Implementation
+1) Read freelist_head from table cell 2.
+2) If freelist_head != 0, pop it: read its cell value (which encodes
+   0 - next link), restore freelist_head to that next link, return
+   the popped id.
+3) Otherwise read next_handle from cell 1, increment, store back,
+   return the original next_handle.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if the freelist is exhausted AND next_handle would exceed
+the table capacity. Caller is expected to grow the table before
+acquiring in that case.
+@End Security_Scope
+Process called "pq_handle_acquire" takes table as Integer returns Integer:
+    If table is equal to 0:
+        Return 0
+    End If
+    Let freelist_head be proc memory_get_int64 from Memory with table, 16
+    If freelist_head is not equal to 0:
+        Let cell be proc pq_table_get with table, freelist_head
+        Let next_link be 0 minus cell
+        proc memory_set_int64 from Memory with table, 16, next_link
+        Return freelist_head
+    End If
+    Let next_handle be proc memory_get_int64 from Memory with table, 8
+    Let capacity be proc memory_get_int64 from Memory with table, 0
+    If next_handle is greater than capacity:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with table, 8, next_handle plus 1
+    Return next_handle
+End Process
+
+@Reasoning
+Release a handle back to the freelist for reuse on the next acquire.
+@End Reasoning
+
+@Implementation
+1) Read current freelist_head.
+2) Write into table[handle_id] the encoded next_link = 0 - freelist_head.
+3) Set freelist_head = handle_id.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must pass a handle id that is no longer associated with any
+live slot. Double-release would corrupt the freelist chain.
+@End Security_Scope
+Process called "pq_handle_release" takes table as Integer, handle_id as Integer returns Integer:
+    If table is equal to 0:
+        Return 0
+    End If
+    If handle_id is less than or equal to 0:
+        Return 0
+    End If
+    Let old_head be proc memory_get_int64 from Memory with table, 16
+    Let encoded_next be 0 minus old_head
+    proc pq_table_set with table, handle_id, encoded_next
+    proc memory_set_int64 from Memory with table, 16, handle_id
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: COMPARISON HELPER
+Note: ============================================================================
+
+@Reasoning
+Compare two priorities according to the queue's ordering. Returns
+-1 if a should sit ABOVE b in the heap (i.e. closer to the root), 0 if
+equivalent, 1 if b sits above a.
+
+For MIN ordering, smaller priorities sit above. For MAX, larger
+priorities sit above; we invert the sign of the comparison.
+@End Reasoning
+
+@Implementation
+Direct comparison without subtraction to avoid signed overflow.
+Invert verdict if ordering == PQ_ORDERING_MAX.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure function on Integer priorities.
+@End Security_Scope
+Process called "pq_compare" takes ordering as Integer, a as Integer, b as Integer returns Integer:
+    Let verdict be 0
+    If a is less than b:
+        Set verdict to 0 minus 1
+    End If
+    If a is greater than b:
+        Set verdict to 1
+    End If
+    If ordering is equal to PQ_ORDERING_MAX:
+        Set verdict to 0 minus verdict
+    End If
+    Return verdict
+End Process
+
+Note: ============================================================================
+Note: CONSTRUCTION / DESTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Allocate a fresh priority queue with the requested initial capacity
+and ordering. Capacity below PQ_INITIAL_CAPACITY is rounded up.
+Ordering must be 0 (MIN) or 1 (MAX); any other value defaults to MIN.
+@End Reasoning
+
+@Implementation
+1) Clamp capacity up to PQ_INITIAL_CAPACITY when smaller.
+2) Allocate header (56 bytes).
+3) Allocate priorities/values/handles arrays sized capacity + 1
+   (so slot 1..capacity are usable; slot 0 unused).
+4) Allocate the handle table for capacity.
+5) Initialize all header fields.
+@End Implementation
+
+@Performance_Hints
+Time: O(capacity).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure; cleans up partial allocations.
+@End Security_Scope
+Process called "pq_create" takes capacity as Integer, ordering as Integer returns Integer:
+    Let final_capacity be capacity
+    If final_capacity is less than PQ_INITIAL_CAPACITY:
+        Set final_capacity to PQ_INITIAL_CAPACITY
+    End If
+    Let final_ordering be PQ_ORDERING_MIN
+    If ordering is equal to PQ_ORDERING_MAX:
+        Set final_ordering to PQ_ORDERING_MAX
+    End If
+    Let pq be proc allocate from Layout with PQ_HEADER_SIZE
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let array_cells be final_capacity plus 1
+    Let array_bytes be array_cells multiplied by PQ_WORD_SIZE
+    Let priorities be proc allocate from Layout with array_bytes
+    If priorities is equal to 0:
+        proc deallocate from Layout with pq
+        Return 0
+    End If
+    Let values be proc allocate from Layout with array_bytes
+    If values is equal to 0:
+        proc deallocate from Layout with priorities
+        proc deallocate from Layout with pq
+        Return 0
+    End If
+    Let handles be proc allocate from Layout with array_bytes
+    If handles is equal to 0:
+        proc deallocate from Layout with values
+        proc deallocate from Layout with priorities
+        proc deallocate from Layout with pq
+        Return 0
+    End If
+    Let table be proc pq_handle_table_create with final_capacity
+    If table is equal to 0:
+        proc deallocate from Layout with handles
+        proc deallocate from Layout with values
+        proc deallocate from Layout with priorities
+        proc deallocate from Layout with pq
+        Return 0
+    End If
+    proc memory_fill from Memory with priorities, 0, array_bytes
+    proc memory_fill from Memory with values, 0, array_bytes
+    proc memory_fill from Memory with handles, 0, array_bytes
+    proc memory_set_int64 from Memory with pq, 0, priorities
+    proc memory_set_int64 from Memory with pq, 8, values
+    proc memory_set_int64 from Memory with pq, 16, handles
+    proc memory_set_int64 from Memory with pq, 24, table
+    proc memory_set_int64 from Memory with pq, 32, 0
+    proc memory_set_int64 from Memory with pq, 40, final_capacity
+    proc memory_set_int64 from Memory with pq, 48, final_ordering
+    Return pq
+End Process
+
+@Reasoning
+Convenience constructor for a MIN-heap priority queue.
+@End Reasoning
+
+@Implementation
+Calls pq_create with PQ_ORDERING_MIN.
+@End Implementation
+
+@Performance_Hints
+Time: O(capacity).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pq_create_min" takes capacity as Integer returns Integer:
+    Return proc pq_create with capacity, PQ_ORDERING_MIN
+End Process
+
+@Reasoning
+Convenience constructor for a MAX-heap priority queue.
+@End Reasoning
+
+@Implementation
+Calls pq_create with PQ_ORDERING_MAX.
+@End Implementation
+
+@Performance_Hints
+Time: O(capacity).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pq_create_max" takes capacity as Integer returns Integer:
+    Return proc pq_create with capacity, PQ_ORDERING_MAX
+End Process
+
+@Reasoning
+Destroy the priority queue, freeing all backing arrays and the
+handle table.
+@End Reasoning
+
+@Implementation
+Frees priorities, values, handles, handle_table, then the header.
+@End Implementation
+
+@Performance_Hints
+Time: O(1) (capacity-independent at the allocator boundary).
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned; do not pass the same pointer twice.
+@End Security_Scope
+Process called "pq_destroy" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    Let handles be proc memory_get_int64 from Memory with pq, 16
+    Let table be proc memory_get_int64 from Memory with pq, 24
+    If priorities is not equal to 0:
+        proc deallocate from Layout with priorities
+    End If
+    If values is not equal to 0:
+        proc deallocate from Layout with values
+    End If
+    If handles is not equal to 0:
+        proc deallocate from Layout with handles
+    End If
+    If table is not equal to 0:
+        proc deallocate from Layout with table
+    End If
+    proc deallocate from Layout with pq
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: STATE QUERIES
+Note: ============================================================================
+
+@Reasoning
+Number of live entries.
+@End Reasoning
+
+@Implementation
+Returns size field at offset 32.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "pq_size" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with pq, 32
+End Process
+
+@Reasoning
+Empty predicate.
+@End Reasoning
+
+@Implementation
+Returns 1 if size == 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "pq_is_empty" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 1
+    End If
+    Let size be proc memory_get_int64 from Memory with pq, 32
+    If size is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Backing capacity (excludes the unused slot 0).
+@End Reasoning
+
+@Implementation
+Returns capacity field at offset 40.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "pq_capacity" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with pq, 40
+End Process
+
+@Reasoning
+Ordering: 0 MIN, 1 MAX.
+@End Reasoning
+
+@Implementation
+Returns ordering field at offset 48.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "pq_ordering" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return PQ_ORDERING_MIN
+    End If
+    Return proc memory_get_int64 from Memory with pq, 48
+End Process
+
+Note: ============================================================================
+Note: INTERNAL SWAP - swaps slot a and b across all three arrays AND
+Note: maintains the handle_table mapping for both handles.
+Note: ============================================================================
+
+@Reasoning
+Swap two entries at slot indices a and b. Both their priorities,
+values, and handles are swapped, and the handle_table is updated so
+that the moved handles point to their new slot.
+@End Reasoning
+
+@Implementation
+1) Load priorities/values/handles arrays and handle table.
+2) Load both entries' (priority, value, handle) words.
+3) Write swapped values back to slots a and b.
+4) For each of the two handles, update table[handle] to its new slot.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must guarantee 1 <= a, b <= size. No bounds check.
+@End Security_Scope
+Process called "pq_swap" takes pq as Integer, a as Integer, b as Integer returns Integer:
+    If a is equal to b:
+        Return 1
+    End If
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    Let handles be proc memory_get_int64 from Memory with pq, 16
+    Let table be proc memory_get_int64 from Memory with pq, 24
+    Let pa be proc pq_priority_addr with priorities, a
+    Let pb be proc pq_priority_addr with priorities, b
+    Let va be proc pq_value_addr with values, a
+    Let vb be proc pq_value_addr with values, b
+    Let ha be proc pq_handle_addr with handles, a
+    Let hb be proc pq_handle_addr with handles, b
+    Let pri_a be proc memory_get_int64 from Memory with pa, 0
+    Let pri_b be proc memory_get_int64 from Memory with pb, 0
+    Let val_a be proc memory_get_int64 from Memory with va, 0
+    Let val_b be proc memory_get_int64 from Memory with vb, 0
+    Let han_a be proc memory_get_int64 from Memory with ha, 0
+    Let han_b be proc memory_get_int64 from Memory with hb, 0
+    proc memory_set_int64 from Memory with pa, 0, pri_b
+    proc memory_set_int64 from Memory with pb, 0, pri_a
+    proc memory_set_int64 from Memory with va, 0, val_b
+    proc memory_set_int64 from Memory with vb, 0, val_a
+    proc memory_set_int64 from Memory with ha, 0, han_b
+    proc memory_set_int64 from Memory with hb, 0, han_a
+    proc pq_table_set with table, han_a, b
+    proc pq_table_set with table, han_b, a
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SIFT UP / SIFT DOWN
+Note: ============================================================================
+
+@Reasoning
+Restore heap property by moving the entry at index upward while it
+sits above its parent in the ordering. Stops at the root (index 1).
+@End Reasoning
+
+@Implementation
+While index > 1:
+  parent = index / 2
+  If pq_compare(ordering, priorities[index], priorities[parent]) < 0:
+    swap(index, parent); index = parent
+  Else: break
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Caller must guarantee 1 <= index <= size.
+@End Security_Scope
+Process called "pq_sift_up" takes pq as Integer, index as Integer returns Integer:
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let ordering be proc memory_get_int64 from Memory with pq, 48
+    Let i be index
+    Let keep_going be 1
+    While keep_going is equal to 1:
+        If i is less than or equal to 1:
+            Set keep_going to 0
+        Otherwise:
+            Let parent be i divided by 2
+            Let p_addr_i be proc pq_priority_addr with priorities, i
+            Let p_addr_p be proc pq_priority_addr with priorities, parent
+            Let pri_i be proc memory_get_int64 from Memory with p_addr_i, 0
+            Let pri_p be proc memory_get_int64 from Memory with p_addr_p, 0
+            Let verdict be proc pq_compare with ordering, pri_i, pri_p
+            If verdict is less than 0:
+                proc pq_swap with pq, i, parent
+                Set i to parent
+            Otherwise:
+                Set keep_going to 0
+            End If
+        End If
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Restore heap property by moving the entry at index downward toward the
+leaves, swapping with the child that sits highest under ordering.
+@End Reasoning
+
+@Implementation
+size = pq_size(pq)
+While left = 2*index <= size:
+  smallest = index
+  right = left + 1
+  If pq_compare(ordering, priorities[left], priorities[smallest]) < 0:
+    smallest = left
+  If right <= size AND
+     pq_compare(ordering, priorities[right], priorities[smallest]) < 0:
+    smallest = right
+  If smallest == index: break
+  swap(index, smallest); index = smallest
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Caller must guarantee 1 <= index <= size.
+@End Security_Scope
+Process called "pq_sift_down" takes pq as Integer, index as Integer returns Integer:
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let ordering be proc memory_get_int64 from Memory with pq, 48
+    Let size be proc memory_get_int64 from Memory with pq, 32
+    Let i be index
+    Let keep_going be 1
+    While keep_going is equal to 1:
+        Let left be i multiplied by 2
+        If left is greater than size:
+            Set keep_going to 0
+        Otherwise:
+            Let best be i
+            Let p_addr_best be proc pq_priority_addr with priorities, best
+            Let p_addr_left be proc pq_priority_addr with priorities, left
+            Let pri_best be proc memory_get_int64 from Memory with p_addr_best, 0
+            Let pri_left be proc memory_get_int64 from Memory with p_addr_left, 0
+            Let v_l be proc pq_compare with ordering, pri_left, pri_best
+            If v_l is less than 0:
+                Set best to left
+            End If
+            Let right be left plus 1
+            If right is less than or equal to size:
+                Let p_addr_right be proc pq_priority_addr with priorities, right
+                Let pri_right be proc memory_get_int64 from Memory with p_addr_right, 0
+                Let p_addr_cur_best be proc pq_priority_addr with priorities, best
+                Let pri_cur_best be proc memory_get_int64 from Memory with p_addr_cur_best, 0
+                Let v_r be proc pq_compare with ordering, pri_right, pri_cur_best
+                If v_r is less than 0:
+                    Set best to right
+                End If
+            End If
+            If best is equal to i:
+                Set keep_going to 0
+            Otherwise:
+                proc pq_swap with pq, i, best
+                Set i to best
+            End If
+        End If
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: GROW - geometric capacity expansion
+Note: ============================================================================
+
+@Reasoning
+Double the backing arrays' capacity and grow the handle table to
+match. Used when push would overflow.
+@End Reasoning
+
+@Implementation
+1) Compute new_capacity = capacity * 2.
+2) Allocate three new arrays of (new_capacity + 1) * 8 bytes.
+3) Copy existing (size + 1) entries from each old array to the new one
+   (the +1 covers the unused slot 0).
+4) Zero the freshly allocated tails.
+5) Free old arrays; install new pointers in header.
+6) Grow the handle table to new_capacity.
+@End Implementation
+
+@Performance_Hints
+Time: O(size). Triggered amortized O(1) per push.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure. On partial failure the original
+arrays remain valid (no in-place mutation occurs before all
+allocations succeed).
+@End Security_Scope
+Process called "pq_grow" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let old_capacity be proc memory_get_int64 from Memory with pq, 40
+    Let new_capacity be old_capacity multiplied by PQ_GROWTH_FACTOR
+    Let new_cells be new_capacity plus 1
+    Let new_bytes be new_cells multiplied by PQ_WORD_SIZE
+    Let new_priorities be proc allocate from Layout with new_bytes
+    If new_priorities is equal to 0:
+        Return 0
+    End If
+    Let new_values be proc allocate from Layout with new_bytes
+    If new_values is equal to 0:
+        proc deallocate from Layout with new_priorities
+        Return 0
+    End If
+    Let new_handles be proc allocate from Layout with new_bytes
+    If new_handles is equal to 0:
+        proc deallocate from Layout with new_values
+        proc deallocate from Layout with new_priorities
+        Return 0
+    End If
+    proc memory_fill from Memory with new_priorities, 0, new_bytes
+    proc memory_fill from Memory with new_values, 0, new_bytes
+    proc memory_fill from Memory with new_handles, 0, new_bytes
+    Let old_priorities be proc memory_get_int64 from Memory with pq, 0
+    Let old_values be proc memory_get_int64 from Memory with pq, 8
+    Let old_handles be proc memory_get_int64 from Memory with pq, 16
+    Let size be proc memory_get_int64 from Memory with pq, 32
+    Let copy_cells be size plus 1
+    Let copy_bytes be copy_cells multiplied by PQ_WORD_SIZE
+    proc memory_copy from Memory with new_priorities, old_priorities, copy_bytes
+    proc memory_copy from Memory with new_values, old_values, copy_bytes
+    proc memory_copy from Memory with new_handles, old_handles, copy_bytes
+    proc deallocate from Layout with old_priorities
+    proc deallocate from Layout with old_values
+    proc deallocate from Layout with old_handles
+    proc memory_set_int64 from Memory with pq, 0, new_priorities
+    proc memory_set_int64 from Memory with pq, 8, new_values
+    proc memory_set_int64 from Memory with pq, 16, new_handles
+    proc memory_set_int64 from Memory with pq, 40, new_capacity
+    Let old_table be proc memory_get_int64 from Memory with pq, 24
+    Let new_table be proc pq_handle_table_grow with old_table, new_capacity
+    If new_table is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with pq, 24, new_table
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PUSH / POP / PEEK / UPDATE_PRIORITY / CLEAR
+Note: ============================================================================
+
+@Reasoning
+Insert a new (priority, value) entry into the queue. Returns the
+handle id assigned to this entry. Handle ids are positive integers;
+0 indicates failure (out of memory).
+@End Reasoning
+
+@Implementation
+1) If size + 1 > capacity, grow the arrays AND the handle table.
+2) new_index = size + 1
+3) Acquire a fresh handle from the table.
+4) Write priorities[new_index], values[new_index], handles[new_index].
+5) Set table[handle] = new_index.
+6) Increment size.
+7) Sift the new entry up.
+8) Return the assigned handle id.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n) amortized.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure or handle exhaustion.
+@End Security_Scope
+Process called "pq_push" takes pq as Integer, priority as Integer, value as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Memory with pq, 32
+    Let capacity be proc memory_get_int64 from Memory with pq, 40
+    If size plus 1 is greater than capacity:
+        Let grow_ok be proc pq_grow with pq
+        If grow_ok is equal to 0:
+            Return 0
+        End If
+    End If
+    Let table be proc memory_get_int64 from Memory with pq, 24
+    Let handle_id be proc pq_handle_acquire with table
+    If handle_id is equal to 0:
+        Return 0
+    End If
+    Let new_index be size plus 1
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    Let handles be proc memory_get_int64 from Memory with pq, 16
+    Let p_addr be proc pq_priority_addr with priorities, new_index
+    Let v_addr be proc pq_value_addr with values, new_index
+    Let h_addr be proc pq_handle_addr with handles, new_index
+    proc memory_set_int64 from Memory with p_addr, 0, priority
+    proc memory_set_int64 from Memory with v_addr, 0, value
+    proc memory_set_int64 from Memory with h_addr, 0, handle_id
+    proc pq_table_set with table, handle_id, new_index
+    proc memory_set_int64 from Memory with pq, 32, new_index
+    proc pq_sift_up with pq, new_index
+    Return handle_id
+End Process
+
+@Reasoning
+Remove and return the root entry's value (the highest-priority entry
+under the queue's ordering). Returns 0 on empty queue.
+@End Reasoning
+
+@Implementation
+1) Empty check.
+2) Capture root value and root handle.
+3) If size > 1, copy last entry into slot 1 (priority, value, handle),
+   update table[last_handle] = 1.
+4) Zero the freed last slot.
+5) Decrement size.
+6) Release the root handle.
+7) If size >= 1, sift down slot 1.
+8) Return root value.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on empty (caller cannot distinguish a real value of 0 from
+empty without first checking pq_is_empty).
+@End Security_Scope
+Process called "pq_pop" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Memory with pq, 32
+    If size is equal to 0:
+        Return 0
+    End If
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    Let handles be proc memory_get_int64 from Memory with pq, 16
+    Let table be proc memory_get_int64 from Memory with pq, 24
+    Let v_root_addr be proc pq_value_addr with values, 1
+    Let h_root_addr be proc pq_handle_addr with handles, 1
+    Let root_value be proc memory_get_int64 from Memory with v_root_addr, 0
+    Let root_handle be proc memory_get_int64 from Memory with h_root_addr, 0
+    If size is greater than 1:
+        Let p_last_addr be proc pq_priority_addr with priorities, size
+        Let v_last_addr be proc pq_value_addr with values, size
+        Let h_last_addr be proc pq_handle_addr with handles, size
+        Let last_priority be proc memory_get_int64 from Memory with p_last_addr, 0
+        Let last_value be proc memory_get_int64 from Memory with v_last_addr, 0
+        Let last_handle be proc memory_get_int64 from Memory with h_last_addr, 0
+        Let p_root_addr be proc pq_priority_addr with priorities, 1
+        proc memory_set_int64 from Memory with p_root_addr, 0, last_priority
+        proc memory_set_int64 from Memory with v_root_addr, 0, last_value
+        proc memory_set_int64 from Memory with h_root_addr, 0, last_handle
+        proc memory_set_int64 from Memory with p_last_addr, 0, 0
+        proc memory_set_int64 from Memory with v_last_addr, 0, 0
+        proc memory_set_int64 from Memory with h_last_addr, 0, 0
+        proc pq_table_set with table, last_handle, 1
+    Otherwise:
+        Let p_root_addr be proc pq_priority_addr with priorities, 1
+        proc memory_set_int64 from Memory with p_root_addr, 0, 0
+        proc memory_set_int64 from Memory with v_root_addr, 0, 0
+        proc memory_set_int64 from Memory with h_root_addr, 0, 0
+    End If
+    proc pq_handle_release with table, root_handle
+    proc memory_set_int64 from Memory with pq, 32, size minus 1
+    Let new_size be size minus 1
+    If new_size is greater than or equal to 1:
+        proc pq_sift_down with pq, 1
+    End If
+    Return root_value
+End Process
+
+@Reasoning
+Peek the value of the root entry without removing it.
+@End Reasoning
+
+@Implementation
+1) Empty check.
+2) Return values[1].
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on empty.
+@End Security_Scope
+Process called "pq_peek" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Memory with pq, 32
+    If size is equal to 0:
+        Return 0
+    End If
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    Let v_addr be proc pq_value_addr with values, 1
+    Return proc memory_get_int64 from Memory with v_addr, 0
+End Process
+
+@Reasoning
+Peek the priority of the root entry (the extremal priority).
+@End Reasoning
+
+@Implementation
+1) Empty check.
+2) Return priorities[1].
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on empty (which is also a legitimate priority - caller
+should check pq_is_empty first).
+@End Security_Scope
+Process called "pq_peek_priority" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Memory with pq, 32
+    If size is equal to 0:
+        Return 0
+    End If
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let p_addr be proc pq_priority_addr with priorities, 1
+    Return proc memory_get_int64 from Memory with p_addr, 0
+End Process
+
+@Reasoning
+Resolve a handle to the value of the entry it identifies. Returns 0
+if the handle is invalid (released or never issued).
+@End Reasoning
+
+@Implementation
+1) Lookup table[handle]; if <= 0, return 0 (freed or never live).
+2) Read values[slot].
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must distinguish a real value of 0 from invalid handle by
+calling pq_handle_is_valid first if needed.
+@End Security_Scope
+Process called "pq_handle_value" takes pq as Integer, handle_id as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    If handle_id is less than or equal to 0:
+        Return 0
+    End If
+    Let table be proc memory_get_int64 from Memory with pq, 24
+    Let slot be proc pq_table_get with table, handle_id
+    If slot is less than or equal to 0:
+        Return 0
+    End If
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    Let v_addr be proc pq_value_addr with values, slot
+    Return proc memory_get_int64 from Memory with v_addr, 0
+End Process
+
+@Reasoning
+Resolve a handle to its current priority. Returns 0 if invalid.
+@End Reasoning
+
+@Implementation
+Symmetric with pq_handle_value but reads priorities[slot].
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Same caveat as pq_handle_value.
+@End Security_Scope
+Process called "pq_handle_priority" takes pq as Integer, handle_id as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    If handle_id is less than or equal to 0:
+        Return 0
+    End If
+    Let table be proc memory_get_int64 from Memory with pq, 24
+    Let slot be proc pq_table_get with table, handle_id
+    If slot is less than or equal to 0:
+        Return 0
+    End If
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let p_addr be proc pq_priority_addr with priorities, slot
+    Return proc memory_get_int64 from Memory with p_addr, 0
+End Process
+
+@Reasoning
+Returns 1 if the handle currently identifies a live entry, 0 otherwise.
+@End Reasoning
+
+@Implementation
+table[handle] > 0 iff live.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "pq_handle_is_valid" takes pq as Integer, handle_id as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    If handle_id is less than or equal to 0:
+        Return 0
+    End If
+    Let table be proc memory_get_int64 from Memory with pq, 24
+    Let slot be proc pq_table_get with table, handle_id
+    If slot is greater than 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Change the priority of the entry identified by handle. The entry is
+located in O(1) via the handle table, the priority is rewritten, and
+the heap property is restored in O(log n) by sifting up or down based
+on how the new priority compares to the old.
+@End Reasoning
+
+@Implementation
+1) Validate handle (table[handle] > 0).
+2) Read old priority at priorities[slot].
+3) Write new priority into priorities[slot].
+4) verdict = pq_compare(ordering, new_priority, old_priority).
+5) If verdict < 0 (new sits closer to root) -> pq_sift_up(slot).
+   If verdict > 0 (new sits closer to leaves) -> pq_sift_down(slot).
+   If verdict == 0 nothing to do.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 if the handle is invalid; returns 1 on success.
+@End Security_Scope
+Process called "pq_update_priority" takes pq as Integer, handle_id as Integer, new_priority as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let valid be proc pq_handle_is_valid with pq, handle_id
+    If valid is equal to 0:
+        Return 0
+    End If
+    Let table be proc memory_get_int64 from Memory with pq, 24
+    Let slot be proc pq_table_get with table, handle_id
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let p_addr be proc pq_priority_addr with priorities, slot
+    Let old_priority be proc memory_get_int64 from Memory with p_addr, 0
+    proc memory_set_int64 from Memory with p_addr, 0, new_priority
+    Let ordering be proc memory_get_int64 from Memory with pq, 48
+    Let verdict be proc pq_compare with ordering, new_priority, old_priority
+    If verdict is less than 0:
+        proc pq_sift_up with pq, slot
+    End If
+    If verdict is greater than 0:
+        proc pq_sift_down with pq, slot
+    End If
+    Return 1
+End Process
+
+@Reasoning
+Remove the entry identified by handle. Internally we sift it to the
+root by giving it a sentinel best-priority then popping it.
+@End Reasoning
+
+@Implementation
+1) Validate handle.
+2) Read old priority; pick a sentinel that beats every real priority
+   under ordering: for MIN we use the smallest 64-bit signed value,
+   for MAX we use the largest 64-bit signed value.
+3) Write sentinel; sift up to root.
+4) Call pq_pop to drop the root.
+5) Return 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on invalid handle.
+@End Security_Scope
+Process called "pq_remove" takes pq as Integer, handle_id as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let valid be proc pq_handle_is_valid with pq, handle_id
+    If valid is equal to 0:
+        Return 0
+    End If
+    Let ordering be proc memory_get_int64 from Memory with pq, 48
+    Let sentinel be 0 minus 9223372036854775807
+    Set sentinel to sentinel minus 1
+    If ordering is equal to PQ_ORDERING_MAX:
+        Set sentinel to 9223372036854775807
+    End If
+    Let table be proc memory_get_int64 from Memory with pq, 24
+    Let slot be proc pq_table_get with table, handle_id
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let p_addr be proc pq_priority_addr with priorities, slot
+    proc memory_set_int64 from Memory with p_addr, 0, sentinel
+    proc pq_sift_up with pq, slot
+    proc pq_pop with pq
+    Return 1
+End Process
+
+@Reasoning
+Empty the queue in O(size). All live handles are released to the
+freelist so subsequent push calls reuse handle slots.
+@End Reasoning
+
+@Implementation
+1) For slot = 1..size: release handles[slot] and zero the entry.
+2) Set size = 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(size).
+@End Performance_Hints
+
+@Security_Scope
+After clear, all previously issued handles are invalid.
+@End Security_Scope
+Process called "pq_clear" takes pq as Integer returns Integer:
+    If pq is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Memory with pq, 32
+    Let priorities be proc memory_get_int64 from Memory with pq, 0
+    Let values be proc memory_get_int64 from Memory with pq, 8
+    Let handles be proc memory_get_int64 from Memory with pq, 16
+    Let table be proc memory_get_int64 from Memory with pq, 24
+    Let i be 1
+    While i is less than or equal to size:
+        Let h_addr be proc pq_handle_addr with handles, i
+        Let handle_id be proc memory_get_int64 from Memory with h_addr, 0
+        proc pq_handle_release with table, handle_id
+        Let p_addr be proc pq_priority_addr with priorities, i
+        Let v_addr be proc pq_value_addr with values, i
+        proc memory_set_int64 from Memory with p_addr, 0, 0
+        proc memory_set_int64 from Memory with v_addr, 0, 0
+        proc memory_set_int64 from Memory with h_addr, 0, 0
+        Set i to i plus 1
+    End While
+    proc memory_set_int64 from Memory with pq, 32, 0
+    Return 1
+End Process

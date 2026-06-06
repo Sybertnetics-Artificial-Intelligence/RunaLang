@@ -1,0 +1,654 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+NONCE - Context-tagged nonce value to prevent cross-context reuse
+==============================================================================
+
+A Nonce value carries:
+  - the CONTEXT in which the nonce is valid
+  - the raw nonce bytes
+  - the byte length
+
+The context is an integer enum that pins each nonce to a single usage
+domain. The crypto module that consumes a nonce verifies the context tag
+matches its own; nonce reuse across contexts (e.g., the same 12-byte
+buffer used as both an AES-GCM IV and an Ed25519 signing nonce) is
+structurally impossible because:
+  - AES-GCM rejects nonces tagged with NONCE_CONTEXT_SIGNATURE.
+  - Signing rejects nonces tagged with NONCE_CONTEXT_AES_GCM.
+  - etc.
+
+Nonce reuse is CATASTROPHIC for several crypto schemes:
+  - AES-GCM: reusing IV with the same key recovers the authentication
+    key (XOR of MAC tags reveals H * E_K(0)).
+  - ChaCha20-Poly1305: same as AES-GCM (Poly1305 key forgery).
+  - ECDSA: reusing k recovers the private key (computeable from two
+    signatures).
+  - Schnorr / EdDSA: reusing the per-signature randomness similarly
+    leaks the private key.
+
+This primitive makes nonce reuse a TYPE error rather than a runtime
+audit-trail check.
+
+Memory layout (32 bytes):
+  offset  0 : context tag        (8 bytes)
+  offset  8 : nonce_bytes ptr    (8 bytes)
+  offset 16 : nonce_bytes len    (8 bytes)
+  offset 24 : counter or flags   (8 bytes; used by counter-mode nonces)
+
+Context tags:
+  NONCE_CTX_AES_GCM        = 1   12-byte IV per SP 800-38D 8.2
+  NONCE_CTX_AES_GCM_SIV    = 2   12-byte IV per RFC 8452
+  NONCE_CTX_CHACHA20       = 3   12-byte per RFC 8439
+  NONCE_CTX_XCHACHA20      = 4   24-byte per libsodium
+  NONCE_CTX_ECDSA_K        = 5   curve-scalar-bytes (32/48/66)
+  NONCE_CTX_ED25519_R      = 6   64-byte (deterministic per RFC 8032)
+  NONCE_CTX_TLS_RECORD     = 7   8-byte per RFC 8446 5.3
+  NONCE_CTX_NOISE_PROTOCOL = 8   8 or 12 bytes per Noise Protocol Spec
+  NONCE_CTX_GENERIC        = 9   reserved for future, generic random
+
+References:
+- NIST SP 800-38D section 8.2: GCM IV construction.
+- RFC 8439: ChaCha20-Poly1305 nonce.
+- libsodium docs: XChaCha20 24-byte nonce.
+- RFC 6979: deterministic ECDSA k generation.
+- RFC 8032: Ed25519 deterministic R.
+- Bellovin, "Cryptographic Considerations in Internet Protocols",
+  RFC 4949 / RFC 4086.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/entropy.runa" as Entropy
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+
+Let NONCE_STRUCT_SIZE be 32
+Let NONCE_OFF_CONTEXT be 0
+Let NONCE_OFF_BYTES_PTR be 8
+Let NONCE_OFF_BYTES_LEN be 16
+Let NONCE_OFF_COUNTER be 24
+
+Let NONCE_CTX_AES_GCM be 1
+Let NONCE_CTX_AES_GCM_SIV be 2
+Let NONCE_CTX_CHACHA20 be 3
+Let NONCE_CTX_XCHACHA20 be 4
+Let NONCE_CTX_ECDSA_K be 5
+Let NONCE_CTX_ED25519_R be 6
+Let NONCE_CTX_TLS_RECORD be 7
+Let NONCE_CTX_NOISE_PROTOCOL be 8
+Let NONCE_CTX_GENERIC be 9
+
+Note: ============================================================================
+Note: SECTION 1: Context metadata
+Note: ============================================================================
+
+@Reasoning
+Returns the canonical nonce byte length for the named context, or 0 if
+the context is not recognized. Used by constructors to validate inputs
+without needing the caller to remember the size per context.
+
+Sizes per published spec:
+  AES_GCM, AES_GCM_SIV:  12  (SP 800-38D 8.2 recommended; libsodium 12)
+  CHACHA20:              12  (RFC 8439 section 2.4)
+  XCHACHA20:             24  (libsodium spec)
+  ECDSA_K:               32  (curve-scalar bytes for P-256; longer for
+                              P-384/P-521, but the canonical default
+                              tagged with ECDSA_K is the P-256 one;
+                              ECDSA-P384 nonces use a distinct curve-
+                              parameterized factory which is outside
+                              the standard nonce_random surface)
+  ED25519_R:             64  (RFC 8032 5.1.6 computes 64-byte digest)
+  TLS_RECORD:            8   (RFC 8446 5.3 per_record_iv)
+  NOISE_PROTOCOL:        12  (Noise Protocol Framework section 5.1)
+  GENERIC:               0   (length is caller-specified)
+@End Reasoning
+
+@Implementation
+Lookup by integer comparison.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "nonce_context_byte_length" takes context as Integer returns Integer:
+    If context is equal to NONCE_CTX_AES_GCM:
+        Return 12
+    End If
+    If context is equal to NONCE_CTX_AES_GCM_SIV:
+        Return 12
+    End If
+    If context is equal to NONCE_CTX_CHACHA20:
+        Return 12
+    End If
+    If context is equal to NONCE_CTX_XCHACHA20:
+        Return 24
+    End If
+    If context is equal to NONCE_CTX_ECDSA_K:
+        Return 32
+    End If
+    If context is equal to NONCE_CTX_ED25519_R:
+        Return 64
+    End If
+    If context is equal to NONCE_CTX_TLS_RECORD:
+        Return 8
+    End If
+    If context is equal to NONCE_CTX_NOISE_PROTOCOL:
+        Return 12
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Returns 1 if the named context permits a counter-derived nonce, 0 if
+random-only.
+
+The counter-mode-safe contexts are those where deterministic per-record
+counter advancement is the spec-recommended pattern:
+  - AES_GCM (per NIST SP 800-38D 8.2.1 "Deterministic Construction").
+  - CHACHA20 in TLS (RFC 8446 uses per-record counter).
+  - TLS_RECORD (the canonical use of counter-mode nonces).
+  - NOISE_PROTOCOL (per spec).
+
+Counter-mode is REQUIRED for nonces whose security argument depends on
+no repeat (vs random where the probability of repeat is the security
+budget).
+@End Reasoning
+
+@Implementation
+Lookup by integer comparison.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+The result is non-secret. Returning 1 does NOT mean "counter is safe
+in all cases"; the caller still has to ensure the counter is unique
+under the (key, context) pair.
+@End Security_Scope
+Process called "nonce_context_supports_counter" takes context as Integer returns Integer:
+    If context is equal to NONCE_CTX_AES_GCM:
+        Return 1
+    End If
+    If context is equal to NONCE_CTX_CHACHA20:
+        Return 1
+    End If
+    If context is equal to NONCE_CTX_TLS_RECORD:
+        Return 1
+    End If
+    If context is equal to NONCE_CTX_NOISE_PROTOCOL:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: nonce_random
+Note: ============================================================================
+
+@Reasoning
+Generate a random nonce in the given context using the OS entropy
+source. The byte length is implied by the context (see
+nonce_context_byte_length).
+
+This is the recommended path for contexts where the spec permits a
+random nonce: AES_GCM_SIV (RFC 8452 is misuse-resistant; random is
+OK), XCHACHA20 (192-bit nonce makes random safe up to ~2^64 messages
+per RFC misuse-resistance argument), ECDSA_K (random k is acceptable
+when generated from a high-quality DRBG), ED25519_R (deterministic
+is preferred but random is accepted per RFC 8032).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena, context.
+  2. Resolve byte length.
+  3. Allocate struct and byte buffer.
+  4. Fill bytes via entropy_random_bytes.
+  5. Set context tag and counter=0.
+@End Implementation
+
+@Performance_Hints
+O(n) entropy reading. Linux getrandom is fast (~10us per 32 bytes).
+@End Performance_Hints
+
+@Security_Scope
+Random nonce quality is bounded by the OS DRBG. For AES_GCM specifically
+the random-IV construction is safe only up to ~2^48 messages per
+SP 800-38D 8.3 birthday-bound analysis; for higher message counts use
+counter-mode via nonce_counter_next.
+
+References:
+- SP 800-38D 8.3: random IV safe message counts.
+- RFC 8452 section 7: AES-GCM-SIV nonce misuse argument.
+- libsodium random_nonce rationale.
+@End Security_Scope
+Process called "nonce_random" takes arena as Integer, context as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    Let n_len be nonce_context_byte_length(context)
+    If n_len is equal to 0:
+        Return 0
+    End If
+    Let n be Arena.arena_allocate(arena, NONCE_STRUCT_SIZE)
+    If n is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than NONCE_STRUCT_SIZE:
+        Memory.memory_set_byte(n, zi, 0)
+        Set zi to zi plus 1
+    End While
+    Let buf be Arena.arena_allocate(arena, n_len)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let rc be Entropy.entropy_random_bytes(arena, buf, n_len)
+    If rc is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_qword(n, NONCE_OFF_CONTEXT, context)
+    Memory.memory_set_qword(n, NONCE_OFF_BYTES_PTR, buf)
+    Memory.memory_set_qword(n, NONCE_OFF_BYTES_LEN, n_len)
+    Memory.memory_set_qword(n, NONCE_OFF_COUNTER, 0)
+    Return n
+End Process
+
+@Reasoning
+Generate a generic-context random nonce of caller-specified length. For
+contexts other than GENERIC, use nonce_random which enforces the
+correct byte length.
+@End Reasoning
+
+@Implementation
+Same as nonce_random but with context = NONCE_CTX_GENERIC and explicit
+length.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+Same as nonce_random. Caller is responsible for using the resulting
+nonce only with consumers expecting NONCE_CTX_GENERIC.
+@End Security_Scope
+Process called "nonce_random_generic" takes arena as Integer, byte_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If byte_length is less than 1:
+        Return 0
+    End If
+    If byte_length is greater than 256:
+        Return 0
+    End If
+    Let n be Arena.arena_allocate(arena, NONCE_STRUCT_SIZE)
+    If n is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than NONCE_STRUCT_SIZE:
+        Memory.memory_set_byte(n, zi, 0)
+        Set zi to zi plus 1
+    End While
+    Let buf be Arena.arena_allocate(arena, byte_length)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let rc be Entropy.entropy_random_bytes(arena, buf, byte_length)
+    If rc is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_qword(n, NONCE_OFF_CONTEXT, NONCE_CTX_GENERIC)
+    Memory.memory_set_qword(n, NONCE_OFF_BYTES_PTR, buf)
+    Memory.memory_set_qword(n, NONCE_OFF_BYTES_LEN, byte_length)
+    Memory.memory_set_qword(n, NONCE_OFF_COUNTER, 0)
+    Return n
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Counter-mode nonces
+Note: ============================================================================
+
+@Reasoning
+Construct a counter-mode nonce for context. The first 4 bytes are
+treated as a fixed "salt" (caller-supplied) and the remaining bytes
+encode the counter big-endian. This matches the SP 800-38D 8.2.1
+"Deterministic Construction" for AES-GCM (fixed field || invocation
+field).
+
+For TLS_RECORD (8 bytes), the salt is 4 bytes and the counter is 4
+bytes; for AES_GCM (12 bytes), the salt is 4 bytes and the counter is 8
+bytes (matching TLS 1.3's 64-bit record sequence number XOR'd with
+the IV per RFC 8446 5.3).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate context permits counter mode.
+  2. Allocate nonce struct + byte buffer.
+  3. Write salt (4 bytes) at offset 0; salt_in must be 4 bytes.
+  4. Write counter big-endian at offset 4..end.
+  5. Initialize counter state.
+@End Implementation
+
+@Performance_Hints
+O(byte_len). Constant for fixed-length contexts.
+@End Performance_Hints
+
+@Security_Scope
+Counter UNIQUENESS under the (key, context) pair is the caller's
+guarantee. This proc just constructs the bytes; the security argument
+requires the caller to advance the counter via nonce_counter_next
+between uses with the same key.
+
+A reused counter value with the same key is CATASTROPHIC; for AES-GCM
+this leaks the GHASH authentication key, for ChaCha20-Poly1305 the
+Poly1305 key.
+
+References:
+- SP 800-38D 8.2.1.
+- RFC 8446 section 5.3.
+@End Security_Scope
+Process called "nonce_counter_init" takes arena as Integer, context as Integer, salt_4bytes as Integer, initial_counter as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If salt_4bytes is equal to 0:
+        Return 0
+    End If
+    If nonce_context_supports_counter(context) is equal to 0:
+        Return 0
+    End If
+    Let n_len be nonce_context_byte_length(context)
+    If n_len is equal to 0:
+        Return 0
+    End If
+    If n_len is less than 5:
+        Return 0
+    End If
+    Let counter_bytes be n_len minus 4
+    If counter_bytes is greater than 8:
+        Set counter_bytes to 8
+    End If
+
+    Let n be Arena.arena_allocate(arena, NONCE_STRUCT_SIZE)
+    If n is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than NONCE_STRUCT_SIZE:
+        Memory.memory_set_byte(n, zi, 0)
+        Set zi to zi plus 1
+    End While
+    Let buf be Arena.arena_allocate(arena, n_len)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(buf, salt_4bytes, 4)
+
+    Note: Encode initial_counter big-endian in remaining bytes.
+    Let ctr_value be initial_counter
+    Let i be 0
+    Let pad_bytes be (n_len minus 4) minus counter_bytes
+    Let pi be 0
+    While pi is less than pad_bytes:
+        Memory.memory_set_byte(buf, 4 plus pi, 0)
+        Set pi to pi plus 1
+    End While
+    Let write_off be 4 plus pad_bytes plus counter_bytes minus 1
+    While i is less than counter_bytes:
+        Memory.memory_set_byte(buf, write_off, ctr_value modulo by 256)
+        Set ctr_value to ctr_value divided by 256
+        Set write_off to write_off minus 1
+        Set i to i plus 1
+    End While
+    Memory.memory_set_qword(n, NONCE_OFF_CONTEXT, context)
+    Memory.memory_set_qword(n, NONCE_OFF_BYTES_PTR, buf)
+    Memory.memory_set_qword(n, NONCE_OFF_BYTES_LEN, n_len)
+    Memory.memory_set_qword(n, NONCE_OFF_COUNTER, initial_counter)
+    Return n
+End Process
+
+@Reasoning
+Advance the counter of a counter-mode nonce. The counter field is
+incremented by 1 and re-encoded in the byte buffer big-endian.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Read current counter value from offset 24.
+  2. Increment by 1.
+  3. Re-encode in the byte buffer (counter portion).
+  4. Update the counter qword.
+Returns 1 on success.
+@End Implementation
+
+@Performance_Hints
+O(counter byte width) = O(1) for fixed-length nonces.
+@End Performance_Hints
+
+@Security_Scope
+Counter uniqueness is the spec requirement. This proc DOES NOT detect
+counter wraparound; for contexts where the counter is 8 bytes the
+wraparound is at 2^64 messages per (key, context), which is far above
+any practical limit. For 4-byte counters (TLS 1.3 record sequence) the
+limit is 2^32 records and the application must rekey before then.
+
+References:
+- SP 800-38D 5.2.1.1: "The maximum number of invocations of the
+  authenticated encryption function with the same key shall be 2^32".
+@End Security_Scope
+Process called "nonce_counter_next" takes nonce as Integer returns Integer:
+    If nonce is equal to 0:
+        Return 0
+    End If
+    Let context be Memory.memory_get_qword(nonce, NONCE_OFF_CONTEXT)
+    If nonce_context_supports_counter(context) is equal to 0:
+        Return 0
+    End If
+    Let cur be Memory.memory_get_qword(nonce, NONCE_OFF_COUNTER)
+    Let next_v be cur plus 1
+    Memory.memory_set_qword(nonce, NONCE_OFF_COUNTER, next_v)
+
+    Let buf be Memory.memory_get_qword(nonce, NONCE_OFF_BYTES_PTR)
+    Let n_len be Memory.memory_get_qword(nonce, NONCE_OFF_BYTES_LEN)
+    Let counter_bytes be n_len minus 4
+    If counter_bytes is greater than 8:
+        Set counter_bytes to 8
+    End If
+
+    Let ctr_value be next_v
+    Let i be 0
+    Let pad_bytes be (n_len minus 4) minus counter_bytes
+    Let write_off be 4 plus pad_bytes plus counter_bytes minus 1
+    While i is less than counter_bytes:
+        Memory.memory_set_byte(buf, write_off, ctr_value modulo by 256)
+        Set ctr_value to ctr_value divided by 256
+        Set write_off to write_off minus 1
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Accessors and verification
+Note: ============================================================================
+
+@Reasoning
+Returns the context tag.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "nonce_context" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(n, NONCE_OFF_CONTEXT)
+End Process
+
+@Reasoning
+Returns the nonce byte pointer.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 8.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+The bytes are non-secret BUT must NEVER be reused with the same key.
+Crypto consumers of this proc must respect the (context, key) =>
+unique-nonce invariant.
+@End Security_Scope
+Process called "nonce_bytes" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(n, NONCE_OFF_BYTES_PTR)
+End Process
+
+@Reasoning
+Returns the nonce byte length.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 16.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "nonce_byte_length" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(n, NONCE_OFF_BYTES_LEN)
+End Process
+
+@Reasoning
+Returns the current counter value (for counter-mode nonces), or 0 for
+random nonces.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 24.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+The counter value itself is non-secret. Knowing the counter does not
+break security on its own; it is the (key, nonce) pairing that matters.
+@End Security_Scope
+Process called "nonce_counter_value" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(n, NONCE_OFF_COUNTER)
+End Process
+
+@Reasoning
+Returns 1 if the nonce's context matches the expected context, 0
+otherwise. This is the type-confusion gate that crypto primitives
+call before accepting a nonce: a nonce tagged AES_GCM CANNOT be used
+as an ECDSA_K nonce, even if the byte length happens to match.
+@End Reasoning
+
+@Implementation
+Compares the context tag to the expected value.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+This is the runtime expression of the structural rule "no nonce reuse
+across contexts". Crypto consumers MUST call this before reading
+nonce_bytes.
+@End Security_Scope
+Process called "nonce_check_context" takes n as Integer, expected_context as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Let ctx be nonce_context(n)
+    If ctx is not equal to expected_context:
+        Return 0
+    End If
+    Return 1
+End Process
+
+@Reasoning
+Destroy a nonce by wiping its bytes with secure_zero. Counter-mode
+nonces SHOULD NOT be reused across reset cycles, so destruction is
+the explicit signal that this counter sequence is exhausted.
+@End Reasoning
+
+@Implementation
+secure_zero on the byte buffer. Counter is set to 0 in the struct.
+@End Implementation
+
+@Performance_Hints
+O(byte_len).
+@End Performance_Hints
+
+@Security_Scope
+After destroy, the nonce bytes are zero. The struct header is kept;
+the arena reclaims it on arena_destroy. Calling crypto with a destroyed
+nonce will (depending on the consumer) either reject (zero nonce check)
+or use the zero bytes (which is itself a security failure if the
+counter sequence is reused; do not do this).
+@End Security_Scope
+Process called "nonce_destroy" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 0
+    End If
+    Let buf be Memory.memory_get_qword(n, NONCE_OFF_BYTES_PTR)
+    Let len be Memory.memory_get_qword(n, NONCE_OFF_BYTES_LEN)
+    Secure.secure_zero(buf, len)
+    Memory.memory_set_qword(n, NONCE_OFF_COUNTER, 0)
+    Return 1
+End Process

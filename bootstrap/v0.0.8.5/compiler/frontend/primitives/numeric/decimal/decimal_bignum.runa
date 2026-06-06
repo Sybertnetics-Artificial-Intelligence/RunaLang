@@ -1,0 +1,1260 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Decimal Bignum - shared multi-digit decimal helpers used by the IEEE
+754-2008 Decimal64, Decimal128, and arbitrary-precision decimal modules.
+
+The single Integer in the bootstrap stage1 holds at most 18 decimal digits
+(2^63 - 1 = 9223372036854775807). Decimal64 (16 digits) products produce
+32-digit intermediates, Decimal128 (34 digits) needs 34-digit coefficients
+plus 68-digit products. Both cases exceed Integer range.
+
+This module exposes a "digit buffer" abstraction:
+
+    digit_buffer = pointer to a byte array where each byte holds one
+                   decimal digit 0..9 (NOT ASCII; raw 0..9 values).
+                   index 0 = MOST SIGNIFICANT digit (big-endian).
+
+    A digit_buffer is always paired with an Integer "digit count" that
+    indicates how many of the leading bytes hold valid digits. Bytes
+    beyond digit_count are unspecified.
+
+All routines in this module take ownership semantics from their callers:
+the caller allocates digit buffers via decbn_alloc and releases them via
+decbn_free. Functions that return a new buffer document the allocation
+in their @Reasoning block.
+
+IEEE 754-2008 conformance: the routines here implement the integer-domain
+primitives used by Section 5 operations. They do not enforce any precision
+constraint themselves; the calling Decimal{32,64,128} module is responsible
+for capping the result to its precision via decbn_round_to_precision.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: Rounding mode constants - shared with all Decimal modules.
+Note: ============================================================================
+
+Constant DECBN_ROUND_HALF_EVEN as Integer is 0
+Constant DECBN_ROUND_HALF_UP as Integer is 1
+Constant DECBN_ROUND_TOWARD_ZERO as Integer is 2
+Constant DECBN_ROUND_TOWARD_POS as Integer is 3
+Constant DECBN_ROUND_TOWARD_NEG as Integer is 4
+
+Note: ============================================================================
+Note: Allocator
+Note: ============================================================================
+
+Process called "decbn_alloc" takes capacity as Integer returns Integer:
+    @Reasoning
+    Allocates a zero-initialized digit buffer with the requested byte
+    capacity. The Layout.allocate path guarantees zero-initialized
+    pages per the calloc-zero contract documented in
+    memory/layout.runa allocate(), so we do not need an explicit
+    fill.
+    @End Reasoning
+
+    @Implementation
+    Layout.allocate; if it returns 0 we propagate the 0 sentinel.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) at the allocator level. Hot path for arithmetic intermediates.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure propagates as 0 (NULL). Callers MUST check.
+    @End Security_Scope
+
+    If capacity is less than 1:
+        Return 0
+    End If
+    Return Layout.allocate(capacity)
+End Process
+
+Process called "decbn_free" takes buf as Integer returns Integer:
+    @Reasoning
+    Releases a digit buffer allocated via decbn_alloc. Idempotent on
+    NULL via the underlying allocator.
+    @End Reasoning
+
+    @Implementation
+    Layout.deallocate.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Double-free triggers the canary protocol in the allocator.
+    @End Security_Scope
+
+    If buf is equal to 0:
+        Return 0
+    End If
+    Layout.deallocate(buf)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Conversion: Integer <-> digit buffer
+Note: ============================================================================
+
+Process called "decbn_from_integer" takes value as Integer, out_count_ptr as Integer returns Integer:
+    @Reasoning
+    Converts a non-negative Integer to a freshly-allocated digit buffer
+    with the most-significant digit at index 0. The digit count is
+    written into the Integer at out_count_ptr (offset 0). The returned
+    buffer is sized to the actual digit count plus one byte of slack
+    for in-place carry propagation by downstream routines.
+
+    For value = 0 we still return a 1-digit buffer holding 0 because
+    that is the conventional representation of zero.
+    @End Reasoning
+
+    @Implementation
+    1. Compute digit count via successive division by 10.
+    2. Allocate buffer.
+    3. Fill from the right (least significant) up.
+    @End Implementation
+
+    @Performance_Hints
+    O(log10 value). The 2-pass form (count then fill) avoids reallocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Negative input is treated as its absolute value; the caller must
+    track the sign separately. out_count_ptr must point to writable
+    Integer storage.
+    @End Security_Scope
+
+    Let v be value
+    If v is less than 0:
+        Set v to 0 minus v
+    End If
+    Let count be 0
+    If v is equal to 0:
+        Set count to 1
+    Otherwise:
+        Let scan be v
+        While scan is greater than 0:
+            Set count to count plus 1
+            Set scan to scan divided by 10
+        End While
+    End If
+
+    Let buf be decbn_alloc(count plus 1)
+    If buf is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+
+    If v is equal to 0:
+        Memory.memory_set_byte(buf, 0, 0)
+    Otherwise:
+        Let idx be count minus 1
+        Let cur be v
+        While cur is greater than 0:
+            Let digit be cur minus ((cur divided by 10) multiplied by 10)
+            Memory.memory_set_byte(buf, idx, digit)
+            Set cur to cur divided by 10
+            Set idx to idx minus 1
+        End While
+    End If
+
+    If out_count_ptr is not equal to 0:
+        __store(out_count_ptr, 0, count)
+    End If
+    Return buf
+End Process
+
+Process called "decbn_to_integer_capped" takes buf as Integer, count as Integer, cap_digits as Integer returns Integer:
+    @Reasoning
+    Reads the first cap_digits leading digits of buf and packs them
+    into a single Integer. If count < cap_digits the value is whatever
+    digits exist; if count > cap_digits the lower digits are discarded
+    (use decbn_round_to_precision first if rounding is desired).
+    @End Reasoning
+
+    @Implementation
+    Accumulator * 10 + digit, bounded to cap_digits iterations.
+    @End Implementation
+
+    @Performance_Hints
+    O(cap_digits) which is bounded by 18 (the Integer limit).
+    @End Performance_Hints
+
+    @Security_Scope
+    cap_digits must be <= 18 to avoid Integer overflow. Callers in this
+    module enforce that constraint.
+    @End Security_Scope
+
+    If buf is equal to 0:
+        Return 0
+    End If
+    If count is less than or equal to 0:
+        Return 0
+    End If
+    Let limit be cap_digits
+    If limit is greater than count:
+        Set limit to count
+    End If
+    Let result be 0
+    Let i be 0
+    While i is less than limit:
+        Let d be Memory.memory_get_byte(buf, i)
+        Set result to (result multiplied by 10) plus d
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+Process called "decbn_copy" takes src as Integer, src_count as Integer returns Integer:
+    @Reasoning
+    Allocates a new buffer and copies the leading src_count digits.
+    The new buffer has one byte of slack for downstream carry
+    propagation, matching decbn_from_integer.
+    @End Reasoning
+
+    @Implementation
+    decbn_alloc + memory_copy via a digit loop (avoids dependence on
+    memory_copy which is overkill for typical 16-34 digit counts).
+    @End Implementation
+
+    @Performance_Hints
+    O(src_count). Inline copy loop avoids a function-call boundary.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If src is equal to 0:
+        Return 0
+    End If
+    If src_count is less than 1:
+        Return 0
+    End If
+    Let buf be decbn_alloc(src_count plus 1)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than src_count:
+        Let d be Memory.memory_get_byte(src, i)
+        Memory.memory_set_byte(buf, i, d)
+        Set i to i plus 1
+    End While
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: Comparison
+Note: ============================================================================
+
+Process called "decbn_compare_magnitude" takes a as Integer, a_count as Integer, b as Integer, b_count as Integer returns Integer:
+    @Reasoning
+    Magnitude compare: returns -1, 0, or 1. Leading zeros are NOT
+    handled here; callers must pass normalized counts (no leading
+    zeros) for the comparison to be correct. The reason we do not
+    auto-strip leading zeros is that strip would require scanning
+    both buffers, doubling the cost in the hot path; the calling
+    arithmetic routines always produce normalized counts already.
+    @End Reasoning
+
+    @Implementation
+    1. Strip leading zeros locally (cheap; in normalized inputs the
+       strip is a no-op).
+    2. Compare effective digit counts.
+    3. If equal, compare digit-by-digit from MSD to LSD.
+    @End Implementation
+
+    @Performance_Hints
+    O(min(a_count, b_count)) in the worst case (equal magnitudes).
+    Best case O(1) when lengths differ.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure. NULL inputs treated as zero magnitude.
+    @End Security_Scope
+
+    Let a_eff be a_count
+    Let b_eff be b_count
+    Note: Skip leading zeros to ensure correct length comparison.
+    Let ai be 0
+    While ai is less than a_eff:
+        If a is equal to 0:
+            Set a_eff to 0
+            Set ai to a_eff
+        Otherwise:
+            Let av be Memory.memory_get_byte(a, ai)
+            If av is equal to 0:
+                Set ai to ai plus 1
+            Otherwise:
+                Set ai to a_eff
+            End If
+        End If
+    End While
+    Let a_lead_zeros be ai
+    Let a_remaining be a_eff minus a_lead_zeros
+
+    Let bj be 0
+    While bj is less than b_eff:
+        If b is equal to 0:
+            Set b_eff to 0
+            Set bj to b_eff
+        Otherwise:
+            Let bv be Memory.memory_get_byte(b, bj)
+            If bv is equal to 0:
+                Set bj to bj plus 1
+            Otherwise:
+                Set bj to b_eff
+            End If
+        End If
+    End While
+    Let b_lead_zeros be bj
+    Let b_remaining be b_eff minus b_lead_zeros
+
+    If a_remaining is less than b_remaining:
+        Return -1
+    End If
+    If a_remaining is greater than b_remaining:
+        Return 1
+    End If
+
+    Let k be 0
+    While k is less than a_remaining:
+        Let da be Memory.memory_get_byte(a, a_lead_zeros plus k)
+        Let db be Memory.memory_get_byte(b, b_lead_zeros plus k)
+        If da is less than db:
+            Return -1
+        End If
+        If da is greater than db:
+            Return 1
+        End If
+        Set k to k plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Addition (magnitudes; signs handled at the call site)
+Note: ============================================================================
+
+Process called "decbn_add_magnitude" takes a as Integer, a_count as Integer, b as Integer, b_count as Integer, out_count_ptr as Integer returns Integer:
+    @Reasoning
+    Adds two magnitude digit buffers and returns a fresh buffer holding
+    the sum. The sum can have at most max(a_count, b_count) + 1 digits.
+    The result is normalized: no leading zeros except for the canonical
+    zero (a single 0 digit with count=1).
+    @End Reasoning
+
+    @Implementation
+    Right-to-left grade-school addition with a carry word. Operand
+    digits are aligned by right-justification - we conceptually pad
+    the shorter operand with leading zeros (no buffer modification
+    needed, just an index check).
+    @End Implementation
+
+    @Performance_Hints
+    O(max(a_count, b_count)). Allocates one buffer of size
+    max+2 (max+1 for digits, +1 slack for downstream use).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0 and sets *out_count_ptr = 0.
+    @End Security_Scope
+
+    Let big_n be a_count
+    If b_count is greater than big_n:
+        Set big_n to b_count
+    End If
+    Let result_capacity be big_n plus 2
+    Let result be decbn_alloc(result_capacity)
+    If result is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+
+    Note: Build digits right-to-left into a temporary array, then
+    Note: compact into the result buffer in big-endian order.
+    Let temp be decbn_alloc(result_capacity)
+    If temp is equal to 0:
+        decbn_free(result)
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+
+    Let carry be 0
+    Let i be 0
+    Note: i counts position from least-significant end (0 = ones digit).
+    While i is less than big_n:
+        Let da be 0
+        Let db be 0
+        If i is less than a_count:
+            Set da to Memory.memory_get_byte(a, a_count minus 1 minus i)
+        End If
+        If i is less than b_count:
+            Set db to Memory.memory_get_byte(b, b_count minus 1 minus i)
+        End If
+        Let s be da plus db plus carry
+        Set carry to s divided by 10
+        Memory.memory_set_byte(temp, i, s minus (carry multiplied by 10))
+        Set i to i plus 1
+    End While
+    Let final_count be big_n
+    If carry is greater than 0:
+        Memory.memory_set_byte(temp, i, carry)
+        Set final_count to final_count plus 1
+    End If
+
+    Note: Reverse temp into result.
+    Let j be 0
+    While j is less than final_count:
+        Let v be Memory.memory_get_byte(temp, final_count minus 1 minus j)
+        Memory.memory_set_byte(result, j, v)
+        Set j to j plus 1
+    End While
+    decbn_free(temp)
+
+    If out_count_ptr is not equal to 0:
+        __store(out_count_ptr, 0, final_count)
+    End If
+    Return result
+End Process
+
+Process called "decbn_sub_magnitude" takes a as Integer, a_count as Integer, b as Integer, b_count as Integer, out_count_ptr as Integer returns Integer:
+    @Reasoning
+    Computes a - b assuming |a| >= |b|. Caller must verify ordering
+    via decbn_compare_magnitude before calling. The result is
+    normalized (no leading zeros) and has at most a_count digits.
+    @End Reasoning
+
+    @Implementation
+    Right-to-left grade-school subtraction with a borrow word.
+    Strip leading zeros from the result before returning.
+    @End Implementation
+
+    @Performance_Hints
+    O(a_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    If |b| > |a| the result is undefined and likely garbage. The
+    caller MUST check ordering. We do not assert here because the
+    routine is on the hot path of the add/sub combine step.
+    @End Security_Scope
+
+    Let temp_capacity be a_count plus 2
+    Let temp be decbn_alloc(temp_capacity)
+    If temp is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+
+    Let borrow be 0
+    Let i be 0
+    While i is less than a_count:
+        Let da be Memory.memory_get_byte(a, a_count minus 1 minus i)
+        Let db be 0
+        If i is less than b_count:
+            Set db to Memory.memory_get_byte(b, b_count minus 1 minus i)
+        End If
+        Let diff be da minus db minus borrow
+        If diff is less than 0:
+            Set diff to diff plus 10
+            Set borrow to 1
+        Otherwise:
+            Set borrow to 0
+        End If
+        Memory.memory_set_byte(temp, i, diff)
+        Set i to i plus 1
+    End While
+
+    Note: Strip leading zeros (which are at the HIGH end of the temp
+    Note: array, i.e. the largest indices).
+    Let effective_count be a_count
+    Let scan be a_count minus 1
+    While scan is greater than 0:
+        Let v be Memory.memory_get_byte(temp, scan)
+        If v is equal to 0:
+            Set effective_count to effective_count minus 1
+            Set scan to scan minus 1
+        Otherwise:
+            Set scan to 0
+        End If
+    End While
+
+    Let result be decbn_alloc(effective_count plus 1)
+    If result is equal to 0:
+        decbn_free(temp)
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+
+    Let j be 0
+    While j is less than effective_count:
+        Let v2 be Memory.memory_get_byte(temp, effective_count minus 1 minus j)
+        Memory.memory_set_byte(result, j, v2)
+        Set j to j plus 1
+    End While
+    decbn_free(temp)
+
+    If out_count_ptr is not equal to 0:
+        __store(out_count_ptr, 0, effective_count)
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Multiplication (grade-school)
+Note: ============================================================================
+
+Process called "decbn_mul" takes a as Integer, a_count as Integer, b as Integer, b_count as Integer, out_count_ptr as Integer returns Integer:
+    @Reasoning
+    Multiplies two magnitude digit buffers; the result has at most
+    a_count + b_count digits. Uses classical O(n*m) long multiplication
+    in the decimal base, suitable for up to ~50-digit operands where
+    Karatsuba's crossover begins; below that the constant factor of
+    grade-school dominates. For Decimal64 (16 digits) and Decimal128
+    (34 digits) classical is optimal.
+    @End Reasoning
+
+    @Implementation
+    Two-loop accumulator: for each digit of b (least-significant first)
+    multiply the entire a by that digit, accumulate with carry into a
+    temp buffer at position offset by the b digit's position from the
+    right. Then compact and reverse into the final result.
+    @End Implementation
+
+    @Performance_Hints
+    O(a_count * b_count). For 34*34 = 1156 single-digit multiplies
+    plus carries.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    Let total_size be a_count plus b_count plus 2
+    Let temp be decbn_alloc(total_size)
+    If temp is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+
+    Note: temp is indexed right-to-left (index 0 = ones digit).
+    Let i be 0
+    While i is less than b_count:
+        Let bd be Memory.memory_get_byte(b, b_count minus 1 minus i)
+        If bd is greater than 0:
+            Let carry be 0
+            Let j be 0
+            While j is less than a_count:
+                Let ad be Memory.memory_get_byte(a, a_count minus 1 minus j)
+                Let existing be Memory.memory_get_byte(temp, i plus j)
+                Let p be (ad multiplied by bd) plus existing plus carry
+                Set carry to p divided by 10
+                Memory.memory_set_byte(temp, i plus j, p minus (carry multiplied by 10))
+                Set j to j plus 1
+            End While
+            Note: Propagate trailing carry.
+            Let k be a_count
+            While carry is greater than 0:
+                Let existing2 be Memory.memory_get_byte(temp, i plus k)
+                Let s be existing2 plus carry
+                Set carry to s divided by 10
+                Memory.memory_set_byte(temp, i plus k, s minus (carry multiplied by 10))
+                Set k to k plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Determine effective digit count by scanning from the high end.
+    Let max_pos be a_count plus b_count
+    Let effective be max_pos
+    While effective is greater than 1:
+        Let hv be Memory.memory_get_byte(temp, effective minus 1)
+        If hv is equal to 0:
+            Set effective to effective minus 1
+        Otherwise:
+            Set effective to 0 minus effective
+        End If
+    End While
+    If effective is less than 0:
+        Set effective to 0 minus effective
+    End If
+    If effective is equal to 0:
+        Set effective to 1
+    End If
+
+    Let result be decbn_alloc(effective plus 1)
+    If result is equal to 0:
+        decbn_free(temp)
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+    Let m be 0
+    While m is less than effective:
+        Let v be Memory.memory_get_byte(temp, effective minus 1 minus m)
+        Memory.memory_set_byte(result, m, v)
+        Set m to m plus 1
+    End While
+    decbn_free(temp)
+    If out_count_ptr is not equal to 0:
+        __store(out_count_ptr, 0, effective)
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Division (long division)
+Note: ============================================================================
+
+Process called "decbn_div_mod" takes a as Integer, a_count as Integer, b as Integer, b_count as Integer, quo_count_ptr as Integer, rem_count_ptr as Integer, rem_out_ptr as Integer returns Integer:
+    @Reasoning
+    Long division of a / b. Returns the quotient as the function return,
+    the quotient's digit count via quo_count_ptr, and the remainder
+    via rem_count_ptr + rem_out_ptr. The remainder buffer is allocated
+    by this routine and stored at *rem_out_ptr; the caller is
+    responsible for freeing both buffers via decbn_free.
+
+    This is correctly-rounding-capable since the remainder carries
+    all the rounding-decision information.
+    @End Reasoning
+
+    @Implementation
+    Schoolbook long division: bring down one digit at a time from a,
+    maintain a running prefix, and subtract the largest multiple of b
+    that fits. For each step the trial digit is at most 9; we try
+    0..9 in ascending order to find the largest k such that k*b <=
+    prefix. This is O(a_count * b_count * 10) per division.
+    @End Implementation
+
+    @Performance_Hints
+    Heavier than mul but acceptable for v0.0.8.5. Improvements to
+    Knuth Algorithm D can come later behind a perf benchmark.
+    @End Performance_Hints
+
+    @Security_Scope
+    Divide by zero returns 0 quotient and 0 remainder; callers MUST
+    check for cb=0 before calling.
+    @End Security_Scope
+
+    If b is equal to 0:
+        If quo_count_ptr is not equal to 0:
+            __store(quo_count_ptr, 0, 0)
+        End If
+        If rem_count_ptr is not equal to 0:
+            __store(rem_count_ptr, 0, 0)
+        End If
+        If rem_out_ptr is not equal to 0:
+            __store(rem_out_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+    If b_count is equal to 1:
+        Let only_digit be Memory.memory_get_byte(b, 0)
+        If only_digit is equal to 0:
+            If quo_count_ptr is not equal to 0:
+                __store(quo_count_ptr, 0, 0)
+            End If
+            If rem_count_ptr is not equal to 0:
+                __store(rem_count_ptr, 0, 0)
+            End If
+            If rem_out_ptr is not equal to 0:
+                __store(rem_out_ptr, 0, 0)
+            End If
+            Return 0
+        End If
+    End If
+
+    Note: Quotient buffer: at most a_count digits.
+    Let q_buf be decbn_alloc(a_count plus 1)
+    If q_buf is equal to 0:
+        Return 0
+    End If
+    Note: Prefix buffer: at most b_count + 1 digits.
+    Let prefix_capacity be b_count plus 2
+    Let prefix_buf be decbn_alloc(prefix_capacity)
+    If prefix_buf is equal to 0:
+        decbn_free(q_buf)
+        Return 0
+    End If
+    Let prefix_count be 0
+
+    Let pos be 0
+    Let q_pos be 0
+    Let zero_buf be decbn_alloc(1)
+    If zero_buf is equal to 0:
+        decbn_free(q_buf)
+        decbn_free(prefix_buf)
+        Return 0
+    End If
+    Memory.memory_set_byte(zero_buf, 0, 0)
+
+    While pos is less than a_count:
+        Let next_digit be Memory.memory_get_byte(a, pos)
+        Note: Append next_digit to prefix. In big-endian layout (index 0
+        Note: is most significant) this is simply: write next_digit at
+        Note: index prefix_count then increment prefix_count. If the
+        Note: prefix is currently zero, we treat the leading zero as
+        Note: dropped so we do not accumulate "00..."; the only digit
+        Note: present becomes next_digit.
+        If prefix_count is equal to 0:
+            If next_digit is not equal to 0:
+                Memory.memory_set_byte(prefix_buf, 0, next_digit)
+                Set prefix_count to 1
+            End If
+        Otherwise:
+            Memory.memory_set_byte(prefix_buf, prefix_count, next_digit)
+            Set prefix_count to prefix_count plus 1
+        End If
+
+        Note: Find the largest k in 0..9 such that k*b <= prefix.
+        Let k be 9
+        Let trial be 0
+        Let trial_count be 0
+        Let found be 0
+        While found is equal to 0:
+            Note: Build k * b: scale b by k.
+            If k is equal to 0:
+                Set trial to zero_buf
+                Set trial_count to 1
+                Set found to 1
+            Otherwise:
+                Let scaled_count_storage be Layout.allocate(8)
+                If scaled_count_storage is equal to 0:
+                    decbn_free(q_buf)
+                    decbn_free(prefix_buf)
+                    decbn_free(zero_buf)
+                    Return 0
+                End If
+                Let scaled be decbn_scale_by_digit(b, b_count, k, scaled_count_storage)
+                Let scaled_count be __load(scaled_count_storage, 0)
+                Layout.deallocate(scaled_count_storage)
+                If scaled is equal to 0:
+                    decbn_free(q_buf)
+                    decbn_free(prefix_buf)
+                    decbn_free(zero_buf)
+                    Return 0
+                End If
+                Let cmp be decbn_compare_magnitude(scaled, scaled_count, prefix_buf, prefix_count)
+                If cmp is less than or equal to 0:
+                    Set trial to scaled
+                    Set trial_count to scaled_count
+                    Set found to 1
+                Otherwise:
+                    decbn_free(scaled)
+                    Set k to k minus 1
+                End If
+            End If
+        End While
+
+        Memory.memory_set_byte(q_buf, q_pos, k)
+        Set q_pos to q_pos plus 1
+
+        If k is greater than 0:
+            Let sub_count_storage be Layout.allocate(8)
+            If sub_count_storage is equal to 0:
+                decbn_free(trial)
+                decbn_free(q_buf)
+                decbn_free(prefix_buf)
+                decbn_free(zero_buf)
+                Return 0
+            End If
+            Let new_prefix be decbn_sub_magnitude(prefix_buf, prefix_count, trial, trial_count, sub_count_storage)
+            Let new_prefix_count be __load(sub_count_storage, 0)
+            Layout.deallocate(sub_count_storage)
+            decbn_free(trial)
+            If new_prefix is equal to 0:
+                decbn_free(q_buf)
+                decbn_free(prefix_buf)
+                decbn_free(zero_buf)
+                Return 0
+            End If
+            Note: Copy new_prefix back into prefix_buf.
+            Let n2 be 0
+            While n2 is less than new_prefix_count:
+                Memory.memory_set_byte(prefix_buf, n2, Memory.memory_get_byte(new_prefix, n2))
+                Set n2 to n2 plus 1
+            End While
+            Set prefix_count to new_prefix_count
+            decbn_free(new_prefix)
+        End If
+
+        Set pos to pos plus 1
+    End While
+
+    decbn_free(zero_buf)
+
+    Note: Strip leading zeros from quotient. We keep at least one digit
+    Note: so that a zero quotient is represented as a single 0.
+    Let q_lead be 0
+    Let scanning_zeros be 1
+    While scanning_zeros is equal to 1:
+        If q_lead is greater than or equal to q_pos minus 1:
+            Set scanning_zeros to 0
+        Otherwise:
+            Let qv be Memory.memory_get_byte(q_buf, q_lead)
+            If qv is equal to 0:
+                Set q_lead to q_lead plus 1
+            Otherwise:
+                Set scanning_zeros to 0
+            End If
+        End If
+    End While
+
+    Let q_final_count be q_pos minus q_lead
+    Let q_final be decbn_alloc(q_final_count plus 1)
+    If q_final is equal to 0:
+        decbn_free(q_buf)
+        decbn_free(prefix_buf)
+        Return 0
+    End If
+    Let fi be 0
+    While fi is less than q_final_count:
+        Memory.memory_set_byte(q_final, fi, Memory.memory_get_byte(q_buf, q_lead plus fi))
+        Set fi to fi plus 1
+    End While
+    decbn_free(q_buf)
+
+    Note: Remainder is whatever remains in prefix_buf.
+    Let rem be decbn_alloc(prefix_count plus 1)
+    If rem is equal to 0:
+        decbn_free(q_final)
+        decbn_free(prefix_buf)
+        Return 0
+    End If
+    Let ri be 0
+    Let rem_effective be prefix_count
+    If rem_effective is equal to 0:
+        Memory.memory_set_byte(rem, 0, 0)
+        Set rem_effective to 1
+    Otherwise:
+        While ri is less than rem_effective:
+            Memory.memory_set_byte(rem, ri, Memory.memory_get_byte(prefix_buf, ri))
+            Set ri to ri plus 1
+        End While
+    End If
+    decbn_free(prefix_buf)
+
+    If quo_count_ptr is not equal to 0:
+        __store(quo_count_ptr, 0, q_final_count)
+    End If
+    If rem_count_ptr is not equal to 0:
+        __store(rem_count_ptr, 0, rem_effective)
+    End If
+    If rem_out_ptr is not equal to 0:
+        __store(rem_out_ptr, 0, rem)
+    Otherwise:
+        decbn_free(rem)
+    End If
+    Return q_final
+End Process
+
+Process called "decbn_scale_by_digit" takes a as Integer, a_count as Integer, digit as Integer, out_count_ptr as Integer returns Integer:
+    @Reasoning
+    Multiplies a by a single digit (0..9). Result has at most a_count+1
+    digits. Used internally by decbn_div_mod's trial-digit loop.
+    @End Reasoning
+
+    @Implementation
+    Standard scale-by-digit: walk right-to-left, multiply each digit
+    by the scalar, propagate carry.
+    @End Implementation
+
+    @Performance_Hints
+    O(a_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    digit outside 0..9 will overflow the internal carry; callers in
+    this module enforce the constraint.
+    @End Security_Scope
+
+    If digit is equal to 0:
+        Let zero be decbn_alloc(2)
+        If zero is equal to 0:
+            If out_count_ptr is not equal to 0:
+                __store(out_count_ptr, 0, 0)
+            End If
+            Return 0
+        End If
+        Memory.memory_set_byte(zero, 0, 0)
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 1)
+        End If
+        Return zero
+    End If
+    Let temp be decbn_alloc(a_count plus 2)
+    If temp is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+    Let carry be 0
+    Let i be 0
+    While i is less than a_count:
+        Let ad be Memory.memory_get_byte(a, a_count minus 1 minus i)
+        Let p be (ad multiplied by digit) plus carry
+        Set carry to p divided by 10
+        Memory.memory_set_byte(temp, i, p minus (carry multiplied by 10))
+        Set i to i plus 1
+    End While
+    Let final_count be a_count
+    While carry is greater than 0:
+        Memory.memory_set_byte(temp, i, carry minus ((carry divided by 10) multiplied by 10))
+        Set carry to carry divided by 10
+        Set final_count to final_count plus 1
+        Set i to i plus 1
+    End While
+    Let result be decbn_alloc(final_count plus 1)
+    If result is equal to 0:
+        decbn_free(temp)
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+    Let j be 0
+    While j is less than final_count:
+        Let v be Memory.memory_get_byte(temp, final_count minus 1 minus j)
+        Memory.memory_set_byte(result, j, v)
+        Set j to j plus 1
+    End While
+    decbn_free(temp)
+    If out_count_ptr is not equal to 0:
+        __store(out_count_ptr, 0, final_count)
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Rounding to a specified digit count (IEEE 754-2008 Section 4.3)
+Note: ============================================================================
+
+Process called "decbn_round_to_precision" takes buf as Integer, count as Integer, precision as Integer, sign as Integer, rounding_mode as Integer, out_count_ptr as Integer, exp_delta_ptr as Integer returns Integer:
+    @Reasoning
+    Rounds a digit buffer to at most 'precision' digits per the given
+    IEEE 754-2008 rounding mode. The returned buffer is fresh; the
+    caller must free it. The exponent delta caused by digit-shrinkage
+    or carry-out is written into *exp_delta_ptr (positive means the
+    exponent should increase by that amount).
+
+    Rounding modes:
+        HALF_EVEN: ties go to even last digit (default for finance).
+        HALF_UP:   ties go away from zero.
+        TOWARD_ZERO: truncation.
+        TOWARD_POS: round up if positive sign and non-zero discarded.
+        TOWARD_NEG: round up if negative sign and non-zero discarded.
+    @End Reasoning
+
+    @Implementation
+    1. If count <= precision, return copy with exp_delta=0.
+    2. Compute excess = count - precision. The first 'precision'
+       digits are kept; the remaining 'excess' digits inform the
+       rounding decision.
+    3. Build the kept-digit buffer.
+    4. Determine round_up by examining the first discarded digit
+       (the rounding digit) and the sticky bit (OR of remaining
+       discarded digits).
+    5. If round_up, propagate +1 with carry through the kept buffer.
+       A carry-out from the high digit shifts the result and bumps
+       exp_delta.
+    6. Set *exp_delta_ptr = excess (+ optional 1 for the carry).
+    @End Implementation
+
+    @Performance_Hints
+    O(excess + precision). For typical Decimal{32,64,128} flows the
+    excess is small (1-2 digits).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure returns 0.
+    @End Security_Scope
+
+    If buf is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        If exp_delta_ptr is not equal to 0:
+            __store(exp_delta_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+
+    If count is less than or equal to precision:
+        If exp_delta_ptr is not equal to 0:
+            __store(exp_delta_ptr, 0, 0)
+        End If
+        Let copy be decbn_copy(buf, count)
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, count)
+        End If
+        Return copy
+    End If
+
+    Let excess be count minus precision
+    Let result be decbn_alloc(precision plus 2)
+    If result is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        If exp_delta_ptr is not equal to 0:
+            __store(exp_delta_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+    Let i be 0
+    While i is less than precision:
+        Memory.memory_set_byte(result, i, Memory.memory_get_byte(buf, i))
+        Set i to i plus 1
+    End While
+
+    Let rounding_digit be Memory.memory_get_byte(buf, precision)
+    Let sticky be 0
+    Let s be precision plus 1
+    While s is less than count:
+        If Memory.memory_get_byte(buf, s) is not equal to 0:
+            Set sticky to 1
+            Set s to count
+        Otherwise:
+            Set s to s plus 1
+        End If
+    End While
+
+    Let round_up be 0
+    If rounding_mode is equal to DECBN_ROUND_HALF_EVEN:
+        If rounding_digit is greater than 5:
+            Set round_up to 1
+        Otherwise:
+            If rounding_digit is equal to 5:
+                If sticky is equal to 1:
+                    Set round_up to 1
+                Otherwise:
+                    Let last_kept be Memory.memory_get_byte(result, precision minus 1)
+                    If last_kept is not equal to ((last_kept divided by 2) multiplied by 2):
+                        Set round_up to 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+    If rounding_mode is equal to DECBN_ROUND_HALF_UP:
+        If rounding_digit is greater than or equal to 5:
+            Set round_up to 1
+        End If
+    End If
+    If rounding_mode is equal to DECBN_ROUND_TOWARD_POS:
+        If sign is equal to 0:
+            If rounding_digit is greater than 0:
+                Set round_up to 1
+            End If
+            If sticky is equal to 1:
+                Set round_up to 1
+            End If
+        End If
+    End If
+    If rounding_mode is equal to DECBN_ROUND_TOWARD_NEG:
+        If sign is equal to 1:
+            If rounding_digit is greater than 0:
+                Set round_up to 1
+            End If
+            If sticky is equal to 1:
+                Set round_up to 1
+            End If
+        End If
+    End If
+
+    Let final_precision be precision
+    Let exp_delta be excess
+    If round_up is equal to 1:
+        Let carry be 1
+        Let cp be precision minus 1
+        While cp is greater than or equal to 0:
+            If carry is equal to 0:
+                Set cp to -1
+            Otherwise:
+                Let d be Memory.memory_get_byte(result, cp)
+                Set d to d plus 1
+                If d is equal to 10:
+                    Memory.memory_set_byte(result, cp, 0)
+                    Set carry to 1
+                Otherwise:
+                    Memory.memory_set_byte(result, cp, d)
+                    Set carry to 0
+                End If
+                Set cp to cp minus 1
+            End If
+        End While
+        If carry is equal to 1:
+            Note: Carry-out: shift right by one and add leading 1.
+            Let r2 be precision minus 1
+            While r2 is greater than or equal to 0:
+                Memory.memory_set_byte(result, r2 plus 1, Memory.memory_get_byte(result, r2))
+                Set r2 to r2 minus 1
+            End While
+            Memory.memory_set_byte(result, 0, 1)
+            Set final_precision to precision plus 1
+            Set exp_delta to exp_delta plus 1
+        End If
+    End If
+
+    If out_count_ptr is not equal to 0:
+        __store(out_count_ptr, 0, final_precision)
+    End If
+    If exp_delta_ptr is not equal to 0:
+        __store(exp_delta_ptr, 0, exp_delta)
+    End If
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Append / parse helpers (ASCII <-> digit buffer)
+Note: ============================================================================
+
+Process called "decbn_from_string" takes s as Integer, start_pos as Integer, end_pos as Integer, out_count_ptr as Integer returns Integer:
+    @Reasoning
+    Parses a contiguous decimal digit string from s[start_pos..end_pos)
+    into a digit buffer. Non-digit bytes cause early termination (the
+    out_pos in the caller's view will be the first non-digit byte).
+    Used by the Decimal{32,64,128,arbitrary} from_string parsers to
+    convert the digit-only portion of the input.
+    @End Reasoning
+
+    @Implementation
+    Walks the range, accumulating digits into a fresh buffer. Skips
+    leading zeros to keep the count normalized.
+    @End Implementation
+
+    @Performance_Hints
+    Single pass; allocations bounded by the digit count.
+    @End Performance_Hints
+
+    @Security_Scope
+    end_pos > start_pos must hold; otherwise we return 0.
+    @End Security_Scope
+
+    If s is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+    If end_pos is less than or equal to start_pos:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+
+    Let capacity be end_pos minus start_pos plus 1
+    Let buf be decbn_alloc(capacity)
+    If buf is equal to 0:
+        If out_count_ptr is not equal to 0:
+            __store(out_count_ptr, 0, 0)
+        End If
+        Return 0
+    End If
+
+    Let cnt be 0
+    Let i be start_pos
+    Let leading_zero be 1
+    While i is less than end_pos:
+        Let b be Memory.memory_get_byte(s, i)
+        If b is less than 48:
+            Set i to end_pos
+        Otherwise:
+            If b is greater than 57:
+                Set i to end_pos
+            Otherwise:
+                Let digit_value be b minus 48
+                If leading_zero is equal to 1:
+                    If digit_value is not equal to 0:
+                        Memory.memory_set_byte(buf, cnt, digit_value)
+                        Set cnt to cnt plus 1
+                        Set leading_zero to 0
+                    End If
+                Otherwise:
+                    Memory.memory_set_byte(buf, cnt, digit_value)
+                    Set cnt to cnt plus 1
+                End If
+                Set i to i plus 1
+            End If
+        End If
+    End While
+    If cnt is equal to 0:
+        Memory.memory_set_byte(buf, 0, 0)
+        Set cnt to 1
+    End If
+    If out_count_ptr is not equal to 0:
+        __store(out_count_ptr, 0, cnt)
+    End If
+    Return buf
+End Process
+
+Process called "decbn_write_ascii" takes buf as Integer, count as Integer, out as Integer, out_offset as Integer returns Integer:
+    @Reasoning
+    Writes 'count' digits from buf as ASCII characters '0'..'9' into
+    out starting at out_offset. Returns the number of bytes written
+    (always equal to count on success).
+    @End Reasoning
+    @Implementation
+    Add 48 to each digit and store.
+    @End Implementation
+    @Performance_Hints
+    O(count).
+    @End Performance_Hints
+    @Security_Scope
+    Caller must ensure out has space for at least count bytes from
+    out_offset.
+    @End Security_Scope
+
+    If buf is equal to 0:
+        Return 0
+    End If
+    If out is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than count:
+        Let d be Memory.memory_get_byte(buf, i)
+        Memory.memory_set_byte(out, out_offset plus i, d plus 48)
+        Set i to i plus 1
+    End While
+    Return count
+End Process

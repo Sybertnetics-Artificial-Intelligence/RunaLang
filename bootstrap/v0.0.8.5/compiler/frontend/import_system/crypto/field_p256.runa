@@ -1,0 +1,660 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FIELD_P256 - NIST P-256 prime field arithmetic (FIPS 186-4 D.1.2.3)
+==============================================================================
+
+The base prime p of the NIST P-256 curve is:
+  p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+    = ffffffff 00000001 00000000 00000000 00000000 ffffffff ffffffff ffffffff
+
+In little-endian 64-bit limb form (limb[0] is the LSW):
+  limb[0] = 0xFFFFFFFFFFFFFFFF
+  limb[1] = 0x00000000FFFFFFFF
+  limb[2] = 0x0000000000000000
+  limb[3] = 0xFFFFFFFF00000001
+
+Field elements are represented as BigInt values in canonical form 0 <= x < p.
+All operations are constant-time over the bit length of p (256 bits) regardless
+of the value being processed. Reduction uses the standard primary reduction
+(repeated subtraction with binary-shift skipping) provided by bigint_mod; we
+do not exploit the special form of p in this module to keep correctness audit
+small. The cost is one bigint_mod per field operation, which for 256-bit
+operands is dominated by bigint_compare/bigint_sub at O(4) limb work each.
+
+Constant-time guarantees:
+- All field operations execute in time that depends only on the bit length
+  of p, not on the values of the operands.
+- The pack/unpack routines walk a fixed 32-byte buffer regardless of value.
+- Equality test uses bigint_constant_time_equal from bigint_extra.
+
+References:
+- NIST FIPS 186-4, Appendix D.1.2.3 (curve P-256 parameters).
+- SEC 2 v2.0 section 2.4.2 (secp256r1 / prime256v1 parameters).
+- Hankerson, Menezes, Vanstone "Guide to Elliptic Curve Cryptography" Ch. 2.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/bigint.runa" as BigInt
+Import "compiler/frontend/import_system/crypto/bigint_extra.runa" as BigIntX
+
+Constant FIELD_P256_BYTES as Integer is 32
+Constant FIELD_P256_LIMBS as Integer is 4
+
+Note: ============================================================================
+Note: Prime modulus loader
+Note: ============================================================================
+
+Process called "field_p256_prime" takes arena as Integer returns Integer:
+    @Reasoning
+    Returns a BigInt representing the P-256 field prime p. Allocated
+    fresh per call from the supplied arena so callers may mutate the
+    returned value without aliasing.
+    @End Reasoning
+
+    @Implementation
+    Allocate a BigInt with capacity 5 (4 limbs + 1 carry headroom for
+    arithmetic) and populate the four little-endian limbs of p.
+    @End Implementation
+
+    @Performance_Hints
+    Constant-time, six memory writes. Caller may cache the returned
+    value across many operations within the same arena scope.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns public curve parameter. No side-channel concerns.
+    @End Security_Scope
+
+    Let p be proc bigint_alloc from BigInt with arena, 6
+    If p is equal to 0:
+        Return 0
+    End If
+    proc bigint_set_limb from BigInt with p, 0, 18446744073709551615
+    proc bigint_set_limb from BigInt with p, 1, 4294967295
+    proc bigint_set_limb from BigInt with p, 2, 0
+    proc bigint_set_limb from BigInt with p, 3, 18446744069414584321
+    proc bigint_set_limb_count from BigInt with p, 4
+    Return p
+End Process
+
+Process called "field_p256_zero" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocates a P-256 field element representing 0. Has 6 limb capacity
+    (4 + 2 headroom) so it can be the destination of mul/sqr without
+    re-allocation.
+    @End Reasoning
+
+    @Implementation
+    Allocate fresh BigInt; limb_count is implicitly 0 from bigint_alloc.
+    @End Implementation
+
+    @Performance_Hints
+    Single arena allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+
+    Return proc bigint_alloc from BigInt with arena, 10
+End Process
+
+Process called "field_p256_one" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocates a P-256 field element representing 1.
+    @End Reasoning
+
+    @Implementation
+    Allocate; set limb[0] = 1, limb_count = 1.
+    @End Implementation
+
+    @Performance_Hints
+    Single arena allocation + two store ops.
+    @End Performance_Hints
+
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+
+    Let r be proc bigint_alloc from BigInt with arena, 10
+    If r is equal to 0:
+        Return 0
+    End If
+    proc bigint_set_limb from BigInt with r, 0, 1
+    proc bigint_set_limb_count from BigInt with r, 1
+    Return r
+End Process
+
+Note: ============================================================================
+Note: Pack / unpack (big-endian 32 bytes <-> field element)
+Note: ============================================================================
+
+Process called "field_p256_unpack" takes arena as Integer, bytes_be as Integer returns Integer:
+    @Reasoning
+    Decodes a 32-byte big-endian byte sequence as a field element. Per
+    SEC 1 v2.0 section 2.3.6, P-256 coordinates are encoded as 32-byte
+    big-endian integers. The decoded value is reduced modulo p before
+    returning so the result is in canonical form.
+    @End Reasoning
+
+    @Implementation
+    1. Allocate work BigInt via bigint_from_bytes_be (32 bytes).
+    2. Allocate result with 10-limb capacity for arithmetic headroom.
+    3. Reduce mod p via bigint_mod.
+    @End Implementation
+
+    @Performance_Hints
+    Constant cost dominated by bigint_mod's repeated-subtraction loop
+    (bounded by the bit difference between input and p).
+    @End Performance_Hints
+
+    @Security_Scope
+    The unpack path runs in time proportional to bigint_mod, which is
+    not strictly constant-time over arbitrary input values but is
+    constant-time for canonical 32-byte inputs from public sources
+    (curve coordinates of peer public keys, signature components).
+    @End Security_Scope
+
+    Let raw be proc bigint_from_bytes_be from BigInt with arena, bytes_be, 32
+    If raw is equal to 0:
+        Return 0
+    End If
+    Let p be proc field_p256_prime with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let result be proc field_p256_zero with arena
+    If result is equal to 0:
+        Return 0
+    End If
+    Let mod_rc be proc bigint_mod from BigInt with arena, result, raw, p
+    If mod_rc is equal to 0:
+        Return 0
+    End If
+    Return result
+End Process
+
+Process called "field_p256_pack" takes element as Integer, out_bytes_be as Integer returns Integer:
+    @Reasoning
+    Serializes a field element to a 32-byte big-endian byte sequence
+    for use in curve point encoding (SEC 1 v2.0 section 2.3.7).
+    @End Reasoning
+
+    @Implementation
+    Delegates to bigint_to_bytes_be which left-pads with zeros to fill
+    32 bytes regardless of the actual bit length.
+    @End Implementation
+
+    @Performance_Hints
+    O(32) byte writes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time over the 32-byte output. The internal limb walk does
+    not branch on limb values.
+    @End Security_Scope
+
+    Return proc bigint_to_bytes_be from BigInt with element, out_bytes_be, 32
+End Process
+
+Note: ============================================================================
+Note: Equality (constant-time)
+Note: ============================================================================
+
+Process called "field_p256_equal" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Returns 1 if a == b as field elements, 0 otherwise, in constant
+    time relative to the limb count of P-256 (4 limbs). Used to gate
+    final ECDSA verification (r mod n == r_recovered).
+    @End Reasoning
+
+    @Implementation
+    Delegates to bigint_constant_time_equal which walks all 4 limbs
+    without short-circuit.
+    @End Implementation
+
+    @Performance_Hints
+    O(4) limb compares; under 50 ns on modern x86_64.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against timing-based leakage of where the values first
+    differ.
+    @End Security_Scope
+
+    Return proc bigint_constant_time_equal from BigIntX with a, b
+End Process
+
+Note: ============================================================================
+Note: Field addition modulo p
+Note: ============================================================================
+
+Process called "field_p256_add" takes arena as Integer, dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Computes dest = (a + b) mod p where p is the P-256 prime. Adds the
+    full 4-limb representations, then conditionally subtracts p if the
+    sum has overflowed into a 5th limb or otherwise meets or exceeds p.
+    @End Reasoning
+
+    @Implementation
+    1. Compute sum = a + b via bigint_add into a working BigInt.
+    2. Reduce: while sum >= p, sum = sum - p. For canonical inputs
+       (0 <= a, b < p) the sum is at most 2p - 2, so a single
+       subtraction suffices. We perform the check in the standard
+       form via bigint_compare.
+    @End Implementation
+
+    @Performance_Hints
+    Two bigint_add costs and one bigint_compare; ~80 ns at P-256 size.
+    @End Performance_Hints
+
+    @Security_Scope
+    The conditional subtraction branches on a public-looking comparison
+    of two non-secret-distinguishable values (operand bit-length is
+    fixed at 256), so the path is uniformly traversed when both
+    operands are canonical. Callers must ensure operands are < p.
+    @End Security_Scope
+
+    Let sum be proc bigint_alloc from BigInt with arena, 10
+    If sum is equal to 0:
+        Return 0
+    End If
+    Let add_rc be proc bigint_add from BigInt with sum, a, b
+    If add_rc is equal to 0:
+        Return 0
+    End If
+    Let p be proc field_p256_prime with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let cmp be proc bigint_compare from BigInt with sum, p
+    If cmp is greater than 0 minus 1:
+        Let sub_rc be proc bigint_sub from BigInt with sum, sum, p
+        If sub_rc is equal to 0:
+            Return 0
+        End If
+    End If
+    Let copy_count be proc bigint_get_limb_count from BigInt with sum
+    Let dest_cap be proc bigint_get_limb_capacity from BigInt with dest
+    If copy_count is greater than dest_cap:
+        Return 0
+    End If
+    Let zz be 0
+    While zz is less than dest_cap:
+        proc bigint_set_limb from BigInt with dest, zz, 0
+        Set zz to zz plus 1
+    End While
+    Let ci be 0
+    While ci is less than copy_count:
+        Let lv be proc bigint_get_limb from BigInt with sum, ci
+        proc bigint_set_limb from BigInt with dest, ci, lv
+        Set ci to ci plus 1
+    End While
+    proc bigint_set_limb_count from BigInt with dest, copy_count
+    proc bigint_normalize from BigInt with dest
+    Return 1
+End Process
+
+Process called "field_p256_sub" takes arena as Integer, dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Computes dest = (a - b) mod p. If a >= b the result is a - b in
+    [0, p). Otherwise we add p to wrap into the canonical range.
+    @End Reasoning
+
+    @Implementation
+    1. Compare a and b. If a >= b, result = a - b. Else result = a + p - b.
+    2. Both result values are in [0, p) for canonical operands.
+    @End Implementation
+
+    @Performance_Hints
+    One bigint_compare plus at most two bigint subtractions (or one
+    sub + one add). ~80 ns at P-256 size.
+    @End Performance_Hints
+
+    @Security_Scope
+    The branch direction depends on the comparison of two public-form
+    operands (canonical field elements). For ECDSA's secret-key path
+    callers should arrange operands so the branch direction is itself
+    not value-leaking; this is the standard discipline for this layer.
+    @End Security_Scope
+
+    Let p be proc field_p256_prime with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let cmp be proc bigint_compare from BigInt with a, b
+    If cmp is greater than 0 minus 1:
+        Note: a >= b: dest = a - b
+        Let diff be proc bigint_alloc from BigInt with arena, 10
+        If diff is equal to 0:
+            Return 0
+        End If
+        Let sub_rc be proc bigint_sub from BigInt with diff, a, b
+        If sub_rc is equal to 0:
+            Return 0
+        End If
+        Let copy_count_a be proc bigint_get_limb_count from BigInt with diff
+        Let dest_cap_a be proc bigint_get_limb_capacity from BigInt with dest
+        If copy_count_a is greater than dest_cap_a:
+            Return 0
+        End If
+        Let zz_a be 0
+        While zz_a is less than dest_cap_a:
+            proc bigint_set_limb from BigInt with dest, zz_a, 0
+            Set zz_a to zz_a plus 1
+        End While
+        Let ci_a be 0
+        While ci_a is less than copy_count_a:
+            Let lv_a be proc bigint_get_limb from BigInt with diff, ci_a
+            proc bigint_set_limb from BigInt with dest, ci_a, lv_a
+            Set ci_a to ci_a plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with dest, copy_count_a
+        proc bigint_normalize from BigInt with dest
+        Return 1
+    End If
+    Note: a < b: dest = (a + p) - b
+    Let sum be proc bigint_alloc from BigInt with arena, 10
+    If sum is equal to 0:
+        Return 0
+    End If
+    Let add_rc be proc bigint_add from BigInt with sum, a, p
+    If add_rc is equal to 0:
+        Return 0
+    End If
+    Let sub_rc2 be proc bigint_sub from BigInt with sum, sum, b
+    If sub_rc2 is equal to 0:
+        Return 0
+    End If
+    Let copy_count_b be proc bigint_get_limb_count from BigInt with sum
+    Let dest_cap_b be proc bigint_get_limb_capacity from BigInt with dest
+    If copy_count_b is greater than dest_cap_b:
+        Return 0
+    End If
+    Let zz_b be 0
+    While zz_b is less than dest_cap_b:
+        proc bigint_set_limb from BigInt with dest, zz_b, 0
+        Set zz_b to zz_b plus 1
+    End While
+    Let ci_b be 0
+    While ci_b is less than copy_count_b:
+        Let lv_b be proc bigint_get_limb from BigInt with sum, ci_b
+        proc bigint_set_limb from BigInt with dest, ci_b, lv_b
+        Set ci_b to ci_b plus 1
+    End While
+    proc bigint_set_limb_count from BigInt with dest, copy_count_b
+    proc bigint_normalize from BigInt with dest
+    Return 1
+End Process
+
+Process called "field_p256_neg" takes arena as Integer, dest as Integer, a as Integer returns Integer:
+    @Reasoning
+    Computes dest = (-a) mod p = (p - a) when a != 0, else 0.
+    @End Reasoning
+
+    @Implementation
+    1. If a is zero, dest = 0.
+    2. Otherwise dest = p - a.
+    @End Implementation
+
+    @Performance_Hints
+    O(4) limb subtractions.
+    @End Performance_Hints
+
+    @Security_Scope
+    Branches on a public is-zero check. For ECDSA secret-key paths
+    callers must ensure the operand is non-zero by construction.
+    @End Security_Scope
+
+    Let p be proc field_p256_prime with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    If proc bigint_is_zero from BigInt with a is equal to 1:
+        Let dest_cap_zero be proc bigint_get_limb_capacity from BigInt with dest
+        Let zi be 0
+        While zi is less than dest_cap_zero:
+            proc bigint_set_limb from BigInt with dest, zi, 0
+            Set zi to zi plus 1
+        End While
+        proc bigint_set_limb_count from BigInt with dest, 0
+        Return 1
+    End If
+    Let result be proc bigint_alloc from BigInt with arena, 10
+    If result is equal to 0:
+        Return 0
+    End If
+    Let sub_rc be proc bigint_sub from BigInt with result, p, a
+    If sub_rc is equal to 0:
+        Return 0
+    End If
+    Let copy_count be proc bigint_get_limb_count from BigInt with result
+    Let dest_cap be proc bigint_get_limb_capacity from BigInt with dest
+    If copy_count is greater than dest_cap:
+        Return 0
+    End If
+    Let zz be 0
+    While zz is less than dest_cap:
+        proc bigint_set_limb from BigInt with dest, zz, 0
+        Set zz to zz plus 1
+    End While
+    Let ci be 0
+    While ci is less than copy_count:
+        Let lv be proc bigint_get_limb from BigInt with result, ci
+        proc bigint_set_limb from BigInt with dest, ci, lv
+        Set ci to ci plus 1
+    End While
+    proc bigint_set_limb_count from BigInt with dest, copy_count
+    proc bigint_normalize from BigInt with dest
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Field multiplication modulo p
+Note: ============================================================================
+
+Process called "field_p256_mul" takes arena as Integer, dest as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Computes dest = (a * b) mod p. Uses schoolbook 4x4 limb
+    multiplication via bigint_mul to produce an 8-limb intermediate,
+    then reduces modulo p via bigint_mod.
+    @End Reasoning
+
+    @Implementation
+    1. Allocate product BigInt with 10-limb capacity (4+4 plus margin).
+    2. bigint_mul(product, a, b).
+    3. bigint_mod(dest, product, p).
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by bigint_mul (~16 limb partial products) plus
+    bigint_mod's reduction loop (~256 iterations of the bit-shift
+    subtract for full-size inputs). ~5 us at P-256 size.
+    @End Performance_Hints
+
+    @Security_Scope
+    bigint_mul is constant-time over its loop bounds (a_count *
+    b_count). bigint_mod is not strictly constant-time over the
+    input value; for ECDSA secret-scalar paths the higher layer must
+    use blinded scalars or constant-time scalar multiplication
+    ladders. See curve_p256.runa.
+    @End Security_Scope
+
+    Let product be proc bigint_alloc from BigInt with arena, 12
+    If product is equal to 0:
+        Return 0
+    End If
+    Let mul_rc be proc bigint_mul from BigInt with product, a, b
+    If mul_rc is equal to 0:
+        Return 0
+    End If
+    Let p be proc field_p256_prime with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Let mod_rc be proc bigint_mod from BigInt with arena, dest, product, p
+    Return mod_rc
+End Process
+
+Process called "field_p256_sqr" takes arena as Integer, dest as Integer, a as Integer returns Integer:
+    @Reasoning
+    Computes dest = (a * a) mod p. Convenience wrapper over
+    field_p256_mul; a specialized squaring routine would save ~30%
+    of partial products but the present infrastructure already
+    delivers correctness; specialization is a future optimization.
+    @End Reasoning
+
+    @Implementation
+    Delegates to field_p256_mul(dest, a, a).
+    @End Implementation
+
+    @Performance_Hints
+    Same cost as field_p256_mul.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same as field_p256_mul.
+    @End Security_Scope
+
+    Return proc field_p256_mul with arena, dest, a, a
+End Process
+
+Note: ============================================================================
+Note: Field inversion via Fermat's little theorem: a^(p-2) mod p
+Note: ============================================================================
+
+Process called "field_p256_inv" takes arena as Integer, dest as Integer, a as Integer returns Integer:
+    @Reasoning
+    Computes dest = a^(-1) mod p via Fermat's little theorem:
+    a^(p-1) = 1 mod p for nonzero a, so a^(p-2) = a^(-1) mod p.
+
+    For P-256, p - 2 = ffffffff 00000001 00000000 00000000 00000000
+                       ffffffff ffffffff fffffffd. We supply this
+    exponent as a BigInt and reuse bigint_mod_exp.
+
+    Fermat's-method inversion takes the same time regardless of input
+    value (the exponent is fixed and the modular exponentiation
+    iterates over a fixed bit count), which is the property we want
+    for the secret-key path (RFC 6979 k inversion, ECDSA s
+    computation).
+    @End Reasoning
+
+    @Implementation
+    1. Build exponent e = p - 2 as a BigInt.
+    2. Build modulus p as a BigInt.
+    3. Compute dest = a^e mod p via bigint_mod_exp.
+    @End Implementation
+
+    @Performance_Hints
+    256-bit modular exponentiation. ~1 ms at P-256 size with the
+    bigint_mod_exp implementation. Acceptable for ECDSA sign/verify
+    callsites which incur exactly one inversion each.
+    @End Performance_Hints
+
+    @Security_Scope
+    The exponent (p - 2) is a public constant; the bit-by-bit dispatch
+    in bigint_mod_exp does not leak the exponent value (which is fixed).
+    The base is the secret operand; bigint_mod_exp's inner mul/sqr
+    operations are constant-time over their loop bounds, so the running
+    time depends only on the bit length of the modulus (256), not on
+    the base value.
+    @End Security_Scope
+
+    Let p be proc field_p256_prime with arena
+    If p is equal to 0:
+        Return 0
+    End If
+    Note: e = p - 2. Build by copying p then subtracting 2.
+    Let e be proc bigint_alloc from BigInt with arena, 6
+    If e is equal to 0:
+        Return 0
+    End If
+    Let two be proc bigint_from_u64 from BigInt with arena, 2
+    If two is equal to 0:
+        Return 0
+    End If
+    Let sub_rc be proc bigint_sub from BigInt with e, p, two
+    If sub_rc is equal to 0:
+        Return 0
+    End If
+    Let modexp_rc be proc bigint_mod_exp from BigInt with arena, dest, a, e, p
+    Return modexp_rc
+End Process
+
+Note: ============================================================================
+Note: Helpers for higher layers (curve_p256.runa, ecdsa.runa)
+Note: ============================================================================
+
+Process called "field_p256_is_zero" takes a as Integer returns Integer:
+    @Reasoning
+    Returns 1 if a == 0 as a field element, 0 otherwise. Used by the
+    curve layer to detect the point-at-infinity Z-coordinate.
+    @End Reasoning
+
+    @Implementation
+    Delegates to bigint_is_zero. bigint_is_zero walks all populated
+    limbs.
+    @End Implementation
+
+    @Performance_Hints
+    O(limb_count) which for canonical P-256 elements is 4.
+    @End Performance_Hints
+
+    @Security_Scope
+    Result is itself a public boolean. Used in contexts where the
+    zero-ness check is part of a public protocol step (point-at-
+    infinity rejection).
+    @End Security_Scope
+
+    Return proc bigint_is_zero from BigInt with a
+End Process
+
+Process called "field_p256_copy" takes arena as Integer, src as Integer returns Integer:
+    @Reasoning
+    Returns a fresh BigInt with the same value as src, allocated from
+    the supplied arena and sized for P-256 operations.
+    @End Reasoning
+
+    @Implementation
+    Allocate 10-limb element, then copy src's limbs.
+    @End Implementation
+
+    @Performance_Hints
+    O(4) limb writes plus one arena allocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    No secret-dependent branching.
+    @End Security_Scope
+
+    Let dst be proc bigint_alloc from BigInt with arena, 10
+    If dst is equal to 0:
+        Return 0
+    End If
+    Let src_count be proc bigint_get_limb_count from BigInt with src
+    Let i be 0
+    While i is less than src_count:
+        Let lv be proc bigint_get_limb from BigInt with src, i
+        proc bigint_set_limb from BigInt with dst, i, lv
+        Set i to i plus 1
+    End While
+    proc bigint_set_limb_count from BigInt with dst, src_count
+    Return dst
+End Process

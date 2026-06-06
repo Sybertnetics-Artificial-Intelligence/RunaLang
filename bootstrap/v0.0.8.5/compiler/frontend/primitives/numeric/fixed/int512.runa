@@ -1,0 +1,1514 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+512-bit Unsigned Integer Arithmetic (Int512)
+
+This module provides 512-bit unsigned integer arithmetic, primarily as a
+companion to Int256 for holding intermediate products of 256x256 -> 512
+multiplications without precision loss. It is also directly usable for
+wider deterministic arithmetic.
+
+Determinism guarantee:
+- All operations produce bit-exact identical output for identical input on
+  every platform (no floating point, no platform-dependent integer widths,
+  no undefined-behavior arithmetic).
+- This is the bedrock requirement for consensus-critical state machines
+  (smart contracts, distributed ledgers, replicated state machines).
+
+Representation:
+- Int512 = pointer to a 64-byte heap-allocated buffer
+- 8 little-endian limbs of 64 bits each:
+    offset  0: limb[0] = bits 0..63   (least significant)
+    offset  8: limb[1] = bits 64..127
+    offset 16: limb[2] = bits 128..191
+    offset 24: limb[3] = bits 192..255
+    offset 32: limb[4] = bits 256..319
+    offset 40: limb[5] = bits 320..383
+    offset 48: limb[6] = bits 384..447
+    offset 56: limb[7] = bits 448..511 (most significant)
+
+@Reasoning
+A flat byte buffer with explicit limb offsets was chosen over a struct
+representation because:
+1. The 64-bit Integer is the only general-purpose integer type the bootstrap
+   compiler exposes; limb arithmetic must read/write Integer-sized cells.
+2. Carry propagation requires uniform access patterns across all 8 limbs;
+   a struct with 8 named fields would force open-coding every loop.
+3. The 64-byte aligned allocation matches CPU cache lines on every target
+   architecture, giving optimal load/store performance.
+4. Serialization to/from byte arrays maps to direct memory_get_byte /
+   memory_set_byte calls with no copy.
+@End Reasoning
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+
+Note: ============================================================================
+Note: Constants
+Note: ============================================================================
+
+Constant INT512_SIZE_BYTES as Integer is 64
+Constant INT512_LIMB_COUNT as Integer is 8
+Constant INT512_BIT_WIDTH as Integer is 512
+Constant INT512_LIMB_BITS as Integer is 64
+Constant INT512_HIGH_BIT_MASK as Integer is 0x8000000000000000
+Constant INT512_LIMB_MASK_LOW32 as Integer is 0x00000000FFFFFFFF
+Constant INT512_OK as Integer is 0
+Constant INT512_ERR_NULL as Integer is -1
+Constant INT512_ERR_DIVIDE_BY_ZERO as Integer is -2
+Constant INT512_ERR_INVALID_SHIFT as Integer is -3
+
+Note: ============================================================================
+Note: Internal Helpers: Carry/Borrow Computation
+Note: ============================================================================
+
+Process called "int512_carry_from_add" takes a as Integer, b as Integer, sum as Integer returns Integer:
+    @Reasoning
+        Compute the unsigned overflow (carry) bit from a 64-bit add a+b=sum.
+        Returns 1 if (a + b) wrapped past 2^64, otherwise 0. Uses the standard
+        bit trick: carry = ((a AND b) OR ((a OR b) AND NOT s)) >> 63, which is
+        bit-equivalent to the unsigned comparison (sum < a) without requiring
+        an unsigned compare primitive.
+    @End Reasoning
+    @Implementation
+        The formula derives from the per-bit truth table of full-adder carry:
+        each bit position's carry-out is generated when both inputs are 1, or
+        propagated when either input is 1 and the sum bit is 0. Folding over
+        all 64 bit positions, the most significant bit of the combined mask is
+        the carry-out of the top limb position.
+    @End Implementation
+    @Performance_Hints
+        Constant time: 5 bitwise ops + 1 shift. No branches. Branch-predictor
+        friendly. Maps to roughly 5 instructions on every supported ISA.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time by construction; safe to use on secret-dependent inputs
+        (no data-dependent branches, no data-dependent memory access).
+    @End Security_Scope
+
+    Let term1 be a bitwise and b
+    Let or_ab be a bitwise or b
+    Let not_s be bitwise not sum
+    Let term2 be or_ab bitwise and not_s
+    Let combined be term1 bitwise or term2
+    Let carry_bit be combined shifted right by 63
+    Let result be carry_bit bitwise and 1
+    Return result
+End Process
+
+Process called "int512_borrow_from_sub" takes a as Integer, b as Integer, diff as Integer returns Integer:
+    @Reasoning
+        Compute the unsigned borrow bit from a 64-bit subtract a-b=diff.
+        Returns 1 if a was unsigned-less-than b, otherwise 0. Uses the dual
+        bit trick: borrow = ((NOT a AND b) OR (NOT (a XOR b) AND d)) >> 63.
+    @End Reasoning
+    @Implementation
+        The formula is the subtractive companion of the additive carry trick.
+        For each bit position, a borrow is generated when a=0 and b=1, or
+        propagated when a and b agree and the diff bit is 1. Folding gives
+        the borrow-out from the top bit position.
+    @End Implementation
+    @Performance_Hints
+        Constant time: 5 bitwise ops + 1 shift. No branches.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time by construction.
+    @End Security_Scope
+
+    Let not_a be bitwise not a
+    Let term1 be not_a bitwise and b
+    Let xor_ab be a bitwise xor b
+    Let not_xor be bitwise not xor_ab
+    Let term2 be not_xor bitwise and diff
+    Let combined be term1 bitwise or term2
+    Let borrow_bit be combined shifted right by 63
+    Let result be borrow_bit bitwise and 1
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Allocation and Construction
+Note: ============================================================================
+
+Process called "int512_allocate" returns Integer:
+    @Reasoning
+        Allocate a fresh 64-byte Int512 buffer on the owned heap (Tier 3).
+        Buffer is guaranteed zero-initialized by the layout allocator's
+        calloc-zero contract, so a fresh allocation represents the value 0.
+    @End Reasoning
+    @Implementation
+        Delegates to Layout.allocate which guarantees zeroed memory.
+        Returns 0 on allocation failure (out of memory).
+    @End Implementation
+    @Performance_Hints
+        O(1) when the pool fast path services the request. Allocation size
+        (64 bytes) matches a typical small-bucket size, so allocations are
+        cheap and cache-aligned.
+    @End Performance_Hints
+    @Security_Scope
+        Memory is fully zeroed by the allocator; no information leak from
+        prior allocations. Caller is responsible for deallocation via
+        int512_free to prevent leaks.
+    @End Security_Scope
+
+    Let ptr be proc allocate from Layout with INT512_SIZE_BYTES
+    Return ptr
+End Process
+
+Process called "int512_free" takes a as Integer returns Integer:
+    @Reasoning
+        Release an Int512 buffer back to the owned heap. Caller must ensure
+        no aliases remain.
+    @End Reasoning
+    @Implementation
+        Delegates to Layout.deallocate. Passing 0 is a no-op (idempotent
+        free safety).
+    @End Implementation
+    @Performance_Hints
+        O(1) for pool-recycled buffers.
+    @End Performance_Hints
+    @Security_Scope
+        Caller must not use the pointer after this call (use-after-free).
+        Memory contents are not zeroed on free; if the buffer held secret
+        material, the caller should zero it first via int512_set_zero.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_OK
+    End If
+    Let dummy be proc deallocate from Layout with a
+    Return INT512_OK
+End Process
+
+Process called "int512_set_zero" takes a as Integer returns Integer:
+    @Reasoning
+        Set all 8 limbs of an Int512 to zero, producing the canonical zero
+        value. Required for resetting buffers between operations and for
+        zeroing sensitive material before free.
+    @End Reasoning
+    @Implementation
+        Stores 0 to each limb offset directly via memory_set_int64.
+    @End Implementation
+    @Performance_Hints
+        8 stores, fully unrolled, no branches. Maps to 8 mov instructions
+        on x86_64 and equivalent stores on other ISAs.
+    @End Performance_Hints
+    @Security_Scope
+        Safe for secret-zeroing as long as the buffer pointer is valid.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    Let dummy0 be proc memory_set_int64 from MemoryCore with a, 0, 0
+    Let dummy1 be proc memory_set_int64 from MemoryCore with a, 8, 0
+    Let dummy2 be proc memory_set_int64 from MemoryCore with a, 16, 0
+    Let dummy3 be proc memory_set_int64 from MemoryCore with a, 24, 0
+    Let dummy4 be proc memory_set_int64 from MemoryCore with a, 32, 0
+    Let dummy5 be proc memory_set_int64 from MemoryCore with a, 40, 0
+    Let dummy6 be proc memory_set_int64 from MemoryCore with a, 48, 0
+    Let dummy7 be proc memory_set_int64 from MemoryCore with a, 56, 0
+    Return INT512_OK
+End Process
+
+Process called "int512_copy" takes src as Integer, dst as Integer returns Integer:
+    @Reasoning
+        Copy all 8 limbs from src to dst. Required so callers can preserve
+        operands when an arithmetic primitive writes to a result buffer that
+        might alias an input.
+    @End Reasoning
+    @Implementation
+        Limb-by-limb load and store via memory_get_int64 / memory_set_int64.
+        Safe to call with src == dst (no-op effectively).
+    @End Implementation
+    @Performance_Hints
+        8 loads + 8 stores, fully unrolled.
+    @End Performance_Hints
+    @Security_Scope
+        No information leak; constant-time per call.
+    @End Security_Scope
+
+    If src is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If dst is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    Let l0 be proc memory_get_int64 from MemoryCore with src, 0
+    Let l1 be proc memory_get_int64 from MemoryCore with src, 8
+    Let l2 be proc memory_get_int64 from MemoryCore with src, 16
+    Let l3 be proc memory_get_int64 from MemoryCore with src, 24
+    Let l4 be proc memory_get_int64 from MemoryCore with src, 32
+    Let l5 be proc memory_get_int64 from MemoryCore with src, 40
+    Let l6 be proc memory_get_int64 from MemoryCore with src, 48
+    Let l7 be proc memory_get_int64 from MemoryCore with src, 56
+    Let d0 be proc memory_set_int64 from MemoryCore with dst, 0, l0
+    Let d1 be proc memory_set_int64 from MemoryCore with dst, 8, l1
+    Let d2 be proc memory_set_int64 from MemoryCore with dst, 16, l2
+    Let d3 be proc memory_set_int64 from MemoryCore with dst, 24, l3
+    Let d4 be proc memory_set_int64 from MemoryCore with dst, 32, l4
+    Let d5 be proc memory_set_int64 from MemoryCore with dst, 40, l5
+    Let d6 be proc memory_set_int64 from MemoryCore with dst, 48, l6
+    Let d7 be proc memory_set_int64 from MemoryCore with dst, 56, l7
+    Return INT512_OK
+End Process
+
+Process called "int512_set_u64" takes a as Integer, value as Integer returns Integer:
+    @Reasoning
+        Initialize an Int512 from a single 64-bit value: low limb gets value,
+        upper 7 limbs zero.
+    @End Reasoning
+    @Implementation
+        Stores value at offset 0 and zero at offsets 8..56.
+    @End Implementation
+    @Performance_Hints
+        8 stores, fully unrolled.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    Let d0 be proc memory_set_int64 from MemoryCore with a, 0, value
+    Let d1 be proc memory_set_int64 from MemoryCore with a, 8, 0
+    Let d2 be proc memory_set_int64 from MemoryCore with a, 16, 0
+    Let d3 be proc memory_set_int64 from MemoryCore with a, 24, 0
+    Let d4 be proc memory_set_int64 from MemoryCore with a, 32, 0
+    Let d5 be proc memory_set_int64 from MemoryCore with a, 40, 0
+    Let d6 be proc memory_set_int64 from MemoryCore with a, 48, 0
+    Let d7 be proc memory_set_int64 from MemoryCore with a, 56, 0
+    Return INT512_OK
+End Process
+
+Note: ============================================================================
+Note: Limb Accessors
+Note: ============================================================================
+
+Process called "int512_get_limb" takes a as Integer, index as Integer returns Integer:
+    @Reasoning
+        Read a 64-bit limb at the given index (0..7, 0 = least significant).
+        Out-of-range indices return 0 to keep arithmetic loops total over
+        index spaces that exceed the limb count.
+    @End Reasoning
+    @Implementation
+        Index validated; offset computed as index*8 and read via
+        memory_get_int64.
+    @End Implementation
+    @Performance_Hints
+        One load + one branch for bounds check.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds-checked; safe against out-of-range index attacks.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than 7:
+        Return 0
+    End If
+    Let offset be index multiplied by 8
+    Let value be proc memory_get_int64 from MemoryCore with a, offset
+    Return value
+End Process
+
+Process called "int512_set_limb" takes a as Integer, index as Integer, value as Integer returns Integer:
+    @Reasoning
+        Write a 64-bit limb at the given index (0..7, 0 = least significant).
+        Out-of-range indices are silently dropped to keep iterative
+        algorithms safe.
+    @End Reasoning
+    @Implementation
+        Index validated; offset = index*8; store via memory_set_int64.
+    @End Implementation
+    @Performance_Hints
+        One store + one branch.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds-checked.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If index is less than 0:
+        Return INT512_OK
+    End If
+    If index is greater than 7:
+        Return INT512_OK
+    End If
+    Let offset be index multiplied by 8
+    Let dummy be proc memory_set_int64 from MemoryCore with a, offset, value
+    Return INT512_OK
+End Process
+
+Note: ============================================================================
+Note: Predicates
+Note: ============================================================================
+
+Process called "int512_is_zero" takes a as Integer returns Integer:
+    @Reasoning
+        Test whether every limb is zero. Returns 1 if so, 0 otherwise.
+    @End Reasoning
+    @Implementation
+        OR-folds all 8 limbs; result == 0 iff all limbs were zero.
+    @End Implementation
+    @Performance_Hints
+        8 loads + 7 ORs + 1 compare. No branches in the hot path.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time data flow; safe on secret-dependent input.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    Let l0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let l1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let l2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let l3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let l4 be proc memory_get_int64 from MemoryCore with a, 32
+    Let l5 be proc memory_get_int64 from MemoryCore with a, 40
+    Let l6 be proc memory_get_int64 from MemoryCore with a, 48
+    Let l7 be proc memory_get_int64 from MemoryCore with a, 56
+    Let or01 be l0 bitwise or l1
+    Let or23 be l2 bitwise or l3
+    Let or45 be l4 bitwise or l5
+    Let or67 be l6 bitwise or l7
+    Let or0123 be or01 bitwise or or23
+    Let or4567 be or45 bitwise or or67
+    Let combined be or0123 bitwise or or4567
+    If combined is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "int512_compare_unsigned_limb" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Compare two 64-bit values as unsigned. Returns -1 if a<b, 0 if equal,
+        1 if a>b under unsigned interpretation. Used by the multi-limb
+        compare loop. Implemented via the bit trick (a XOR sign_bit) <
+        (b XOR sign_bit) which converts unsigned comparison to signed on
+        identical two's-complement bit patterns.
+    @End Reasoning
+    @Implementation
+        Flip the sign bit on both operands; signed comparison then yields
+        the unsigned ordering.
+    @End Implementation
+    @Performance_Hints
+        Constant time.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time control flow up to the result.
+    @End Security_Scope
+
+    If a is equal to b:
+        Return 0
+    End If
+    Let a_flip be a bitwise xor INT512_HIGH_BIT_MASK
+    Let b_flip be b bitwise xor INT512_HIGH_BIT_MASK
+    If a_flip is less than b_flip:
+        Return -1
+    End If
+    Return 1
+End Process
+
+Process called "int512_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Three-way unsigned comparison. Returns -1, 0, or 1. Iterates from
+        most significant limb downward so the first differing limb decides
+        the ordering.
+    @End Reasoning
+    @Implementation
+        Loop from limb index 7 down to 0; compare limbs as unsigned 64-bit
+        via int512_compare_unsigned_limb. First non-equal limb returns its
+        comparison; if all equal, returns 0.
+    @End Implementation
+    @Performance_Hints
+        Worst case: 8 limb comparisons. Early-exit on first difference.
+    @End Performance_Hints
+    @Security_Scope
+        Data-dependent early exit. For constant-time comparison on secret
+        values, the caller should use a dedicated CT routine; this routine
+        is optimized for the common consensus-path use case where ordering
+        is decided by public values.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let i be 7
+    While i is greater than or equal to 0:
+        Let offset be i multiplied by 8
+        Let la be proc memory_get_int64 from MemoryCore with a, offset
+        Let lb be proc memory_get_int64 from MemoryCore with b, offset
+        If la is not equal to lb:
+            Let result be proc int512_compare_unsigned_limb with la, lb
+            Return result
+        End If
+        Set i to i minus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Addition and Subtraction
+Note: ============================================================================
+
+Process called "int512_add" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Compute result = (a + b) mod 2^512 with wrapping semantics. Carry
+        is propagated from limb 0 upward; carry out of limb 7 is discarded
+        (this is the wrapping behavior).
+    @End Reasoning
+    @Implementation
+        For each limb i in 0..7:
+          sum_i = a_i + b_i + carry_in
+          carry_out = carry from a_i + b_i, plus carry from (a_i+b_i)+carry_in
+        Each sub-add's carry is computed via int512_carry_from_add; carries
+        are summed because adding three 64-bit values can produce a
+        2-bit carry.
+    @End Implementation
+    @Performance_Hints
+        8 unrolled limbs, each with constant-time carry computation.
+        Branch-free in the hot path.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time; suitable for secret values. Wrapping behavior is
+        explicit and documented; checked variants raise overflow flags
+        instead of silently wrapping.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+
+    Let carry be 0
+    Let i be 0
+    While i is less than 8:
+        Let offset be i multiplied by 8
+        Let la be proc memory_get_int64 from MemoryCore with a, offset
+        Let lb be proc memory_get_int64 from MemoryCore with b, offset
+        Let s1 be la plus lb
+        Let c1 be proc int512_carry_from_add with la, lb, s1
+        Let s2 be s1 plus carry
+        Let c2 be proc int512_carry_from_add with s1, carry, s2
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, s2
+        Set carry to c1 plus c2
+        Set i to i plus 1
+    End While
+    Return INT512_OK
+End Process
+
+Process called "int512_add_checked" takes a as Integer, b as Integer, result as Integer, overflow_out as Integer returns Integer:
+    @Reasoning
+        Same as int512_add but writes the carry-out of the top limb to
+        overflow_out. Caller observes whether a + b exceeded 2^512 - 1.
+    @End Reasoning
+    @Implementation
+        Mirrors int512_add but preserves the final carry value and writes
+        it to *overflow_out via memory_set_int64.
+    @End Implementation
+    @Performance_Hints
+        One additional store relative to int512_add.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If overflow_out is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+
+    Let carry be 0
+    Let i be 0
+    While i is less than 8:
+        Let offset be i multiplied by 8
+        Let la be proc memory_get_int64 from MemoryCore with a, offset
+        Let lb be proc memory_get_int64 from MemoryCore with b, offset
+        Let s1 be la plus lb
+        Let c1 be proc int512_carry_from_add with la, lb, s1
+        Let s2 be s1 plus carry
+        Let c2 be proc int512_carry_from_add with s1, carry, s2
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, s2
+        Set carry to c1 plus c2
+        Set i to i plus 1
+    End While
+    Let dummy_ov be proc memory_set_int64 from MemoryCore with overflow_out, 0, carry
+    Return INT512_OK
+End Process
+
+Process called "int512_sub" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Compute result = (a - b) mod 2^512 with wrapping semantics. Borrow
+        is propagated from limb 0 upward.
+    @End Reasoning
+    @Implementation
+        For each limb i:
+          tmp1 = a_i - b_i
+          b1 = borrow from a_i - b_i
+          tmp2 = tmp1 - borrow_in
+          b2 = borrow from tmp1 - borrow_in
+        Borrows are summed because subtracting three 64-bit values yields
+        at most a 2-bit borrow.
+    @End Implementation
+    @Performance_Hints
+        8 unrolled limbs, constant-time borrow computation.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+
+    Let borrow be 0
+    Let i be 0
+    While i is less than 8:
+        Let offset be i multiplied by 8
+        Let la be proc memory_get_int64 from MemoryCore with a, offset
+        Let lb be proc memory_get_int64 from MemoryCore with b, offset
+        Let d1 be la minus lb
+        Let b1 be proc int512_borrow_from_sub with la, lb, d1
+        Let d2 be d1 minus borrow
+        Let b2 be proc int512_borrow_from_sub with d1, borrow, d2
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, d2
+        Set borrow to b1 plus b2
+        Set i to i plus 1
+    End While
+    Return INT512_OK
+End Process
+
+Note: ============================================================================
+Note: Bitwise Operations
+Note: ============================================================================
+
+Process called "int512_bit_and" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Element-wise bitwise AND across all 8 limbs.
+    @End Reasoning
+    @Implementation
+        Loop 0..7: result_i = a_i AND b_i.
+    @End Implementation
+    @Performance_Hints
+        8 loads from each of a and b, 8 ANDs, 8 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    Let i be 0
+    While i is less than 8:
+        Let offset be i multiplied by 8
+        Let la be proc memory_get_int64 from MemoryCore with a, offset
+        Let lb be proc memory_get_int64 from MemoryCore with b, offset
+        Let r be la bitwise and lb
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, r
+        Set i to i plus 1
+    End While
+    Return INT512_OK
+End Process
+
+Process called "int512_bit_or" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Element-wise bitwise OR across all 8 limbs.
+    @End Reasoning
+    @Implementation
+        Loop 0..7: result_i = a_i OR b_i.
+    @End Implementation
+    @Performance_Hints
+        Same pattern as int512_bit_and.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    Let i be 0
+    While i is less than 8:
+        Let offset be i multiplied by 8
+        Let la be proc memory_get_int64 from MemoryCore with a, offset
+        Let lb be proc memory_get_int64 from MemoryCore with b, offset
+        Let r be la bitwise or lb
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, r
+        Set i to i plus 1
+    End While
+    Return INT512_OK
+End Process
+
+Process called "int512_bit_xor" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Element-wise bitwise XOR across all 8 limbs.
+    @End Reasoning
+    @Implementation
+        Loop 0..7: result_i = a_i XOR b_i.
+    @End Implementation
+    @Performance_Hints
+        Same pattern as int512_bit_and.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    Let i be 0
+    While i is less than 8:
+        Let offset be i multiplied by 8
+        Let la be proc memory_get_int64 from MemoryCore with a, offset
+        Let lb be proc memory_get_int64 from MemoryCore with b, offset
+        Let r be la bitwise xor lb
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, r
+        Set i to i plus 1
+    End While
+    Return INT512_OK
+End Process
+
+Process called "int512_bit_not" takes a as Integer, result as Integer returns Integer:
+    @Reasoning
+        One's complement: flip every bit. Equivalent to (2^512 - 1) - a.
+    @End Reasoning
+    @Implementation
+        Loop 0..7: result_i = NOT a_i.
+    @End Implementation
+    @Performance_Hints
+        8 loads, 8 NOTs, 8 stores.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    Let i be 0
+    While i is less than 8:
+        Let offset be i multiplied by 8
+        Let la be proc memory_get_int64 from MemoryCore with a, offset
+        Let r be bitwise not la
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, r
+        Set i to i plus 1
+    End While
+    Return INT512_OK
+End Process
+
+Note: ============================================================================
+Note: Shifts
+Note: ============================================================================
+
+Process called "int512_shift_left" takes a as Integer, bits as Integer, result as Integer returns Integer:
+    @Reasoning
+        Logical left shift by `bits` positions (0..511). Vacated low bits
+        become zero; bits shifted past position 511 are lost (this is the
+        wrapping semantics for mod 2^512).
+    @End Reasoning
+    @Implementation
+        Decompose into limb-shift and intra-limb-shift.
+        limb_shift = bits / 64; bit_shift = bits mod 64.
+        For each output limb i (top-down to allow aliasing source==result):
+          let src_hi_index = i - limb_shift
+          let src_lo_index = src_hi_index - 1
+          if bit_shift == 0:
+              result_i = src[src_hi_index] (or 0 if out of range)
+          else:
+              hi = (src[src_hi_index] << bit_shift)
+              lo = (src[src_lo_index] >> (64 - bit_shift))
+              result_i = hi | lo (with out-of-range source treated as 0)
+        Iterating top-down (from limb 7 down to 0) means each result limb
+        is written after its source has been fully read, so source==result
+        is safe.
+    @End Implementation
+    @Performance_Hints
+        Constant-time for fixed `bits`. Per-limb cost: 2 loads, 1 OR,
+        1 store, plus shift operations.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds-validated: bits < 0 or bits >= 512 returns error.
+        Constant-time data flow.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If bits is less than 0:
+        Return INT512_ERR_INVALID_SHIFT
+    End If
+    If bits is greater than or equal to INT512_BIT_WIDTH:
+        Note: Shifting by >= width yields zero
+        Let zero_ret be proc int512_set_zero with result
+        Return INT512_OK
+    End If
+
+    Let limb_shift be bits divided by 64
+    Let bit_shift be bits modulo by 64
+
+    Note: Load all 8 source limbs into local registers to guarantee
+    Note: aliasing safety (read all before writing any).
+    Let s0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let s1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let s2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let s3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let s4 be proc memory_get_int64 from MemoryCore with a, 32
+    Let s5 be proc memory_get_int64 from MemoryCore with a, 40
+    Let s6 be proc memory_get_int64 from MemoryCore with a, 48
+    Let s7 be proc memory_get_int64 from MemoryCore with a, 56
+
+    Let i be 0
+    While i is less than 8:
+        Let hi_index be i minus limb_shift
+        Let lo_index be hi_index minus 1
+        Let hi_limb be 0
+        Let lo_limb be 0
+        If hi_index is greater than or equal to 0:
+            If hi_index is equal to 0:
+                Set hi_limb to s0
+            End If
+            If hi_index is equal to 1:
+                Set hi_limb to s1
+            End If
+            If hi_index is equal to 2:
+                Set hi_limb to s2
+            End If
+            If hi_index is equal to 3:
+                Set hi_limb to s3
+            End If
+            If hi_index is equal to 4:
+                Set hi_limb to s4
+            End If
+            If hi_index is equal to 5:
+                Set hi_limb to s5
+            End If
+            If hi_index is equal to 6:
+                Set hi_limb to s6
+            End If
+            If hi_index is equal to 7:
+                Set hi_limb to s7
+            End If
+        End If
+        If lo_index is greater than or equal to 0:
+            If lo_index is equal to 0:
+                Set lo_limb to s0
+            End If
+            If lo_index is equal to 1:
+                Set lo_limb to s1
+            End If
+            If lo_index is equal to 2:
+                Set lo_limb to s2
+            End If
+            If lo_index is equal to 3:
+                Set lo_limb to s3
+            End If
+            If lo_index is equal to 4:
+                Set lo_limb to s4
+            End If
+            If lo_index is equal to 5:
+                Set lo_limb to s5
+            End If
+            If lo_index is equal to 6:
+                Set lo_limb to s6
+            End If
+            If lo_index is equal to 7:
+                Set lo_limb to s7
+            End If
+        End If
+        Let out_value be 0
+        If bit_shift is equal to 0:
+            Set out_value to hi_limb
+        Otherwise:
+            Let hi_part be hi_limb shifted left by bit_shift
+            Let inv_shift be 64 minus bit_shift
+            Let lo_part be lo_limb shifted right by inv_shift
+            Note: Mask off any sign-extension that arithmetic right shift
+            Note: may have introduced on the lo_part. The high bits above
+            Note: bit_shift in lo_part must be zero.
+            Let lo_mask_width be bit_shift
+            Let lo_mask be 0
+            If lo_mask_width is equal to 64:
+                Set lo_mask to bitwise not 0
+            Otherwise:
+                Let mask_base be 1 shifted left by lo_mask_width
+                Set lo_mask to mask_base minus 1
+            End If
+            Let lo_masked be lo_part bitwise and lo_mask
+            Set out_value to hi_part bitwise or lo_masked
+        End If
+        Let offset be i multiplied by 8
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, out_value
+        Set i to i plus 1
+    End While
+    Return INT512_OK
+End Process
+
+Process called "int512_shift_right" takes a as Integer, bits as Integer, result as Integer returns Integer:
+    @Reasoning
+        Logical right shift by `bits` positions (0..511). Vacated high bits
+        become zero; bits shifted past position 0 are lost.
+    @End Reasoning
+    @Implementation
+        Symmetric to int512_shift_left: each result limb is composed from
+        a "low" source limb (right-shifted by bit_shift) and a "high"
+        source limb (left-shifted by 64-bit_shift). Loads all source limbs
+        first to allow aliasing source==result.
+    @End Implementation
+    @Performance_Hints
+        Constant-time for fixed `bits`.
+    @End Performance_Hints
+    @Security_Scope
+        Bounds-validated; constant-time data flow.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If bits is less than 0:
+        Return INT512_ERR_INVALID_SHIFT
+    End If
+    If bits is greater than or equal to INT512_BIT_WIDTH:
+        Let zero_ret be proc int512_set_zero with result
+        Return INT512_OK
+    End If
+
+    Let limb_shift be bits divided by 64
+    Let bit_shift be bits modulo by 64
+
+    Let s0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let s1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let s2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let s3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let s4 be proc memory_get_int64 from MemoryCore with a, 32
+    Let s5 be proc memory_get_int64 from MemoryCore with a, 40
+    Let s6 be proc memory_get_int64 from MemoryCore with a, 48
+    Let s7 be proc memory_get_int64 from MemoryCore with a, 56
+
+    Let i be 0
+    While i is less than 8:
+        Let lo_index be i plus limb_shift
+        Let hi_index be lo_index plus 1
+        Let lo_limb be 0
+        Let hi_limb be 0
+        If lo_index is less than or equal to 7:
+            If lo_index is equal to 0:
+                Set lo_limb to s0
+            End If
+            If lo_index is equal to 1:
+                Set lo_limb to s1
+            End If
+            If lo_index is equal to 2:
+                Set lo_limb to s2
+            End If
+            If lo_index is equal to 3:
+                Set lo_limb to s3
+            End If
+            If lo_index is equal to 4:
+                Set lo_limb to s4
+            End If
+            If lo_index is equal to 5:
+                Set lo_limb to s5
+            End If
+            If lo_index is equal to 6:
+                Set lo_limb to s6
+            End If
+            If lo_index is equal to 7:
+                Set lo_limb to s7
+            End If
+        End If
+        If hi_index is less than or equal to 7:
+            If hi_index is equal to 0:
+                Set hi_limb to s0
+            End If
+            If hi_index is equal to 1:
+                Set hi_limb to s1
+            End If
+            If hi_index is equal to 2:
+                Set hi_limb to s2
+            End If
+            If hi_index is equal to 3:
+                Set hi_limb to s3
+            End If
+            If hi_index is equal to 4:
+                Set hi_limb to s4
+            End If
+            If hi_index is equal to 5:
+                Set hi_limb to s5
+            End If
+            If hi_index is equal to 6:
+                Set hi_limb to s6
+            End If
+            If hi_index is equal to 7:
+                Set hi_limb to s7
+            End If
+        End If
+        Let out_value be 0
+        If bit_shift is equal to 0:
+            Set out_value to lo_limb
+        Otherwise:
+            Let lo_part be lo_limb shifted right by bit_shift
+            Note: Mask the lo_part so any arithmetic-right-shift sign
+            Note: extension is cleared (logical shift semantics).
+            Let lo_keep_width be 64 minus bit_shift
+            Let lo_mask be 0
+            If lo_keep_width is equal to 64:
+                Set lo_mask to bitwise not 0
+            Otherwise:
+                Let mask_base be 1 shifted left by lo_keep_width
+                Set lo_mask to mask_base minus 1
+            End If
+            Let lo_masked be lo_part bitwise and lo_mask
+            Let inv_shift be 64 minus bit_shift
+            Let hi_part be hi_limb shifted left by inv_shift
+            Set out_value to lo_masked bitwise or hi_part
+        End If
+        Let offset be i multiplied by 8
+        Let dummy be proc memory_set_int64 from MemoryCore with result, offset, out_value
+        Set i to i plus 1
+    End While
+    Return INT512_OK
+End Process
+
+Note: ============================================================================
+Note: 32-bit Half-Limb Multiplication (Schoolbook Building Block)
+Note: ============================================================================
+
+Process called "int512_mul_64x64_to_128_lo" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Compute the low 64 bits of (a * b) where a, b are unsigned 64-bit
+        values. Native multiplication wraps to 64 bits, so this is just
+        the wrapping product.
+    @End Reasoning
+    @Implementation
+        Return a * b (the bootstrap compiler emits an imulq which produces
+        the low 64 bits of the 128-bit product, identical to mulq's low
+        result for unsigned multiplication).
+    @End Implementation
+    @Performance_Hints
+        Single multiplication instruction.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time (single mul).
+    @End Security_Scope
+    Return a multiplied by b
+End Process
+
+Process called "int512_mul_64x64_to_128_hi" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+        Compute the high 64 bits of the 128-bit unsigned product a * b.
+        Since the bootstrap compiler does not expose a 128-bit type or
+        the mulhi instruction, we decompose into 32-bit halves:
+          a = a_hi * 2^32 + a_lo
+          b = b_hi * 2^32 + b_lo
+          a*b = a_hi*b_hi*2^64 + (a_hi*b_lo + a_lo*b_hi)*2^32 + a_lo*b_lo
+        The high 64 bits are extracted by summing the high-32-bit-carries
+        from the cross terms plus a_hi*b_hi.
+    @End Reasoning
+    @Implementation
+        Split a and b into 32-bit halves; compute the four 64-bit partial
+        products (each fits because 32*32 = 64 bits max); sum the products
+        column-by-column, capturing the carry into the high 64 bits.
+
+        Layout (each cell is 32 bits):
+                                a_hi   a_lo
+                              x b_hi   b_lo
+                              -----------
+                             lo_lo (low 64 bits = [hi32(lo_lo) | lo32(lo_lo)])
+                       hi_lo + lo_hi  (each is a 64-bit product placed at offset 32)
+              hi_hi (placed at offset 64)
+        We sum column 32 (the middle column) including hi32(lo_lo); the
+        carry out of bit 95 (column 64+) goes into the high result.
+    @End Implementation
+    @Performance_Hints
+        4 multiplications, several shifts/adds. The bootstrap compiler
+        cannot expose mulq's RDX:RAX output as a single instruction, so
+        this is the portable fallback. Maps to the same operations a C
+        compiler would emit on a target without __int128.
+    @End Performance_Hints
+    @Security_Scope
+        Constant-time: no branches on operand bits.
+    @End Security_Scope
+
+    Let mask32 be INT512_LIMB_MASK_LOW32
+    Let a_lo be a bitwise and mask32
+    Let a_hi_signed be a shifted right by 32
+    Let a_hi be a_hi_signed bitwise and mask32
+    Let b_lo be b bitwise and mask32
+    Let b_hi_signed be b shifted right by 32
+    Let b_hi be b_hi_signed bitwise and mask32
+
+    Note: Four 32x32 -> 64 partial products (always fit in 64 bits unsigned)
+    Let lo_lo be a_lo multiplied by b_lo
+    Let hi_lo be a_hi multiplied by b_lo
+    Let lo_hi be a_lo multiplied by b_hi
+    Let hi_hi be a_hi multiplied by b_hi
+
+    Note: Extract the high 32 bits of lo_lo (the carry from column 0 to
+    Note: column 32). Note: arithmetic right shift may sign-extend; mask.
+    Let lo_lo_high_signed be lo_lo shifted right by 32
+    Let lo_lo_high be lo_lo_high_signed bitwise and mask32
+
+    Note: Sum the middle column at offset 32: hi_lo + lo_hi + lo_lo_high.
+    Note: Each summand is <= (2^32 - 1)^2 ~= 2^64 - 2^33 + 1, plus
+    Note: 2^32 - 1; total < 2 * 2^64 so we capture carry across two adds.
+    Let mid_a be hi_lo plus lo_lo_high
+    Let carry_a be proc int512_carry_from_add with hi_lo, lo_lo_high, mid_a
+    Let mid be mid_a plus lo_hi
+    Let carry_b be proc int512_carry_from_add with mid_a, lo_hi, mid
+
+    Note: The high 64 bits of the full 128-bit product are:
+    Note:   hi_hi + (carry from middle column) * 2^64-contribution
+    Note:   + (mid's upper 32 bits as the carry into column 64)
+    Let mid_high_signed be mid shifted right by 32
+    Let mid_high be mid_high_signed bitwise and mask32
+
+    Note: Combine: hi_hi sits naturally at offset 64. Add mid_high and
+    Note: the cross-column carry shifted up by 32 bits.
+    Let total_carry be carry_a plus carry_b
+    Let carry_contribution be total_carry shifted left by 32
+    Let hi_result_partial be hi_hi plus mid_high
+    Let hi_result be hi_result_partial plus carry_contribution
+    Return hi_result
+End Process
+
+Note: ============================================================================
+Note: Multiplication
+Note: ============================================================================
+
+Process called "int512_mul" takes a as Integer, b as Integer, result as Integer returns Integer:
+    @Reasoning
+        Compute result = (a * b) mod 2^512 with wrapping semantics. Uses
+        schoolbook multiplication: for each (i, j) limb pair where i+j < 8,
+        accumulate a_i * b_j into the result at limb i+j (and carry into
+        i+j+1).
+    @End Reasoning
+    @Implementation
+        Initialize result to zero. For each i in 0..7, for each j in 0..7
+        with i+j < 8, compute the 128-bit product a_i * b_j (lo and hi
+        halves via int512_mul_64x64_to_128_lo / _hi), then add lo to
+        result[i+j] and hi to result[i+j+1], propagating carry.
+
+        Aliasing safety: if `result` overlaps `a` or `b`, we copy operands
+        to local 8-limb arrays in `a_local` / `b_local` first. To avoid
+        allocating temporary buffers, we instead snapshot all 8 limbs of
+        each operand into local variables before zeroing `result`.
+    @End Implementation
+    @Performance_Hints
+        Schoolbook is O(n^2) on limbs: 36 full and partial multiplications
+        for 8x8 limbs with truncation at limb 7. No Karatsuba threshold
+        crossed at this width (Karatsuba breaks even around 16+ limbs on
+        modern CPUs).
+    @End Performance_Hints
+    @Security_Scope
+        Wrapping semantics documented. Constant-time data flow (no
+        operand-dependent branches in the inner loop).
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If result is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+
+    Note: Snapshot a and b into locals (8 64-bit values each) so the result
+    Note: buffer can safely alias a or b.
+    Let a0 be proc memory_get_int64 from MemoryCore with a, 0
+    Let a1 be proc memory_get_int64 from MemoryCore with a, 8
+    Let a2 be proc memory_get_int64 from MemoryCore with a, 16
+    Let a3 be proc memory_get_int64 from MemoryCore with a, 24
+    Let a4 be proc memory_get_int64 from MemoryCore with a, 32
+    Let a5 be proc memory_get_int64 from MemoryCore with a, 40
+    Let a6 be proc memory_get_int64 from MemoryCore with a, 48
+    Let a7 be proc memory_get_int64 from MemoryCore with a, 56
+    Let b0 be proc memory_get_int64 from MemoryCore with b, 0
+    Let b1 be proc memory_get_int64 from MemoryCore with b, 8
+    Let b2 be proc memory_get_int64 from MemoryCore with b, 16
+    Let b3 be proc memory_get_int64 from MemoryCore with b, 24
+    Let b4 be proc memory_get_int64 from MemoryCore with b, 32
+    Let b5 be proc memory_get_int64 from MemoryCore with b, 40
+    Let b6 be proc memory_get_int64 from MemoryCore with b, 48
+    Let b7 be proc memory_get_int64 from MemoryCore with b, 56
+
+    Let zero_ret be proc int512_set_zero with result
+
+    Let i be 0
+    While i is less than 8:
+        Let j be 0
+        Let ai be 0
+        If i is equal to 0:
+            Set ai to a0
+        End If
+        If i is equal to 1:
+            Set ai to a1
+        End If
+        If i is equal to 2:
+            Set ai to a2
+        End If
+        If i is equal to 3:
+            Set ai to a3
+        End If
+        If i is equal to 4:
+            Set ai to a4
+        End If
+        If i is equal to 5:
+            Set ai to a5
+        End If
+        If i is equal to 6:
+            Set ai to a6
+        End If
+        If i is equal to 7:
+            Set ai to a7
+        End If
+
+        While j is less than 8:
+            Let dest be i plus j
+            If dest is less than 8:
+                Let bj be 0
+                If j is equal to 0:
+                    Set bj to b0
+                End If
+                If j is equal to 1:
+                    Set bj to b1
+                End If
+                If j is equal to 2:
+                    Set bj to b2
+                End If
+                If j is equal to 3:
+                    Set bj to b3
+                End If
+                If j is equal to 4:
+                    Set bj to b4
+                End If
+                If j is equal to 5:
+                    Set bj to b5
+                End If
+                If j is equal to 6:
+                    Set bj to b6
+                End If
+                If j is equal to 7:
+                    Set bj to b7
+                End If
+
+                Let p_lo be proc int512_mul_64x64_to_128_lo with ai, bj
+                Let p_hi be proc int512_mul_64x64_to_128_hi with ai, bj
+
+                Note: Add p_lo to result[dest] with carry propagation upward.
+                Let dest_offset be dest multiplied by 8
+                Let cur_dest be proc memory_get_int64 from MemoryCore with result, dest_offset
+                Let new_dest be cur_dest plus p_lo
+                Let carry_dest be proc int512_carry_from_add with cur_dest, p_lo, new_dest
+                Let dummy_a be proc memory_set_int64 from MemoryCore with result, dest_offset, new_dest
+
+                Note: Add p_hi + carry_dest to result[dest+1], propagating
+                Note: any further carry through all higher limbs.
+                Let next_dest be dest plus 1
+                If next_dest is less than 8:
+                    Let next_offset be next_dest multiplied by 8
+                    Let cur_next be proc memory_get_int64 from MemoryCore with result, next_offset
+                    Let added_hi be cur_next plus p_hi
+                    Let carry_hi be proc int512_carry_from_add with cur_next, p_hi, added_hi
+                    Let final_next be added_hi plus carry_dest
+                    Let carry_cd be proc int512_carry_from_add with added_hi, carry_dest, final_next
+                    Let dummy_b be proc memory_set_int64 from MemoryCore with result, next_offset, final_next
+                    Let propagate_carry be carry_hi plus carry_cd
+                    Let k be next_dest plus 1
+                    While k is less than 8:
+                        If propagate_carry is equal to 0:
+                            Set k to 8
+                        Otherwise:
+                            Let k_offset be k multiplied by 8
+                            Let cur_k be proc memory_get_int64 from MemoryCore with result, k_offset
+                            Let new_k be cur_k plus propagate_carry
+                            Let carry_k be proc int512_carry_from_add with cur_k, propagate_carry, new_k
+                            Let dummy_k be proc memory_set_int64 from MemoryCore with result, k_offset, new_k
+                            Set propagate_carry to carry_k
+                            Set k to k plus 1
+                        End If
+                    End While
+                End If
+            End If
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+    Return INT512_OK
+End Process
+
+Note: ============================================================================
+Note: Division and Modulo (Long Division)
+Note: ============================================================================
+
+Process called "int512_divmod" takes a as Integer, b as Integer, quotient_out as Integer, remainder_out as Integer returns Integer:
+    @Reasoning
+        Unsigned long division: compute q, r such that a = q * b + r,
+        0 <= r < b. Uses binary long division (shift-and-subtract), which
+        is portable and deterministic across all platforms.
+    @End Reasoning
+    @Implementation
+        Algorithm (classical schoolbook binary long division):
+          if b == 0: return INT512_ERR_DIVIDE_BY_ZERO
+          quotient = 0, remainder = 0
+          for bit_index from 511 downto 0:
+              remainder = (remainder << 1) | bit(a, bit_index)
+              if remainder >= b:
+                  remainder -= b
+                  set bit_index of quotient
+          write quotient, remainder
+
+        We use temporary scratch buffers for the in-progress remainder.
+        Aliasing safety: snapshot a and b into local arrays via copy() to
+        scratch buffers, then write quotient_out / remainder_out at the
+        end.
+    @End Implementation
+    @Performance_Hints
+        512 iterations, each doing one shift-left, one limb compare, one
+        conditional subtract, one bit-set. Total cost dominated by the
+        512 shift-left passes (each O(limbs)).
+    @End Performance_Hints
+    @Security_Scope
+        Division by zero is explicitly rejected with INT512_ERR_DIVIDE_BY_ZERO;
+        callers must check the return value. Data flow is value-dependent
+        (the inner comparison branches on remainder >= divisor); this is
+        acceptable for non-secret divisors.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If quotient_out is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If remainder_out is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+
+    Let is_div_zero be proc int512_is_zero with b
+    If is_div_zero is equal to 1:
+        Return INT512_ERR_DIVIDE_BY_ZERO
+    End If
+
+    Note: Allocate scratch buffers. We need 4: a_copy (to safely read the
+    Note: dividend bits even if a aliases quotient_out / remainder_out),
+    Note: b_copy (similarly safe), remainder_work, and quotient_work.
+    Let a_copy be proc int512_allocate
+    If a_copy is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    Let b_copy be proc int512_allocate
+    If b_copy is equal to 0:
+        Let dummy_free_a be proc int512_free with a_copy
+        Return INT512_ERR_NULL
+    End If
+    Let remainder_work be proc int512_allocate
+    If remainder_work is equal to 0:
+        Let dummy_free_a2 be proc int512_free with a_copy
+        Let dummy_free_b2 be proc int512_free with b_copy
+        Return INT512_ERR_NULL
+    End If
+    Let quotient_work be proc int512_allocate
+    If quotient_work is equal to 0:
+        Let dummy_free_a3 be proc int512_free with a_copy
+        Let dummy_free_b3 be proc int512_free with b_copy
+        Let dummy_free_r3 be proc int512_free with remainder_work
+        Return INT512_ERR_NULL
+    End If
+
+    Let cp_a be proc int512_copy with a, a_copy
+    Let cp_b be proc int512_copy with b, b_copy
+    Let z_r be proc int512_set_zero with remainder_work
+    Let z_q be proc int512_set_zero with quotient_work
+
+    Let bit_index be 511
+    While bit_index is greater than or equal to 0:
+        Note: Shift remainder_work left by 1.
+        Let dummy_shl be proc int512_shift_left with remainder_work, 1, remainder_work
+
+        Note: Extract bit `bit_index` from a_copy and OR into remainder_work bit 0.
+        Let limb_idx be bit_index divided by 64
+        Let bit_in_limb be bit_index modulo by 64
+        Let offset be limb_idx multiplied by 8
+        Let a_limb be proc memory_get_int64 from MemoryCore with a_copy, offset
+        Let shifted_limb be a_limb shifted right by bit_in_limb
+        Let dividend_bit be shifted_limb bitwise and 1
+
+        Let cur_remainder_low be proc memory_get_int64 from MemoryCore with remainder_work, 0
+        Let new_remainder_low be cur_remainder_low bitwise or dividend_bit
+        Let set_low be proc memory_set_int64 from MemoryCore with remainder_work, 0, new_remainder_low
+
+        Note: Compare remainder_work to b_copy. If >=, subtract and set quotient bit.
+        Let cmp be proc int512_compare with remainder_work, b_copy
+        If cmp is greater than or equal to 0:
+            Let dummy_sub be proc int512_sub with remainder_work, b_copy, remainder_work
+            Let q_limb_idx be bit_index divided by 64
+            Let q_bit_in_limb be bit_index modulo by 64
+            Let q_offset be q_limb_idx multiplied by 8
+            Let q_cur be proc memory_get_int64 from MemoryCore with quotient_work, q_offset
+            Let q_bit_mask be 1 shifted left by q_bit_in_limb
+            Let q_new be q_cur bitwise or q_bit_mask
+            Let dummy_qset be proc memory_set_int64 from MemoryCore with quotient_work, q_offset, q_new
+        End If
+
+        Set bit_index to bit_index minus 1
+    End While
+
+    Note: Copy results out.
+    Let cp_q be proc int512_copy with quotient_work, quotient_out
+    Let cp_r be proc int512_copy with remainder_work, remainder_out
+
+    Let dummy_free_a4 be proc int512_free with a_copy
+    Let dummy_free_b4 be proc int512_free with b_copy
+    Let dummy_free_r4 be proc int512_free with remainder_work
+    Let dummy_free_q4 be proc int512_free with quotient_work
+    Return INT512_OK
+End Process
+
+Process called "int512_div" takes a as Integer, b as Integer, quotient_out as Integer returns Integer:
+    @Reasoning
+        Compute quotient = a / b (unsigned). Convenience wrapper around
+        int512_divmod that discards the remainder.
+    @End Reasoning
+    @Implementation
+        Allocates a scratch remainder buffer, calls divmod, then frees the
+        scratch.
+    @End Implementation
+    @Performance_Hints
+        Same cost as divmod plus one allocation/deallocation.
+    @End Performance_Hints
+    @Security_Scope
+        Same as divmod.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If quotient_out is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+
+    Let r_scratch be proc int512_allocate
+    If r_scratch is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    Let rc be proc int512_divmod with a, b, quotient_out, r_scratch
+    Let dummy_free be proc int512_free with r_scratch
+    Return rc
+End Process
+
+Process called "int512_mod" takes a as Integer, b as Integer, remainder_out as Integer returns Integer:
+    @Reasoning
+        Compute remainder = a mod b (unsigned). Convenience wrapper around
+        int512_divmod that discards the quotient.
+    @End Reasoning
+    @Implementation
+        Allocates a scratch quotient buffer, calls divmod, then frees it.
+    @End Implementation
+    @Performance_Hints
+        Same cost as divmod plus one allocation/deallocation.
+    @End Performance_Hints
+    @Security_Scope
+        Same as divmod.
+    @End Security_Scope
+
+    If a is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If b is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    If remainder_out is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+
+    Let q_scratch be proc int512_allocate
+    If q_scratch is equal to 0:
+        Return INT512_ERR_NULL
+    End If
+    Let rc be proc int512_divmod with a, b, q_scratch, remainder_out
+    Let dummy_free be proc int512_free with q_scratch
+    Return rc
+End Process

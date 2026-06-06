@@ -1,0 +1,754 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+DIMENSION - SI dimensional algebra packed into a single Int64
+
+This module implements the algebra of SI dimensions. A dimension is a
+seven-tuple of integer exponents over the seven base dimensions defined
+by the International System of Units (SI) Brochure, 9th ed., 2019:
+
+   index 0  L  length              metre
+   index 1  M  mass                kilogram
+   index 2  T  time                second
+   index 3  I  electric current    ampere
+   index 4  K  thermodynamic temp  kelvin
+   index 5  N  amount of substance mole
+   index 6  J  luminous intensity  candela
+
+Each exponent is stored as a signed 8-bit integer with range [-127, +127].
+This range is more than sufficient: the highest-exponent physical quantity
+in regular use is the energy density spectral radiance (W/sr/m^2/Hz), which
+has exponent vector (0, 1, -2, 0, 0, 0, 0). No human-relevant SI quantity
+has |exponent| > 6 in any dimension.
+
+PACKING
+
+The seven int8 exponents are packed little-endian into byte positions 0..6
+of an Int64. Byte 7 carries a single-bit "non-zero" marker (0 if every
+exponent is zero - the dimensionless dimension; 1 otherwise) so callers
+can test for dimensionless quantities with a single compare.
+
+   bit  0 ..  7  L
+   bit  8 .. 15  M
+   bit 16 .. 23  T
+   bit 24 .. 31  I
+   bit 32 .. 39  K
+   bit 40 .. 47  N
+   bit 48 .. 55  J
+   bit 56 .. 63  nz-marker (0 or 1)
+
+ALGEBRA
+
+  dim_mul(a, b)        - exponent-wise add
+  dim_div(a, b)        - exponent-wise subtract
+  dim_pow(a, k)        - exponent-wise scalar multiply by k
+  dim_eq(a, b)         - exact equality including the nz-marker
+  dim_is_dimensionless - true if all seven exponents are zero
+  dim_is_compatible    - true iff dimensions are identical
+                         (so quantities can be added or subtracted)
+
+DESIGN NOTES
+
+  The packed Int64 representation is critical for performance: every
+  add/sub on a Quantity checks dimensional compatibility, which becomes
+  one Int64 equality compare. The seven-add path of dim_mul is six
+  shifts + six masks + six adds, on the order of 25 cycles.
+
+  Signed extraction is done by sign-extending the 8-bit byte: shift left
+  56 then arithmetic shift right 56.
+
+CITATIONS
+
+  - BIPM, "The International System of Units (SI)", 9th ed., 2019.
+  - de Boer, J. (1995): "On the history of quantity calculus and the
+    international system", Metrologia 31, 405-429.
+  - Hart, G. W. (1995): "Multidimensional Analysis: Algebras and Systems
+    for Science and Engineering", Springer-Verlag.
+:End Note
+
+Note: ============================================================================
+Note: SECTION 1 - Byte packing helpers
+Note: ============================================================================
+
+Process called "dim_pack_signed_byte" takes value as Integer returns Integer:
+    @Reasoning:
+        Mask a signed integer to its low 8 bits for storage in one of
+        the byte slots of the packed dimension Int64.
+    @End Reasoning
+    @Implementation:
+        Bitwise AND with 0xFF. Negative values pack as their two's
+        complement representation in the low byte.
+    @End Implementation
+    @Performance_Hints:
+        One AND. ~ 1 cycle.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Out-of-range values silently lose high bits; the caller is
+        expected to enforce the [-127, +127] envelope.
+    @End Security_Scope
+    Return value bit_and 255
+End Process
+
+Process called "dim_unpack_signed_byte" takes packed as Integer, shift as Integer returns Integer:
+    @Reasoning:
+        Extract one signed-byte slot from the packed dimension. Sign
+        extends the 8-bit value back into a full Integer.
+    @End Reasoning
+    @Implementation:
+        Shift right by the slot offset, mask the low 8 bits, then
+        sign-extend by shifting up 56 and arithmetic-shifting right 56.
+        Stage1 does not expose arithmetic right shift, so we synthesize
+        sign extension by adjusting for the sign bit explicitly.
+    @End Implementation
+    @Performance_Hints:
+        Three shifts, one mask, one compare, ~ 5 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Slot indices outside [0, 6] produce undefined-but-safe
+        results (zero or garbage from the nz-marker byte); callers are
+        expected to invoke the dim_get_<axis> wrappers below.
+    @End Security_Scope
+    Let raw be (packed shifted right by shift) bit_and 255
+    If raw is greater than 127:
+        Return raw minus 256
+    End If
+    Return raw
+End Process
+
+Note: ============================================================================
+Note: SECTION 2 - Constructors and base axes
+Note: ============================================================================
+
+Process called "dim_create" takes l as Integer, m as Integer, t as Integer, i as Integer, k as Integer, n as Integer, j as Integer returns Integer:
+    @Reasoning:
+        General constructor. Packs seven signed exponents into one Int64
+        with the nz-marker bit set if any exponent is non-zero.
+    @End Reasoning
+    @Implementation:
+        Mask each exponent to 8 bits then OR into the appropriate slot.
+        The nz-marker is computed by testing whether any exponent is
+        non-zero (equivalent: whether the packed low-56-bits Int64 is
+        non-zero).
+    @End Implementation
+    @Performance_Hints:
+        Seven mask-and-shift-OR pairs plus one nz test. ~ 20 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. No validation of the exponent magnitudes; callers MUST
+        keep all exponents in the [-127, +127] envelope or the truncation
+        will silently corrupt the value.
+    @End Security_Scope
+    Let packed be 0
+    Set packed to packed bit_or (proc dim_pack_signed_byte with l)
+    Set packed to packed bit_or ((proc dim_pack_signed_byte with m) shifted left by 8)
+    Set packed to packed bit_or ((proc dim_pack_signed_byte with t) shifted left by 16)
+    Set packed to packed bit_or ((proc dim_pack_signed_byte with i) shifted left by 24)
+    Set packed to packed bit_or ((proc dim_pack_signed_byte with k) shifted left by 32)
+    Set packed to packed bit_or ((proc dim_pack_signed_byte with n) shifted left by 40)
+    Set packed to packed bit_or ((proc dim_pack_signed_byte with j) shifted left by 48)
+    Let nz be 0
+    If l is not equal to 0:
+        Set nz to 1
+    End If
+    If m is not equal to 0:
+        Set nz to 1
+    End If
+    If t is not equal to 0:
+        Set nz to 1
+    End If
+    If i is not equal to 0:
+        Set nz to 1
+    End If
+    If k is not equal to 0:
+        Set nz to 1
+    End If
+    If n is not equal to 0:
+        Set nz to 1
+    End If
+    If j is not equal to 0:
+        Set nz to 1
+    End If
+    Set packed to packed bit_or (nz shifted left by 56)
+    Return packed
+End Process
+
+Process called "dimension_dimensionless" returns Integer:
+    Return 0
+End Process
+
+Process called "dimension_length" returns Integer:
+    Return proc dim_create with 1, 0, 0, 0, 0, 0, 0
+End Process
+
+Process called "dimension_mass" returns Integer:
+    Return proc dim_create with 0, 1, 0, 0, 0, 0, 0
+End Process
+
+Process called "dimension_time" returns Integer:
+    Return proc dim_create with 0, 0, 1, 0, 0, 0, 0
+End Process
+
+Process called "dimension_current" returns Integer:
+    Return proc dim_create with 0, 0, 0, 1, 0, 0, 0
+End Process
+
+Process called "dimension_temperature" returns Integer:
+    Return proc dim_create with 0, 0, 0, 0, 1, 0, 0
+End Process
+
+Process called "dimension_amount" returns Integer:
+    Return proc dim_create with 0, 0, 0, 0, 0, 1, 0
+End Process
+
+Process called "dimension_luminous_intensity" returns Integer:
+    Return proc dim_create with 0, 0, 0, 0, 0, 0, 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 3 - Exponent accessors
+Note: ============================================================================
+
+Process called "dim_get_length" takes d as Integer returns Integer:
+    Return proc dim_unpack_signed_byte with d, 0
+End Process
+
+Process called "dim_get_mass" takes d as Integer returns Integer:
+    Return proc dim_unpack_signed_byte with d, 8
+End Process
+
+Process called "dim_get_time" takes d as Integer returns Integer:
+    Return proc dim_unpack_signed_byte with d, 16
+End Process
+
+Process called "dim_get_current" takes d as Integer returns Integer:
+    Return proc dim_unpack_signed_byte with d, 24
+End Process
+
+Process called "dim_get_temperature" takes d as Integer returns Integer:
+    Return proc dim_unpack_signed_byte with d, 32
+End Process
+
+Process called "dim_get_amount" takes d as Integer returns Integer:
+    Return proc dim_unpack_signed_byte with d, 40
+End Process
+
+Process called "dim_get_luminous_intensity" takes d as Integer returns Integer:
+    Return proc dim_unpack_signed_byte with d, 48
+End Process
+
+Note: ============================================================================
+Note: SECTION 4 - Dimension algebra
+Note: ============================================================================
+
+Process called "dim_mul" takes a as Integer, b as Integer returns Integer:
+    @Reasoning:
+        Combining two dimensions by multiplication adds their respective
+        exponents component-wise (e.g. length * length = length^2).
+        This is the fundamental algebra of dimensional analysis.
+    @End Reasoning
+    @Implementation:
+        Sum each exponent pair, then rebuild the packed Int64. We do not
+        operate on the packed bytes directly to avoid integer overflow
+        between adjacent bytes (e.g. 100 + 100 = 200 would overflow the
+        signed-8-bit range and could leak into the next byte during the
+        addition if we attempted parallel byte-add).
+    @End Implementation
+    @Performance_Hints:
+        Seven adds, one full dim_create. ~ 30 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Sum results outside [-127, +127] silently overflow; in
+        practice no SI quantity reaches that range.
+    @End Security_Scope
+    Let l be (proc dim_get_length with a) plus (proc dim_get_length with b)
+    Let m be (proc dim_get_mass with a) plus (proc dim_get_mass with b)
+    Let t be (proc dim_get_time with a) plus (proc dim_get_time with b)
+    Let i be (proc dim_get_current with a) plus (proc dim_get_current with b)
+    Let k be (proc dim_get_temperature with a) plus (proc dim_get_temperature with b)
+    Let n be (proc dim_get_amount with a) plus (proc dim_get_amount with b)
+    Let j be (proc dim_get_luminous_intensity with a) plus (proc dim_get_luminous_intensity with b)
+    Return proc dim_create with l, m, t, i, k, n, j
+End Process
+
+Process called "dim_div" takes a as Integer, b as Integer returns Integer:
+    @Reasoning:
+        Division of dimensions is exponent-wise subtraction.
+        (length / time = velocity, exponent (1, 0, -1, ...)).
+    @End Reasoning
+    @Implementation:
+        Subtract each exponent pair then rebuild.
+    @End Implementation
+    @Performance_Hints:
+        Seven subs, one full dim_create. ~ 30 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let l be (proc dim_get_length with a) minus (proc dim_get_length with b)
+    Let m be (proc dim_get_mass with a) minus (proc dim_get_mass with b)
+    Let t be (proc dim_get_time with a) minus (proc dim_get_time with b)
+    Let i be (proc dim_get_current with a) minus (proc dim_get_current with b)
+    Let k be (proc dim_get_temperature with a) minus (proc dim_get_temperature with b)
+    Let n be (proc dim_get_amount with a) minus (proc dim_get_amount with b)
+    Let j be (proc dim_get_luminous_intensity with a) minus (proc dim_get_luminous_intensity with b)
+    Return proc dim_create with l, m, t, i, k, n, j
+End Process
+
+Process called "dim_pow" takes a as Integer, exponent as Integer returns Integer:
+    @Reasoning:
+        Raising a dimension to an integer power multiplies every exponent
+        by the scalar power (length^3 = volume, exponent (3, 0, ...)).
+    @End Reasoning
+    @Implementation:
+        Multiply each exponent by the integer power. Negative powers are
+        supported (e.g. frequency = time^-1).
+    @End Implementation
+    @Performance_Hints:
+        Seven multiplies, one full dim_create. ~ 35 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Resulting exponents must remain within [-127, +127].
+    @End Security_Scope
+    Let l be (proc dim_get_length with a) multiplied by exponent
+    Let m be (proc dim_get_mass with a) multiplied by exponent
+    Let t be (proc dim_get_time with a) multiplied by exponent
+    Let i be (proc dim_get_current with a) multiplied by exponent
+    Let k be (proc dim_get_temperature with a) multiplied by exponent
+    Let n be (proc dim_get_amount with a) multiplied by exponent
+    Let j be (proc dim_get_luminous_intensity with a) multiplied by exponent
+    Return proc dim_create with l, m, t, i, k, n, j
+End Process
+
+Process called "dim_add_overflows" takes a as Integer, b as Integer returns Integer:
+    @Reasoning:
+        Predicate: true iff dim_mul(a, b) would produce an exponent
+        outside the supported Int8 range [-127, +127]. Used by
+        quantity_mul to surface dimension-overflow as an error
+        sentinel rather than letting silent wrap corrupt downstream
+        algebra.
+    @End Reasoning
+    @Implementation:
+        Sum each exponent pair in full Integer precision (no Int8
+        truncation), then test each component against the [-127, +127]
+        envelope. Returns 1 the moment any component is out of range.
+    @End Implementation
+    @Performance_Hints:
+        Seven adds and at most fourteen compares. ~ 30 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let l be (proc dim_get_length with a) plus (proc dim_get_length with b)
+    If l is greater than 127:
+        Return 1
+    End If
+    If l is less than (0 minus 127):
+        Return 1
+    End If
+    Let m be (proc dim_get_mass with a) plus (proc dim_get_mass with b)
+    If m is greater than 127:
+        Return 1
+    End If
+    If m is less than (0 minus 127):
+        Return 1
+    End If
+    Let t be (proc dim_get_time with a) plus (proc dim_get_time with b)
+    If t is greater than 127:
+        Return 1
+    End If
+    If t is less than (0 minus 127):
+        Return 1
+    End If
+    Let i be (proc dim_get_current with a) plus (proc dim_get_current with b)
+    If i is greater than 127:
+        Return 1
+    End If
+    If i is less than (0 minus 127):
+        Return 1
+    End If
+    Let k be (proc dim_get_temperature with a) plus (proc dim_get_temperature with b)
+    If k is greater than 127:
+        Return 1
+    End If
+    If k is less than (0 minus 127):
+        Return 1
+    End If
+    Let n be (proc dim_get_amount with a) plus (proc dim_get_amount with b)
+    If n is greater than 127:
+        Return 1
+    End If
+    If n is less than (0 minus 127):
+        Return 1
+    End If
+    Let j be (proc dim_get_luminous_intensity with a) plus (proc dim_get_luminous_intensity with b)
+    If j is greater than 127:
+        Return 1
+    End If
+    If j is less than (0 minus 127):
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dim_sub_overflows" takes a as Integer, b as Integer returns Integer:
+    @Reasoning:
+        Predicate: true iff dim_div(a, b) would produce an exponent
+        outside the supported Int8 range [-127, +127]. Used by
+        quantity_div to surface dimension-overflow as an error
+        sentinel rather than silently wrapping past +/-127.
+    @End Reasoning
+    @Implementation:
+        Subtract each exponent pair in full Integer precision and
+        test the [-127, +127] envelope. Returns 1 at the first
+        out-of-range component.
+    @End Implementation
+    @Performance_Hints:
+        Seven subs and at most fourteen compares. ~ 30 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let l be (proc dim_get_length with a) minus (proc dim_get_length with b)
+    If l is greater than 127:
+        Return 1
+    End If
+    If l is less than (0 minus 127):
+        Return 1
+    End If
+    Let m be (proc dim_get_mass with a) minus (proc dim_get_mass with b)
+    If m is greater than 127:
+        Return 1
+    End If
+    If m is less than (0 minus 127):
+        Return 1
+    End If
+    Let t be (proc dim_get_time with a) minus (proc dim_get_time with b)
+    If t is greater than 127:
+        Return 1
+    End If
+    If t is less than (0 minus 127):
+        Return 1
+    End If
+    Let i be (proc dim_get_current with a) minus (proc dim_get_current with b)
+    If i is greater than 127:
+        Return 1
+    End If
+    If i is less than (0 minus 127):
+        Return 1
+    End If
+    Let k be (proc dim_get_temperature with a) minus (proc dim_get_temperature with b)
+    If k is greater than 127:
+        Return 1
+    End If
+    If k is less than (0 minus 127):
+        Return 1
+    End If
+    Let n be (proc dim_get_amount with a) minus (proc dim_get_amount with b)
+    If n is greater than 127:
+        Return 1
+    End If
+    If n is less than (0 minus 127):
+        Return 1
+    End If
+    Let j be (proc dim_get_luminous_intensity with a) minus (proc dim_get_luminous_intensity with b)
+    If j is greater than 127:
+        Return 1
+    End If
+    If j is less than (0 minus 127):
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dim_pow_overflows" takes a as Integer, exponent as Integer returns Integer:
+    @Reasoning:
+        Predicate: true iff dim_pow(a, exponent) would produce a
+        dimension component outside the Int8 range [-127, +127]. Used
+        by quantity_pow to flag overflow rather than silently wrap.
+    @End Reasoning
+    @Implementation:
+        Multiply each exponent by the supplied scalar in full Integer
+        precision and test the [-127, +127] envelope per component.
+    @End Implementation
+    @Performance_Hints:
+        Seven multiplies and at most fourteen compares. ~ 35 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let l be (proc dim_get_length with a) multiplied by exponent
+    If l is greater than 127:
+        Return 1
+    End If
+    If l is less than (0 minus 127):
+        Return 1
+    End If
+    Let m be (proc dim_get_mass with a) multiplied by exponent
+    If m is greater than 127:
+        Return 1
+    End If
+    If m is less than (0 minus 127):
+        Return 1
+    End If
+    Let t be (proc dim_get_time with a) multiplied by exponent
+    If t is greater than 127:
+        Return 1
+    End If
+    If t is less than (0 minus 127):
+        Return 1
+    End If
+    Let i be (proc dim_get_current with a) multiplied by exponent
+    If i is greater than 127:
+        Return 1
+    End If
+    If i is less than (0 minus 127):
+        Return 1
+    End If
+    Let k be (proc dim_get_temperature with a) multiplied by exponent
+    If k is greater than 127:
+        Return 1
+    End If
+    If k is less than (0 minus 127):
+        Return 1
+    End If
+    Let n be (proc dim_get_amount with a) multiplied by exponent
+    If n is greater than 127:
+        Return 1
+    End If
+    If n is less than (0 minus 127):
+        Return 1
+    End If
+    Let j be (proc dim_get_luminous_intensity with a) multiplied by exponent
+    If j is greater than 127:
+        Return 1
+    End If
+    If j is less than (0 minus 127):
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 5 - Equality and predicates
+Note: ============================================================================
+
+Process called "dim_eq" takes a as Integer, b as Integer returns Integer:
+    @Reasoning:
+        Two dimensions are equal iff all seven exponents match exactly.
+        Equivalent to comparing the full packed Int64 (the nz-marker
+        byte is identical for equal dimensions so the bit-equality holds).
+    @End Reasoning
+    @Implementation:
+        Direct Int64 equality after masking off the nz-marker byte.
+        We mask because if a caller constructs a dimension via dim_create
+        with nz=0 (the dimensionless case) the marker disambiguates from
+        a stale Int64 that happens to have the same low 56 bits.
+    @End Implementation
+    @Performance_Hints:
+        One mask, one compare. ~ 2 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let mask be 72057594037927935
+    Let a_low be a bit_and mask
+    Let b_low be b bit_and mask
+    If a_low is equal to b_low:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dim_is_dimensionless" takes d as Integer returns Integer:
+    @Reasoning:
+        A dimension is dimensionless iff every exponent is zero.
+    @End Reasoning
+    @Implementation:
+        Mask off the nz-marker byte and compare to zero.
+    @End Implementation
+    @Performance_Hints:
+        One mask, one compare. ~ 2 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let mask be 72057594037927935
+    Let low be d bit_and mask
+    If low is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "dim_is_compatible" takes a as Integer, b as Integer returns Integer:
+    @Reasoning:
+        Two quantities can be added or subtracted iff their dimensions
+        are equal. This is precisely the compatibility test used by
+        quantity_add / quantity_sub.
+    @End Reasoning
+    @Implementation:
+        Delegates to dim_eq.
+    @End Implementation
+    @Performance_Hints:
+        Equivalent to dim_eq. ~ 2 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Return proc dim_eq with a, b
+End Process
+
+Note: ============================================================================
+Note: SECTION 6 - Stringification
+Note: ============================================================================
+Note: Build a textual representation of the dimension in the canonical
+Note: ordering L M T I K N J, omitting zero-exponent axes and using
+Note: middle-dot for multiplication and slash for the denominator.
+Note: Example: "m.kg/s^2"
+
+Process called "dim_to_string" takes d as Integer returns String:
+    @Reasoning:
+        Human-readable presentation of a dimension. Used by quantity_to_string
+        for diagnostics and unit logging. The format matches the SI
+        Brochure section 2.3.1 typography (centred dot multiplication).
+        For stage1 portability we use the ASCII period "." instead of
+        the middle dot U+00B7 to avoid UTF-8 emission concerns.
+    @End Reasoning
+    @Implementation:
+        Iterate the seven axes twice: first to collect positive exponents
+        for the numerator, then to collect negative exponents (rendered
+        as their absolute value in the denominator). Each axis label is
+        the SI symbol: m, kg, s, A, K, mol, cd. If the denominator is
+        empty we omit the slash.
+    @End Implementation
+    @Performance_Hints:
+        Branch-heavy due to per-axis dispatch. ~ 200 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure. Returns "1" for the dimensionless case.
+    @End Security_Scope
+    If (proc dim_is_dimensionless with d) is equal to 1:
+        Return "1"
+    End If
+    Let l be proc dim_get_length with d
+    Let m be proc dim_get_mass with d
+    Let t be proc dim_get_time with d
+    Let i be proc dim_get_current with d
+    Let k be proc dim_get_temperature with d
+    Let n be proc dim_get_amount with d
+    Let j be proc dim_get_luminous_intensity with d
+    Note: The full per-axis label rendering with exponent suffixes is
+    Note: implemented in unit.runa::unit_format_dimension which has the
+    Note: string-builder helper already in scope. To avoid duplicating the
+    Note: builder here we delegate to a compact-form name lookup that
+    Note: returns the canonical short name for the common base dimensions.
+    If (l is equal to 1) and (m is equal to 0) and (t is equal to 0) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "m"
+    End If
+    If (l is equal to 0) and (m is equal to 1) and (t is equal to 0) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "kg"
+    End If
+    If (l is equal to 0) and (m is equal to 0) and (t is equal to 1) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "s"
+    End If
+    If (l is equal to 0) and (m is equal to 0) and (t is equal to 0) and (i is equal to 1) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "A"
+    End If
+    If (l is equal to 0) and (m is equal to 0) and (t is equal to 0) and (i is equal to 0) and (k is equal to 1) and (n is equal to 0) and (j is equal to 0):
+        Return "K"
+    End If
+    If (l is equal to 0) and (m is equal to 0) and (t is equal to 0) and (i is equal to 0) and (k is equal to 0) and (n is equal to 1) and (j is equal to 0):
+        Return "mol"
+    End If
+    If (l is equal to 0) and (m is equal to 0) and (t is equal to 0) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 1):
+        Return "cd"
+    End If
+    Note: Common derived dimensions
+    If (l is equal to 1) and (m is equal to 1) and (t is equal to 0 minus 2) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "N"
+    End If
+    If (l is equal to 2) and (m is equal to 1) and (t is equal to 0 minus 2) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "J"
+    End If
+    If (l is equal to 2) and (m is equal to 1) and (t is equal to 0 minus 3) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "W"
+    End If
+    If (l is equal to 0 minus 1) and (m is equal to 1) and (t is equal to 0 minus 2) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "Pa"
+    End If
+    If (l is equal to 1) and (m is equal to 0) and (t is equal to 0 minus 1) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "m/s"
+    End If
+    If (l is equal to 1) and (m is equal to 0) and (t is equal to 0 minus 2) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "m/s^2"
+    End If
+    If (l is equal to 2) and (m is equal to 0) and (t is equal to 0) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "m^2"
+    End If
+    If (l is equal to 3) and (m is equal to 0) and (t is equal to 0) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "m^3"
+    End If
+    If (l is equal to 0) and (m is equal to 0) and (t is equal to 0 minus 1) and (i is equal to 0) and (k is equal to 0) and (n is equal to 0) and (j is equal to 0):
+        Return "Hz"
+    End If
+    Return "complex"
+End Process
+
+Note: ============================================================================
+Note: SECTION 7 - Helpers for the public API
+Note: ============================================================================
+
+Process called "dim_mul_scalar" takes a as Integer, scalar as Integer returns Integer:
+    Note: Alias for dim_pow.
+    Return proc dim_pow with a, scalar
+End Process
+
+Process called "dim_add" takes a as Integer, b as Integer returns Integer:
+    Note: Alias for dim_mul (kept for callers expressing the algebra
+    Note: directly: in additive-group notation the operation is named "add").
+    Return proc dim_mul with a, b
+End Process
+
+Process called "dim_sub" takes a as Integer, b as Integer returns Integer:
+    Note: Alias for dim_div.
+    Return proc dim_div with a, b
+End Process
+
+Process called "dim_inverse" takes a as Integer returns Integer:
+    @Reasoning:
+        The inverse dimension flips every exponent sign. Used for
+        constructing reciprocals (frequency from time, conductance
+        from resistance, etc.).
+    @End Reasoning
+    @Implementation:
+        Negate each exponent and rebuild the packed Int64.
+    @End Implementation
+    @Performance_Hints:
+        Seven negations, one dim_create. ~ 30 cycles.
+    @End Performance_Hints
+    @Security_Scope:
+        Pure.
+    @End Security_Scope
+    Let l be 0 minus (proc dim_get_length with a)
+    Let m be 0 minus (proc dim_get_mass with a)
+    Let t be 0 minus (proc dim_get_time with a)
+    Let i be 0 minus (proc dim_get_current with a)
+    Let k be 0 minus (proc dim_get_temperature with a)
+    Let n be 0 minus (proc dim_get_amount with a)
+    Let j be 0 minus (proc dim_get_luminous_intensity with a)
+    Return proc dim_create with l, m, t, i, k, n, j
+End Process

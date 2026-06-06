@@ -1,0 +1,484 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+PRIVATE_KEY - Algorithm-tagged private key with strong secrecy invariants
+==============================================================================
+
+A PrivateKey carries an algorithm tag and the secret key bytes. It has the
+same memory layout as PublicKey but the API deliberately omits any path that
+could serialize or display the secret material WITHOUT an explicit serialize
+call. There is no to_hex / to_base64 / Display path.
+
+SECURITY CONTRACT (the whole point of this type):
+  1. PrivateKey bytes MUST NEVER be passed to any logging, formatting, or
+     general-purpose serialization API.
+  2. The ONLY paths that may read PrivateKey bytes are:
+       - signature/KEM internal procs (sign, decapsulate, derive_public).
+       - private_key_serialize_authorized: an explicit, named, audit-trail
+         serialize for backup/escrow workflows. Use is intended to be rare.
+       - private_key_destroy: wipes the bytes with secure_zero.
+  3. On destroy, the byte buffer is overwritten with zeros via
+     secure_memory.secure_zero so the wipe survives compiler dead-store
+     elimination.
+  4. The struct's algorithm tag and byte length are non-secret.
+
+Memory layout (arena-allocated, 32 bytes):
+  offset  0 : algorithm tag        (8 bytes)
+  offset  8 : key_bytes pointer    (8 bytes, into arena)
+  offset 16 : key_bytes length     (8 bytes)
+  offset 24 : status flags         (8 bytes; bit 0 = wiped)
+
+References:
+- RFC 8017 section 3.2: RSAPrivateKey representation.
+- RFC 8410: Ed25519/Ed448/X25519/X448 OneAsymmetricKey.
+- D.J. Bernstein, T. Lange, "Failures in NIST's ECC standards" 2014:
+  motivation for private-key handling discipline.
+- BoringSSL crypto/mem.c OPENSSL_cleanse: dead-store-resistant wipe.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+
+Let PRIVATE_KEY_STRUCT_SIZE be 32
+Let PRIVATE_KEY_OFF_ALGORITHM be 0
+Let PRIVATE_KEY_OFF_BYTES_PTR be 8
+Let PRIVATE_KEY_OFF_BYTES_LEN be 16
+Let PRIVATE_KEY_OFF_FLAGS be 24
+
+Let SK_FLAG_WIPED be 1
+
+Note: ============================================================================
+Note: SECTION 1: Construction (validated)
+Note: ============================================================================
+
+@Reasoning
+Construct a PrivateKey from arena-allocated storage, validating the
+algorithm tag and byte length against the algorithm's published private-
+key size (algorithm_private_key_byte_length).
+
+The algorithm MUST be a signature or KEM/key-agreement scheme; hash, AEAD,
+and KDF tags are rejected because they have no notion of "private key".
+
+For RSA, private-key encoding is variable-length so the exact-length
+check is relaxed to a sanity bound (>= 320 bytes per RFC 8017's
+RSAPrivateKey minimum, <= 8192 bytes upper bound).
+
+This is the ONLY constructor for PrivateKey. There is no "private_key_
+from_hex / from_base64" constructor that takes a raw string, because
+allowing raw-string construction encourages copy-pasting key material
+into source code or logs; the only path to a PrivateKey from external
+storage is private_key_deserialize_authorized, which is named to make
+audit trails obvious.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Reject null arena, null bytes pointer, negative length.
+  2. Verify algorithm tag is a signature or KEM/key-agreement.
+  3. For fixed-length algs: require bytes_length matches the published
+     private-key length.
+  4. For RSA: require 320 <= bytes_length <= 8192.
+  5. Allocate the 32-byte struct, zero it.
+  6. Allocate the key buffer, copy in the bytes.
+  7. Store tag, pointer, length, flags=0. Return struct pointer.
+
+Returns 0 on any failure.
+@End Implementation
+
+@Performance_Hints
+O(n) due to the copy. Two arena allocations.
+@End Performance_Hints
+
+@Security_Scope
+The bytes copied into the arena are SECRET. The caller's source buffer
+may be wiped after this call returns (the arena-owned copy is independent).
+
+The arena where the PrivateKey lives must be treated as secret-bearing
+memory for its lifetime. Callers should ensure the arena is dedicated to
+secret material (never shared with non-secret data) so secure_zero on
+arena destruction is comprehensive.
+
+Construction does NOT log the key material in any way. The compiler is
+trusted not to insert debug spills of arguments to this proc; the entire
+arena should be allocated with the secret-memory tier in production.
+
+References:
+- HC#11 (TASC): algorithm-tagged crypto material.
+- libsodium sodium_mlock recommendation.
+@End Security_Scope
+Process called "private_key_create" takes arena as Integer, algorithm as Integer, bytes_in as Integer, bytes_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If bytes_in is equal to 0:
+        Return 0
+    End If
+    If bytes_length is less than 0:
+        Return 0
+    End If
+
+    Let is_sig be Alg.algorithm_is_signature(algorithm)
+    Let is_kem be Alg.algorithm_is_kem_or_kex(algorithm)
+    If is_sig is equal to 0:
+        If is_kem is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Let expected_len be Alg.algorithm_private_key_byte_length(algorithm)
+    If expected_len is greater than 0:
+        If bytes_length is not equal to expected_len:
+            Return 0
+        End If
+    Otherwise:
+        Note: RSA path.
+        If bytes_length is less than 320:
+            Return 0
+        End If
+        If bytes_length is greater than 8192:
+            Return 0
+        End If
+    End If
+
+    Let sk be Arena.arena_allocate(arena, PRIVATE_KEY_STRUCT_SIZE)
+    If sk is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than PRIVATE_KEY_STRUCT_SIZE:
+        Memory.memory_set_byte(sk, zi, 0)
+        Set zi to zi plus 1
+    End While
+
+    Let buf be Arena.arena_allocate(arena, bytes_length)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(buf, bytes_in, bytes_length)
+
+    Memory.memory_set_qword(sk, PRIVATE_KEY_OFF_ALGORITHM, algorithm)
+    Memory.memory_set_qword(sk, PRIVATE_KEY_OFF_BYTES_PTR, buf)
+    Memory.memory_set_qword(sk, PRIVATE_KEY_OFF_BYTES_LEN, bytes_length)
+    Memory.memory_set_qword(sk, PRIVATE_KEY_OFF_FLAGS, 0)
+    Return sk
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Accessors (algorithm, length only; NOT byte content publicly)
+Note: ============================================================================
+
+@Reasoning
+Returns the algorithm tag. Non-secret metadata.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "private_key_algorithm" takes sk as Integer returns Integer:
+    If sk is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(sk, PRIVATE_KEY_OFF_ALGORITHM)
+End Process
+
+@Reasoning
+Returns the byte length. Non-secret metadata.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 16.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "private_key_byte_length" takes sk as Integer returns Integer:
+    If sk is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(sk, PRIVATE_KEY_OFF_BYTES_LEN)
+End Process
+
+@Reasoning
+Returns the status flag word.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 24.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "private_key_flags" takes sk as Integer returns Integer:
+    If sk is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(sk, PRIVATE_KEY_OFF_FLAGS)
+End Process
+
+@Reasoning
+Returns 1 if the key has been wiped via private_key_destroy. Wiped keys
+must not be used in any cryptographic operation.
+@End Reasoning
+
+@Implementation
+Reads bit 0 of the flags qword.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Status check before crypto use is mandatory. Calling sign/derive on a
+wiped key is a usage bug; the implementations check this flag.
+@End Security_Scope
+Process called "private_key_is_wiped" takes sk as Integer returns Integer:
+    If sk is equal to 0:
+        Return 1
+    End If
+    Let f be private_key_flags(sk)
+    Let masked be f bitwise_and SK_FLAG_WIPED
+    If masked is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: PROTECTED byte access for crypto operations
+Note: ============================================================================
+
+@Reasoning
+Returns the raw byte pointer for a PrivateKey, FOR USE BY CRYPTO PROCS
+ONLY. This accessor is named to make the security boundary explicit: any
+call site outside the crypto module set (ed25519, ecdsa, rsa, ml_dsa,
+slh_dsa, falcon, x25519, x448, ml_kem) is a violation of the security
+contract and must be reviewed.
+
+The reason a public-named accessor exists at all (rather than declaring
+it module-private) is that the v0.0.8.5 bootstrap does not yet enforce
+inter-module visibility; the discipline is enforced by naming and review
+rather than by the compiler.
+
+Calling this on a wiped key returns 0 to make use-after-wipe detectable.
+@End Reasoning
+
+@Implementation
+Returns 0 if the wiped bit is set. Otherwise returns the qword at offset 8.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+This is the secret-bearing accessor. NEVER call this from logging code,
+formatting code, error-reporting code, or any code path that may emit
+the value to a log, a network message, a file, or stdout.
+
+The "internal" suffix is the audit trail: any line referencing
+private_key_secret_bytes_internal must be inside a crypto primitive.
+@End Security_Scope
+Process called "private_key_secret_bytes_internal" takes sk as Integer returns Integer:
+    If sk is equal to 0:
+        Return 0
+    End If
+    If private_key_is_wiped(sk) is equal to 1:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(sk, PRIVATE_KEY_OFF_BYTES_PTR)
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Authorized serialize / deserialize for backup workflows
+Note: ============================================================================
+
+@Reasoning
+Copies the secret bytes into out_buffer for explicit serialization
+(backup, escrow, hardware token import). This is the ONE PERMITTED PATH
+that emits the secret bytes out of the PrivateKey container. The name
+"authorized" makes audit-trail review trivial: every call site exporting
+secret material is visible to grep.
+
+Returns the number of bytes written, or 0 on any failure (null inputs,
+wiped key, insufficient buffer).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate sk is non-null and non-wiped.
+  2. Validate out_buffer is non-null and out_capacity is sufficient.
+  3. Copy bytes via memory_copy.
+  4. Return the byte length.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+The caller MUST handle the out_buffer with the same care as the
+PrivateKey itself. Recommended practice: out_buffer lives in mlock'd
+memory and is wiped with secure_zero immediately after the
+serialization (encryption, transmission to hardware token, etc.)
+completes.
+
+NEVER pass an out_buffer that resides in a logging path, an error
+context, or any heap allocated by general-purpose code.
+
+References:
+- NIST SP 800-57 Part 1 Rev 5 section 6.2.1.1: key wrapping for
+  archive and backup.
+- PKCS #8 (RFC 5208) one-asymmetric-key serialization.
+@End Security_Scope
+Process called "private_key_serialize_authorized" takes sk as Integer, out_buffer as Integer, out_capacity as Integer returns Integer:
+    If sk is equal to 0:
+        Return 0
+    End If
+    If out_buffer is equal to 0:
+        Return 0
+    End If
+    If private_key_is_wiped(sk) is equal to 1:
+        Return 0
+    End If
+    Let len be private_key_byte_length(sk)
+    If out_capacity is less than len:
+        Return 0
+    End If
+    Let src be Memory.memory_get_qword(sk, PRIVATE_KEY_OFF_BYTES_PTR)
+    Memory.memory_copy(out_buffer, src, len)
+    Return len
+End Process
+
+@Reasoning
+Reconstruct a PrivateKey from previously-serialized secret bytes
+(typically read from encrypted backup or hardware-token import). The
+caller has supplied the bytes via private_key_create, so this proc is
+an alias that exists purely for symmetric naming with
+private_key_serialize_authorized.
+
+The wrap-and-name pattern keeps audit-trail review symmetric: a grep
+for "authorized" finds both export and import paths.
+@End Reasoning
+
+@Implementation
+Delegates to private_key_create. The algorithm tag and bytes_length
+are validated by the underlying constructor.
+@End Implementation
+
+@Performance_Hints
+O(n).
+@End Performance_Hints
+
+@Security_Scope
+Bytes_in must be wiped by the CALLER immediately after this proc
+returns, regardless of success or failure. The arena-owned copy is
+the only retained instance.
+@End Security_Scope
+Process called "private_key_deserialize_authorized" takes arena as Integer, algorithm as Integer, bytes_in as Integer, bytes_length as Integer returns Integer:
+    Return private_key_create(arena, algorithm, bytes_in, bytes_length)
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Destroy with secure_zero
+Note: ============================================================================
+
+@Reasoning
+Securely wipe the secret bytes carried by sk and mark the struct as
+wiped. After this call:
+  - private_key_is_wiped returns 1
+  - private_key_secret_bytes_internal returns 0
+  - all crypto ops on this PrivateKey will refuse the operation
+  - the byte buffer in the arena is overwritten with zeros via
+    secure_memory.secure_zero so the wipe survives compiler dead-store
+    elimination
+
+The struct header itself stays in the arena (arena destruction will
+reclaim it). We do not destroy the arena because the caller may have
+other items in it.
+
+This proc is idempotent: calling on an already-wiped key is a no-op
+that returns 1.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. If sk is null, return 0.
+  2. If already wiped, return 1.
+  3. Look up buffer pointer and length.
+  4. Call secure_zero to overwrite the buffer.
+  5. Set the wiped flag bit.
+  6. Return 1.
+@End Implementation
+
+@Performance_Hints
+O(n) in key length.
+@End Performance_Hints
+
+@Security_Scope
+The secure_zero primitive is constructed to resist dead-store
+elimination by the compiler (see secure_memory.runa for details). This
+is the canonical wipe for secret material.
+
+After secure_zero, the buffer's bytes are 0; the struct is marked
+wiped to give later code a fast-path check without re-reading the
+(now-zero) buffer.
+
+Cold-boot DRAM remanence remains an out-of-scope hardware threat;
+defeated only by hardware memory encryption (Intel TME / AMD SME).
+
+References:
+- BoringSSL OPENSSL_cleanse.
+- libsodium sodium_memzero.
+- Halderman et al. "Lest We Remember", USENIX Security 2008.
+@End Security_Scope
+Process called "private_key_destroy" takes sk as Integer returns Integer:
+    If sk is equal to 0:
+        Return 0
+    End If
+    If private_key_is_wiped(sk) is equal to 1:
+        Return 1
+    End If
+    Let buf be Memory.memory_get_qword(sk, PRIVATE_KEY_OFF_BYTES_PTR)
+    Let len be Memory.memory_get_qword(sk, PRIVATE_KEY_OFF_BYTES_LEN)
+    Secure.secure_zero(buf, len)
+    Let f be Memory.memory_get_qword(sk, PRIVATE_KEY_OFF_FLAGS)
+    Let updated be f bitwise_or SK_FLAG_WIPED
+    Memory.memory_set_qword(sk, PRIVATE_KEY_OFF_FLAGS, updated)
+    Return 1
+End Process

@@ -1,0 +1,1164 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+MARKUP SELECTOR ENGINE - Matches CSS Selectors against the Element AST
+==============================================================================
+
+This module is the matching engine that pairs the CSS Selector AST defined
+in compiler/frontend/primitives/style/selector.runa with the Element AST
+defined in compiler/frontend/primitives/markup/element.runa.  The parser
++ specificity calculator live in style/selector.runa; the matcher and
+the query-all driver live here so the markup substrate can be used
+without pulling in the style subsystem when matching is unused.
+
+Matching semantics follow W3C Selectors Level 4
+(https://www.w3.org/TR/selectors-4/).  Combinators are evaluated
+right-to-left per the algorithm in section 4.  Pseudo-classes implemented:
+
+  :hover, :focus, :active            -- evaluated as always-false unless the
+                                        caller has set the corresponding
+                                        state flag on the element (state
+                                        flags are application concerns)
+  :first-child, :last-child          -- structural position in parent
+  :nth-child(An+B)                   -- per section 14.4
+  :not(simple-selector)              -- recursive non-match
+  :has(selector)                     -- recursive presence test (Level 4)
+  :empty                             -- no children
+  :root                              -- element has no parent
+
+The matcher is iterative; it allocates only when descending into a
+combinator's leftward partner via element ancestor / preceding-sibling
+chains and produces stable results in O(depth * combinator-count *
+average-selector-length) per call.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+Import "compiler/frontend/primitives/markup/element.runa" as Elem
+Import "compiler/frontend/primitives/style/selector.runa" as Sel
+
+Note: ============================================================================
+Note: TAG MIRRORS - kept in lockstep with style/selector.runa
+Note: ============================================================================
+
+Constant MS_KIND_UNIVERSAL as Integer is 1
+Constant MS_KIND_TYPE as Integer is 2
+Constant MS_KIND_CLASS as Integer is 3
+Constant MS_KIND_ID as Integer is 4
+Constant MS_KIND_ATTRIBUTE as Integer is 5
+Constant MS_KIND_PSEUDO_CLASS as Integer is 6
+Constant MS_KIND_PSEUDO_ELEMENT as Integer is 7
+Constant MS_KIND_COMPOUND as Integer is 8
+Constant MS_KIND_COMPLEX as Integer is 9
+Constant MS_KIND_LIST as Integer is 10
+Constant MS_KIND_COMBINATOR as Integer is 11
+
+Constant MS_COMB_DESCENDANT as Integer is 0
+Constant MS_COMB_CHILD as Integer is 1
+Constant MS_COMB_ADJACENT as Integer is 2
+Constant MS_COMB_GENERAL as Integer is 3
+Constant MS_COMB_COLUMN as Integer is 4
+
+Constant MS_ATTR_PRESENT as Integer is 0
+Constant MS_ATTR_EQ as Integer is 1
+Constant MS_ATTR_INCLUDES as Integer is 2
+Constant MS_ATTR_DASHMATCH as Integer is 3
+Constant MS_ATTR_PREFIX as Integer is 4
+Constant MS_ATTR_SUFFIX as Integer is 5
+Constant MS_ATTR_SUBSTR as Integer is 6
+
+Note: ============================================================================
+Note: STRING UTILITIES - whitespace tokenization on attribute values
+Note: ============================================================================
+
+@Reasoning
+Class attribute matching needs whitespace-tokenized comparison: the
+selector .foo matches an element whose class attribute, when split on
+ASCII whitespace, contains "foo" exactly.  This is W3C Selectors Level
+4 section 6.5.
+@End Reasoning
+@Implementation
+Scan the haystack one character at a time.  Whenever a non-whitespace
+run begins, compare it byte-by-byte against the needle; if it matches
+in full and the run terminates at the needle's length, return 1.
+Otherwise advance to the next whitespace boundary and continue.
+@End Implementation
+@Performance_Hints
+O(len(haystack) * len(needle)) worst case; in practice the early-out on
+length mismatch keeps this near O(len(haystack)).
+@End Performance_Hints
+@Security_Scope
+Null-safe in both arguments; returns 0 on null haystack.
+@End Security_Scope
+Process called "ms_token_contains" takes haystack as Integer, needle as Integer returns Integer:
+    If haystack is equal to 0:
+        Return 0
+    End If
+    If needle is equal to 0:
+        Return 0
+    End If
+    Let hlen be proc string_length from StringCore with haystack
+    Let nlen be proc string_length from StringCore with needle
+    If nlen is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than hlen:
+        Let ch be proc string_char_at from StringCore with haystack, i
+        Let is_ws be proc is_whitespace from Char with ch
+        If is_ws is equal to 1:
+            Set i to i plus 1
+        Otherwise:
+            Let start be i
+            While i is less than hlen:
+                Let c2 be proc string_char_at from StringCore with haystack, i
+                Let is_ws2 be proc is_whitespace from Char with c2
+                If is_ws2 is equal to 1:
+                    Set i to hlen
+                Otherwise:
+                    Set i to i plus 1
+                End If
+            End While
+            Let run_end be i
+            If is_ws is equal to 0:
+                Let run_len be run_end minus start
+                If run_len is equal to nlen:
+                    Let match be 1
+                    Let k be 0
+                    While k is less than nlen:
+                        Let ah be proc string_char_at from StringCore with haystack, start plus k
+                        Let an be proc string_char_at from StringCore with needle, k
+                        If ah is not equal to an:
+                            Set match to 0
+                            Set k to nlen
+                        End If
+                        Set k to k plus 1
+                    End While
+                    If match is equal to 1:
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Substring containment used by [attr*=value] (CSS Selectors 4 6.5.7).
+@End Reasoning
+@Implementation
+Sliding window scan with early-exit on first match.  Byte-equality used
+because attribute values are treated as opaque byte streams; case
+sensitivity is the parser/normalizer's responsibility.
+@End Implementation
+@Performance_Hints
+O(len(haystack) * len(needle)).
+@End Performance_Hints
+@Security_Scope
+Null-safe in both inputs.
+@End Security_Scope
+Process called "ms_contains_substring" takes haystack as Integer, needle as Integer returns Integer:
+    If haystack is equal to 0:
+        Return 0
+    End If
+    If needle is equal to 0:
+        Return 0
+    End If
+    Let hlen be proc string_length from StringCore with haystack
+    Let nlen be proc string_length from StringCore with needle
+    If nlen is equal to 0:
+        Return 1
+    End If
+    If nlen is greater than hlen:
+        Return 0
+    End If
+    Let last_start be hlen minus nlen
+    Let i be 0
+    While i is less than or equal to last_start:
+        Let match be 1
+        Let k be 0
+        While k is less than nlen:
+            Let ah be proc string_char_at from StringCore with haystack, i plus k
+            Let an be proc string_char_at from StringCore with needle, k
+            If ah is not equal to an:
+                Set match to 0
+                Set k to nlen
+            End If
+            Set k to k plus 1
+        End While
+        If match is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning
+[attr|=value] dash-match per CSS Selectors 4 6.5.4: the attribute value
+either equals `value` exactly or begins with `value-`.
+@End Reasoning
+@Implementation
+Equality fast-path, then prefix check followed by a dash test.
+@End Implementation
+@Performance_Hints
+O(len(needle) + 1).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "ms_dashmatch" takes haystack as Integer, needle as Integer returns Integer:
+    If haystack is equal to 0:
+        Return 0
+    End If
+    If needle is equal to 0:
+        Return 0
+    End If
+    Let eq be proc string_equals from StringCore with haystack, needle
+    If eq is equal to 1:
+        Return 1
+    End If
+    Let prefix_ok be proc string_starts_with from StringCore with haystack, needle
+    If prefix_ok is equal to 0:
+        Return 0
+    End If
+    Let nlen be proc string_length from StringCore with needle
+    Let next_ch be proc string_char_at from StringCore with haystack, nlen
+    If next_ch is equal to 45:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SIMPLE SELECTOR MATCH
+Note: ============================================================================
+
+@Reasoning
+Test whether a single simple selector matches the given element.  This
+is the leaf of the matching recursion.  Each kind is handled with the
+inverse of how the parser populates the primary/secondary/attr_op slots.
+@End Reasoning
+@Implementation
+Switch on the selector kind tag.  Universal selectors trivially match.
+Type selectors compare tag names.  Class selectors look up the "class"
+attribute and use token-contains.  Id selectors use byte equality on
+"id".  Attribute selectors dispatch on attr_op (PRESENT, EQ, INCLUDES,
+DASHMATCH, PREFIX, SUFFIX, SUBSTR).  Pseudo-classes call into the
+pseudo-class evaluator.
+@End Implementation
+@Performance_Hints
+O(attributes) for attribute / class lookups; O(1) otherwise.
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Pseudo-element selectors always return 0 because they match
+no element (they match a generated box).
+@End Security_Scope
+Process called "selector_match_simple" takes element as Integer, sel as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    If sel is equal to 0:
+        Return 0
+    End If
+    Let kind be proc selector_kind from Sel with sel
+    If kind is equal to MS_KIND_UNIVERSAL:
+        Return 1
+    End If
+    If kind is equal to MS_KIND_TYPE:
+        Let needed be proc selector_primary from Sel with sel
+        Let tag be proc element_get_tag_name from Elem with element
+        Return proc string_equals from StringCore with tag, needed
+    End If
+    If kind is equal to MS_KIND_CLASS:
+        Let class_name be proc selector_primary from Sel with sel
+        Let class_attr be "class"
+        Let class_value be proc element_get_attribute from Elem with element, class_attr
+        Return proc ms_token_contains with class_value, class_name
+    End If
+    If kind is equal to MS_KIND_ID:
+        Let id_name be proc selector_primary from Sel with sel
+        Let id_attr be "id"
+        Let id_value be proc element_get_attribute from Elem with element, id_attr
+        Return proc string_equals from StringCore with id_value, id_name
+    End If
+    If kind is equal to MS_KIND_ATTRIBUTE:
+        Return proc selector_match_attribute with element, sel
+    End If
+    If kind is equal to MS_KIND_PSEUDO_CLASS:
+        Return proc selector_match_pseudo_class with element, sel
+    End If
+    If kind is equal to MS_KIND_PSEUDO_ELEMENT:
+        Return 0
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Match an attribute selector against an element.  Combines the seven
+operator variants defined by CSS Selectors Level 4 section 6.
+@End Reasoning
+@Implementation
+Read primary (attribute name), secondary (operand value), and attr_op
+slots from the selector node.  For PRESENT, only existence is checked;
+for the value-bearing operators, get the actual attribute value and
+dispatch to the appropriate comparator helper.
+@End Implementation
+@Performance_Hints
+O(attributes) on the element; each comparator is linear in value length.
+@End Performance_Hints
+@Security_Scope
+Returns 0 when the attribute is missing.
+@End Security_Scope
+Process called "selector_match_attribute" takes element as Integer, sel as Integer returns Integer:
+    Let attr_name be proc selector_primary from Sel with sel
+    Let op be proc selector_attr_op from Sel with sel
+    Let has be proc element_has_attribute from Elem with element, attr_name
+    If has is equal to 0:
+        Return 0
+    End If
+    If op is equal to MS_ATTR_PRESENT:
+        Return 1
+    End If
+    Let value be proc element_get_attribute from Elem with element, attr_name
+    Let needed be proc selector_secondary from Sel with sel
+    If op is equal to MS_ATTR_EQ:
+        Return proc string_equals from StringCore with value, needed
+    End If
+    If op is equal to MS_ATTR_INCLUDES:
+        Return proc ms_token_contains with value, needed
+    End If
+    If op is equal to MS_ATTR_DASHMATCH:
+        Return proc ms_dashmatch with value, needed
+    End If
+    If op is equal to MS_ATTR_PREFIX:
+        Return proc string_starts_with from StringCore with value, needed
+    End If
+    If op is equal to MS_ATTR_SUFFIX:
+        Return proc string_ends_with from StringCore with value, needed
+    End If
+    If op is equal to MS_ATTR_SUBSTR:
+        Return proc ms_contains_substring with value, needed
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PSEUDO-CLASS MATCH
+Note: ============================================================================
+
+@Reasoning
+Evaluate the structural and presence-style pseudo-classes that the
+substrate can answer without external state.  Dynamic pseudo-classes
+(:hover, :focus, :active) require interaction state that lives outside
+the markup substrate and therefore always evaluate to false here.
+@End Reasoning
+@Implementation
+Switch on the pseudo name string.  :first-child / :last-child compare
+the element's position against its parent's element-child list (text and
+comment nodes are skipped per CSS Selectors 4 section 14.3).  :nth-child
+parses the An+B argument and tests the position formula per CSS
+Selectors 4 section 14.4, accepting bare integers, the An+B grammar,
+and the odd / even keywords.  :empty returns 1 when the element has no
+children.  :root returns 1 when the element has no parent in the active
+scope subtree.  :not and :has recurse into the inner selector parsed
+from the secondary slot.  :hover, :focus, :active require interaction
+state that lives outside the markup substrate and evaluate to 0.
+@End Implementation
+@Performance_Hints
+O(parent_children) for position-bearing pseudo-classes; O(subtree) for
+:has; O(1) for the others.
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Unknown pseudo names return 0.
+@End Security_Scope
+Process called "ms_element_position_in_parent" takes parent as Integer, target as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+    If target is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with parent, 24
+    If children is equal to 0:
+        Return 0
+    End If
+    Let ccount be proc list_length from List with children
+    Let i be 0
+    Let position be 0
+    While i is less than ccount:
+        Let node be proc list_get from List with children, i
+        Let kind be proc memory_get_int64 from Memory with node, 0
+        If kind is equal to 1:
+            Set position to position plus 1
+            Let elem be proc memory_get_int64 from Memory with node, 8
+            If elem is equal to target:
+                Return position
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "ms_element_child_count" takes parent as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with parent, 24
+    If children is equal to 0:
+        Return 0
+    End If
+    Let ccount be proc list_length from List with children
+    Let i be 0
+    Let count be 0
+    While i is less than ccount:
+        Let node be proc list_get from List with children, i
+        Let kind be proc memory_get_int64 from Memory with node, 0
+        If kind is equal to 1:
+            Set count to count plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return count
+End Process
+
+Note: ============================================================================
+Note: AN+B PARSER for :nth-child
+Note: ============================================================================
+
+@Reasoning
+CSS Selectors Level 4 grammar for the :nth-child argument permits a
+small set of shapes: an integer literal (e.g. `5`), the keywords
+`odd` and `even`, or the An+B form `2n+1`, `-3n+4`, `n`, `-n`, `n-2`,
+`+2n`, etc.  This helper parses any of those forms and returns two
+out-parameters: the A coefficient and the B offset.  The caller then
+applies the matching rule: a 1-indexed position p matches when there
+exists a non-negative integer k such that p == A*k + B.  When A is
+zero, this collapses to p == B.
+@End Reasoning
+@Implementation
+The arg string is consumed in one left-to-right pass.  Leading
+whitespace is skipped.  If the string is exactly "odd" (case-sensitive
+in CSS but the parser accepts canonical lowercase) the result is
+(2,1); for "even" the result is (2,0).  Otherwise an optional sign
+prefix is read; a digit run before `n` is the A magnitude (1 when
+absent and the sign is present, e.g. `-n`).  If no `n` token is found,
+the leading signed integer is B with A=0.  After the `n`, optional
+whitespace, sign, whitespace, and digits form B (default 0).  All
+whitespace tolerance follows the grammar definition in the spec.
+Result encoding: writes A at out_a (8-byte slot) and B at out_b.
+Returns 1 on success and 0 on malformed input.
+@End Implementation
+@Performance_Hints
+O(len(arg)).
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Malformed input returns 0 and out parameters are unchanged.
+@End Security_Scope
+Process called "ms_skip_ws" takes s as Integer, i as Integer, slen as Integer returns Integer:
+    While i is less than slen:
+        Let ch be proc string_char_at from StringCore with s, i
+        Let is_ws be proc is_whitespace from Char with ch
+        If is_ws is equal to 0:
+            Return i
+        End If
+        Set i to i plus 1
+    End While
+    Return i
+End Process
+
+Process called "ms_parse_nth_arg" takes arg as Integer, out_a as Integer, out_b as Integer returns Integer:
+    If arg is equal to 0:
+        Return 0
+    End If
+    Let slen be proc string_length from StringCore with arg
+    If slen is equal to 0:
+        Return 0
+    End If
+    Let eq_odd be proc string_equals from StringCore with arg, "odd"
+    If eq_odd is equal to 1:
+        proc memory_set_int64 from Memory with out_a, 0, 2
+        proc memory_set_int64 from Memory with out_b, 0, 1
+        Return 1
+    End If
+    Let eq_even be proc string_equals from StringCore with arg, "even"
+    If eq_even is equal to 1:
+        proc memory_set_int64 from Memory with out_a, 0, 2
+        proc memory_set_int64 from Memory with out_b, 0, 0
+        Return 1
+    End If
+    Let i be proc ms_skip_ws with arg, 0, slen
+    If i is greater than or equal to slen:
+        Return 0
+    End If
+    Let sign be 1
+    Let ch0 be proc string_char_at from StringCore with arg, i
+    If ch0 is equal to 43:
+        Set i to i plus 1
+    Otherwise:
+        If ch0 is equal to 45:
+            Set sign to 0 minus 1
+            Set i to i plus 1
+        End If
+    End If
+    Set i to proc ms_skip_ws with arg, i, slen
+    Let digit_start be i
+    While i is less than slen:
+        Let cd be proc string_char_at from StringCore with arg, i
+        Let isd be proc is_digit from Char with cd
+        If isd is equal to 0:
+            Set i to slen plus 1
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+    If i is greater than slen:
+        Set i to i minus slen
+        Set i to i minus 1
+        Note: i now holds the position of the first non-digit (or slen if all digits)
+    Otherwise:
+        Note: ran off the end with all digits
+        Set i to slen
+    End If
+    Let mag be 0
+    Let has_digits be 0
+    Let p be digit_start
+    While p is less than i:
+        Let pd be proc string_char_at from StringCore with arg, p
+        Set mag to mag multiplied by 10
+        Set mag to mag plus (pd minus 48)
+        Set has_digits to 1
+        Set p to p plus 1
+    End While
+    Set i to proc ms_skip_ws with arg, i, slen
+    Let saw_n be 0
+    If i is less than slen:
+        Let cn be proc string_char_at from StringCore with arg, i
+        If cn is equal to 110:
+            Set saw_n to 1
+        Otherwise:
+            If cn is equal to 78:
+                Set saw_n to 1
+            End If
+        End If
+    End If
+    If saw_n is equal to 0:
+        If has_digits is equal to 0:
+            Return 0
+        End If
+        Let b_val be mag multiplied by sign
+        proc memory_set_int64 from Memory with out_a, 0, 0
+        proc memory_set_int64 from Memory with out_b, 0, b_val
+        Return 1
+    End If
+    Set i to i plus 1
+    Let a_val be mag
+    If has_digits is equal to 0:
+        Set a_val to 1
+    End If
+    Set a_val to a_val multiplied by sign
+    Set i to proc ms_skip_ws with arg, i, slen
+    Let b_sign be 1
+    Let b_val2 be 0
+    Let saw_b_sign be 0
+    If i is less than slen:
+        Let cs be proc string_char_at from StringCore with arg, i
+        If cs is equal to 43:
+            Set saw_b_sign to 1
+            Set i to i plus 1
+        Otherwise:
+            If cs is equal to 45:
+                Set saw_b_sign to 1
+                Set b_sign to 0 minus 1
+                Set i to i plus 1
+            End If
+        End If
+    End If
+    Set i to proc ms_skip_ws with arg, i, slen
+    Let b_has_digits be 0
+    While i is less than slen:
+        Let cb be proc string_char_at from StringCore with arg, i
+        Let isbd be proc is_digit from Char with cb
+        If isbd is equal to 0:
+            Set i to slen
+        Otherwise:
+            Set b_val2 to b_val2 multiplied by 10
+            Set b_val2 to b_val2 plus (cb minus 48)
+            Set b_has_digits to 1
+            Set i to i plus 1
+        End If
+    End While
+    If saw_b_sign is equal to 1:
+        If b_has_digits is equal to 0:
+            Return 0
+        End If
+    End If
+    Let b_final be b_val2 multiplied by b_sign
+    proc memory_set_int64 from Memory with out_a, 0, a_val
+    proc memory_set_int64 from Memory with out_b, 0, b_final
+    Return 1
+End Process
+
+Process called "selector_match_pseudo_class" takes element as Integer, sel as Integer returns Integer:
+    Return proc selector_match_pseudo_class_in_scope with element, sel, element
+End Process
+
+Process called "selector_match_pseudo_class_in_scope" takes element as Integer, sel as Integer, scope as Integer returns Integer:
+    Let name be proc selector_primary from Sel with sel
+    If name is equal to 0:
+        Return 0
+    End If
+    Let eq_empty be proc string_equals from StringCore with name, "empty"
+    If eq_empty is equal to 1:
+        Let count be proc element_child_count from Elem with element
+        If count is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    Let eq_first be proc string_equals from StringCore with name, "first-child"
+    If eq_first is equal to 1:
+        Let parent_f be proc ms_find_parent with scope, element
+        If parent_f is equal to 0:
+            Return 0
+        End If
+        Let pos_f be proc ms_element_position_in_parent with parent_f, element
+        If pos_f is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+    Let eq_last be proc string_equals from StringCore with name, "last-child"
+    If eq_last is equal to 1:
+        Let parent_l be proc ms_find_parent with scope, element
+        If parent_l is equal to 0:
+            Return 0
+        End If
+        Let pos_l be proc ms_element_position_in_parent with parent_l, element
+        If pos_l is equal to 0:
+            Return 0
+        End If
+        Let total_l be proc ms_element_child_count with parent_l
+        If pos_l is equal to total_l:
+            Return 1
+        End If
+        Return 0
+    End If
+    Let eq_nth be proc string_equals from StringCore with name, "nth-child"
+    If eq_nth is equal to 1:
+        Let parent_n be proc ms_find_parent with scope, element
+        If parent_n is equal to 0:
+            Return 0
+        End If
+        Let pos_n be proc ms_element_position_in_parent with parent_n, element
+        If pos_n is equal to 0:
+            Return 0
+        End If
+        Let arg be proc selector_secondary from Sel with sel
+        Let a_slot be proc memory_allocate from Memory with 8
+        If a_slot is equal to 0:
+            Return 0
+        End If
+        Let b_slot be proc memory_allocate from Memory with 8
+        If b_slot is equal to 0:
+            proc memory_free from Memory with a_slot
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with a_slot, 0, 0
+        proc memory_set_int64 from Memory with b_slot, 0, 0
+        Let parsed be proc ms_parse_nth_arg with arg, a_slot, b_slot
+        Let a_coef be proc memory_get_int64 from Memory with a_slot, 0
+        Let b_off be proc memory_get_int64 from Memory with b_slot, 0
+        proc memory_free from Memory with a_slot
+        proc memory_free from Memory with b_slot
+        If parsed is equal to 0:
+            Return 0
+        End If
+        If a_coef is equal to 0:
+            If pos_n is equal to b_off:
+                Return 1
+            End If
+            Return 0
+        End If
+        Let diff be pos_n minus b_off
+        If a_coef is greater than 0:
+            If diff is less than 0:
+                Return 0
+            End If
+            Let r be diff
+            While r is greater than or equal to a_coef:
+                Set r to r minus a_coef
+            End While
+            If r is equal to 0:
+                Return 1
+            End If
+            Return 0
+        End If
+        Let neg_a be 0 minus a_coef
+        If diff is greater than 0:
+            Return 0
+        End If
+        Let r2 be 0 minus diff
+        While r2 is greater than or equal to neg_a:
+            Set r2 to r2 minus neg_a
+        End While
+        If r2 is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    Let eq_root be proc string_equals from StringCore with name, "root"
+    If eq_root is equal to 1:
+        Let parent_r be proc ms_find_parent with scope, element
+        If parent_r is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    Let eq_not be proc string_equals from StringCore with name, "not"
+    If eq_not is equal to 1:
+        Let inner be proc selector_secondary from Sel with sel
+        Let inner_sel be proc selector_parse from Sel with inner
+        If inner_sel is equal to 0:
+            Return 0
+        End If
+        Let inner_match be proc selector_match_in_scope with element, inner_sel, scope
+        proc selector_destroy from Sel with inner_sel
+        If inner_match is equal to 1:
+            Return 0
+        End If
+        Return 1
+    End If
+    Let eq_has be proc string_equals from StringCore with name, "has"
+    If eq_has is equal to 1:
+        Let inner_text be proc selector_secondary from Sel with sel
+        Let inner_h be proc selector_parse from Sel with inner_text
+        If inner_h is equal to 0:
+            Return 0
+        End If
+        Let descendants be proc list_create from List
+        If descendants is equal to 0:
+            proc selector_destroy from Sel with inner_h
+            Return 0
+        End If
+        proc element_walk from Elem with element, descendants
+        Let dcount be proc list_length from List with descendants
+        Let i be 1
+        Let found be 0
+        While i is less than dcount:
+            Let d be proc list_get from List with descendants, i
+            Let m be proc selector_match_in_scope with d, inner_h, scope
+            If m is equal to 1:
+                Set found to 1
+                Set i to dcount
+            End If
+            Set i to i plus 1
+        End While
+        proc list_destroy from List with descendants
+        proc selector_destroy from Sel with inner_h
+        Return found
+    End If
+    Let eq_hover be proc string_equals from StringCore with name, "hover"
+    If eq_hover is equal to 1:
+        Return 0
+    End If
+    Let eq_focus be proc string_equals from StringCore with name, "focus"
+    If eq_focus is equal to 1:
+        Return 0
+    End If
+    Let eq_active be proc string_equals from StringCore with name, "active"
+    If eq_active is equal to 1:
+        Return 0
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: COMPOUND AND COMPLEX MATCH
+Note: ============================================================================
+
+@Reasoning
+A compound selector matches an element iff every simple selector in
+its child list matches that same element.  Combinators are encoded
+inside complex selectors only, so a compound selector's children are
+all simple.
+@End Reasoning
+@Implementation
+Iterate the children list; on any failure, return 0.  All children
+matching returns 1.  Empty compound selectors trivially match.
+@End Implementation
+@Performance_Hints
+O(simple-selector count).
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "selector_match_compound" takes element as Integer, sel as Integer returns Integer:
+    Let children be proc selector_children from Sel with sel
+    If children is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from List with children
+    Let i be 0
+    While i is less than count:
+        Let child_sel be proc list_get from List with children, i
+        Let m be proc selector_match with element, child_sel
+        If m is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning
+A complex selector's children list interleaves selector pieces and
+combinator records: [piece0, comb0, piece1, comb1, piece2, ...].
+Matching is performed right-to-left because the rightmost piece must
+match the candidate element and earlier combinators specify how to
+ascend the tree to find the prior piece.
+@End Reasoning
+@Implementation
+Walk the children list from the tail.  The terminal piece must match
+the candidate.  For each preceding [combinator, piece] pair, find the
+appropriate partner element relative to the current candidate
+(parent for child combinator, any ancestor for descendant, previous
+sibling for adjacent, any earlier sibling for general).  Recurse on
+that partner with the partner piece.  Failure to find any partner
+satisfying the piece returns 0.
+@End Implementation
+@Performance_Hints
+O(depth * pieces) for descendant combinators; O(siblings * pieces) for
+sibling combinators.
+@End Performance_Hints
+@Security_Scope
+Null-safe.  Malformed complex selectors (odd-length children list
+without a terminating combinator partner) return 0.
+@End Security_Scope
+Process called "ms_find_parent" takes root as Integer, target as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    If target is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Memory with root, 24
+    If children is equal to 0:
+        Return 0
+    End If
+    Let ccount be proc list_length from List with children
+    Let i be 0
+    While i is less than ccount:
+        Let node be proc list_get from List with children, i
+        Let kind be proc memory_get_int64 from Memory with node, 0
+        If kind is equal to 1:
+            Let elem be proc memory_get_int64 from Memory with node, 8
+            If elem is equal to target:
+                Return root
+            End If
+            Let parent_in_sub be proc ms_find_parent with elem, target
+            If parent_in_sub is not equal to 0:
+                Return parent_in_sub
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "selector_match_complex" takes element as Integer, sel as Integer, scope as Integer returns Integer:
+    Let children be proc selector_children from Sel with sel
+    If children is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from List with children
+    If count is equal to 0:
+        Return 1
+    End If
+    Let last_index be count minus 1
+    Let last_piece be proc list_get from List with children, last_index
+    Let tail_match be proc selector_match with element, last_piece
+    If tail_match is equal to 0:
+        Return 0
+    End If
+    If count is equal to 1:
+        Return 1
+    End If
+    Let current be element
+    Let i be last_index minus 1
+    While i is greater than or equal to 1:
+        Let comb_node be proc list_get from List with children, i
+        Let comb_id be proc selector_combinator_id from Sel with comb_node
+        Let piece_node be proc list_get from List with children, i minus 1
+        Let parent be proc ms_find_parent with scope, current
+        If comb_id is equal to MS_COMB_CHILD:
+            If parent is equal to 0:
+                Return 0
+            End If
+            Let pm be proc selector_match with parent, piece_node
+            If pm is equal to 0:
+                Return 0
+            End If
+            Set current to parent
+        Otherwise:
+            If comb_id is equal to MS_COMB_DESCENDANT:
+                Let ancestor be parent
+                Let found be 0
+                While ancestor is not equal to 0:
+                    Let am be proc selector_match with ancestor, piece_node
+                    If am is equal to 1:
+                        Set current to ancestor
+                        Set found to 1
+                        Set ancestor to 0
+                    Otherwise:
+                        Set ancestor to proc ms_find_parent with scope, ancestor
+                    End If
+                End While
+                If found is equal to 0:
+                    Return 0
+                End If
+            Otherwise:
+                If comb_id is equal to MS_COMB_ADJACENT:
+                    If parent is equal to 0:
+                        Return 0
+                    End If
+                    Let siblings be proc memory_get_int64 from Memory with parent, 24
+                    Let scount be proc list_length from List with siblings
+                    Let s be 0
+                    Let prev be 0
+                    While s is less than scount:
+                        Let snode be proc list_get from List with siblings, s
+                        Let snode_kind be proc memory_get_int64 from Memory with snode, 0
+                        If snode_kind is equal to 1:
+                            Let selem be proc memory_get_int64 from Memory with snode, 8
+                            If selem is equal to current:
+                                Set s to scount
+                            Otherwise:
+                                Set prev to selem
+                            End If
+                        End If
+                        Set s to s plus 1
+                    End While
+                    If prev is equal to 0:
+                        Return 0
+                    End If
+                    Let pm2 be proc selector_match with prev, piece_node
+                    If pm2 is equal to 0:
+                        Return 0
+                    End If
+                    Set current to prev
+                Otherwise:
+                    If comb_id is equal to MS_COMB_GENERAL:
+                        If parent is equal to 0:
+                            Return 0
+                        End If
+                        Let siblings2 be proc memory_get_int64 from Memory with parent, 24
+                        Let s2count be proc list_length from List with siblings2
+                        Let t be 0
+                        Let general_found be 0
+                        While t is less than s2count:
+                            Let tnode be proc list_get from List with siblings2, t
+                            Let tnode_kind be proc memory_get_int64 from Memory with tnode, 0
+                            If tnode_kind is equal to 1:
+                                Let telem be proc memory_get_int64 from Memory with tnode, 8
+                                If telem is equal to current:
+                                    Set t to s2count
+                                Otherwise:
+                                    Let gm be proc selector_match with telem, piece_node
+                                    If gm is equal to 1:
+                                        Set general_found to 1
+                                        Set current to telem
+                                    End If
+                                End If
+                            End If
+                            Set t to t plus 1
+                        End While
+                        If general_found is equal to 0:
+                            Return 0
+                        End If
+                    Otherwise:
+                        Return 0
+                    End If
+                End If
+            End If
+        End If
+        Set i to i minus 2
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PUBLIC ENTRY POINT
+Note: ============================================================================
+
+@Reasoning
+Top-level matcher dispatching on the selector kind.  For complex
+selectors the scope (root the matcher knows about) is the element
+itself.  Users who already have a document root for ancestor queries
+should call selector_match_in_scope.
+@End Reasoning
+@Implementation
+Switch on kind: simple-leaf kinds delegate to selector_match_simple,
+compound to selector_match_compound, complex to selector_match_complex,
+list to a logical-OR over the list members.  Combinator nodes never
+appear as standalone selectors and always return 0 if reached.
+@End Implementation
+@Performance_Hints
+Linear in selector structure plus the cost of the per-kind matcher.
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "selector_match" takes element as Integer, sel as Integer returns Integer:
+    Return proc selector_match_in_scope with element, sel, element
+End Process
+
+Process called "selector_match_in_scope" takes element as Integer, sel as Integer, scope as Integer returns Integer:
+    If element is equal to 0:
+        Return 0
+    End If
+    If sel is equal to 0:
+        Return 0
+    End If
+    Let kind be proc selector_kind from Sel with sel
+    If kind is equal to MS_KIND_COMPOUND:
+        Return proc selector_match_compound with element, sel
+    End If
+    If kind is equal to MS_KIND_COMPLEX:
+        Return proc selector_match_complex with element, sel, scope
+    End If
+    If kind is equal to MS_KIND_LIST:
+        Let children be proc selector_children from Sel with sel
+        Let count be proc list_length from List with children
+        Let i be 0
+        While i is less than count:
+            Let sub be proc list_get from List with children, i
+            Let m be proc selector_match_in_scope with element, sub, scope
+            If m is equal to 1:
+                Return 1
+            End If
+            Set i to i plus 1
+        End While
+        Return 0
+    End If
+    If kind is equal to MS_KIND_COMBINATOR:
+        Return 0
+    End If
+    Return proc selector_match_simple with element, sel
+End Process
+
+Note: ============================================================================
+Note: QUERY-ALL DRIVER
+Note: ============================================================================
+
+@Reasoning
+Return every element under `root` (in document order) that matches the
+given selector.  Mirrors DOM document.querySelectorAll.  The result is
+a freshly allocated List of element pointers; the caller owns it and
+must release it with list_destroy.
+@End Reasoning
+@Implementation
+1. Walk the entire subtree with element_walk into a scratch list.
+2. Iterate, pushing every matching element to a fresh result list.
+3. Destroy the scratch list and return the result.
+@End Implementation
+@Performance_Hints
+O(n * selector_cost).  Two list allocations; the scratch is bounded by
+total element count and released before return.
+@End Performance_Hints
+@Security_Scope
+Returns 0 on OOM or null root/selector.  An empty (non-null) list means
+"no matches".
+@End Security_Scope
+Process called "selector_query_all" takes root as Integer, sel as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    If sel is equal to 0:
+        Return 0
+    End If
+    Let candidates be proc list_create from List
+    If candidates is equal to 0:
+        Return 0
+    End If
+    proc element_walk from Elem with root, candidates
+    Let result be proc list_create from List
+    If result is equal to 0:
+        proc list_destroy from List with candidates
+        Return 0
+    End If
+    Let count be proc list_length from List with candidates
+    Let i be 0
+    While i is less than count:
+        Let elem be proc list_get from List with candidates, i
+        Let m be proc selector_match_in_scope with elem, sel, root
+        If m is equal to 1:
+            proc list_push from List with result, elem
+        End If
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with candidates
+    Return result
+End Process
+
+@Reasoning
+Return the first matching element or 0.  Mirrors DOM querySelector.
+@End Reasoning
+@Implementation
+Same scan as selector_query_all but bails out on first match.
+@End Implementation
+@Performance_Hints
+O(n * selector_cost) worst case; often much less because of early-exit.
+@End Performance_Hints
+@Security_Scope
+Null-safe.
+@End Security_Scope
+Process called "selector_query_first" takes root as Integer, sel as Integer returns Integer:
+    If root is equal to 0:
+        Return 0
+    End If
+    If sel is equal to 0:
+        Return 0
+    End If
+    Let candidates be proc list_create from List
+    If candidates is equal to 0:
+        Return 0
+    End If
+    proc element_walk from Elem with root, candidates
+    Let count be proc list_length from List with candidates
+    Let i be 0
+    Let found be 0
+    While i is less than count:
+        Let elem be proc list_get from List with candidates, i
+        Let m be proc selector_match_in_scope with elem, sel, root
+        If m is equal to 1:
+            Set found to elem
+            Set i to count
+        End If
+        Set i to i plus 1
+    End While
+    proc list_destroy from List with candidates
+    Return found
+End Process

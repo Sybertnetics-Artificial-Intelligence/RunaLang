@@ -1,0 +1,1101 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+CERTIFICATE - Tier-1 X.509 certificate value built on x509.runa
+==============================================================================
+
+A Certificate is a thin wrapper around an x509.runa-parsed X.509
+certificate. It carries:
+  - the underlying x509_cert handle (arena-owned)
+  - cached pointers to the raw DER bytes
+  - the certificate's algorithm classification (signature algorithm)
+
+A CertificateChain is an ordered list of certificates leaf to root.
+Construction validates that each parses as DER X.509 v3.
+
+Memory layout (Certificate, 32 bytes):
+  offset  0 : x509_cert handle  (8 bytes)
+  offset  8 : der_bytes ptr     (8 bytes)
+  offset 16 : der_bytes len     (8 bytes)
+  offset 24 : signature_alg tag (8 bytes; CryptoAlgorithm)
+
+Memory layout (CertificateChain, variable):
+  offset  0 : count (8 bytes)
+  offset  8 : array of Certificate pointers (8 * count bytes)
+
+References:
+- RFC 5280: PKIX certificate and CRL profile.
+- RFC 8410: Ed25519/Ed448/X25519/X448 in PKIX.
+- IETF draft-ietf-lamps-dilithium-certificates: ML-DSA in PKIX.
+- RFC 4055: RSA-PSS in PKIX.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/x509.runa" as X509
+Import "compiler/frontend/import_system/crypto/asn1_der.runa" as Asn1Der
+
+Let CERTIFICATE_STRUCT_SIZE be 32
+Let CERT_OFF_X509_HANDLE be 0
+Let CERT_OFF_DER_PTR be 8
+Let CERT_OFF_DER_LEN be 16
+Let CERT_OFF_SIG_ALG be 24
+
+Let CHAIN_HEADER_SIZE be 8
+
+Note: ============================================================================
+Note: SECTION 1: Construction
+Note: ============================================================================
+
+@Reasoning
+Parse a DER-encoded X.509 certificate via x509.runa and wrap as a
+Certificate value. The signature algorithm OID extracted from the
+TBS is mapped to a CryptoAlgorithm tag for downstream type-safe
+dispatch.
+
+OID -> CryptoAlgorithm mapping (the common subset shipped):
+  1.3.101.112      (Ed25519)              -> ALG_ED25519
+  1.3.101.113      (Ed448)                -> ALG_ED448
+  1.2.840.10045.4.3.2 (ecdsa-with-SHA256) -> ALG_ECDSA_P256
+  1.2.840.10045.4.3.3 (ecdsa-with-SHA384) -> ALG_ECDSA_P384
+  1.2.840.10045.4.3.4 (ecdsa-with-SHA512) -> ALG_ECDSA_P521
+  1.2.840.113549.1.1.11 (sha256WithRSAEncryption) -> ALG_RSA_PKCS1V15_SHA256_{2048,3072,4096}
+  1.2.840.113549.1.1.12 (sha384WithRSAEncryption) -> ALG_RSA_PKCS1V15_SHA384_{2048,3072,4096}
+  1.2.840.113549.1.1.13 (sha512WithRSAEncryption) -> ALG_RSA_PKCS1V15_SHA512_{2048,3072,4096}
+  1.2.840.113549.1.1.10 (RSASSA-PSS)              -> ALG_RSA_PSS_SHA{256,384,512}_{2048,3072,4096}
+
+For RSA, the (OID, modulus length) PAIR selects the specific algorithm
+tag. The OID determines the hash algorithm (or, for PSS, an internal
+parameter walk on the SPKI determines it); certificate_rsa_modulus_byte_length
+determines the modulus index. A modulus length of 256 bytes selects
+the 2048-bit variant, 384 bytes -> 3072-bit, 512 bytes -> 4096-bit.
+Any other modulus length yields ALG_UNKNOWN.
+
+The historical bug where 1.2.840.113549.1.1.12 (SHA-384) and 1.1.13
+(SHA-512) RSA signatures were mapped to ALG_RSA_PKCS1V15_2048 (a tag
+that encoded ONLY modulus, dropping the hash binding) caused SHA-384
+and SHA-512 RSA cert signatures to silently fail verification under
+SHA-256 dispatch. The new mapping preserves the hash binding in the
+algorithm tag, so downstream rsa_verify_from_spki reads the correct
+hash from the tag and applies the correct RSA verify path.
+
+Unknown OIDs return ALG_UNKNOWN and the resulting Certificate carries
+that tag; downstream verification logic must reject ALG_UNKNOWN.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena, der_bytes_in, der_length.
+  2. Call x509_parse to obtain the x509_cert handle. Reject on null.
+  3. Allocate Certificate struct, store handle, der pointer/length.
+  4. Determine signature_algorithm tag by extracting the OID from the
+     parsed certificate's outer signatureAlgorithm AlgorithmIdentifier
+     and routing through certificate_signature_oid_to_algorithm. For
+     RSA OIDs, the specific tag (PSS vs PKCS1v15; 2048/3072/4096) is
+     selected by inspecting the SPKI modulus length encoded in the
+     parsed certificate, so the carried tag uniquely identifies the
+     verify path.
+@End Implementation
+
+@Performance_Hints
+O(parse cost). One arena allocation for the wrapper struct.
+@End Performance_Hints
+
+@Security_Scope
+Parsing validates DER structure per RFC 5280. The signature itself is
+NOT verified at construction time; call certificate_chain_verify (or
+the lower-level x509 chain verify) to validate the chain.
+
+References:
+- RFC 5280 section 6: certification path validation.
+@End Security_Scope
+Process called "certificate_create_from_der" takes arena as Integer, der_bytes_in as Integer, der_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If der_bytes_in is equal to 0:
+        Return 0
+    End If
+    If der_length is less than 32:
+        Return 0
+    End If
+
+    Let cert_handle be X509.x509_parse(arena, der_bytes_in, der_length)
+    If cert_handle is equal to 0:
+        Return 0
+    End If
+
+    Let wrapper be Arena.arena_allocate(arena, CERTIFICATE_STRUCT_SIZE)
+    If wrapper is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than CERTIFICATE_STRUCT_SIZE:
+        Memory.memory_set_byte(wrapper, zi, 0)
+        Set zi to zi plus 1
+    End While
+    Let der_copy be Arena.arena_allocate(arena, der_length)
+    If der_copy is equal to 0:
+        Return 0
+    End If
+    Memory.memory_copy(der_copy, der_bytes_in, der_length)
+    Memory.memory_set_qword(wrapper, CERT_OFF_X509_HANDLE, cert_handle)
+    Memory.memory_set_qword(wrapper, CERT_OFF_DER_PTR, der_copy)
+    Memory.memory_set_qword(wrapper, CERT_OFF_DER_LEN, der_length)
+
+    Note: Extract the outer signatureAlgorithm OID and map to a
+    Note: CryptoAlgorithm tag. The x509_cert slot[40] carries the outer
+    Note: AlgorithmIdentifier TLV per x509.runa.
+    Let sig_alg_tlv be Memory.memory_get_qword(cert_handle, 40)
+    Let mapped_alg be certificate_signature_algorithm_from_tlv(arena, sig_alg_tlv, cert_handle)
+    Memory.memory_set_qword(wrapper, CERT_OFF_SIG_ALG, mapped_alg)
+    Return wrapper
+End Process
+
+@Reasoning
+Allocate a DER-encoded OID byte buffer on the arena. Each helper
+builds one of the supported certificate signatureAlgorithm OIDs by
+writing the shared prefix bytes and a trailing identifying byte. Used
+by certificate_signature_algorithm_from_tlv when comparing the parsed
+OID against the candidate list.
+@End Reasoning
+
+@Implementation
+Allocate the right size, set the bytes, return the buffer.
+@End Implementation
+
+@Performance_Hints
+O(1) per OID candidate.
+@End Performance_Hints
+
+@Security_Scope
+Pure byte construction. No secret data.
+@End Security_Scope
+Process called "certificate_oid_pkcs1_family" takes arena as Integer, trailing as Integer returns Integer:
+    Let buf be Arena.arena_allocate(arena, 9)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 134)
+    Memory.memory_set_byte(buf, 4, 247)
+    Memory.memory_set_byte(buf, 5, 13)
+    Memory.memory_set_byte(buf, 6, 1)
+    Memory.memory_set_byte(buf, 7, 1)
+    Memory.memory_set_byte(buf, 8, trailing)
+    Return buf
+End Process
+
+Process called "certificate_oid_ecdsa_family" takes arena as Integer, trailing as Integer returns Integer:
+    Let buf be Arena.arena_allocate(arena, 8)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(buf, 0, 42)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 206)
+    Memory.memory_set_byte(buf, 4, 61)
+    Memory.memory_set_byte(buf, 5, 4)
+    Memory.memory_set_byte(buf, 6, 3)
+    Memory.memory_set_byte(buf, 7, trailing)
+    Return buf
+End Process
+
+Process called "certificate_oid_edwards_family" takes arena as Integer, trailing as Integer returns Integer:
+    Let buf be Arena.arena_allocate(arena, 3)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(buf, 0, 43)
+    Memory.memory_set_byte(buf, 1, 101)
+    Memory.memory_set_byte(buf, 2, trailing)
+    Return buf
+End Process
+
+@Reasoning
+For RSA OIDs (which do not encode modulus length), select the specific
+ALG_RSA_* tag by inspecting the certificate's SubjectPublicKeyInfo to
+determine the modulus byte length. The x509_cert slot[72] carries the
+SPKI TLV; we walk SPKI -> AlgorithmIdentifier (skipped) ->
+subjectPublicKey BIT STRING -> RSAPublicKey SEQUENCE -> modulus
+INTEGER, then strip a leading DER sign byte if present and compute
+modulus_bits = byte_length * 8.
+
+Mapping:
+  256 bytes (2048 bits) -> ALG_RSA_*_2048
+  384 bytes (3072 bits) -> ALG_RSA_*_3072
+  512 bytes (4096 bits) -> ALG_RSA_*_4096
+
+Any modulus length not in {256, 384, 512} yields ALG_UNKNOWN; the
+verifier rejects unknown tags.
+@End Reasoning
+
+@Implementation
+Standard SPKI walk via Asn1Der primitives.
+@End Implementation
+
+@Performance_Hints
+O(SPKI size) DER walk.
+@End Performance_Hints
+
+@Security_Scope
+Strict tag checks on every step; reject any deviation from RFC 5280
+4.1 / RFC 8017 A.1.1 encoding.
+@End Security_Scope
+Process called "certificate_rsa_modulus_byte_length" takes arena as Integer, cert_handle as Integer returns Integer:
+    If cert_handle is equal to 0:
+        Return 0
+    End If
+    Let spki_tlv be Memory.memory_get_qword(cert_handle, 72)
+    If spki_tlv is equal to 0:
+        Return 0
+    End If
+    If Asn1Der.asn1_tlv_get_tag(spki_tlv) is not equal to 48:
+        Return 0
+    End If
+
+    Let alg_id be Asn1Der.asn1_iter_first_child(arena, spki_tlv)
+    If alg_id is equal to 0:
+        Return 0
+    End If
+    Let bit_string be Asn1Der.asn1_iter_next_sibling(arena, spki_tlv, alg_id)
+    If bit_string is equal to 0:
+        Return 0
+    End If
+    If Asn1Der.asn1_tlv_get_tag(bit_string) is not equal to 3:
+        Return 0
+    End If
+
+    Let bit_string_buffer be Asn1Der.asn1_tlv_get_buffer(bit_string)
+    Let bit_string_content_offset be Asn1Der.asn1_tlv_get_content_offset(bit_string)
+    Let bit_string_content_length be Asn1Der.asn1_tlv_get_content_length(bit_string)
+    If bit_string_content_length is less than 2:
+        Return 0
+    End If
+    Let unused_bits be Memory.memory_get_byte(bit_string_buffer, bit_string_content_offset)
+    If unused_bits is not equal to 0:
+        Return 0
+    End If
+
+    Let rsa_pubkey_offset be bit_string_content_offset plus 1
+    Let rsa_pubkey_limit be bit_string_content_offset plus bit_string_content_length
+    Let rsa_pubkey_seq be Asn1Der.asn1_parse_tlv(arena, bit_string_buffer, rsa_pubkey_offset, rsa_pubkey_limit)
+    If rsa_pubkey_seq is equal to 0:
+        Return 0
+    End If
+    If Asn1Der.asn1_tlv_get_tag(rsa_pubkey_seq) is not equal to 48:
+        Return 0
+    End If
+
+    Let modulus_int be Asn1Der.asn1_iter_first_child(arena, rsa_pubkey_seq)
+    If modulus_int is equal to 0:
+        Return 0
+    End If
+    If Asn1Der.asn1_tlv_get_tag(modulus_int) is not equal to 2:
+        Return 0
+    End If
+
+    Let modulus_buffer be Asn1Der.asn1_tlv_get_buffer(modulus_int)
+    Let modulus_content_offset be Asn1Der.asn1_tlv_get_content_offset(modulus_int)
+    Let modulus_content_length be Asn1Der.asn1_tlv_get_content_length(modulus_int)
+    Let effective_length be modulus_content_length
+    If modulus_content_length is greater than 1:
+        If Memory.memory_get_byte(modulus_buffer, modulus_content_offset) is equal to 0:
+            Set effective_length to modulus_content_length minus 1
+        End If
+    End If
+    Return effective_length
+End Process
+
+@Reasoning
+Given the outer signatureAlgorithm AlgorithmIdentifier TLV and the
+parsed x509_cert handle, identify the CryptoAlgorithm tag.
+
+OID mappings:
+  1.3.101.112      (Ed25519)              -> ALG_ED25519
+  1.3.101.113      (Ed448)                -> ALG_ED448
+  1.2.840.10045.4.3.2 (ecdsa-with-SHA256) -> ALG_ECDSA_P256
+  1.2.840.10045.4.3.3 (ecdsa-with-SHA384) -> ALG_ECDSA_P384
+  1.2.840.10045.4.3.4 (ecdsa-with-SHA512) -> ALG_ECDSA_P521
+  1.2.840.113549.1.1.10 (RSASSA-PSS)             -> ALG_RSA_PSS_SHA{X}_{2048,3072,4096}
+  1.2.840.113549.1.1.11 (sha256WithRSAEnc)       -> ALG_RSA_PKCS1V15_SHA256_{2048,3072,4096}
+  1.2.840.113549.1.1.12 (sha384WithRSAEnc)       -> ALG_RSA_PKCS1V15_SHA384_{2048,3072,4096}
+  1.2.840.113549.1.1.13 (sha512WithRSAEnc)       -> ALG_RSA_PKCS1V15_SHA512_{2048,3072,4096}
+
+For PKCS#1 v1.5 OIDs the hash is part of the OID (.11=SHA-256,
+.12=SHA-384, .13=SHA-512) and the modulus comes from the SPKI; the
+algorithm tag encodes both.
+
+For RSASSA-PSS the OID alone (.10) does not encode the hash — the
+hash is carried inside the PSS parameters AlgorithmIdentifier. We
+walk the parameters here (via certificate_pss_parameters_hash_id)
+to recover the hash, then combine with the modulus to select the
+ALG_RSA_PSS_SHA<X>_<bits> tag.
+
+For ECDSA OIDs, this surface assumes the RFC 5758 curve-hash matching
+convention (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512). Callers
+needing mixed curve-hash pairings must read the SPKI named-curve OID
+separately and bypass this mapping.
+
+The mapping covers the OIDs profiled by the CA/Browser Forum Baseline
+Requirements and the IETF LAMPS WG specifications. PQC algorithms
+(ML-DSA, SLH-DSA, FALCON) lack final X.509 OID assignments at the
+date of this writing; their branches enter this dispatcher when the
+IETF draft-ietf-lamps-* documents publish assigned OIDs.
+
+This routine corrects the hash-info-loss bug that previously caused
+sha384WithRSAEncryption and sha512WithRSAEncryption certificate
+signatures to be mapped to a tag that encoded only the modulus,
+forcing rsa_verify_from_spki to verify under hardcoded SHA-256.
+@End Reasoning
+
+@Implementation
+Walk the AlgorithmIdentifier SEQUENCE to extract the OID TLV (its
+first child). Compare against each candidate OID via
+Asn1Der.asn1_oid_equals. On an RSA-family match:
+  - Read the modulus length from the SPKI via
+    certificate_rsa_modulus_byte_length.
+  - For PKCS#1 v1.5 OIDs, the hash is taken from the trailing OID
+    byte (0x0B=SHA-256, 0x0C=SHA-384, 0x0D=SHA-512).
+  - For RSASSA-PSS, parse the PSS parameters to recover the hash;
+    fall back to ALG_UNKNOWN if the parameters are missing or carry
+    an unrecognized hash (this is hard-reject per the production
+    crypto policy; the signer MUST be explicit about the hash).
+  - Combine (hash, modulus) -> the appropriate ALG_RSA_* tag.
+@End Implementation
+
+@Performance_Hints
+At most ~12 short byte comparisons.
+@End Performance_Hints
+
+@Security_Scope
+Returns ALG_UNKNOWN on any unrecognized OID, unrecognized hash, or
+unsupported modulus length. Downstream code MUST reject ALG_UNKNOWN
+before invoking verify.
+@End Security_Scope
+Process called "certificate_signature_algorithm_from_tlv" takes arena as Integer, alg_id_tlv as Integer, cert_handle as Integer returns Integer:
+    If alg_id_tlv is equal to 0:
+        Return Alg.ALG_UNKNOWN
+    End If
+    If Asn1Der.asn1_tlv_get_tag(alg_id_tlv) is not equal to 48:
+        Return Alg.ALG_UNKNOWN
+    End If
+    Let oid_tlv be Asn1Der.asn1_iter_first_child(arena, alg_id_tlv)
+    If oid_tlv is equal to 0:
+        Return Alg.ALG_UNKNOWN
+    End If
+    If Asn1Der.asn1_tlv_get_tag(oid_tlv) is not equal to 6:
+        Return Alg.ALG_UNKNOWN
+    End If
+
+    Note: Ed25519 OID 1.3.101.112.
+    Let ed25519_oid be certificate_oid_edwards_family(arena, 112)
+    If ed25519_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, ed25519_oid, 3) is equal to 1:
+            Return Alg.ALG_ED25519
+        End If
+    End If
+    Note: Ed448 OID 1.3.101.113.
+    Let ed448_oid be certificate_oid_edwards_family(arena, 113)
+    If ed448_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, ed448_oid, 3) is equal to 1:
+            Return Alg.ALG_ED448
+        End If
+    End If
+
+    Note: ecdsa-with-SHA256 OID 1.2.840.10045.4.3.2.
+    Let ecdsa_sha256_oid be certificate_oid_ecdsa_family(arena, 2)
+    If ecdsa_sha256_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, ecdsa_sha256_oid, 8) is equal to 1:
+            Return Alg.ALG_ECDSA_P256
+        End If
+    End If
+    Note: ecdsa-with-SHA384 OID 1.2.840.10045.4.3.3.
+    Let ecdsa_sha384_oid be certificate_oid_ecdsa_family(arena, 3)
+    If ecdsa_sha384_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, ecdsa_sha384_oid, 8) is equal to 1:
+            Return Alg.ALG_ECDSA_P384
+        End If
+    End If
+    Note: ecdsa-with-SHA512 OID 1.2.840.10045.4.3.4.
+    Let ecdsa_sha512_oid be certificate_oid_ecdsa_family(arena, 4)
+    If ecdsa_sha512_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, ecdsa_sha512_oid, 8) is equal to 1:
+            Return Alg.ALG_ECDSA_P521
+        End If
+    End If
+
+    Note: PKCS#1 family. Trailing byte selects the specific OID:
+    Note:   0x0A id-RSASSA-PSS                  -> hash from PSS params
+    Note:   0x0B sha256WithRSAEncryption        -> hash = SHA-256
+    Note:   0x0C sha384WithRSAEncryption        -> hash = SHA-384
+    Note:   0x0D sha512WithRSAEncryption        -> hash = SHA-512
+    Let rsa_modulus_bytes be certificate_rsa_modulus_byte_length(arena, cert_handle)
+    Let modulus_index be certificate_rsa_modulus_index(rsa_modulus_bytes)
+    If modulus_index is less than 0:
+        Note: Unrecognized modulus length -> ALG_UNKNOWN. The verifier
+        Note: must hard-reject this; no fall-through to a default.
+        Return Alg.ALG_UNKNOWN
+    End If
+
+    Let pss_oid be certificate_oid_pkcs1_family(arena, 10)
+    If pss_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, pss_oid, 9) is equal to 1:
+            Let pss_hash_index be certificate_pss_parameters_hash_index(arena, alg_id_tlv)
+            If pss_hash_index is less than 0:
+                Return Alg.ALG_UNKNOWN
+            End If
+            Return certificate_compose_rsa_pss_tag(pss_hash_index, modulus_index)
+        End If
+    End If
+    Let pkcs1_sha256_oid be certificate_oid_pkcs1_family(arena, 11)
+    If pkcs1_sha256_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, pkcs1_sha256_oid, 9) is equal to 1:
+            Return certificate_compose_rsa_pkcs1v15_tag(0, modulus_index)
+        End If
+    End If
+    Let pkcs1_sha384_oid be certificate_oid_pkcs1_family(arena, 12)
+    If pkcs1_sha384_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, pkcs1_sha384_oid, 9) is equal to 1:
+            Return certificate_compose_rsa_pkcs1v15_tag(1, modulus_index)
+        End If
+    End If
+    Let pkcs1_sha512_oid be certificate_oid_pkcs1_family(arena, 13)
+    If pkcs1_sha512_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, pkcs1_sha512_oid, 9) is equal to 1:
+            Return certificate_compose_rsa_pkcs1v15_tag(2, modulus_index)
+        End If
+    End If
+
+    Return Alg.ALG_UNKNOWN
+End Process
+
+@Reasoning
+Map an RSA modulus length in bytes (decoded from the SPKI by
+certificate_rsa_modulus_byte_length) to the modulus index used by
+the tag-composition helpers:
+  256 bytes (2048-bit)  -> 0
+  384 bytes (3072-bit)  -> 1
+  512 bytes (4096-bit)  -> 2
+Other lengths return -1 (hard-reject).
+
+The modulus-index space mirrors the slot offsets in the Alg enum's
+RSA section (110/113/116 etc. for SHA-256/384/512 PKCS1v15, with
+each hash block ordering moduli 2048, 3072, 4096), so composing a
+final tag is a simple base-plus-index calculation.
+@End Reasoning
+
+@Implementation
+Three integer comparisons; constant-time.
+@End Implementation
+
+@Performance_Hints
+O(1). Three integer compares plus one return.
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata. -1 result MUST result in caller rejection; never
+substitute a default modulus.
+@End Security_Scope
+Process called "certificate_rsa_modulus_index" takes rsa_modulus_bytes as Integer returns Integer:
+    If rsa_modulus_bytes is equal to 256:
+        Return 0
+    End If
+    If rsa_modulus_bytes is equal to 384:
+        Return 1
+    End If
+    If rsa_modulus_bytes is equal to 512:
+        Return 2
+    End If
+    Return 0 minus 1
+End Process
+
+@Reasoning
+Compose an ALG_RSA_PKCS1V15_SHA*_* tag from (hash_index, modulus_index)
+where:
+  hash_index    : 0 -> SHA-256, 1 -> SHA-384, 2 -> SHA-512.
+  modulus_index : 0 -> 2048-bit, 1 -> 3072-bit, 2 -> 4096-bit.
+
+The Alg enum's RSA PKCS#1 v1.5 block starts at slot 110 (SHA-256)
+and is laid out as nine consecutive slots (hash * 3 + modulus_index)
+ending at slot 118 (SHA-512 + 4096-bit). The composition is therefore
+110 + hash_index*3 + modulus_index.
+@End Reasoning
+
+@Implementation
+Compute via arithmetic on the slot offsets. Bounds-check both indices
+and return ALG_UNKNOWN on out-of-range input.
+@End Implementation
+
+@Performance_Hints
+O(1). One addition and one multiplication.
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata. Out-of-range input MUST result in ALG_UNKNOWN.
+@End Security_Scope
+Process called "certificate_compose_rsa_pkcs1v15_tag" takes hash_index as Integer, modulus_index as Integer returns Integer:
+    If hash_index is less than 0:
+        Return Alg.ALG_UNKNOWN
+    End If
+    If hash_index is greater than 2:
+        Return Alg.ALG_UNKNOWN
+    End If
+    If modulus_index is less than 0:
+        Return Alg.ALG_UNKNOWN
+    End If
+    If modulus_index is greater than 2:
+        Return Alg.ALG_UNKNOWN
+    End If
+    Return 110 plus (hash_index multiplied by 3) plus modulus_index
+End Process
+
+@Reasoning
+Compose an ALG_RSA_PSS_SHA*_* tag from (hash_index, modulus_index).
+The Alg enum's RSA-PSS block starts at slot 120 (SHA-256+2048) and is
+laid out as nine consecutive slots ending at 128 (SHA-512+4096).
+@End Reasoning
+
+@Implementation
+120 + hash_index*3 + modulus_index. Bounds-checked.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata. Out-of-range input MUST result in ALG_UNKNOWN.
+@End Security_Scope
+Process called "certificate_compose_rsa_pss_tag" takes hash_index as Integer, modulus_index as Integer returns Integer:
+    If hash_index is less than 0:
+        Return Alg.ALG_UNKNOWN
+    End If
+    If hash_index is greater than 2:
+        Return Alg.ALG_UNKNOWN
+    End If
+    If modulus_index is less than 0:
+        Return Alg.ALG_UNKNOWN
+    End If
+    If modulus_index is greater than 2:
+        Return Alg.ALG_UNKNOWN
+    End If
+    Return 120 plus (hash_index multiplied by 3) plus modulus_index
+End Process
+
+@Reasoning
+Walk the RSASSA-PSS AlgorithmIdentifier parameters per RFC 4055 §3.1
+and return the hash index (0=SHA-256, 1=SHA-384, 2=SHA-512) for the
+declared hashAlgorithm.
+
+Per the production crypto policy, the RFC 4055 sha1Identifier DEFAULT is
+NOT silently accepted; an explicit hashAlgorithm OID is REQUIRED. A
+caller that needs to verify a PSS certificate signed under the SHA-1
+default will see -1 here and reject the certificate.
+
+The reason we are stricter than RFC 4055 at this layer is that the
+certificate signature_algorithm tag drives downstream type-safe
+dispatch (rsa_verify_from_spki reads hash + modulus from the tag). If
+this proc returned 0 (SHA-256) on absent fields, the resulting tag
+would silently misrepresent a SHA-1 signature as a SHA-256 signature,
+defeating the strength gate in rsa_decode_pss_parameters at the
+signature.runa layer. The signing CA controls whether the parameters
+are present; absent parameters indicates an out-of-policy issuer.
+@End Reasoning
+
+@Implementation
+1. Read the parameters TLV (second child of alg_id_tlv).
+2. If absent or not SEQUENCE, return -1.
+3. Walk the parameters SEQUENCE for context tag [0] (hashAlgorithm).
+4. The hash OID is the first OID inside [0]'s wrapped AlgorithmIdentifier.
+5. Compare against SHA-256/384/512 OIDs; return 0/1/2 on match.
+6. Any other OID (SHA-1, MD5, or unknown) returns -1.
+@End Implementation
+
+@Performance_Hints
+O(parameters size). Small constant for typical certificates.
+@End Performance_Hints
+
+@Security_Scope
+Strict OID comparison; no length-based dispatch. Rejection on absent
+parameters is the policy gate that prevents algorithm-confusion via
+RFC 4055 default exploitation.
+@End Security_Scope
+Process called "certificate_pss_parameters_hash_index" takes arena as Integer, alg_id_tlv as Integer returns Integer:
+    Let oid_child be Asn1Der.asn1_iter_first_child(arena, alg_id_tlv)
+    If oid_child is equal to 0:
+        Return 0 minus 1
+    End If
+    Let params_child be Asn1Der.asn1_iter_next_sibling(arena, alg_id_tlv, oid_child)
+    If params_child is equal to 0:
+        Return 0 minus 1
+    End If
+    If Asn1Der.asn1_tlv_get_tag(params_child) is not equal to 48:
+        Return 0 minus 1
+    End If
+
+    Let field be Asn1Der.asn1_iter_first_child(arena, params_child)
+    While field is not equal to 0:
+        Let field_tag be Asn1Der.asn1_tlv_get_tag(field)
+        Note: Context-specific explicit tag [0]: hashAlgorithm.
+        If field_tag is equal to 160:
+            Let hash_alg be Asn1Der.asn1_iter_first_child(arena, field)
+            If hash_alg is not equal to 0:
+                Let hash_oid be Asn1Der.asn1_iter_first_child(arena, hash_alg)
+                If hash_oid is not equal to 0:
+                    Return certificate_sha2_oid_to_hash_index(arena, hash_oid)
+                End If
+            End If
+            Return 0 minus 1
+        End If
+        Set field to Asn1Der.asn1_iter_next_sibling(arena, params_child, field)
+    End While
+    Note: No hashAlgorithm field found in parameters. RFC 4055 says
+    Note: this defaults to SHA-1; the production crypto policy rejects.
+    Return 0 minus 1
+End Process
+
+@Reasoning
+Map a SHA-2 OID TLV to the hash index (0=SHA-256, 1=SHA-384,
+2=SHA-512). Returns -1 for any other OID, including SHA-1 / MD5 /
+unknown OIDs.
+
+The SHA-2 OID prefix is 1.3.14.3.2.1.X = 60 86 48 01 65 03 04 02 0X,
+where X selects the digest size: 0x01=SHA-256, 0x02=SHA-384,
+0x03=SHA-512.
+@End Reasoning
+
+@Implementation
+Allocate the candidate OIDs via the local certificate_oid_sha2_family
+helper and compare via Asn1Der.asn1_oid_equals.
+@End Implementation
+
+@Performance_Hints
+O(1). Three short byte comparisons.
+@End Performance_Hints
+
+@Security_Scope
+Strict OID equality. Returns -1 on any non-SHA-2 hash, never falls
+back to a default.
+@End Security_Scope
+Process called "certificate_sha2_oid_to_hash_index" takes arena as Integer, oid_tlv as Integer returns Integer:
+    Let sha256_oid be certificate_oid_sha2_family(arena, 1)
+    If sha256_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, sha256_oid, 9) is equal to 1:
+            Return 0
+        End If
+    End If
+    Let sha384_oid be certificate_oid_sha2_family(arena, 2)
+    If sha384_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, sha384_oid, 9) is equal to 1:
+            Return 1
+        End If
+    End If
+    Let sha512_oid be certificate_oid_sha2_family(arena, 3)
+    If sha512_oid is not equal to 0:
+        If Asn1Der.asn1_oid_equals(oid_tlv, sha512_oid, 9) is equal to 1:
+            Return 2
+        End If
+    End If
+    Return 0 minus 1
+End Process
+
+@Reasoning
+DER-encoded SHA-2 OID family from {2, 16, 840, 1, 101, 3, 4, 2, X}.
+Shared prefix: 0x60 0x86 0x48 0x01 0x65 0x03 0x04 0x02 (8 bytes).
+trailing selects the digest: 0x01=SHA-256, 0x02=SHA-384, 0x03=SHA-512.
+@End Reasoning
+
+@Implementation
+Allocate 9 bytes; write the shared prefix; write the trailing byte.
+@End Implementation
+
+@Performance_Hints
+O(1). 9 bytes written.
+@End Performance_Hints
+
+@Security_Scope
+Pure byte construction.
+@End Security_Scope
+Process called "certificate_oid_sha2_family" takes arena as Integer, trailing as Integer returns Integer:
+    Let buf be Arena.arena_allocate(arena, 9)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_byte(buf, 0, 96)
+    Memory.memory_set_byte(buf, 1, 134)
+    Memory.memory_set_byte(buf, 2, 72)
+    Memory.memory_set_byte(buf, 3, 1)
+    Memory.memory_set_byte(buf, 4, 101)
+    Memory.memory_set_byte(buf, 5, 3)
+    Memory.memory_set_byte(buf, 6, 4)
+    Memory.memory_set_byte(buf, 7, 2)
+    Memory.memory_set_byte(buf, 8, trailing)
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Accessors
+Note: ============================================================================
+
+@Reasoning
+Returns the underlying x509_cert handle, for callers that need access
+to the parsed TLV structure (issuer name, subject name, validity, SPKI).
+@End Reasoning
+
+@Implementation
+Reads qword at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+The handle gives access to x509.runa's parser surface; that surface is
+read-only and arena-owned.
+@End Security_Scope
+Process called "certificate_x509_handle" takes cert as Integer returns Integer:
+    If cert is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(cert, CERT_OFF_X509_HANDLE)
+End Process
+
+@Reasoning
+Returns the raw DER byte pointer of the certificate.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 8.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Public certificate material.
+@End Security_Scope
+Process called "certificate_der_bytes" takes cert as Integer returns Integer:
+    If cert is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(cert, CERT_OFF_DER_PTR)
+End Process
+
+@Reasoning
+Returns the DER byte length.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 16.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "certificate_der_length" takes cert as Integer returns Integer:
+    If cert is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(cert, CERT_OFF_DER_LEN)
+End Process
+
+@Reasoning
+Returns the signature algorithm tag.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 24.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata. ALG_UNKNOWN means downstream verify must reject.
+@End Security_Scope
+Process called "certificate_signature_algorithm" takes cert as Integer returns Integer:
+    If cert is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(cert, CERT_OFF_SIG_ALG)
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: Certificate chain
+Note: ============================================================================
+
+@Reasoning
+Allocate an empty CertificateChain that will hold up to max_count
+certificates. The caller adds certificates via certificate_chain_append.
+Storage layout is a 8-byte count header followed by an 8*max_count
+pointer array.
+@End Reasoning
+
+@Implementation
+arena_allocate(8 + 8*max_count), zero the count.
+@End Implementation
+
+@Performance_Hints
+O(1) for header, O(max_count) for zeroing the slot array.
+@End Performance_Hints
+
+@Security_Scope
+Empty chain validates only as "trivially valid" (no certs), which is
+the safe zero-state.
+@End Security_Scope
+Process called "certificate_chain_create" takes arena as Integer, max_count as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If max_count is less than 1:
+        Return 0
+    End If
+    If max_count is greater than 256:
+        Return 0
+    End If
+    Let total be CHAIN_HEADER_SIZE plus (max_count multiplied by 8)
+    Let chain be Arena.arena_allocate(arena, total)
+    If chain is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_qword(chain, 0, 0)
+    Let i be 0
+    While i is less than max_count:
+        Memory.memory_set_qword(chain, CHAIN_HEADER_SIZE plus (i multiplied by 8), 0)
+        Set i to i plus 1
+    End While
+    Return chain
+End Process
+
+@Reasoning
+Append a Certificate to a chain. The chain stores certificates in
+leaf-to-root order. Order is the caller's responsibility; this proc
+does not validate the issuer-of relation.
+@End Reasoning
+
+@Implementation
+1. Validate.
+2. Read current count.
+3. Store cert pointer at slot[count].
+4. Increment count.
+Returns 1 on success.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Chain ordering is the caller's responsibility; certificate_chain_verify
+validates the issuer-subject linkage and signature path.
+@End Security_Scope
+Process called "certificate_chain_append" takes chain as Integer, cert as Integer returns Integer:
+    If chain is equal to 0:
+        Return 0
+    End If
+    If cert is equal to 0:
+        Return 0
+    End If
+    Let count be Memory.memory_get_qword(chain, 0)
+    Memory.memory_set_qword(chain, CHAIN_HEADER_SIZE plus (count multiplied by 8), cert)
+    Memory.memory_set_qword(chain, 0, count plus 1)
+    Return 1
+End Process
+
+@Reasoning
+Returns the number of certificates in the chain.
+@End Reasoning
+
+@Implementation
+Reads the count header.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "certificate_chain_count" takes chain as Integer returns Integer:
+    If chain is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(chain, 0)
+End Process
+
+@Reasoning
+Returns the i-th Certificate pointer in the chain, or 0 if i is out
+of range.
+@End Reasoning
+
+@Implementation
+Reads slot[i] after bounds check.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns a read-only pointer; the Certificate itself is arena-owned.
+@End Security_Scope
+Process called "certificate_chain_at" takes chain as Integer, i as Integer returns Integer:
+    If chain is equal to 0:
+        Return 0
+    End If
+    Let count be Memory.memory_get_qword(chain, 0)
+    If i is less than 0:
+        Return 0
+    End If
+    If i is greater than or equal to count:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(chain, CHAIN_HEADER_SIZE plus (i multiplied by 8))
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Subject / Issuer accessors
+Note: ============================================================================
+
+@Reasoning
+Returns the issuer Name TLV pointer (x509.runa TLV slot). Callers can
+walk this with the asn1_der iteration primitives.
+@End Reasoning
+
+@Implementation
+Delegates to x509_get_issuer_name_tlv.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+TLV is read-only.
+@End Security_Scope
+Process called "certificate_issuer_tlv" takes cert as Integer returns Integer:
+    If cert is equal to 0:
+        Return 0
+    End If
+    Let handle be certificate_x509_handle(cert)
+    If handle is equal to 0:
+        Return 0
+    End If
+    Return X509.x509_get_issuer_name_tlv(handle)
+End Process
+
+@Reasoning
+Returns the subject Name TLV pointer.
+@End Reasoning
+
+@Implementation
+Delegates to x509_get_subject_name_tlv.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+TLV is read-only.
+@End Security_Scope
+Process called "certificate_subject_tlv" takes cert as Integer returns Integer:
+    If cert is equal to 0:
+        Return 0
+    End If
+    Let handle be certificate_x509_handle(cert)
+    If handle is equal to 0:
+        Return 0
+    End If
+    Return X509.x509_get_subject_name_tlv(handle)
+End Process
+
+@Reasoning
+Returns the SubjectPublicKeyInfo TLV pointer.
+@End Reasoning
+
+@Implementation
+Delegates to x509_get_subject_public_key_info_tlv.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+TLV is read-only.
+@End Security_Scope
+Process called "certificate_spki_tlv" takes cert as Integer returns Integer:
+    If cert is equal to 0:
+        Return 0
+    End If
+    Let handle be certificate_x509_handle(cert)
+    If handle is equal to 0:
+        Return 0
+    End If
+    Return X509.x509_get_subject_public_key_info_tlv(handle)
+End Process
+
+@Reasoning
+Returns 1 if cert_a's issuer name equals cert_b's subject name, 0
+otherwise. Used to check the issuer-of relation when validating a
+chain.
+@End Reasoning
+
+@Implementation
+Delegates to x509_name_equals.
+@End Implementation
+
+@Performance_Hints
+O(name encoding length).
+@End Performance_Hints
+
+@Security_Scope
+Constant in input length; not constant-time but operates on public
+DER bytes.
+@End Security_Scope
+Process called "certificate_issued_by" takes cert_a as Integer, cert_b as Integer returns Integer:
+    If cert_a is equal to 0:
+        Return 0
+    End If
+    If cert_b is equal to 0:
+        Return 0
+    End If
+    Let issuer_a be certificate_issuer_tlv(cert_a)
+    Let subject_b be certificate_subject_tlv(cert_b)
+    If issuer_a is equal to 0:
+        Return 0
+    End If
+    If subject_b is equal to 0:
+        Return 0
+    End If
+    Return X509.x509_name_equals(issuer_a, subject_b)
+End Process

@@ -1,0 +1,609 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+HMAC - Keyed-Hash Message Authentication Code per RFC 2104 + FIPS 198-1
+==============================================================================
+
+Implements HMAC over each SHA-2 family hash:
+- hmac_sha256: block 64 bytes, output 32 bytes
+- hmac_sha384: block 128 bytes, output 48 bytes
+- hmac_sha512: block 128 bytes, output 64 bytes
+
+HMAC construction (RFC 2104 section 2):
+
+    HMAC(K, m) = H((K' XOR opad) || H((K' XOR ipad) || m))
+
+where:
+- K is the secret key
+- K' is K padded to the hash block size B (left-pad with zeros if |K|<B,
+  hashed-then-padded if |K|>B)
+- ipad = byte 0x36 repeated B times
+- opad = byte 0x5C repeated B times
+
+The compound XOR-pad keys are independent for ipad/opad so an inner-hash
+collision does not directly yield an outer forgery, which is the property
+that makes HMAC secure even when the underlying hash has length-extension
+weaknesses (e.g., SHA-256).
+
+Tag verification (hmac_verify_*) uses constant-time comparison from
+secure_memory to defeat the Lucky13-class timing oracle that breaks naive
+byte-by-byte memcmp on tags.
+
+Caller-provided buffers:
+- key + key_length: secret key
+- message + message_length: data to authenticate
+- out_tag: buffer of size 32/48/64 bytes (depends on which hash)
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/sha2.runa" as Sha2
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as SecureMem
+
+Constant HMAC_SHA256_BLOCK as Integer is 64
+Constant HMAC_SHA256_OUTPUT as Integer is 32
+Constant HMAC_SHA384_BLOCK as Integer is 128
+Constant HMAC_SHA384_OUTPUT as Integer is 48
+Constant HMAC_SHA512_BLOCK as Integer is 128
+Constant HMAC_SHA512_OUTPUT as Integer is 64
+Constant HMAC_IPAD_BYTE as Integer is 54
+Constant HMAC_OPAD_BYTE as Integer is 92
+
+Note: ============================================================================
+Note: SECTION 1: HMAC-SHA256
+Note: ============================================================================
+
+Process called "hmac_sha256" takes arena as Integer, key as Integer, key_length as Integer, message as Integer, message_length as Integer, out_tag as Integer returns Integer:
+    @Reasoning
+    Computes HMAC-SHA256(key, message) into out_tag (32 bytes). The
+    block size is 64 bytes per the SHA-256 specification. Implements
+    the standard RFC 2104 construction with key preprocessing: keys
+    shorter than the block size are zero-padded on the right; keys
+    longer than the block size are first hashed down to 32 bytes
+    and then zero-padded to 64 bytes.
+    @End Reasoning
+
+    @Implementation
+    1. Compute K': if key_length > 64, K' = SHA256(key) padded with
+       zeros to 64 bytes; else K' = key padded with zeros to 64 bytes.
+    2. Build ipad_key[64] = K' XOR 0x36-repeated.
+    3. Build inner_msg[64 + message_length] = ipad_key || message.
+    4. inner_hash = SHA256(inner_msg) into a 32-byte buffer.
+    5. Build opad_key[64] = K' XOR 0x5C-repeated.
+    6. Build outer_msg[64 + 32] = opad_key || inner_hash.
+    7. SHA256(outer_msg) into out_tag.
+    8. Securely wipe the temporary keys (ipad_key, opad_key, K')
+       since they are derived from the secret key and could yield
+       the key if disclosed.
+
+    The XOR steps and buffer assembly walk the full block size on
+    every call so the timing is independent of key contents.
+    @End Implementation
+
+    @Performance_Hints
+    Two SHA-256 invocations per message: one over (64 + |message|)
+    bytes and one over 96 bytes. For long messages, the inner hash
+    dominates and the total cost is approximately 2 * sha256(msg).
+    For very short messages (< 32 bytes), the overhead of the two
+    96-byte fixed hashes (~600 ns each on modern x86) is the floor.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against:
+    - Length-extension attacks on the underlying SHA-256 (HMAC's
+      outer hash neutralizes these by construction).
+    - Key-recovery via tag timing (use hmac_sha256_verify, not
+      memcmp-based comparison, for verification paths).
+    - Information leakage on the derived ipad/opad keys: they are
+      securely wiped before this proc returns.
+
+    Out of scope:
+    - Side-channels in the underlying SHA-256 compression function
+      (SHA-256 has no secret-dependent branches or memory accesses
+      so this is not a concern).
+    - Key-confusion attacks where the same key is used across
+      protocols (caller's responsibility per RFC 2104 section 6).
+
+    References:
+    - RFC 2104, "HMAC: Keyed-Hashing for Message Authentication".
+    - FIPS PUB 198-1, "The Keyed-Hash Message Authentication Code".
+    - Bellare et al., "Keying Hash Functions for Message
+      Authentication", CRYPTO 1996.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If key_length is less than 0:
+        Return 0
+    End If
+    If message is equal to 0:
+        If message_length is greater than 0:
+            Return 0
+        End If
+    End If
+    If message_length is less than 0:
+        Return 0
+    End If
+    If out_tag is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Step 1: derive K' (64 bytes) from key ----
+    Let kprime be proc arena_allocate from Arena with arena, HMAC_SHA256_BLOCK
+    If kprime is equal to 0:
+        Return 0
+    End If
+    proc memory_zero from Memory with kprime, HMAC_SHA256_BLOCK
+
+    If key_length is greater than HMAC_SHA256_BLOCK:
+        Note: Hash long key down to 32 bytes
+        Let hashed_key be proc arena_allocate from Arena with arena, HMAC_SHA256_OUTPUT
+        If hashed_key is equal to 0:
+            Return 0
+        End If
+        Let h_rc be proc sha256_hash from Sha2 with arena, key, key_length, hashed_key
+        If h_rc is equal to 0:
+            Return 0
+        End If
+        proc memory_copy from Memory with kprime, hashed_key, HMAC_SHA256_OUTPUT
+    Otherwise:
+        If key_length is greater than 0:
+            proc memory_copy from Memory with kprime, key, key_length
+        End If
+    End If
+
+    Note: ---- Step 2: build ipad_key = K' XOR 0x36 ----
+    Let ipad_key be proc arena_allocate from Arena with arena, HMAC_SHA256_BLOCK
+    If ipad_key is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than HMAC_SHA256_BLOCK:
+        Let kbyte be proc memory_get_byte from Memory with kprime, i
+        Let pbyte be kbyte bitwise_xor HMAC_IPAD_BYTE
+        proc memory_set_byte from Memory with ipad_key, i, pbyte
+        Set i to i plus 1
+    End While
+
+    Note: ---- Step 3: build inner_msg = ipad_key || message ----
+    Let inner_len be HMAC_SHA256_BLOCK plus message_length
+    Let inner_msg be proc arena_allocate from Arena with arena, inner_len
+    If inner_msg is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from Memory with inner_msg, ipad_key, HMAC_SHA256_BLOCK
+    If message_length is greater than 0:
+        proc memory_copy from Memory with inner_msg plus HMAC_SHA256_BLOCK, message, message_length
+    End If
+
+    Note: ---- Step 4: inner_hash = SHA256(inner_msg) ----
+    Let inner_hash be proc arena_allocate from Arena with arena, HMAC_SHA256_OUTPUT
+    If inner_hash is equal to 0:
+        Return 0
+    End If
+    Let ih_rc be proc sha256_hash from Sha2 with arena, inner_msg, inner_len, inner_hash
+    If ih_rc is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Step 5: build opad_key = K' XOR 0x5C ----
+    Let opad_key be proc arena_allocate from Arena with arena, HMAC_SHA256_BLOCK
+    If opad_key is equal to 0:
+        Return 0
+    End If
+    Let j be 0
+    While j is less than HMAC_SHA256_BLOCK:
+        Let kbyte2 be proc memory_get_byte from Memory with kprime, j
+        Let pbyte2 be kbyte2 bitwise_xor HMAC_OPAD_BYTE
+        proc memory_set_byte from Memory with opad_key, j, pbyte2
+        Set j to j plus 1
+    End While
+
+    Note: ---- Step 6: build outer_msg = opad_key || inner_hash ----
+    Let outer_len be HMAC_SHA256_BLOCK plus HMAC_SHA256_OUTPUT
+    Let outer_msg be proc arena_allocate from Arena with arena, outer_len
+    If outer_msg is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from Memory with outer_msg, opad_key, HMAC_SHA256_BLOCK
+    proc memory_copy from Memory with outer_msg plus HMAC_SHA256_BLOCK, inner_hash, HMAC_SHA256_OUTPUT
+
+    Note: ---- Step 7: out_tag = SHA256(outer_msg) ----
+    Let final_rc be proc sha256_hash from Sha2 with arena, outer_msg, outer_len, out_tag
+    If final_rc is equal to 0:
+        Return 0
+    End If
+
+    Note: ---- Step 8: wipe secret-derived intermediates ----
+    proc secure_zero from SecureMem with kprime, HMAC_SHA256_BLOCK
+    proc secure_zero from SecureMem with ipad_key, HMAC_SHA256_BLOCK
+    proc secure_zero from SecureMem with opad_key, HMAC_SHA256_BLOCK
+    proc secure_zero from SecureMem with inner_msg, HMAC_SHA256_BLOCK
+    Note: inner_msg's message portion is plaintext, ipad portion is secret.
+    Note: We wiped only the ipad portion above; the message portion is the
+    Note: caller's plaintext and the caller decides its lifetime.
+
+    Return 1
+End Process
+
+Process called "hmac_sha256_verify" takes arena as Integer, key as Integer, key_length as Integer, message as Integer, message_length as Integer, expected_tag as Integer returns Integer:
+    @Reasoning
+    Verifies that expected_tag equals HMAC-SHA256(key, message) in
+    constant time. Returns 1 if equal, 0 otherwise. This is the
+    only safe way to verify HMAC tags in security-sensitive code;
+    a naive byte-by-byte memcmp would leak the position of the
+    first mismatching byte and allow tag forgery.
+    @End Reasoning
+
+    @Implementation
+    1. Compute the expected HMAC into a local 32-byte buffer.
+    2. constant_time_compare against expected_tag.
+    3. Securely wipe the local computed tag.
+    @End Implementation
+
+    @Performance_Hints
+    Same cost as hmac_sha256 plus one 32-byte constant-time compare
+    plus one 32-byte wipe; the latter two are sub-microsecond.
+    @End Performance_Hints
+
+    @Security_Scope
+    Hardened against: Lucky13-class timing oracles on the tag bytes.
+    @End Security_Scope
+
+    Let computed_tag be proc arena_allocate from Arena with arena, HMAC_SHA256_OUTPUT
+    If computed_tag is equal to 0:
+        Return 0
+    End If
+
+    Let rc be proc hmac_sha256 with arena, key, key_length, message, message_length, computed_tag
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Let eq be proc constant_time_compare from SecureMem with computed_tag, expected_tag, HMAC_SHA256_OUTPUT
+    proc secure_zero from SecureMem with computed_tag, HMAC_SHA256_OUTPUT
+    Return eq
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: HMAC-SHA384
+Note: ============================================================================
+
+Process called "hmac_sha384" takes arena as Integer, key as Integer, key_length as Integer, message as Integer, message_length as Integer, out_tag as Integer returns Integer:
+    @Reasoning
+    Computes HMAC-SHA384(key, message) into out_tag (48 bytes). The
+    block size is 128 bytes per SHA-384/SHA-512 specification. Same
+    construction as hmac_sha256 with block size 128 and output 48.
+    @End Reasoning
+
+    @Implementation
+    Identical to hmac_sha256 except B=128 and the underlying hash
+    is sha384_hash (48-byte output). Long-key preprocessing hashes
+    to 48 bytes then zero-pads to 128.
+    @End Implementation
+
+    @Performance_Hints
+    SHA-384 internally runs SHA-512 with different IV and a truncated
+    output, so the per-block cost is ~SHA-512 (slower than SHA-256
+    on 32-bit machines, faster on 64-bit due to 64-bit operations).
+    @End Performance_Hints
+
+    @Security_Scope
+    Same as hmac_sha256. SHA-384's truncation to 48 bytes provides
+    additional resistance to length-extension at the cost of larger
+    state. Recommended for protocols at the 192-bit security level.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If key_length is less than 0:
+        Return 0
+    End If
+    If message_length is less than 0:
+        Return 0
+    End If
+    If out_tag is equal to 0:
+        Return 0
+    End If
+
+    Let kprime be proc arena_allocate from Arena with arena, HMAC_SHA384_BLOCK
+    If kprime is equal to 0:
+        Return 0
+    End If
+    proc memory_zero from Memory with kprime, HMAC_SHA384_BLOCK
+
+    If key_length is greater than HMAC_SHA384_BLOCK:
+        Let hashed_key be proc arena_allocate from Arena with arena, HMAC_SHA384_OUTPUT
+        If hashed_key is equal to 0:
+            Return 0
+        End If
+        Let h_rc be proc sha384_hash from Sha2 with arena, key, key_length, hashed_key
+        If h_rc is equal to 0:
+            Return 0
+        End If
+        proc memory_copy from Memory with kprime, hashed_key, HMAC_SHA384_OUTPUT
+    Otherwise:
+        If key_length is greater than 0:
+            proc memory_copy from Memory with kprime, key, key_length
+        End If
+    End If
+
+    Let ipad_key be proc arena_allocate from Arena with arena, HMAC_SHA384_BLOCK
+    If ipad_key is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than HMAC_SHA384_BLOCK:
+        Let kbyte be proc memory_get_byte from Memory with kprime, i
+        Let pbyte be kbyte bitwise_xor HMAC_IPAD_BYTE
+        proc memory_set_byte from Memory with ipad_key, i, pbyte
+        Set i to i plus 1
+    End While
+
+    Let inner_len be HMAC_SHA384_BLOCK plus message_length
+    Let inner_msg be proc arena_allocate from Arena with arena, inner_len
+    If inner_msg is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from Memory with inner_msg, ipad_key, HMAC_SHA384_BLOCK
+    If message_length is greater than 0:
+        proc memory_copy from Memory with inner_msg plus HMAC_SHA384_BLOCK, message, message_length
+    End If
+
+    Let inner_hash be proc arena_allocate from Arena with arena, HMAC_SHA384_OUTPUT
+    If inner_hash is equal to 0:
+        Return 0
+    End If
+    Let ih_rc be proc sha384_hash from Sha2 with arena, inner_msg, inner_len, inner_hash
+    If ih_rc is equal to 0:
+        Return 0
+    End If
+
+    Let opad_key be proc arena_allocate from Arena with arena, HMAC_SHA384_BLOCK
+    If opad_key is equal to 0:
+        Return 0
+    End If
+    Let j be 0
+    While j is less than HMAC_SHA384_BLOCK:
+        Let kbyte2 be proc memory_get_byte from Memory with kprime, j
+        Let pbyte2 be kbyte2 bitwise_xor HMAC_OPAD_BYTE
+        proc memory_set_byte from Memory with opad_key, j, pbyte2
+        Set j to j plus 1
+    End While
+
+    Let outer_len be HMAC_SHA384_BLOCK plus HMAC_SHA384_OUTPUT
+    Let outer_msg be proc arena_allocate from Arena with arena, outer_len
+    If outer_msg is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from Memory with outer_msg, opad_key, HMAC_SHA384_BLOCK
+    proc memory_copy from Memory with outer_msg plus HMAC_SHA384_BLOCK, inner_hash, HMAC_SHA384_OUTPUT
+
+    Let final_rc be proc sha384_hash from Sha2 with arena, outer_msg, outer_len, out_tag
+    If final_rc is equal to 0:
+        Return 0
+    End If
+
+    proc secure_zero from SecureMem with kprime, HMAC_SHA384_BLOCK
+    proc secure_zero from SecureMem with ipad_key, HMAC_SHA384_BLOCK
+    proc secure_zero from SecureMem with opad_key, HMAC_SHA384_BLOCK
+    proc secure_zero from SecureMem with inner_msg, HMAC_SHA384_BLOCK
+
+    Return 1
+End Process
+
+Process called "hmac_sha384_verify" takes arena as Integer, key as Integer, key_length as Integer, message as Integer, message_length as Integer, expected_tag as Integer returns Integer:
+    @Reasoning
+    Constant-time HMAC-SHA384 tag verification.
+    @End Reasoning
+
+    @Implementation
+    Compute, compare in constant time, wipe.
+    @End Implementation
+
+    @Performance_Hints
+    Same as hmac_sha384.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same as hmac_sha256_verify.
+    @End Security_Scope
+
+    Let computed_tag be proc arena_allocate from Arena with arena, HMAC_SHA384_OUTPUT
+    If computed_tag is equal to 0:
+        Return 0
+    End If
+
+    Let rc be proc hmac_sha384 with arena, key, key_length, message, message_length, computed_tag
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Let eq be proc constant_time_compare from SecureMem with computed_tag, expected_tag, HMAC_SHA384_OUTPUT
+    proc secure_zero from SecureMem with computed_tag, HMAC_SHA384_OUTPUT
+    Return eq
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: HMAC-SHA512
+Note: ============================================================================
+
+Process called "hmac_sha512" takes arena as Integer, key as Integer, key_length as Integer, message as Integer, message_length as Integer, out_tag as Integer returns Integer:
+    @Reasoning
+    Computes HMAC-SHA512(key, message) into out_tag (64 bytes). Block
+    size 128 bytes. Same construction with the full 64-byte SHA-512
+    output (no truncation). Recommended for the 256-bit security
+    level when HMAC-SHA256 is insufficient.
+    @End Reasoning
+
+    @Implementation
+    Identical to hmac_sha384 except output is 64 bytes from
+    sha512_hash.
+    @End Implementation
+
+    @Performance_Hints
+    Same throughput as HMAC-SHA384 (both built on SHA-512); the
+    only difference is the final truncation, which is free.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same as hmac_sha256/384. Provides 256-bit security against
+    key recovery and tag forgery.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If key_length is less than 0:
+        Return 0
+    End If
+    If message_length is less than 0:
+        Return 0
+    End If
+    If out_tag is equal to 0:
+        Return 0
+    End If
+
+    Let kprime be proc arena_allocate from Arena with arena, HMAC_SHA512_BLOCK
+    If kprime is equal to 0:
+        Return 0
+    End If
+    proc memory_zero from Memory with kprime, HMAC_SHA512_BLOCK
+
+    If key_length is greater than HMAC_SHA512_BLOCK:
+        Let hashed_key be proc arena_allocate from Arena with arena, HMAC_SHA512_OUTPUT
+        If hashed_key is equal to 0:
+            Return 0
+        End If
+        Let h_rc be proc sha512_hash from Sha2 with arena, key, key_length, hashed_key
+        If h_rc is equal to 0:
+            Return 0
+        End If
+        proc memory_copy from Memory with kprime, hashed_key, HMAC_SHA512_OUTPUT
+    Otherwise:
+        If key_length is greater than 0:
+            proc memory_copy from Memory with kprime, key, key_length
+        End If
+    End If
+
+    Let ipad_key be proc arena_allocate from Arena with arena, HMAC_SHA512_BLOCK
+    If ipad_key is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than HMAC_SHA512_BLOCK:
+        Let kbyte be proc memory_get_byte from Memory with kprime, i
+        Let pbyte be kbyte bitwise_xor HMAC_IPAD_BYTE
+        proc memory_set_byte from Memory with ipad_key, i, pbyte
+        Set i to i plus 1
+    End While
+
+    Let inner_len be HMAC_SHA512_BLOCK plus message_length
+    Let inner_msg be proc arena_allocate from Arena with arena, inner_len
+    If inner_msg is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from Memory with inner_msg, ipad_key, HMAC_SHA512_BLOCK
+    If message_length is greater than 0:
+        proc memory_copy from Memory with inner_msg plus HMAC_SHA512_BLOCK, message, message_length
+    End If
+
+    Let inner_hash be proc arena_allocate from Arena with arena, HMAC_SHA512_OUTPUT
+    If inner_hash is equal to 0:
+        Return 0
+    End If
+    Let ih_rc be proc sha512_hash from Sha2 with arena, inner_msg, inner_len, inner_hash
+    If ih_rc is equal to 0:
+        Return 0
+    End If
+
+    Let opad_key be proc arena_allocate from Arena with arena, HMAC_SHA512_BLOCK
+    If opad_key is equal to 0:
+        Return 0
+    End If
+    Let j be 0
+    While j is less than HMAC_SHA512_BLOCK:
+        Let kbyte2 be proc memory_get_byte from Memory with kprime, j
+        Let pbyte2 be kbyte2 bitwise_xor HMAC_OPAD_BYTE
+        proc memory_set_byte from Memory with opad_key, j, pbyte2
+        Set j to j plus 1
+    End While
+
+    Let outer_len be HMAC_SHA512_BLOCK plus HMAC_SHA512_OUTPUT
+    Let outer_msg be proc arena_allocate from Arena with arena, outer_len
+    If outer_msg is equal to 0:
+        Return 0
+    End If
+    proc memory_copy from Memory with outer_msg, opad_key, HMAC_SHA512_BLOCK
+    proc memory_copy from Memory with outer_msg plus HMAC_SHA512_BLOCK, inner_hash, HMAC_SHA512_OUTPUT
+
+    Let final_rc be proc sha512_hash from Sha2 with arena, outer_msg, outer_len, out_tag
+    If final_rc is equal to 0:
+        Return 0
+    End If
+
+    proc secure_zero from SecureMem with kprime, HMAC_SHA512_BLOCK
+    proc secure_zero from SecureMem with ipad_key, HMAC_SHA512_BLOCK
+    proc secure_zero from SecureMem with opad_key, HMAC_SHA512_BLOCK
+    proc secure_zero from SecureMem with inner_msg, HMAC_SHA512_BLOCK
+
+    Return 1
+End Process
+
+Process called "hmac_sha512_verify" takes arena as Integer, key as Integer, key_length as Integer, message as Integer, message_length as Integer, expected_tag as Integer returns Integer:
+    @Reasoning
+    Constant-time HMAC-SHA512 tag verification.
+    @End Reasoning
+
+    @Implementation
+    Compute, compare in constant time, wipe.
+    @End Implementation
+
+    @Performance_Hints
+    Same as hmac_sha512.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same as hmac_sha256_verify.
+    @End Security_Scope
+
+    Let computed_tag be proc arena_allocate from Arena with arena, HMAC_SHA512_OUTPUT
+    If computed_tag is equal to 0:
+        Return 0
+    End If
+
+    Let rc be proc hmac_sha512 with arena, key, key_length, message, message_length, computed_tag
+    If rc is equal to 0:
+        Return 0
+    End If
+
+    Let eq be proc constant_time_compare from SecureMem with computed_tag, expected_tag, HMAC_SHA512_OUTPUT
+    proc secure_zero from SecureMem with computed_tag, HMAC_SHA512_OUTPUT
+    Return eq
+End Process

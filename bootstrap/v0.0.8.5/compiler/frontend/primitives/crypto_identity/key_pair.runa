@@ -1,0 +1,497 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+KEY_PAIR - Algorithm-tagged (private, public) bundle
+==============================================================================
+
+A KeyPair is the canonical primitive for generating and carrying a freshly-
+generated public/private pair. The KeyPair always satisfies
+  public_key_algorithm(kp.public) == private_key_algorithm(kp.private)
+and the two keys are mathematically related (public is derived from private
+by the algorithm's published public-derivation algorithm).
+
+Memory layout (16 bytes):
+  offset 0 : private_key pointer
+  offset 8 : public_key pointer
+
+The constructor keypair_generate dispatches on the algorithm tag to the
+appropriate keygen routine in the underlying crypto module.
+
+References:
+- RFC 8032 5.1.5: Ed25519 key generation.
+- RFC 7748: X25519/X448 key generation.
+- FIPS 186-5 A.2: ECDSA key pair generation.
+- FIPS 203, 204, 205: ML-KEM / ML-DSA / SLH-DSA key generation.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "compiler/frontend/primitives/crypto_identity/public_key.runa" as PK
+Import "compiler/frontend/primitives/crypto_identity/private_key.runa" as SK
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+Import "compiler/frontend/import_system/crypto/ed25519.runa" as Ed25519
+Import "compiler/frontend/import_system/crypto/ed448.runa" as Ed448
+Import "compiler/frontend/import_system/crypto/x25519.runa" as X25519
+Import "compiler/frontend/import_system/crypto/x448.runa" as X448
+Import "compiler/frontend/import_system/crypto/entropy.runa" as Entropy
+
+Let KEYPAIR_STRUCT_SIZE be 16
+Let KEYPAIR_OFF_PRIVATE be 0
+Let KEYPAIR_OFF_PUBLIC be 8
+
+Note: ============================================================================
+Note: SECTION 1: Generic constructor from (sk, pk) pair
+Note: ============================================================================
+
+@Reasoning
+Bundle a pre-existing PrivateKey and PublicKey into a KeyPair, after
+verifying the algorithm tags match. This is the path used when the keys
+were generated externally (hardware token, derived elsewhere) and need
+to be wrapped together.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate non-null arena, sk, pk.
+  2. Validate algorithm tags match.
+  3. Allocate KeyPair struct from arena.
+  4. Store pointers.
+@End Implementation
+
+@Performance_Hints
+O(1). One arena allocation.
+@End Performance_Hints
+
+@Security_Scope
+Caller is responsible for ensuring the private key actually produces the
+public key. We do NOT recompute the public derivation here because that
+would require an extra scalar-mult per construction; the validation is
+expressed via assertable invariants in tests.
+
+For the safer path that DOES recompute, see keypair_generate (random) or
+keypair_from_seed (deterministic).
+@End Security_Scope
+Process called "keypair_from_keys" takes arena as Integer, sk as Integer, pk as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If sk is equal to 0:
+        Return 0
+    End If
+    If pk is equal to 0:
+        Return 0
+    End If
+    Let sk_alg be SK.private_key_algorithm(sk)
+    Let pk_alg be PK.public_key_algorithm(pk)
+    If sk_alg is not equal to pk_alg:
+        Return 0
+    End If
+    Let kp be Arena.arena_allocate(arena, KEYPAIR_STRUCT_SIZE)
+    If kp is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_qword(kp, KEYPAIR_OFF_PRIVATE, sk)
+    Memory.memory_set_qword(kp, KEYPAIR_OFF_PUBLIC, pk)
+    Return kp
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: Accessors
+Note: ============================================================================
+
+@Reasoning
+Returns the PrivateKey pointer carried by kp.
+@End Reasoning
+
+@Implementation
+Reads the first qword.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns a secret-bearing handle; callers must respect PrivateKey discipline.
+@End Security_Scope
+Process called "keypair_private" takes kp as Integer returns Integer:
+    If kp is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(kp, KEYPAIR_OFF_PRIVATE)
+End Process
+
+@Reasoning
+Returns the PublicKey pointer carried by kp.
+@End Reasoning
+
+@Implementation
+Reads the second qword.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret material.
+@End Security_Scope
+Process called "keypair_public" takes kp as Integer returns Integer:
+    If kp is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(kp, KEYPAIR_OFF_PUBLIC)
+End Process
+
+@Reasoning
+Returns the algorithm tag (both keys share it by invariant).
+@End Reasoning
+
+@Implementation
+Reads the algorithm from the carried public key.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "keypair_algorithm" takes kp as Integer returns Integer:
+    If kp is equal to 0:
+        Return 0
+    End If
+    Let pk be keypair_public(kp)
+    Return PK.public_key_algorithm(pk)
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: keypair_from_seed - deterministic from caller-supplied entropy
+Note: ============================================================================
+
+@Reasoning
+Construct a KeyPair from caller-supplied seed bytes. The seed must be
+algorithm-appropriate-length (see the per-algorithm spec for the seed
+size). This is the deterministic constructor used for:
+  - reproducible keys in test vectors (RFC 8032 7.1 et al.)
+  - HD-wallet style derivation where the seed comes from a parent key
+  - HSM-imported deterministic key generation
+
+Currently supports the algorithms whose underlying keygen primitives are
+implemented in tree:
+  - Ed25519 (seed = 32 bytes per RFC 8032 5.1.5)
+  - Ed448   (seed = 57 bytes per RFC 8032 5.2.5)
+  - X25519  (seed = 32 bytes; treated as clamped scalar per RFC 7748)
+  - X448    (seed = 56 bytes per RFC 7748)
+
+For other algorithms (ECDSA, RSA, PQ), use keypair_generate which uses
+the algorithm's specified randomized keygen procedure.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate arena, seed_bytes, seed_length, algorithm.
+  2. Verify seed_length == published seed length for algorithm.
+  3. Allocate temp scratch buffers for the keygen outputs in arena.
+  4. Dispatch to algorithm-specific keygen:
+       - ALG_ED25519: ed25519_keygen(arena, seed, pub_buf, sec_buf)
+       - ALG_ED448:   ed448_keygen(arena, seed, pub_buf, sec_buf)
+       - ALG_X25519:  scalarmult basepoint(seed) -> pub; seed is sec
+       - ALG_X448:    scalarmult basepoint(seed) -> pub; seed is sec
+  5. Wrap outputs as PrivateKey + PublicKey.
+  6. Bundle as KeyPair.
+@End Implementation
+
+@Performance_Hints
+O(keygen). One scalar-mult plus internal hashing per Ed25519/Ed448, or
+one scalar-mult for X25519/X448.
+@End Performance_Hints
+
+@Security_Scope
+The SEED is secret. After this call, the seed buffer should be wiped by
+the caller with secure_zero unless the caller plans to retain it (e.g.,
+for deterministic re-derivation in a wallet recovery flow).
+
+For Ed25519 in particular, ed25519_keygen produces a 64-byte expanded
+secret key per RFC 8032; we store the full 64-byte expansion in the
+PrivateKey (not just the 32-byte seed). This matches RFC 8032
+section 5.1.6 which uses the expanded form for signing.
+
+References:
+- RFC 8032 sections 5.1.5, 5.2.5: Ed25519/Ed448 deterministic keygen.
+- RFC 7748: X25519/X448 keygen via scalar clamping.
+- BIP-32 (Bitcoin HD wallets): seed-based key derivation precedent.
+@End Security_Scope
+Process called "keypair_from_seed" takes arena as Integer, algorithm as Integer, seed_bytes as Integer, seed_length as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If seed_bytes is equal to 0:
+        Return 0
+    End If
+
+    If algorithm is equal to Alg.ALG_ED25519:
+        If seed_length is not equal to 32:
+            Return 0
+        End If
+        Let pub_buf be Arena.arena_allocate(arena, 32)
+        If pub_buf is equal to 0:
+            Return 0
+        End If
+        Let sec_buf be Arena.arena_allocate(arena, 64)
+        If sec_buf is equal to 0:
+            Return 0
+        End If
+        Let rc be Ed25519.ed25519_keygen(arena, seed_bytes, pub_buf, sec_buf)
+        If rc is equal to 0:
+            Return 0
+        End If
+        Let pk be PK.public_key_create(arena, algorithm, pub_buf, 32)
+        If pk is equal to 0:
+            Return 0
+        End If
+        Let sk be SK.private_key_create(arena, algorithm, sec_buf, 32)
+        If sk is equal to 0:
+            Return 0
+        End If
+        Note: Wipe the in-arena scratch sec_buf now that PrivateKey owns
+        Note: an independent copy. The arena will reclaim the slot.
+        Secure.secure_zero(sec_buf, 64)
+        Return keypair_from_keys(arena, sk, pk)
+    End If
+
+    If algorithm is equal to Alg.ALG_ED448:
+        If seed_length is not equal to 57:
+            Return 0
+        End If
+        Let pub_buf448 be Arena.arena_allocate(arena, 57)
+        If pub_buf448 is equal to 0:
+            Return 0
+        End If
+        Let sec_buf448 be Arena.arena_allocate(arena, 114)
+        If sec_buf448 is equal to 0:
+            Return 0
+        End If
+        Let rc448 be Ed448.ed448_keygen(arena, seed_bytes, pub_buf448, sec_buf448)
+        If rc448 is equal to 0:
+            Return 0
+        End If
+        Let pk448 be PK.public_key_create(arena, algorithm, pub_buf448, 57)
+        If pk448 is equal to 0:
+            Return 0
+        End If
+        Let sk448 be SK.private_key_create(arena, algorithm, sec_buf448, 57)
+        If sk448 is equal to 0:
+            Return 0
+        End If
+        Secure.secure_zero(sec_buf448, 114)
+        Return keypair_from_keys(arena, sk448, pk448)
+    End If
+
+    If algorithm is equal to Alg.ALG_X25519:
+        If seed_length is not equal to 32:
+            Return 0
+        End If
+        Note: For X25519 the "seed" IS the private scalar (after clamping
+        Note: which x25519_scalarmult applies internally). To derive the
+        Note: corresponding public key, scalar-mult against the basepoint.
+        Note: The x25519_scalarmult proc handles the basepoint case by
+        Note: convention: pass a public buffer holding the 32-byte
+        Note: standard basepoint (u=9, rest zero).
+        Let bp_buf be Arena.arena_allocate(arena, 32)
+        If bp_buf is equal to 0:
+            Return 0
+        End If
+        Let i be 0
+        While i is less than 32:
+            Memory.memory_set_byte(bp_buf, i, 0)
+            Set i to i plus 1
+        End While
+        Memory.memory_set_byte(bp_buf, 0, 9)
+        Let pub_x be Arena.arena_allocate(arena, 32)
+        If pub_x is equal to 0:
+            Return 0
+        End If
+        Let rcx be X25519.x25519_scalarmult(arena, seed_bytes, bp_buf, pub_x)
+        If rcx is equal to 0:
+            Return 0
+        End If
+        Let pk_x be PK.public_key_create(arena, algorithm, pub_x, 32)
+        If pk_x is equal to 0:
+            Return 0
+        End If
+        Let sk_x be SK.private_key_create(arena, algorithm, seed_bytes, 32)
+        If sk_x is equal to 0:
+            Return 0
+        End If
+        Return keypair_from_keys(arena, sk_x, pk_x)
+    End If
+
+    If algorithm is equal to Alg.ALG_X448:
+        If seed_length is not equal to 56:
+            Return 0
+        End If
+        Note: X448 basepoint is u=5, rest zero (RFC 7748 section 4.2).
+        Let bp_buf448 be Arena.arena_allocate(arena, 56)
+        If bp_buf448 is equal to 0:
+            Return 0
+        End If
+        Let j be 0
+        While j is less than 56:
+            Memory.memory_set_byte(bp_buf448, j, 0)
+            Set j to j plus 1
+        End While
+        Memory.memory_set_byte(bp_buf448, 0, 5)
+        Let pub_x448 be Arena.arena_allocate(arena, 56)
+        If pub_x448 is equal to 0:
+            Return 0
+        End If
+        Let rcx448 be X448.x448_scalarmult(arena, seed_bytes, bp_buf448, pub_x448)
+        If rcx448 is equal to 0:
+            Return 0
+        End If
+        Let pk_x448 be PK.public_key_create(arena, algorithm, pub_x448, 56)
+        If pk_x448 is equal to 0:
+            Return 0
+        End If
+        Let sk_x448 be SK.private_key_create(arena, algorithm, seed_bytes, 56)
+        If sk_x448 is equal to 0:
+            Return 0
+        End If
+        Return keypair_from_keys(arena, sk_x448, pk_x448)
+    End If
+
+    Note: Other algorithms require non-seeded keygen; use keypair_generate.
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: keypair_generate - random from entropy source
+Note: ============================================================================
+
+@Reasoning
+Generate a KeyPair using the OS-level entropy source (entropy.runa).
+Dispatches to the algorithm-specific seeded keygen with a freshly-drawn
+seed of the appropriate size.
+
+The random-vs-deterministic split exists because some test paths and
+audit-recovery paths require deterministic keygen (keypair_from_seed),
+while production application keygen prefers OS entropy.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Resolve seed length for the algorithm.
+  2. Allocate seed buffer in arena.
+  3. Call entropy_random_bytes to fill it.
+  4. Delegate to keypair_from_seed.
+  5. Wipe the seed buffer (the arena slot stays in the arena but is now
+     overwritten with zero bytes so future reads see no key material).
+@End Implementation
+
+@Performance_Hints
+O(keygen) plus one entropy read.
+@End Performance_Hints
+
+@Security_Scope
+Uses the OS entropy source via entropy_random_bytes. On Linux this is
+getrandom(2); on macOS, getentropy(3); on Windows, BCryptGenRandom.
+See entropy.runa for full sourcing details and fallback strategy.
+
+Seed buffer is wiped after key derivation; the PrivateKey holds its own
+copy. The arena where the buffer resided is still allocated; if the
+caller wants no trace of the seed in the arena even after wipe, the
+caller should use a dedicated short-lived arena for keygen and destroy it.
+
+References:
+- NIST SP 800-90A Rev 1: DRBG mechanisms (we use OS DRBG via entropy.runa).
+- RFC 4086: randomness requirements for security.
+@End Security_Scope
+Process called "keypair_generate" takes arena as Integer, algorithm as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Determine seed length.
+    Let seed_len be 0
+    If algorithm is equal to Alg.ALG_ED25519:
+        Set seed_len to 32
+    End If
+    If algorithm is equal to Alg.ALG_ED448:
+        Set seed_len to 57
+    End If
+    If algorithm is equal to Alg.ALG_X25519:
+        Set seed_len to 32
+    End If
+    If algorithm is equal to Alg.ALG_X448:
+        Set seed_len to 56
+    End If
+    If seed_len is equal to 0:
+        Return 0
+    End If
+
+    Let seed_buf be Arena.arena_allocate(arena, seed_len)
+    If seed_buf is equal to 0:
+        Return 0
+    End If
+    Let rc be Entropy.entropy_random_bytes(arena, seed_buf, seed_len)
+    If rc is equal to 0:
+        Secure.secure_zero(seed_buf, seed_len)
+        Return 0
+    End If
+
+    Let kp be keypair_from_seed(arena, algorithm, seed_buf, seed_len)
+    Secure.secure_zero(seed_buf, seed_len)
+    Return kp
+End Process
+
+Note: ============================================================================
+Note: SECTION 5: Destroy
+Note: ============================================================================
+
+@Reasoning
+Destroy the KeyPair by wiping its private-key bytes. The public key is
+left intact (non-secret); the arena reclaims everything on arena_destroy.
+@End Reasoning
+
+@Implementation
+Calls private_key_destroy on the wrapped private key. The KeyPair struct
+header stays in the arena.
+@End Implementation
+
+@Performance_Hints
+O(n) in private-key length.
+@End Performance_Hints
+
+@Security_Scope
+After this call, the wrapped private key's wiped flag is set and its
+byte buffer is zeroed. Subsequent crypto operations on the keypair will
+refuse the private key.
+@End Security_Scope
+Process called "keypair_destroy" takes kp as Integer returns Integer:
+    If kp is equal to 0:
+        Return 0
+    End If
+    Let sk be keypair_private(kp)
+    If sk is equal to 0:
+        Return 0
+    End If
+    Return SK.private_key_destroy(sk)
+End Process

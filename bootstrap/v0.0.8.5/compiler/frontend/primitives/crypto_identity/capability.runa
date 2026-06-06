@@ -1,0 +1,477 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+CAPABILITY - Unforgeable capability token for authorization
+==============================================================================
+
+A Capability is a cryptographically-bound authorization token. The
+holder of a valid Capability has proven they can perform the named
+operation on the named scope until the named expiration. The token
+carries an Ed25519 signature; verification requires the public key
+of the issuing authority.
+
+Field layout in the SIGNED PAYLOAD (canonical encoding):
+  +-- operation_id (8 bytes, big-endian integer)
+  +-- scope_hash   (32 bytes; SHA-256 of the scope string)
+  +-- issued_at    (8 bytes, Unix seconds, big-endian)
+  +-- expiration   (8 bytes, Unix seconds, big-endian)
+  +-- nonce        (16 bytes, random; per-token uniqueness)
+
+Total payload = 72 bytes.
+
+Memory layout of the Capability struct itself (48 bytes):
+  offset  0 : operation_id   (8 bytes)
+  offset  8 : scope_hash ptr (8 bytes; into arena)
+  offset 16 : issued_at      (8 bytes)
+  offset 24 : expiration     (8 bytes)
+  offset 32 : nonce ptr      (8 bytes; into arena)
+  offset 40 : signature ptr  (8 bytes; into arena; 64-byte Ed25519 sig)
+
+The signature is over the canonical-encoded 72-byte payload.
+
+References:
+- Dennis & Van Horn, "Programming Semantics for Multiprogrammed
+  Computations", CACM 1966 (capability-based security origin).
+- Macaroons (Birgisson et al. 2014): caveat-extensible capabilities.
+- RFC 6749 OAuth 2.0: bearer tokens.
+- RFC 7519: JWT (a degenerate-form capability).
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/crypto_identity/crypto_algorithm.runa" as Alg
+Import "compiler/frontend/primitives/crypto_identity/public_key.runa" as PK
+Import "compiler/frontend/primitives/crypto_identity/private_key.runa" as SK
+Import "compiler/frontend/primitives/crypto_identity/signature.runa" as Sig
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/sha2.runa" as Sha2
+Import "compiler/frontend/import_system/crypto/entropy.runa" as Entropy
+Import "compiler/frontend/import_system/crypto/secure_memory.runa" as Secure
+
+Let CAPABILITY_STRUCT_SIZE be 48
+Let CAP_OFF_OPERATION be 0
+Let CAP_OFF_SCOPE_HASH be 8
+Let CAP_OFF_ISSUED_AT be 16
+Let CAP_OFF_EXPIRATION be 24
+Let CAP_OFF_NONCE be 32
+Let CAP_OFF_SIGNATURE be 40
+
+Let CAP_PAYLOAD_SIZE be 72
+Let CAP_SCOPE_HASH_SIZE be 32
+Let CAP_NONCE_SIZE be 16
+
+Note: ============================================================================
+Note: SECTION 1: Canonical encoding
+Note: ============================================================================
+
+@Reasoning
+Encode the capability payload bytes for signing. Output is exactly
+72 bytes, written into out_buffer at offset 0.
+
+Big-endian integer encoding is used throughout so the canonical bytes
+are byte-order-independent. The Network and persistence layers see the
+same bytes regardless of platform endianness.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate buffers.
+  2. Write operation_id as 8 bytes big-endian.
+  3. Copy scope_hash (32 bytes) at offset 8.
+  4. Write issued_at as 8 bytes big-endian at offset 40.
+  5. Write expiration as 8 bytes big-endian at offset 48.
+  6. Copy nonce (16 bytes) at offset 56.
+@End Implementation
+
+@Performance_Hints
+O(payload size = 72). Constant cost.
+@End Performance_Hints
+
+@Security_Scope
+The canonical encoding must be exact across producers and verifiers;
+any divergence breaks signature verification. Field ordering matches
+the FIELD LAYOUT comment in the module header and MUST NOT be
+changed without bumping a version field (which v0.0.8.5 does not yet
+include; downstream "Capability v2" extensions will).
+@End Security_Scope
+Process called "capability_encode_payload" takes operation_id as Integer, scope_hash_32 as Integer, issued_at as Integer, expiration as Integer, nonce_16 as Integer, out_buffer as Integer returns Integer:
+    If out_buffer is equal to 0:
+        Return 0
+    End If
+    If scope_hash_32 is equal to 0:
+        Return 0
+    End If
+    If nonce_16 is equal to 0:
+        Return 0
+    End If
+
+    Note: operation_id big-endian, 8 bytes.
+    Let op_v be operation_id
+    Let oi be 7
+    Let oc be 0
+    While oc is less than 8:
+        Memory.memory_set_byte(out_buffer, oi, op_v modulo by 256)
+        Set op_v to op_v divided by 256
+        Set oi to oi minus 1
+        Set oc to oc plus 1
+    End While
+
+    Note: scope_hash 32 bytes at offset 8.
+    Memory.memory_copy(out_buffer plus 8, scope_hash_32, CAP_SCOPE_HASH_SIZE)
+
+    Note: issued_at big-endian, 8 bytes at offset 40.
+    Let ia_v be issued_at
+    Let ii be 47
+    Let ic be 0
+    While ic is less than 8:
+        Memory.memory_set_byte(out_buffer, ii, ia_v modulo by 256)
+        Set ia_v to ia_v divided by 256
+        Set ii to ii minus 1
+        Set ic to ic plus 1
+    End While
+
+    Note: expiration big-endian, 8 bytes at offset 48.
+    Let ex_v be expiration
+    Let xi be 55
+    Let xc be 0
+    While xc is less than 8:
+        Memory.memory_set_byte(out_buffer, xi, ex_v modulo by 256)
+        Set ex_v to ex_v divided by 256
+        Set xi to xi minus 1
+        Set xc to xc plus 1
+    End While
+
+    Note: nonce 16 bytes at offset 56.
+    Memory.memory_copy(out_buffer plus 56, nonce_16, CAP_NONCE_SIZE)
+    Return CAP_PAYLOAD_SIZE
+End Process
+
+Note: ============================================================================
+Note: SECTION 2: capability_grant - issue and sign
+Note: ============================================================================
+
+@Reasoning
+Issue a new Capability granting holder permission to perform
+operation_id on scope (any byte string) until expiration. The scope is
+hashed with SHA-256 to produce a 32-byte commitment; the full scope
+string need not be transported with the token (verification can
+recompute the hash).
+
+The token is signed with issuing_private_key, which MUST be the
+Ed25519 private key of the issuing authority. Other signature
+algorithms are rejected; the Capability primitive uses Ed25519
+exclusively for simplicity and to keep verification cost minimal
+(~100us on x86-64).
+
+A 16-byte random nonce is included to ensure token uniqueness even
+across same-(op, scope, issued_at, expiration) issuances.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate inputs.
+  2. Verify issuing_private_key.algorithm == ALG_ED25519.
+  3. Allocate scope_hash buffer; compute SHA-256 of scope_bytes.
+  4. Generate random 16-byte nonce.
+  5. Compose 72-byte payload.
+  6. Sign payload using signature_sign on the private key.
+  7. Allocate Capability struct, store all fields.
+@End Implementation
+
+@Performance_Hints
+O(scope_length + sign).
+@End Performance_Hints
+
+@Security_Scope
+The Capability is unforgeable under the unforgeability of Ed25519
+(EUF-CMA per RFC 8032 / Bernstein 2011).
+
+The issuing PRIVATE key must be protected per the PrivateKey discipline
+(see private_key.runa). The compromise of the issuing key compromises
+ALL capabilities issued under that key, retroactively.
+
+Operation IDs and scopes are application-defined; the cryptographic
+binding ensures they cannot be tampered with after issuance.
+@End Security_Scope
+Process called "capability_grant" takes arena as Integer, issuing_private_key as Integer, operation_id as Integer, scope_bytes as Integer, scope_length as Integer, issued_at as Integer, expiration as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If issuing_private_key is equal to 0:
+        Return 0
+    End If
+    If scope_bytes is equal to 0:
+        Return 0
+    End If
+    If scope_length is less than 0:
+        Return 0
+    End If
+    If expiration is less than issued_at:
+        Return 0
+    End If
+
+    Let alg be SK.private_key_algorithm(issuing_private_key)
+    If alg is not equal to Alg.ALG_ED25519:
+        Return 0
+    End If
+
+    Let scope_hash be Arena.arena_allocate(arena, CAP_SCOPE_HASH_SIZE)
+    If scope_hash is equal to 0:
+        Return 0
+    End If
+    Let rh be Sha2.sha256_hash(arena, scope_bytes, scope_length, scope_hash)
+    If rh is equal to 0:
+        Return 0
+    End If
+
+    Let nonce_buf be Arena.arena_allocate(arena, CAP_NONCE_SIZE)
+    If nonce_buf is equal to 0:
+        Return 0
+    End If
+    Let rn be Entropy.entropy_random_bytes(arena, nonce_buf, CAP_NONCE_SIZE)
+    If rn is equal to 0:
+        Return 0
+    End If
+
+    Let payload be Arena.arena_allocate(arena, CAP_PAYLOAD_SIZE)
+    If payload is equal to 0:
+        Return 0
+    End If
+    Let enc_rc be capability_encode_payload(operation_id, scope_hash, issued_at, expiration, nonce_buf, payload)
+    If enc_rc is equal to 0:
+        Return 0
+    End If
+
+    Let sig_val be Sig.signature_sign(arena, issuing_private_key, payload, CAP_PAYLOAD_SIZE)
+    If sig_val is equal to 0:
+        Return 0
+    End If
+
+    Let cap be Arena.arena_allocate(arena, CAPABILITY_STRUCT_SIZE)
+    If cap is equal to 0:
+        Return 0
+    End If
+    Memory.memory_set_qword(cap, CAP_OFF_OPERATION, operation_id)
+    Memory.memory_set_qword(cap, CAP_OFF_SCOPE_HASH, scope_hash)
+    Memory.memory_set_qword(cap, CAP_OFF_ISSUED_AT, issued_at)
+    Memory.memory_set_qword(cap, CAP_OFF_EXPIRATION, expiration)
+    Memory.memory_set_qword(cap, CAP_OFF_NONCE, nonce_buf)
+    Memory.memory_set_qword(cap, CAP_OFF_SIGNATURE, sig_val)
+    Return cap
+End Process
+
+Note: ============================================================================
+Note: SECTION 3: capability_verify - cryptographic + temporal check
+Note: ============================================================================
+
+@Reasoning
+Verify that the Capability:
+  (a) was signed by issuing_public_key
+  (b) covers the named operation_id
+  (c) covers the supplied scope_bytes (i.e., SHA-256(scope) matches
+      the embedded scope_hash)
+  (d) has not yet expired (current_time < expiration)
+  (e) was issued in the past (current_time >= issued_at)
+
+Returns 1 if all checks pass, 0 otherwise.
+
+Per HC#11 the signature check uses signature_verify, which itself
+enforces the algorithm-match-public-key gate. So the entire chain
+of cryptographic preconditions for trusting this capability is
+type-safe.
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Validate inputs.
+  2. Check temporal bounds.
+  3. Verify operation_id matches.
+  4. Recompute scope_hash, constant-time compare.
+  5. Re-encode payload and verify the embedded signature.
+@End Implementation
+
+@Performance_Hints
+O(scope_length + verify) ~ a few hundred microseconds for typical
+scope lengths.
+@End Performance_Hints
+
+@Security_Scope
+The cryptographic binding (Ed25519 signature) is the unforgeability
+guarantee. The temporal and operation-match checks are policy checks;
+violating them returns 0 just as a forged signature would.
+
+References:
+- RFC 8032 EUF-CMA guarantee for Ed25519.
+@End Security_Scope
+Process called "capability_verify" takes arena as Integer, cap as Integer, issuing_public_key as Integer, operation_id as Integer, scope_bytes as Integer, scope_length as Integer, current_time as Integer returns Integer:
+    If arena is equal to 0:
+        Return 0
+    End If
+    If cap is equal to 0:
+        Return 0
+    End If
+    If issuing_public_key is equal to 0:
+        Return 0
+    End If
+    If scope_bytes is equal to 0:
+        Return 0
+    End If
+
+    Note: Algorithm check.
+    Let pk_alg be PK.public_key_algorithm(issuing_public_key)
+    If pk_alg is not equal to Alg.ALG_ED25519:
+        Return 0
+    End If
+
+    Note: Temporal.
+    Let issued_at be Memory.memory_get_qword(cap, CAP_OFF_ISSUED_AT)
+    Let expiration be Memory.memory_get_qword(cap, CAP_OFF_EXPIRATION)
+    If current_time is less than issued_at:
+        Return 0
+    End If
+    If current_time is greater than or equal to expiration:
+        Return 0
+    End If
+
+    Note: Operation match.
+    Let cap_op be Memory.memory_get_qword(cap, CAP_OFF_OPERATION)
+    If cap_op is not equal to operation_id:
+        Return 0
+    End If
+
+    Note: Recompute scope hash and constant-time compare.
+    Let scope_hash_expected be Arena.arena_allocate(arena, CAP_SCOPE_HASH_SIZE)
+    If scope_hash_expected is equal to 0:
+        Return 0
+    End If
+    Let rh be Sha2.sha256_hash(arena, scope_bytes, scope_length, scope_hash_expected)
+    If rh is equal to 0:
+        Return 0
+    End If
+    Let cap_scope_hash be Memory.memory_get_qword(cap, CAP_OFF_SCOPE_HASH)
+    Let hash_match be Secure.constant_time_compare(scope_hash_expected, cap_scope_hash, CAP_SCOPE_HASH_SIZE)
+    If hash_match is equal to 0:
+        Return 0
+    End If
+
+    Note: Re-encode payload and verify signature.
+    Let nonce_buf be Memory.memory_get_qword(cap, CAP_OFF_NONCE)
+    Let payload be Arena.arena_allocate(arena, CAP_PAYLOAD_SIZE)
+    If payload is equal to 0:
+        Return 0
+    End If
+    Let enc_rc be capability_encode_payload(cap_op, cap_scope_hash, issued_at, expiration, nonce_buf, payload)
+    If enc_rc is equal to 0:
+        Return 0
+    End If
+
+    Let sig_val be Memory.memory_get_qword(cap, CAP_OFF_SIGNATURE)
+    Return Sig.signature_verify(arena, issuing_public_key, payload, CAP_PAYLOAD_SIZE, sig_val)
+End Process
+
+Note: ============================================================================
+Note: SECTION 4: Accessors
+Note: ============================================================================
+
+@Reasoning
+Returns the operation id from the capability.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 0.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "capability_operation_id" takes cap as Integer returns Integer:
+    If cap is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(cap, CAP_OFF_OPERATION)
+End Process
+
+@Reasoning
+Returns the issued_at timestamp.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 16.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "capability_issued_at" takes cap as Integer returns Integer:
+    If cap is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(cap, CAP_OFF_ISSUED_AT)
+End Process
+
+@Reasoning
+Returns the expiration timestamp.
+@End Reasoning
+
+@Implementation
+Reads qword at offset 24.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Non-secret metadata.
+@End Security_Scope
+Process called "capability_expiration" takes cap as Integer returns Integer:
+    If cap is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(cap, CAP_OFF_EXPIRATION)
+End Process
+
+@Reasoning
+Returns the embedded signature pointer (a Signature value).
+@End Reasoning
+
+@Implementation
+Reads qword at offset 40.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+The signature is non-secret; transporting the capability includes
+transporting its signature.
+@End Security_Scope
+Process called "capability_signature" takes cap as Integer returns Integer:
+    If cap is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_qword(cap, CAP_OFF_SIGNATURE)
+End Process

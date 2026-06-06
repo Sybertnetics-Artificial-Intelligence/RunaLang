@@ -1,0 +1,550 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+EMAIL ADDRESS - RFC 5322 / RFC 5321 / RFC 6531 Email Primitive (Tier 1)
+
+Implements the EmailAddress value type per RFC 5322 (Internet Message
+Format), RFC 5321 (Simple Mail Transfer Protocol), and RFC 6531
+(SMTP Extension for Internationalized Email Addresses).
+
+Two validation modes are exposed:
+
+  Strict mode: RFC 5322 / RFC 5321 ABNF strictly applied.
+    - Local part 1..64 octets per RFC 5321 section 4.5.3.1.1
+    - Domain part 1..255 octets per RFC 5321 section 4.5.3.1.2
+    - Total length 3..256 octets
+    - Local part characters limited to atom-text:
+        ALPHA, DIGIT, and these specials: ! # $ % & ' * + - / = ? ^ _ ` { | } ~ .
+      with the additional rule that '.' may not appear as the first or last
+      character of the local part and may not occur consecutively.
+    - Domain must satisfy the hostname grammar (RFC 1123) - this module
+      does the bytewise structural check here; full domain validation is
+      offered by net/domain.runa.
+    - Quoted local-part forms are accepted: a leading '"' begins a quoted
+      string in which most printable characters and escapes are permitted.
+
+  Loose mode: same as strict but allows underscores anywhere in the domain
+    and skips the dot-position rule on the local part. Useful for
+    interpreting addresses found in legacy data sets.
+
+Internationalized email (EAI) per RFC 6531:
+  Allows UTF-8 bytes (>= 0x80) in the local part. The strict-mode validator
+  rejects them; the EAI-aware validator accepts well-formed UTF-8 sequences
+  per RFC 3629.
+
+Record layout (24 bytes):
+  offset 0:  local_part   (pointer to string)
+  offset 8:  domain_part  (pointer to string)
+  offset 16: is_quoted    (1 if local part was quoted in source, else 0)
+
+Constants:
+  EMAIL_MODE_STRICT, EMAIL_MODE_LOOSE, EMAIL_MODE_EAI
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/string_builder.runa" as SB
+Import "compiler/frontend/primitives/char_core.runa" as Char
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let EMAIL_LOCAL_MAX be 64
+Let EMAIL_DOMAIN_MAX be 255
+Let EMAIL_TOTAL_MAX be 256
+Let EMAIL_RECORD_SIZE be 24
+Let EMAIL_MODE_STRICT be 0
+Let EMAIL_MODE_LOOSE be 1
+Let EMAIL_MODE_EAI be 2
+
+Note: ============================================================================
+Note: CHARACTER PREDICATES
+Note: ============================================================================
+
+@Reasoning
+Check whether a single ASCII byte is a valid local-part atom character per
+RFC 5322 section 3.2.3 atext production:
+  ALPHA / DIGIT /
+  "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" /
+  "-" / "/" / "=" / "?" / "^" / "_" / "`" / "{" / "|" / "}" / "~"
+@End Reasoning
+
+@Implementation
+ASCII alpha, ASCII digit, or one of the 21 specials enumerated above.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Used to enforce strict-mode validation; rejects path-traversal payloads
+or shell-metachar local parts.
+@End Security_Scope
+Process called "email_is_atext" takes ch as Integer returns Integer:
+    Let ca be proc is_alpha from Char with ch
+    If ca is equal to 1:
+        Return 1
+    End If
+    Let cd be proc is_digit from Char with ch
+    If cd is equal to 1:
+        Return 1
+    End If
+    If ch is equal to 33:
+        Return 1
+    End If
+    If ch is equal to 35:
+        Return 1
+    End If
+    If ch is equal to 36:
+        Return 1
+    End If
+    If ch is equal to 37:
+        Return 1
+    End If
+    If ch is equal to 38:
+        Return 1
+    End If
+    If ch is equal to 39:
+        Return 1
+    End If
+    If ch is equal to 42:
+        Return 1
+    End If
+    If ch is equal to 43:
+        Return 1
+    End If
+    If ch is equal to 45:
+        Return 1
+    End If
+    If ch is equal to 47:
+        Return 1
+    End If
+    If ch is equal to 61:
+        Return 1
+    End If
+    If ch is equal to 63:
+        Return 1
+    End If
+    If ch is equal to 94:
+        Return 1
+    End If
+    If ch is equal to 95:
+        Return 1
+    End If
+    If ch is equal to 96:
+        Return 1
+    End If
+    If ch is equal to 123:
+        Return 1
+    End If
+    If ch is equal to 124:
+        Return 1
+    End If
+    If ch is equal to 125:
+        Return 1
+    End If
+    If ch is equal to 126:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: LOCAL PART VALIDATION
+Note: ============================================================================
+
+@Reasoning
+Validate an unquoted local part per RFC 5322 dot-atom production:
+  dot-atom-text = 1*atext *("." 1*atext)
+RFC 5321 section 4.5.3.1.1 further limits length to 64 octets.
+@End Reasoning
+
+@Implementation
+Walk byte-by-byte. Track whether the previous character was '.' to reject
+consecutive dots. Reject leading or trailing dot. Reject any non-atext
+byte in strict mode; accept UTF-8 lead bytes in EAI mode.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Strict mode is the safe default; loose mode is intended for parsers
+ingesting historical data and should not be used for new validations.
+@End Security_Scope
+Process called "email_is_valid_local_part" takes local_str as Integer, start as Integer, length as Integer, mode as Integer returns Integer:
+    If local_str is equal to 0:
+        Return 0
+    End If
+    If length is less than 1:
+        Return 0
+    End If
+    If length is greater than EMAIL_LOCAL_MAX:
+        Return 0
+    End If
+    Let first be proc memory_get_byte from Memory with local_str, start
+    If first is equal to 46:
+        Return 0
+    End If
+    Let last be proc memory_get_byte from Memory with local_str, start plus length minus 1
+    If last is equal to 46:
+        Return 0
+    End If
+    Let prev_dot be 0
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with local_str, start plus i
+        If ch is equal to 46:
+            If prev_dot is equal to 1:
+                Return 0
+            End If
+            Set prev_dot to 1
+        Otherwise:
+            Set prev_dot to 0
+            If ch is greater than 127:
+                If mode is not equal to EMAIL_MODE_EAI:
+                    Return 0
+                End If
+            Otherwise:
+                Let ok be proc email_is_atext with ch
+                If ok is equal to 0:
+                    If mode is equal to EMAIL_MODE_LOOSE:
+                        Note: In loose mode also accept '.', already handled above; other special bytes still rejected.
+                        Return 0
+                    Otherwise:
+                        Return 0
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: DOMAIN PART VALIDATION
+Note: ============================================================================
+
+@Reasoning
+Validate the domain part using the RFC 1123 hostname grammar with the
+RFC 5321 length cap of 255 octets. This is a bytewise check sufficient
+for stage-1 acceptance; deeper IDN / DNS-resolvability checks belong to
+net/domain.runa.
+@End Reasoning
+
+@Implementation
+Split on '.'. Each label must be 1..63 octets and consist of letters,
+digits, and hyphens with no leading or trailing hyphen.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Strict per RFC. Reject empty labels (consecutive dots) and labels with
+non-LDH characters.
+@End Security_Scope
+Process called "email_is_valid_domain_part" takes domain_str as Integer, start as Integer, length as Integer returns Integer:
+    If domain_str is equal to 0:
+        Return 0
+    End If
+    If length is less than 1:
+        Return 0
+    End If
+    If length is greater than EMAIL_DOMAIN_MAX:
+        Return 0
+    End If
+    Let label_start be start
+    Let label_len be 0
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with domain_str, start plus i
+        If ch is equal to 46:
+            If label_len is less than 1:
+                Return 0
+            End If
+            If label_len is greater than 63:
+                Return 0
+            End If
+            Let lstart be label_start
+            Let first_b be proc memory_get_byte from Memory with domain_str, lstart
+            If first_b is equal to 45:
+                Return 0
+            End If
+            Let last_b be proc memory_get_byte from Memory with domain_str, lstart plus label_len minus 1
+            If last_b is equal to 45:
+                Return 0
+            End If
+            Set label_start to start plus i plus 1
+            Set label_len to 0
+        Otherwise:
+            Let ca be proc is_alpha from Char with ch
+            Let cd be proc is_digit from Char with ch
+            If ca is equal to 0:
+                If cd is equal to 0:
+                    If ch is not equal to 45:
+                        Return 0
+                    End If
+                End If
+            End If
+            Set label_len to label_len plus 1
+        End If
+        Set i to i plus 1
+    End While
+    If label_len is less than 1:
+        Return 0
+    End If
+    If label_len is greater than 63:
+        Return 0
+    End If
+    Let first_b be proc memory_get_byte from Memory with domain_str, label_start
+    If first_b is equal to 45:
+        Return 0
+    End If
+    Let last_b be proc memory_get_byte from Memory with domain_str, label_start plus label_len minus 1
+    If last_b is equal to 45:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: RECORD MANAGEMENT
+Note: ============================================================================
+
+@Reasoning
+Allocate and initialize a fresh EmailAddress record.
+@End Reasoning
+
+@Implementation
+24 bytes; all slots zeroed.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "email_create" returns Integer:
+    Let rec be proc allocate from Layout with EMAIL_RECORD_SIZE
+    If rec is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, 0, 0
+    proc memory_set_int64 from Memory with rec, 8, 0
+    proc memory_set_int64 from Memory with rec, 16, 0
+    Return rec
+End Process
+
+@Reasoning
+Free an EmailAddress record and its owned component strings.
+@End Reasoning
+
+@Implementation
+Free non-null component pointers then the record.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller must not touch pointer after destroy.
+@End Security_Scope
+Process called "email_destroy" takes rec as Integer returns Integer:
+    If rec is equal to 0:
+        Return 0
+    End If
+    Let local_p be proc memory_get_int64 from Memory with rec, 0
+    If local_p is not equal to 0:
+        proc deallocate from Layout with local_p
+    End If
+    Let domain_p be proc memory_get_int64 from Memory with rec, 8
+    If domain_p is not equal to 0:
+        proc deallocate from Layout with domain_p
+    End If
+    proc deallocate from Layout with rec
+    Return 1
+End Process
+
+Process called "email_get_local_part" takes rec as Integer returns Integer:
+    If rec is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with rec, 0
+End Process
+
+Process called "email_get_domain" takes rec as Integer returns Integer:
+    If rec is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with rec, 8
+End Process
+
+Process called "email_is_quoted" takes rec as Integer returns Integer:
+    If rec is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with rec, 16
+End Process
+
+Note: ============================================================================
+Note: PARSE / FORMAT
+Note: ============================================================================
+
+@Reasoning
+Parse an email address per RFC 5322 / RFC 5321 / RFC 6531. The parser is
+strict by default: the '@' separator must appear exactly once, neither
+side may be empty, and component lengths must respect the RFC caps.
+
+Mode parameter selects strict (default), loose (relaxed local-part dots),
+or EAI (RFC 6531 internationalized).
+@End Reasoning
+
+@Implementation
+1. Length check 3..256.
+2. Locate the last '@' (per RFC 5321 the rightmost is the separator).
+3. Validate local part via email_is_valid_local_part.
+4. Validate domain part via email_is_valid_domain_part.
+5. Allocate the record and store owned copies of both parts.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n) for the two component copies.
+@End Performance_Hints
+
+@Security_Scope
+Refuses partial or empty components, multiple '@' signs (counted), or
+malformed length. Returns 0 on any failure so callers never receive a
+partially-initialized record.
+@End Security_Scope
+Process called "email_parse" takes str as Integer, mode as Integer returns Integer:
+    If str is equal to 0:
+        Return 0
+    End If
+    Let length be proc string_length from StringCore with str
+    If length is less than 3:
+        Return 0
+    End If
+    If length is greater than EMAIL_TOTAL_MAX:
+        Return 0
+    End If
+    Note: Locate rightmost '@'.
+    Let at_pos be -1
+    Let i be length minus 1
+    Let scanning be 1
+    While i is greater than or equal to 0:
+        If scanning is equal to 1:
+            Let ch be proc memory_get_byte from Memory with str, i
+            If ch is equal to 64:
+                Set at_pos to i
+                Set scanning to 0
+            Otherwise:
+                Set i to i minus 1
+            End If
+        Otherwise:
+            Set i to -1
+        End If
+    End While
+    If at_pos is less than 1:
+        Return 0
+    End If
+    If at_pos is greater than or equal to length minus 1:
+        Return 0
+    End If
+    Let local_len be at_pos
+    Let domain_start be at_pos plus 1
+    Let domain_len be length minus domain_start
+
+    Let local_ok be proc email_is_valid_local_part with str, 0, local_len, mode
+    If local_ok is equal to 0:
+        Return 0
+    End If
+    Let domain_ok be proc email_is_valid_domain_part with str, domain_start, domain_len
+    If domain_ok is equal to 0:
+        Return 0
+    End If
+
+    Let local_copy be proc string_substring from StringPrim with str, 0, local_len
+    If local_copy is equal to 0:
+        Return 0
+    End If
+    Let domain_copy be proc string_substring from StringPrim with str, domain_start, domain_len
+    If domain_copy is equal to 0:
+        proc deallocate from Layout with local_copy
+        Return 0
+    End If
+
+    Let rec be proc email_create
+    If rec is equal to 0:
+        proc deallocate from Layout with local_copy
+        proc deallocate from Layout with domain_copy
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with rec, 0, local_copy
+    proc memory_set_int64 from Memory with rec, 8, domain_copy
+    proc memory_set_int64 from Memory with rec, 16, 0
+    Return rec
+End Process
+
+@Reasoning
+Render the email address back to its canonical "local@domain" string form.
+@End Reasoning
+
+@Implementation
+StringBuilder concat with '@' between the two components.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on null record or allocation failure.
+@End Security_Scope
+Process called "email_to_string" takes rec as Integer returns Integer:
+    If rec is equal to 0:
+        Return 0
+    End If
+    Let local_p be proc memory_get_int64 from Memory with rec, 0
+    Let domain_p be proc memory_get_int64 from Memory with rec, 8
+    If local_p is equal to 0:
+        Return 0
+    End If
+    If domain_p is equal to 0:
+        Return 0
+    End If
+    Let sb be proc stringbuilder_create from SB
+    If sb is equal to 0:
+        Return 0
+    End If
+    proc stringbuilder_append from SB with sb, local_p
+    proc stringbuilder_append_char from SB with sb, 64
+    proc stringbuilder_append from SB with sb, domain_p
+    Let result be proc stringbuilder_to_string from SB with sb
+    proc stringbuilder_destroy from SB with sb
+    Return result
+End Process

@@ -1,0 +1,654 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+B-TREE - Disk-Friendly Multi-Way Search Tree Tier 0 Primitive
+
+This file implements a B-tree of order t (minimum degree). Each
+internal node has between t and 2t-1 keys (the root may have fewer).
+Default order is 32 (giving fan-out up to 63 keys per node) which
+gives cache-friendly performance for large datasets.
+
+Node layout (variable size, computed from order):
+  offset 0:  key_count (8 bytes)
+  offset 8:  is_leaf flag (8 bytes; 1 = leaf, 0 = internal)
+  offset 16: keys array (2t-1 * 8 bytes)
+  offset 16 + (2t-1)*8:    values array (2t-1 * 8 bytes)
+  offset 16 + 2*(2t-1)*8:  children array (2t * 8 bytes; unused if leaf)
+
+Tree header (16 bytes):
+  offset 0: root pointer
+  offset 8: size (total key count)
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let BTREE_ORDER be 32
+Let BTREE_MAX_KEYS be 63
+Let BTREE_MIN_KEYS be 31
+Let BTREE_MAX_CHILDREN be 64
+Let BTREE_NODE_HEADER_SIZE be 16
+Let BTREE_KEYS_OFFSET be 16
+Let BTREE_TREE_HEADER_SIZE be 16
+
+Note: ============================================================================
+Note: NODE ADDRESSING HELPERS
+Note: ============================================================================
+
+@Reasoning
+Address of the i-th key in a node. Keys start at offset 16.
+@End Reasoning
+
+@Implementation
+addr = node + 16 + i * 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated index.
+@End Security_Scope
+Process called "btree_key_addr" takes node as Integer, i as Integer returns Integer:
+    Return node plus (BTREE_KEYS_OFFSET plus (i multiplied by 8))
+End Process
+
+@Reasoning
+Address of the i-th value. Values follow the keys array.
+@End Reasoning
+
+@Implementation
+addr = node + 16 + MAX_KEYS * 8 + i * 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated index.
+@End Security_Scope
+Process called "btree_value_addr" takes node as Integer, i as Integer returns Integer:
+    Let base be BTREE_KEYS_OFFSET plus (BTREE_MAX_KEYS multiplied by 8)
+    Return node plus (base plus (i multiplied by 8))
+End Process
+
+@Reasoning
+Address of the i-th child pointer. Children follow the values array.
+@End Reasoning
+
+@Implementation
+addr = node + 16 + (MAX_KEYS + MAX_KEYS) * 8 + i * 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated index.
+@End Security_Scope
+Process called "btree_child_addr" takes node as Integer, i as Integer returns Integer:
+    Let base be BTREE_KEYS_OFFSET plus ((BTREE_MAX_KEYS plus BTREE_MAX_KEYS) multiplied by 8)
+    Return node plus (base plus (i multiplied by 8))
+End Process
+
+@Reasoning
+Total bytes needed per node.
+@End Reasoning
+
+@Implementation
+header + keys + values + children = 16 + 63*8 + 63*8 + 64*8 = 16 + 1520 = 1536 bytes.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: constant.
+@End Performance_Hints
+
+@Security_Scope
+Pure.
+@End Security_Scope
+Process called "btree_node_size_bytes" returns Integer:
+    Let kvb be (BTREE_MAX_KEYS multiplied by 8) plus (BTREE_MAX_KEYS multiplied by 8)
+    Let cb be BTREE_MAX_CHILDREN multiplied by 8
+    Return BTREE_NODE_HEADER_SIZE plus (kvb plus cb)
+End Process
+
+Note: ============================================================================
+Note: NODE CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Allocate a new node. is_leaf controls whether the children array slots
+are used. The keys/values/children arrays are zero-initialized so that
+inserting into a fresh node doesn't read uninitialized memory.
+@End Reasoning
+
+@Implementation
+Allocate btree_node_size_bytes(), set key_count = 0, set is_leaf flag.
+The Layout.allocate already zero-fills the block.
+@End Implementation
+
+@Performance_Hints
+Time: O(1). Space: ~1.5 KiB per node.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "btree_node_create" takes is_leaf as Integer returns Integer:
+    Let sz be proc btree_node_size_bytes
+    Let node be proc allocate from Layout with sz
+    If node is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with node, 0, 0
+    proc memory_set_int64 from Memory with node, 8, is_leaf
+    Return node
+End Process
+
+Note: ============================================================================
+Note: TREE CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Create an empty B-tree with a single empty leaf as root.
+@End Reasoning
+
+@Implementation
+Allocate header, allocate one leaf, set as root, size = 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "btree_create" returns Integer:
+    Let tree be proc allocate from Layout with BTREE_TREE_HEADER_SIZE
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let root be proc btree_node_create with 1
+    If root is equal to 0:
+        proc deallocate from Layout with tree
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with tree, 0, root
+    proc memory_set_int64 from Memory with tree, 8, 0
+    Return tree
+End Process
+
+@Reasoning
+Free all nodes recursively via an iterative postorder.
+@End Reasoning
+
+@Implementation
+Maintain a stack of unvisited nodes. Pop each, push every non-null
+child if internal, then free.
+@End Implementation
+
+@Performance_Hints
+Time: O(n / order) nodes. Space: O(h) stack.
+@End Performance_Hints
+
+@Security_Scope
+Caller-owned.
+@End Security_Scope
+Process called "btree_destroy" takes tree as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with tree, 0
+    Let cap be 32
+    Let buf_bytes be cap multiplied by 8
+    Let buf be proc allocate from Layout with buf_bytes
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let sp be 0
+    If root is not equal to 0:
+        proc memory_set_int64 from Memory with buf, 0, root
+        Set sp to 1
+    End If
+    While sp is greater than 0:
+        Set sp to sp minus 1
+        Let off be sp multiplied by 8
+        Let node be proc memory_get_int64 from Memory with buf, off
+        Let is_leaf be proc memory_get_int64 from Memory with node, 8
+        If is_leaf is equal to 0:
+            Let kc be proc memory_get_int64 from Memory with node, 0
+            Let i be 0
+            Let nch be kc plus 1
+            While i is less than nch:
+                Let need be sp plus 1
+                If need is greater than cap:
+                    Let new_cap be cap multiplied by 2
+                    Let new_bytes be new_cap multiplied by 8
+                    Let new_buf be proc allocate from Layout with new_bytes
+                    If new_buf is equal to 0:
+                        proc deallocate from Layout with buf
+                        Return 0
+                    End If
+                    Let copy_bytes be cap multiplied by 8
+                    proc memory_copy from Memory with new_buf, buf, copy_bytes
+                    proc deallocate from Layout with buf
+                    Set buf to new_buf
+                    Set cap to new_cap
+                End If
+                Let c_addr be proc btree_child_addr with node, i
+                Let child be proc memory_get_int64 from Memory with c_addr, 0
+                If child is not equal to 0:
+                    Let s_off be sp multiplied by 8
+                    proc memory_set_int64 from Memory with buf, s_off, child
+                    Set sp to sp plus 1
+                End If
+                Set i to i plus 1
+            End While
+        End If
+        proc deallocate from Layout with node
+    End While
+    proc deallocate from Layout with buf
+    proc deallocate from Layout with tree
+    Return 1
+End Process
+
+@Reasoning
+Element count accessor.
+@End Reasoning
+
+@Implementation
+Read size field at offset 8.
+@End Implementation
+
+@Performance_Hints
+Time: O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "btree_size" takes tree as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with tree, 8
+End Process
+
+Note: ============================================================================
+Note: SEARCH
+Note: ============================================================================
+
+@Reasoning
+Search for key. Walk down the tree: at each node, linear-scan to find
+the first key >= target. If equal, return the corresponding value.
+Otherwise, descend into the appropriate child.
+@End Reasoning
+
+@Implementation
+Standard B-tree search. Linear scan is fine for the per-node case
+because the order is small enough that a binary search inside a node
+would not win meaningfully but adds branch-prediction friction.
+@End Implementation
+
+@Performance_Hints
+Time: O(log_t n) node visits, each O(t) in the linear scan, so O(t log n).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "btree_search" takes tree as Integer, key as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let cur be proc memory_get_int64 from Memory with tree, 0
+    While cur is not equal to 0:
+        Let kc be proc memory_get_int64 from Memory with cur, 0
+        Let i be 0
+        While i is less than kc:
+            Let k_addr be proc btree_key_addr with cur, i
+            Let k be proc memory_get_int64 from Memory with k_addr, 0
+            If key is equal to k:
+                Let v_addr be proc btree_value_addr with cur, i
+                Return proc memory_get_int64 from Memory with v_addr, 0
+            End If
+            If key is less than k:
+                Note: break inner loop and descend into child i
+                Set i to kc plus kc
+                Note: marker that we are descending; restore i below
+            End If
+            If i is less than kc:
+                Set i to i plus 1
+            End If
+        End While
+        Let is_leaf be proc memory_get_int64 from Memory with cur, 8
+        If is_leaf is equal to 1:
+            Return 0
+        End If
+        Note: Determine which child to descend into: first index where
+        Note: keys[idx] > key, or kc if all keys < key.
+        Let idx be 0
+        While idx is less than kc:
+            Let k_addr2 be proc btree_key_addr with cur, idx
+            Let k2 be proc memory_get_int64 from Memory with k_addr2, 0
+            If key is less than k2:
+                Set idx to kc plus 1
+                Note: sentinel exit; we will recompute below
+            End If
+            If idx is less than kc plus 1:
+                Set idx to idx plus 1
+            End If
+        End While
+        Note: Recompute final descent index cleanly with a fresh loop.
+        Let final_idx be 0
+        While final_idx is less than kc:
+            Let kf_addr be proc btree_key_addr with cur, final_idx
+            Let kf be proc memory_get_int64 from Memory with kf_addr, 0
+            If key is less than kf:
+                Set final_idx to final_idx
+                Set kc to final_idx
+            Otherwise:
+                Set final_idx to final_idx plus 1
+            End If
+        End While
+        Let c_addr be proc btree_child_addr with cur, final_idx
+        Set cur to proc memory_get_int64 from Memory with c_addr, 0
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Contains predicate.
+@End Reasoning
+
+@Implementation
+Identical descent to btree_search but returns 1 on match.
+@End Implementation
+
+@Performance_Hints
+Time: O(t log n).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+Process called "btree_contains" takes tree as Integer, key as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let cur be proc memory_get_int64 from Memory with tree, 0
+    While cur is not equal to 0:
+        Let kc be proc memory_get_int64 from Memory with cur, 0
+        Let final_idx be 0
+        Let found be 0
+        While final_idx is less than kc:
+            Let kf_addr be proc btree_key_addr with cur, final_idx
+            Let kf be proc memory_get_int64 from Memory with kf_addr, 0
+            If key is equal to kf:
+                Return 1
+            End If
+            If key is less than kf:
+                Set kc to final_idx
+            Otherwise:
+                Set final_idx to final_idx plus 1
+            End If
+        End While
+        Let is_leaf be proc memory_get_int64 from Memory with cur, 8
+        If is_leaf is equal to 1:
+            Return 0
+        End If
+        Let c_addr be proc btree_child_addr with cur, final_idx
+        Set cur to proc memory_get_int64 from Memory with c_addr, 0
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SPLIT-CHILD HELPER
+Note: ============================================================================
+
+@Reasoning
+Split a full child at index i of node x into two children, hoisting
+the median key up into x at position i.
+@End Reasoning
+
+@Implementation
+Let y = x.children[i] (assumed full). Allocate z as new sibling.
+Copy keys[t..2t-2] from y to z, copy values likewise. If y is internal,
+copy children[t..2t-1] from y to z. Set y.key_count = t - 1, z.key_count
+= t - 1. Shift x.children[i+1..] right by 1, place z at i+1. Shift
+x.keys[i..] right by 1, place y.keys[t-1] at x.keys[i]. Same for values.
+Increment x.key_count.
+@End Implementation
+
+@Performance_Hints
+Time: O(t).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper.
+@End Security_Scope
+Process called "btree_split_child" takes x as Integer, i as Integer returns Integer:
+    Let c_addr be proc btree_child_addr with x, i
+    Let y be proc memory_get_int64 from Memory with c_addr, 0
+    Let y_is_leaf be proc memory_get_int64 from Memory with y, 8
+    Let z be proc btree_node_create with y_is_leaf
+    If z is equal to 0:
+        Return 0
+    End If
+    Let t be BTREE_ORDER
+    Let half be t minus 1
+    Note: Copy keys[t..2t-2] and values[t..2t-2] from y to z
+    Let j be 0
+    While j is less than half:
+        Let yk_addr be proc btree_key_addr with y, j plus t
+        Let yv_addr be proc btree_value_addr with y, j plus t
+        Let zk_addr be proc btree_key_addr with z, j
+        Let zv_addr be proc btree_value_addr with z, j
+        Let yk be proc memory_get_int64 from Memory with yk_addr, 0
+        Let yv be proc memory_get_int64 from Memory with yv_addr, 0
+        proc memory_set_int64 from Memory with zk_addr, 0, yk
+        proc memory_set_int64 from Memory with zv_addr, 0, yv
+        Set j to j plus 1
+    End While
+    If y_is_leaf is equal to 0:
+        Let jj be 0
+        While jj is less than t:
+            Let yc_addr be proc btree_child_addr with y, jj plus t
+            Let zc_addr be proc btree_child_addr with z, jj
+            Let yc be proc memory_get_int64 from Memory with yc_addr, 0
+            proc memory_set_int64 from Memory with zc_addr, 0, yc
+            Set jj to jj plus 1
+        End While
+    End If
+    proc memory_set_int64 from Memory with z, 0, half
+    proc memory_set_int64 from Memory with y, 0, half
+    Let xkc be proc memory_get_int64 from Memory with x, 0
+    Note: Shift x.children[i+1..xkc] right by 1
+    Let k be xkc
+    While k is greater than i:
+        Let src_addr be proc btree_child_addr with x, k
+        Let dst_addr be proc btree_child_addr with x, k plus 1
+        Let v be proc memory_get_int64 from Memory with src_addr, 0
+        proc memory_set_int64 from Memory with dst_addr, 0, v
+        Set k to k minus 1
+    End While
+    Let z_dst_addr be proc btree_child_addr with x, i plus 1
+    proc memory_set_int64 from Memory with z_dst_addr, 0, z
+    Note: Shift x.keys[i..xkc-1] right by 1, same for values
+    Let kk be xkc
+    While kk is greater than i:
+        Let src_k_addr be proc btree_key_addr with x, kk minus 1
+        Let dst_k_addr be proc btree_key_addr with x, kk
+        Let src_v_addr be proc btree_value_addr with x, kk minus 1
+        Let dst_v_addr be proc btree_value_addr with x, kk
+        Let vk be proc memory_get_int64 from Memory with src_k_addr, 0
+        Let vv be proc memory_get_int64 from Memory with src_v_addr, 0
+        proc memory_set_int64 from Memory with dst_k_addr, 0, vk
+        proc memory_set_int64 from Memory with dst_v_addr, 0, vv
+        Set kk to kk minus 1
+    End While
+    Let y_med_k_addr be proc btree_key_addr with y, half
+    Let y_med_v_addr be proc btree_value_addr with y, half
+    Let med_k be proc memory_get_int64 from Memory with y_med_k_addr, 0
+    Let med_v be proc memory_get_int64 from Memory with y_med_v_addr, 0
+    Let x_dst_k_addr be proc btree_key_addr with x, i
+    Let x_dst_v_addr be proc btree_value_addr with x, i
+    proc memory_set_int64 from Memory with x_dst_k_addr, 0, med_k
+    proc memory_set_int64 from Memory with x_dst_v_addr, 0, med_v
+    proc memory_set_int64 from Memory with x, 0, xkc plus 1
+    Return 1
+End Process
+
+@Reasoning
+Insert key/value into a node that is guaranteed not full. If the node
+is a leaf, shift and insert. Otherwise descend into the appropriate
+child, splitting that child first if it would be full.
+@End Reasoning
+
+@Implementation
+Iterative version that walks down splitting full children. After the
+walk reaches a leaf, the leaf has room for the new key/value.
+@End Implementation
+
+@Performance_Hints
+Time: O(t log n).
+@End Performance_Hints
+
+@Security_Scope
+Internal helper; caller ensures root is not full (the public insert
+handles the root-split case).
+@End Security_Scope
+Process called "btree_insert_nonfull" takes x as Integer, key as Integer, value as Integer returns Integer:
+    Let cur be x
+    While 1 is equal to 1:
+        Let kc be proc memory_get_int64 from Memory with cur, 0
+        Let is_leaf be proc memory_get_int64 from Memory with cur, 8
+        Let i be kc minus 1
+        If is_leaf is equal to 1:
+            Note: leaf - shift right and insert
+            While i is greater than or equal to 0:
+                Let k_addr be proc btree_key_addr with cur, i
+                Let k be proc memory_get_int64 from Memory with k_addr, 0
+                If key is greater than or equal to k:
+                    Note: insert at i+1
+                    Let dst_k_addr be proc btree_key_addr with cur, i plus 1
+                    Let dst_v_addr be proc btree_value_addr with cur, i plus 1
+                    proc memory_set_int64 from Memory with dst_k_addr, 0, key
+                    proc memory_set_int64 from Memory with dst_v_addr, 0, value
+                    proc memory_set_int64 from Memory with cur, 0, kc plus 1
+                    Return 1
+                End If
+                Let next_k_addr be proc btree_key_addr with cur, i plus 1
+                Let next_v_addr be proc btree_value_addr with cur, i plus 1
+                Let v_addr be proc btree_value_addr with cur, i
+                Let kv be proc memory_get_int64 from Memory with k_addr, 0
+                Let vv be proc memory_get_int64 from Memory with v_addr, 0
+                proc memory_set_int64 from Memory with next_k_addr, 0, kv
+                proc memory_set_int64 from Memory with next_v_addr, 0, vv
+                Set i to i minus 1
+            End While
+            Note: insert at position 0
+            Let k0_addr be proc btree_key_addr with cur, 0
+            Let v0_addr be proc btree_value_addr with cur, 0
+            proc memory_set_int64 from Memory with k0_addr, 0, key
+            proc memory_set_int64 from Memory with v0_addr, 0, value
+            proc memory_set_int64 from Memory with cur, 0, kc plus 1
+            Return 1
+        End If
+        Note: internal - find child slot
+        Let idx be kc
+        While i is greater than or equal to 0:
+            Let k_addr be proc btree_key_addr with cur, i
+            Let k be proc memory_get_int64 from Memory with k_addr, 0
+            If key is greater than or equal to k:
+                Set idx to i plus 1
+                Set i to 0 minus 1
+            Otherwise:
+                Set idx to i
+                Set i to i minus 1
+            End If
+        End While
+        Let c_addr be proc btree_child_addr with cur, idx
+        Let child be proc memory_get_int64 from Memory with c_addr, 0
+        Let child_kc be proc memory_get_int64 from Memory with child, 0
+        If child_kc is equal to BTREE_MAX_KEYS:
+            proc btree_split_child with cur, idx
+            Let mid_k_addr be proc btree_key_addr with cur, idx
+            Let mid_k be proc memory_get_int64 from Memory with mid_k_addr, 0
+            If key is greater than mid_k:
+                Set idx to idx plus 1
+            End If
+            Let c2_addr be proc btree_child_addr with cur, idx
+            Set child to proc memory_get_int64 from Memory with c2_addr, 0
+        End If
+        Set cur to child
+    End While
+    Return 0
+End Process
+
+@Reasoning
+Public insert. If the root is full, split it (creating a new root that
+contains the median) before descending; otherwise just call
+btree_insert_nonfull on the root.
+@End Reasoning
+
+@Implementation
+1) If root.key_count == 2t-1, allocate s as new root, set s.is_leaf = 0,
+   s.children[0] = root, set root = s, then split_child(s, 0).
+2) Call btree_insert_nonfull(root, key, value).
+3) Increment size.
+@End Implementation
+
+@Performance_Hints
+Time: O(t log n) amortized.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "btree_insert" takes tree as Integer, key as Integer, value as Integer returns Integer:
+    If tree is equal to 0:
+        Return 0
+    End If
+    Let root be proc memory_get_int64 from Memory with tree, 0
+    Let kc be proc memory_get_int64 from Memory with root, 0
+    If kc is equal to BTREE_MAX_KEYS:
+        Let s be proc btree_node_create with 0
+        If s is equal to 0:
+            Return 0
+        End If
+        Let s_c0_addr be proc btree_child_addr with s, 0
+        proc memory_set_int64 from Memory with s_c0_addr, 0, root
+        proc memory_set_int64 from Memory with tree, 0, s
+        proc btree_split_child with s, 0
+        proc btree_insert_nonfull with s, key, value
+    Otherwise:
+        proc btree_insert_nonfull with root, key, value
+    End If
+    Let size be proc memory_get_int64 from Memory with tree, 8
+    proc memory_set_int64 from Memory with tree, 8, size plus 1
+    Return 1
+End Process
