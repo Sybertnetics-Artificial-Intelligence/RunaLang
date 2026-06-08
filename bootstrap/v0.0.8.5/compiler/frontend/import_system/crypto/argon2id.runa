@@ -223,6 +223,65 @@ Process called "argon2_low32" takes value as Integer returns Integer:
     Return value bitwise_and U32_MASK_A2
 End Process
 
+Process called "argon2_logical_shr64" takes value as Integer, n as Integer returns Integer:
+    @Reasoning
+    Logical right shift of a 64-bit value by n positions (0 <= n < 64).
+    Runa's `divided by 2^k` and `shifted right by k` both emit arithmetic
+    right shift (sarq) which sign-extends when bit 63 is set. For uint64
+    operands (Blake2b state, output serialization) we need logical shift.
+    Synthesizes it via the sha2 rotr64 pattern: clear bit 63, divide the
+    63-bit magnitude, then re-insert the original bit 63 at its new
+    position.
+    @End Reasoning
+
+    @Implementation
+    1. low63 = value AND 0x7FFFFFFFFFFFFFFF (positive 63-bit magnitude).
+    2. right = low63 / 2^n. This is arithmetic-right-shift but low63 is
+       non-negative so it equals logical-right-shift.
+    3. If value < 0 (original bit 63 was set), OR in 2^(63-n) at the new
+       bit position.
+    @End Implementation
+
+    @Performance_Hints
+    O(n) loops only because shift constants are built by repeated doubling.
+    The ALU itself is O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Constant-time over operand value; iteration count depends only on n
+    which is a public Blake2b rotation/serialization constant.
+    @End Security_Scope
+
+    Let n_mod be n modulo by 64
+    If n_mod is equal to 0:
+        Return value
+    End If
+
+    Let shift_factor be 1
+    Let s_i be 0
+    While s_i is less than n_mod:
+        Set shift_factor to shift_factor multiplied by 2
+        Set s_i to s_i plus 1
+    End While
+
+    Let mask63 be 9223372036854775807
+    Let low63 be value bitwise_and mask63
+    Let result be low63 divided by shift_factor
+
+    If value is less than 0:
+        Let top_bit_factor be 1
+        Let tb_count be 0
+        Let top_bit_position be 63 minus n_mod
+        While tb_count is less than top_bit_position:
+            Set top_bit_factor to top_bit_factor multiplied by 2
+            Set tb_count to tb_count plus 1
+        End While
+        Set result to result bitwise_or top_bit_factor
+    End If
+
+    Return result
+End Process
+
 Process called "argon2_rotr64" takes value as Integer, n as Integer returns Integer:
     @Reasoning
     Rotate-right of a uint64 by n bits (0 <= n < 64). Used in the
@@ -250,30 +309,44 @@ Process called "argon2_rotr64" takes value as Integer, n as Integer returns Inte
 
     Let n_mod be n modulo by 64
     If n_mod is equal to 0:
-        Return value bitwise_and U64_MASK
+        Return value
     End If
 
-    Let shift_left be 1
-    Let il be 0
+    Note: Runa's `shifted right by` and `divided by 2^k` both emit arithmetic
+    Note: right shift (sarq on x86_64), which sign-extends when bit 63 is set.
+    Note: For an unsigned 64-bit rotation we need logical shift. Synthesize it
+    Note: via the sha2 rotr64 pattern: strip bit 63, divide the 63-bit magnitude,
+    Note: then re-insert the original bit 63 at its new position after the shift.
+    Let shift_factor_right be 1
+    Let rc1 be 0
+    While rc1 is less than n_mod:
+        Set shift_factor_right to shift_factor_right multiplied by 2
+        Set rc1 to rc1 plus 1
+    End While
+    Let shift_factor_left be 1
+    Let rc2 be 0
     Let left_count be 64 minus n_mod
-    While il is less than left_count:
-        Set shift_left to shift_left multiplied by 2
-        Set il to il plus 1
+    While rc2 is less than left_count:
+        Set shift_factor_left to shift_factor_left multiplied by 2
+        Set rc2 to rc2 plus 1
     End While
 
-    Let shift_right be 1
-    Let ir be 0
-    While ir is less than n_mod:
-        Set shift_right to shift_right multiplied by 2
-        Set ir to ir plus 1
-    End While
+    Let mask63 be 9223372036854775807
+    Let low63 be value bitwise_and mask63
+    Let right_part be low63 divided by shift_factor_right
+    If value is less than 0:
+        Let top_bit_factor be 1
+        Let tb_count be 0
+        Let top_bit_position be 63 minus n_mod
+        While tb_count is less than top_bit_position:
+            Set top_bit_factor to top_bit_factor multiplied by 2
+            Set tb_count to tb_count plus 1
+        End While
+        Set right_part to right_part bitwise_or top_bit_factor
+    End If
 
-    Let v_masked be value bitwise_and U64_MASK
-    Let left_part be v_masked multiplied by shift_left
-    Set left_part to left_part bitwise_and U64_MASK
-    Let right_part be v_masked divided by shift_right
-    Let combined be left_part bitwise_or right_part
-    Return combined bitwise_and U64_MASK
+    Let left_part be value multiplied by shift_factor_left
+    Return right_part bitwise_or left_part
 End Process
 
 Process called "argon2_load64_le" takes ptr as Integer, offset as Integer returns Integer:
@@ -336,15 +409,19 @@ Process called "argon2_store64_le" takes ptr as Integer, offset as Integer, valu
     Constant-time.
     @End Security_Scope
 
-    Let v be value bitwise_and U64_MASK
-    Let b0 be v bitwise_and U8_MASK
-    Let b1 be (v divided by 256) bitwise_and U8_MASK
-    Let b2 be (v divided by 65536) bitwise_and U8_MASK
-    Let b3 be (v divided by 16777216) bitwise_and U8_MASK
-    Let b4 be (v divided by 4294967296) bitwise_and U8_MASK
-    Let b5 be (v divided by 1099511627776) bitwise_and U8_MASK
-    Let b6 be (v divided by 281474976710656) bitwise_and U8_MASK
-    Let b7 be (v divided by 72057594037927936) bitwise_and U8_MASK
+    Note: `divided by 2^k` and `shifted right by k` BOTH produce arithmetic
+    Note: right shift (sarq) in current Runa codegen, which sign-extends when
+    Note: bit 63 is set. For byte extraction from a uint64 we need logical
+    Note: shift -- argon2_logical_shr64 implements it via the sha2 rotr64
+    Note: pattern.
+    Let b0 be value bitwise_and U8_MASK
+    Let b1 be argon2_logical_shr64(value, 8) bitwise_and U8_MASK
+    Let b2 be argon2_logical_shr64(value, 16) bitwise_and U8_MASK
+    Let b3 be argon2_logical_shr64(value, 24) bitwise_and U8_MASK
+    Let b4 be argon2_logical_shr64(value, 32) bitwise_and U8_MASK
+    Let b5 be argon2_logical_shr64(value, 40) bitwise_and U8_MASK
+    Let b6 be argon2_logical_shr64(value, 48) bitwise_and U8_MASK
+    Let b7 be argon2_logical_shr64(value, 56) bitwise_and U8_MASK
     proc memory_set_byte from Memory with ptr, offset, b0
     proc memory_set_byte from Memory with ptr, offset plus 1, b1
     proc memory_set_byte from Memory with ptr, offset plus 2, b2
@@ -1079,20 +1156,18 @@ Process called "blake2b_hash" takes arena as Integer, input as Integer, input_le
         proc blake2b_compress with h, block_buf, final_t_low, 0, 1
     End If
 
-    Note: Output: little-endian serialise the first output_len bytes of h
+    Note: Output: little-endian serialise the first output_len bytes of h.
+    Note: Use logical right shift -- `divided by 2^k` and `shifted right by k`
+    Note: both emit arithmetic right shift in current codegen, producing the
+    Note: wrong byte for qwords with bit 63 set.
     Let oi be 0
     While oi is less than output_len:
         Let qword_idx be oi divided by 8
         Let byte_in_qword be oi modulo by 8
         Let qoff be qword_idx multiplied by 8
         Let qval be proc memory_get_qword from Memory with h, qoff
-        Let divisor be 1
-        Let sc be 0
-        While sc is less than byte_in_qword:
-            Set divisor to divisor multiplied by 256
-            Set sc to sc plus 1
-        End While
-        Let shifted be qval divided by divisor
+        Let bit_shift be byte_in_qword multiplied by 8
+        Let shifted be argon2_logical_shr64(qval, bit_shift)
         Let byte_val be shifted bitwise_and U8_MASK
         proc memory_set_byte from Memory with output, oi, byte_val
         Set oi to oi plus 1
