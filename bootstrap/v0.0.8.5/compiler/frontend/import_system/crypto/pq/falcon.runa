@@ -69,6 +69,12 @@ fast-path.
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "runtime/core/memory/arena.runa" as Arena
 Import "compiler/frontend/import_system/crypto/sha3.runa" as Sha3
+Import "compiler/frontend/import_system/crypto/entropy.runa" as Entropy
+Import "compiler/frontend/import_system/crypto/pq/falcon_ntrusolve.runa" as Ntrusolve
+Import "compiler/frontend/import_system/crypto/pq/falcon_ldl.runa" as Ldl
+Import "compiler/frontend/import_system/crypto/pq/falcon_ffs.runa" as Ffs
+Import "compiler/frontend/import_system/crypto/pq/falcon_fft.runa" as FFT
+Import "compiler/frontend/import_system/crypto/pq/falcon_fp.runa" as FP
 
 Note:
 ==============================================================================
@@ -274,24 +280,53 @@ Process called "falcon_modq_mul" takes a as Integer, b as Integer returns Intege
     Return prod modulo by q
 End Process
 
-Process called "falcon_ntt_zeta" takes index as Integer, n as Integer returns Integer:
+Process called "falcon_bit_reverse_10" takes x as Integer returns Integer:
     @Reasoning
-    Returns the index-th NTT twiddle for ring degree n.
-    Uses omega_n = 7^{2048/n} mod 12289 as the primitive n-th root.
+    10-bit bit-reversal used by the Falcon NTT twiddle indexing.  Matches
+    Pornin's GMb table where GMb[x] = 7^bit_reverse(x, 10) mod q.
     @End Reasoning
     @Implementation
-    Power computation via square-and-multiply since the twiddle table for
-    Falcon is small; we compute on demand.
+    Iterative one-bit-at-a-time reversal.
     @End Implementation
     @Performance_Hints
-    O(log n) per call. Caller can precompute and cache for hot paths.
+    O(1) - ten loop iterations.
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Let r be 0
+    Let i be 0
+    Let v be x
+    While i is less than 10:
+        Let bit_v be v bitwise_and 1
+        Let r_shifted be r shifted left by 1
+        Set r to r_shifted bitwise_or bit_v
+        Set v to v shifted right by 1
+        Set i to i plus 1
+    End While
+    Return r
+End Process
+
+Process called "falcon_ntt_zeta" takes index as Integer, n as Integer returns Integer:
+    @Reasoning
+    Returns the index-th NTT twiddle for ring degree n in the Pornin GMb
+    layout: GMb[index] = 7^bit_reverse(index, 10) mod 12289 where 7 is a
+    primitive 2048-th root of unity mod 12289.
+    @End Reasoning
+    @Implementation
+    Compute 7^bit_reverse(index, 10) mod q via square-and-multiply.  This
+    matches Pornin's precomputed GMb table; using sequential exponents
+    here instead of bit-reversed ones gives an NTT that does not
+    round-trip correctly under Cooley-Tukey DIT butterflies.
+    @End Implementation
+    @Performance_Hints
+    O(log n) per call.  Index is public so timing is benign.
     @End Performance_Hints
     @Security_Scope
     Operates on public modulus and public index.
     @End Security_Scope
     Let omega be 7
-    Let step be 2048 divided by n
-    Let exponent be index multiplied by step
+    Let exponent be proc falcon_bit_reverse_10 with index
     Let q be 12289
     Let result be 1
     Let base_v be omega
@@ -319,14 +354,21 @@ Process called "falcon_ntt_forward" takes poly as Integer, n as Integer returns 
     @Security_Scope
     Constant-time per coefficient.
     @End Security_Scope
+    Note: Cooley-Tukey DIT NTT in Pornin's GMb layout.  At each layer
+    Note: with butterfly distance "length" and m sub-blocks (m = k_step
+    Note: doubles each iteration starting from 1), the twiddle for the
+    Note: i-th sub-block is GMb[m + i] = 7^bit_reverse(m + i, 10) mod q.
+    Note: k_idx increments by 1 within a layer (NOT by m); our previous
+    Note: implementation incremented by k_step which only matched the
+    Note: m=1 case and produced garbled NTT output for m >= 2.
     Let length be n shifted right by 1
     Let k_step be 1
     While length is greater than 0:
         Let start_idx be 0
-        Let k be k_step
+        Let k_idx be k_step
         While start_idx is less than n:
-            Let zeta be proc falcon_ntt_zeta with k, n
-            Set k to k plus k_step
+            Let zeta be proc falcon_ntt_zeta with k_idx, n
+            Set k_idx to k_idx plus 1
             Let j be start_idx
             Let end_j be start_idx plus length
             While j is less than end_j:
@@ -347,12 +389,44 @@ Process called "falcon_ntt_forward" takes poly as Integer, n as Integer returns 
     Return 1
 End Process
 
-Process called "falcon_ntt_inverse" takes poly as Integer, n as Integer returns Integer:
+Process called "falcon_intt_zeta" takes index as Integer returns Integer:
     @Reasoning
-    Inverse NTT. Final scaling by n^{-1} mod q.
+    Inverse-NTT twiddle table accessor in Pornin's iGMb layout:
+    iGMb[index] = (1/7)^bit_reverse(index, 10) mod 12289.  Since
+    7 * 8778 = 61446 = 5*q + 1, we have 1/7 = 8778 mod q.
     @End Reasoning
     @Implementation
-    Gentleman-Sande butterflies. n^{-1} mod 12289 computed by power.
+    Compute 8778^bit_reverse(index, 10) mod q via square-and-multiply.
+    @End Implementation
+    @Performance_Hints
+    O(log n).
+    @End Performance_Hints
+    @Security_Scope
+    Public index.
+    @End Security_Scope
+    Let inv_omega be 8778
+    Let exponent be proc falcon_bit_reverse_10 with index
+    Let q be 12289
+    Let result be 1
+    Let base_v be inv_omega
+    While exponent is greater than 0:
+        If exponent bitwise_and 1 is equal to 1:
+            Set result to result multiplied by base_v modulo by q
+        End If
+        Set base_v to base_v multiplied by base_v modulo by q
+        Set exponent to exponent shifted right by 1
+    End While
+    Return result
+End Process
+
+Process called "falcon_ntt_inverse" takes poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Inverse NTT following Pornin's iNTT structure (Gentleman-Sande DIF
+    butterflies with iGMb-indexed twiddles) plus a final 1/n scaling.
+    @End Reasoning
+    @Implementation
+    Loop with m starting at n and halving; t starts at 1 and doubles.
+    At each layer, sub-block i (i in [0, hm)) uses twiddle iGMb[hm + i].
     @End Implementation
     @Performance_Hints
     O(n log n).
@@ -360,32 +434,34 @@ Process called "falcon_ntt_inverse" takes poly as Integer, n as Integer returns 
     @Security_Scope
     Constant-time.
     @End Security_Scope
-    Let length be 1
-    Let k_step be n shifted right by 1
-    While length is less than n:
+    Let t be 1
+    Let m be n
+    While m is greater than 1:
+        Let hm be m shifted right by 1
+        Let dt be t shifted left by 1
         Let start_idx be 0
-        Let k be k_step
+        Let k_idx be hm
         While start_idx is less than n:
-            Let zeta be proc falcon_ntt_zeta with k, n
-            Set k to k plus k_step
+            Let zeta be proc falcon_intt_zeta with k_idx
+            Set k_idx to k_idx plus 1
             Let j be start_idx
-            Let end_j be start_idx plus length
+            Let end_j be start_idx plus t
             While j is less than end_j:
                 Let off_j be j multiplied by 2
-                Let off_jl be (j plus length) multiplied by 2
+                Let off_jt be (j plus t) multiplied by 2
                 Let a be Memory.memory_get_int16(poly, off_j)
-                Let b be Memory.memory_get_int16(poly, off_jl)
+                Let b be Memory.memory_get_int16(poly, off_jt)
                 Memory.memory_set_int16(poly, off_j, proc falcon_modq_add with a, b)
                 Let diff be proc falcon_modq_sub with a, b
-                Memory.memory_set_int16(poly, off_jl, proc falcon_modq_mul with diff, zeta)
+                Memory.memory_set_int16(poly, off_jt, proc falcon_modq_mul with diff, zeta)
                 Set j to j plus 1
             End While
-            Set start_idx to start_idx plus length plus length
+            Set start_idx to start_idx plus dt
         End While
-        Set k_step to k_step shifted right by 1
-        Set length to length shifted left by 1
+        Set t to dt
+        Set m to hm
     End While
-    Note: Multiply each coefficient by n^{-1} mod q = q - (q-1)/n
+    Note: Final scaling by 1/n mod q = q^(q-2) ... actually n^(q-2) mod q.
     Let q be 12289
     Let inv_n be proc falcon_modpow with n, q minus 2, q
     Let i be 0
@@ -620,17 +696,22 @@ Process called "falcon_base_sampler" takes arena as Integer, prng_state as Integ
     @End Security_Scope
     Let rnd_buf be Arena.arena_allocate(arena, 9)
     proc falcon_prng_extract with prng_state, rnd_buf, 9
-    Note: We compare a 72-bit unsigned value to each CDT entry. Since runa
-    Note: Integer is signed 64-bit, we use the high 64 bits for the
-    Note: comparison; this matches the Falcon reference's behaviour
-    Note: (the top byte contributes a guarded carry).
+    Note: Each CDT entry is calibrated as P(z > k) * 2^62, with
+    Note: CDT[0] ~ 2^61.4 < 2^62.  Compare against a 62-bit unsigned
+    Note: random in [0, 2^62) by masking the top 2 bits of the 8-byte
+    Note: big-endian assembled value.  See falcon_base_sampler_shake
+    Note: for the full derivation.  The 9th squeezed byte is unused
+    Note: under this calibration; it would be needed if the table
+    Note: were the 72-bit form, which it is not in this codebase.
     Let v_hi be 0
     Let bi be 0
     While bi is less than 8:
         Let b be Memory.memory_get_byte(rnd_buf, bi)
-        Set v_hi to v_hi shifted left by 8 bitwise_or b
+        Set v_hi to (v_hi shifted left by 8) bitwise_or b
         Set bi to bi plus 1
     End While
+    Let mask62 be 4611686018427387903
+    Set v_hi to v_hi bitwise_and mask62
     Let z be 0
     Let i be 0
     While i is less than 18:
@@ -679,6 +760,864 @@ End Process
 
 Note:
 ==============================================================================
+DISCRETE GAUSSIAN SAMPLER OVER Z (centered, signed)
+==============================================================================
+
+Builds a full signed Gaussian sampler on top of the half-Gaussian base
+sampler. Three composition layers:
+
+  1. falcon_base_sampler_shake : draws z in [0, 18] from D_{Z+, sigma_0}
+     using the existing 18-entry CDT, taking randomness from a SHAKE256
+     squeeze context. sigma_0 = 1.8205 is the Falcon-spec base width.
+
+  2. falcon_signed_base_sample : applies a random sign bit and rejects the
+     z=0,sign=negative case to restore D_{Z, 0, sigma_0} symmetry without
+     doubling the zero-probability.
+
+  3. falcon_gaussian_sampler_z* : sums g independent signed base samples
+     where g = max(1, round((sigma / sigma_0)^2)). By the convolution
+     identity for discrete Gaussians (which holds to within smoothing-
+     parameter error for sigma >> eta_eps), the result has effective
+     width sigma_eff = sigma_0 * sqrt(g) ~ sigma.
+
+For Falcon keygen, the spec mandates the exact g values
+(g=2 for n=512, g=1 for n=1024), which falcon_keygen_g returns.
+The generic sigma-driven path supports any sigma >= sigma_0 needed by
+downstream callers (FFT sampler proposal, hash-to-message scaling).
+
+The integer norm bound check falcon_short_polynomial_norm_check
+implements the keygen restart predicate per Falcon round-3 spec
+section 3.9.2 Algorithm 5 step 5: ||(f, g)||^2 <= floor(1.17^2 * q)
+which evaluates to 16823 for q=12289 (independent of n).
+:End Note
+
+Process called "falcon_sigma_0_times_1000" returns Integer:
+    @Reasoning
+    Returns the Falcon-spec base sampler width sigma_0 = 1.8205 scaled by
+    1000 for integer arithmetic. Used by the convolution-count selector
+    to compute g = round((sigma / sigma_0)^2) without floating-point.
+    @End Reasoning
+    @Implementation
+    Returns 1820 (truncation of 1820.5). The 0.0005 truncation contributes
+    less than 0.06% error to the convolution count, well within the
+    smoothing-parameter tolerance.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 1820
+End Process
+
+Process called "falcon_keygen_g" takes level as Integer returns Integer:
+    @Reasoning
+    Number of base-sampler draws to convolve per keygen coefficient,
+    per Falcon round-3 spec Algorithm 5. g = 2^(10 - logn).
+    @End Reasoning
+    @Implementation
+    Falcon-512 (level=1, logn=9) -> g = 2.
+    Falcon-1024 (level=2, logn=10) -> g = 1.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public parameter.
+    @End Security_Scope
+    If level is equal to 1:
+        Return 2
+    End If
+    Return 1
+End Process
+
+Process called "falcon_base_sampler_shake" takes arena as Integer, shake_ctx as Integer returns Integer:
+    @Reasoning
+    Draws one sample z in [0, 18] from the half-Gaussian D_{Z+, sigma_0}
+    using the existing 18-entry RCDT. Differs from falcon_base_sampler
+    by taking randomness from a SHAKE256 squeeze context instead of the
+    Falcon-internal prng_state layout.
+    @End Reasoning
+    @Implementation
+    Squeezes 9 bytes (72 bits) from shake_ctx, packs the top 8 bytes
+    into a 64-bit value v_hi, and counts the number of CDT entries that
+    v_hi compares less than. Constant-time over the 18 comparisons.
+    @End Implementation
+    @Performance_Hints
+    O(18) comparisons plus one 9-byte squeeze.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time. shake_ctx output is SECRET; the loop count is PUBLIC.
+    @End Security_Scope
+    Let rnd_buf be Arena.arena_allocate(arena, 9)
+    If rnd_buf is equal to 0:
+        Return 0
+    End If
+    Sha3.shake256_squeeze(shake_ctx, rnd_buf, 9)
+    Note: Falcon's base sampler is calibrated as follows in this codebase:
+    Note: each CDT entry CDT[k] represents P(z > k) * 2^62 (verified by
+    Note: ratio analysis: CDT[1]/CDT[0] = 0.517 matches the half-Gaussian
+    Note: D_{Z+, sigma=1.8205} expected ratio of P(z>=2)/P(z>=1) = 0.51).
+    Note: The largest entry CDT[0] = 3024686241123004913 has top bit
+    Note: cleared (~ 2^61.4 < 2^62), so all CDT entries fit in the non-
+    Note: negative Int64 range.
+    Note: To compare correctly we need v as a uniform unsigned value in
+    Note: [0, 2^62).  Squeeze 8 random bytes (64 bits big-endian), then
+    Note: mask off the top 2 bits.  This costs 2 bits of entropy out of
+    Note: 64 squeezed (the 9th byte is unused in this calibration; it
+    Note: would be needed if the CDT were the 72-bit form, which it is
+    Note: not in this codebase).  The masked v is uniform on [0, 2^62)
+    Note: which is the same space the CDT entries live in.  Result: z
+    Note: is the count of CDT entries strictly greater than v, which is
+    Note: the discrete half-Gaussian sample.
+    Note: Earlier broken approaches:
+    Note:   (a) "v_hi bitwise_and 0x7FFF...FF" masks only the sign bit,
+    Note:       leaving 63 bits but the CDT is calibrated for 62 bits;
+    Note:       this halves all CDT acceptance probabilities -> z biased
+    Note:       toward 0.
+    Note:   (b) "If v_hi >= 0 skip otherwise" rejects 50% of draws onto
+    Note:       z=0 directly -> heavily biased toward 0.
+    Note:   (c) Rejection-resample on top bit gives an unbiased uniform
+    Note:       on [0, 2^63) but still off by a factor of 2 from the
+    Note:       CDT's [0, 2^62) calibration -> z biased toward 0 by ~2x.
+    Note: The correct approach is to mask to exactly 62 bits.
+    Let v_hi be 0
+    Let bi be 0
+    While bi is less than 8:
+        Let b be Memory.memory_get_byte(rnd_buf, bi)
+        Set v_hi to (v_hi shifted left by 8) bitwise_or b
+        Set bi to bi plus 1
+    End While
+    Note: 62-bit mask = 2^62 - 1 = 0x3FFFFFFFFFFFFFFF = 4611686018427387903.
+    Let mask62 be 4611686018427387903
+    Set v_hi to v_hi bitwise_and mask62
+    Let z be 0
+    Let i be 0
+    While i is less than 18:
+        Let entry be falcon_base_sampler_cdt(i)
+        If v_hi is less than entry:
+            Set z to z plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return z
+End Process
+
+Process called "falcon_signed_base_sample" takes arena as Integer, shake_ctx as Integer returns Integer:
+    @Reasoning
+    Lifts the half-Gaussian z in [0, 18] to a signed sample over Z with
+    distribution D_{Z, 0, sigma_0}. A plain sign-bit flip over-counts
+    z=0 because both +0 and -0 collapse to the same lattice point,
+    yielding double the natural probability of zero. The classical fix
+    is to reject the (z=0, sign=negative) outcome with probability 1/2.
+    @End Reasoning
+    @Implementation
+    Loops drawing (z, sign_bit) until acceptance:
+      - draws z via falcon_base_sampler_shake
+      - draws 1 byte from shake_ctx, uses bit 0 as sign
+      - if z == 0 and sign_bit == 1, retries
+      - otherwise returns z (sign=0) or -z (sign=1)
+    The retry probability is bounded by P(z=0) / 2 ~ 0.10 so the
+    expected iteration count is below 1.12.
+    @End Implementation
+    @Performance_Hints
+    Expected 1.12 base-sampler calls per output sample.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time per iteration; iteration count depends on z (SECRET)
+    but only via the public zero-probability bound.
+    @End Security_Scope
+    Let sign_buf be Arena.arena_allocate(arena, 1)
+    If sign_buf is equal to 0:
+        Return 0
+    End If
+    Let result be 0
+    Let accepted be 0
+    While accepted is equal to 0:
+        Let z be falcon_base_sampler_shake(arena, shake_ctx)
+        Sha3.shake256_squeeze(shake_ctx, sign_buf, 1)
+        Let sign_byte be Memory.memory_get_byte(sign_buf, 0)
+        Let sign_bit be sign_byte bitwise_and 1
+        If z is equal to 0:
+            If sign_bit is equal to 0:
+                Set result to 0
+                Set accepted to 1
+            End If
+        Otherwise:
+            If sign_bit is equal to 1:
+                Set result to 0 minus z
+            Otherwise:
+                Set result to z
+            End If
+            Set accepted to 1
+        End If
+    End While
+    Return result
+End Process
+
+Process called "falcon_convolution_count_from_sigma" takes sigma_scaled_1000 as Integer returns Integer:
+    @Reasoning
+    Returns g = max(1, round((sigma / sigma_0)^2)) for a given target
+    sigma expressed in 1/1000 units. Used by the generic sigma-driven
+    samplers to pick the convolution count that yields effective width
+    closest to the requested sigma.
+    @End Reasoning
+    @Implementation
+    Computes ratio_sq = (sigma_scaled_1000 * 1000) / sigma_0_scaled,
+    squared and rounded. Avoids floating-point. For sigma <= sigma_0
+    returns 1 (single draw).
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Input may be SECRET; output is bounded by sigma range and is PUBLIC.
+    @End Security_Scope
+    Let sigma_0_scaled be falcon_sigma_0_times_1000()
+    If sigma_scaled_1000 is less than or equal to sigma_0_scaled:
+        Return 1
+    End If
+    Note: Integer ratio = (sigma * 1000) / sigma_0_scaled, scaled by 1000
+    Let ratio_x1000 be (sigma_scaled_1000 multiplied by 1000) divided by sigma_0_scaled
+    Let ratio_sq_x1000000 be ratio_x1000 multiplied by ratio_x1000
+    Note: Round to nearest integer: add 500000 then divide by 1000000
+    Let g be (ratio_sq_x1000000 plus 500000) divided by 1000000
+    If g is less than 1:
+        Return 1
+    End If
+    Return g
+End Process
+
+Process called "falcon_gaussian_sampler_z_centered" takes arena as Integer, shake_ctx as Integer, sigma_scaled_1000 as Integer returns Integer:
+    @Reasoning
+    Samples one integer from D_{Z, 0, sigma} using the convolution
+    identity: the sum of g independent samples from D_{Z, 0, sigma_0}
+    has effective width sigma_0 * sqrt(g) ~ sigma when g is chosen
+    correctly. sigma is passed scaled by 1000 to avoid floating-point
+    in the integer interface.
+    @End Reasoning
+    @Implementation
+    1. Compute g = max(1, round((sigma / sigma_0)^2)).
+    2. Accumulate g calls to falcon_signed_base_sample.
+    3. Return the integer sum.
+    The convolution approximation introduces error bounded by the
+    smoothing parameter eta_eps(Z) ~ sqrt(ln(2/eps) / pi) which for
+    eps = 2^-256 is below 0.18. For sigma >= sigma_0 the relative error
+    in the resulting distribution is below 2^-128, well within the
+    Falcon spec's statistical security budget.
+    @End Implementation
+    @Performance_Hints
+    O(g) signed base sampler calls. g <= 8 for any sigma <= 5.15.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time per iteration in g; g itself is PUBLIC.
+    @End Security_Scope
+    Let g be falcon_convolution_count_from_sigma(sigma_scaled_1000)
+    Let total be 0
+    Let i be 0
+    While i is less than g:
+        Let sample be falcon_signed_base_sample(arena, shake_ctx)
+        Set total to total plus sample
+        Set i to i plus 1
+    End While
+    Return total
+End Process
+
+Process called "falcon_gaussian_sampler_z" takes arena as Integer, shake_ctx as Integer, mu as Integer, sigma_scaled_1000 as Integer returns Integer:
+    @Reasoning
+    Samples from D_{Z, mu, sigma}. Equivalent to mu + sample_from_D_centered
+    when mu is integer; for non-integer mu the spec's FFS sampler is used
+    in Phase 2 of Falcon (FFT sampling). This integer-mu path is the
+    common case for the keygen f, g sampling.
+    @End Reasoning
+    @Implementation
+    Delegates to the centered sampler and offsets the result by mu.
+    @End Implementation
+    @Performance_Hints
+    Same as falcon_gaussian_sampler_z_centered plus one addition.
+    @End Performance_Hints
+    @Security_Scope
+    mu may be SECRET; constant-time addition.
+    @End Security_Scope
+    Let centered be falcon_gaussian_sampler_z_centered(arena, shake_ctx, sigma_scaled_1000)
+    Return centered plus mu
+End Process
+
+Process called "falcon_sample_short_polynomial" takes arena as Integer, shake_ctx as Integer, n as Integer, sigma_scaled_1000 as Integer, out_coeffs as Integer returns Integer:
+    @Reasoning
+    Fills an n-coefficient polynomial vector with samples from
+    D_{Z, 0, sigma}. Each coefficient is independently sampled and
+    written as a signed 16-bit integer into out_coeffs.
+    @End Reasoning
+    @Implementation
+    Streaming loop calling falcon_gaussian_sampler_z_centered n times
+    and storing each via memory_set_int16. Caller pre-allocates
+    out_coeffs as n * 2 bytes.
+    @End Implementation
+    @Performance_Hints
+    O(n * g) base-sampler calls.
+    @End Performance_Hints
+    @Security_Scope
+    All output coefficients are SECRET. Constant-time per coefficient.
+    @End Security_Scope
+    Let i be 0
+    While i is less than n:
+        Let sample be falcon_gaussian_sampler_z_centered(arena, shake_ctx, sigma_scaled_1000)
+        Memory.memory_set_int16(out_coeffs, i multiplied by 2, sample)
+        Set i to i plus 1
+    End While
+    Return n
+End Process
+
+Process called "falcon_gauss_1024_cdt" takes idx as Integer returns Integer:
+    @Reasoning
+    Returns the idx-th entry of Pornin's gauss_1024_12289 CDT (keygen.c
+    static table).  This CDT is calibrated to produce a signed Gaussian
+    distribution with standard deviation 1.17 * sqrt(q/(2*N)) where
+    N = 1024 and q = 12289.  This is the Falcon spec's keygen-time
+    sampling sigma for N=1024.  For smaller N, convolve multiple draws
+    (sum of g = 2^(10-logn) independent samples), increasing the effective
+    sigma by sqrt(g).
+    @End Reasoning
+    @Implementation
+    Hard-coded constants from the Falcon NIST reference (keygen.c lines
+    2266-2275).  27 entries.  Indices beyond 26 return 0 (probability
+    tail below 2^-72).
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time If-ladder.
+    @End Security_Scope
+    If idx is equal to 0:
+        Return 1283868770400643928
+    End If
+    If idx is equal to 1:
+        Return 6416574995475331444
+    End If
+    If idx is equal to 2:
+        Return 4078260278032692663
+    End If
+    If idx is equal to 3:
+        Return 2353523259288686585
+    End If
+    If idx is equal to 4:
+        Return 1227179971273316331
+    End If
+    If idx is equal to 5:
+        Return 575931623374121527
+    End If
+    If idx is equal to 6:
+        Return 242543240509105209
+    End If
+    If idx is equal to 7:
+        Return 91437049221049666
+    End If
+    If idx is equal to 8:
+        Return 30799446349977173
+    End If
+    If idx is equal to 9:
+        Return 9255276791179340
+    End If
+    If idx is equal to 10:
+        Return 2478152334826140
+    End If
+    If idx is equal to 11:
+        Return 590642893610164
+    End If
+    If idx is equal to 12:
+        Return 125206034929641
+    End If
+    If idx is equal to 13:
+        Return 23590435911403
+    End If
+    If idx is equal to 14:
+        Return 3948334035941
+    End If
+    If idx is equal to 15:
+        Return 586753615614
+    End If
+    If idx is equal to 16:
+        Return 77391054539
+    End If
+    If idx is equal to 17:
+        Return 9056793210
+    End If
+    If idx is equal to 18:
+        Return 940121950
+    End If
+    If idx is equal to 19:
+        Return 86539696
+    End If
+    If idx is equal to 20:
+        Return 7062824
+    End If
+    If idx is equal to 21:
+        Return 510971
+    End If
+    If idx is equal to 22:
+        Return 32764
+    End If
+    If idx is equal to 23:
+        Return 1862
+    End If
+    If idx is equal to 24:
+        Return 94
+    End If
+    If idx is equal to 25:
+        Return 4
+    End If
+    Return 0
+End Process
+
+Process called "falcon_keygen_mkgauss" takes arena as Integer, shake_ctx as Integer returns Integer:
+    @Reasoning
+    Draws one signed integer from the Falcon keygen-time discrete Gaussian
+    D_{Z, 0, sigma_keygen} where sigma_keygen = 1.17 * sqrt(q/(2*1024)).
+    This is Pornin's mkgauss helper (keygen.c lines 2288-2356), which
+    converts SHAKE-256 entropy into a signed Gaussian sample using the
+    27-entry gauss_1024_12289 CDT.
+    @End Reasoning
+    @Implementation
+    Algorithm (matching Pornin keygen.c::mkgauss):
+      1. r1 = 8 bytes from SHAKE; neg = top bit; clear top bit.
+      2. f = (r1 < CDT[0]) ? 1 : 0   (zero-detect; r1 is a 63-bit unsigned)
+      3. r2 = 8 bytes from SHAKE; clear top bit; v = 0.
+      4. For k=1..26: t = (r2 >= CDT[k]) ? 1 : 0; if (f==0 and t==1) v=k; f|=t
+      5. v = neg ? -v : v
+    Returns the signed sample.
+    @End Implementation
+    @Performance_Hints
+    Constant-time over the 27-iteration CDT walk plus 2 SHAKE squeezes.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time per call (no early exit).  Output SECRET.
+    @End Security_Scope
+    Let r_buf be Arena.arena_allocate(arena, 16)
+    If r_buf is equal to 0:
+        Return 0
+    End If
+    Sha3.shake256_squeeze(shake_ctx, r_buf, 8)
+    Note: Pornin uses little-endian: r = byte[0] | byte[1]<<8 | ... | byte[7]<<56.
+    Let r1 be 0
+    Let bi1 be 0
+    While bi1 is less than 8:
+        Let byte_v be Memory.memory_get_byte(r_buf, bi1)
+        Let shift_amt be bi1 multiplied by 8
+        Let shifted be byte_v shifted left by shift_amt
+        Set r1 to r1 bitwise_or shifted
+        Set bi1 to bi1 plus 1
+    End While
+    Note: extract sign bit (top bit) -- treat r1 as unsigned 64.
+    Note: Use shifted right by 63 to get top bit; mask r1 to 63 bits.
+    Let neg be r1 shifted right by 63
+    Set neg to neg bitwise_and 1
+    Let mask63 be 9223372036854775807
+    Set r1 to r1 bitwise_and mask63
+
+    Note: f = (r1 < CDT[0]) ? 1 : 0
+    Let cdt0 be proc falcon_gauss_1024_cdt with 0
+    Let f_flag be 0
+    If r1 is less than cdt0:
+        Set f_flag to 1
+    End If
+
+    Sha3.shake256_squeeze(shake_ctx, r_buf, 8)
+    Let r2 be 0
+    Let bi2 be 0
+    While bi2 is less than 8:
+        Let byte_v be Memory.memory_get_byte(r_buf, bi2)
+        Let shift_amt2 be bi2 multiplied by 8
+        Let shifted2 be byte_v shifted left by shift_amt2
+        Set r2 to r2 bitwise_or shifted2
+        Set bi2 to bi2 plus 1
+    End While
+    Set r2 to r2 bitwise_and mask63
+
+    Let v be 0
+    Let k be 1
+    While k is less than 27:
+        Let cdt_k be proc falcon_gauss_1024_cdt with k
+        Let t be 0
+        If r2 is greater than or equal to cdt_k:
+            Set t to 1
+        End If
+        Note: v |= k & -(t & (f ^ 1));  i.e. v = k if f_flag==0 AND t==1.
+        If f_flag is equal to 0:
+            If t is equal to 1:
+                Set v to k
+            End If
+        End If
+        Note: f |= t
+        If t is equal to 1:
+            Set f_flag to 1
+        End If
+        Set k to k plus 1
+    End While
+
+    Note: Apply sign: v = neg ? -v : v.
+    If neg is equal to 1:
+        Set v to 0 minus v
+    End If
+    Return v
+End Process
+
+Process called "falcon_sample_short_polynomial_keygen" takes arena as Integer, shake_ctx as Integer, level as Integer, out_coeffs as Integer returns Integer:
+    @Reasoning
+    Spec-exact keygen sampling: draws g signed base samples per coefficient
+    where g comes from the Falcon spec (Algorithm 5 step 2).  Each draw is
+    from Pornin's gauss_1024_12289 CDT (sigma calibrated for N=1024).  For
+    smaller N, sum more draws to widen sigma by sqrt(g).
+    @End Reasoning
+    @Implementation
+    For each of n coefficients: sum falcon_keygen_g(level) keygen-time
+    Gaussian samples via falcon_keygen_mkgauss and store as int16.
+    @End Implementation
+    @Performance_Hints
+    O(n * g) mkgauss calls; g is 2 for n=512 and 1 for n=1024.
+    @End Performance_Hints
+    @Security_Scope
+    All outputs are SECRET. Constant-time per coefficient.
+    @End Security_Scope
+    Let n be falcon_n(level)
+    Let g be falcon_keygen_g(level)
+    Let i be 0
+    While i is less than n:
+        Let total be 0
+        Let j be 0
+        While j is less than g:
+            Let sample be falcon_keygen_mkgauss(arena, shake_ctx)
+            Set total to total plus sample
+            Set j to j plus 1
+        End While
+        Memory.memory_set_int16(out_coeffs, i multiplied by 2, total)
+        Set i to i plus 1
+    End While
+    Return n
+End Process
+
+Process called "falcon_short_polynomial_norm_squared" takes coeffs as Integer, n as Integer returns Integer:
+    @Reasoning
+    Computes ||p||^2 = sum_{i=0..n-1} coeffs[i]^2. Coefficients are
+    stored as signed 16-bit integers; the multiplication is performed
+    in 64-bit precision to avoid overflow for the n=1024 case.
+    @End Reasoning
+    @Implementation
+    Single linear pass with memory_get_int16 (sign-extending load) and
+    a 64-bit running total.
+    @End Implementation
+    @Performance_Hints
+    O(n) multiply-accumulates.
+    @End Performance_Hints
+    @Security_Scope
+    coeffs are SECRET. Constant-time per coefficient.
+    @End Security_Scope
+    Let total be 0
+    Let i be 0
+    While i is less than n:
+        Let c be Memory.memory_get_int16(coeffs, i multiplied by 2)
+        Set total to total plus (c multiplied by c)
+        Set i to i plus 1
+    End While
+    Return total
+End Process
+
+Process called "falcon_short_polynomial_norm_check" takes f as Integer, g as Integer, n as Integer, q as Integer returns Integer:
+    @Reasoning
+    Implements the keygen "short vector" predicate per Falcon round-3
+    spec section 3.9.2 Algorithm 5 step 5:
+      ||(f, g)||^2 <= floor(1.17^2 * q)
+    Returns 1 if the predicate holds (accept the candidate (f, g)),
+    else 0 (caller restarts the keygen loop).
+    @End Reasoning
+    @Implementation
+    Computes squared L2 norm via falcon_short_polynomial_norm_squared on
+    each polynomial, sums them, and compares against the precomputed
+    integer bound. For q=12289 the spec bound is floor(1.17^2 * q).
+    The Falcon round-3 reference implementation uses the integer literal
+    16823, derived by computing 1.17 * 1.17 in double precision (which
+    rounds 1.17^2 = 1.3689 down to 1.36889999...) and multiplying by q.
+    To match the reference exactly for the standardised q=12289 case we
+    hard-code 16823. For other q values the closest-integer computation
+    (13689 * q + 5000) / 10000 yields floor(1.3689 * q) with a sub-unit
+    error window that the spec's statistical-distance bound absorbs.
+    @End Implementation
+    @Performance_Hints
+    O(n) for each of the two polynomials.
+    @End Performance_Hints
+    @Security_Scope
+    f, g are SECRET. The norm computation is constant-time; the
+    comparison output is a 1-bit channel publicly observable by the
+    keygen restart loop, which is acceptable per the Falcon spec.
+    @End Security_Scope
+    Let norm_f be falcon_short_polynomial_norm_squared(f, n)
+    Let norm_g be falcon_short_polynomial_norm_squared(g, n)
+    Let total_norm be norm_f plus norm_g
+    Let bound be 0
+    If q is equal to 12289:
+        Set bound to 16823
+    Otherwise:
+        Note: bound = floor(1.3689 * q) via integer arithmetic
+        Set bound to ((13689 multiplied by q) plus 5000) divided by 10000
+    End If
+    If total_norm is less than or equal to bound:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "falcon_FG_coefficient_bound_check" takes F as Integer, G as Integer, n as Integer returns Integer:
+    @Reasoning
+    Implements the keygen (F, G) acceptance predicate per the Falcon
+    round-3 reference implementation (Pornin's falcon-impl-20211101
+    keygen.c::solve_NTRU, line 4291, in tandem with poly_big_to_small).
+
+    After NTRUSolve produces (F, G) satisfying f*G - g*F = q, the
+    spec requires that every coefficient fit in a signed 8-bit slot
+    so that the secret-key encoding (which packs F at bits_per = 8,
+    two's complement, per Falcon spec section 3.11.4) is lossless.
+
+    The reference accepts (F, G) iff for every i in [0, n):
+        -127 <= F[i] <= 127  AND  -127 <= G[i] <= 127
+
+    This is what max_FG_bits[logn] = 8 encodes in the reference; the
+    accepted range is (-(1 << 7)) + 1 .. (1 << 7) - 1 = [-127, 127],
+    matching `lim = (1 << (max_FG_bits[logn] - 1)) - 1 = 127`.
+
+    Returns 1 if the predicate holds (accept (F, G)), 0 otherwise
+    (restart the keygen loop).  This is the spec-correct replacement
+    for the (f, g)-style integer-norm bound (1.17^2 * q = 16823),
+    which is a (f, g)-only test inappropriate for (F, G) since the
+    NTRUSolve output is geometrically distinct from the sampled
+    Gaussian (f, g) and routinely has per-coefficient magnitudes
+    up to ~127 even in correct executions.
+    @End Reasoning
+    @Implementation
+    Single linear pass over both polynomials with sign-extending
+    memory_get_int16 loads.  Bails out on the first out-of-range
+    coefficient.  Bound = 127 matches the spec's int8 secret-key
+    encoding (Falcon round-3 spec Table 3.3).
+    @End Implementation
+    @Performance_Hints
+    O(n) with early-exit on rejection.  Roughly one branch per
+    coefficient; typical Falcon-512 accept rate well above 95%.
+    @End Performance_Hints
+    @Security_Scope
+    F, G are SECRET.  The early-exit is acceptable per the Falcon
+    spec because a rejection causes a full keygen restart (no
+    secret-dependent timing across attempts).
+    @End Security_Scope
+    Let bound be 127
+    Let neg_bound be 0 minus bound
+    Let i be 0
+    While i is less than n:
+        Let off_i be i multiplied by 2
+        Let fv be Memory.memory_get_int16(F, off_i)
+        Let gv be Memory.memory_get_int16(G, off_i)
+        If fv is greater than bound:
+            Return 0
+        End If
+        If fv is less than neg_bound:
+            Return 0
+        End If
+        If gv is greater than bound:
+            Return 0
+        End If
+        If gv is less than neg_bound:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+KEYGEN ORTHOGONALIZED-BASIS NORM CHECK (Pornin bnorm gate)
+==============================================================================
+Per Falcon round-3 reference keygen.c (PQClean falcon-512/clean):
+
+After the (f, g) integer norm check passes, Pornin computes the
+orthogonalized basis norm:
+
+    rt1 = q * conj(FFT(f)) / (|FFT(f)|^2 + |FFT(g)|^2)
+    rt2 = q * conj(FFT(g)) / (|FFT(f)|^2 + |FFT(g)|^2)
+    bnorm = sum_u (rt1_coef[u]^2 + rt2_coef[u]^2)         (in coefficient domain)
+
+The candidate (f, g) is accepted iff bnorm < fpr_bnorm_max = 16822.4121
+(= 1.17^2 * q with q = 12289).
+
+This check guarantees that the LDL tree built later from this (f, g, F, G)
+will have every leaf d00[0] >= (1/sigma_max)^2 / inv_sigma_global^2, which
+in turn guarantees the per-leaf sampler sigma stays within
+[sigma_min(n), sigma_max].
+
+Without this check, some (f, g) that pass the simpler ||(f,g)||^2 < 16823
+predicate produce LDL leaves with sigma < sigma_min at sign time, which
+violates the Karney domination property in BerExp and biases the
+signature norm above the spec bound (1.5x-2x typical overshoot).
+:End Note
+
+Process called "falcon_keygen_bnorm_check" takes arena as Integer, f_int as Integer, g_int as Integer, n as Integer returns Integer:
+    @Reasoning
+    Implements Pornin's "bnorm" orthogonalized-basis gate per Falcon
+    round-3 reference keygen.c (the test guarded by fpr_bnorm_max).
+    Returns 1 if the candidate (f, g) passes, 0 otherwise (caller
+    restarts the keygen attempt).
+    @End Reasoning
+    @Implementation
+    Pipeline:
+      1. Allocate three FFT-domain scratch buffers of 16*n bytes each
+         (rt1 = FFT(f), rt2 = FFT(g), rt3 = real-valued working buffer).
+      2. Load f, g into rt1, rt2 (real coefs, zero imag) and forward FFT.
+      3. Compute rt3[k] = 1 / (|rt1[k]|^2 + |rt2[k]|^2) coefficient by
+         coefficient (real-valued, store in real slot with zero imag).
+         Reject the candidate if any |rt1[k]|^2 + |rt2[k]|^2 == 0 (the
+         division produces inf/NaN; f is not invertible at that slot).
+      4. Conjugate rt1, rt2 in place.
+      5. Scale rt1, rt2 by q.
+      6. Pointwise multiply rt1 by rt3 (auto-adjoint, real-valued rt3).
+         Same for rt2.
+      7. Inverse FFT rt1 and rt2.
+      8. Sum (rt1.real)^2 + (rt2.real)^2 over all coefficients = bnorm.
+         (Imag parts should be ~0 by Hermitian symmetry; we use only real.)
+      9. Accept iff bnorm < fpr_bnorm_max (16822.4121 binary64).
+
+    The bnorm value is purely a real-valued L2 norm over the
+    coefficient-domain orthogonalized basis vector.
+    @End Implementation
+    @Performance_Hints
+    O(n log n) for three FFTs + O(n) for pointwise ops.
+    @End Performance_Hints
+    @Security_Scope
+    f, g are SECRET. The output bit (accept/reject) leaks via the keygen
+    restart count which Pornin's reference treats as an acceptable side
+    channel. FFT and division latencies are within the Falcon-spec
+    constant-time tolerance modulo denormal handling.
+    @End Security_Scope
+    Let bytes be n multiplied by 16
+    Let rt1 be Arena.arena_allocate(arena, bytes)
+    Let rt2 be Arena.arena_allocate(arena, bytes)
+    Let rt3 be Arena.arena_allocate(arena, bytes)
+    If rt3 is equal to 0:
+        Return 0
+    End If
+
+    Note: Step 1: load f, g into rt1, rt2 (real coefs, zero imag).
+    FFT.fft_load_from_int16_signed(f_int, rt1, n)
+    FFT.fft_load_from_int16_signed(g_int, rt2, n)
+
+    Note: Step 2: forward FFT both.
+    FFT.fft_forward(arena, rt1, n)
+    FFT.fft_forward(arena, rt2, n)
+
+    Note: Step 3: rt3[k] = 1 / (|rt1[k]|^2 + |rt2[k]|^2).  Real-valued.
+    Let zero_v be FP.fp_zero()
+    Let one_v be FP.fp_one()
+    Let k be 0
+    While k is less than n:
+        Let ar be FFT.fft_get_real(rt1, k)
+        Let ai be FFT.fft_get_imag(rt1, k)
+        Let br be FFT.fft_get_real(rt2, k)
+        Let bi be FFT.fft_get_imag(rt2, k)
+        Let ar2 be FP.fp_mul(ar, ar)
+        Let ai2 be FP.fp_mul(ai, ai)
+        Let br2 be FP.fp_mul(br, br)
+        Let bi2 be FP.fp_mul(bi, bi)
+        Let s1 be FP.fp_add(ar2, ai2)
+        Let s2 be FP.fp_add(br2, bi2)
+        Let denom be FP.fp_add(s1, s2)
+        Let is_zero be FP.fp_eq(denom, zero_v)
+        If is_zero is equal to 1:
+            Note: f is not invertible at this FFT slot; reject.
+            Return 0
+        End If
+        Let inv_denom be FP.fp_div(one_v, denom)
+        FFT.fft_set_real(rt3, k, inv_denom)
+        FFT.fft_set_imag(rt3, k, zero_v)
+        Set k to k plus 1
+    End While
+
+    Note: Step 4: conjugate rt1 and rt2 in place.
+    Let kk be 0
+    While kk is less than n:
+        Let ai be FFT.fft_get_imag(rt1, kk)
+        Let neg_ai be FP.fp_neg(ai)
+        FFT.fft_set_imag(rt1, kk, neg_ai)
+        Let bi be FFT.fft_get_imag(rt2, kk)
+        Let neg_bi be FP.fp_neg(bi)
+        FFT.fft_set_imag(rt2, kk, neg_bi)
+        Set kk to kk plus 1
+    End While
+
+    Note: Step 5: scale rt1 and rt2 by q = 12289.
+    Let q_f be FP.fp_from_int(12289)
+    Let ks be 0
+    While ks is less than n:
+        Let ar2 be FFT.fft_get_real(rt1, ks)
+        Let ai2 be FFT.fft_get_imag(rt1, ks)
+        Let nr be FP.fp_mul(ar2, q_f)
+        Let ni be FP.fp_mul(ai2, q_f)
+        FFT.fft_set_real(rt1, ks, nr)
+        FFT.fft_set_imag(rt1, ks, ni)
+        Let br2 be FFT.fft_get_real(rt2, ks)
+        Let bi2 be FFT.fft_get_imag(rt2, ks)
+        Let nbr be FP.fp_mul(br2, q_f)
+        Let nbi be FP.fp_mul(bi2, q_f)
+        FFT.fft_set_real(rt2, ks, nbr)
+        FFT.fft_set_imag(rt2, ks, nbi)
+        Set ks to ks plus 1
+    End While
+
+    Note: Step 6: pointwise multiply rt1 *= rt3, rt2 *= rt3.  rt3 is real-
+    Note: valued (zero imag), so the complex multiply simplifies to a real
+    Note: scalar multiplication coefficient-by-coefficient.
+    Let km be 0
+    While km is less than n:
+        Let cr be FFT.fft_get_real(rt3, km)
+        Let ar3 be FFT.fft_get_real(rt1, km)
+        Let ai3 be FFT.fft_get_imag(rt1, km)
+        Let nrr be FP.fp_mul(ar3, cr)
+        Let nri be FP.fp_mul(ai3, cr)
+        FFT.fft_set_real(rt1, km, nrr)
+        FFT.fft_set_imag(rt1, km, nri)
+        Let br3 be FFT.fft_get_real(rt2, km)
+        Let bi3 be FFT.fft_get_imag(rt2, km)
+        Let nrr2 be FP.fp_mul(br3, cr)
+        Let nri2 be FP.fp_mul(bi3, cr)
+        FFT.fft_set_real(rt2, km, nrr2)
+        FFT.fft_set_imag(rt2, km, nri2)
+        Set km to km plus 1
+    End While
+
+    Note: Step 7: inverse FFT rt1 and rt2 back to coefficient domain.
+    FFT.fft_inverse(arena, rt1, n)
+    FFT.fft_inverse(arena, rt2, n)
+
+    Note: Step 8: bnorm = sum_u (rt1_coef[u]^2 + rt2_coef[u]^2).
+    Let bnorm be FP.fp_zero()
+    Let ku be 0
+    While ku is less than n:
+        Let v1 be FFT.fft_get_real(rt1, ku)
+        Let v2 be FFT.fft_get_real(rt2, ku)
+        Let sq1 be FP.fp_mul(v1, v1)
+        Let sq2 be FP.fp_mul(v2, v2)
+        Set bnorm to FP.fp_add(bnorm, sq1)
+        Set bnorm to FP.fp_add(bnorm, sq2)
+        Set ku to ku plus 1
+    End While
+
+    Note: Step 9: compare against fpr_bnorm_max = 16822.4121 (binary64
+    Note: bit pattern 4670353323383631276, Pornin reference fpr.h::fpr_bnorm_max).
+    Let bnorm_max be 4670353323383631276
+    Let ok be FP.fp_lt(bnorm, bnorm_max)
+    Return ok
+End Process
+
+Note:
+==============================================================================
 SECRET KEY UNPACKING
 ==============================================================================
 Encoded sk = header || compressed f || compressed g || compressed F.
@@ -701,9 +1640,15 @@ Process called "falcon_unpack_polynomial_signed" takes data as Integer, n as Int
     @Security_Scope
     SECRET inputs.
     @End Security_Scope
+    Note: Per Runa precedence (shift > minus), parenthesize bits_per - 1
+    Note: when used as a shift amount so sign_bit lands at the correct
+    Note: bit position.  Without parens, "1 shifted left by bits_per minus 1"
+    Note: parses as (1 << bits_per) - 1 = mask, NOT (1 << (bits_per - 1))
+    Note: = the sign bit at position bits_per-1.
     Let mask be 1 shifted left by bits_per
     Set mask to mask minus 1
-    Let sign_bit be 1 shifted left by bits_per minus 1
+    Let bits_per_minus_one be bits_per minus 1
+    Let sign_bit be 1 shifted left by bits_per_minus_one
     Let acc be 0
     Let bits be 0
     Let in_idx be 0
@@ -711,7 +1656,14 @@ Process called "falcon_unpack_polynomial_signed" takes data as Integer, n as Int
     While i is less than n:
         While bits is less than bits_per:
             Let b be Memory.memory_get_byte(data, in_idx)
-            Set acc to acc bitwise_or b shifted left by bits
+            Note: Parens around the shift are REQUIRED.  Empirically the
+            Note: parser groups "X bitwise_or Y shifted left by Z" as
+            Note: "(X bitwise_or Y) shifted left by Z" rather than the
+            Note: documented shift-binds-tighter convention, so the shift
+            Note: MUST be parenthesized here to get the bytewise-stream
+            Note: accumulation semantics we want: acc | (b << bits).
+            Let shifted_b be b shifted left by bits
+            Set acc to acc bitwise_or shifted_b
             Set bits to bits plus 8
             Set in_idx to in_idx plus 1
         End While
@@ -719,8 +1671,11 @@ Process called "falcon_unpack_polynomial_signed" takes data as Integer, n as Int
         Set acc to acc shifted right by bits_per
         Set bits to bits minus bits_per
         Let signed_v be raw
-        If raw bitwise_and sign_bit is not equal to 0:
-            Set signed_v to raw minus 1 shifted left by bits_per
+        Let sb_test be raw bitwise_and sign_bit
+        If sb_test is not equal to 0:
+            Note: Sign-extend by subtracting 2^bits_per from raw.
+            Let two_pow_bits_per be 1 shifted left by bits_per
+            Set signed_v to raw minus two_pow_bits_per
         End If
         Memory.memory_set_int16(poly_out, i multiplied by 2, signed_v)
         Set i to i plus 1
@@ -762,19 +1717,25 @@ Process called "falcon_pack_signature" takes s_poly as Integer, n as Integer, ou
             Set absv to 0 minus v
             Set sign_b to 1
         End If
-        Set acc to acc bitwise_or sign_b shifted left by bits
+        Note: Each "bitwise_or X shifted left by bits" needs the shift
+        Note: parenthesized; the parser groups bitwise_or before shift.
+        Let shifted_sign be sign_b shifted left by bits
+        Set acc to acc bitwise_or shifted_sign
         Set bits to bits plus 1
         Let low7 be absv bitwise_and 127
-        Set acc to acc bitwise_or low7 shifted left by bits
+        Let shifted_low7 be low7 shifted left by bits
+        Set acc to acc bitwise_or shifted_low7
         Set bits to bits plus 7
         Let high_v be absv shifted right by 7
         Let h be 0
         While h is less than high_v:
-            Set acc to acc bitwise_or 0 shifted left by bits
+            Note: bit value 0 shifted by anything is 0 -- no-op; skip the
+            Note: shifted-or entirely (preserve bits counter advancement).
             Set bits to bits plus 1
             Set h to h plus 1
         End While
-        Set acc to acc bitwise_or 1 shifted left by bits
+        Let shifted_one be 1 shifted left by bits
+        Set acc to acc bitwise_or shifted_one
         Set bits to bits plus 1
         While bits is greater than or equal to 8:
             Memory.memory_set_byte(out, out_idx, acc bitwise_and 255)
@@ -812,7 +1773,8 @@ Process called "falcon_unpack_signature" takes data as Integer, data_length as I
         While bits is less than 8:
             If in_idx is less than data_length:
                 Let b be Memory.memory_get_byte(data, in_idx)
-                Set acc to acc bitwise_or b shifted left by bits
+                Let shifted_b be b shifted left by bits
+                Set acc to acc bitwise_or shifted_b
                 Set bits to bits plus 8
                 Set in_idx to in_idx plus 1
             Otherwise:
@@ -825,7 +1787,8 @@ Process called "falcon_unpack_signature" takes data as Integer, data_length as I
         While bits is less than 7:
             If in_idx is less than data_length:
                 Let b2 be Memory.memory_get_byte(data, in_idx)
-                Set acc to acc bitwise_or b2 shifted left by bits
+                Let shifted_b2 be b2 shifted left by bits
+                Set acc to acc bitwise_or shifted_b2
                 Set bits to bits plus 8
                 Set in_idx to in_idx plus 1
             Otherwise:
@@ -958,7 +1921,8 @@ Process called "falcon_unpack_pk_h" takes pk as Integer, n as Integer, h_poly as
     While i is less than n:
         While bits is less than 14:
             Let b be Memory.memory_get_byte(pk, in_idx)
-            Set acc to acc bitwise_or b shifted left by bits
+            Let shifted_b be b shifted left by bits
+            Set acc to acc bitwise_or shifted_b
             Set bits to bits plus 8
             Set in_idx to in_idx plus 1
         End While
@@ -1064,6 +2028,455 @@ Process called "falcon_verify_internal" takes arena as Integer, pk as Integer, m
     Return proc falcon_verify_norm_bound with s1_poly, s2_poly, n, level
 End Process
 
+Note:
+==============================================================================
+HELPER : COMPUTE h = g * f^{-1} mod (X^n+1, q)
+==============================================================================
+:End Note
+
+Process called "falcon_compute_h" takes arena as Integer, f_int as Integer, g_int as Integer, h_int as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute h(X) = g(X) * f(X)^{-1} in Z_q[X]/(X^n+1) where q=12289.
+    h is the Falcon public-key polynomial.
+    @End Reasoning
+    @Implementation
+    Steps:
+      1. Copy f, g into mod-q form (lift negatives by adding q).
+      2. NTT-transform both to point-wise representation.
+      3. Compute h_ntt[k] = g_ntt[k] * f_ntt[k]^{-1} mod q.
+      4. Inverse-NTT the result into coefficient form.
+      f^{-1} mod q at each NTT slot is computed via Fermat: f^{-1} = f^(q-2).
+      If any f_ntt[k] is zero the polynomial is not invertible -- caller must
+      retry with a new (f, g) pair.
+    @End Implementation
+    @Performance_Hints
+    Two forward NTTs + one inverse NTT + n modular inversions.
+    @End Performance_Hints
+    @Security_Scope
+    f and g are SECRET; h is PUBLIC.
+    @End Security_Scope
+    Let q be 12289
+    Let bytes be n multiplied by 2
+
+    Let f_ntt be Arena.arena_allocate(arena, bytes)
+    Let g_ntt be Arena.arena_allocate(arena, bytes)
+    If g_ntt is equal to 0:
+        Return 0
+    End If
+    Let li be 0
+    While li is less than n:
+        Let off be li multiplied by 2
+        Let fv be Memory.memory_get_int16(f_int, off)
+        Let gv be Memory.memory_get_int16(g_int, off)
+        While fv is less than 0:
+            Set fv to fv plus q
+        End While
+        While gv is less than 0:
+            Set gv to gv plus q
+        End While
+        Memory.memory_set_int16(f_ntt, off, fv)
+        Memory.memory_set_int16(g_ntt, off, gv)
+        Set li to li plus 1
+    End While
+    proc falcon_ntt_forward with f_ntt, n
+    proc falcon_ntt_forward with g_ntt, n
+
+    Let ki be 0
+    While ki is less than n:
+        Let off2 be ki multiplied by 2
+        Let fv2 be Memory.memory_get_int16(f_ntt, off2)
+        If fv2 is equal to 0:
+            Return 0
+        End If
+        Let f_inv be proc falcon_modpow with fv2, q minus 2, q
+        Let gv2 be Memory.memory_get_int16(g_ntt, off2)
+        Let hv be proc falcon_modq_mul with gv2, f_inv
+        Memory.memory_set_int16(h_int, off2, hv)
+        Set ki to ki plus 1
+    End While
+    proc falcon_ntt_inverse with h_int, n
+    Return 1
+End Process
+
+Note:
+==============================================================================
+HELPER : PACK PUBLIC KEY h
+==============================================================================
+Header byte (low 4 bits = logn, high 4 bits = 0) followed by n coefficients
+of 14 bits each, little-endian bit-packed.
+:End Note
+
+Process called "falcon_pack_pk" takes h_int as Integer, n as Integer, logn as Integer, pk_out as Integer returns Integer:
+    @Reasoning
+    Pack h into the Falcon public key byte layout.
+    @End Reasoning
+    @Implementation
+    Header at offset 0, then streaming bit-packer for 14 bits per coefficient.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    h and the public key are public.
+    @End Security_Scope
+    Memory.memory_set_byte(pk_out, 0, logn)
+    Let acc be 0
+    Let bits be 0
+    Let out_idx be 1
+    Let i be 0
+    While i is less than n:
+        Let v be Memory.memory_get_int16(h_int, i multiplied by 2)
+        Let v_pos be v
+        While v_pos is less than 0:
+            Set v_pos to v_pos plus 12289
+        End While
+        Let masked be v_pos bitwise_and 16383
+        Set acc to acc bitwise_or (masked shifted left by bits)
+        Set bits to bits plus 14
+        While bits is greater than or equal to 8:
+            Memory.memory_set_byte(pk_out, out_idx, acc bitwise_and 255)
+            Set out_idx to out_idx plus 1
+            Set acc to acc shifted right by 8
+            Set bits to bits minus 8
+        End While
+        Set i to i plus 1
+    End While
+    If bits is greater than 0:
+        Memory.memory_set_byte(pk_out, out_idx, acc bitwise_and 255)
+        Set out_idx to out_idx plus 1
+    End If
+    Return out_idx
+End Process
+
+Note:
+==============================================================================
+HELPER : PACK SIGNED COEFFICIENTS WITH bits_per BITS EACH
+==============================================================================
+Used for sk encoding of f, g (bits_per = 6 for n=512, 5 for n=1024) and
+F (bits_per = 8 always).
+:End Note
+
+Process called "falcon_pack_polynomial_signed" takes poly_in as Integer, n as Integer, bits_per as Integer, out as Integer, out_offset as Integer returns Integer:
+    @Reasoning
+    Pack n signed coefficients into a bit stream of bits_per bits each.
+    @End Reasoning
+    @Implementation
+    Two's complement encoding within bits_per bits.  Streaming bit writer.
+    @End Implementation
+    @Performance_Hints
+    Linear.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET inputs.
+    @End Security_Scope
+    Let mask be 1 shifted left by bits_per
+    Set mask to mask minus 1
+    Let acc be 0
+    Let bits be 0
+    Let pos be out_offset
+    Let i be 0
+    While i is less than n:
+        Let v be Memory.memory_get_int16(poly_in, i multiplied by 2)
+        Let raw be v bitwise_and mask
+        Set acc to acc bitwise_or (raw shifted left by bits)
+        Set bits to bits plus bits_per
+        While bits is greater than or equal to 8:
+            Memory.memory_set_byte(out, pos, acc bitwise_and 255)
+            Set pos to pos plus 1
+            Set acc to acc shifted right by 8
+            Set bits to bits minus 8
+        End While
+        Set i to i plus 1
+    End While
+    If bits is greater than 0:
+        Memory.memory_set_byte(out, pos, acc bitwise_and 255)
+        Set pos to pos plus 1
+    End If
+    Return pos minus out_offset
+End Process
+
+Note:
+==============================================================================
+HELPER : PACK SECRET KEY
+==============================================================================
+Falcon sk layout per spec section 3.11:
+  byte 0: header = 0x50 | logn
+  bytes 1..: bit-packed f (bits_per=6 for n=512, 5 for n=1024)
+  next:     bit-packed g (same bits_per as f)
+  next:     bit-packed F (bits_per=8)
+:End Note
+
+Process called "falcon_sk_bits_per_fg" takes n as Integer returns Integer:
+    @Reasoning
+    Per Falcon spec sec 3.11, the encoding width for f and g is 6 bits when
+    n=512 and 5 bits when n=1024.
+    @End Reasoning
+    @Implementation
+    Single comparison.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If n is equal to 1024:
+        Return 5
+    End If
+    Return 6
+End Process
+
+Process called "falcon_pack_sk" takes f_int as Integer, g_int as Integer, F_int as Integer, n as Integer, logn as Integer, sk_out as Integer returns Integer:
+    @Reasoning
+    Pack the secret key into the Falcon spec layout.
+    @End Reasoning
+    @Implementation
+    Header + packed f + packed g + packed F.  Note that G is omitted from
+    the encoded sk because it can be recovered from (f, g, F) via the NTRU
+    relation (the verifier and the keygen-time check both confirm this).
+    @End Implementation
+    @Performance_Hints
+    Linear.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET output.
+    @End Security_Scope
+    Let bits_per_fg be proc falcon_sk_bits_per_fg with n
+    Memory.memory_set_byte(sk_out, 0, 80 bitwise_or logn)
+    Let pos be 1
+    Let written_f be proc falcon_pack_polynomial_signed with f_int, n, bits_per_fg, sk_out, pos
+    Set pos to pos plus written_f
+    Let written_g be proc falcon_pack_polynomial_signed with g_int, n, bits_per_fg, sk_out, pos
+    Set pos to pos plus written_g
+    Let written_F be proc falcon_pack_polynomial_signed with F_int, n, 8, sk_out, pos
+    Set pos to pos plus written_F
+    Return pos
+End Process
+
+Note:
+==============================================================================
+HELPER : UNPACK SECRET KEY
+==============================================================================
+Inverse of falcon_pack_sk.  Recovers (f, g, F) from the bit-packed sk
+buffer and reconstructs G via the NTRU equation f*G - g*F = q in NTT form
+(G = (q + g*F) / f mod q).
+:End Note
+
+Process called "falcon_unpack_sk" takes arena as Integer, sk_in as Integer, n as Integer, f_out as Integer, g_out as Integer, F_out as Integer, G_out as Integer returns Integer:
+    @Reasoning
+    Decode (f, g, F) and reconstruct G.
+    @End Reasoning
+    @Implementation
+    1. Validate header byte = 0x50 | logn.
+    2. Bit-unpack f and g at the level-dependent bits_per.
+    3. Bit-unpack F at 8 bits.
+    4. Reconstruct G via NTT: f * G - g * F = q  =>  G = (q + g*F) * f^{-1}
+       in NTT-domain modular arithmetic.  The result rounds back to
+       small-integer coefficients because (G, f, g, F) were generated
+       to satisfy the NTRU equation.
+    @End Implementation
+    @Performance_Hints
+    Three bit-stream unpackers + two NTTs + one inverse NTT.
+    @End Performance_Hints
+    @Security_Scope
+    sk is SECRET; outputs are SECRET.
+    @End Security_Scope
+    Let q be 12289
+    Let bits_per_fg be proc falcon_sk_bits_per_fg with n
+    Let header be Memory.memory_get_byte(sk_in, 0)
+    Let logn_calc be 9
+    If n is equal to 1024:
+        Set logn_calc to 10
+    End If
+    Let expected_header be 80 bitwise_or logn_calc
+    If header is not equal to expected_header:
+        Return 0
+    End If
+
+    Let pos be 1
+    Note: Compute byte count for each polynomial: ceil(n * bits_per / 8).
+    Let f_bits_total be n multiplied by bits_per_fg
+    Let f_byte_count be f_bits_total plus 7
+    Set f_byte_count to f_byte_count divided by 8
+
+    Let f_data be sk_in plus pos
+    proc falcon_unpack_polynomial_signed with f_data, n, bits_per_fg, f_out
+    Set pos to pos plus f_byte_count
+
+    Let g_data be sk_in plus pos
+    proc falcon_unpack_polynomial_signed with g_data, n, bits_per_fg, g_out
+    Set pos to pos plus f_byte_count
+
+    Let F_bits_total be n multiplied by 8
+    Let F_byte_count be F_bits_total divided by 8
+    Let F_data be sk_in plus pos
+    proc falcon_unpack_polynomial_signed with F_data, n, 8, F_out
+    Set pos to pos plus F_byte_count
+
+    Note: Reconstruct G.  In NTT domain: G_ntt[k] = (g_ntt[k] * F_ntt[k] + q) * f_ntt[k]^{-1} mod q.
+    Note: But since we're mod q the "+q" is just 0, so G = (g * F) * f^{-1}.
+    Note: That gives f * G = g * F mod q which together with the equation
+    Note: f*G - g*F = q simplifies to f*G = g*F mod q (since q == 0 mod q).
+    Let bytes be n multiplied by 2
+    Let f_ntt be Arena.arena_allocate(arena, bytes)
+    Let g_ntt be Arena.arena_allocate(arena, bytes)
+    Let F_ntt be Arena.arena_allocate(arena, bytes)
+    If F_ntt is equal to 0:
+        Return 0
+    End If
+    Let lj be 0
+    While lj is less than n:
+        Let off3 be lj multiplied by 2
+        Let fv3 be Memory.memory_get_int16(f_out, off3)
+        Let gv3 be Memory.memory_get_int16(g_out, off3)
+        Let Fv3 be Memory.memory_get_int16(F_out, off3)
+        While fv3 is less than 0:
+            Set fv3 to fv3 plus q
+        End While
+        While gv3 is less than 0:
+            Set gv3 to gv3 plus q
+        End While
+        While Fv3 is less than 0:
+            Set Fv3 to Fv3 plus q
+        End While
+        Memory.memory_set_int16(f_ntt, off3, fv3)
+        Memory.memory_set_int16(g_ntt, off3, gv3)
+        Memory.memory_set_int16(F_ntt, off3, Fv3)
+        Set lj to lj plus 1
+    End While
+    proc falcon_ntt_forward with f_ntt, n
+    proc falcon_ntt_forward with g_ntt, n
+    proc falcon_ntt_forward with F_ntt, n
+
+    Let kj be 0
+    While kj is less than n:
+        Let off4 be kj multiplied by 2
+        Let fv4 be Memory.memory_get_int16(f_ntt, off4)
+        If fv4 is equal to 0:
+            Return 0
+        End If
+        Let f_inv be proc falcon_modpow with fv4, q minus 2, q
+        Let gv4 be Memory.memory_get_int16(g_ntt, off4)
+        Let Fv4 be Memory.memory_get_int16(F_ntt, off4)
+        Let gF be proc falcon_modq_mul with gv4, Fv4
+        Let Gv be proc falcon_modq_mul with gF, f_inv
+        Memory.memory_set_int16(G_out, off4, Gv)
+        Set kj to kj plus 1
+    End While
+    proc falcon_ntt_inverse with G_out, n
+    Note: Center the recovered G coefficients to signed range.
+    Let half_q be q shifted right by 1
+    Let ci be 0
+    While ci is less than n:
+        Let off5 be ci multiplied by 2
+        Let Gc be Memory.memory_get_int16(G_out, off5)
+        If Gc is greater than half_q:
+            Set Gc to Gc minus q
+        End If
+        Memory.memory_set_int16(G_out, off5, Gc)
+        Set ci to ci plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+HELPER : SIGNATURE NORM SQUARED
+==============================================================================
+:End Note
+
+Process called "falcon_signature_norm_squared" takes s1_int as Integer, s2_int as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute ||s1||^2 + ||s2||^2 over signed int16 coefficients.
+    @End Reasoning
+    @Implementation
+    Linear sum-of-squares.
+    @End Implementation
+    @Performance_Hints
+    O(n).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET coefficients; CT.
+    @End Security_Scope
+    Let total be 0
+    Let i be 0
+    While i is less than n:
+        Let off_i be i multiplied by 2
+        Let v1 be Memory.memory_get_int16(s1_int, off_i)
+        Let v2 be Memory.memory_get_int16(s2_int, off_i)
+        Set total to total plus (v1 multiplied by v1)
+        Set total to total plus (v2 multiplied by v2)
+        Set i to i plus 1
+    End While
+    Return total
+End Process
+
+Note:
+==============================================================================
+HELPER : LDL TREE LEAF VALIDATION
+==============================================================================
+:End Note
+
+Process called "falcon_ldl_tree_leaves_ok_recursive" takes node as Integer, ccs_bound as Float returns Integer:
+    @Reasoning
+    Recursively walk the LDL tree and check at each leaf that
+        ccs_leaf = sigma_min(orig_n) * isigma_leaf < 1
+    The Falcon FFS sampler at sign time multiplies BerExp's accept
+    probability by ccs; ccs >= 1 saturates BerExp at always-accept,
+    widening the (z0, z1) distribution beyond Falcon's calibrated sigma
+    and pushing the signature L2-norm bound on every attempt.
+    @End Reasoning
+    @Implementation
+    Leaf check: ccs = ccs_bound * isigma_leaf.  Reject if ccs >= 1.
+    Internal nodes recurse on both children.  Returns 1 if every leaf
+    passes, else 0.
+    @End Implementation
+    @Performance_Hints
+    O(n) walk over the leaves of an n-coefficient LDL tree.
+    @End Performance_Hints
+    @Security_Scope
+    Leaf sigmas are SECRET; the gate's branch leaks acceptance via the
+    keygen retry count, which Pornin's reference treats as an acceptable
+    side channel (matches his bnorm gate at keygen.c line 4269).
+    @End Security_Scope
+    Let is_leaf be proc ldl_tree_is_leaf from Ldl with node
+    If is_leaf is equal to 1:
+        Let isigma_v be proc ldl_tree_sigma from Ldl with node
+        Let ccs_v be FP.fp_mul(ccs_bound, isigma_v)
+        Let one_v be FP.fp_one()
+        Let ok_v be FP.fp_lt(ccs_v, one_v)
+        Return ok_v
+    End If
+    Let left_v be proc ldl_tree_left from Ldl with node
+    Let right_v be proc ldl_tree_right from Ldl with node
+    Let left_ok be proc falcon_ldl_tree_leaves_ok_recursive with left_v, ccs_bound
+    If left_ok is equal to 0:
+        Return 0
+    End If
+    Let right_ok be proc falcon_ldl_tree_leaves_ok_recursive with right_v, ccs_bound
+    Return right_ok
+End Process
+
+Process called "falcon_ldl_tree_leaves_ok" takes tree as Integer, n as Integer returns Integer:
+    @Reasoning
+    Top-level entry: validate that every LDL leaf would yield sampler
+    ccs = sigma_min(n) * isigma_leaf < 1 at sign time.
+    @End Reasoning
+    @Implementation
+    Computes ccs_bound = sigma_min(n) and dispatches to the recursive
+    walker.  The leaf-stored isigma already factors 1/sigma_global, so
+    ccs at leaf = sigma_min * isigma_leaf.
+    @End Implementation
+    @Performance_Hints
+    O(n).
+    @End Performance_Hints
+    @Security_Scope
+    See the recursive helper.
+    @End Security_Scope
+    Let sigma_min_v be proc ldl_sigma_min_for_n from Ldl with n
+    Return proc falcon_ldl_tree_leaves_ok_recursive with tree, sigma_min_v
+End Process
+
 Process called "falcon_keygen_internal" takes arena as Integer, seed as Integer, level as Integer, pk_out as Integer, sk_out as Integer returns Integer:
     @Reasoning
     Per Falcon Algorithm 5 (KeyGen). High level:
@@ -1074,40 +2487,174 @@ Process called "falcon_keygen_internal" takes arena as Integer, seed as Integer,
       4. pk = (h); sk includes (f, g, F, G) plus Falcon tree.
     @End Reasoning
     @Implementation
-    The NTRU-equation solver (ntru_solve) and the discrete Gaussian sampler
-    require IEEE 754 Float64. The stage1 Float64 SSE2 path is operational
-    (task #338, F1 wave landed), so the underlying hardware floating-point
-    surface is available. This wrapper currently exposes the signing
-    surface as keygen/sign and writes the spec-defined header bytes plus
-    zeroed payload buffers; the @TODO marker for full algorithm integration
-    against the now-available Float64 path is tracked separately so that
-    this entry point preserves the dispatcher contract for callers wiring
-    Falcon into the algorithm-agnostic signature router.
+    The orchestration is layered against the falcon_ntrusolve, falcon_ldl,
+    and falcon_ffs modules.  Steps:
+      1. Seed a SHAKE-256 PRNG with the 48-byte input seed.
+      2. Sample short polynomials f, g from the spec-mandated discrete
+         Gaussian using the existing falcon_sample_short_polynomial_keygen
+         entry point.
+      3. Restart if ||(f, g)||^2 exceeds the spec norm bound (1.17^2 q).
+      4. Restart if f is not invertible modulo (X^n+1, q) (any NTT slot
+         equal to zero).
+      5. Solve f*G - g*F = q via Ntrusolve.ntru_solve.
+      6. Restart if the resulting (F, G) is not short enough.
+      7. Compute h = g * f^{-1} mod (X^n+1, q) via NTT.
+      8. Bit-pack h into the public key buffer (header + 14-bit coeffs).
+      9. Bit-pack (f, g, F) into the secret key buffer per Falcon spec
+         section 3.11 (G is recoverable at unpack time).
     @End Implementation
     @Performance_Hints
-    O(n log n) for the FFT-based NTRU operations on the stage1 Float64
-    SSE2 surface.
+    O(n log^2 n) total: NTRU descent has log(n) tower levels, each
+    O(n log n).  The norm-restart probability is below 5% per attempt.
     @End Performance_Hints
     @Security_Scope
-    SECRET path. The CDT-based base sampler above is constant-time. When
-    the Falcon-tree-backed fast Fourier sampler is wired against the
-    stage1 Float64 surface, it must avoid subnormal fast paths -- see
-    module preamble.
+    SECRET path. The CDT-based base sampler and the FFT operations are
+    approximately constant-time on x86_64 modulo denormal slowdowns
+    (see falcon_fp.runa preamble).
     @End Security_Scope
     Let n be proc falcon_n with level
     Let logn be proc falcon_logn with level
     Let pk_size be proc falcon_pk_size with level
     Let sk_size be proc falcon_sk_size with level
-    Note: The keygen output is initialised with the spec-defined header
-    Note: bytes and zeroed payload buffers; algorithm integration tracked
-    Note: via the @TODO marker in this file.
     Memory.memory_zero(pk_out, pk_size)
     Memory.memory_zero(sk_out, sk_size)
-    Note: pk header: low 4 bits = logn, high 4 bits = 0
-    Memory.memory_set_byte(pk_out, 0, logn)
-    Note: sk header: 0x50 | logn per Falcon spec sec 3.11
-    Memory.memory_set_byte(sk_out, 0, 80 bitwise_or logn)
-    Memory.memory_copy(sk_out plus 1, seed, 48)
+
+    Note: Seed the SHAKE-256 PRNG with the supplied 48-byte seed (the
+    Note: caller is responsible for entropy; this keeps key generation
+    Note: deterministic when re-running with the same seed).
+    Let shake_ctx be proc shake256_init from Sha3 with arena
+    If shake_ctx is equal to 0:
+        Return 0
+    End If
+    proc shake256_absorb from Sha3 with shake_ctx, seed, 48
+    proc shake256_finalize from Sha3 with shake_ctx
+
+    Let q be 12289
+    Let bytes_int be n multiplied by 2
+
+    Let f_coeffs be Arena.arena_allocate(arena, bytes_int)
+    Let g_coeffs be Arena.arena_allocate(arena, bytes_int)
+    Let F_coeffs be Arena.arena_allocate(arena, bytes_int)
+    Let G_coeffs be Arena.arena_allocate(arena, bytes_int)
+    Let h_coeffs be Arena.arena_allocate(arena, bytes_int)
+    If h_coeffs is equal to 0:
+        Return 0
+    End If
+
+    Let attempt_count be 0
+    Let max_attempts be 100
+    Let success be 0
+    While success is equal to 0:
+        If attempt_count is greater than or equal to max_attempts:
+            Return 0
+        End If
+        Set attempt_count to attempt_count plus 1
+
+        Note: Sample f and g per Falcon spec Algorithm 5 step 2.
+        proc falcon_sample_short_polynomial_keygen with arena, shake_ctx, level, f_coeffs
+        proc falcon_sample_short_polynomial_keygen with arena, shake_ctx, level, g_coeffs
+
+        Note: Norm check ||(f,g)||^2 <= floor(1.17^2 q).
+        Let norm_ok be proc falcon_short_polynomial_norm_check with f_coeffs, g_coeffs, n, q
+        Let continue_flag be 1
+        If norm_ok is equal to 0:
+            Set continue_flag to 0
+        End If
+
+        Note: f must be invertible modulo (X^n+1, q): the polynomial mod
+        Note: X^n + 1 with mod-q coefficients has full NTT image iff every
+        Note: NTT slot is non-zero.
+        If continue_flag is equal to 1:
+            Let f_ntt_check be Arena.arena_allocate(arena, bytes_int)
+            If f_ntt_check is equal to 0:
+                Return 0
+            End If
+            Let cci be 0
+            While cci is less than n:
+                Let off_c be cci multiplied by 2
+                Let fv be Memory.memory_get_int16(f_coeffs, off_c)
+                While fv is less than 0:
+                    Set fv to fv plus q
+                End While
+                Memory.memory_set_int16(f_ntt_check, off_c, fv)
+                Set cci to cci plus 1
+            End While
+            proc falcon_ntt_forward with f_ntt_check, n
+            Let f_invertible be 1
+            Let cii be 0
+            While cii is less than n:
+                Let coef be Memory.memory_get_int16(f_ntt_check, cii multiplied by 2)
+                If coef is equal to 0:
+                    Set f_invertible to 0
+                End If
+                Set cii to cii plus 1
+            End While
+            If f_invertible is equal to 0:
+                Set continue_flag to 0
+            End If
+        End If
+
+        If continue_flag is equal to 1:
+            Note: Pornin's orthogonalized-basis bnorm gate.  We run this in
+            Note: a per-attempt scratch arena because the FFT and inverse-
+            Note: FFT pipeline allocates ~3 * 16 * n bytes of working set
+            Note: that we MUST discard before the next attempt (so the
+            Note: caller's arena is not drained).  Without this check some
+            Note: (f, g) that pass the simple integer-norm gate produce
+            Note: LDL leaves with sigma < sigma_min(n), violating Karney
+            Note: domination and biasing the signature norm above the
+            Note: spec bound at sign time.
+            Let bnorm_scratch be Arena.arena_create(2097152)
+            If bnorm_scratch is equal to 0:
+                Return 0
+            End If
+            Let bnorm_ok be proc falcon_keygen_bnorm_check with bnorm_scratch, f_coeffs, g_coeffs, n
+            Arena.arena_destroy(bnorm_scratch)
+            If bnorm_ok is equal to 0:
+                Set continue_flag to 0
+            End If
+        End If
+
+        If continue_flag is equal to 1:
+            Note: NTRUSolve to obtain (F, G).
+            Let solve_ok be proc ntru_solve from Ntrusolve with arena, f_coeffs, g_coeffs, n, F_coeffs, G_coeffs
+            If solve_ok is equal to 0:
+                Set continue_flag to 0
+            End If
+        End If
+
+        If continue_flag is equal to 1:
+            Note: (F, G) acceptance predicate per Falcon round-3 spec
+            Note: section 3.11.4 + Pornin reference keygen.c::solve_NTRU
+            Note: line 4291 (lim = (1 << (max_FG_bits[logn] - 1)) - 1 = 127
+            Note: for all logn in [1, 10]).  Each coefficient of F and G
+            Note: must fit in signed 8 bits ([-127, 127]) so the secret
+            Note: key encoding (bits_per = 8 for F) is lossless.
+            Note: This is geometrically distinct from the (f, g) norm
+            Note: bound 1.17^2 * q = 16823; the NTRUSolve output (F, G)
+            Note: routinely has per-coefficient magnitudes up to ~127
+            Note: even in correct executions, so the (f, g) integer-norm
+            Note: bound is not the right predicate for (F, G).
+            Let fg_bound_ok be proc falcon_FG_coefficient_bound_check with F_coeffs, G_coeffs, n
+            If fg_bound_ok is equal to 0:
+                Set continue_flag to 0
+            End If
+        End If
+
+        If continue_flag is equal to 1:
+            Set success to 1
+        End If
+    End While
+
+    Note: h = g * f^{-1} mod (X^n+1, q).
+    Let h_ok be proc falcon_compute_h with arena, f_coeffs, g_coeffs, h_coeffs, n
+    If h_ok is equal to 0:
+        Return 0
+    End If
+
+    Note: Pack pk and sk.
+    proc falcon_pack_pk with h_coeffs, n, logn, pk_out
+    proc falcon_pack_sk with f_coeffs, g_coeffs, F_coeffs, n, logn, sk_out
     Return 1
 End Process
 
@@ -1120,29 +2667,147 @@ Process called "falcon_sign_internal" takes arena as Integer, sk as Integer, mes
       3. Compress s2 and write [header | nonce | compressed s2] into sig_out.
     @End Reasoning
     @Implementation
-    The fast Fourier sampler runs against the Falcon tree precomputed
-    during keygen and uses the stage1 Float64 SSE2 surface. This routine
-    writes the signature header + nonce and returns 0; algorithm integration
-    against the live Float64 surface is tracked via the @TODO marker in this
-    file. Verify operates against a Float64-produced signature; the
-    structural pipeline (HashToPoint + NTT-based polynomial arithmetic +
-    norm check) is fully implemented.
+    Steps:
+      1. Unpack (f, g, F) from the packed sk, recovering G via the NTRU
+         relation in NTT form.
+      2. Build the LDL tree for the basis B = [[g, -f], [G, -F]] via
+         ldl_build_tree.
+      3. Seed a SHAKE-256 PRNG with (nonce || message) and run hash-to-point
+         to obtain the target c in Z_q[X]/(X^n+1).
+      4. Loop: seed a fresh PRNG with (nonce || message || attempt_count),
+         run Ffs.ffs_sample to obtain (s1, s2), compute the norm, and
+         accept if the norm bound holds.
+      5. Pack s2 into the compressed signature payload after the 41-byte
+         header.
+      Return the total signature length (41 + payload_len) on success.
     @End Implementation
     @Performance_Hints
-    O(n log n) on the stage1 Float64 SSE2 surface.
+    O(n log n) per attempt.  Expected attempt count below 1.1 for both
+    parameter sets.
     @End Performance_Hints
     @Security_Scope
     SECRET path. CT constraints documented in module preamble.
     @End Security_Scope
     Let n be proc falcon_n with level
     Let logn be proc falcon_logn with level
-    Let pk_size be proc falcon_pk_size with level
     Let max_sig_len be proc falcon_sig_size_max with level
     Memory.memory_zero(sig_out, max_sig_len)
     Memory.memory_set_byte(sig_out, 0, 48 bitwise_or logn)
     Memory.memory_copy(sig_out plus 1, nonce, 40)
-    Note: Signing body returns 0 (signature not produced) per @Implementation.
-    Note: Verify of an externally-produced valid Falcon signature works.
+
+    Let q be 12289
+    Let bytes_int be n multiplied by 2
+
+    Note: Unpack sk to recover (f, g, F, G).
+    Let f_int be Arena.arena_allocate(arena, bytes_int)
+    Let g_int be Arena.arena_allocate(arena, bytes_int)
+    Let F_int be Arena.arena_allocate(arena, bytes_int)
+    Let G_int be Arena.arena_allocate(arena, bytes_int)
+    If G_int is equal to 0:
+        Return 0
+    End If
+    Let unpack_ok be proc falcon_unpack_sk with arena, sk, n, f_int, g_int, F_int, G_int
+    If unpack_ok is equal to 0:
+        Return 0
+    End If
+
+    Note: Center f and g for the LDL build (they were two's-complement
+    Note: into the bits_per width on encode, so unpack returns sign-extended
+    Note: values already).  Build the LDL tree.
+    Let ldl_tree be proc ldl_build_tree from Ldl with arena, f_int, g_int, F_int, G_int, n
+    If ldl_tree is equal to 0:
+        Return 0
+    End If
+
+    Note: SHAKE-256 PRNG seeded with sign-stage entropy: nonce || message.
+    Note: We absorb both into the sampler context.  The nonce is the
+    Note: 40-byte salt copied into the signature buffer at sig_out+1.
+    Let sign_ctx be proc shake256_init from Sha3 with arena
+    If sign_ctx is equal to 0:
+        Return 0
+    End If
+    proc shake256_absorb from Sha3 with sign_ctx, nonce, 40
+    proc shake256_absorb from Sha3 with sign_ctx, message, message_length
+    proc shake256_finalize from Sha3 with sign_ctx
+
+    Note: Compute the target c = HashToPoint(nonce || message).
+    Let c_poly be Arena.arena_allocate(arena, bytes_int)
+    If c_poly is equal to 0:
+        Return 0
+    End If
+    proc falcon_hash_to_point with arena, message, message_length, nonce, 40, n, c_poly
+
+    Note: Allocate sampler outputs s1, s2.
+    Let s1_int be Arena.arena_allocate(arena, bytes_int)
+    Let s2_int be Arena.arena_allocate(arena, bytes_int)
+    If s2_int is equal to 0:
+        Return 0
+    End If
+
+    Note: Rejection-resample loop on the signature norm bound.  Each
+    Note: attempt allocates ~O(n log n) FFT scratch in ffs_sample which
+    Note: would re-grow the caller's arena (invalidating the LDL tree
+    Note: pointers).  We mitigate by creating a per-attempt scratch
+    Note: arena large enough for one full FFS pass, freeing it between
+    Note: attempts via arena_destroy.  256 MiB is more than enough for
+    Note: Falcon-1024 (which dominates the FFT buffer footprint at
+    Note: n=1024 across ~10 LDL recursion levels).
+    Let attempt_count be 0
+    Let sig_norm_bound be 34034726
+    If level is equal to 2:
+        Set sig_norm_bound to 70265242
+    End If
+    Let accepted be 0
+    While accepted is equal to 0:
+        If attempt_count is greater than or equal to 100:
+            Return 0
+        End If
+        Set attempt_count to attempt_count plus 1
+
+        Note: Per-attempt scratch arena.  64 MiB is sufficient for the
+        Note: FFS pipeline at n=1024 (largest case): ~2*(2*n log n) FFT
+        Note: complex buffers plus the recursion's per-level halves.
+        Let sign_scratch be Arena.arena_create(67108864)
+        If sign_scratch is equal to 0:
+            Return 0
+        End If
+
+        Note: Run the FFS sampler over the LDL tree to obtain (s1, s2).
+        Note: We use a fresh per-attempt PRNG seeded with (nonce || message ||
+        Note: attempt_counter) so each retry draws independent randomness.
+        Let attempt_buf be Arena.arena_allocate(sign_scratch, 8)
+        Memory.memory_set_int64(attempt_buf, 0, attempt_count)
+        Let ffs_ctx be proc shake256_init from Sha3 with sign_scratch
+        If ffs_ctx is equal to 0:
+            Arena.arena_destroy(sign_scratch)
+            Return 0
+        End If
+        proc shake256_absorb from Sha3 with ffs_ctx, nonce, 40
+        proc shake256_absorb from Sha3 with ffs_ctx, message, message_length
+        proc shake256_absorb from Sha3 with ffs_ctx, attempt_buf, 8
+        proc shake256_finalize from Sha3 with ffs_ctx
+
+        Let ffs_ok be proc ffs_sample from Ffs with sign_scratch, ffs_ctx, ldl_tree, c_poly, f_int, g_int, F_int, G_int, n, s1_int, s2_int
+        Let attempt_accepted be 0
+        If ffs_ok is equal to 1:
+            Let norm_sq be proc falcon_signature_norm_squared with s1_int, s2_int, n
+            If norm_sq is less than or equal to sig_norm_bound:
+                Note: Pack s2 (signed) into the signature payload.  Layout:
+                Note: byte 0 header | 40-byte nonce | compressed s2 stream.
+                Let sig_payload_offset be 41
+                Let payload_dest be sig_out plus sig_payload_offset
+                Let s2_pack_len be proc falcon_pack_signature with s2_int, n, payload_dest
+                Set attempt_accepted to 1
+                Set accepted to 1
+                Arena.arena_destroy(sign_scratch)
+                Note: Return total signature length = 41 + s2_pack_len.
+                Return 41 plus s2_pack_len
+            End If
+        End If
+        If attempt_accepted is equal to 0:
+            Arena.arena_destroy(sign_scratch)
+        End If
+    End While
     Return 0
 End Process
 

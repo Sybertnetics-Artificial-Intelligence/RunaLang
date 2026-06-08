@@ -1,0 +1,732 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FALCON-FFS : Fast Fourier Sampling on the LDL tree
+==============================================================================
+
+Per Falcon spec section 3.9 (Sign), the trapdoor sampler walks the LDL
+tree top-down sampling a pair of polynomials (z1, z2) over Z[X]/(X^n+1)
+that constitute the closest lattice point to a target (t0, t1).  The
+result is the Falcon signature (s1, s2).
+
+Algorithm outline (Falcon spec Algorithm 11):
+  ffSample(t, tree):
+    if tree is a leaf:
+      return one integer sample from D_{Z, t, sigma_leaf}
+    let (t0, t1) be the splitfft of t into K_{n/2} pair
+    z1 = ffSample(t1, tree.right)
+    t0' = t0 + (t1 - z1) * tree.L01
+    z0 = ffSample(t0', tree.left)
+    return mergefft(z0, z1)
+
+The "merge" of (z0, z1) is the inverse of splitfft: it reconstructs the
+length-n FFT polynomial z(X) = z0(X^2) + X * z1(X^2).
+
+The Falcon spec then translates the recursion to operate on a pair
+(t0, t1) where t0 corresponds to the row 0 of the basis and t1 to row 1.
+The top-level entry of the sampler computes
+  t1 = -c * (1/f) in FFT
+  t0 = -t1 * (F/-q) ... etc per spec
+and then ffSample yields (z0, z1) and finally the integer signature
+(s1, s2) = (c - z1 * h - z0, z0 - z1 * something).
+
+This module exposes ffs_sample(arena, shake_ctx, tree, c_int, n, s1_out,
+s2_out) which encapsulates the whole signing-stage sampler: it consumes
+the LDL tree built by ldl_build_tree, the SHAKE-256 PRNG state seeded
+by the caller, and the integer hash-to-point target c.  It produces
+signed-integer polynomials s1 and s2 such that ||s1||^2 + ||s2||^2 is
+expected to fall below the Falcon signature norm bound.
+
+This module depends on:
+  falcon_fp.runa       hardware Float64 arithmetic
+  falcon_fft.runa      complex FFT and pointwise ops
+  falcon_sampler.runa  signed Gaussian sampler over Z
+  falcon_ldl.runa      LDL tree accessors
+
+Security_Scope (module-wide):
+  All inputs and outputs are SECRET except for the SHAKE-256 PRNG state
+  type and the public dimension n.  The recursion is constant-time in
+  the tree structure; per-leaf sampler iteration counts are data-dependent
+  but bounded per Falcon spec.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/pq/falcon_fp.runa" as FP
+Import "compiler/frontend/import_system/crypto/pq/falcon_fft.runa" as FFT
+Import "compiler/frontend/import_system/crypto/pq/falcon_sampler.runa" as Sampler
+Import "compiler/frontend/import_system/crypto/pq/falcon_ldl.runa" as Ldl
+
+Note:
+==============================================================================
+INTEGER POLYNOMIAL MULTIPLICATION (anti-cyclic, Z[X]/(X^n+1))
+==============================================================================
+Used by ffs_sample to compute the signature components s1, s2 directly in
+the integer ring rather than via FFT extraction. The float-FFT representation
+of the sampler's (z0, z1) output is NOT exactly FFT(z0_int) / FFT(z1_int) at
+realistic Falcon parameter sizes (n >= 512); the merge/recursion accumulates
+sub-ULP discrepancies that vanish on per-axis rounding (so z0_int and z1_int
+recover cleanly) but persist when the FFT-domain values are multiplied by
+f_fft / F_fft and then inverse-transformed. Pornin's reference avoids this
+by computing s1 and s2 in the integer ring once (z0, z1) are sampled. We
+replicate that: schoolbook in 64-bit integers, reduced into int16 with the
+anti-cyclic fold X^n = -1.
+:End Note
+
+Process called "ffs_int_poly_mul_anti_cyclic" takes arena as Integer, a_int as Integer, b_int as Integer, n as Integer, c_int as Integer returns Integer:
+    @Reasoning
+    Compute c = a * b in Z[X]/(X^n + 1) via schoolbook multiplication purely
+    in 64-bit integer arithmetic, with the anti-cyclic fold X^n = -1 applied
+    at the end. Output values written to c_int with int16 truncation.
+    @End Reasoning
+    @Implementation
+    For two polynomials a, b with int16 (signed) coefficients of length n:
+      Step 1: accumulate the unreduced convolution into a length-2n int64
+              scratch buffer: acc[i+j] += a[i] * b[j].
+      Step 2: fold the high half into the low half with negation:
+              c[k] = acc[k] - acc[k + n]
+              (because X^n = -1 in the cyclotomic ring).
+      Step 3: truncate to int16 (sign-preserving low-16-bit wrap) and store.
+    @End Implementation
+    @Performance_Hints
+    O(n^2) schoolbook. Cost dominates inside ffs_sample for large n but the
+    constant is small (single 64-bit multiply and add per iteration) and the
+    diagnostics confirmed FFT-based convolution is mathematically equivalent
+    only when the FFT input is itself a clean integer polynomial, which the
+    sampler's intermediate (z0_full, z1_full) is not at n >= 512.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET key material (f, g, F, G) and SECRET sampler output (z0, z1) on
+    inputs. Loop bounds are public (depend on n only). 64-bit integer
+    multiplications are constant-time on x86_64 and aarch64.
+    @End Security_Scope
+    Let scratch_bytes be 2 multiplied by n multiplied by 8
+    Let acc be Arena.arena_allocate(arena, scratch_bytes)
+    If acc is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(acc, scratch_bytes)
+    Let i be 0
+    While i is less than n:
+        Let a_i be Memory.memory_get_int16(a_int, i multiplied by 2)
+        Let j be 0
+        While j is less than n:
+            Let b_j be Memory.memory_get_int16(b_int, j multiplied by 2)
+            Let k be i plus j
+            Let off be k multiplied by 8
+            Let prev be Memory.memory_get_int64(acc, off)
+            Let new_val be prev plus (a_i multiplied by b_j)
+            Memory.memory_set_int64(acc, off, new_val)
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+    Let kf be 0
+    While kf is less than n:
+        Let lo_off be kf multiplied by 8
+        Let hi_off be (kf plus n) multiplied by 8
+        Let lo_val be Memory.memory_get_int64(acc, lo_off)
+        Let hi_val be Memory.memory_get_int64(acc, hi_off)
+        Let folded be lo_val minus hi_val
+        Memory.memory_set_int16(c_int, kf multiplied by 2, folded)
+        Set kf to kf plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+FFT MERGE (inverse of split)
+==============================================================================
+Inverse of ldl_fft_split: given (fe, fo) over K_{n/2}, reconstructs an
+FFT-domain polynomial over K_n such that f(X) = fe(X^2) + X*fo(X^2)
+in coefficient form.
+
+Formula:
+  f[k]         = fe[k] + zeta_k * fo[k]
+  f[k + n/2]   = fe[k] - zeta_k * fo[k]
+where zeta_k = exp(i * (2k+1) * pi / n).
+:End Note
+
+Process called "ffs_fft_merge" takes arena as Integer, fe as Integer, fo as Integer, n as Integer, out as Integer returns Integer:
+    @Reasoning
+    Merge two K_{n/2} FFT polynomials into a K_n FFT polynomial.
+    Inverse of ffs_fft_split: writes interleaved-pair output slots
+    (2u, 2u+1) using twiddle zeta_a = exp(i*(2*rev_{logn-1}(u)+1)*pi/n).
+    Matches Pornin reference poly_merge_fft (fft.c).
+    @End Reasoning
+    @Implementation
+    Per Falcon spec section 2.3 mergefft.
+      slot_2u   = fe[u] + zeta_a * fo[u]
+      slot_2u+1 = fe[u] - zeta_a * fo[u]
+    @End Implementation
+    @Performance_Hints
+    O(n) with cos/sin per coefficient.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET inputs.
+    @End Security_Scope
+    Let half_n be n shifted right by 1
+    Let n_f be FP.fp_from_int(n)
+    Let pi_v be FP.fp_pi()
+    Let logn_minus_1 be 0
+    Let tmp_n be half_n
+    While tmp_n is greater than 1:
+        Set logn_minus_1 to logn_minus_1 plus 1
+        Set tmp_n to tmp_n shifted right by 1
+    End While
+    Let u be 0
+    While u is less than half_n:
+        Let er be FFT.fft_get_real(fe, u)
+        Let ei be FFT.fft_get_imag(fe, u)
+        Let or_v be FFT.fft_get_real(fo, u)
+        Let oi be FFT.fft_get_imag(fo, u)
+
+        Let a_idx be proc FFT.fft_bit_reverse with u, logn_minus_1
+        Let two_a_plus_1 be 2 multiplied by a_idx plus 1
+        Let ta_f be FP.fp_from_int(two_a_plus_1)
+        Let prod1 be FP.fp_mul(ta_f, pi_v)
+        Let theta be FP.fp_div(prod1, n_f)
+        Let cr be FP.fp_cos(theta)
+        Let ci be FP.fp_sin(theta)
+
+        Note: zeta * fo = (cr + ci*i)(or + oi*i) = (cr*or - ci*oi) + (cr*oi + ci*or)i
+        Let m1 be FP.fp_mul(cr, or_v)
+        Let m2 be FP.fp_mul(ci, oi)
+        Let z_o_r be FP.fp_sub(m1, m2)
+        Let m3 be FP.fp_mul(cr, oi)
+        Let m4 be FP.fp_mul(ci, or_v)
+        Let z_o_i be FP.fp_add(m3, m4)
+
+        Let top_r be FP.fp_add(er, z_o_r)
+        Let top_i be FP.fp_add(ei, z_o_i)
+        Let bot_r be FP.fp_sub(er, z_o_r)
+        Let bot_i be FP.fp_sub(ei, z_o_i)
+
+        Let slot_a be u multiplied by 2
+        Let slot_b be slot_a plus 1
+        FFT.fft_set_real(out, slot_a, top_r)
+        FFT.fft_set_imag(out, slot_a, top_i)
+        FFT.fft_set_real(out, slot_b, bot_r)
+        FFT.fft_set_imag(out, slot_b, bot_i)
+        Set u to u plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+FFLDL SPLIT (forward, identical to ldl_fft_split)
+==============================================================================
+Replicated here to keep ffs independent of the LDL internal naming.
+:End Note
+
+Process called "ffs_fft_split" takes arena as Integer, src as Integer, n as Integer, fe as Integer, fo as Integer returns Integer:
+    @Reasoning
+    FFT split into K_{n/2} pair. Bit-reversed-output-aware pairing:
+    pair (slot 2u, slot 2u+1), use twiddle exp(-i*(2*rev_{logn-1}(u)+1)*pi/n).
+    Matches Pornin reference poly_split_fft (fft.c).
+    @End Reasoning
+    @Implementation
+    Per Falcon spec section 2.3 splitfft (matches ldl_fft_split).
+    @End Implementation
+    @Performance_Hints
+    O(n) with cos/sin per coefficient.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let half_n be n shifted right by 1
+    Let two_v be FP.fp_from_int(2)
+    Let n_f be FP.fp_from_int(n)
+    Let pi_v be FP.fp_pi()
+    Let logn_minus_1 be 0
+    Let tmp_n be half_n
+    While tmp_n is greater than 1:
+        Set logn_minus_1 to logn_minus_1 plus 1
+        Set tmp_n to tmp_n shifted right by 1
+    End While
+    Let u be 0
+    While u is less than half_n:
+        Let slot_a be u multiplied by 2
+        Let slot_b be slot_a plus 1
+        Let ar be FFT.fft_get_real(src, slot_a)
+        Let ai be FFT.fft_get_imag(src, slot_a)
+        Let br be FFT.fft_get_real(src, slot_b)
+        Let bi be FFT.fft_get_imag(src, slot_b)
+
+        Let sr be FP.fp_add(ar, br)
+        Let si be FP.fp_add(ai, bi)
+        Let dr be FP.fp_sub(ar, br)
+        Let di be FP.fp_sub(ai, bi)
+        Let fe_r be FP.fp_div(sr, two_v)
+        Let fe_i be FP.fp_div(si, two_v)
+        Let dr_half be FP.fp_div(dr, two_v)
+        Let di_half be FP.fp_div(di, two_v)
+
+        Let a_idx be proc FFT.fft_bit_reverse with u, logn_minus_1
+        Let two_a_plus_1 be 2 multiplied by a_idx plus 1
+        Let ta_f be FP.fp_from_int(two_a_plus_1)
+        Let prod1 be FP.fp_mul(ta_f, pi_v)
+        Let theta be FP.fp_div(prod1, n_f)
+        Let cr be FP.fp_cos(theta)
+        Let ci_neg be FP.fp_sin(theta)
+        Let ci be FP.fp_neg(ci_neg)
+
+        Let m1 be FP.fp_mul(dr_half, cr)
+        Let m2 be FP.fp_mul(di_half, ci)
+        Let fo_r be FP.fp_sub(m1, m2)
+        Let m3 be FP.fp_mul(dr_half, ci)
+        Let m4 be FP.fp_mul(di_half, cr)
+        Let fo_i be FP.fp_add(m3, m4)
+
+        FFT.fft_set_real(fe, u, fe_r)
+        FFT.fft_set_imag(fe, u, fe_i)
+        FFT.fft_set_real(fo, u, fo_r)
+        FFT.fft_set_imag(fo, u, fo_i)
+
+        Set u to u plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+INTERNAL ffSampling RECURSION (Pornin two-polynomial form)
+==============================================================================
+Per Falcon spec Algorithm 11 / Pornin reference ffSampling_fft (sign.c).
+The recursion operates on an explicit polynomial PAIR (t0, t1) over K_n
+and writes the sampled pair (z0, z1) into caller-supplied buffers.  The
+at-node l10 is read from the tree at size n.  At each internal level
+the pair is multiplied through L10 in K_n (full-size FFT) and the
+split/merge ferries the new pair down/up the recursion.
+:End Note
+
+Process called "ffs_recursive" takes arena as Integer, shake_ctx as Integer, tree as Integer, t0_fft as Integer, t1_fft as Integer, n as Integer, orig_n as Integer, z0_fft as Integer, z1_fft as Integer returns Integer:
+    @Reasoning
+    Two-polynomial ffSampling per Pornin reference (sign.c::ffSampling_fft).
+    Receives (t0, t1) at size n and writes (z0, z1) at size n.  Walks
+    the LDL tree top-down doing K_n full-size arithmetic at each node;
+    this is structurally NOT equivalent to a single-polynomial recursion
+    that does K_{n/2} arithmetic on split components, because pointwise
+    multiplication in K_n does not commute with the K_{n/2} cyclotomic
+    multiplication law applied to a split pair.
+    @End Reasoning
+    @Implementation
+    Leaf case (tree.is_leaf, n == 1):
+      - Stored value is isigma = sqrt(d00[0]) * (1/sigma_global) per
+        Pornin's ffLDL_binary_normalize.
+      - ccs = sigma_min(orig_n) * isigma  -- matches spc->ccs in Pornin.
+      - Sample z0[0] = samplerz(t0[0], isigma, ccs)
+      - Sample z1[0] = samplerz(t1[0], isigma, ccs)
+      Both centers share the same leaf sigma because the leaf is reached
+      by a unique recursion path and the stored sigma is that path's
+      d00[0] (after normalization).
+
+    Internal case (n >= 2):
+      half_n = n / 2
+      L10 = tree.L10  (full-size n complex polynomial stored at this node)
+
+      Step 1: Split t1 into (t1_e, t1_o) over K_{n/2}.
+      Step 2: Recurse with (t1_e, t1_o, n/2, tree.right) producing
+              (z1_inner_e, z1_inner_o) at size n/2.
+      Step 3: Merge (z1_inner_e, z1_inner_o) -> z1_fft at size n.
+      Step 4: Compute tmp = (t1 - z1) * L10 in K_n (full-size pointwise
+              FFT multiplication after a K_n subtraction).
+      Step 5: t0_new = t0 + tmp (size n).
+      Step 6: Split t0_new into (t0n_e, t0n_o) over K_{n/2}.
+      Step 7: Recurse with (t0n_e, t0n_o, n/2, tree.left) producing
+              (z0_inner_e, z0_inner_o) at size n/2.
+      Step 8: Merge -> z0_fft at size n.
+
+    All intermediate allocations come from the caller-supplied arena.
+    @End Implementation
+    @Performance_Hints
+    O(n log n) total work over the recursion.  Each level does O(n)
+    K_n arithmetic plus two O(n) splits and two O(n) merges.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET centers; sampler iteration counts are data-dependent.
+    @End Security_Scope
+    Let is_leaf be proc ldl_tree_is_leaf from Ldl with tree
+    If is_leaf is equal to 1:
+        Let mu0 be FFT.fft_get_real(t0_fft, 0)
+        Let mu1 be FFT.fft_get_real(t1_fft, 0)
+        Let isigma be proc ldl_tree_sigma from Ldl with tree
+        Let zero_v be FP.fp_zero()
+        Let sigma_min_v be proc ldl_sigma_min_for_n from Ldl with orig_n
+        Let ccs be FP.fp_mul(sigma_min_v, isigma)
+        Let z0_int be proc sampler_z from Sampler with arena, shake_ctx, mu0, isigma, ccs
+        Let z1_int be proc sampler_z from Sampler with arena, shake_ctx, mu1, isigma, ccs
+        Let z0_f be FP.fp_from_int(z0_int)
+        Let z1_f be FP.fp_from_int(z1_int)
+        FFT.fft_set_real(z0_fft, 0, z0_f)
+        FFT.fft_set_imag(z0_fft, 0, zero_v)
+        FFT.fft_set_real(z1_fft, 0, z1_f)
+        FFT.fft_set_imag(z1_fft, 0, zero_v)
+        Return 1
+    End If
+
+    Let half_n be n shifted right by 1
+    Let half_bytes be half_n multiplied by 16
+    Let full_bytes be n multiplied by 16
+
+    Note: Step 1: split t1 over K_{n/2}.
+    Let t1_e be Arena.arena_allocate(arena, half_bytes)
+    Let t1_o be Arena.arena_allocate(arena, half_bytes)
+    If t1_o is equal to 0:
+        Return 0
+    End If
+    proc ffs_fft_split with arena, t1_fft, n, t1_e, t1_o
+
+    Note: Step 2: recurse on (t1_e, t1_o) with tree.right at n/2.
+    Let z1_inner_e be Arena.arena_allocate(arena, half_bytes)
+    Let z1_inner_o be Arena.arena_allocate(arena, half_bytes)
+    If z1_inner_o is equal to 0:
+        Return 0
+    End If
+    Let right_tree be proc ldl_tree_right from Ldl with tree
+    Let rec1 be proc ffs_recursive with arena, shake_ctx, right_tree, t1_e, t1_o, half_n, orig_n, z1_inner_e, z1_inner_o
+    If rec1 is equal to 0:
+        Return 0
+    End If
+
+    Note: Step 3: merge (z1_inner_e, z1_inner_o) -> z1_fft at size n.
+    proc ffs_fft_merge with arena, z1_inner_e, z1_inner_o, n, z1_fft
+
+    Note: Step 4: tmp = (t1 - z1) * L10 in K_n (size n pointwise).
+    Let L10 be proc ldl_tree_L01 from Ldl with tree
+    Let tmp_buf be Arena.arena_allocate(arena, full_bytes)
+    If tmp_buf is equal to 0:
+        Return 0
+    End If
+    FFT.fft_sub_pointwise(t1_fft, z1_fft, tmp_buf, n)
+    Note: pointwise complex multiplication tmp_buf = tmp_buf * L10
+    Let mul_buf be Arena.arena_allocate(arena, full_bytes)
+    If mul_buf is equal to 0:
+        Return 0
+    End If
+    FFT.fft_mul_pointwise(tmp_buf, L10, mul_buf, n)
+
+    Note: Step 5: t0_new = t0 + mul_buf in K_n.
+    Let t0_new be Arena.arena_allocate(arena, full_bytes)
+    If t0_new is equal to 0:
+        Return 0
+    End If
+    FFT.fft_add_pointwise(t0_fft, mul_buf, t0_new, n)
+
+    Note: Step 6: split t0_new over K_{n/2}.
+    Let t0n_e be Arena.arena_allocate(arena, half_bytes)
+    Let t0n_o be Arena.arena_allocate(arena, half_bytes)
+    If t0n_o is equal to 0:
+        Return 0
+    End If
+    proc ffs_fft_split with arena, t0_new, n, t0n_e, t0n_o
+
+    Note: Step 7: recurse on (t0n_e, t0n_o) with tree.left at n/2.
+    Let z0_inner_e be Arena.arena_allocate(arena, half_bytes)
+    Let z0_inner_o be Arena.arena_allocate(arena, half_bytes)
+    If z0_inner_o is equal to 0:
+        Return 0
+    End If
+    Let left_tree be proc ldl_tree_left from Ldl with tree
+    Let rec0 be proc ffs_recursive with arena, shake_ctx, left_tree, t0n_e, t0n_o, half_n, orig_n, z0_inner_e, z0_inner_o
+    If rec0 is equal to 0:
+        Return 0
+    End If
+
+    Note: Step 8: merge -> z0_fft at size n.
+    proc ffs_fft_merge with arena, z0_inner_e, z0_inner_o, n, z0_fft
+    Return 1
+End Process
+
+Note:
+==============================================================================
+PUBLIC ENTRY POINT : ffs_sample
+==============================================================================
+:End Note
+
+Process called "ffs_sample" takes arena as Integer, shake_ctx as Integer, tree as Integer, c_int as Integer, f_int as Integer, g_int as Integer, F_int as Integer, G_int as Integer, n as Integer, s1_out as Integer, s2_out as Integer returns Integer:
+    @Reasoning
+    Falcon Algorithm 16 (Sign) top-level sampler.  Given the hash-to-point
+    target c and the secret key (f, g, F, G), produces (s1, s2) integer
+    polynomials such that
+        s1 + s2 * h == c (mod q)
+        ||(s1, s2)||^2 <= sig_norm_bound
+    where h = g * f^{-1} (mod q) is the public key.
+    @End Reasoning
+    @Implementation
+    Per Falcon round-3 spec section 3.9 + Pornin reference do_sign_dyn.
+
+    Geometry:
+      Basis B = [[g, -f], [G, -F]] (rows are basis vectors).
+      Lattice L = { z * B : z in Z^{2n} }.
+      For target (c, 0) in R^{2n}, we want a near lattice point
+        (z0*g + z1*G,  -z0*f - z1*F)  in L.
+      Signature components:
+        s1 = c - (z0*g + z1*G)
+        s2 = z0*f + z1*F
+      Verify identity:
+        s1 + s2 * h = c - z0*g - z1*G + (z0*f + z1*F) * (g/f)
+                    = c + z1 * (F*g - G*f) / f
+                    = c + z1 * (-q) / f
+                    = c (mod q)
+        (using fG - gF = q so Fg - Gf = -q).
+
+    Algorithm steps:
+      1. Build FFT-domain images of c, f, g, F, G.
+      2. Compute basis-coord targets:
+           t1[i] = c_fft[i] * f_fft[i] / q       (in FFT)
+           t0[i] = -c_fft[i] * F_fft[i] / q      (in FFT)
+      3. Run 2x2 ffSampling at the top of the LDL tree to obtain
+         (z0, z1) lattice-basis coords in FFT domain.
+      4. Inverse FFT (z0_full, z1_full) and round to int to obtain the
+         clean integer polynomials (z0_int, z1_int). This step is the
+         only consumer of float precision in the entire signature path:
+         per-coefficient rounding tolerates sub-ULP error and recovers
+         the unique integer polynomial the sampler intends to produce.
+      5. Compute s1, s2 directly via integer schoolbook in Z[X]/(X^n+1):
+           s2 = z0_int * f + z1_int * F
+           s1 = centered(c) - (z0_int * g + z1_int * G)
+         This avoids the well-known issue that pointwise multiplication
+         z0_full * f_fft + z1_full * F_fft followed by inverse FFT does
+         NOT round to the same integer polynomial: the merge/recursion
+         accumulates sub-ULP discrepancies in (z0_full, z1_full) that
+         do not satisfy FFT(integer) form exactly, even though they
+         round to the right integer polynomials. The error amplifies
+         under FFT-domain multiplication into hundreds of units of
+         per-coefficient error. Pornin's reference uses the integer
+         pathway here; we follow that.
+    @End Implementation
+    @Performance_Hints
+    O(n log n) for the FFT pipeline plus O(n^2) for the two pairs of
+    integer schoolbook multiplies. At Falcon parameter sizes the n^2
+    cost is small in absolute terms (n in {512, 1024}, single 64-bit
+    mul-add per inner iteration) and is dominated by the LDL recursion
+    cost.
+    @End Performance_Hints
+    @Security_Scope
+    All inputs SECRET; sampler iteration counts data-dependent per
+    Falcon spec.
+    @End Security_Scope
+    Let bytes be n multiplied by 16
+    Let half_n be n shifted right by 1
+    Let half_bytes be half_n multiplied by 16
+    Let q be 12289
+
+    Note: Step 1: FFT-domain images.
+    Let c_fft be Arena.arena_allocate(arena, bytes)
+    Let f_fft be Arena.arena_allocate(arena, bytes)
+    Let g_fft be Arena.arena_allocate(arena, bytes)
+    Let F_fft be Arena.arena_allocate(arena, bytes)
+    Let G_fft be Arena.arena_allocate(arena, bytes)
+    If G_fft is equal to 0:
+        Return 0
+    End If
+    FFT.fft_load_from_int16_modq(c_int, c_fft, n)
+    FFT.fft_load_from_int16_signed(f_int, f_fft, n)
+    FFT.fft_load_from_int16_signed(g_int, g_fft, n)
+    FFT.fft_load_from_int16_signed(F_int, F_fft, n)
+    FFT.fft_load_from_int16_signed(G_int, G_fft, n)
+    FFT.fft_forward(arena, c_fft, n)
+    FFT.fft_forward(arena, f_fft, n)
+    FFT.fft_forward(arena, g_fft, n)
+    FFT.fft_forward(arena, F_fft, n)
+    FFT.fft_forward(arena, G_fft, n)
+
+    Note: Step 2: basis-coord targets in FFT.
+    Note:   t1[i] =  c_fft[i] * f_fft[i] / q
+    Note:   t0[i] = -c_fft[i] * F_fft[i] / q
+    Let t_full be Arena.arena_allocate(arena, bytes)
+    Let t1_full be Arena.arena_allocate(arena, bytes)
+    If t1_full is equal to 0:
+        Return 0
+    End If
+    Let q_f be FP.fp_from_int(q)
+    Let inv_q be FP.fp_div(FP.fp_one(), q_f)
+    Let neg_inv_q be FP.fp_neg(inv_q)
+    Let ti be 0
+    While ti is less than n:
+        Let cr be FFT.fft_get_real(c_fft, ti)
+        Let ci be FFT.fft_get_imag(c_fft, ti)
+        Let fr be FFT.fft_get_real(f_fft, ti)
+        Let fi be FFT.fft_get_imag(f_fft, ti)
+        Let Fr be FFT.fft_get_real(F_fft, ti)
+        Let Fi be FFT.fft_get_imag(F_fft, ti)
+
+        Note: c * f / q
+        Let a1 be FP.fp_mul(cr, fr)
+        Let a2 be FP.fp_mul(ci, fi)
+        Let cf_r be FP.fp_sub(a1, a2)
+        Let a3 be FP.fp_mul(cr, fi)
+        Let a4 be FP.fp_mul(ci, fr)
+        Let cf_i be FP.fp_add(a3, a4)
+        Let t1r be FP.fp_mul(cf_r, inv_q)
+        Let t1i be FP.fp_mul(cf_i, inv_q)
+        FFT.fft_set_real(t1_full, ti, t1r)
+        FFT.fft_set_imag(t1_full, ti, t1i)
+
+        Note: -c * F / q
+        Let b1 be FP.fp_mul(cr, Fr)
+        Let b2 be FP.fp_mul(ci, Fi)
+        Let cF_r be FP.fp_sub(b1, b2)
+        Let b3 be FP.fp_mul(cr, Fi)
+        Let b4 be FP.fp_mul(ci, Fr)
+        Let cF_i be FP.fp_add(b3, b4)
+        Let t0r be FP.fp_mul(cF_r, neg_inv_q)
+        Let t0i be FP.fp_mul(cF_i, neg_inv_q)
+        FFT.fft_set_real(t_full, ti, t0r)
+        FFT.fft_set_imag(t_full, ti, t0i)
+        Set ti to ti plus 1
+    End While
+
+    Note: Step 3: top-level 2x2 ffSampling.  Per Pornin sign.c::ffSampling_fft
+    Note: at logn >= 3, the entry point splits t1 over K_{n/2}, recurses on
+    Note: the (t1_e, t1_o) pair with tree.right at size n/2, merges back to
+    Note: z1 of size n, then applies the L10 update in K_n, splits t0' and
+    Note: recurses on the (t0'_e, t0'_o) pair with tree.left.
+    Let z0_full be Arena.arena_allocate(arena, bytes)
+    Let z1_full be Arena.arena_allocate(arena, bytes)
+    If z1_full is equal to 0:
+        Return 0
+    End If
+
+    Note: Split t1_full over K_{n/2}.
+    Let t1_e be Arena.arena_allocate(arena, half_bytes)
+    Let t1_o be Arena.arena_allocate(arena, half_bytes)
+    If t1_o is equal to 0:
+        Return 0
+    End If
+    proc ffs_fft_split with arena, t1_full, n, t1_e, t1_o
+
+    Note: Recurse on (t1_e, t1_o) with tree.right at n/2.
+    Let z1_inner_e be Arena.arena_allocate(arena, half_bytes)
+    Let z1_inner_o be Arena.arena_allocate(arena, half_bytes)
+    If z1_inner_o is equal to 0:
+        Return 0
+    End If
+    Let right_tree be proc ldl_tree_right from Ldl with tree
+    Let rec1 be proc ffs_recursive with arena, shake_ctx, right_tree, t1_e, t1_o, half_n, n, z1_inner_e, z1_inner_o
+    If rec1 is equal to 0:
+        Return 0
+    End If
+
+    Note: Merge (z1_inner_e, z1_inner_o) -> z1_full at size n.
+    proc ffs_fft_merge with arena, z1_inner_e, z1_inner_o, n, z1_full
+
+    Note: Compute mul_buf = (t1_full - z1_full) * L01_top in K_n.
+    Let L01 be proc ldl_tree_L01 from Ldl with tree
+    Let tmp_buf be Arena.arena_allocate(arena, bytes)
+    Let mul_buf be Arena.arena_allocate(arena, bytes)
+    Let t0_prime be Arena.arena_allocate(arena, bytes)
+    If t0_prime is equal to 0:
+        Return 0
+    End If
+    FFT.fft_sub_pointwise(t1_full, z1_full, tmp_buf, n)
+    FFT.fft_mul_pointwise(tmp_buf, L01, mul_buf, n)
+    FFT.fft_add_pointwise(t_full, mul_buf, t0_prime, n)
+
+    Note: Split t0_prime over K_{n/2}.
+    Let t0p_e be Arena.arena_allocate(arena, half_bytes)
+    Let t0p_o be Arena.arena_allocate(arena, half_bytes)
+    If t0p_o is equal to 0:
+        Return 0
+    End If
+    proc ffs_fft_split with arena, t0_prime, n, t0p_e, t0p_o
+
+    Note: Recurse on (t0p_e, t0p_o) with tree.left at n/2.
+    Let z0_inner_e be Arena.arena_allocate(arena, half_bytes)
+    Let z0_inner_o be Arena.arena_allocate(arena, half_bytes)
+    If z0_inner_o is equal to 0:
+        Return 0
+    End If
+    Let left_tree be proc ldl_tree_left from Ldl with tree
+    Let rec0 be proc ffs_recursive with arena, shake_ctx, left_tree, t0p_e, t0p_o, half_n, n, z0_inner_e, z0_inner_o
+    If rec0 is equal to 0:
+        Return 0
+    End If
+
+    Note: Merge -> z0_full at size n.
+    proc ffs_fft_merge with arena, z0_inner_e, z0_inner_o, n, z0_full
+
+    Note: Step 4: extract z0 and z1 in integer (coefficient-domain) form.
+    Note: Pornin's Falcon reference computes s1, s2 in the integer ring
+    Note: (not in FFT domain) because the FFT-domain values (z0_full,
+    Note: z1_full) produced by the merge recursion are NOT exactly
+    Note: FFT(z0_int) / FFT(z1_int) -- they differ by sub-ULP amounts
+    Note: that vanish on inverse-FFT-and-round (so z0_int and z1_int
+    Note: are clean integer polynomials) but accumulate into hundreds-
+    Note: of-units error when used inside another FFT-domain product.
+    Note: We follow the integer path: inverse-FFT z0_full and z1_full,
+    Note: round to int, then run integer schoolbook convolution.
+    Let int_bytes be n multiplied by 2
+    Let z0_int be Arena.arena_allocate(arena, int_bytes)
+    Let z1_int be Arena.arena_allocate(arena, int_bytes)
+    If z1_int is equal to 0:
+        Return 0
+    End If
+    FFT.fft_inverse(arena, z0_full, n)
+    FFT.fft_inverse(arena, z1_full, n)
+    FFT.fft_extract_real_round(z0_full, z0_int, n)
+    FFT.fft_extract_real_round(z1_full, z1_int, n)
+
+    Note: Step 5: compute s1, s2 via integer schoolbook (Z[X]/(X^n+1)).
+    Note: s2 = z0_int * f + z1_int * F
+    Note: s1 = c - (z0_int * g + z1_int * G)
+    Let s1_part_a be Arena.arena_allocate(arena, int_bytes)
+    Let s1_part_b be Arena.arena_allocate(arena, int_bytes)
+    Let s2_part_a be Arena.arena_allocate(arena, int_bytes)
+    Let s2_part_b be Arena.arena_allocate(arena, int_bytes)
+    If s2_part_b is equal to 0:
+        Return 0
+    End If
+    proc ffs_int_poly_mul_anti_cyclic with arena, z0_int, f_int, n, s2_part_a
+    proc ffs_int_poly_mul_anti_cyclic with arena, z1_int, F_int, n, s2_part_b
+    proc ffs_int_poly_mul_anti_cyclic with arena, z0_int, g_int, n, s1_part_a
+    proc ffs_int_poly_mul_anti_cyclic with arena, z1_int, G_int, n, s1_part_b
+    Note: c was hashed-to-point as raw values in [0, q-1]. Pornin centers
+    Note: c into [-q/2, q/2] before subtracting (z0*g + z1*G) so that the
+    Note: integer polynomial s1 stays small. Replicate that centering.
+    Let outi be 0
+    Let q_mod be 12289
+    Let half_q be 6144
+    While outi is less than n:
+        Let off_o be outi multiplied by 2
+        Let s2a be Memory.memory_get_int16(s2_part_a, off_o)
+        Let s2b be Memory.memory_get_int16(s2_part_b, off_o)
+        Let s2_sum be s2a plus s2b
+        Memory.memory_set_int16(s2_out, off_o, s2_sum)
+        Let cv_raw be Memory.memory_get_int16(c_int, off_o)
+        Let cv be cv_raw
+        If cv is greater than half_q:
+            Set cv to cv minus q_mod
+        End If
+        Let s1a be Memory.memory_get_int16(s1_part_a, off_o)
+        Let s1b be Memory.memory_get_int16(s1_part_b, off_o)
+        Let s1_combined be cv minus s1a minus s1b
+        Memory.memory_set_int16(s1_out, off_o, s1_combined)
+        Set outi to outi plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+END falcon_ffs
+==============================================================================
+:End Note

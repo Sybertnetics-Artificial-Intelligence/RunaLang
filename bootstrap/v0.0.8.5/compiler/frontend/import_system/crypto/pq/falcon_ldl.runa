@@ -1,0 +1,1062 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FALCON-LDL : LDL decomposition tree for the Falcon trapdoor sampler
+==============================================================================
+
+Per Falcon spec section 3.8.3 ("ffLDL Tree"), the secret-key trapdoor
+basis B = [[g, -f], [G, -F]] generates a Gram matrix
+
+    Gtilde = B * B^H = [[ |g|^2 + |G|^2 ,  -(g*f_bar + G*F_bar) ],
+                       [ -(g_bar*f + G_bar*F), |f|^2 + |F|^2 ]]
+
+in the cyclotomic FFT domain.  Its LDL decomposition Gtilde = L * D * L^H
+with L unit-lower-triangular and D diagonal is unique and is the entry
+point for the Fast Fourier Sampler:
+
+  L = [[1,    0],
+       [L10,  1]]
+
+  D = diag(D0, D1)
+
+where
+  D0   = Gtilde[0,0]
+  L10  = Gtilde[1,0] / D0
+  D1   = Gtilde[1,1] - L10 * conj(L10) * D0
+
+The Falcon FFS recurses on the diagonal entries D0 and D1: each is split
+into half-size cyclotomic representations and the LDL decomposition is
+applied again at the smaller ring.  At the leaves (n = 1) the tree stores
+the standard deviation sigma = sqrt(D_leaf) which the integer Gaussian
+sampler uses directly.
+
+Tree node layout in memory (allocated per-node from the arena):
+  Offset  0:   pointer to L10 FFT buffer (16*n bytes of complex Float64)
+               -- only present for internal nodes (n >= 2)
+  Offset  8:   pointer to D0 FFT buffer (16*n_half bytes), real coefficients
+               -- pre-split into the half-size domain
+  Offset 16:   pointer to D1 FFT buffer (16*n_half bytes), real coefficients
+  Offset 24:   pointer to left subtree (LDL tree on D0 at size n_half)
+  Offset 32:   pointer to right subtree (LDL tree on D1 at size n_half)
+  Offset 40:   the n associated with this node, stored as Integer (8 bytes)
+  Offset 48:   leaf-flag (1 if this is the n=1 leaf, else 0)
+  Offset 56:   leaf-only: sigma value (Float64) for the integer sampler
+
+Total node header size: 64 bytes plus the variable-length FFT buffers.
+
+This module depends on falcon_fft.runa (forward/inverse FFT, pointwise
+ops), falcon_fp.runa (Float64 arithmetic), and the standard memory/arena
+primitives.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/pq/falcon_fp.runa" as FP
+Import "compiler/frontend/import_system/crypto/pq/falcon_fft.runa" as FFT
+
+Note:
+==============================================================================
+Constants for the Falcon-spec sigma parameters used at leaves
+==============================================================================
+sigma_min is encoded here as a Float64 derived from Falcon's published
+constants.  Falcon-512 uses sigma_min = 1.2778, Falcon-1024 uses
+sigma_min = 1.298.  We expose level-dispatched accessors.
+:End Note
+
+Process called "ldl_sigma_min_512" returns Float:
+    @Reasoning
+    Returns the Falcon-512 sigma_min as IEEE 754 binary64 (Pornin
+    reference fpr_sigma_min[9]).
+    @End Reasoning
+    @Implementation
+    Bit pattern 4608433670533905013 = 0x3FF47201BF1F7A75 decodes to
+    1.2778336969128337 (decimal) -- the per-logn smoothing-parameter
+    based sigma_min from the Falcon round-3 specification at logn=9.
+    This is the exact constant from Pornin's reference fpr.h::fpr_sigma_min[9].
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 4608433670533905013
+End Process
+
+Process called "ldl_sigma_min_1024" returns Float:
+    @Reasoning
+    Returns the Falcon-1024 sigma_min as IEEE 754 binary64 (Pornin
+    reference fpr_sigma_min[10]).
+    @End Reasoning
+    @Implementation
+    Bit pattern 4608525754002622308 = 0x3FF4C5C19990C764 decodes to
+    1.298280334344292 (decimal) -- the per-logn sigma_min from the
+    Falcon round-3 specification at logn=10.  This is the exact constant
+    from Pornin's reference fpr.h::fpr_sigma_min[10].
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 4608525754002622308
+End Process
+
+Process called "ldl_sigma_min_for_n" takes n as Integer returns Float:
+    @Reasoning
+    Dispatches between Falcon-512 and Falcon-1024 sigma_min.
+    @End Reasoning
+    @Implementation
+    n=512 -> Falcon-512 constant, n=1024 -> Falcon-1024 constant.
+    For intermediate tree levels (n < 512) the Falcon spec uses the
+    same sigma_min as the top level since the recursion preserves
+    the smoothing parameter bound.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If n is greater than or equal to 1024:
+        Return proc ldl_sigma_min_1024
+    End If
+    Return proc ldl_sigma_min_512
+End Process
+
+Note:
+==============================================================================
+GLOBAL TRAPDOOR SIGMA (fpr_inv_sigma[logn] in Pornin reference)
+==============================================================================
+The Falcon spec uses a global trapdoor sigma (sigma_global) that drives
+the per-leaf normalization.  Each leaf stores the isigma value
+   isigma_leaf = sqrt(D_leaf[0]) / sigma_global
+which the integer sampler consumes directly as 1/sigma_effective.  The
+sigma_global value for Falcon-N is the same one used in the reference
+constant table fpr_inv_sigma[logn], decoded from the published bit
+patterns:
+   logn=9 (n=512)  : bit pattern 4573606369665796042, value ~0.006033669668
+                     (1/sigma_global ~ 165.7366)
+   logn=10 (n=1024): bit pattern 4573496814039276259, value ~0.005938645310
+                     (1/sigma_global ~ 168.3886)
+We expose the value of 1/sigma_global as a Float since that is the form
+required by the leaf normalization (sigma_leaf_stored = sqrt(D) * inv_sigma_global).
+:End Note
+
+Process called "ldl_inv_sigma_global_512" returns Float:
+    @Reasoning
+    Returns 1/sigma_global for Falcon-512 as IEEE 754 binary64.
+    @End Reasoning
+    @Implementation
+    Bit pattern 4573606369665796042 from Pornin reference fpr_inv_sigma[9].
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 4573606369665796042
+End Process
+
+Process called "ldl_inv_sigma_global_1024" returns Float:
+    @Reasoning
+    Returns 1/sigma_global for Falcon-1024 as IEEE 754 binary64.
+    @End Reasoning
+    @Implementation
+    Bit pattern 4573496814039276259 from Pornin reference fpr_inv_sigma[10].
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 4573496814039276259
+End Process
+
+Process called "ldl_inv_sigma_global_for_n" takes n as Integer returns Float:
+    @Reasoning
+    Dispatches 1/sigma_global between Falcon-512 and Falcon-1024.
+    @End Reasoning
+    @Implementation
+    n >= 1024 -> Falcon-1024 constant, otherwise Falcon-512 constant.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If n is greater than or equal to 1024:
+        Return proc ldl_inv_sigma_global_1024
+    End If
+    Return proc ldl_inv_sigma_global_512
+End Process
+
+Note:
+==============================================================================
+TREE NODE FIELD ACCESSORS
+==============================================================================
+:End Note
+
+Process called "ldl_tree_L01" takes tree as Integer returns Integer:
+    @Reasoning
+    Pointer to the L10 FFT buffer (offset 0).
+    @End Reasoning
+    @Implementation
+    Single qword load.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Return Memory.memory_get_pointer(tree, 0)
+End Process
+
+Process called "ldl_tree_D0" takes tree as Integer returns Integer:
+    @Reasoning
+    Pointer to the D0 FFT buffer.
+    @End Reasoning
+    @Implementation
+    Qword load at offset 8.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Return Memory.memory_get_pointer(tree, 8)
+End Process
+
+Process called "ldl_tree_D1" takes tree as Integer returns Integer:
+    @Reasoning
+    Pointer to the D1 FFT buffer.
+    @End Reasoning
+    @Implementation
+    Qword load at offset 16.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Return Memory.memory_get_pointer(tree, 16)
+End Process
+
+Process called "ldl_tree_left" takes tree as Integer returns Integer:
+    @Reasoning
+    Pointer to the left child subtree.
+    @End Reasoning
+    @Implementation
+    Qword load at offset 24.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Return Memory.memory_get_pointer(tree, 24)
+End Process
+
+Process called "ldl_tree_right" takes tree as Integer returns Integer:
+    @Reasoning
+    Pointer to the right child subtree.
+    @End Reasoning
+    @Implementation
+    Qword load at offset 32.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Return Memory.memory_get_pointer(tree, 32)
+End Process
+
+Process called "ldl_tree_n" takes tree as Integer returns Integer:
+    @Reasoning
+    Returns the ring degree associated with this node.
+    @End Reasoning
+    @Implementation
+    Qword load at offset 40.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Return Memory.memory_get_qword(tree, 40)
+End Process
+
+Process called "ldl_tree_is_leaf" takes tree as Integer returns Integer:
+    @Reasoning
+    1 if this is a sampler leaf, 0 otherwise.
+    @End Reasoning
+    @Implementation
+    Qword load at offset 48.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Return Memory.memory_get_qword(tree, 48)
+End Process
+
+Process called "ldl_tree_sigma" takes tree as Integer returns Float:
+    @Reasoning
+    Leaf-only sigma value.
+    @End Reasoning
+    @Implementation
+    Float64 load at offset 56.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Return Memory.memory_get_int64(tree, 56)
+End Process
+
+Process called "ldl_tree_set_L01" takes tree as Integer, ptr as Integer returns Integer:
+    @Reasoning
+    Set the L10 pointer at offset 0.
+    @End Reasoning
+    @Implementation
+    Qword store.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Memory.memory_set_pointer(tree, 0, ptr)
+    Return 1
+End Process
+
+Process called "ldl_tree_set_D0" takes tree as Integer, ptr as Integer returns Integer:
+    @Reasoning
+    Set the D0 pointer at offset 8.
+    @End Reasoning
+    @Implementation
+    Qword store.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Memory.memory_set_pointer(tree, 8, ptr)
+    Return 1
+End Process
+
+Process called "ldl_tree_set_D1" takes tree as Integer, ptr as Integer returns Integer:
+    @Reasoning
+    Set the D1 pointer at offset 16.
+    @End Reasoning
+    @Implementation
+    Qword store.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Memory.memory_set_pointer(tree, 16, ptr)
+    Return 1
+End Process
+
+Process called "ldl_tree_set_left" takes tree as Integer, ptr as Integer returns Integer:
+    @Reasoning
+    Set the left-subtree pointer at offset 24.
+    @End Reasoning
+    @Implementation
+    Qword store.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Memory.memory_set_pointer(tree, 24, ptr)
+    Return 1
+End Process
+
+Process called "ldl_tree_set_right" takes tree as Integer, ptr as Integer returns Integer:
+    @Reasoning
+    Set the right-subtree pointer at offset 32.
+    @End Reasoning
+    @Implementation
+    Qword store.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Memory.memory_set_pointer(tree, 32, ptr)
+    Return 1
+End Process
+
+Process called "ldl_tree_set_n" takes tree as Integer, n as Integer returns Integer:
+    @Reasoning
+    Set the ring-degree field at offset 40.
+    @End Reasoning
+    @Implementation
+    Qword store.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Memory.memory_set_qword(tree, 40, n)
+    Return 1
+End Process
+
+Process called "ldl_tree_set_is_leaf" takes tree as Integer, flag as Integer returns Integer:
+    @Reasoning
+    Set the leaf flag at offset 48.
+    @End Reasoning
+    @Implementation
+    Qword store.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Memory.memory_set_qword(tree, 48, flag)
+    Return 1
+End Process
+
+Process called "ldl_tree_set_sigma" takes tree as Integer, sigma_v as Float returns Integer:
+    @Reasoning
+    Set the leaf sigma value at offset 56.
+    @End Reasoning
+    @Implementation
+    Float64 store via memory_set_int64.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Internal.
+    @End Security_Scope
+    Memory.memory_set_int64(tree, 56, sigma_v)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+RECURSIVE LDL OF A SINGLE-DIMENSIONAL POSITIVE-REAL POLYNOMIAL
+==============================================================================
+This is the "ffLDL_internal" routine of the Falcon reference.  It takes a
+length-n FFT-domain polynomial G (which must be a positive-real diagonal
+entry derived from the Gram matrix in the parent step) and:
+
+  1. Splits G into two half-size representations G_e and G_o via the
+     Falcon "fft split" formula (see Falcon spec sec 2.3 splitfft / mergefft).
+  2. Sets L10 = G_o * G_e^{-1}  (a complex-valued half-size FFT polynomial).
+  3. Sets D0 = G_e, D1 = G_o - L10 * conj(L10) * G_e.
+  4. Recurses on D0, D1 at size n/2.
+  5. At n = 1, stores sigma = sqrt(D) and marks the node as a leaf.
+:End Note
+
+Note:
+==============================================================================
+FFT SPLIT / MERGE (Falcon spec section 2.3)
+==============================================================================
+For an FFT-domain polynomial f over K_n = Q[X]/(X^n+1), the splitfft
+operator produces two half-size FFT-domain polynomials f_e, f_o over
+K_{n/2} = Q[Y]/(Y^(n/2)+1) such that f(X) = f_e(X^2) + X * f_o(X^2)
+in coefficient form.
+
+In FFT representation the formula is:
+
+  f_e[k] = (f[k] + f[k + n/2]) / 2
+  f_o[k] = ((f[k] - f[k + n/2]) / 2) * conj(zeta_k)
+
+where zeta_k = exp(i * (2k+1) * pi / n) is the k-th primitive 2n-th
+root of unity at the odd position (the same indexing used by
+fft_forward above).
+:End Note
+
+Process called "ldl_fft_split" takes arena as Integer, src as Integer, n as Integer, fe as Integer, fo as Integer returns Integer:
+    @Reasoning
+    FFT split into K_{n/2} pair. Our forward FFT outputs slots in
+    bit-reversed order (slot k holds f(zeta_{rev(k)})). For the
+    K_n -> K_{n/2} decomposition along z² substitution, the paired
+    eval points zeta_a and zeta_{a+hn} live at INTERLEAVED slot
+    indices (2u, 2u+1), not at distant indices (k, k+hn). The split
+    therefore pairs consecutive even/odd slots and uses a twiddle
+    indexed by the bit-reversal of u.
+    @End Reasoning
+    @Implementation
+    Per Falcon spec sec 2.3 splitfft formula (Pornin reference
+    poly_split_fft, fft.c).  For u in [0, n/2):
+      a_complex = src[2u]
+      b_complex = src[2u+1]
+      fe[u]     = (a + b) / 2
+      twiddle   = conj(zeta_{rev_logn(2u)}) where rev_logn is
+                  bit-reversal over logn bits. Note rev_logn(2u) =
+                  rev_{logn-1}(u) since the low bit of 2u is 0.
+      fo[u]     = ((a - b) / 2) * twiddle
+    @End Implementation
+    @Performance_Hints
+    O(n) with n/2 cos/sin evaluations on the twiddle path.
+    @End Performance_Hints
+    @Security_Scope
+    Operands SECRET; deterministic in n.
+    @End Security_Scope
+    Let half_n be n shifted right by 1
+    Let two_v be FP.fp_from_int(2)
+    Let n_f be FP.fp_from_int(n)
+    Let pi_v be FP.fp_pi()
+    Note: logn_minus_1 = log2(n) - 1
+    Let logn_minus_1 be 0
+    Let tmp_n be half_n
+    While tmp_n is greater than 1:
+        Set logn_minus_1 to logn_minus_1 plus 1
+        Set tmp_n to tmp_n shifted right by 1
+    End While
+    Let u be 0
+    While u is less than half_n:
+        Let slot_a be u multiplied by 2
+        Let slot_b be slot_a plus 1
+        Let ar be FFT.fft_get_real(src, slot_a)
+        Let ai be FFT.fft_get_imag(src, slot_a)
+        Let br be FFT.fft_get_real(src, slot_b)
+        Let bi be FFT.fft_get_imag(src, slot_b)
+
+        Let sr be FP.fp_add(ar, br)
+        Let si be FP.fp_add(ai, bi)
+        Let dr be FP.fp_sub(ar, br)
+        Let di be FP.fp_sub(ai, bi)
+        Let fe_r be FP.fp_div(sr, two_v)
+        Let fe_i be FP.fp_div(si, two_v)
+        Let dr_half be FP.fp_div(dr, two_v)
+        Let di_half be FP.fp_div(di, two_v)
+
+        Note: twiddle conj(zeta_a) = cos(theta) - i*sin(theta) with
+        Note: theta = (2*a + 1) * pi / n where a = rev_{logn-1}(u).
+        Let a_idx be proc FFT.fft_bit_reverse with u, logn_minus_1
+        Let two_a_plus_1 be 2 multiplied by a_idx plus 1
+        Let ta_f be FP.fp_from_int(two_a_plus_1)
+        Let prod1 be FP.fp_mul(ta_f, pi_v)
+        Let theta be FP.fp_div(prod1, n_f)
+        Let cr be FP.fp_cos(theta)
+        Let ci_neg be FP.fp_sin(theta)
+        Let ci be FP.fp_neg(ci_neg)
+
+        Note: fo = (dr_half + di_half*i) * (cr + ci*i)
+        Note:    = (dr_half*cr - di_half*ci) + (dr_half*ci + di_half*cr) i
+        Let m1 be FP.fp_mul(dr_half, cr)
+        Let m2 be FP.fp_mul(di_half, ci)
+        Let fo_r be FP.fp_sub(m1, m2)
+        Let m3 be FP.fp_mul(dr_half, ci)
+        Let m4 be FP.fp_mul(di_half, cr)
+        Let fo_i be FP.fp_add(m3, m4)
+
+        FFT.fft_set_real(fe, u, fe_r)
+        FFT.fft_set_imag(fe, u, fe_i)
+        FFT.fft_set_real(fo, u, fo_r)
+        FFT.fft_set_imag(fo, u, fo_i)
+
+        Set u to u plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+GRAM MATRIX COMPUTATION
+==============================================================================
+Build the 2x2 Hermitian Gram matrix in the FFT domain over K_n.
+ldl_gram_diag computes |a|^2 + |b|^2 (a real-positive diagonal entry).
+ldl_gram_off_diag computes a*conj(b) + c*conj(d) (a complex off-diagonal).
+The caller chooses which polynomials map to which slot per the Falcon
+ROW convention (see ldl_build_tree).
+:End Note
+
+Process called "ldl_gram_diag" takes arena as Integer, a_fft as Integer, b_fft as Integer, n as Integer, out as Integer returns Integer:
+    @Reasoning
+    Compute |a|^2 + |b|^2 in the FFT domain into the real-valued out buffer.
+    @End Reasoning
+    @Implementation
+    For each k: out[k] = a_r^2 + a_i^2 + b_r^2 + b_i^2 (real), zero imag.
+    @End Implementation
+    @Performance_Hints
+    O(n).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let k be 0
+    While k is less than n:
+        Let ar be FFT.fft_get_real(a_fft, k)
+        Let ai be FFT.fft_get_imag(a_fft, k)
+        Let br be FFT.fft_get_real(b_fft, k)
+        Let bi be FFT.fft_get_imag(b_fft, k)
+        Let ar2 be FP.fp_mul(ar, ar)
+        Let ai2 be FP.fp_mul(ai, ai)
+        Let br2 be FP.fp_mul(br, br)
+        Let bi2 be FP.fp_mul(bi, bi)
+        Let s1 be FP.fp_add(ar2, ai2)
+        Let s2 be FP.fp_add(br2, bi2)
+        Let total be FP.fp_add(s1, s2)
+        FFT.fft_set_real(out, k, total)
+        Let zv be FP.fp_zero()
+        FFT.fft_set_imag(out, k, zv)
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Process called "ldl_gram_off_diag" takes arena as Integer, a_fft as Integer, b_fft as Integer, c_fft as Integer, d_fft as Integer, n as Integer, out as Integer returns Integer:
+    @Reasoning
+    Compute  a * conj(b) + c * conj(d)  in the FFT domain.
+    @End Reasoning
+    @Implementation
+    For each k:
+      (a + ai)(br - bi*i) = (a_r*br + a_i*bi) + (a_i*br - a_r*bi)i
+      Similarly for c*conj(d).  Sum into out.
+    @End Implementation
+    @Performance_Hints
+    O(n) with 8 mulsd + several adds per coefficient.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let k be 0
+    While k is less than n:
+        Let ar be FFT.fft_get_real(a_fft, k)
+        Let ai be FFT.fft_get_imag(a_fft, k)
+        Let br be FFT.fft_get_real(b_fft, k)
+        Let bi be FFT.fft_get_imag(b_fft, k)
+        Let cr be FFT.fft_get_real(c_fft, k)
+        Let ci be FFT.fft_get_imag(c_fft, k)
+        Let dr be FFT.fft_get_real(d_fft, k)
+        Let di be FFT.fft_get_imag(d_fft, k)
+        Let ab_r1 be FP.fp_mul(ar, br)
+        Let ab_r2 be FP.fp_mul(ai, bi)
+        Let ab_r be FP.fp_add(ab_r1, ab_r2)
+        Let ab_i1 be FP.fp_mul(ai, br)
+        Let ab_i2 be FP.fp_mul(ar, bi)
+        Let ab_i be FP.fp_sub(ab_i1, ab_i2)
+        Let cd_r1 be FP.fp_mul(cr, dr)
+        Let cd_r2 be FP.fp_mul(ci, di)
+        Let cd_r be FP.fp_add(cd_r1, cd_r2)
+        Let cd_i1 be FP.fp_mul(ci, dr)
+        Let cd_i2 be FP.fp_mul(cr, di)
+        Let cd_i be FP.fp_sub(cd_i1, cd_i2)
+        Let total_r be FP.fp_add(ab_r, cd_r)
+        Let total_i be FP.fp_add(ab_i, cd_i)
+        FFT.fft_set_real(out, k, total_r)
+        FFT.fft_set_imag(out, k, total_i)
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+INTERNAL FFLDL RECURSION (Pornin two-polynomial form)
+==============================================================================
+ldl_internal(g0, g1, n): given an FFT-domain pair (g0, g1) over K_n,
+build a Falcon LDL tree node whose at-this-node L10 lives in K_n and
+whose children recurse over the split halves of d00 and d11.
+
+This is the EXPLICIT two-polynomial recursion of Pornin's reference
+ffLDL_fft_inner (sign.c).  At each call the input (g0, g1) represents
+the off-diagonal pair of an implied 2x2 Hermitian Gram
+    [[ g0, g1 ],
+     [ conj(g1), g0 ]]
+(i.e. g11 = g0 = d00 carried down from the parent's split).  The LDL
+decomposition of this Gram is
+
+    L10 = g1 / g0                (complex polynomial in K_n)
+    d11 = g0 - |g1|^2 / g0        (real polynomial in K_n)
+
+The node stores L10 at FULL size n (Pornin convention: l10 has the same
+dimension as the polynomial-pair at the node).  Children are built by
+splitting d00=g0 and d11 into K_{n/2} pairs and recursing with each pair.
+:End Note
+
+Process called "ldl_internal" takes arena as Integer, g0_fft as Integer, g1_fft as Integer, n as Integer, orig_n as Integer returns Integer:
+    @Reasoning
+    Pornin reference ffLDL_fft_inner (sign.c).  Builds the LDL subtree
+    rooted at the polynomial pair (g0, g1) over K_n.  The implied 2x2
+    Gram is [[g0, g1], [conj(g1), g0]] with d00 = g11 = g0.  orig_n is
+    the top-level dimension used for leaf normalization.
+    @End Reasoning
+    @Implementation
+    Leaf case (n == 1):
+      - Store isigma = sqrt(g0[0]) * (1/sigma_global(orig_n))  matching
+        Pornin's ffLDL_binary_normalize.  g1 is unused at the leaf since
+        the leaf's stored value is purely the d00 entry; g1 contributes
+        to its sibling subtree via the splitting at the parent level.
+        Negative values from float noise are clamped to zero before the
+        square root.
+
+    Internal case (n >= 2):
+      - Compute the in-place LDL of the implied [[g0, g1], [conj(g1), g0]]
+        Hermitian Gram:
+          L10[k] = g1[k] / g0[k]                       (complex K_n)
+          d11[k] = g0[k] - |g1[k]|^2 / g0[k]           (real K_n)
+        L10 lives in K_n (size n) and is stored at this node.
+      - Allocate the two split halves of d00 = g0 (size n/2 each) and
+        of d11 (size n/2 each) into fresh arena buffers.
+      - Recurse left  with (split-low(d00), split-high(d00), n/2)
+      - Recurse right with (split-low(d11), split-high(d11), n/2)
+      Pornin's "left" subtree corresponds to the d00 split (the
+      polynomial that feeds the t0 sampler), "right" to the d11 split
+      (which feeds the t1 sampler).
+    @End Implementation
+    @Performance_Hints
+    O(n) LDL work at this node plus the split costs; recursion makes
+    the total O(n log n) across the whole tree.
+    @End Performance_Hints
+    @Security_Scope
+    All inputs SECRET; the only branching is on n which is public.
+    @End Security_Scope
+    Let node be Arena.arena_allocate(arena, 64)
+    If node is equal to 0:
+        Return 0
+    End If
+    proc ldl_tree_set_L01 with node, 0
+    proc ldl_tree_set_D0 with node, 0
+    proc ldl_tree_set_D1 with node, 0
+    proc ldl_tree_set_left with node, 0
+    proc ldl_tree_set_right with node, 0
+    proc ldl_tree_set_n with node, n
+    proc ldl_tree_set_is_leaf with node, 0
+
+    If n is equal to 1:
+        Let leaf_v be FFT.fft_get_real(g0_fft, 0)
+        Note: Clamp negative values to zero (numerical noise can produce
+        Note: tiny negative reals in well-conditioned inputs).
+        Let zero_v be FP.fp_zero()
+        Let neg_v be FP.fp_lt(leaf_v, zero_v)
+        If neg_v is equal to 1:
+            Set leaf_v to zero_v
+        End If
+        Note: Store isigma_leaf = sqrt(d00[0]) * (1/sigma_global).  Matches
+        Note: Pornin's ffLDL_binary_normalize (sign.c).  g1[0] is not stored
+        Note: at this leaf -- it contributes to the SIBLING subtree via the
+        Note: parent's split routing.
+        Let sqrt_v be FP.fp_sqrt(leaf_v)
+        Let inv_sigma_g be proc ldl_inv_sigma_global_for_n with orig_n
+        Let isigma_leaf be FP.fp_mul(sqrt_v, inv_sigma_g)
+        proc ldl_tree_set_sigma with node, isigma_leaf
+        proc ldl_tree_set_is_leaf with node, 1
+        Return node
+    End If
+
+    Let half_n be n shifted right by 1
+    Let full_bytes be n multiplied by 16
+    Let half_bytes be half_n multiplied by 16
+
+    Note: Step 1: LDL of the quasicyclic Hermitian 2x2 [[g0, g1], [conj(g1), g0]]
+    Note: in K_n.  Per Pornin reference (poly_LDLmv_fft, fft.c):
+    Note:   mu     = g01 / g00 = g1 / g0    (full complex divide)
+    Note:   d11    = g11 - mu * conj(g01) = g0 - mu * conj(g1)   (complex)
+    Note:   l10    = conj(mu)
+    Note: g0 is auto-adjoint at the n=initial level (real-valued in our
+    Note: layout); after the FFT split into K_{n/2}, the resulting pair
+    Note: is GENERALLY COMPLEX at each slot (the auto-adjoint property
+    Note: is preserved as a structural property of the pair, not as a
+    Note: "real-valued slot" property).  The LDL therefore MUST use full
+    Note: complex arithmetic at every internal recursion level; reading
+    Note: only g0_re and treating g0_im = 0 produces wrong l10 and d11
+    Note: at sub-K_n recursion depths and breaks the sampler for Falcon
+    Note: parameters that recurse more than a few levels deep.
+    Let L10 be Arena.arena_allocate(arena, full_bytes)
+    Let d11 be Arena.arena_allocate(arena, full_bytes)
+    If d11 is equal to 0:
+        Return 0
+    End If
+    Let k be 0
+    While k is less than n:
+        Let g0r be FFT.fft_get_real(g0_fft, k)
+        Let g0i be FFT.fft_get_imag(g0_fft, k)
+        Let g1r be FFT.fft_get_real(g1_fft, k)
+        Let g1i be FFT.fft_get_imag(g1_fft, k)
+        Let zero_v be FP.fp_zero()
+
+        Note: |g0|^2 = g0r^2 + g0i^2.
+        Let g0_sqr_re be FP.fp_mul(g0r, g0r)
+        Let g0_sqr_im be FP.fp_mul(g0i, g0i)
+        Let g0_norm2 be FP.fp_add(g0_sqr_re, g0_sqr_im)
+        Let g0_is_zero be FP.fp_eq(g0_norm2, zero_v)
+
+        Let mu_r be zero_v
+        Let mu_i be zero_v
+        Let d11r be g0r
+        Let d11i be g0i
+        If g0_is_zero is equal to 0:
+            Note: mu = g1 / g0 = g1 * conj(g0) / |g0|^2 (complex divide).
+            Let num_r_a be FP.fp_mul(g1r, g0r)
+            Let num_r_b be FP.fp_mul(g1i, g0i)
+            Let num_r be FP.fp_add(num_r_a, num_r_b)
+            Let num_i_a be FP.fp_mul(g1i, g0r)
+            Let num_i_b be FP.fp_mul(g1r, g0i)
+            Let num_i be FP.fp_sub(num_i_a, num_i_b)
+            Set mu_r to FP.fp_div(num_r, g0_norm2)
+            Set mu_i to FP.fp_div(num_i, g0_norm2)
+
+            Note: subterm = mu * conj(g1) = (mu_r + mu_i*i) * (g1r - g1i*i)
+            Note:        = (mu_r*g1r + mu_i*g1i) + (mu_i*g1r - mu_r*g1i)*i
+            Let sub_r_a be FP.fp_mul(mu_r, g1r)
+            Let sub_r_b be FP.fp_mul(mu_i, g1i)
+            Let sub_r be FP.fp_add(sub_r_a, sub_r_b)
+            Let sub_i_a be FP.fp_mul(mu_i, g1r)
+            Let sub_i_b be FP.fp_mul(mu_r, g1i)
+            Let sub_i be FP.fp_sub(sub_i_a, sub_i_b)
+
+            Set d11r to FP.fp_sub(g0r, sub_r)
+            Set d11i to FP.fp_sub(g0i, sub_i)
+        End If
+        Note: l10 = conj(mu) = (mu_r, -mu_i).
+        Let neg_mu_i be FP.fp_neg(mu_i)
+        FFT.fft_set_real(L10, k, mu_r)
+        FFT.fft_set_imag(L10, k, neg_mu_i)
+        FFT.fft_set_real(d11, k, d11r)
+        FFT.fft_set_imag(d11, k, d11i)
+        Set k to k plus 1
+    End While
+    proc ldl_tree_set_L01 with node, L10
+
+    Note: Step 2: split d00 = g0 into two K_{n/2} polynomials (d00_e, d00_o).
+    Let d00_e be Arena.arena_allocate(arena, half_bytes)
+    Let d00_o be Arena.arena_allocate(arena, half_bytes)
+    If d00_o is equal to 0:
+        Return 0
+    End If
+    proc ldl_fft_split with arena, g0_fft, n, d00_e, d00_o
+
+    Note: Step 3: split d11 into (d11_e, d11_o) in K_{n/2}.
+    Let d11_e be Arena.arena_allocate(arena, half_bytes)
+    Let d11_o be Arena.arena_allocate(arena, half_bytes)
+    If d11_o is equal to 0:
+        Return 0
+    End If
+    proc ldl_fft_split with arena, d11, n, d11_e, d11_o
+
+    Note: Step 4: recurse.  Left subtree carries the d00 split (feeds the
+    Note: t0 sampler); right subtree carries the d11 split (feeds t1).
+    Let left_child be proc ldl_internal with arena, d00_e, d00_o, half_n, orig_n
+    If left_child is equal to 0:
+        Return 0
+    End If
+    Let right_child be proc ldl_internal with arena, d11_e, d11_o, half_n, orig_n
+    If right_child is equal to 0:
+        Return 0
+    End If
+    proc ldl_tree_set_left with node, left_child
+    proc ldl_tree_set_right with node, right_child
+    Return node
+End Process
+
+Note:
+==============================================================================
+TOP-LEVEL FFLDL CONSTRUCTION
+==============================================================================
+ldl_build_tree(f, g, F, G, n): Falcon-spec Algorithm 8 (entry).  Computes
+the Gram matrix of the basis B = [[g, -f], [G, -F]] in the FFT domain,
+performs the 2x2 LDL split, and recurses on D0 and D1.
+:End Note
+
+Process called "ldl_build_tree" takes arena as Integer, f_int as Integer, g_int as Integer, F_int as Integer, G_int as Integer, n as Integer returns Integer:
+    @Reasoning
+    Build the Falcon LDL tree for the trapdoor basis B = [[g, -f], [G, -F]]
+    rooted at the basis-level 2x2 Gram and recursing down to leaves via
+    Pornin's explicit two-polynomial ffLDL_fft recursion (sign.c).
+    @End Reasoning
+    @Implementation
+    Algorithm 8 (Falcon spec) / Pornin reference ffLDL_fft (sign.c):
+
+    1. FFT-load f, g, F, G and run the forward FFT to length n.
+
+    2. Compute the 2x2 Hermitian Gram of the row basis B = [[g, -f], [G, -F]]
+       in K_n:
+         gram_00 = <row0, row0> = |g|^2 + |f|^2       (real)
+         gram_11 = <row1, row1> = |G|^2 + |F|^2       (real)
+         gram_10 = <row1, row0> = G*conj(g) + F*conj(f)  (complex)
+
+    3. In-place LDL at the top: with g00 = gram_00 (real-positive), g01 =
+       gram_10, g11 = gram_11:
+         L01_top[k] = g01[k] / g00[k]    (complex K_n divide; g00 real)
+         d11[k]     = g11[k] - |g01[k]|^2 / g00[k]    (real K_n)
+       L01_top is the at-node l10 of the top node and is stored at full
+       size n (matching Pornin's tree[0..n-1]).
+
+    4. Split d00 = gram_00 into K_{n/2} pair (d00_e, d00_o); split d11
+       into (d11_e, d11_o).  Recurse:
+         left  subtree = ldl_internal(d00_e, d00_o, n/2)
+         right subtree = ldl_internal(d11_e, d11_o, n/2)
+
+    This is structurally identical to Pornin's ffLDL_fft (sign.c lines
+    ~360-405) up to the FFT layout convention.  All multiplications and
+    divides at the top happen in K_n (size n FFT) so the subsequent
+    sampler can do its K_n multiplications against L01_top without
+    losing the structural equivalence between split(t * l10) and
+    split(t) * split(l10) under K_{n/2}-arithmetic.
+    @End Implementation
+    @Performance_Hints
+    O(n log n) total; O(n) per level for the LDL + splits.
+    @End Performance_Hints
+    @Security_Scope
+    All inputs SECRET; loop bounds depend on n which is public.
+    @End Security_Scope
+    Let bytes be n multiplied by 16
+    Let half_n be n shifted right by 1
+    Let half_bytes be half_n multiplied by 16
+
+    Let f_fft be Arena.arena_allocate(arena, bytes)
+    Let g_fft be Arena.arena_allocate(arena, bytes)
+    Let F_fft be Arena.arena_allocate(arena, bytes)
+    Let G_fft be Arena.arena_allocate(arena, bytes)
+    If G_fft is equal to 0:
+        Return 0
+    End If
+    FFT.fft_load_from_int16_signed(f_int, f_fft, n)
+    FFT.fft_load_from_int16_signed(g_int, g_fft, n)
+    FFT.fft_load_from_int16_signed(F_int, F_fft, n)
+    FFT.fft_load_from_int16_signed(G_int, G_fft, n)
+    FFT.fft_forward(arena, f_fft, n)
+    FFT.fft_forward(arena, g_fft, n)
+    FFT.fft_forward(arena, F_fft, n)
+    FFT.fft_forward(arena, G_fft, n)
+
+    Note: 2x2 Gram of the row basis.  Per Pornin sign.c::expand_privkey,
+    Note: gram_00 = |g|^2 + |f|^2 (row 0 norm squared), gram_11 = |G|^2 +
+    Note: |F|^2 (row 1 norm squared), and gram_10 = G*conj(g) + F*conj(f)
+    Note: (row 1 dot row 0 with the (-) signs cancelling).
+    Let gram_00 be Arena.arena_allocate(arena, bytes)
+    Let gram_11 be Arena.arena_allocate(arena, bytes)
+    Let gram_10 be Arena.arena_allocate(arena, bytes)
+    If gram_10 is equal to 0:
+        Return 0
+    End If
+    proc ldl_gram_diag with arena, g_fft, f_fft, n, gram_00
+    proc ldl_gram_diag with arena, G_fft, F_fft, n, gram_11
+    proc ldl_gram_off_diag with arena, G_fft, g_fft, F_fft, f_fft, n, gram_10
+
+    Let node be Arena.arena_allocate(arena, 64)
+    If node is equal to 0:
+        Return 0
+    End If
+    proc ldl_tree_set_L01 with node, 0
+    proc ldl_tree_set_D0 with node, 0
+    proc ldl_tree_set_D1 with node, 0
+    proc ldl_tree_set_left with node, 0
+    proc ldl_tree_set_right with node, 0
+    proc ldl_tree_set_n with node, n
+    proc ldl_tree_set_is_leaf with node, 0
+
+    Note: Top-level 2x2 LDL:
+    Note:   L01_top[k] = gram_10[k] / gram_00[k]   (complex; g00 is real)
+    Note:   D1_top[k]  = gram_11[k] - |gram_10[k]|^2 / gram_00[k]   (real)
+    Let L01_top be Arena.arena_allocate(arena, bytes)
+    Let D1_top be Arena.arena_allocate(arena, bytes)
+    If D1_top is equal to 0:
+        Return 0
+    End If
+    Let kk be 0
+    While kk is less than n:
+        Let g00 be FFT.fft_get_real(gram_00, kk)
+        Let g10r be FFT.fft_get_real(gram_10, kk)
+        Let g10i be FFT.fft_get_imag(gram_10, kk)
+        Let g11_v be FFT.fft_get_real(gram_11, kk)
+        Let zero_v be FP.fp_zero()
+        Let g00_is_zero be FP.fp_eq(g00, zero_v)
+        Let l01r be zero_v
+        Let l01i be zero_v
+        Let new_d1 be g11_v
+        If g00_is_zero is equal to 0:
+            Set l01r to FP.fp_div(g10r, g00)
+            Set l01i to FP.fp_div(g10i, g00)
+            Let m_a be FP.fp_mul(g10r, g10r)
+            Let m_b be FP.fp_mul(g10i, g10i)
+            Let mag2 be FP.fp_add(m_a, m_b)
+            Let drop be FP.fp_div(mag2, g00)
+            Set new_d1 to FP.fp_sub(g11_v, drop)
+        End If
+        FFT.fft_set_real(L01_top, kk, l01r)
+        FFT.fft_set_imag(L01_top, kk, l01i)
+        FFT.fft_set_real(D1_top, kk, new_d1)
+        FFT.fft_set_imag(D1_top, kk, zero_v)
+        Set kk to kk plus 1
+    End While
+
+    proc ldl_tree_set_L01 with node, L01_top
+
+    Note: Split d00 = gram_00 into (d00_e, d00_o) over K_{n/2}.
+    Let d00_e be Arena.arena_allocate(arena, half_bytes)
+    Let d00_o be Arena.arena_allocate(arena, half_bytes)
+    If d00_o is equal to 0:
+        Return 0
+    End If
+    proc ldl_fft_split with arena, gram_00, n, d00_e, d00_o
+
+    Note: Split d11 = D1_top into (d11_e, d11_o) over K_{n/2}.
+    Let d11_e be Arena.arena_allocate(arena, half_bytes)
+    Let d11_o be Arena.arena_allocate(arena, half_bytes)
+    If d11_o is equal to 0:
+        Return 0
+    End If
+    proc ldl_fft_split with arena, D1_top, n, d11_e, d11_o
+
+    Let left_child be proc ldl_internal with arena, d00_e, d00_o, half_n, n
+    If left_child is equal to 0:
+        Return 0
+    End If
+    Let right_child be proc ldl_internal with arena, d11_e, d11_o, half_n, n
+    If right_child is equal to 0:
+        Return 0
+    End If
+    proc ldl_tree_set_left with node, left_child
+    proc ldl_tree_set_right with node, right_child
+
+    Return node
+End Process
+
+Note:
+==============================================================================
+END falcon_ldl
+==============================================================================
+:End Note

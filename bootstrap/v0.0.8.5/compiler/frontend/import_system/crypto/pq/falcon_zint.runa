@@ -1,0 +1,1633 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FALCON-ZINT : multi-precision signed integers (sign-magnitude, 31-bit limbs)
+==============================================================================
+
+Storage convention. A zint is a contiguous arena-allocated block:
+
+    offset  0  (int32)  sign        0 = nonnegative, 1 = negative
+    offset  4  (int32)  used        number of "live" limbs (0 if value == 0)
+    offset  8  (int32)  capacity    number of allocated limbs
+    offset 12  (int32)  padding     reserved (alignment)
+    offset 16  (int32[]) limbs      little-endian limbs in [0, 2^31)
+
+Each limb stores 31 significant bits. The 32nd bit (sign bit of the
+underlying int32) is reserved as a carry workspace for addition and
+shifting, so we never need a temporary widening cast.
+
+Two-stage representation. The arithmetic primitives keep the magnitude
+canonical: trailing zero limbs are trimmed via zint_normalize so that
+used == 0 iff the value is zero, and the top live limb is nonzero
+otherwise. Sign is held as a single bit; the canonical encoding of zero
+forces sign = 0.
+
+This mirrors Pornin's zint design in falcon/zint*.c (NIST PQC Round 3
+submission package) at the algorithmic level. We diverge from the
+reference in two engineering ways:
+
+  1. We use 31-bit limbs in int32 cells rather than 30-bit limbs in
+     int32 cells; the spare bit is enough for additive carry only and we
+     handle multiplicative carry via explicit splitting into two limbs.
+
+  2. We store sign and length in a 16-byte header in front of the limb
+     array rather than packing them into a separate descriptor, so a
+     single arena_allocate returns a self-contained zint pointer.
+
+The Falcon NTRUSolve descent peaks at roughly 2560-bit coefficients
+(depth 9 of the Falcon-1024 tower); 84 limbs at 31 bits per limb covers
+the worst case with margin.
+
+Security_Scope (module-wide):
+  Coefficient values are SECRET Falcon key material. The schoolbook
+  multiply, Karatsuba, and the binary-extended-gcd primitives all run
+  in time linear in the limb count (no early-exit on limb value), so
+  the wall-clock cost depends on size but not on data. Sign bits are
+  manipulated by branchless XOR / mask patterns.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+
+Note:
+==============================================================================
+LAYOUT HELPERS
+==============================================================================
+:End Note
+
+Process called "zint_header_bytes" returns Integer:
+    @Reasoning
+    Return the size (in bytes) of the zint header. Used by every
+    primitive that walks the limb array.
+    @End Reasoning
+    @Implementation
+    Header = 4 (sign) + 4 (used) + 4 (capacity) + 4 (padding) = 16 bytes.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return 16
+End Process
+
+Process called "zint_limb_bits" returns Integer:
+    @Reasoning
+    Return the number of significant bits per limb.
+    @End Reasoning
+    @Implementation
+    Constant 31; chosen so that two 31-bit limbs fit in a 63-bit
+    multiply accumulator without overflow.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return 31
+End Process
+
+Process called "zint_limb_mask" returns Integer:
+    @Reasoning
+    Return the mask that isolates the low 31 bits of an int64 / int32.
+    @End Reasoning
+    @Implementation
+    2^31 - 1 = 2147483647.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return 2147483647
+End Process
+
+Process called "zint_limb_radix" returns Integer:
+    @Reasoning
+    Return the limb radix B = 2^31.
+    @End Reasoning
+    @Implementation
+    Constant 2147483648.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return 2147483648
+End Process
+
+Process called "zint_get_sign" takes z as Integer returns Integer:
+    @Reasoning
+    Read the sign field of a zint.
+    @End Reasoning
+    @Implementation
+    Load int32 at offset 0.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Public layout.
+    @End Security_Scope
+    Return Memory.memory_get_int32(z, 0)
+End Process
+
+Process called "zint_set_sign" takes z as Integer, sign as Integer returns Integer:
+    @Reasoning
+    Write the sign field of a zint.
+    @End Reasoning
+    @Implementation
+    Store int32 at offset 0.
+    @End Implementation
+    @Performance_Hints
+    Single store.
+    @End Performance_Hints
+    @Security_Scope
+    Public layout.
+    @End Security_Scope
+    Memory.memory_set_int32(z, 0, sign)
+    Return 1
+End Process
+
+Process called "zint_get_used" takes z as Integer returns Integer:
+    @Reasoning
+    Read the used-limb count of a zint.
+    @End Reasoning
+    @Implementation
+    Load int32 at offset 4.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Public layout.
+    @End Security_Scope
+    Return Memory.memory_get_int32(z, 4)
+End Process
+
+Process called "zint_set_used" takes z as Integer, used as Integer returns Integer:
+    @Reasoning
+    Write the used-limb count of a zint.
+    @End Reasoning
+    @Implementation
+    Store int32 at offset 4.
+    @End Implementation
+    @Performance_Hints
+    Single store.
+    @End Performance_Hints
+    @Security_Scope
+    Public layout.
+    @End Security_Scope
+    Memory.memory_set_int32(z, 4, used)
+    Return 1
+End Process
+
+Process called "zint_get_capacity" takes z as Integer returns Integer:
+    @Reasoning
+    Read the capacity field of a zint.
+    @End Reasoning
+    @Implementation
+    Load int32 at offset 8.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Public layout.
+    @End Security_Scope
+    Return Memory.memory_get_int32(z, 8)
+End Process
+
+Process called "zint_set_capacity" takes z as Integer, cap as Integer returns Integer:
+    @Reasoning
+    Write the capacity field of a zint.
+    @End Reasoning
+    @Implementation
+    Store int32 at offset 8.
+    @End Implementation
+    @Performance_Hints
+    Single store.
+    @End Performance_Hints
+    @Security_Scope
+    Public layout.
+    @End Security_Scope
+    Memory.memory_set_int32(z, 8, cap)
+    Return 1
+End Process
+
+Process called "zint_limb_addr" takes z as Integer, idx as Integer returns Integer:
+    @Reasoning
+    Compute the byte address of limb idx within zint z.
+    @End Reasoning
+    @Implementation
+    base + header_bytes + 4 * idx.
+    @End Implementation
+    @Performance_Hints
+    Two adds and one shift.
+    @End Performance_Hints
+    @Security_Scope
+    Public layout.
+    @End Security_Scope
+    Let hdr be proc zint_header_bytes
+    Let off be hdr plus (idx multiplied by 4)
+    Return z plus off
+End Process
+
+Process called "zint_get_limb" takes z as Integer, idx as Integer returns Integer:
+    @Reasoning
+    Read limb idx of zint z. Returns 0 for out-of-range indices to
+    let callers walk past the used count without bounds checks.
+    @End Reasoning
+    @Implementation
+    If idx >= used, return 0. Otherwise load the int32 at the limb's
+    byte address.
+    @End Implementation
+    @Performance_Hints
+    Single load (or zero on out-of-range).
+    @End Performance_Hints
+    @Security_Scope
+    Public layout. Limb values are SECRET.
+    @End Security_Scope
+    Let used be proc zint_get_used with z
+    If idx is greater than or equal to used:
+        Return 0
+    End If
+    Let addr be proc zint_limb_addr with z, idx
+    Return Memory.memory_get_int32(addr, 0)
+End Process
+
+Process called "zint_set_limb" takes z as Integer, idx as Integer, value as Integer returns Integer:
+    @Reasoning
+    Write limb idx of zint z. Caller is responsible for keeping idx
+    within capacity and for masking value to 31 bits.
+    @End Reasoning
+    @Implementation
+    Store int32 at the computed limb address.
+    @End Implementation
+    @Performance_Hints
+    Single store.
+    @End Performance_Hints
+    @Security_Scope
+    Public layout. Limb values are SECRET.
+    @End Security_Scope
+    Let addr be proc zint_limb_addr with z, idx
+    Memory.memory_set_int32(addr, 0, value)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+ALLOCATION / DESTRUCTION
+==============================================================================
+:End Note
+
+Process called "zint_create" takes arena as Integer, capacity as Integer returns Integer:
+    @Reasoning
+    Allocate a zint with capacity for `capacity` 31-bit limbs.
+    @End Reasoning
+    @Implementation
+    Allocate header + 4 * max(capacity, 1) bytes from the arena, zero
+    the entire block (so sign = 0, used = 0, all limbs = 0), then
+    write the capacity field.
+    @End Implementation
+    @Performance_Hints
+    One arena_allocate plus one memory_zero.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET zints live in the same arena as the surrounding NTRUSolve
+    descent; the arena is overwritten at the end of keygen.
+    @End Security_Scope
+    Let safe_cap be capacity
+    If safe_cap is less than 1:
+        Set safe_cap to 1
+    End If
+    Let hdr be proc zint_header_bytes
+    Let bytes be hdr plus (safe_cap multiplied by 4)
+    Let z be Arena.arena_allocate(arena, bytes)
+    If z is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(z, bytes)
+    proc zint_set_capacity with z, safe_cap
+    Return z
+End Process
+
+Process called "zint_destroy" takes z as Integer returns Integer:
+    @Reasoning
+    Logically destroy a zint by zeroing its contents.
+    @End Reasoning
+    @Implementation
+    No-op for the underlying memory (the arena owns the storage and
+    will free it wholesale), but we zero the live bytes to scrub any
+    SECRET material in case the caller maps the arena page somewhere
+    visible.
+    @End Implementation
+    @Performance_Hints
+    Linear in capacity.
+    @End Performance_Hints
+    @Security_Scope
+    Helpful for SECRET hygiene; not load-bearing for correctness.
+    @End Security_Scope
+    If z is equal to 0:
+        Return 0
+    End If
+    Let cap be proc zint_get_capacity with z
+    Let hdr be proc zint_header_bytes
+    Let bytes be hdr plus (cap multiplied by 4)
+    Memory.memory_zero(z, bytes)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+NORMALIZATION
+==============================================================================
+:End Note
+
+Process called "zint_normalize" takes z as Integer returns Integer:
+    @Reasoning
+    Trim trailing zero limbs and canonicalise the sign of zero so that
+    every zint of the same value has the same byte representation.
+    @End Reasoning
+    @Implementation
+    Walk used downward while the top limb is zero; if used reaches 0,
+    also force sign = 0.
+    @End Implementation
+    @Performance_Hints
+    O(used). Branch on limb value is timing-visible only via the loop
+    iteration count, which depends on the magnitude (a Falcon-permitted
+    leakage path).
+    @End Performance_Hints
+    @Security_Scope
+    Operates on SECRET limbs.
+    @End Security_Scope
+    Let used be proc zint_get_used with z
+    Let scanning be 1
+    While scanning is equal to 1:
+        If used is equal to 0:
+            Set scanning to 0
+        Otherwise:
+            Let top be proc zint_get_limb with z, used minus 1
+            If top is equal to 0:
+                Set used to used minus 1
+            Otherwise:
+                Set scanning to 0
+            End If
+        End If
+    End While
+    proc zint_set_used with z, used
+    If used is equal to 0:
+        proc zint_set_sign with z, 0
+    End If
+    Return 1
+End Process
+
+Note:
+==============================================================================
+ZERO / ONE / FROM_INT / TO_INT
+==============================================================================
+:End Note
+
+Process called "zint_set_zero" takes z as Integer returns Integer:
+    @Reasoning
+    Force z to the canonical encoding of zero.
+    @End Reasoning
+    @Implementation
+    sign = 0, used = 0. Limb memory is left alone; readers ignore
+    limbs beyond used.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    proc zint_set_sign with z, 0
+    proc zint_set_used with z, 0
+    Return 1
+End Process
+
+Process called "zint_is_zero" takes z as Integer returns Integer:
+    @Reasoning
+    Test whether z is the canonical zero.
+    @End Reasoning
+    @Implementation
+    Returns 1 iff used == 0.
+    @End Implementation
+    @Performance_Hints
+    Single load and compare.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let used be proc zint_get_used with z
+    If used is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "zint_from_int" takes arena as Integer, value as Integer returns Integer:
+    @Reasoning
+    Build a zint from a signed Integer (Int64 on this target).
+    @End Reasoning
+    @Implementation
+    Split |value| into low and high 31-bit limbs. Allocate capacity 3
+    (covers any Int64 magnitude up to 2^93 - 1 with margin) and store
+    the limbs little-endian.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET if value carries key material.
+    @End Security_Scope
+    Let z be proc zint_create with arena, 3
+    If z is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Return z
+    End If
+    Let sign be 0
+    Let mag be value
+    If mag is less than 0:
+        Set sign to 1
+        Set mag to 0 minus mag
+    End If
+    Let mask be proc zint_limb_mask
+    Let bits be proc zint_limb_bits
+    Let limb0 be mag bitwise_and mask
+    Let limb1 be (mag shifted right by bits) bitwise_and mask
+    Let limb2 be (mag shifted right by (bits multiplied by 2)) bitwise_and mask
+    proc zint_set_limb with z, 0, limb0
+    proc zint_set_limb with z, 1, limb1
+    proc zint_set_limb with z, 2, limb2
+    proc zint_set_sign with z, sign
+    proc zint_set_used with z, 3
+    proc zint_normalize with z
+    Return z
+End Process
+
+Process called "zint_to_int" takes z as Integer returns Integer:
+    @Reasoning
+    Convert z back to a signed Integer. Returns the value modulo 2^63
+    after sign application; callers that need overflow detection should
+    use zint_bit_length first.
+    @End Reasoning
+    @Implementation
+    Accumulate limbs lowest-first, shifting by 31 each step. Apply sign.
+    @End Implementation
+    @Performance_Hints
+    O(used).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let used be proc zint_get_used with z
+    Let bits be proc zint_limb_bits
+    Let acc be 0
+    Let i be used
+    While i is greater than 0:
+        Set i to i minus 1
+        Let limb be proc zint_get_limb with z, i
+        Set acc to (acc shifted left by bits) bitwise_or limb
+    End While
+    Let sign be proc zint_get_sign with z
+    If sign is equal to 1:
+        Set acc to 0 minus acc
+    End If
+    Return acc
+End Process
+
+Process called "zint_bit_length" takes z as Integer returns Integer:
+    @Reasoning
+    Return the number of significant bits in |z|. Zero returns 0.
+    @End Reasoning
+    @Implementation
+    bits = 31 * (used - 1) + (bit position of top non-zero bit + 1).
+    Find the topmost set bit of the top limb by linear scan; the limb
+    has at most 31 bits so the scan is bounded.
+    @End Implementation
+    @Performance_Hints
+    O(used + 31).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let used be proc zint_get_used with z
+    If used is equal to 0:
+        Return 0
+    End If
+    Let bits_per be proc zint_limb_bits
+    Let top be proc zint_get_limb with z, used minus 1
+    Let top_bits be 0
+    While top is not equal to 0:
+        Set top to top shifted right by 1
+        Set top_bits to top_bits plus 1
+    End While
+    Let total be ((used minus 1) multiplied by bits_per) plus top_bits
+    Return total
+End Process
+
+Note:
+==============================================================================
+COPY / NEG / ABS / COMPARE
+==============================================================================
+:End Note
+
+Process called "zint_copy" takes arena as Integer, src as Integer returns Integer:
+    @Reasoning
+    Duplicate a zint into a freshly allocated buffer.
+    @End Reasoning
+    @Implementation
+    Allocate capacity = src.capacity, memory_copy header+limbs.
+    @End Implementation
+    @Performance_Hints
+    O(capacity).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let cap be proc zint_get_capacity with src
+    Let dst be proc zint_create with arena, cap
+    If dst is equal to 0:
+        Return 0
+    End If
+    Let hdr be proc zint_header_bytes
+    Let bytes be hdr plus (cap multiplied by 4)
+    Memory.memory_copy(dst, src, bytes)
+    Return dst
+End Process
+
+Process called "zint_copy_into" takes dst as Integer, src as Integer returns Integer:
+    @Reasoning
+    Copy src into a pre-allocated dst whose capacity must be at least
+    src.used. Preserves dst.capacity.
+    @End Reasoning
+    @Implementation
+    Read src sign and used, copy used limbs, write dst sign and used,
+    zero any trailing limbs of dst within its capacity.
+    @End Implementation
+    @Performance_Hints
+    O(src.used + dst.capacity).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let used be proc zint_get_used with src
+    Let sign be proc zint_get_sign with src
+    Let dst_cap be proc zint_get_capacity with dst
+    If used is greater than dst_cap:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than used:
+        Let v be proc zint_get_limb with src, i
+        proc zint_set_limb with dst, i, v
+        Set i to i plus 1
+    End While
+    While i is less than dst_cap:
+        proc zint_set_limb with dst, i, 0
+        Set i to i plus 1
+    End While
+    proc zint_set_used with dst, used
+    proc zint_set_sign with dst, sign
+    Return 1
+End Process
+
+Process called "zint_neg" takes z as Integer returns Integer:
+    @Reasoning
+    Flip the sign of z in place. Zero stays zero.
+    @End Reasoning
+    @Implementation
+    If used == 0 keep sign 0; else XOR sign with 1.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET; CT.
+    @End Security_Scope
+    Let used be proc zint_get_used with z
+    If used is equal to 0:
+        proc zint_set_sign with z, 0
+        Return 1
+    End If
+    Let s be proc zint_get_sign with z
+    Let flipped be s bitwise_xor 1
+    proc zint_set_sign with z, flipped
+    Return 1
+End Process
+
+Process called "zint_abs" takes z as Integer returns Integer:
+    @Reasoning
+    Force z to be nonnegative in place.
+    @End Reasoning
+    @Implementation
+    Set sign to 0.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET; CT.
+    @End Security_Scope
+    proc zint_set_sign with z, 0
+    Return 1
+End Process
+
+Process called "zint_compare_magnitude" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Compare |a| versus |b|. Returns -1 if |a| < |b|, 0 if equal,
+    +1 if |a| > |b|.
+    @End Reasoning
+    @Implementation
+    First compare used counts; if equal walk limbs high-to-low until a
+    difference is found.
+    @End Implementation
+    @Performance_Hints
+    O(max(used_a, used_b)).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET; control flow leaks magnitude difference position.
+    @End Security_Scope
+    Let ua be proc zint_get_used with a
+    Let ub be proc zint_get_used with b
+    If ua is less than ub:
+        Return 0 minus 1
+    End If
+    If ua is greater than ub:
+        Return 1
+    End If
+    Let i be ua
+    While i is greater than 0:
+        Set i to i minus 1
+        Let la be proc zint_get_limb with a, i
+        Let lb be proc zint_get_limb with b, i
+        If la is less than lb:
+            Return 0 minus 1
+        End If
+        If la is greater than lb:
+            Return 1
+        End If
+    End While
+    Return 0
+End Process
+
+Process called "zint_compare" takes a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Signed comparison. Returns -1 if a < b, 0 if a == b, +1 if a > b.
+    @End Reasoning
+    @Implementation
+    Handle sign cases:
+      - a < 0 and b >= 0: a < b.
+      - a >= 0 and b < 0: a > b.
+      - both nonnegative: compare magnitudes directly.
+      - both negative: reverse the magnitude comparison.
+    A negative zero is impossible because zero is canonicalised to
+    sign = 0 by zint_normalize.
+    @End Implementation
+    @Performance_Hints
+    O(max(used_a, used_b)).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let sa be proc zint_get_sign with a
+    Let sb be proc zint_get_sign with b
+    If sa is equal to 1:
+        If sb is equal to 0:
+            Return 0 minus 1
+        End If
+        Let mag be proc zint_compare_magnitude with a, b
+        Return 0 minus mag
+    End If
+    If sb is equal to 1:
+        Return 1
+    End If
+    Return proc zint_compare_magnitude with a, b
+End Process
+
+Note:
+==============================================================================
+ADD / SUB
+==============================================================================
+
+Internally we implement unsigned magnitude addition / subtraction and
+let zint_add / zint_sub dispatch by sign. The magnitude routines assume
+the caller has already ensured the destination has enough capacity.
+:End Note
+
+Process called "zint_add_mag_into" takes out_z as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Compute |out| = |a| + |b| (magnitude only) and store the result
+    into out_z. Sets out.used to the new length and leaves out.sign
+    untouched.
+    @End Reasoning
+    @Implementation
+    Walk limbs lowest-first with a single-bit carry. Use the spare
+    32nd bit of int32 as the carry workspace; mask each result back
+    to 31 bits before storing.
+    @End Implementation
+    @Performance_Hints
+    O(max(used_a, used_b)).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let ua be proc zint_get_used with a
+    Let ub be proc zint_get_used with b
+    Let max_u be ua
+    If ub is greater than max_u:
+        Set max_u to ub
+    End If
+    Let cap be proc zint_get_capacity with out_z
+    If (max_u plus 1) is greater than cap:
+        Return 0
+    End If
+    Let mask be proc zint_limb_mask
+    Let bits be proc zint_limb_bits
+    Let carry be 0
+    Let i be 0
+    While i is less than max_u:
+        Let la be proc zint_get_limb with a, i
+        Let lb be proc zint_get_limb with b, i
+        Let sum be la plus lb
+        Set sum to sum plus carry
+        Let limb be sum bitwise_and mask
+        Set carry to sum shifted right by bits
+        proc zint_set_limb with out_z, i, limb
+        Set i to i plus 1
+    End While
+    Let new_used be max_u
+    If carry is not equal to 0:
+        proc zint_set_limb with out_z, max_u, carry
+        Set new_used to max_u plus 1
+    End If
+    Note: Zero any leftover trailing limbs within capacity so the
+    Note: destination remains canonical even when reused across many
+    Note: operations.
+    Let j be new_used
+    While j is less than cap:
+        proc zint_set_limb with out_z, j, 0
+        Set j to j plus 1
+    End While
+    proc zint_set_used with out_z, new_used
+    Return 1
+End Process
+
+Process called "zint_sub_mag_into" takes out_z as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Compute |out| = |a| - |b| (magnitude only) where the caller has
+    guaranteed |a| >= |b|. Stores into out_z and updates out.used.
+    @End Reasoning
+    @Implementation
+    Walk limbs lowest-first with a single-bit borrow. The result limb
+    is (la - lb - borrow) modulo 2^31; the borrow is 1 iff the bare
+    subtraction yields a negative intermediate.
+    @End Implementation
+    @Performance_Hints
+    O(used_a).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET. Caller-precondition violations (|a| < |b|) corrupt the
+    output; zint_sub dispatcher always feeds the correct order.
+    @End Security_Scope
+    Let ua be proc zint_get_used with a
+    Let mask be proc zint_limb_mask
+    Let bits be proc zint_limb_bits
+    Let radix be proc zint_limb_radix
+    Let cap be proc zint_get_capacity with out_z
+    If ua is greater than cap:
+        Return 0
+    End If
+    Let borrow be 0
+    Let i be 0
+    While i is less than ua:
+        Let la be proc zint_get_limb with a, i
+        Let lb be proc zint_get_limb with b, i
+        Let diff be la minus lb
+        Set diff to diff minus borrow
+        If diff is less than 0:
+            Set diff to diff plus radix
+            Set borrow to 1
+        Otherwise:
+            Set borrow to 0
+        End If
+        Let limb_val be diff bitwise_and mask
+        proc zint_set_limb with out_z, i, limb_val
+        Set i to i plus 1
+    End While
+    Note: borrow must be zero here because the caller guaranteed
+    Note: |a| >= |b|. Zero out trailing limbs within capacity.
+    Let j be ua
+    While j is less than cap:
+        proc zint_set_limb with out_z, j, 0
+        Set j to j plus 1
+    End While
+    Note: Commit used to the upper bound so the trim loop can read the
+    Note: limbs we just wrote via zint_get_limb (which guards on used).
+    proc zint_set_used with out_z, ua
+    Note: New used count: drop trailing zero limbs of the result.
+    Let new_used be ua
+    Let scanning be 1
+    While scanning is equal to 1:
+        If new_used is equal to 0:
+            Set scanning to 0
+        Otherwise:
+            Let top be proc zint_get_limb with out_z, new_used minus 1
+            If top is equal to 0:
+                Set new_used to new_used minus 1
+            Otherwise:
+                Set scanning to 0
+            End If
+        End If
+    End While
+    proc zint_set_used with out_z, new_used
+    Return 1
+End Process
+
+Process called "zint_add" takes out_z as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Signed addition: out = a + b. out may alias a or b (we read sign /
+    used from the operands first then overwrite limbs in-place safely
+    because addition writes limbs in increasing index order with carry
+    forward).
+    @End Reasoning
+    @Implementation
+    Same-sign:  add magnitudes, keep that sign.
+    Diff-sign:  subtract smaller magnitude from larger; sign is the
+                sign of the larger operand. If magnitudes are equal,
+                result is zero with sign 0.
+    @End Implementation
+    @Performance_Hints
+    O(max(used_a, used_b)).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let sa be proc zint_get_sign with a
+    Let sb be proc zint_get_sign with b
+    If sa is equal to sb:
+        proc zint_add_mag_into with out_z, a, b
+        proc zint_set_sign with out_z, sa
+        proc zint_normalize with out_z
+        Return 1
+    End If
+    Let cmp be proc zint_compare_magnitude with a, b
+    If cmp is equal to 0:
+        proc zint_set_zero with out_z
+        Return 1
+    End If
+    If cmp is greater than 0:
+        proc zint_sub_mag_into with out_z, a, b
+        proc zint_set_sign with out_z, sa
+    Otherwise:
+        proc zint_sub_mag_into with out_z, b, a
+        proc zint_set_sign with out_z, sb
+    End If
+    proc zint_normalize with out_z
+    Return 1
+End Process
+
+Process called "zint_sub" takes out_z as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Signed subtraction: out = a - b.
+    @End Reasoning
+    @Implementation
+    Diff-sign: add magnitudes, keep sign of a.
+    Same-sign: subtract magnitudes; sign is sign(a) if |a| > |b|,
+               opposite-of-sign(a) if |a| < |b|, zero if equal.
+    @End Implementation
+    @Performance_Hints
+    O(max(used_a, used_b)).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let sa be proc zint_get_sign with a
+    Let sb be proc zint_get_sign with b
+    If sa is not equal to sb:
+        proc zint_add_mag_into with out_z, a, b
+        proc zint_set_sign with out_z, sa
+        proc zint_normalize with out_z
+        Return 1
+    End If
+    Let cmp be proc zint_compare_magnitude with a, b
+    If cmp is equal to 0:
+        proc zint_set_zero with out_z
+        Return 1
+    End If
+    If cmp is greater than 0:
+        proc zint_sub_mag_into with out_z, a, b
+        proc zint_set_sign with out_z, sa
+    Otherwise:
+        proc zint_sub_mag_into with out_z, b, a
+        Let opp_sign be sa bitwise_xor 1
+        proc zint_set_sign with out_z, opp_sign
+    End If
+    proc zint_normalize with out_z
+    Return 1
+End Process
+
+Note:
+==============================================================================
+MULTIPLY
+==============================================================================
+Schoolbook for small inputs, Karatsuba for large ones. The threshold
+was picked so that the asymptotic crossover lines up with the typical
+NTRUSolve descent: at depth 0..5 the operands are small (under 16
+limbs) and schoolbook wins; at depth 6+ Karatsuba dominates.
+:End Note
+
+Process called "zint_karatsuba_threshold" returns Integer:
+    @Reasoning
+    Return the limb count above which Karatsuba multiplication is used
+    in preference to schoolbook.
+    @End Reasoning
+    @Implementation
+    Constant 32 (empirically near the crossover for 31-bit limbs).
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    Return 32
+End Process
+
+Process called "zint_mul_schoolbook" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Multiply zints a and b via O(used_a * used_b) schoolbook. Returns
+    a freshly allocated zint.
+    @End Reasoning
+    @Implementation
+    For each (i, j) accumulate la[i] * lb[j] into limb (i + j) of the
+    output, propagating carry through subsequent limbs. The product
+    of two 31-bit limbs fits in 62 bits, leaving 2 bits of carry slack
+    per partial product; we accumulate into an int64 accumulator and
+    flush low 31 bits + carry every inner iteration.
+    @End Implementation
+    @Performance_Hints
+    O(ua * ub). For ua = ub = 16 this is 256 multiplies.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET. Multiplications run unconditionally; the only data-dep
+    branch is the trailing-zero trim at the end.
+    @End Security_Scope
+    Let ua be proc zint_get_used with a
+    Let ub be proc zint_get_used with b
+    If ua is equal to 0:
+        Return proc zint_from_int with arena, 0
+    End If
+    If ub is equal to 0:
+        Return proc zint_from_int with arena, 0
+    End If
+    Let out_cap be ua plus ub plus 1
+    Let out_z be proc zint_create with arena, out_cap
+    If out_z is equal to 0:
+        Return 0
+    End If
+    Let mask be proc zint_limb_mask
+    Let bits be proc zint_limb_bits
+    Note: Pre-commit used = out_cap so the accumulator and trim loops
+    Note: can read intermediate limbs via zint_get_limb (which guards
+    Note: on used). The final used is reset below after the trim pass.
+    proc zint_set_used with out_z, out_cap
+    Let i be 0
+    While i is less than ua:
+        Let la be proc zint_get_limb with a, i
+        Let carry be 0
+        Let j be 0
+        While j is less than ub:
+            Let lb be proc zint_get_limb with b, j
+            Let dst_idx be i plus j
+            Let cur be proc zint_get_limb with out_z, dst_idx
+            Let prod be la multiplied by lb
+            Let total be prod plus cur
+            Set total to total plus carry
+            Let new_limb be total bitwise_and mask
+            Set carry to total shifted right by bits
+            proc zint_set_limb with out_z, dst_idx, new_limb
+            Set j to j plus 1
+        End While
+        Note: Propagate any leftover carry from this row.
+        Let k be i plus ub
+        While carry is not equal to 0:
+            Let cur2 be proc zint_get_limb with out_z, k
+            Let total2 be cur2 plus carry
+            Let masked_v be total2 bitwise_and mask
+            proc zint_set_limb with out_z, k, masked_v
+            Set carry to total2 shifted right by bits
+            Set k to k plus 1
+        End While
+        Set i to i plus 1
+    End While
+    Note: Compute final used count by trimming trailing zeros.
+    Let used be out_cap
+    Let scanning be 1
+    While scanning is equal to 1:
+        If used is equal to 0:
+            Set scanning to 0
+        Otherwise:
+            Let top be proc zint_get_limb with out_z, used minus 1
+            If top is equal to 0:
+                Set used to used minus 1
+            Otherwise:
+                Set scanning to 0
+            End If
+        End If
+    End While
+    proc zint_set_used with out_z, used
+    Let sa be proc zint_get_sign with a
+    Let sb be proc zint_get_sign with b
+    Let prod_sign be sa bitwise_xor sb
+    proc zint_set_sign with out_z, prod_sign
+    proc zint_normalize with out_z
+    Return out_z
+End Process
+
+Process called "zint_split_low_high" takes arena as Integer, src as Integer, half_limbs as Integer, low_out_ptr as Integer, high_out_ptr as Integer returns Integer:
+    @Reasoning
+    Split src into low half (first half_limbs limbs) and high half
+    (remaining limbs). Used by Karatsuba.
+    @End Reasoning
+    @Implementation
+    Allocate two zints; low gets limbs [0, half), high gets limbs
+    [half, used). Both are nonnegative.
+    @End Implementation
+    @Performance_Hints
+    O(used).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let used be proc zint_get_used with src
+    Let low_used be half_limbs
+    If low_used is greater than used:
+        Set low_used to used
+    End If
+    Let high_used be 0
+    If used is greater than half_limbs:
+        Set high_used to used minus half_limbs
+    End If
+    Let low_cap be low_used
+    If low_cap is less than 1:
+        Set low_cap to 1
+    End If
+    Let high_cap be high_used
+    If high_cap is less than 1:
+        Set high_cap to 1
+    End If
+    Let low_z be proc zint_create with arena, low_cap
+    Let high_z be proc zint_create with arena, high_cap
+    If high_z is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than low_used:
+        Let v be proc zint_get_limb with src, i
+        proc zint_set_limb with low_z, i, v
+        Set i to i plus 1
+    End While
+    proc zint_set_used with low_z, low_used
+    Let j be 0
+    While j is less than high_used:
+        Let v2 be proc zint_get_limb with src, half_limbs plus j
+        proc zint_set_limb with high_z, j, v2
+        Set j to j plus 1
+    End While
+    proc zint_set_used with high_z, high_used
+    proc zint_normalize with low_z
+    proc zint_normalize with high_z
+    Memory.memory_set_int64(low_out_ptr, 0, low_z)
+    Memory.memory_set_int64(high_out_ptr, 0, high_z)
+    Return 1
+End Process
+
+Process called "zint_shift_limbs_left" takes arena as Integer, src as Integer, limbs as Integer returns Integer:
+    @Reasoning
+    Multiply src by 2^(31*limbs) by prepending `limbs` zero limbs.
+    Returns a freshly allocated zint.
+    @End Reasoning
+    @Implementation
+    Allocate src.used + limbs limbs, leave low `limbs` limbs as zero,
+    copy src into the top.
+    @End Implementation
+    @Performance_Hints
+    O(src.used + limbs).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let used be proc zint_get_used with src
+    If used is equal to 0:
+        Return proc zint_from_int with arena, 0
+    End If
+    Let new_used be used plus limbs
+    Let dst be proc zint_create with arena, new_used
+    If dst is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than used:
+        Let v be proc zint_get_limb with src, i
+        proc zint_set_limb with dst, i plus limbs, v
+        Set i to i plus 1
+    End While
+    proc zint_set_used with dst, new_used
+    Let src_sign be proc zint_get_sign with src
+    proc zint_set_sign with dst, src_sign
+    proc zint_normalize with dst
+    Return dst
+End Process
+
+Process called "zint_mul_karatsuba" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Karatsuba multiplication: 3 multiplies of half-size operands plus
+    O(n) adds. Recurses down to schoolbook when both operands fit
+    within the schoolbook threshold.
+    @End Reasoning
+    @Implementation
+    Let n = max(used_a, used_b) / 2 rounded up. Split each operand
+    into (low, high) where high gets the top limbs. Then
+
+        a*b = high_a*high_b * B^(2n) + low_a*low_b
+              + ((high_a + low_a) * (high_b + low_b)
+                 - high_a*high_b - low_a*low_b) * B^n
+
+    Sign handling is collapsed into a single XOR after the unsigned
+    magnitude result is computed.
+    @End Implementation
+    @Performance_Hints
+    O(n^1.585). Crosses over schoolbook at ~32 limbs in our setting.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let ua be proc zint_get_used with a
+    Let ub be proc zint_get_used with b
+    Let threshold be proc zint_karatsuba_threshold
+    If ua is less than threshold:
+        Return proc zint_mul_schoolbook with arena, a, b
+    End If
+    If ub is less than threshold:
+        Return proc zint_mul_schoolbook with arena, a, b
+    End If
+    Let max_used be ua
+    If ub is greater than max_used:
+        Set max_used to ub
+    End If
+    Let half_limbs be (max_used plus 1) shifted right by 1
+
+    Let low_a_ptr be Arena.arena_allocate(arena, 8)
+    Let high_a_ptr be Arena.arena_allocate(arena, 8)
+    Let low_b_ptr be Arena.arena_allocate(arena, 8)
+    Let high_b_ptr be Arena.arena_allocate(arena, 8)
+    proc zint_split_low_high with arena, a, half_limbs, low_a_ptr, high_a_ptr
+    proc zint_split_low_high with arena, b, half_limbs, low_b_ptr, high_b_ptr
+    Let low_a be Memory.memory_get_int64(low_a_ptr, 0)
+    Let high_a be Memory.memory_get_int64(high_a_ptr, 0)
+    Let low_b be Memory.memory_get_int64(low_b_ptr, 0)
+    Let high_b be Memory.memory_get_int64(high_b_ptr, 0)
+
+    Note: Use unsigned magnitudes for the recursive multiplies; the
+    Note: sign of the final result is the XOR of the input signs.
+    proc zint_abs with low_a
+    proc zint_abs with high_a
+    proc zint_abs with low_b
+    proc zint_abs with high_b
+
+    Let z0 be proc zint_mul_karatsuba with arena, low_a, low_b
+    Let z2 be proc zint_mul_karatsuba with arena, high_a, high_b
+
+    Let sum_a_cap be (proc zint_get_used with low_a) plus (proc zint_get_used with high_a) plus 2
+    Let sum_b_cap be (proc zint_get_used with low_b) plus (proc zint_get_used with high_b) plus 2
+    Let sum_a be proc zint_create with arena, sum_a_cap
+    Let sum_b be proc zint_create with arena, sum_b_cap
+    proc zint_add with sum_a, low_a, high_a
+    proc zint_add with sum_b, low_b, high_b
+
+    Let z1_full be proc zint_mul_karatsuba with arena, sum_a, sum_b
+    Let z1_cap be proc zint_get_used with z1_full
+    Set z1_cap to z1_cap plus 2
+    Let z1 be proc zint_create with arena, z1_cap
+    proc zint_sub with z1, z1_full, z0
+    Let z1_tmp_cap be proc zint_get_used with z1
+    Set z1_tmp_cap to z1_tmp_cap plus 2
+    Let z1_tmp be proc zint_create with arena, z1_tmp_cap
+    proc zint_sub with z1_tmp, z1, z2
+    Set z1 to z1_tmp
+
+    Let z1_shifted be proc zint_shift_limbs_left with arena, z1, half_limbs
+    Let z2_shifted be proc zint_shift_limbs_left with arena, z2, half_limbs multiplied by 2
+
+    Let acc_cap be (proc zint_get_used with z2_shifted) plus 2
+    If (proc zint_get_used with z1_shifted) plus 2 is greater than acc_cap:
+        Set acc_cap to (proc zint_get_used with z1_shifted) plus 2
+    End If
+    If (proc zint_get_used with z0) plus 2 is greater than acc_cap:
+        Set acc_cap to (proc zint_get_used with z0) plus 2
+    End If
+    Let acc be proc zint_create with arena, acc_cap
+    proc zint_add with acc, z0, z1_shifted
+    Let acc2_cap be (proc zint_get_used with acc) plus 2
+    If (proc zint_get_used with z2_shifted) plus 2 is greater than acc2_cap:
+        Set acc2_cap to (proc zint_get_used with z2_shifted) plus 2
+    End If
+    Let acc2 be proc zint_create with arena, acc2_cap
+    proc zint_add with acc2, acc, z2_shifted
+
+    Let sa be proc zint_get_sign with a
+    Let sb be proc zint_get_sign with b
+    Let kar_sign be sa bitwise_xor sb
+    proc zint_set_sign with acc2, kar_sign
+    proc zint_normalize with acc2
+    Return acc2
+End Process
+
+Process called "zint_mul" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Public multiplication entry point. Dispatches to Karatsuba for
+    large operands and schoolbook for small ones.
+    @End Reasoning
+    @Implementation
+    Threshold check on max(used_a, used_b).
+    @End Implementation
+    @Performance_Hints
+    See zint_mul_karatsuba and zint_mul_schoolbook.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let ua be proc zint_get_used with a
+    Let ub be proc zint_get_used with b
+    Let mx be ua
+    If ub is greater than mx:
+        Set mx to ub
+    End If
+    Let threshold be proc zint_karatsuba_threshold
+    If mx is less than threshold:
+        Return proc zint_mul_schoolbook with arena, a, b
+    End If
+    Return proc zint_mul_karatsuba with arena, a, b
+End Process
+
+Note:
+==============================================================================
+SHIFTS
+==============================================================================
+:End Note
+
+Process called "zint_shift_left" takes arena as Integer, src as Integer, shift_bits as Integer returns Integer:
+    @Reasoning
+    Compute src * 2^shift_bits. Returns a fresh zint.
+    @End Reasoning
+    @Implementation
+    Decompose shift_bits = whole_limbs * 31 + bit_offset. First shift
+    by whole_limbs full limbs (free), then by bit_offset within each
+    limb. The bit-shift step splits each limb into low (bit_offset bits
+    pushed up) and high (carry into next limb).
+    @End Implementation
+    @Performance_Hints
+    O(used).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let used be proc zint_get_used with src
+    If used is equal to 0:
+        Return proc zint_from_int with arena, 0
+    End If
+    If shift_bits is equal to 0:
+        Return proc zint_copy with arena, src
+    End If
+    Let bits_per be proc zint_limb_bits
+    Let mask be proc zint_limb_mask
+    Let whole be shift_bits divided by bits_per
+    Let frac be shift_bits minus (whole multiplied by bits_per)
+    Let out_cap be used plus whole plus 2
+    Let dst be proc zint_create with arena, out_cap
+    If dst is equal to 0:
+        Return 0
+    End If
+    Let carry be 0
+    Let i be 0
+    While i is less than used:
+        Let v be proc zint_get_limb with src, i
+        Let shifted be (v shifted left by frac) bitwise_or carry
+        Let limb_val be shifted bitwise_and mask
+        Set carry to shifted shifted right by bits_per
+        proc zint_set_limb with dst, i plus whole, limb_val
+        Set i to i plus 1
+    End While
+    Let new_used be used plus whole
+    If carry is not equal to 0:
+        proc zint_set_limb with dst, new_used, carry
+        Set new_used to new_used plus 1
+    End If
+    proc zint_set_used with dst, new_used
+    Let src_sign be proc zint_get_sign with src
+    proc zint_set_sign with dst, src_sign
+    proc zint_normalize with dst
+    Return dst
+End Process
+
+Process called "zint_shift_left_one_inplace" takes z as Integer returns Integer:
+    @Reasoning
+    Shift z left by 1 bit, in place.  Assumes z has at least one spare
+    limb of capacity above used so that the carry-out can be absorbed
+    without reallocation.
+    @End Reasoning
+    @Implementation
+    Walk limbs lowest-first: new_limb = (old_limb << 1 | carry) & mask;
+    carry = old_limb >> 30 (the bit being shifted out).  After the loop,
+    if carry is nonzero, append it as a new top limb and bump used.
+    @End Implementation
+    @Performance_Hints
+    O(used).  Allocates nothing.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let used be proc zint_get_used with z
+    Let cap be proc zint_get_capacity with z
+    Let mask be proc zint_limb_mask
+    Let bits be proc zint_limb_bits
+    Let carry be 0
+    Let i be 0
+    While i is less than used:
+        Let v be proc zint_get_limb with z, i
+        Let shifted be (v shifted left by 1) bitwise_or carry
+        Let limb_val be shifted bitwise_and mask
+        Set carry to (v shifted right by (bits minus 1)) bitwise_and 1
+        proc zint_set_limb with z, i, limb_val
+        Set i to i plus 1
+    End While
+    If carry is not equal to 0:
+        If used is less than cap:
+            proc zint_set_limb with z, used, 1
+            proc zint_set_used with z, used plus 1
+        Otherwise:
+            Return 0
+        End If
+    End If
+    Return 1
+End Process
+
+Process called "zint_shift_right" takes arena as Integer, src as Integer, shift_bits as Integer returns Integer:
+    @Reasoning
+    Compute floor(|src| / 2^shift_bits) for nonnegative semantics on
+    magnitude, then restore the original sign. (Caller can layer
+    round-toward-zero or floor-division on top via zint_add/sub.)
+    @End Reasoning
+    @Implementation
+    Decompose shift_bits = whole * 31 + frac. Drop whole low limbs,
+    then within each surviving limb shift right by frac, OR with the
+    low bits of the next limb shifted up by (31 - frac).
+    @End Implementation
+    @Performance_Hints
+    O(used).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let used be proc zint_get_used with src
+    If used is equal to 0:
+        Return proc zint_from_int with arena, 0
+    End If
+    If shift_bits is equal to 0:
+        Return proc zint_copy with arena, src
+    End If
+    Let bits_per be proc zint_limb_bits
+    Let mask be proc zint_limb_mask
+    Let whole be shift_bits divided by bits_per
+    Let frac be shift_bits minus (whole multiplied by bits_per)
+    If whole is greater than or equal to used:
+        Return proc zint_from_int with arena, 0
+    End If
+    Let new_used be used minus whole
+    Let dst be proc zint_create with arena, new_used plus 1
+    If dst is equal to 0:
+        Return 0
+    End If
+    Let inv_frac be bits_per minus frac
+    Let i be 0
+    While i is less than new_used:
+        Let src_low be proc zint_get_limb with src, i plus whole
+        Let src_high be 0
+        If (i plus whole plus 1) is less than used:
+            Set src_high to proc zint_get_limb with src, i plus whole plus 1
+        End If
+        Let part_low be src_low shifted right by frac
+        Let part_high be 0
+        If frac is not equal to 0:
+            Set part_high to (src_high shifted left by inv_frac) bitwise_and mask
+        End If
+        Let limb_val be (part_low bitwise_or part_high) bitwise_and mask
+        proc zint_set_limb with dst, i, limb_val
+        Set i to i plus 1
+    End While
+    proc zint_set_used with dst, new_used
+    Let src_sign be proc zint_get_sign with src
+    proc zint_set_sign with dst, src_sign
+    proc zint_normalize with dst
+    Return dst
+End Process
+
+Note:
+==============================================================================
+DIVISION / MODULO
+==============================================================================
+
+Long division using the textbook subtract-and-shift algorithm. The
+quotient and remainder are computed simultaneously. Sign rules:
+truncated division (round toward zero), with the remainder taking the
+sign of the dividend.
+:End Note
+
+Process called "zint_divmod" takes arena as Integer, a as Integer, b as Integer, quot_out_ptr as Integer, rem_out_ptr as Integer returns Integer:
+    @Reasoning
+    Compute (quot, rem) with a = quot*b + rem, |rem| < |b|, sign(rem)
+    = sign(a). Returns 1 on success, 0 if b is zero.
+    @End Reasoning
+    @Implementation
+    Bit-serial long division:
+      r = 0
+      for bit i from msb(a) down to 0:
+        r = (r << 1) | bit_i(|a|)
+        if r >= |b|:
+          r -= |b|
+          set bit_i(quot) = 1
+    Sign post-pass: quot.sign = sa XOR sb (if any nonzero); rem.sign = sa.
+    @End Implementation
+    @Performance_Hints
+    O(bits(a) * limbs(b)). For Falcon NTRUSolve depth-9 (~2560 bits)
+    this is acceptable; the descent's hot inner loop is multiplication,
+    not division.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET. Bit-serial control flow leaks the bit length of the
+    operands, which is a Falcon-permitted leakage path.
+    @End Security_Scope
+    Let bits_b be proc zint_bit_length with b
+    If bits_b is equal to 0:
+        Return 0
+    End If
+    Let sa be proc zint_get_sign with a
+    Let sb be proc zint_get_sign with b
+    Let bits_a be proc zint_bit_length with a
+    Let bits_per be proc zint_limb_bits
+    Let quot_limbs be (bits_a divided by bits_per) plus 2
+    Let rem_limbs be (bits_b divided by bits_per) plus 2
+    Let quot be proc zint_create with arena, quot_limbs
+    Let rem be proc zint_create with arena, rem_limbs
+    proc zint_set_used with quot, 0
+    proc zint_set_used with rem, 0
+
+    Note: Take unsigned magnitudes (cheap: just clear sign).
+    Let abs_a be proc zint_copy with arena, a
+    Let abs_b be proc zint_copy with arena, b
+    proc zint_abs with abs_a
+    proc zint_abs with abs_b
+
+    Note: Initialise quot limbs to zero so we can OR bits in.
+    Let qi be 0
+    While qi is less than quot_limbs:
+        proc zint_set_limb with quot, qi, 0
+        Set qi to qi plus 1
+    End While
+    proc zint_set_used with quot, quot_limbs
+
+    Note: Bit-serial loop high bit to low bit of abs_a, all in place
+    Note: against the pre-allocated rem buffer.  No per-iteration zint
+    Note: allocations means the inner cost is purely arithmetic.
+    Let bit_i be bits_a minus 1
+    While bit_i is greater than or equal to 0:
+        Note: r <<= 1 (in place).
+        proc zint_shift_left_one_inplace with rem
+
+        Note: bit_a = (abs_a >> bit_i) & 1 by inspecting limb / position.
+        Let limb_idx be bit_i divided by bits_per
+        Let bit_idx be bit_i minus (limb_idx multiplied by bits_per)
+        Let la be proc zint_get_limb with abs_a, limb_idx
+        Let bit_a be (la shifted right by bit_idx) bitwise_and 1
+
+        Note: OR bit_a into rem's lowest limb.
+        If bit_a is equal to 1:
+            Let rem_used be proc zint_get_used with rem
+            If rem_used is equal to 0:
+                proc zint_set_limb with rem, 0, 1
+                proc zint_set_used with rem, 1
+            Otherwise:
+                Let r0 be proc zint_get_limb with rem, 0
+                Let new_r0 be r0 bitwise_or 1
+                proc zint_set_limb with rem, 0, new_r0
+            End If
+        End If
+
+        Note: if rem >= |b|, subtract abs_b from rem in place and set the
+        Note: quotient bit.
+        Let cmp be proc zint_compare_magnitude with rem, abs_b
+        If cmp is greater than or equal to 0:
+            proc zint_sub_mag_into with rem, rem, abs_b
+
+            Note: Set quotient bit bit_i = (limb_idx, bit_idx within limb).
+            Let q_limb be proc zint_get_limb with quot, limb_idx
+            Let bit_mask be 1 shifted left by bit_idx
+            Let new_q be q_limb bitwise_or bit_mask
+            proc zint_set_limb with quot, limb_idx, new_q
+        End If
+
+        Set bit_i to bit_i minus 1
+    End While
+
+    proc zint_normalize with quot
+    proc zint_normalize with rem
+    Let q_sign be sa bitwise_xor sb
+    If (proc zint_get_used with quot) is equal to 0:
+        Set q_sign to 0
+    End If
+    proc zint_set_sign with quot, q_sign
+    If (proc zint_get_used with rem) is equal to 0:
+        proc zint_set_sign with rem, 0
+    Otherwise:
+        proc zint_set_sign with rem, sa
+    End If
+
+    Memory.memory_set_int64(quot_out_ptr, 0, quot)
+    Memory.memory_set_int64(rem_out_ptr, 0, rem)
+    Return 1
+End Process
+
+Process called "zint_div" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Return quotient of a/b. Returns 0 (pointer) on division by zero.
+    @End Reasoning
+    @Implementation
+    Calls zint_divmod and discards remainder.
+    @End Implementation
+    @Performance_Hints
+    See zint_divmod.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let q_ptr be Arena.arena_allocate(arena, 8)
+    Let r_ptr be Arena.arena_allocate(arena, 8)
+    Let rc be proc zint_divmod with arena, a, b, q_ptr, r_ptr
+    If rc is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int64(q_ptr, 0)
+End Process
+
+Process called "zint_mod" takes arena as Integer, a as Integer, b as Integer returns Integer:
+    @Reasoning
+    Return remainder of a/b with sign of a.
+    @End Reasoning
+    @Implementation
+    Calls zint_divmod and discards quotient.
+    @End Implementation
+    @Performance_Hints
+    See zint_divmod.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let q_ptr be Arena.arena_allocate(arena, 8)
+    Let r_ptr be Arena.arena_allocate(arena, 8)
+    Let rc be proc zint_divmod with arena, a, b, q_ptr, r_ptr
+    If rc is equal to 0:
+        Return 0
+    End If
+    Return Memory.memory_get_int64(r_ptr, 0)
+End Process
+
+Note:
+==============================================================================
+END falcon_zint
+==============================================================================
+:End Note

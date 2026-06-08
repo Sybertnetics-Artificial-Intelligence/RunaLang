@@ -1,3 +1,5 @@
+.section .data
+
 .text
 print_string:
     pushq %rbp
@@ -38,8 +40,14 @@ print_integer:
     movq %rsp, %rbp
     subq $32, %rsp  # Space for string buffer (20 digits + null)
 
-    # Convert integer to string
+    # Convert integer to string (signed)
     movq %rdi, %rax  # integer value
+    xorq %r8, %r8    # r8 = 0 (negative flag)
+    testq %rax, %rax
+    jns .pi_not_negative
+    movq $1, %r8     # mark as negative
+    negq %rax        # make positive for conversion
+.pi_not_negative:
     leaq -32(%rbp), %rsi  # buffer pointer
     addq $19, %rsi  # point to end of buffer (for reverse building)
     movb $0, (%rsi)  # null terminator
@@ -65,6 +73,12 @@ print_integer:
 
 .convert_done:
     incq %rsi  # point to first character
+    # Prepend minus sign if negative
+    testq %r8, %r8
+    jz .pi_not_neg_print
+    decq %rsi
+    movb $45, (%rsi)  # '-' character
+.pi_not_neg_print:
 
     # Calculate string length
     movq %rsi, %rcx  # Counter for strlen
@@ -113,7 +127,7 @@ print_integer:
 hashtable_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1064, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -142,7 +156,7 @@ hashtable_create:
 hashtable_create_with_destructors:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1112, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -357,7 +371,7 @@ hashtable_create_with_destructors:
 hashtable_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1048, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -405,7 +419,7 @@ hashtable_destroy:
 hashtable_put:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1192, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -488,6 +502,24 @@ hashtable_put:
     movq -40(%rbp), %rax
     subq -64(%rbp), %rax
     movq %rax, -72(%rbp)
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L101
+    movq -72(%rbp), %rax
+    addq -48(%rbp), %rax
+    pushq %rax
+    leaq -72(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L102
+.L101:
+.L102:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -508,7 +540,7 @@ hashtable_put:
     movq %rax, -96(%rbp)
     movq $1, %rax
     movq %rax, -104(%rbp)
-.L101:    movq -104(%rbp), %rax
+.L111:    movq -104(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -516,7 +548,7 @@ hashtable_put:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L102
+    jz .L112
     movq -88(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -525,14 +557,14 @@ hashtable_put:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L111
+    jz .L121
     movq $0, %rax
     pushq %rax
     leaq -104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L112
-.L111:
+    jmp .L122
+.L121:
     movq $0, %rax
     pushq %rax
     movq -88(%rbp), %rax
@@ -568,7 +600,7 @@ hashtable_put:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L121
+    jz .L131
     movq $48, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -593,7 +625,7 @@ hashtable_put:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L131
+    jz .L141
     movq -144(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -602,7 +634,7 @@ hashtable_put:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L141
+    jz .L151
     movq -144(%rbp), %rax
     pushq %rax
     movq -136(%rbp), %rax
@@ -610,12 +642,12 @@ hashtable_put:
     popq %rdi
     popq %rsi
     call call_function_1
+    jmp .L152
+.L151:
+.L152:
     jmp .L142
 .L141:
 .L142:
-    jmp .L132
-.L131:
-.L132:
     movq -24(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -630,9 +662,9 @@ hashtable_put:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L122
-.L121:
-.L122:
+    jmp .L132
+.L131:
+.L132:
     movq -88(%rbp), %rax
     pushq %rax
     leaq -96(%rbp), %rbx
@@ -649,9 +681,9 @@ hashtable_put:
     leaq -88(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+.L122:
+    jmp .L111
 .L112:
-    jmp .L101
-.L102:
     movq $24, %rax
     pushq %rax
     popq %rdi
@@ -665,14 +697,14 @@ hashtable_put:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L151
+    jz .L161
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L152
-.L151:
-.L152:
+    jmp .L162
+.L161:
+.L162:
     movq -16(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -711,7 +743,7 @@ hashtable_put:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L161
+    jz .L171
     movq -152(%rbp), %rax
     pushq %rax
     movq $16, %rax
@@ -722,8 +754,8 @@ hashtable_put:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    jmp .L162
-.L161:
+    jmp .L172
+.L171:
     movq -152(%rbp), %rax
     pushq %rax
     movq -72(%rbp), %rax
@@ -734,7 +766,7 @@ hashtable_put:
     popq %rsi
     popq %rdx
     call memory_set_pointer_at_index@PLT
-.L162:
+.L172:
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -764,26 +796,10 @@ hashtable_put:
 hashtable_get:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1144, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L171
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L172
-.L171:
-.L172:
-    movq -16(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -799,6 +815,22 @@ hashtable_get:
     jmp .L182
 .L181:
 .L182:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L191
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L192
+.L191:
+.L192:
     movq $24, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -829,13 +861,13 @@ hashtable_get:
     movq %rax, %rcx
     popq %rax
     testq %rcx, %rcx
-    jz .Ldiv_by_zero_19
+    jz .Ldiv_by_zero_20
     cqto
     idivq %rcx
-    jmp .Ldiv_done_19
-.Ldiv_by_zero_19:
+    jmp .Ldiv_done_20
+.Ldiv_by_zero_20:
     movq $0, %rax
-.Ldiv_done_19:
+.Ldiv_done_20:
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rax
     pushq %rax
@@ -846,6 +878,24 @@ hashtable_get:
     movq -32(%rbp), %rax
     subq -56(%rbp), %rax
     movq %rax, -64(%rbp)
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L211
+    movq -64(%rbp), %rax
+    addq -40(%rbp), %rax
+    pushq %rax
+    leaq -64(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L212
+.L211:
+.L212:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -862,7 +912,7 @@ hashtable_get:
     popq %rsi
     call memory_get_pointer_at_index
     movq %rax, -80(%rbp)
-.L201:    movq -80(%rbp), %rax
+.L221:    movq -80(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -870,7 +920,7 @@ hashtable_get:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L202
+    jz .L222
     movq $0, %rax
     pushq %rax
     movq -80(%rbp), %rax
@@ -906,7 +956,7 @@ hashtable_get:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L211
+    jz .L231
     movq $8, %rax
     pushq %rax
     movq -80(%rbp), %rax
@@ -917,9 +967,9 @@ hashtable_get:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L212
-.L211:
-.L212:
+    jmp .L232
+.L231:
+.L232:
     movq $16, %rax
     pushq %rax
     movq -80(%rbp), %rax
@@ -931,8 +981,8 @@ hashtable_get:
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L201
-.L202:
+    jmp .L221
+.L222:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -943,7 +993,7 @@ hashtable_get:
 hashtable_remove:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1192, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -954,14 +1004,14 @@ hashtable_remove:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L221
+    jz .L241
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L222
-.L221:
-.L222:
+    jmp .L242
+.L241:
+.L242:
     movq -16(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -970,14 +1020,14 @@ hashtable_remove:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L231
+    jz .L251
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L232
-.L231:
-.L232:
+    jmp .L252
+.L251:
+.L252:
     movq $24, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1008,13 +1058,13 @@ hashtable_remove:
     movq %rax, %rcx
     popq %rax
     testq %rcx, %rcx
-    jz .Ldiv_by_zero_24
+    jz .Ldiv_by_zero_26
     cqto
     idivq %rcx
-    jmp .Ldiv_done_24
-.Ldiv_by_zero_24:
+    jmp .Ldiv_done_26
+.Ldiv_by_zero_26:
     movq $0, %rax
-.Ldiv_done_24:
+.Ldiv_done_26:
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rax
     pushq %rax
@@ -1025,6 +1075,24 @@ hashtable_remove:
     movq -32(%rbp), %rax
     subq -56(%rbp), %rax
     movq %rax, -64(%rbp)
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L271
+    movq -64(%rbp), %rax
+    addq -40(%rbp), %rax
+    pushq %rax
+    leaq -64(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L272
+.L271:
+.L272:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1043,7 +1111,7 @@ hashtable_remove:
     movq %rax, -80(%rbp)
     movq $0, %rax
     movq %rax, -88(%rbp)
-.L251:    movq -80(%rbp), %rax
+.L281:    movq -80(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1051,7 +1119,7 @@ hashtable_remove:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L252
+    jz .L282
     movq $0, %rax
     pushq %rax
     movq -80(%rbp), %rax
@@ -1087,7 +1155,7 @@ hashtable_remove:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L261
+    jz .L291
     movq $16, %rax
     pushq %rax
     movq -80(%rbp), %rax
@@ -1104,7 +1172,7 @@ hashtable_remove:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L271
+    jz .L301
     movq -120(%rbp), %rax
     pushq %rax
     movq $16, %rax
@@ -1115,8 +1183,8 @@ hashtable_remove:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    jmp .L272
-.L271:
+    jmp .L302
+.L301:
     movq -120(%rbp), %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -1127,7 +1195,7 @@ hashtable_remove:
     popq %rsi
     popq %rdx
     call memory_set_pointer_at_index@PLT
-.L272:
+.L302:
     movq $40, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1144,7 +1212,7 @@ hashtable_remove:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L281
+    jz .L311
     movq -96(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -1153,7 +1221,7 @@ hashtable_remove:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L291
+    jz .L321
     movq -96(%rbp), %rax
     pushq %rax
     movq -128(%rbp), %rax
@@ -1161,12 +1229,12 @@ hashtable_remove:
     popq %rdi
     popq %rsi
     call call_function_1
-    jmp .L292
-.L291:
-.L292:
-    jmp .L282
-.L281:
-.L282:
+    jmp .L322
+.L321:
+.L322:
+    jmp .L312
+.L311:
+.L312:
     movq $48, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1191,7 +1259,7 @@ hashtable_remove:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L301
+    jz .L331
     movq -144(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -1200,7 +1268,7 @@ hashtable_remove:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L311
+    jz .L341
     movq -144(%rbp), %rax
     pushq %rax
     movq -136(%rbp), %rax
@@ -1208,12 +1276,12 @@ hashtable_remove:
     popq %rdi
     popq %rsi
     call call_function_1
-    jmp .L312
-.L311:
-.L312:
-    jmp .L302
-.L301:
-.L302:
+    jmp .L342
+.L341:
+.L342:
+    jmp .L332
+.L331:
+.L332:
     movq -80(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -1241,9 +1309,9 @@ hashtable_remove:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L262
-.L261:
-.L262:
+    jmp .L292
+.L291:
+.L292:
     movq -80(%rbp), %rax
     pushq %rax
     leaq -88(%rbp), %rbx
@@ -1260,8 +1328,8 @@ hashtable_remove:
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L251
-.L252:
+    jmp .L281
+.L282:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1272,7 +1340,7 @@ hashtable_remove:
 hashtable_contains:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1064, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -1291,14 +1359,14 @@ hashtable_contains:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L321
+    jz .L351
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L322
-.L321:
-.L322:
+    jmp .L352
+.L351:
+.L352:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1309,7 +1377,7 @@ hashtable_contains:
 hashtable_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1048, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1319,7 +1387,7 @@ hashtable_size:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L331
+    jz .L361
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1330,9 +1398,9 @@ hashtable_size:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L332
-.L331:
-.L332:
+    jmp .L362
+.L361:
+.L362:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1343,7 +1411,7 @@ hashtable_size:
 hashtable_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1112, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1353,14 +1421,14 @@ hashtable_clear:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L341
+    jz .L371
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L342
-.L341:
-.L342:
+    jmp .L372
+.L371:
+.L372:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1395,7 +1463,7 @@ hashtable_clear:
     movq %rax, -40(%rbp)
     movq $0, %rax
     movq %rax, -48(%rbp)
-.L351:    movq -48(%rbp), %rax
+.L381:    movq -48(%rbp), %rax
     pushq %rax
     movq -16(%rbp), %rax
     popq %rbx
@@ -1403,7 +1471,7 @@ hashtable_clear:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L352
+    jz .L382
     movq -48(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -1412,7 +1480,7 @@ hashtable_clear:
     popq %rsi
     call memory_get_pointer_at_index
     movq %rax, -56(%rbp)
-.L361:    movq -56(%rbp), %rax
+.L391:    movq -56(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1420,7 +1488,7 @@ hashtable_clear:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L362
+    jz .L392
     movq $16, %rax
     pushq %rax
     movq -56(%rbp), %rax
@@ -1437,7 +1505,7 @@ hashtable_clear:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L371
+    jz .L401
     movq $0, %rax
     pushq %rax
     movq -56(%rbp), %rax
@@ -1454,7 +1522,7 @@ hashtable_clear:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L381
+    jz .L411
     movq -72(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -1462,12 +1530,12 @@ hashtable_clear:
     popq %rdi
     popq %rsi
     call call_function_1
-    jmp .L382
-.L381:
-.L382:
-    jmp .L372
-.L371:
-.L372:
+    jmp .L412
+.L411:
+.L412:
+    jmp .L402
+.L401:
+.L402:
     movq -40(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -1476,7 +1544,7 @@ hashtable_clear:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L391
+    jz .L421
     movq $8, %rax
     pushq %rax
     movq -56(%rbp), %rax
@@ -1493,7 +1561,7 @@ hashtable_clear:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L401
+    jz .L431
     movq -80(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -1501,12 +1569,12 @@ hashtable_clear:
     popq %rdi
     popq %rsi
     call call_function_1
-    jmp .L402
-.L401:
-.L402:
-    jmp .L392
-.L391:
-.L392:
+    jmp .L432
+.L431:
+.L432:
+    jmp .L422
+.L421:
+.L422:
     movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -1516,8 +1584,8 @@ hashtable_clear:
     leaq -56(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L361
-.L362:
+    jmp .L391
+.L392:
     movq $0, %rax
     pushq %rax
     movq -48(%rbp), %rax
@@ -1534,8 +1602,8 @@ hashtable_clear:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L351
-.L352:
+    jmp .L381
+.L382:
     movq $0, %rax
     pushq %rax
     movq $16, %rax
@@ -1556,7 +1624,7 @@ hashtable_clear:
 hashtable_iterator_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1080, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1566,14 +1634,14 @@ hashtable_iterator_create:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L411
+    jz .L441
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L412
-.L411:
-.L412:
+    jmp .L442
+.L441:
+.L442:
     movq $24, %rax
     pushq %rax
     popq %rdi
@@ -1587,14 +1655,14 @@ hashtable_iterator_create:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L421
+    jz .L451
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L422
-.L421:
-.L422:
+    jmp .L452
+.L451:
+.L452:
     movq -8(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -1643,7 +1711,7 @@ hashtable_iterator_create:
     movq %rax, -32(%rbp)
     movq $0, %rax
     movq %rax, -40(%rbp)
-.L431:    movq -40(%rbp), %rax
+.L461:    movq -40(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -1651,7 +1719,7 @@ hashtable_iterator_create:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L432
+    jz .L462
     movq -40(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -1668,7 +1736,7 @@ hashtable_iterator_create:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L441
+    jz .L471
     movq -40(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -1693,17 +1761,17 @@ hashtable_iterator_create:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L442
-.L441:
-.L442:
+    jmp .L472
+.L471:
+.L472:
     movq -40(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L431
-.L432:
+    jmp .L461
+.L462:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1714,7 +1782,7 @@ hashtable_iterator_create:
 hashtable_iterator_has_next:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1048, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1724,14 +1792,14 @@ hashtable_iterator_has_next:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L451
+    jz .L481
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L452
-.L451:
-.L452:
+    jmp .L482
+.L481:
+.L482:
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1748,14 +1816,14 @@ hashtable_iterator_has_next:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L461
+    jz .L491
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L462
-.L461:
-.L462:
+    jmp .L492
+.L491:
+.L492:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1766,79 +1834,11 @@ hashtable_iterator_has_next:
 hashtable_iterator_next:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1144, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
     movq -8(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L471
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L481
-    movq $0, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    jmp .L482
-.L481:
-.L482:
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L491
-    movq $0, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    jmp .L492
-.L491:
-.L492:
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L472
-.L471:
-.L472:
-    movq $16, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -32(%rbp)
-    movq -32(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1898,6 +1898,23 @@ hashtable_iterator_next:
     jmp .L502
 .L501:
 .L502:
+    movq $16, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -32(%rbp)
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L531
     movq -16(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -1906,7 +1923,58 @@ hashtable_iterator_next:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L531
+    jz .L541
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    jmp .L542
+.L541:
+.L542:
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L551
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    jmp .L552
+.L551:
+.L552:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L532
+.L531:
+.L532:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L561
     movq $0, %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -1925,9 +1993,9 @@ hashtable_iterator_next:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    jmp .L532
-.L531:
-.L532:
+    jmp .L562
+.L561:
+.L562:
     movq -24(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -1936,7 +2004,7 @@ hashtable_iterator_next:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L541
+    jz .L571
     movq $8, %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -1955,9 +2023,9 @@ hashtable_iterator_next:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    jmp .L542
-.L541:
-.L542:
+    jmp .L572
+.L571:
+.L572:
     movq $16, %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -1984,7 +2052,7 @@ hashtable_iterator_next:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L551
+    jz .L581
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2020,7 +2088,7 @@ hashtable_iterator_next:
     movq -88(%rbp), %rax
     addq $1, %rax
     movq %rax, -96(%rbp)
-.L561:    movq -96(%rbp), %rax
+.L591:    movq -96(%rbp), %rax
     pushq %rax
     movq -72(%rbp), %rax
     popq %rbx
@@ -2028,7 +2096,7 @@ hashtable_iterator_next:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L562
+    jz .L592
     movq -96(%rbp), %rax
     pushq %rax
     movq -80(%rbp), %rax
@@ -2045,7 +2113,7 @@ hashtable_iterator_next:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L571
+    jz .L601
     movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -2070,20 +2138,20 @@ hashtable_iterator_next:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L572
-.L571:
-.L572:
+    jmp .L602
+.L601:
+.L602:
     movq -96(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L561
-.L562:
-    jmp .L552
-.L551:
-.L552:
+    jmp .L591
+.L592:
+    jmp .L582
+.L581:
+.L582:
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -2094,7 +2162,7 @@ hashtable_iterator_next:
 hashtable_iterator_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1048, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2110,7 +2178,7 @@ hashtable_iterator_destroy:
 hash_string:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1080, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     movq %rax, -16(%rbp)
@@ -2126,7 +2194,7 @@ hash_string:
     movq %rax, -32(%rbp)
     movq $0, %rax
     movq %rax, -40(%rbp)
-.L581:    movq -32(%rbp), %rax
+.L611:    movq -32(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -2134,7 +2202,7 @@ hash_string:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L582
+    jz .L612
     movq -24(%rbp), %rax
     pushq %rax
     movq $32, %rax
@@ -2170,8 +2238,8 @@ hash_string:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L581
-.L582:
+    jmp .L611
+.L612:
     movq -24(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -2182,7 +2250,7 @@ hash_string:
 compare_strings:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1064, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -2201,14 +2269,14 @@ compare_strings:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L591
+    jz .L621
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L592
-.L591:
-.L592:
+    jmp .L622
+.L621:
+.L622:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -2219,7 +2287,7 @@ compare_strings:
 hash_integer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1080, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq $0, %rax
     pushq %rax
@@ -2246,13 +2314,13 @@ hash_integer:
     movq %rax, %rcx
     popq %rax
     testq %rcx, %rcx
-    jz .Ldiv_by_zero_60
+    jz .Ldiv_by_zero_63
     cqto
     idivq %rcx
-    jmp .Ldiv_done_60
-.Ldiv_by_zero_60:
+    jmp .Ldiv_done_63
+.Ldiv_by_zero_63:
     movq $0, %rax
-.Ldiv_done_60:
+.Ldiv_done_63:
     movq %rax, -32(%rbp)
     movq -16(%rbp), %rax
     addq -32(%rbp), %rax
@@ -2277,13 +2345,13 @@ hash_integer:
     movq %rax, %rcx
     popq %rax
     testq %rcx, %rcx
-    jz .Ldiv_by_zero_61
+    jz .Ldiv_by_zero_64
     cqto
     idivq %rcx
-    jmp .Ldiv_done_61
-.Ldiv_by_zero_61:
+    jmp .Ldiv_done_64
+.Ldiv_by_zero_64:
     movq $0, %rax
-.Ldiv_done_61:
+.Ldiv_done_64:
     movq %rax, -48(%rbp)
     movq -16(%rbp), %rax
     addq -48(%rbp), %rax
@@ -2299,16 +2367,16 @@ hash_integer:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L621
+    jz .L651
     movq $0, %rax
     subq -16(%rbp), %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L622
-.L621:
-.L622:
+    jmp .L652
+.L651:
+.L652:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -2319,7 +2387,7 @@ hash_integer:
 compare_integers:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1064, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -2346,14 +2414,14 @@ compare_integers:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L631
+    jz .L661
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L632
-.L631:
-.L632:
+    jmp .L662
+.L661:
+.L662:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -2364,7 +2432,7 @@ compare_integers:
 hash_pointer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1080, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     movq %rax, -16(%rbp)
@@ -2374,13 +2442,13 @@ hash_pointer:
     movq %rax, %rcx
     popq %rax
     testq %rcx, %rcx
-    jz .Ldiv_by_zero_64
+    jz .Ldiv_by_zero_67
     cqto
     idivq %rcx
-    jmp .Ldiv_done_64
-.Ldiv_by_zero_64:
+    jmp .Ldiv_done_67
+.Ldiv_by_zero_67:
     movq $0, %rax
-.Ldiv_done_64:
+.Ldiv_done_67:
     movq %rax, -24(%rbp)
     movq -16(%rbp), %rax
     addq -24(%rbp), %rax
@@ -2405,13 +2473,13 @@ hash_pointer:
     movq %rax, %rcx
     popq %rax
     testq %rcx, %rcx
-    jz .Ldiv_by_zero_65
+    jz .Ldiv_by_zero_68
     cqto
     idivq %rcx
-    jmp .Ldiv_done_65
-.Ldiv_by_zero_65:
+    jmp .Ldiv_done_68
+.Ldiv_by_zero_68:
     movq $0, %rax
-.Ldiv_done_65:
+.Ldiv_done_68:
     movq %rax, -40(%rbp)
     movq -16(%rbp), %rax
     addq -40(%rbp), %rax
@@ -2427,16 +2495,16 @@ hash_pointer:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L661
+    jz .L691
     movq $0, %rax
     subq -16(%rbp), %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L662
-.L661:
-.L662:
+    jmp .L692
+.L691:
+.L692:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -2447,7 +2515,7 @@ hash_pointer:
 compare_pointers:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1048, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2458,14 +2526,14 @@ compare_pointers:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L671
+    jz .L701
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L672
-.L671:
-.L672:
+    jmp .L702
+.L701:
+.L702:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -2476,7 +2544,7 @@ compare_pointers:
 hashtable_get_stats:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1144, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2487,7 +2555,7 @@ hashtable_get_stats:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L681
+    jz .L711
     movq $0, %rax
     pushq %rax
     movq $0, %rax
@@ -2552,9 +2620,9 @@ hashtable_get_stats:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L682
-.L681:
-.L682:
+    jmp .L712
+.L711:
+.L712:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2607,7 +2675,7 @@ hashtable_get_stats:
     movq %rax, -64(%rbp)
     movq $0, %rax
     movq %rax, -72(%rbp)
-.L691:    movq -72(%rbp), %rax
+.L721:    movq -72(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -2615,7 +2683,7 @@ hashtable_get_stats:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L692
+    jz .L722
     movq -72(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -2632,18 +2700,18 @@ hashtable_get_stats:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L701
+    jz .L731
     movq -64(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L702
-.L701:
+    jmp .L732
+.L731:
     movq $0, %rax
     movq %rax, -88(%rbp)
-.L711:    movq -80(%rbp), %rax
+.L741:    movq -80(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -2651,7 +2719,7 @@ hashtable_get_stats:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L712
+    jz .L742
     movq -88(%rbp), %rax
     addq $1, %rax
     pushq %rax
@@ -2669,8 +2737,8 @@ hashtable_get_stats:
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L711
-.L712:
+    jmp .L741
+.L742:
     movq -48(%rbp), %rax
     addq -88(%rbp), %rax
     pushq %rax
@@ -2685,24 +2753,24 @@ hashtable_get_stats:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L721
+    jz .L751
     movq -88(%rbp), %rax
     pushq %rax
     leaq -56(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L722
-.L721:
-.L722:
-.L702:
+    jmp .L752
+.L751:
+.L752:
+.L732:
     movq -72(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L691
-.L692:
+    jmp .L721
+.L722:
     movq -64(%rbp), %rax
     pushq %rax
     movq $16, %rax
@@ -2736,7 +2804,7 @@ hashtable_get_stats:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L731
+    jz .L761
     movq -48(%rbp), %rax
     pushq %rax
     movq $100, %rax
@@ -2752,20 +2820,20 @@ hashtable_get_stats:
     movq %rax, %rcx
     popq %rax
     testq %rcx, %rcx
-    jz .Ldiv_by_zero_74
+    jz .Ldiv_by_zero_77
     cqto
     idivq %rcx
-    jmp .Ldiv_done_74
-.Ldiv_by_zero_74:
+    jmp .Ldiv_done_77
+.Ldiv_by_zero_77:
     movq $0, %rax
-.Ldiv_done_74:
+.Ldiv_done_77:
     pushq %rax
     leaq -104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L732
-.L731:
-.L732:
+    jmp .L762
+.L761:
+.L762:
     movq -104(%rbp), %rax
     pushq %rax
     movq $32, %rax
@@ -2788,13 +2856,13 @@ hashtable_get_stats:
     movq %rax, %rcx
     popq %rax
     testq %rcx, %rcx
-    jz .Ldiv_by_zero_75
+    jz .Ldiv_by_zero_78
     cqto
     idivq %rcx
-    jmp .Ldiv_done_75
-.Ldiv_by_zero_75:
+    jmp .Ldiv_done_78
+.Ldiv_by_zero_78:
     movq $0, %rax
-.Ldiv_done_75:
+.Ldiv_done_78:
     pushq %rax
     leaq -112(%rbp), %rbx
     popq %rax
@@ -2819,7 +2887,7 @@ hashtable_get_stats:
 hashtable_print_stats:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1048, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq $48, %rax
     pushq %rax
@@ -2935,10 +3003,21 @@ hashtable_print_stats:
 call_function_1:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1064, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
+    movq %rax, -24(%rbp)
+
+            # func at -8(%rbp), arg1 at -16(%rbp), result at -24(%rbp).
+            # Load the single integer argument into %rdi per SystemV, the
+            # function pointer into %r11 (scratch), and indirect-call.
+            movq -16(%rbp), %rdi
+            movq -8(%rbp), %r11
+            callq *%r11
+            movq %rax, -24(%rbp)
+        
+    movq -24(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -2948,13 +3027,33 @@ call_function_1:
 call_function_2:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1064, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
     movq $0, %rax
+    movq %rax, -32(%rbp)
+
+            # func at -8(%rbp), arg1 at -16(%rbp), arg2 at -24(%rbp),
+            # result at -32(%rbp). Load both integer arguments into the
+            # SystemV registers, function pointer into %r11, indirect-call.
+            movq -16(%rbp), %rdi
+            movq -24(%rbp), %rsi
+            movq -8(%rbp), %r11
+            callq *%r11
+            movq %rax, -32(%rbp)
+        
+    movq -32(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
+    ret
+
+.weak __module_init
+__module_init:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $2056, %rsp  # Stack space for global initializer expression spills
+    leave
     ret
 
 .null_pointer_error:

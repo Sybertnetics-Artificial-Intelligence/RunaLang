@@ -100,10 +100,10 @@ Process called "keccak_round_constant" takes round_index as Integer returns Inte
         Return 0 minus 9223372034707292150
     End If
     If round_index is equal to 20:
-        Return 0 minus 9223372036854742912
+        Return 0 minus 9223372034707259263
     End If
     If round_index is equal to 21:
-        Return 0 minus 9223372036854775808
+        Return 0 minus 9223372036854742912
     End If
     If round_index is equal to 22:
         Return 2147483649
@@ -291,7 +291,7 @@ Process called "keccak_f1600" takes state as Integer, scratch_b as Integer, scra
                 Let b2_x be (x_idx plus 2) modulo by 5
                 Let b1 be proc memory_get_qword from Memory with scratch_b, y_idx3 multiplied by 40 plus b1_x multiplied by 8
                 Let b2 be proc memory_get_qword from Memory with scratch_b, y_idx3 multiplied by 40 plus b2_x multiplied by 8
-                Let not_b1 be b1 bitwise_xor 0 minus 1
+                Let not_b1 be b1 bitwise_xor (0 minus 1)
                 Let chi_term be not_b1 bitwise_and b2
                 Let final_value be b0 bitwise_xor chi_term
                 proc keccak_state_set with state, x_idx, y_idx3, final_value
@@ -442,4 +442,219 @@ Process called "keccak_256_hash" takes arena as Integer, message as Integer, mes
     Pure. Output buffer must be at least 32 bytes.
     @End Security_Scope
     Return proc sha3_hash_internal with arena, message, message_length, out_digest, 32, 136, 1
+End Process
+
+Note:
+==============================================================================
+SHAKE256 streaming API (init/absorb/finalize/squeeze/destroy)
+==============================================================================
+The SHAKE256 XOF maintains a 504-byte context laid out as:
+  offset    0..200 : Keccak state (5x5 lanes of 8 bytes = 200 bytes)
+  offset  200..400 : scratch_b for keccak_f1600 (200 bytes)
+  offset  400..440 : scratch_c for keccak_f1600 (40 bytes)
+  offset  440..480 : scratch_d for keccak_f1600 (40 bytes)
+  offset       480 : absorb_offset (qword)
+  offset       488 : squeeze_offset (qword)
+  offset       496 : mode (qword): 0 = ABSORB, 1 = SQUEEZE
+:End Note
+
+Process called "shake256_init" takes arena as Integer returns Integer:
+    @Reasoning
+    Allocates and zero-initializes a SHAKE256 sponge context.  Rate
+    = 1088 bits = 136 bytes, capacity = 512 bits, output XOF.  Mode
+    is left at 0 (ABSORB).  Returns the context pointer or 0 if
+    allocation fails.
+    @End Reasoning
+    @Implementation
+    Allocates 504 bytes from the arena and writes 0 into every byte.
+    @End Implementation
+    @Performance_Hints
+    O(1) allocation plus 504 byte writes.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-provided arena.
+    @End Security_Scope
+    Let ctx be proc arena_allocate from Arena with arena, 504
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than 504:
+        proc memory_set_byte from Memory with ctx, zi, 0
+        Set zi to zi plus 1
+    End While
+    Return ctx
+End Process
+
+Process called "shake256_absorb" takes ctx as Integer, data as Integer, length as Integer returns Integer:
+    @Reasoning
+    Streaming absorb into the sponge. Each byte is XORed into state[offset]
+    at the current absorb_offset, and when offset reaches rate=136 the
+    Keccak-f permutation runs and the offset resets to 0.  Refuses to
+    operate in SQUEEZE mode by returning 0.
+    @End Reasoning
+    @Implementation
+    Reads the current absorb_offset from offset 480 and walks every input
+    byte through the sponge.  Refuses to operate when mode != 0.
+    @End Implementation
+    @Performance_Hints
+    O(length) byte ops plus ceil(length / 136) Keccak-f permutations.
+    @End Performance_Hints
+    @Security_Scope
+    Input data may be SECRET.  Constant-time per byte.
+    @End Security_Scope
+    Let mode be proc memory_get_qword from Memory with ctx, 496
+    If mode is not equal to 0:
+        Return 0
+    End If
+    Let scratch_b be ctx plus 200
+    Let scratch_c be ctx plus 400
+    Let scratch_d be ctx plus 440
+    Let absorb_offset be proc memory_get_qword from Memory with ctx, 480
+    Let rate_bytes be 136
+    Let written be 0
+    While written is less than length:
+        Let src_b be proc memory_get_byte from Memory with data, written
+        Let state_b be proc memory_get_byte from Memory with ctx, absorb_offset
+        proc memory_set_byte from Memory with ctx, absorb_offset, state_b bitwise_xor src_b
+        Set absorb_offset to absorb_offset plus 1
+        If absorb_offset is equal to rate_bytes:
+            proc keccak_f1600 with ctx, scratch_b, scratch_c, scratch_d
+            Set absorb_offset to 0
+        End If
+        Set written to written plus 1
+    End While
+    proc memory_set_qword from Memory with ctx, 480, absorb_offset
+    Return length
+End Process
+
+Process called "shake256_finalize" takes ctx as Integer returns Integer:
+    @Reasoning
+    Applies the SHAKE domain pad (0x1F) at the current absorb offset and
+    the trailing 0x80 bit at the last byte of the rate, then permutes
+    the sponge once and transitions the context to SQUEEZE mode.
+    @End Reasoning
+    @Implementation
+    XORs 0x1F into state[absorb_offset], XORs 0x80 into state[135],
+    runs keccak_f1600, sets mode=1, resets squeeze_offset to 0.
+    Refuses to finalise twice by returning 0 if mode is already SQUEEZE.
+    @End Implementation
+    @Performance_Hints
+    One Keccak-f permutation plus two byte writes.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-owned context.
+    @End Security_Scope
+    Let mode be proc memory_get_qword from Memory with ctx, 496
+    If mode is not equal to 0:
+        Return 0
+    End If
+    Let scratch_b be ctx plus 200
+    Let scratch_c be ctx plus 400
+    Let scratch_d be ctx plus 440
+    Let absorb_offset be proc memory_get_qword from Memory with ctx, 480
+    Let pad_byte be proc memory_get_byte from Memory with ctx, absorb_offset
+    proc memory_set_byte from Memory with ctx, absorb_offset, pad_byte bitwise_xor 31
+    Let last_byte be proc memory_get_byte from Memory with ctx, 135
+    proc memory_set_byte from Memory with ctx, 135, last_byte bitwise_xor 128
+    proc keccak_f1600 with ctx, scratch_b, scratch_c, scratch_d
+    proc memory_set_qword from Memory with ctx, 488, 0
+    proc memory_set_qword from Memory with ctx, 496, 1
+    Return 1
+End Process
+
+Process called "shake256_squeeze" takes ctx as Integer, out as Integer, length as Integer returns Integer:
+    @Reasoning
+    Extracts length bytes from the sponge in SQUEEZE mode. After each
+    full 136-byte block consumed from state, Keccak-f permutes the
+    sponge to produce the next block of output.
+    @End Reasoning
+    @Implementation
+    Reads the current squeeze_offset from offset 488 and walks every
+    output byte. When squeeze_offset reaches rate=136, the sponge is
+    permuted and the offset resets to 0. Refuses to operate in ABSORB
+    mode by returning 0.
+    @End Implementation
+    @Performance_Hints
+    O(length) byte reads plus ceil(length / 136) Keccak-f permutations.
+    @End Performance_Hints
+    @Security_Scope
+    Output stream is SECRET when the absorbed material is SECRET.
+    @End Security_Scope
+    Let mode be proc memory_get_qword from Memory with ctx, 496
+    If mode is not equal to 1:
+        Return 0
+    End If
+    Let scratch_b be ctx plus 200
+    Let scratch_c be ctx plus 400
+    Let scratch_d be ctx plus 440
+    Let squeeze_offset be proc memory_get_qword from Memory with ctx, 488
+    Let rate_bytes be 136
+    Let written be 0
+    While written is less than length:
+        If squeeze_offset is equal to rate_bytes:
+            proc keccak_f1600 with ctx, scratch_b, scratch_c, scratch_d
+            Set squeeze_offset to 0
+        End If
+        Let sb be proc memory_get_byte from Memory with ctx, squeeze_offset
+        proc memory_set_byte from Memory with out, written, sb
+        Set squeeze_offset to squeeze_offset plus 1
+        Set written to written plus 1
+    End While
+    proc memory_set_qword from Memory with ctx, 488, squeeze_offset
+    Return length
+End Process
+
+Process called "shake256_destroy" takes ctx as Integer returns Integer:
+    @Reasoning
+    Wipes the sponge and offsets to deny rollback attacks if the same
+    arena memory is later reused. The arena owns the backing storage;
+    explicit free is not required because arena_destroy reclaims it.
+    @End Reasoning
+    @Implementation
+    Overwrites all 504 bytes with zero. The compiler must not elide
+    these stores because the address escapes through the caller.
+    @End Implementation
+    @Performance_Hints
+    O(1) - 504 byte writes.
+    @End Performance_Hints
+    @Security_Scope
+    Best-effort scrub. The arena allocator may keep additional copies.
+    @End Security_Scope
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let zi be 0
+    While zi is less than 504:
+        proc memory_set_byte from Memory with ctx, zi, 0
+        Set zi to zi plus 1
+    End While
+    Return 1
+End Process
+
+Process called "shake256_hash" takes arena as Integer, input as Integer, input_len as Integer, out as Integer, out_len as Integer returns Integer:
+    @Reasoning
+    Single-shot SHAKE256: init + absorb + finalize + squeeze + destroy.
+    Convenient for callers that have the entire input available at once
+    (Falcon seed expansion, hash-to-message, deterministic test vectors).
+    @End Reasoning
+    @Implementation
+    Delegates to the four streaming procs in order. Returns out_len on
+    success or 0 if the context allocation failed.
+    @End Implementation
+    @Performance_Hints
+    Same cost as the streaming form plus one allocation.
+    @End Performance_Hints
+    @Security_Scope
+    All inputs may be SECRET. Output buffer must be at least out_len bytes.
+    @End Security_Scope
+    Let ctx be proc shake256_init with arena
+    If ctx is equal to 0:
+        Return 0
+    End If
+    proc shake256_absorb with ctx, input, input_len
+    proc shake256_finalize with ctx
+    proc shake256_squeeze with ctx, out, out_len
+    proc shake256_destroy with ctx
+    Return out_len
 End Process

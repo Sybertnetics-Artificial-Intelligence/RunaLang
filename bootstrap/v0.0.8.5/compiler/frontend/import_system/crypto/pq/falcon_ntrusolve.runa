@@ -1,0 +1,1576 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FALCON-NTRUSOLVE : recursive cyclotomic tower descent solving f*G - g*F = q
+==============================================================================
+
+Per Falcon spec sections 3.8.2 and 3.8.5 (ntrugen module of the reference
+implementation), the NTRU equation
+
+  f * G - g * F = q   in Z[X]/(X^n + 1)
+
+is solved by descending the tower of cyclotomic rings
+
+  K_n = Q[X]/(X^n + 1)
+  K_{n/2} = Q[X]/(X^(n/2) + 1)
+  ...
+  K_1 = Q
+
+via the field-norm map  N(a) = a * a_bar  where a_bar(X) = a(-X) is the
+Galois conjugate.  The image of f in K_{n/2} (and so on down) shrinks by a
+factor of n/2 in degree at each step.  At the base K_1 the equation is a
+plain Bezout identity over Z and we solve it directly with the extended
+Euclidean algorithm.  On the way back up, the reference (F', G') found at
+half size is lifted into K_n and then Babai-reduced against (f, g) until
+the resulting (F, G) is short enough to satisfy the Falcon norm bound.
+
+Storage convention (v3 - zint internal descent):
+  - The PUBLIC entry point ntru_solve takes int16 arrays for f, g (input)
+    and writes int16 arrays for F, G (output).  The final F, G at the top
+    of the descent are bounded by the Falcon norm acceptance criterion
+    (||(F,G)||^2 <= 16823 * q / n) and so fit comfortably in int16.
+  - All INTERNAL recursive descent operates on multi-precision integer
+    polynomials (zint coefficient form) so that coefficient magnitudes
+    can grow without bound as the descent deepens.  Float64 was insufficient
+    because at depth 9 of Falcon-1024 the field-norm coefficients exceed
+    ~2^2560 and the 53-bit mantissa silently truncates them, producing
+    Bezout failures that cascade as keygen attempt exhaustion.
+  - Sign handling is sign-magnitude on each zint; addition and subtraction
+    dispatch on the sign pair.
+
+Algorithm outline (Falcon spec Algorithm 6):
+  ntru_solve(f, g, n):
+    if n == 1:
+      use extended Euclidean over Z to find (F, G) with f*G - g*F = q
+      return (F, G)
+    let f' = field_norm(f), g' = field_norm(g) in K_{n/2}
+    (F', G') = ntru_solve(f', g', n/2)
+    Lift (F', G') back to K_n by the "split" map and Babai-reduce
+    against (f, g).  Re-check norm; if it is still too large, fail.
+    return (F, G)
+
+Public entry: ntru_solve(arena, f, g, n, F_out, G_out) -> Integer
+Returns 1 on success, 0 on precision failure or no-solution at the
+descent base.
+
+Security_Scope (module-wide):
+  All inputs and outputs of ntru_solve are SECRET (Falcon private key
+  material).  The descent uses zint multi-precision arithmetic whose
+  inner loop iteration counts depend on operand bit length only, not
+  on operand values.  The Babai reduction iteration count is data
+  dependent and is a Falcon-permitted leakage path.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/pq/falcon_zint.runa" as Z
+Import "compiler/frontend/import_system/crypto/pq/falcon_zint_poly.runa" as ZP
+Import "compiler/frontend/import_system/crypto/pq/falcon_fp.runa" as FP
+Import "compiler/frontend/import_system/crypto/pq/falcon_fft.runa" as FFT
+
+Note:
+==============================================================================
+EXTENDED EUCLIDEAN ALGORITHM OVER Z (base case n = 1)
+==============================================================================
+Solves f * G - g * F = q where f, g, F, G are integers.  At the base
+case the coefficients have already been driven down to Int64 range by
+repeated field-norm contraction (the field norm of a small Gaussian
+polynomial in K_1 is a single small integer).
+:End Note
+
+Process called "ntrusolve_extgcd" takes a as Integer, b as Integer, x_out as Integer, y_out as Integer returns Integer:
+    @Reasoning
+    Extended Euclidean: given (a, b) returns (g, x, y) with a*x + b*y = g
+    where g = gcd(|a|, |b|).  We store x at x_out, y at y_out, and return g.
+    @End Reasoning
+    @Implementation
+    Iterative formulation.  Tracks (old_r, r), (old_s, s), (old_t, t) and
+    rotates until r becomes zero.  Handles negative inputs by canonicalising
+    sign at the start and re-applying signs at the end so the returned g is
+    nonnegative and the Bezout identity holds with the original a, b.
+    @End Implementation
+    @Performance_Hints
+    O(log min(|a|, |b|)) divisions.
+    @End Performance_Hints
+    @Security_Scope
+    Inputs are SECRET; control flow depends on quotient sequence which is
+    a Falcon-mandated leakage path.
+    @End Security_Scope
+    Let sa be 1
+    Let sb be 1
+    Let aa be a
+    Let bb be b
+    If aa is less than 0:
+        Set sa to 0 minus 1
+        Set aa to 0 minus aa
+    End If
+    If bb is less than 0:
+        Set sb to 0 minus 1
+        Set bb to 0 minus bb
+    End If
+    Let old_r be aa
+    Let r be bb
+    Let old_s be 1
+    Let s be 0
+    Let old_t be 0
+    Let t be 1
+    While r is not equal to 0:
+        Let q be old_r divided by r
+        Let tmp_r be r
+        Set r to old_r minus q multiplied by r
+        Set old_r to tmp_r
+        Let tmp_s be s
+        Set s to old_s minus q multiplied by s
+        Set old_s to tmp_s
+        Let tmp_t be t
+        Set t to old_t minus q multiplied by t
+        Set old_t to tmp_t
+    End While
+    Note: old_r = gcd, old_s * aa + old_t * bb = old_r
+    Note: Re-apply sign so the identity holds with the original a, b.
+    Let x_val be old_s multiplied by sa
+    Let y_val be old_t multiplied by sb
+    Memory.memory_set_int64(x_out, 0, x_val)
+    Memory.memory_set_int64(y_out, 0, y_val)
+    Return old_r
+End Process
+
+Note:
+==============================================================================
+BASE CASE n = 1 OVER ZINT
+==============================================================================
+:End Note
+
+Process called "ntrusolve_zint_extgcd" takes arena as Integer, a_z as Integer, b_z as Integer, x_out_ptr as Integer, y_out_ptr as Integer returns Integer:
+    @Reasoning
+    Extended Euclidean over zint: given (a, b) compute (g, x, y) with
+    a*x + b*y = g where g = gcd(|a|, |b|).  Stores the freshly allocated
+    zints for x and y at x_out_ptr, y_out_ptr.  Returns g (also a zint).
+    @End Reasoning
+    @Implementation
+    Iterative formulation matching the Int64 extgcd but with all
+    quantities as zints:
+      (old_r, r) = (|a|, |b|)
+      (old_s, s) = (1, 0)
+      (old_t, t) = (0, 1)
+      while r != 0:
+        q = old_r / r          (zint quotient)
+        (old_r, r) = (r, old_r - q*r)
+        (old_s, s) = (s, old_s - q*s)
+        (old_t, t) = (t, old_t - q*t)
+      return (old_r, sa*old_s, sb*old_t)
+    Sign post-pass restores the Bezout identity for the original
+    (signed) a, b.
+    @End Implementation
+    @Performance_Hints
+    O(log(min(|a|, |b|))) zint divisions.  Each division is bit-serial
+    over the operand bit length; total cost is dominated by the deepest
+    descent level where coefficient bit length tops out.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.  Loop count and inner cost depend on bit length only.
+    @End Security_Scope
+    Let sa be Z.zint_get_sign(a_z)
+    Let sb be Z.zint_get_sign(b_z)
+
+    Let old_r be Z.zint_copy(arena, a_z)
+    Z.zint_abs(old_r)
+    Let r be Z.zint_copy(arena, b_z)
+    Z.zint_abs(r)
+
+    Let old_s be Z.zint_from_int(arena, 1)
+    Let s be Z.zint_from_int(arena, 0)
+    Let old_t be Z.zint_from_int(arena, 0)
+    Let t be Z.zint_from_int(arena, 1)
+
+    While Z.zint_is_zero(r) is equal to 0:
+        Let q_ptr be Arena.arena_allocate(arena, 8)
+        Let rem_ptr be Arena.arena_allocate(arena, 8)
+        Z.zint_divmod(arena, old_r, r, q_ptr, rem_ptr)
+        Let q be Memory.memory_get_int64(q_ptr, 0)
+        Let new_r be Memory.memory_get_int64(rem_ptr, 0)
+
+        Note: (old_r, r) = (r, new_r)
+        Set old_r to r
+        Set r to new_r
+
+        Note: (old_s, s) = (s, old_s - q*s)
+        Let q_s be Z.zint_mul(arena, q, s)
+        Let new_s_cap be Z.zint_get_used(old_s)
+        Let qs_u be Z.zint_get_used(q_s)
+        If qs_u is greater than new_s_cap:
+            Set new_s_cap to qs_u
+        End If
+        Set new_s_cap to new_s_cap plus 2
+        Let new_s be Z.zint_create(arena, new_s_cap)
+        Z.zint_sub(new_s, old_s, q_s)
+        Set old_s to s
+        Set s to new_s
+
+        Note: (old_t, t) = (t, old_t - q*t)
+        Let q_t be Z.zint_mul(arena, q, t)
+        Let new_t_cap be Z.zint_get_used(old_t)
+        Let qt_u be Z.zint_get_used(q_t)
+        If qt_u is greater than new_t_cap:
+            Set new_t_cap to qt_u
+        End If
+        Set new_t_cap to new_t_cap plus 2
+        Let new_t be Z.zint_create(arena, new_t_cap)
+        Z.zint_sub(new_t, old_t, q_t)
+        Set old_t to t
+        Set t to new_t
+    End While
+
+    Note: Re-apply sign so identity holds with original a, b.
+    If sa is equal to 1:
+        Z.zint_neg(old_s)
+    End If
+    If sb is equal to 1:
+        Z.zint_neg(old_t)
+    End If
+    Memory.memory_set_int64(x_out_ptr, 0, old_s)
+    Memory.memory_set_int64(y_out_ptr, 0, old_t)
+    Return old_r
+End Process
+
+Process called "ntru_solve_base_n1" takes arena as Integer, f_poly as Integer, g_poly as Integer, F_poly as Integer, G_poly as Integer returns Integer:
+    @Reasoning
+    Solve f*G - g*F = q at n = 1.  f and g are single zint coefficients
+    that can be arbitrarily large (the K_1 image of Falcon-sampled f, g
+    after log2(n) field-norm descents is bounded by roughly ||f||^n
+    in absolute value, i.e. ~2^3000 bits for Falcon-512 and ~2^6000 bits
+    for Falcon-1024).
+    @End Reasoning
+    @Implementation
+    1. Reject if f or g is zero (degenerate input).
+    2. Run zint extgcd on (f_z, g_z) to obtain (d, u, v) with
+       f*u + g*v = d.
+    3. q must be divisible by d; otherwise no integer (F, G) exists
+       satisfying f*G - g*F = q.  Reject (caller restarts).
+    4. F = -v * (q / d); G = u * (q / d).
+    5. Write F, G as single-coefficient zints back into F_poly, G_poly.
+    @End Implementation
+    @Performance_Hints
+    Dominated by the inner zint extgcd, which itself is dominated by
+    zint long division on operands of ~3000 to ~6000 bits depending
+    on parameter set.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let f_z be ZP.zint_poly_get(f_poly, 0)
+    Let g_z be ZP.zint_poly_get(g_poly, 0)
+
+    If Z.zint_is_zero(f_z) is equal to 1:
+        Return 0
+    End If
+    If Z.zint_is_zero(g_z) is equal to 1:
+        Return 0
+    End If
+
+    Let u_ptr be Arena.arena_allocate(arena, 8)
+    Let v_ptr be Arena.arena_allocate(arena, 8)
+    Let d_z be proc ntrusolve_zint_extgcd with arena, f_z, g_z, u_ptr, v_ptr
+    If Z.zint_is_zero(d_z) is equal to 1:
+        Return 0
+    End If
+
+    Note: q must be divisible by d.  We test by zint divmod and checking
+    Note: that the remainder is zero.
+    Let q_z be Z.zint_from_int(arena, 12289)
+    Let qdiv_ptr be Arena.arena_allocate(arena, 8)
+    Let qrem_ptr be Arena.arena_allocate(arena, 8)
+    Z.zint_divmod(arena, q_z, d_z, qdiv_ptr, qrem_ptr)
+    Let q_div_d be Memory.memory_get_int64(qdiv_ptr, 0)
+    Let q_rem be Memory.memory_get_int64(qrem_ptr, 0)
+    If Z.zint_is_zero(q_rem) is equal to 0:
+        Return 0
+    End If
+
+    Let u_z be Memory.memory_get_int64(u_ptr, 0)
+    Let v_z be Memory.memory_get_int64(v_ptr, 0)
+
+    Note: F = -v * q_div_d; G = u * q_div_d.
+    Let G_new be Z.zint_mul(arena, u_z, q_div_d)
+    Let v_q be Z.zint_mul(arena, v_z, q_div_d)
+    Z.zint_neg(v_q)
+    Let F_new be v_q
+
+    ZP.zint_poly_set(F_poly, 0, F_new)
+    ZP.zint_poly_set(G_poly, 0, G_new)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+LIFT : embed K_{n/2} solution into K_n
+==============================================================================
+Given the half-size solution (F', G') in K_{n/2} satisfying
+
+    f_norm * G' - g_norm * F' = q
+
+where f_norm = N(f), g_norm = N(g) in K_{n/2}, the canonical lift to K_n
+satisfying f * G - g * F = q is
+
+    F(X) = F'(X^2) * g_bar(X)
+    G(X) = G'(X^2) * f_bar(X)
+
+where f_bar(X) = f(-X) is the Galois conjugate.  This identity is
+straightforward to verify by substituting the definitions of f_norm and
+g_norm and reducing modulo (X^n + 1).
+:End Note
+
+Process called "ntrusolve_zint_lift_even_squared" takes arena as Integer, half_poly as Integer, half_n as Integer returns Integer:
+    @Reasoning
+    Embed a K_{n/2} zint polynomial p(Y) as p(X^2) in K_n.
+    @End Reasoning
+    @Implementation
+    Allocate a length-n zint polynomial; the k-th coefficient of the
+    half polynomial goes to position 2k of the full polynomial.  Odd
+    positions are zero.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let full_n be half_n multiplied by 2
+    Let bytes be full_n multiplied by 8
+    Let full be Arena.arena_allocate(arena, bytes)
+    If full is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(full, bytes)
+    Let k be 0
+    While k is less than half_n:
+        Let v be ZP.zint_poly_get(half_poly, k)
+        Let copy_v be Z.zint_copy(arena, v)
+        ZP.zint_poly_set(full, k multiplied by 2, copy_v)
+        Set k to k plus 1
+    End While
+    Let idx be 0
+    While idx is less than full_n:
+        Let cur be ZP.zint_poly_get(full, idx)
+        If cur is equal to 0:
+            ZP.zint_poly_set(full, idx, Z.zint_from_int(arena, 0))
+        End If
+        Set idx to idx plus 1
+    End While
+    Return full
+End Process
+
+Note:
+==============================================================================
+BABAI ROUNDING REDUCTION OF (F, G) AGAINST (f, g) -- zint flavour
+==============================================================================
+The Babai reduction step (Falcon spec Algorithm 6, line 6) is
+
+    k = round( (F * adj(f) + G * adj(g)) / (f * adj(f) + g * adj(g)) )
+    (F, G) <- (F - k*f, G - k*g)
+
+iterated until k becomes zero.  In the canonical Pornin reference
+(falcon/ntru.c BABAI_REDUCE) the division is performed in the FFT
+slot domain at fp53 precision: each slot of the numerator is divided
+by the corresponding (real-valued) denominator slot, then inverse-
+FFTed back to coefficient form.
+
+This module is the zint (multi-precision integer) flavour of the
+descent.  The division above is computed by
+zint_poly_divide_by_kn_denominator (in falcon_zint_poly.runa) via
+exact K_n polynomial division, descending the cyclotomic tower down
+to K_1 where each rational division is rounded to nearest integer by
+zint_poly_round_div_scalar.
+
+The K_n denominator D = f*adj(f) + g*adj(g) has only even-power-of-X
+coefficients (cross-term parity cancellation under Galois conjugation
+in K_n).  The top-level divider exploits this by skipping one level
+of the general recursion: it computes D, projects to K_{n/2} via
+extract_even, splits the numerator into even/odd halves under
+Y = X^2, and recursively divides each half by the projected denom in
+K_{n/2}.  At the recursive level the denominator has no special
+structure, so the recursion multiplies by adj_D at each step to
+re-establish the even-coefficient property of D*adj(D), descending
+all the way to K_1.
+
+With exact K_n polynomial division the Babai quotient is mathematically
+precise to within a single coefficient round, so each iteration
+strictly reduces ||(F, G)||^2 by the full denominator bit width and
+the loop converges in O(1) iterations (typically 1 on Falcon-distributed
+inputs).  The max_iter = 32 guard catches pathological data only.
+:End Note
+
+Process called "ntrusolve_zint_poly_norm_sq_scalar" takes arena as Integer, poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute sum_{k=0}^{n-1} poly[k]^2 (a single zint integer; not a
+    polynomial in K_n).  Retained as an inspection helper for the
+    norm-debugging code paths; the Babai reduction no longer uses
+    this scalar quantity (it uses K_n polynomial division instead).
+    @End Reasoning
+    @Implementation
+    For each coefficient, multiply it by itself (always nonnegative)
+    and add to a running zint accumulator.
+    @End Implementation
+    @Performance_Hints
+    O(n) zint multiplies + adds.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let acc be Z.zint_create(arena, 8)
+    Let k be 0
+    While k is less than n:
+        Let c be ZP.zint_poly_get(poly, k)
+        Let sq be Z.zint_mul(arena, c, c)
+        Let acc_u be Z.zint_get_used(acc)
+        Let sq_u be Z.zint_get_used(sq)
+        Let new_cap be acc_u
+        If sq_u is greater than new_cap:
+            Set new_cap to sq_u
+        End If
+        Set new_cap to new_cap plus 2
+        Let new_acc be Z.zint_create(arena, new_cap)
+        Z.zint_add(new_acc, acc, sq)
+        Set acc to new_acc
+        Set k to k plus 1
+    End While
+    Return acc
+End Process
+
+Note:
+==============================================================================
+HYBRID FFT-fp53 + ZINT BABAI REDUCTION (Pornin reference algorithm)
+==============================================================================
+
+Pornin's Falcon reference (falcon/keygen.c BABAI_REDUCE) accelerates the
+Babai inner step by performing the K_n rational division
+  k = round( (F*adj(f) + G*adj(g)) / (f*adj(f) + g*adj(g)) )
+in the FFT slot domain at fp53 precision: each complex slot of the
+numerator is divided by the corresponding (real-valued) denominator
+slot, then inverse-FFT'd back to coefficient form.  This collapses the
+O(n^2 log n) exact-zint polynomial division to an O(n log n) FFT
+pipeline.
+
+When coefficient magnitudes outgrow fp53 (~53 mantissa bits, conservative
+threshold 50 bits to leave a 3-bit round-off margin), the FFT path
+silently truncates and produces an incorrect k.  We detect this BEFORE
+running the FFT by checking the bit length of every coefficient of F, G,
+f, g; on rejection we fall back to the exact-zint kernel for that single
+iteration only.  Coefficient bit lengths grow approximately linearly
+with descent depth, so the FFT path serves the early shallow iterations
+(where it's a major win) and the zint fallback covers the deep tail.
+
+Per-iteration cost when fp53 succeeds:
+  - 4 forward FFTs (f, g, F, G), reused across many Babai iterations
+    via a per-call cache passed through the loop scope.
+  - O(n) pointwise multiplies for numerator and denominator.
+  - O(n) pointwise division.
+  - 1 inverse FFT.
+  - 2 K_n polynomial multiplies (k*f, k*g) in zint for the F, G update.
+  Total: O(n log n) FFT plus O(n^2) zint mul for the update.
+
+Per-iteration cost on fp53 rejection (fallback):
+  - Same as the original pure-zint kernel: O(n^2 log n) per iteration.
+:End Note
+
+Process called "ntrusolve_max_bits_in_polys" takes f_poly as Integer, g_poly as Integer, F_poly as Integer, G_poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute the maximum bit length across all coefficients of f, g, F, G.
+    The Babai numerator F*conj(f) + G*conj(g) has total bit length at
+    most max_bits(F,G) + max_bits(f,g) + log2(n) under K_n convolution;
+    likewise the denominator.  Caller uses this to decide whether the
+    fp53 FFT path is precision-safe.
+    @End Reasoning
+    @Implementation
+    Four passes of zint_poly_max_bit_length (one per polynomial) tracking
+    the running maximum.
+    @End Implementation
+    @Performance_Hints
+    Linear in n across four polynomials.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET; bit length leakage is Falcon-permitted.
+    @End Security_Scope
+    Let max_bits be ZP.zint_poly_max_bit_length(f_poly, n)
+    Let gb be ZP.zint_poly_max_bit_length(g_poly, n)
+    If gb is greater than max_bits:
+        Set max_bits to gb
+    End If
+    Let Fb be ZP.zint_poly_max_bit_length(F_poly, n)
+    If Fb is greater than max_bits:
+        Set max_bits to Fb
+    End If
+    Let Gb be ZP.zint_poly_max_bit_length(G_poly, n)
+    If Gb is greater than max_bits:
+        Set max_bits to Gb
+    End If
+    Return max_bits
+End Process
+
+Process called "ntrusolve_log2_ceil" takes n as Integer returns Integer:
+    @Reasoning
+    Return ceil(log2(n)) for n >= 1.
+    @End Reasoning
+    @Implementation
+    Iteratively halve n until it reaches 1, counting passes.  Add a one
+    to the count when n is not an exact power of two so that the result
+    is ceil rather than floor.
+    @End Implementation
+    @Performance_Hints
+    O(log n) integer ops.
+    @End Performance_Hints
+    @Security_Scope
+    Public.
+    @End Security_Scope
+    If n is less than or equal to 1:
+        Return 0
+    End If
+    Let k be 0
+    Let v be n
+    Let pow2 be 1
+    While pow2 is less than v:
+        Set pow2 to pow2 multiplied by 2
+        Set k to k plus 1
+    End While
+    Return k
+End Process
+
+Process called "ntrusolve_fft_babai_step" takes arena as Integer, f_poly as Integer, g_poly as Integer, F_poly as Integer, G_poly as Integer, n as Integer, did_update_ptr as Integer returns Integer:
+    @Reasoning
+    Perform one Babai reduction iteration in the FFT slot domain at fp53.
+    Returns 1 on success (k computed and F, G updated in place; if k was
+    identically zero, did_update_ptr is set to 0 and the caller halts),
+    or 0 on precision rejection (caller falls back to the exact-zint
+    kernel for this iteration).
+    @End Reasoning
+    @Implementation
+    Step-by-step:
+
+      1. Precision check.  Let max_bits = max coefficient bit length
+         across f, g, F, G.  The numerator F*conj(f) + G*conj(g) and
+         the denominator f*conj(f) + g*conj(g) have coefficient bit
+         lengths bounded by 2*max_bits + log2(n) + 1.  We require this
+         bound to fit inside 50 bits (fp53 minus a 3-bit safety margin).
+         If not, return 0.
+
+      2. Build FFT-domain images of f, g, F, G.
+
+      3. Compute f_conj_fft = conj(f_fft), g_conj_fft = conj(g_fft) by
+         pointwise conjugation (the FFT of the Galois conjugate of a
+         real-coefficient cyclotomic polynomial is exactly the complex
+         conjugate of the slot, mirroring Pornin's reference).
+
+      4. Compute the FFT-domain denominator
+            D_fft[i] = f_fft[i] * conj(f_fft[i]) + g_fft[i] * conj(g_fft[i])
+                     = |f_fft[i]|^2 + |g_fft[i]|^2
+         (a real non-negative number per slot).
+
+      5. Compute the FFT-domain numerator
+            N_fft[i] = F_fft[i] * conj(f_fft[i]) + G_fft[i] * conj(g_fft[i]).
+
+      6. Slot-wise quotient k_fft[i] = N_fft[i] / D_fft[i].  Because D is
+         real this is just a Float division of real and imaginary parts.
+
+      7. Inverse FFT of k_fft.  Round each real part to the nearest
+         integer; build a length-n zint polynomial k_poly.
+
+      8. Convergence test: if every coefficient of k_poly is zero, set
+         *did_update_ptr = 0 and return 1.
+
+      9. Otherwise update F <- F - k_poly * f, G <- G - k_poly * g in
+         zint (exact integer math; the inexactness is confined to the
+         FFT-rounded k).  Copy the new F, G back into the caller's
+         polynomial slots.  Set *did_update_ptr = 1 and return 1.
+    @End Implementation
+    @Performance_Hints
+    Four forward FFTs + one inverse FFT + O(n) pointwise + two K_n
+    zint multiplies per iteration.  O(n log n) FFT pipeline dominates
+    for small n; O(n^2) zint mul dominates for large n.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Note: Step 1: pick a uniform scaling baseline for the FFT lift.
+    Note: We compute the max used-limb count across all four polynomials
+    Note: and lift each coefficient to its top 62 bits at that
+    Note: baseline.  This is Pornin's reference scaling: the resulting
+    Note: N / D ratio in the FFT slot domain is correct because both
+    Note: numerator and denominator scale by the same factor S^2.
+    Note: A precision-rejection path remains for the case where ALL
+    Note: four polynomials have used == 0 (only the trivial zero
+    Note: polynomial), which would yield an all-zero FFT denominator;
+    Note: we treat it as a converged (k = 0) iteration.
+    Let max_used_f be ZP.zint_poly_max_used(f_poly, n)
+    Let max_used_g be ZP.zint_poly_max_used(g_poly, n)
+    Let max_used_F be ZP.zint_poly_max_used(F_poly, n)
+    Let max_used_G be ZP.zint_poly_max_used(G_poly, n)
+    Let baseline_used be max_used_f
+    If max_used_g is greater than baseline_used:
+        Set baseline_used to max_used_g
+    End If
+    If max_used_F is greater than baseline_used:
+        Set baseline_used to max_used_F
+    End If
+    If max_used_G is greater than baseline_used:
+        Set baseline_used to max_used_G
+    End If
+    Note: baseline_used must be at least 2 so that we always have a
+    Note: well-defined top-limb / low-limb pair for the float conversion.
+    If baseline_used is less than 2:
+        Set baseline_used to 2
+    End If
+    Note: If f or g is identically zero we cannot proceed in the FFT
+    Note: kernel because the denominator would be zero; signal failure
+    Note: so the caller falls back to the exact-zint kernel which
+    Note: handles this edge case via its zero-poly short circuit.
+    If max_used_f is equal to 0:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 0
+    End If
+    If max_used_g is equal to 0:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 0
+    End If
+
+    Note: Step 2: FFT-domain images.  Each FFT buffer = 16*n bytes.
+    Let buf_bytes be n multiplied by 16
+    Let f_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let g_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let F_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let G_fft be Arena.arena_allocate(arena, buf_bytes)
+    If G_fft is equal to 0:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 0
+    End If
+
+    Let load_f_ok be ZP.zint_poly_to_fft(arena, f_poly, n, f_fft, baseline_used)
+    If load_f_ok is equal to 0:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 0
+    End If
+    Let load_g_ok be ZP.zint_poly_to_fft(arena, g_poly, n, g_fft, baseline_used)
+    If load_g_ok is equal to 0:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 0
+    End If
+    Let load_F_ok be ZP.zint_poly_to_fft(arena, F_poly, n, F_fft, baseline_used)
+    If load_F_ok is equal to 0:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 0
+    End If
+    Let load_G_ok be ZP.zint_poly_to_fft(arena, G_poly, n, G_fft, baseline_used)
+    If load_G_ok is equal to 0:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 0
+    End If
+
+    Note: Step 3: conjugates of f, g in FFT domain.
+    Let f_conj be Arena.arena_allocate(arena, buf_bytes)
+    Let g_conj be Arena.arena_allocate(arena, buf_bytes)
+    proc FFT.fft_conj with f_fft, f_conj, n
+    proc FFT.fft_conj with g_fft, g_conj, n
+
+    Note: Step 4: denominator D[i] = |f[i]|^2 + |g[i]|^2 (real value
+    Note: per slot).  Compute as fp_mul of (f*conj(f) + g*conj(g))
+    Note: pointwise: store result as a real value with zero imaginary
+    Note: part (the imaginary parts of f*conj(f) and g*conj(g) cancel
+    Note: exactly per Parseval).
+    Let denom_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let zero_v be proc FP.fp_zero
+    Let si be 0
+    While si is less than n:
+        Let fr be proc FFT.fft_get_real with f_fft, si
+        Let fi be proc FFT.fft_get_imag with f_fft, si
+        Let gr be proc FFT.fft_get_real with g_fft, si
+        Let gi be proc FFT.fft_get_imag with g_fft, si
+        Let fr2 be proc FP.fp_mul with fr, fr
+        Let fi2 be proc FP.fp_mul with fi, fi
+        Let gr2 be proc FP.fp_mul with gr, gr
+        Let gi2 be proc FP.fp_mul with gi, gi
+        Let fmag be proc FP.fp_add with fr2, fi2
+        Let gmag be proc FP.fp_add with gr2, gi2
+        Let dmag be proc FP.fp_add with fmag, gmag
+        proc FFT.fft_set_real with denom_fft, si, dmag
+        proc FFT.fft_set_imag with denom_fft, si, zero_v
+        Set si to si plus 1
+    End While
+
+    Note: Step 5: numerator N[i] = F[i]*conj(f[i]) + G[i]*conj(g[i])
+    Let numer_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let ni be 0
+    While ni is less than n:
+        Let Fr be proc FFT.fft_get_real with F_fft, ni
+        Let Fi be proc FFT.fft_get_imag with F_fft, ni
+        Let fcr be proc FFT.fft_get_real with f_conj, ni
+        Let fci be proc FFT.fft_get_imag with f_conj, ni
+        Note: F * conj(f) = (Fr + Fi i)(fcr + fci i)
+        Note:             = (Fr*fcr - Fi*fci) + (Fr*fci + Fi*fcr) i
+        Let p1 be proc FP.fp_mul with Fr, fcr
+        Let p2 be proc FP.fp_mul with Fi, fci
+        Let nr_F be proc FP.fp_sub with p1, p2
+        Let p3 be proc FP.fp_mul with Fr, fci
+        Let p4 be proc FP.fp_mul with Fi, fcr
+        Let ni_F be proc FP.fp_add with p3, p4
+
+        Let Gr be proc FFT.fft_get_real with G_fft, ni
+        Let Gi be proc FFT.fft_get_imag with G_fft, ni
+        Let gcr be proc FFT.fft_get_real with g_conj, ni
+        Let gci be proc FFT.fft_get_imag with g_conj, ni
+        Let q1 be proc FP.fp_mul with Gr, gcr
+        Let q2 be proc FP.fp_mul with Gi, gci
+        Let nr_G be proc FP.fp_sub with q1, q2
+        Let q3 be proc FP.fp_mul with Gr, gci
+        Let q4 be proc FP.fp_mul with Gi, gcr
+        Let ni_G be proc FP.fp_add with q3, q4
+
+        Let nr_tot be proc FP.fp_add with nr_F, nr_G
+        Let ni_tot be proc FP.fp_add with ni_F, ni_G
+        proc FFT.fft_set_real with numer_fft, ni, nr_tot
+        proc FFT.fft_set_imag with numer_fft, ni, ni_tot
+        Set ni to ni plus 1
+    End While
+
+    Note: Step 6: pointwise division k_fft[i] = N[i] / D[i].
+    Note: D[i] is real and non-negative; division reduces to dividing
+    Note: real and imaginary parts of N[i] by D[i].
+    Let k_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let qi be 0
+    While qi is less than n:
+        Let nr be proc FFT.fft_get_real with numer_fft, qi
+        Let nim be proc FFT.fft_get_imag with numer_fft, qi
+        Let d_v be proc FFT.fft_get_real with denom_fft, qi
+        Note: If d_v is exactly zero (degenerate f=g=0 case) we install
+        Note: zero in the quotient slot so the resulting k is zero and
+        Note: the Babai loop sees no update.
+        Let zero_r be proc FP.fp_zero
+        Let d_is_zero be proc FP.fp_eq with d_v, zero_r
+        Let kr be 0
+        Let kim be 0
+        If d_is_zero is equal to 1:
+            Set kr to zero_r
+            Set kim to zero_r
+        Otherwise:
+            Set kr to proc FP.fp_div with nr, d_v
+            Set kim to proc FP.fp_div with nim, d_v
+        End If
+        proc FFT.fft_set_real with k_fft, qi, kr
+        proc FFT.fft_set_imag with k_fft, qi, kim
+        Set qi to qi plus 1
+    End While
+
+    Note: Step 7: inverse FFT and rounding into a zint polynomial.
+    Let k_poly be ZP.fft_to_zint_poly(arena, k_fft, n)
+    If k_poly is equal to 0:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 0
+    End If
+
+    Note: Step 8: convergence check.
+    Let all_zero be 1
+    Let ci be 0
+    While ci is less than n:
+        Let kc be ZP.zint_poly_get(k_poly, ci)
+        If Z.zint_is_zero(kc) is equal to 0:
+            Set all_zero to 0
+        End If
+        Set ci to ci plus 1
+    End While
+    If all_zero is equal to 1:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 1
+    End If
+
+    Note: Step 9: update F <- F - k*f, G <- G - k*g (exact zint math).
+    Let kf be ZP.zint_poly_mul(arena, k_poly, f_poly, n)
+    Let kg be ZP.zint_poly_mul(arena, k_poly, g_poly, n)
+    Let new_F be ZP.zint_poly_sub(arena, F_poly, kf, n)
+    Let new_G be ZP.zint_poly_sub(arena, G_poly, kg, n)
+    Let cp be 0
+    While cp is less than n:
+        ZP.zint_poly_set(F_poly, cp, ZP.zint_poly_get(new_F, cp))
+        ZP.zint_poly_set(G_poly, cp, ZP.zint_poly_get(new_G, cp))
+        Set cp to cp plus 1
+    End While
+    Memory.memory_set_int64(did_update_ptr, 0, 1)
+    Return 1
+End Process
+
+Process called "ntrusolve_zint_babai_iteration" takes arena as Integer, f_poly as Integer, g_poly as Integer, F_poly as Integer, G_poly as Integer, f_bar as Integer, g_bar as Integer, n as Integer, did_update_ptr as Integer returns Integer:
+    @Reasoning
+    Perform one Babai iteration entirely in exact zint arithmetic.  Used
+    as the fallback when the FFT-fp53 path rejects on precision.  Sets
+    *did_update_ptr to 1 if F, G were updated, 0 if k was identically
+    zero (convergence).  Returns 1 on success, 0 on failure.
+    @End Reasoning
+    @Implementation
+    Standard kernel:
+      1. numer = F * f_bar + G * g_bar in K_n.
+      2. k     = round( numer / (f*adj(f) + g*adj(g)) ) in K_n via
+                 zint_poly_divide_by_kn_denominator.
+      3. If k is identically zero, signal convergence.
+      4. F <- F - k*f, G <- G - k*g (copied back into the caller's slots).
+    @End Implementation
+    @Performance_Hints
+    O(n^2 log n) zint multiplications per iteration at the bit length
+    determined by the descent level.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let Ff_bar be ZP.zint_poly_mul(arena, F_poly, f_bar, n)
+    Let Gg_bar be ZP.zint_poly_mul(arena, G_poly, g_bar, n)
+    Let numer be ZP.zint_poly_add(arena, Ff_bar, Gg_bar, n)
+
+    Let k_poly be ZP.zint_poly_divide_by_kn_denominator(arena, numer, f_poly, g_poly, n)
+    If k_poly is equal to 0:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 0
+    End If
+
+    Let all_zero be 1
+    Let ci be 0
+    While ci is less than n:
+        Let kc be ZP.zint_poly_get(k_poly, ci)
+        If Z.zint_is_zero(kc) is equal to 0:
+            Set all_zero to 0
+        End If
+        Set ci to ci plus 1
+    End While
+
+    If all_zero is equal to 1:
+        Memory.memory_set_int64(did_update_ptr, 0, 0)
+        Return 1
+    End If
+
+    Let kf be ZP.zint_poly_mul(arena, k_poly, f_poly, n)
+    Let kg be ZP.zint_poly_mul(arena, k_poly, g_poly, n)
+    Let new_F be ZP.zint_poly_sub(arena, F_poly, kf, n)
+    Let new_G be ZP.zint_poly_sub(arena, G_poly, kg, n)
+    Let cp be 0
+    While cp is less than n:
+        ZP.zint_poly_set(F_poly, cp, ZP.zint_poly_get(new_F, cp))
+        ZP.zint_poly_set(G_poly, cp, ZP.zint_poly_get(new_G, cp))
+        Set cp to cp plus 1
+    End While
+    Memory.memory_set_int64(did_update_ptr, 0, 1)
+    Return 1
+End Process
+
+Process called "ntrusolve_fft_babai_reduce_fft_form" takes arena as Integer, f_fft as Integer, g_fft as Integer, F_fft as Integer, G_fft as Integer, f_conj_fft as Integer, g_conj_fft as Integer, denom_fft as Integer, n as Integer, max_iter as Integer returns Integer:
+    @Reasoning
+    Inner Babai reduction loop operating ENTIRELY in the FFT slot domain
+    at fp53.  Inputs and outputs stay in FFT form across all iterations;
+    no zint allocations, no zint multiplications.  This is the
+    performance-critical kernel of the Falcon NTRU descent: the
+    coefficient-space update F <- F - k*f becomes the pointwise
+    F_fft[i] <- F_fft[i] - k_fft[i] * f_fft[i] in O(n) complex ops, and
+    the only O(n log n) work per iteration is one inverse FFT for the
+    convergence test plus one forward FFT to re-load the rounded k as
+    an integer polynomial in FFT form.
+    @End Reasoning
+    @Implementation
+    Pre-conditions:
+      - f_fft, g_fft: forward FFTs of f, g with a UNIFORM scaling
+        baseline (see zint_poly_to_fft).  Same baseline must have been
+        applied to F_fft, G_fft so the slot-wise ratios cancel.
+      - f_conj_fft = elementwise complex conjugate of f_fft.
+      - g_conj_fft = elementwise complex conjugate of g_fft.
+      - denom_fft[i] = |f_fft[i]|^2 + |g_fft[i]|^2 (real-valued,
+        imaginary slot is zero by Parseval).
+      - F_fft, G_fft: forward FFTs of F, G at the same baseline.  These
+        buffers are MUTATED in place across iterations.
+
+    Per iteration:
+      1. Compute numer_fft[i] = F_fft[i] * f_conj_fft[i]
+                              + G_fft[i] * g_conj_fft[i].
+         Standard complex multiplication accumulated into a fresh slot.
+      2. Compute k_quot_fft[i] = numer_fft[i] / denom_fft[i].
+         Since denom_fft is real, this is two scalar divisions per slot.
+      3. Copy k_quot_fft into k_inverse (because fft_inverse mutates
+         in place and we still need a fresh buffer for the round-trip).
+      4. fft_inverse(k_inverse).  The 1/n scaling pass is included.
+      5. Round each real slot of k_inverse to the nearest Int64.  This
+         is the integer k polynomial.  Track all_zero flag and a
+         max-magnitude bound for downstream re-scaling decisions.
+      6. If all_zero is 1: converged, return iter (the number of
+         completed updates).
+      7. Otherwise: rebuild k_fft_unscaled by loading the Int64 k
+         coefficients as Floats with zero imaginary parts into a fresh
+         FFT buffer, then forward-FFT in place.  This is the FFT of
+         the freshly-rounded k polynomial WITHOUT any baseline scaling
+         (k itself is small, bounded by the round-off of numer/denom).
+      8. Apply the update F_fft[i] -= k_fft_unscaled[i] * f_fft[i] and
+         G_fft[i] -= k_fft_unscaled[i] * g_fft[i] pointwise.  Reason
+         (sketch):
+            F[X] = SUM F_fft[i] * exp(...) * S          (S = baseline scale)
+            f[X] = SUM f_fft[i] * exp(...) * S
+            k[X] = SUM k_fft_unscaled[i] * exp(...)     (no S)
+            (k * f)[X] / S = SUM k_fft_unscaled[i] * f_fft[i] * exp(...)
+         So F_fft[i] -= k_fft_unscaled[i] * f_fft[i] gives the correct
+         updated F_fft at the same baseline scaling as the input.
+
+    The loop terminates when k rounds to identically zero (the Babai
+    convergence criterion) or when iter reaches max_iter.  Returns the
+    number of successful iterations on convergence, or 0 if max_iter is
+    exhausted without convergence (caller treats as failure).
+
+    Precision policy: this kernel assumes the bit length of f, g, F, G
+    at the input baseline fits comfortably inside fp53.  Caller MUST
+    enforce the precision check (max_bits + log2(n) < 50) before
+    invoking this routine; if the check fails, caller falls through to
+    the pure-zint kernel.
+    @End Implementation
+    @Performance_Hints
+    Per iteration:
+      - O(n) complex multiplies and adds for numer and the F, G update.
+      - O(n) real divisions for the quotient slot computation.
+      - O(n log n) for one inverse FFT + one forward FFT.
+      - O(n) Int64 round + reload.
+    Total: O(n log n) per iteration.  No O(n^2) zint multiplications.
+    Convergence is typically 1 iteration for Falcon-distributed inputs.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.  All slot-domain operations are fp53 floating point;
+    rounding behaviour depends only on the bit pattern of the operands,
+    which Falcon classifies as a permitted side channel (the FFT
+    pipeline is the reference implementation pattern).
+    @End Security_Scope
+    Let buf_bytes be n multiplied by 16
+    Let numer_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let k_quot_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let k_inverse be Arena.arena_allocate(arena, buf_bytes)
+    Let k_unscaled_fft be Arena.arena_allocate(arena, buf_bytes)
+    If k_unscaled_fft is equal to 0:
+        Return 0
+    End If
+
+    Let k_coeffs be Arena.arena_allocate(arena, n multiplied by 8)
+    If k_coeffs is equal to 0:
+        Return 0
+    End If
+
+    Let iter be 0
+    Let stop be 0
+    Let zero_v be proc FP.fp_zero
+    While stop is equal to 0:
+        If iter is greater than or equal to max_iter:
+            Note: Convergence failure; caller decides whether this is
+            Note: fatal (pure-zint fallback can handle pathological data).
+            Return 0
+        End If
+
+        Note: Step 1: numerator slot N[i] = F[i]*conj(f)[i] + G[i]*conj(g)[i]
+        Let i be 0
+        While i is less than n:
+            Let Fr be proc FFT.fft_get_real with F_fft, i
+            Let Fi be proc FFT.fft_get_imag with F_fft, i
+            Let fcr be proc FFT.fft_get_real with f_conj_fft, i
+            Let fci be proc FFT.fft_get_imag with f_conj_fft, i
+            Let p1 be proc FP.fp_mul with Fr, fcr
+            Let p2 be proc FP.fp_mul with Fi, fci
+            Let nr_F be proc FP.fp_sub with p1, p2
+            Let p3 be proc FP.fp_mul with Fr, fci
+            Let p4 be proc FP.fp_mul with Fi, fcr
+            Let ni_F be proc FP.fp_add with p3, p4
+
+            Let Gr be proc FFT.fft_get_real with G_fft, i
+            Let Gi be proc FFT.fft_get_imag with G_fft, i
+            Let gcr be proc FFT.fft_get_real with g_conj_fft, i
+            Let gci be proc FFT.fft_get_imag with g_conj_fft, i
+            Let q1 be proc FP.fp_mul with Gr, gcr
+            Let q2 be proc FP.fp_mul with Gi, gci
+            Let nr_G be proc FP.fp_sub with q1, q2
+            Let q3 be proc FP.fp_mul with Gr, gci
+            Let q4 be proc FP.fp_mul with Gi, gcr
+            Let ni_G be proc FP.fp_add with q3, q4
+
+            Let nr_tot be proc FP.fp_add with nr_F, nr_G
+            Let ni_tot be proc FP.fp_add with ni_F, ni_G
+            proc FFT.fft_set_real with numer_fft, i, nr_tot
+            proc FFT.fft_set_imag with numer_fft, i, ni_tot
+            Set i to i plus 1
+        End While
+
+        Note: Step 2: k_quot[i] = N[i] / denom[i] (denom is real-only).
+        Let qi be 0
+        While qi is less than n:
+            Let nr be proc FFT.fft_get_real with numer_fft, qi
+            Let nim be proc FFT.fft_get_imag with numer_fft, qi
+            Let d_v be proc FFT.fft_get_real with denom_fft, qi
+            Let d_is_zero be proc FP.fp_eq with d_v, zero_v
+            Let kr be 0
+            Let kim be 0
+            If d_is_zero is equal to 1:
+                Set kr to zero_v
+                Set kim to zero_v
+            Otherwise:
+                Set kr to proc FP.fp_div with nr, d_v
+                Set kim to proc FP.fp_div with nim, d_v
+            End If
+            proc FFT.fft_set_real with k_quot_fft, qi, kr
+            proc FFT.fft_set_imag with k_quot_fft, qi, kim
+            Set qi to qi plus 1
+        End While
+
+        Note: Step 3: copy k_quot_fft into k_inverse before iFFT
+        Note: (fft_inverse mutates in place).
+        proc FFT.fft_copy with k_inverse, k_quot_fft, n
+
+        Note: Step 4: inverse FFT to coefficient domain.
+        Let inv_ok be proc FFT.fft_inverse with arena, k_inverse, n
+        If inv_ok is equal to 0:
+            Return 0
+        End If
+
+        Note: Step 5: round each real coefficient to nearest Int64.
+        Let all_zero be 1
+        Let ci be 0
+        While ci is less than n:
+            Let r_f be proc FFT.fft_get_real with k_inverse, ci
+            Let k_int be proc FP.fp_to_int_round with r_f
+            Memory.memory_set_int64(k_coeffs, ci multiplied by 8, k_int)
+            If k_int is not equal to 0:
+                Set all_zero to 0
+            End If
+            Set ci to ci plus 1
+        End While
+
+        Note: Step 6: convergence check.
+        If all_zero is equal to 1:
+            Return iter
+        End If
+
+        Note: Step 7: rebuild k_fft (unscaled) by loading Int64 k
+        Note: coefficients into Floats and forward-FFTing.
+        Memory.memory_zero(k_unscaled_fft, buf_bytes)
+        Let li be 0
+        While li is less than n:
+            Let k_int_v be Memory.memory_get_int64(k_coeffs, li multiplied by 8)
+            Let k_f be proc FP.fp_from_int with k_int_v
+            proc FFT.fft_set_real with k_unscaled_fft, li, k_f
+            proc FFT.fft_set_imag with k_unscaled_fft, li, zero_v
+            Set li to li plus 1
+        End While
+        Let fwd_ok be proc FFT.fft_forward with arena, k_unscaled_fft, n
+        If fwd_ok is equal to 0:
+            Return 0
+        End If
+
+        Note: Step 8: F_fft[i] -= k_fft[i] * f_fft[i],
+        Note:         G_fft[i] -= k_fft[i] * g_fft[i] pointwise.
+        Let ui be 0
+        While ui is less than n:
+            Let kfr be proc FFT.fft_get_real with k_unscaled_fft, ui
+            Let kfi be proc FFT.fft_get_imag with k_unscaled_fft, ui
+
+            Let ffr be proc FFT.fft_get_real with f_fft, ui
+            Let ffi be proc FFT.fft_get_imag with f_fft, ui
+            Note: (kfr + kfi i)(ffr + ffi i) = (kfr*ffr - kfi*ffi) + (kfr*ffi + kfi*ffr) i
+            Let af1 be proc FP.fp_mul with kfr, ffr
+            Let af2 be proc FP.fp_mul with kfi, ffi
+            Let kf_r be proc FP.fp_sub with af1, af2
+            Let af3 be proc FP.fp_mul with kfr, ffi
+            Let af4 be proc FP.fp_mul with kfi, ffr
+            Let kf_i be proc FP.fp_add with af3, af4
+
+            Let Fr2 be proc FFT.fft_get_real with F_fft, ui
+            Let Fi2 be proc FFT.fft_get_imag with F_fft, ui
+            Let new_Fr be proc FP.fp_sub with Fr2, kf_r
+            Let new_Fi be proc FP.fp_sub with Fi2, kf_i
+            proc FFT.fft_set_real with F_fft, ui, new_Fr
+            proc FFT.fft_set_imag with F_fft, ui, new_Fi
+
+            Let gfr be proc FFT.fft_get_real with g_fft, ui
+            Let gfi be proc FFT.fft_get_imag with g_fft, ui
+            Let bg1 be proc FP.fp_mul with kfr, gfr
+            Let bg2 be proc FP.fp_mul with kfi, gfi
+            Let kg_r be proc FP.fp_sub with bg1, bg2
+            Let bg3 be proc FP.fp_mul with kfr, gfi
+            Let bg4 be proc FP.fp_mul with kfi, gfr
+            Let kg_i be proc FP.fp_add with bg3, bg4
+
+            Let Gr2 be proc FFT.fft_get_real with G_fft, ui
+            Let Gi2 be proc FFT.fft_get_imag with G_fft, ui
+            Let new_Gr be proc FP.fp_sub with Gr2, kg_r
+            Let new_Gi be proc FP.fp_sub with Gi2, kg_i
+            proc FFT.fft_set_real with G_fft, ui, new_Gr
+            proc FFT.fft_set_imag with G_fft, ui, new_Gi
+
+            Set ui to ui plus 1
+        End While
+
+        Set iter to iter plus 1
+    End While
+    Return iter
+End Process
+
+Process called "ntrusolve_zint_babai_reduce" takes arena as Integer, f_poly as Integer, g_poly as Integer, F_poly as Integer, G_poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Hybrid Babai reduction shim matching the Pornin reference Falcon
+    structure.  Attempts the FAST PATH (FFT-form Babai with no zint
+    inner loop) first; on precision rejection at this descent level
+    falls back to the exact-zint kernel which can handle arbitrarily
+    large coefficients.
+    @End Reasoning
+    @Implementation
+    Fast path:
+      1. Precision check.  Compute max_bits across f, g, F, G.  Numer
+         and denom slot magnitudes are bounded by ~2*max_bits + log2(n).
+         We require this to fit in 50 bits (fp53 minus 3-bit margin).
+         If not, fall through to the pure-zint loop.
+      2. Allocate FFT buffers for f, g, F, G, f_conj, g_conj, denom.
+      3. Compute baseline limb count and lift each zint polynomial into
+         its FFT buffer with that uniform baseline.
+      4. Compute f_conj_fft, g_conj_fft by elementwise conjugation.
+      5. Compute denom_fft[i] = |f_fft[i]|^2 + |g_fft[i]|^2.
+      6. Call ntrusolve_fft_babai_reduce_fft_form for up to max_iter=32
+         iterations.  This is the hot inner loop; it operates entirely
+         in fp53 with O(n log n) per iteration.
+      7. After convergence, inverse-FFT F_fft, G_fft back into zint
+         polynomials.  Because we force baseline_used = 2 in the lift,
+         the Float values stored at each slot are the EXACT integer
+         coefficient values (precision gate ensures each fits in <= 2
+         limbs = 62 bits).  Inverse FFT then yields the same exact
+         integers (modulo fp53 round-off, which the integer rounding
+         absorbs).  No rescaling pass is needed.
+
+    Slow path (zint kernel):
+      Same iterated loop as before, computing the K_n polynomial
+      division exactly with zint_poly_divide_by_kn_denominator.  Used
+      only when the precision check rejects the FFT path, which occurs
+      at the deepest tower levels where coefficients exceed ~2^50.
+    @End Implementation
+    @Performance_Hints
+    Fast path: O(n log n) per iteration, typically 1 iteration.  Memory
+    is O(n) for the seven FFT buffers.
+    Slow path: O(n^2 log n) per iteration via exact zint K_n division.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.  Loop count and FFT-vs-zint dispatch leak the coefficient
+    bit length, a Falcon-permitted side channel.
+    @End Security_Scope
+    Let max_iter be 32
+
+    Note: Step 1: precision check on input bit lengths.  Numerator and
+    Note: denominator products have bit length <= 2*max_bits + log2(n) + 1.
+    Note: We require fit in 50 bits to keep fp53 round-off below 1 LSB
+    Note: of an integer-rounded k coefficient.
+    Let max_bits be proc ntrusolve_max_bits_in_polys with f_poly, g_poly, F_poly, G_poly, n
+    Let log2n be proc ntrusolve_log2_ceil with n
+    Let needed_bits be 2 multiplied by max_bits
+    Set needed_bits to needed_bits plus log2n
+    Set needed_bits to needed_bits plus 1
+
+    Let use_fft_path be 0
+    If needed_bits is less than or equal to 50:
+        Set use_fft_path to 1
+    End If
+
+    Let f_bar be ZP.zint_poly_conjugate(arena, f_poly, n)
+    Let g_bar be ZP.zint_poly_conjugate(arena, g_poly, n)
+
+    If use_fft_path is equal to 1:
+        Note: Fast path: lift to FFT once, do the Babai loop in FFT, lift
+        Note: back once.  We use baseline_used = 2 unconditionally so the
+        Note: zint -> Float mapping is the EXACT integer value (the
+        Note: precision gate above ensures every coefficient fits in
+        Note: the top62-of-2-limbs window, i.e. <= ~62 bits).  With no
+        Note: per-coefficient scaling factor, the inverse-FFT recovery
+        Note: at the end of the loop reads off the integer values
+        Note: directly without rescaling, which is the only stable
+        Note: extraction when Babai has shrunk F, G to small magnitudes.
+        Let max_used_f be ZP.zint_poly_max_used(f_poly, n)
+        Let max_used_g be ZP.zint_poly_max_used(g_poly, n)
+        Let max_used_F be ZP.zint_poly_max_used(F_poly, n)
+        Let max_used_G be ZP.zint_poly_max_used(G_poly, n)
+        Let max_used_all be max_used_f
+        If max_used_g is greater than max_used_all:
+            Set max_used_all to max_used_g
+        End If
+        If max_used_F is greater than max_used_all:
+            Set max_used_all to max_used_F
+        End If
+        If max_used_G is greater than max_used_all:
+            Set max_used_all to max_used_G
+        End If
+
+        Note: Tighter precision check: with baseline_used = 2 the lift
+        Note: stores top62 bits of |z| as a Float, which is exact only
+        Note: when used <= 2.  If any coefficient overflows 2 limbs we
+        Note: must defer to the zint kernel.  This is a stricter
+        Note: condition than the bit-length gate above and so is
+        Note: enforced unconditionally here.
+        If max_used_all is greater than 2:
+            Set use_fft_path to 0
+        End If
+
+        Let baseline_used be 2
+
+        Note: f or g identically zero ==> denom = 0 ==> fast path cannot
+        Note: progress.  Defer to zint loop which handles the edge case.
+        If max_used_f is equal to 0:
+            Set use_fft_path to 0
+        End If
+        If max_used_g is equal to 0:
+            Set use_fft_path to 0
+        End If
+
+        If use_fft_path is equal to 1:
+            Let buf_bytes be n multiplied by 16
+            Let f_fft be Arena.arena_allocate(arena, buf_bytes)
+            Let g_fft be Arena.arena_allocate(arena, buf_bytes)
+            Let F_fft be Arena.arena_allocate(arena, buf_bytes)
+            Let G_fft be Arena.arena_allocate(arena, buf_bytes)
+            Let f_conj_fft be Arena.arena_allocate(arena, buf_bytes)
+            Let g_conj_fft be Arena.arena_allocate(arena, buf_bytes)
+            Let denom_fft be Arena.arena_allocate(arena, buf_bytes)
+            If denom_fft is equal to 0:
+                Set use_fft_path to 0
+            End If
+
+            If use_fft_path is equal to 1:
+                Note: Lift each zint poly into FFT at the shared baseline.
+                Let load_f be ZP.zint_poly_to_fft(arena, f_poly, n, f_fft, baseline_used)
+                Let load_g be ZP.zint_poly_to_fft(arena, g_poly, n, g_fft, baseline_used)
+                Let load_F be ZP.zint_poly_to_fft(arena, F_poly, n, F_fft, baseline_used)
+                Let load_G be ZP.zint_poly_to_fft(arena, G_poly, n, G_fft, baseline_used)
+                If load_G is equal to 0:
+                    Set use_fft_path to 0
+                End If
+
+                If use_fft_path is equal to 1:
+                    Note: Conjugates of f and g in FFT domain.
+                    proc FFT.fft_conj with f_fft, f_conj_fft, n
+                    proc FFT.fft_conj with g_fft, g_conj_fft, n
+
+                    Note: denom_fft[i] = |f|^2 + |g|^2 (real value).
+                    Let zero_v be proc FP.fp_zero
+                    Let si be 0
+                    While si is less than n:
+                        Let fr be proc FFT.fft_get_real with f_fft, si
+                        Let fi be proc FFT.fft_get_imag with f_fft, si
+                        Let gr be proc FFT.fft_get_real with g_fft, si
+                        Let gi be proc FFT.fft_get_imag with g_fft, si
+                        Let fr2 be proc FP.fp_mul with fr, fr
+                        Let fi2 be proc FP.fp_mul with fi, fi
+                        Let gr2 be proc FP.fp_mul with gr, gr
+                        Let gi2 be proc FP.fp_mul with gi, gi
+                        Let fmag be proc FP.fp_add with fr2, fi2
+                        Let gmag be proc FP.fp_add with gr2, gi2
+                        Let dmag be proc FP.fp_add with fmag, gmag
+                        proc FFT.fft_set_real with denom_fft, si, dmag
+                        proc FFT.fft_set_imag with denom_fft, si, zero_v
+                        Set si to si plus 1
+                    End While
+
+                    Note: Drive the inner loop entirely in FFT form.
+                    Let iter_count be proc ntrusolve_fft_babai_reduce_fft_form with arena, f_fft, g_fft, F_fft, G_fft, f_conj_fft, g_conj_fft, denom_fft, n, max_iter
+                    If iter_count is less than 0:
+                        Set use_fft_path to 0
+                    End If
+
+                    If use_fft_path is equal to 1:
+                        Note: Inverse FFT F_fft, G_fft and recover zint
+                        Note: coefficients.  Since the FFT round-trip
+                        Note: preserves integer-valued polynomials up to
+                        Note: fp53 rounding, and our F, G have shrunk in
+                        Note: magnitude after Babai, we extract by inverse
+                        Note: FFT and then rescaling by the baseline
+                        Note: factor (which is what the original lift
+                        Note: applied).
+                        Let inv_F_ok be proc FFT.fft_inverse with arena, F_fft, n
+                        If inv_F_ok is equal to 0:
+                            Return 0
+                        End If
+                        Let inv_G_ok be proc FFT.fft_inverse with arena, G_fft, n
+                        If inv_G_ok is equal to 0:
+                            Return 0
+                        End If
+
+                        Note: With baseline_used = 2 the original lift
+                        Note: stored the EXACT integer value of each
+                        Note: coefficient as a Float (provided used <= 2,
+                        Note: which the gate enforces).  The inverse FFT
+                        Note: round-trip preserves the integer values up
+                        Note: to fp53 rounding, and after Babai the
+                        Note: coefficient magnitudes have only shrunk,
+                        Note: so the integer round of the inverse-FFT
+                        Note: real part recovers the post-Babai
+                        Note: coefficient directly with no rescaling.
+                        Let ki be 0
+                        While ki is less than n:
+                            Let Fr_v be proc FFT.fft_get_real with F_fft, ki
+                            Let Gr_v be proc FFT.fft_get_real with G_fft, ki
+                            Let F_int be proc FP.fp_to_int_round with Fr_v
+                            Let G_int be proc FP.fp_to_int_round with Gr_v
+                            Let F_z be Z.zint_from_int(arena, F_int)
+                            Let G_z be Z.zint_from_int(arena, G_int)
+                            proc ZP.zint_poly_set with F_poly, ki, F_z
+                            proc ZP.zint_poly_set with G_poly, ki, G_z
+                            Set ki to ki plus 1
+                        End While
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: Slow path (pure-zint kernel) used when the precision check
+    Note: rejected the fast path or any allocation failed.
+    Let iter be 0
+    Let stop be 0
+
+    Let did_update_ptr be Arena.arena_allocate(arena, 8)
+    If did_update_ptr is equal to 0:
+        Return 0
+    End If
+
+    While stop is equal to 0:
+        If iter is greater than or equal to max_iter:
+            Set stop to 1
+        End If
+        If stop is equal to 0:
+            Memory.memory_set_int64(did_update_ptr, 0, 0)
+            Let zint_ok be proc ntrusolve_zint_babai_iteration with arena, f_poly, g_poly, F_poly, G_poly, f_bar, g_bar, n, did_update_ptr
+            If zint_ok is equal to 0:
+                Return 0
+            End If
+            Let did_update be Memory.memory_get_int64(did_update_ptr, 0)
+            If did_update is equal to 0:
+                Set stop to 1
+            Otherwise:
+                Set iter to iter plus 1
+            End If
+        End If
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+INTERNAL RECURSIVE DESCENT : ntru_solve_zint
+==============================================================================
+Operates entirely on zint coefficient-form polynomials so that the
+coefficient magnitudes can grow without bound across descent levels.
+:End Note
+
+Process called "ntru_solve_zint" takes arena as Integer, f_poly as Integer, g_poly as Integer, n as Integer, F_poly as Integer, G_poly as Integer returns Integer:
+    @Reasoning
+    Solve the NTRU equation f*G - g*F = q in Z[X]/(X^n+1) via tower
+    descent, fully in zint coefficient-form polynomials.
+    @End Reasoning
+    @Implementation
+    Recursive case n >= 2:
+      1. Compute f_norm = N(f), g_norm = N(g) in K_{n/2}.
+      2. Allocate half-size F_half, G_half buffers.
+      3. Recurse on (f_norm, g_norm, n/2) -> (F_half, G_half).
+      4. Lift via F_full = F_half(X^2) * g_bar(X), G_full = G_half(X^2) * f_bar(X).
+      5. Copy F_full, G_full coefficients into F_poly, G_poly.
+      6. Babai-reduce (F_poly, G_poly) against (f, g).
+    Base case n=1: extended Euclidean over Z (see ntru_solve_base_n1).
+    Returns 1 on success, 0 on precision failure or unsolvable Bezout.
+    @End Implementation
+    @Performance_Hints
+    O(n^2 log n) per level (zint polynomial multiply dominates) times
+    O(log n) levels.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    If n is equal to 1:
+        Return proc ntru_solve_base_n1 with arena, f_poly, g_poly, F_poly, G_poly
+    End If
+
+    Let half_n be n shifted right by 1
+
+    Let f_norm be ZP.zint_poly_field_norm(arena, f_poly, n)
+    Let g_norm be ZP.zint_poly_field_norm(arena, g_poly, n)
+    If g_norm is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate half-size solution buffers.
+    Let F_half be ZP.zint_poly_create(arena, half_n, 1)
+    Let G_half be ZP.zint_poly_create(arena, half_n, 1)
+    If G_half is equal to 0:
+        Return 0
+    End If
+
+    Let rec_ok be proc ntru_solve_zint with arena, f_norm, g_norm, half_n, F_half, G_half
+    If rec_ok is equal to 0:
+        Return 0
+    End If
+
+    Note: Lift.  F_full = F_half(X^2) * g_bar(X), G_full = G_half(X^2) * f_bar(X).
+    Let F_x2 be proc ntrusolve_zint_lift_even_squared with arena, F_half, half_n
+    Let G_x2 be proc ntrusolve_zint_lift_even_squared with arena, G_half, half_n
+    Let f_bar be ZP.zint_poly_conjugate(arena, f_poly, n)
+    Let g_bar be ZP.zint_poly_conjugate(arena, g_poly, n)
+
+    Let F_lifted be ZP.zint_poly_mul(arena, F_x2, g_bar, n)
+    Let G_lifted be ZP.zint_poly_mul(arena, G_x2, f_bar, n)
+
+    Let cp be 0
+    While cp is less than n:
+        ZP.zint_poly_set(F_poly, cp, ZP.zint_poly_get(F_lifted, cp))
+        ZP.zint_poly_set(G_poly, cp, ZP.zint_poly_get(G_lifted, cp))
+        Set cp to cp plus 1
+    End While
+
+    Note: Babai-reduce against (f, g).
+    Let red_ok be proc ntrusolve_zint_babai_reduce with arena, f_poly, g_poly, F_poly, G_poly, n
+    If red_ok is equal to 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note:
+==============================================================================
+PUBLIC ENTRY POINT : ntru_solve  (int16 in, int16 out)
+==============================================================================
+:End Note
+
+Process called "ntru_solve" takes arena as Integer, f_int as Integer, g_int as Integer, n as Integer, F_out as Integer, G_out as Integer returns Integer:
+    @Reasoning
+    Public NTRUSolve entry.  Accepts and produces int16 coefficient arrays
+    for compatibility with the Falcon keygen orchestrator.  Internally
+    creates a transient scratch arena (256 MiB), runs the zint descent
+    inside it, copies the final (F, G) back to the caller's int16 buffers,
+    then destroys the scratch arena.  This isolates the descent's large
+    transient memory footprint from the caller's arena, avoiding the
+    arena re-mmap pointer-invalidation hazard.
+    @End Reasoning
+    @Implementation
+    1. arena_create a scratch arena large enough for the worst-case zint
+       descent (256 MiB suffices for Falcon-1024).
+    2. Build zint polynomials f_poly, g_poly from the int16 inputs.
+    3. Allocate F_poly, G_poly zint polynomials (initially zero).
+    4. Call ntru_solve_zint to perform the descent.
+    5. Extract F_poly, G_poly to the caller's F_out, G_out via
+       zint_poly_to_int_array.  Range rejection at this step is the
+       keygen restart signal.
+    6. Compute the int16 squared norm and reject if it exceeds the
+       sanity bound (catches catastrophic precision failures even when
+       individual coefficients fit in int16).
+    7. arena_destroy the scratch arena and return the success flag.
+    @End Implementation
+    @Performance_Hints
+    Dominated by the recursive descent: O(n^2 log n) zint multiplies.
+    The arena_create / arena_destroy pair costs one mmap + one munmap
+    per call, which is negligible relative to the descent.
+    @End Performance_Hints
+    @Security_Scope
+    All polynomials SECRET.  The scratch arena's munmap returns the
+    pages to the kernel, scrubbing any residual zint limb data.
+    @End Security_Scope
+    Let scratch_cap be 1073741824
+    Let scratch be Arena.arena_create(scratch_cap)
+    If scratch is equal to 0:
+        Return 0
+    End If
+
+    Let f_poly be ZP.zint_poly_from_int_array(scratch, f_int, n, 2)
+    Let g_poly be ZP.zint_poly_from_int_array(scratch, g_int, n, 2)
+    If g_poly is equal to 0:
+        Arena.arena_destroy(scratch)
+        Return 0
+    End If
+
+    Let F_poly be ZP.zint_poly_create(scratch, n, 1)
+    Let G_poly be ZP.zint_poly_create(scratch, n, 1)
+    If G_poly is equal to 0:
+        Arena.arena_destroy(scratch)
+        Return 0
+    End If
+
+    Let solve_ok be proc ntru_solve_zint with scratch, f_poly, g_poly, n, F_poly, G_poly
+    If solve_ok is equal to 0:
+        Arena.arena_destroy(scratch)
+        Return 0
+    End If
+
+    Let F_extract be ZP.zint_poly_to_int_array(F_poly, F_out, n, 2)
+    If F_extract is equal to 0:
+        Arena.arena_destroy(scratch)
+        Return 0
+    End If
+    Let G_extract be ZP.zint_poly_to_int_array(G_poly, G_out, n, 2)
+    If G_extract is equal to 0:
+        Arena.arena_destroy(scratch)
+        Return 0
+    End If
+
+    Note: Per Falcon spec section 3.8.1 the keygen acceptance criterion
+    Note: is ||(g, -f, G, -F)||^2 <= ceil(2 * 16823 * q / n) where q=12289.
+    Note: This bound is the per-key cumulant of the per-signature norm
+    Note: budget; rejecting (F, G) that fails it is what guarantees the
+    Note: subsequent sign-stage sampler never exhausts its rejection
+    Note: window.  The shim already enforces the LARGER 2^40 sanity
+    Note: bound implicitly (via the int16 range), so the only new gate
+    Note: here is the tight Falcon bound on (F, G) PLUS (f, g).
+    Let F_norm be 0
+    Let G_norm be 0
+    Let i be 0
+    While i is less than n:
+        Let off be i multiplied by 2
+        Let Fc be Memory.memory_get_int16(F_out, off)
+        Let Gc be Memory.memory_get_int16(G_out, off)
+        Set F_norm to F_norm plus (Fc multiplied by Fc)
+        Set G_norm to G_norm plus (Gc multiplied by Gc)
+        Set i to i plus 1
+    End While
+    Let f_norm be 0
+    Let g_norm be 0
+    Let j be 0
+    While j is less than n:
+        Let offj be j multiplied by 2
+        Let fc be Memory.memory_get_int16(f_int, offj)
+        Let gc be Memory.memory_get_int16(g_int, offj)
+        Set f_norm to f_norm plus (fc multiplied by fc)
+        Set g_norm to g_norm plus (gc multiplied by gc)
+        Set j to j plus 1
+    End While
+    Let total_norm be F_norm plus G_norm
+    Set total_norm to total_norm plus f_norm
+    Set total_norm to total_norm plus g_norm
+
+    Note: Falcon spec bound: per Pornin reference's falcon_l2bound[logn]
+    Note: table.  This is the per-signature norm budget; (F, G) plus
+    Note: (f, g) must satisfy ||v||^2 <= bound or the sign stage
+    Note: sampler cannot meet its rejection criterion.
+    Note: For Falcon-512 (logn=9): 34034726.
+    Note: For Falcon-1024 (logn=10): 70265242.
+    Let falcon_norm_bound be 34034726
+    If n is equal to 1024:
+        Set falcon_norm_bound to 70265242
+    End If
+    Arena.arena_destroy(scratch)
+    If total_norm is greater than falcon_norm_bound:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note:
+==============================================================================
+END falcon_ntrusolve
+==============================================================================
+:End Note

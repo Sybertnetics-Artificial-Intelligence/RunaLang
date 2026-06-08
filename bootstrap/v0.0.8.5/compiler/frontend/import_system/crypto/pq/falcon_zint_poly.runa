@@ -1,0 +1,1494 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FALCON-ZINT-POLY : polynomials over Z[X]/(X^n + 1) with zint coefficients
+==============================================================================
+
+A zint polynomial of length n is an arena-allocated array of n pointers
+(8 bytes each on Int64), one per coefficient. Each pointer references a
+zint (see falcon_zint.runa). The polynomial pointer itself points to the
+first slot of the pointer array; the n-th coefficient lives at offset
+8*k from the base.
+
+Storage rationale. Pornin's reference uses contiguous limb arrays with
+known limb counts per polynomial; we instead carry a fresh zint per
+coefficient because the Falcon NTRUSolve descent does not have a clean
+single max-bitlen for all coefficients at a level (the field-norm step
+roughly doubles the bit length, but individual coefficients can drift
+by a few bits per descent). The pointer-array layout removes the bug
+class of "I forgot to bump per-coefficient bitlen between levels".
+
+Multiplication semantics. Multiplication is performed in the quotient
+ring Z[X]/(X^n + 1): a product term of degree d >= n is reduced via
+X^n = -1, so the coefficient at position d mod n gets contributed
+with sign (-1)^(d div n).
+
+Security_Scope:
+  All zint poly contents are SECRET Falcon key material; we lean on
+  the zint primitives' constant-time guarantees.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/pq/falcon_zint.runa" as Z
+Import "compiler/frontend/import_system/crypto/pq/falcon_fp.runa" as FP
+Import "compiler/frontend/import_system/crypto/pq/falcon_fft.runa" as FFT
+
+Process called "zint_poly_get" takes poly as Integer, idx as Integer returns Integer:
+    @Reasoning
+    Return the zint pointer at coefficient idx of poly.
+    @End Reasoning
+    @Implementation
+    Load int64 at offset 8 * idx of the polynomial base.
+    @End Implementation
+    @Performance_Hints
+    Single load.
+    @End Performance_Hints
+    @Security_Scope
+    Public layout.
+    @End Security_Scope
+    Let off be idx multiplied by 8
+    Return Memory.memory_get_int64(poly, off)
+End Process
+
+Process called "zint_poly_set" takes poly as Integer, idx as Integer, ptr_value as Integer returns Integer:
+    @Reasoning
+    Write a zint pointer into coefficient idx of poly.
+    @End Reasoning
+    @Implementation
+    Store int64 at offset 8 * idx of the polynomial base.
+    @End Implementation
+    @Performance_Hints
+    Single store.
+    @End Performance_Hints
+    @Security_Scope
+    Public layout.
+    @End Security_Scope
+    Let off be idx multiplied by 8
+    Memory.memory_set_int64(poly, off, ptr_value)
+    Return 1
+End Process
+
+Process called "zint_poly_create" takes arena as Integer, n as Integer, per_coeff_cap as Integer returns Integer:
+    @Reasoning
+    Allocate a zero-initialised zint polynomial of length n. Each
+    coefficient is created with per_coeff_cap limbs of capacity.
+    @End Reasoning
+    @Implementation
+    Allocate 8*n bytes for the pointer array, then create n zints.
+    @End Implementation
+    @Performance_Hints
+    Linear in n plus per_coeff_cap.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let bytes be n multiplied by 8
+    Let poly be Arena.arena_allocate(arena, bytes)
+    If poly is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(poly, bytes)
+    Let i be 0
+    While i is less than n:
+        Let z be Z.zint_create(arena, per_coeff_cap)
+        If z is equal to 0:
+            Return 0
+        End If
+        proc zint_poly_set with poly, i, z
+        Set i to i plus 1
+    End While
+    Return poly
+End Process
+
+Process called "zint_poly_destroy" takes poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Scrub each coefficient zint then zero the pointer array.
+    @End Reasoning
+    @Implementation
+    Walk coefficients calling zint_destroy, then memory_zero the
+    pointer array.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET hygiene.
+    @End Security_Scope
+    If poly is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than n:
+        Let z be proc zint_poly_get with poly, i
+        Z.zint_destroy(z)
+        Set i to i plus 1
+    End While
+    Memory.memory_zero(poly, n multiplied by 8)
+    Return 1
+End Process
+
+Process called "zint_poly_copy" takes arena as Integer, src as Integer, n as Integer returns Integer:
+    @Reasoning
+    Deep-copy a zint polynomial.
+    @End Reasoning
+    @Implementation
+    Allocate the pointer array, then for each coefficient duplicate the
+    zint via zint_copy.
+    @End Implementation
+    @Performance_Hints
+    Linear in n plus total limbs.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let bytes be n multiplied by 8
+    Let dst be Arena.arena_allocate(arena, bytes)
+    If dst is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(dst, bytes)
+    Let i be 0
+    While i is less than n:
+        Let src_z be proc zint_poly_get with src, i
+        Let copy_z be Z.zint_copy(arena, src_z)
+        proc zint_poly_set with dst, i, copy_z
+        Set i to i plus 1
+    End While
+    Return dst
+End Process
+
+Process called "zint_poly_neg" takes poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Negate every coefficient in place.
+    @End Reasoning
+    @Implementation
+    Iterate and call zint_neg.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let i be 0
+    While i is less than n:
+        Let z be proc zint_poly_get with poly, i
+        Z.zint_neg(z)
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "zint_poly_add" takes arena as Integer, a as Integer, b as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute c = a + b coefficient-wise. Allocates a fresh polynomial.
+    @End Reasoning
+    @Implementation
+    For each k allocate an output zint sized for max(a, b) plus carry,
+    then add the corresponding zints into it.
+    @End Implementation
+    @Performance_Hints
+    O(n) zint additions.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let bytes be n multiplied by 8
+    Let dst be Arena.arena_allocate(arena, bytes)
+    If dst is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(dst, bytes)
+    Let i be 0
+    While i is less than n:
+        Let az be proc zint_poly_get with a, i
+        Let bz be proc zint_poly_get with b, i
+        Let max_used be Z.zint_get_used(az)
+        Let bu be Z.zint_get_used(bz)
+        If bu is greater than max_used:
+            Set max_used to bu
+        End If
+        Let cap be max_used plus 2
+        Let cz be Z.zint_create(arena, cap)
+        Z.zint_add(cz, az, bz)
+        proc zint_poly_set with dst, i, cz
+        Set i to i plus 1
+    End While
+    Return dst
+End Process
+
+Process called "zint_poly_sub" takes arena as Integer, a as Integer, b as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute c = a - b coefficient-wise.
+    @End Reasoning
+    @Implementation
+    Mirror of zint_poly_add using zint_sub.
+    @End Implementation
+    @Performance_Hints
+    O(n) zint subtractions.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let bytes be n multiplied by 8
+    Let dst be Arena.arena_allocate(arena, bytes)
+    If dst is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(dst, bytes)
+    Let i be 0
+    While i is less than n:
+        Let az be proc zint_poly_get with a, i
+        Let bz be proc zint_poly_get with b, i
+        Let max_used be Z.zint_get_used(az)
+        Let bu be Z.zint_get_used(bz)
+        If bu is greater than max_used:
+            Set max_used to bu
+        End If
+        Let cap be max_used plus 2
+        Let cz be Z.zint_create(arena, cap)
+        Z.zint_sub(cz, az, bz)
+        proc zint_poly_set with dst, i, cz
+        Set i to i plus 1
+    End While
+    Return dst
+End Process
+
+Process called "zint_poly_mul_into_scratch" takes scratch as Integer, a as Integer, b as Integer, n as Integer returns Integer:
+    @Reasoning
+    Internal worker: compute c = a*b in K_n entirely within `scratch`
+    arena.  Returns the result polynomial pointer (also in scratch).
+    @End Reasoning
+    @Implementation
+    Schoolbook convolution with pre-allocated per-slot accumulators of
+    worst-case capacity.  Each partial product az*bz is allocated in
+    scratch and consumed immediately by a zint_add or zint_sub into
+    the accumulator slot.
+    @End Implementation
+    @Performance_Hints
+    O(n^2) zint multiplications.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let max_used_a be 0
+    Let mi be 0
+    While mi is less than n:
+        Let az be proc zint_poly_get with a, mi
+        Let u be Z.zint_get_used(az)
+        If u is greater than max_used_a:
+            Set max_used_a to u
+        End If
+        Set mi to mi plus 1
+    End While
+    Let max_used_b be 0
+    Let mj be 0
+    While mj is less than n:
+        Let bz be proc zint_poly_get with b, mj
+        Let u2 be Z.zint_get_used(bz)
+        If u2 is greater than max_used_b:
+            Set max_used_b to u2
+        End If
+        Set mj to mj plus 1
+    End While
+    Let log_n_slack be 0
+    Let nn be n
+    While nn is greater than 1:
+        Set nn to nn shifted right by 1
+        Set log_n_slack to log_n_slack plus 1
+    End While
+    Let acc_cap be max_used_a plus max_used_b plus log_n_slack plus 4
+
+    Let dst be Arena.arena_allocate(scratch, n multiplied by 8)
+    If dst is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(dst, n multiplied by 8)
+    Let init_i be 0
+    While init_i is less than n:
+        Let zero_z be Z.zint_create(scratch, acc_cap)
+        proc zint_poly_set with dst, init_i, zero_z
+        Set init_i to init_i plus 1
+    End While
+
+    Let i be 0
+    While i is less than n:
+        Let az be proc zint_poly_get with a, i
+        If Z.zint_is_zero(az) is equal to 0:
+            Let j be 0
+            While j is less than n:
+                Let bz be proc zint_poly_get with b, j
+                If Z.zint_is_zero(bz) is equal to 0:
+                    Let prod be Z.zint_mul(scratch, az, bz)
+                    Let dst_idx be i plus j
+                    Let neg_flag be 0
+                    If dst_idx is greater than or equal to n:
+                        Set dst_idx to dst_idx minus n
+                        Set neg_flag to 1
+                    End If
+                    Let cur be proc zint_poly_get with dst, dst_idx
+                    If neg_flag is equal to 1:
+                        Z.zint_sub(cur, cur, prod)
+                    Otherwise:
+                        Z.zint_add(cur, cur, prod)
+                    End If
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+    Return dst
+End Process
+
+Process called "zint_poly_mul" takes arena as Integer, a as Integer, b as Integer, n as Integer returns Integer:
+    @Reasoning
+    Multiply two zint polynomials in Z[X]/(X^n + 1).  Uses an internal
+    scratch arena for the n^2 transient product zints and copies only
+    the final n-coefficient result polynomial back to the caller's
+    arena, so cumulative memory cost across many calls is O(n * coeff_size)
+    rather than O(n^2 * coeff_size).
+    @End Reasoning
+    @Implementation
+    1. Create a scratch arena sized for one polymul.  The bound is
+       8 * n * (max_used_a + max_used_b + log2(n) + 32) bytes which
+       covers the per-slot accumulators plus the per-(i,j) products.
+    2. Compute the product into the scratch arena via the internal
+       worker.
+    3. Deep-copy the result polynomial (n coefficient zints) into the
+       caller's arena.
+    4. Destroy the scratch arena, releasing all transient storage.
+    @End Implementation
+    @Performance_Hints
+    O(n^2) zint multiplies plus two extra arena syscalls (mmap +
+    munmap) per call.  Memory peak is O(n^2 * coeff_size) within the
+    scratch but bounded by the dedicated allocation.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.  Scratch arena's munmap returns pages to the kernel,
+    scrubbing any residual product limbs.
+    @End Security_Scope
+    Let max_used_a be 0
+    Let mi be 0
+    While mi is less than n:
+        Let az be proc zint_poly_get with a, mi
+        Let u be Z.zint_get_used(az)
+        If u is greater than max_used_a:
+            Set max_used_a to u
+        End If
+        Set mi to mi plus 1
+    End While
+    Let max_used_b be 0
+    Let mj be 0
+    While mj is less than n:
+        Let bz be proc zint_poly_get with b, mj
+        Let u2 be Z.zint_get_used(bz)
+        If u2 is greater than max_used_b:
+            Set max_used_b to u2
+        End If
+        Set mj to mj plus 1
+    End While
+    Let log_n_slack be 0
+    Let nn be n
+    While nn is greater than 1:
+        Set nn to nn shifted right by 1
+        Set log_n_slack to log_n_slack plus 1
+    End While
+    Note: scratch_bytes = n^2 partial products + n accumulators +
+    Note: overhead.  Each partial product is (max_a + max_b + 1) limbs
+    Note: = (max_a + max_b + 1) * 4 bytes + 16-byte header.  Cap the
+    Note: scratch at 64 MiB or 4x the estimated need, whichever is larger.
+    Let prod_bytes be (max_used_a plus max_used_b plus 1) multiplied by 4
+    Set prod_bytes to prod_bytes plus 16
+    Let acc_cap be max_used_a plus max_used_b plus log_n_slack plus 4
+    Let acc_bytes be (acc_cap multiplied by 4) plus 16
+    Let estimate be (n multiplied by n) multiplied by prod_bytes
+    Set estimate to estimate plus (n multiplied by acc_bytes)
+    Set estimate to estimate plus 1048576
+    Let scratch_cap be estimate multiplied by 2
+    If scratch_cap is less than 67108864:
+        Set scratch_cap to 67108864
+    End If
+    If scratch_cap is greater than 1073741824:
+        Set scratch_cap to 1073741824
+    End If
+
+    Let scratch be Arena.arena_create(scratch_cap)
+    If scratch is equal to 0:
+        Return 0
+    End If
+
+    Let result_in_scratch be proc zint_poly_mul_into_scratch with scratch, a, b, n
+    If result_in_scratch is equal to 0:
+        Arena.arena_destroy(scratch)
+        Return 0
+    End If
+
+    Note: Deep-copy result polynomial into caller's arena, then destroy
+    Note: scratch.
+    Let bytes be n multiplied by 8
+    Let dst be Arena.arena_allocate(arena, bytes)
+    If dst is equal to 0:
+        Arena.arena_destroy(scratch)
+        Return 0
+    End If
+    Memory.memory_zero(dst, bytes)
+    Let cp be 0
+    While cp is less than n:
+        Let src_z be proc zint_poly_get with result_in_scratch, cp
+        Let copy_z be Z.zint_copy(arena, src_z)
+        proc zint_poly_set with dst, cp, copy_z
+        Set cp to cp plus 1
+    End While
+
+    Arena.arena_destroy(scratch)
+    Return dst
+End Process
+
+Process called "zint_poly_conjugate" takes arena as Integer, src as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute the Galois conjugate adj(f)(X) = f(-X) of a zint polynomial.
+    @End Reasoning
+    @Implementation
+    adj(f)[k] = (-1)^k * f[k]. Even indices unchanged, odd indices
+    negated.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let bytes be n multiplied by 8
+    Let dst be Arena.arena_allocate(arena, bytes)
+    If dst is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(dst, bytes)
+    Let k be 0
+    While k is less than n:
+        Let src_z be proc zint_poly_get with src, k
+        Let copy_z be Z.zint_copy(arena, src_z)
+        Let parity be k bitwise_and 1
+        If parity is equal to 1:
+            Z.zint_neg(copy_z)
+        End If
+        proc zint_poly_set with dst, k, copy_z
+        Set k to k plus 1
+    End While
+    Return dst
+End Process
+
+Process called "zint_poly_field_norm" takes arena as Integer, src as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute the field-norm map N: K_n -> K_{n/2} for a zint polynomial.
+    @End Reasoning
+    @Implementation
+    Decompose f(X) = f_e(X^2) + X * f_o(X^2) where f_e holds the
+    even-indexed coefficients of f and f_o holds the odd-indexed ones.
+    Then N(f) = f * f(-X) corresponds in K_{n/2} (substituting Y = X^2)
+    to f_e^2 - Y * f_o^2.
+
+    Concretely:
+      n' = n / 2.
+      Build f_e, f_o as zint polynomials of length n'.
+      Compute f_e_sq = f_e * f_e in K_{n'}.
+      Compute f_o_sq = f_o * f_o in K_{n'}.
+      Build Y * f_o_sq by shifting f_o_sq coefficients up by 1
+        (with wrap: position k -> k+1, position n'-1 wraps to -position 0).
+      Return f_e_sq - Y * f_o_sq.
+    @End Implementation
+    @Performance_Hints
+    Two half-size polynomial multiplies plus O(n) overhead. Total
+    O(n^2 / 4) zint multiplies per descent level using the schoolbook
+    multiply; Karatsuba kicks in inside zint_mul once individual
+    coefficients exceed the limb threshold.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET. Multiplications run unconditionally.
+    @End Security_Scope
+    Let half_n be n shifted right by 1
+    Let bytes be half_n multiplied by 8
+
+    Let f_e be Arena.arena_allocate(arena, bytes)
+    Let f_o be Arena.arena_allocate(arena, bytes)
+    If f_o is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(f_e, bytes)
+    Memory.memory_zero(f_o, bytes)
+    Let k be 0
+    While k is less than half_n:
+        Let even_idx be k multiplied by 2
+        Let odd_idx be even_idx plus 1
+        Let ez be proc zint_poly_get with src, even_idx
+        Let oz be proc zint_poly_get with src, odd_idx
+        proc zint_poly_set with f_e, k, Z.zint_copy(arena, ez)
+        proc zint_poly_set with f_o, k, Z.zint_copy(arena, oz)
+        Set k to k plus 1
+    End While
+
+    Let f_e_sq be proc zint_poly_mul with arena, f_e, f_e, half_n
+    Let f_o_sq be proc zint_poly_mul with arena, f_o, f_o, half_n
+
+    Note: Y * f_o_sq in K_{n/2} = Q[Y]/(Y^(n/2)+1). Position k goes to
+    Note: position k+1; the top coefficient wraps to position 0 with
+    Note: sign flip because Y^(n/2) = -1.
+    Let shifted be Arena.arena_allocate(arena, bytes)
+    Memory.memory_zero(shifted, bytes)
+    Let i be 0
+    While i is less than half_n:
+        Let coeff be proc zint_poly_get with f_o_sq, i
+        Let copy be Z.zint_copy(arena, coeff)
+        If i is equal to (half_n minus 1):
+            Z.zint_neg(copy)
+            proc zint_poly_set with shifted, 0, copy
+        Otherwise:
+            proc zint_poly_set with shifted, i plus 1, copy
+        End If
+        Set i to i plus 1
+    End While
+    Note: positions that were not written above need an explicit zero
+    Note: so the pointer array isn't sparse. Walk all slots: every slot
+    Note: except the one we wrote to is still NULL from memory_zero;
+    Note: install a zero zint.
+    Let p be 0
+    While p is less than half_n:
+        Let cur be proc zint_poly_get with shifted, p
+        If cur is equal to 0:
+            proc zint_poly_set with shifted, p, Z.zint_from_int(arena, 0)
+        End If
+        Set p to p plus 1
+    End While
+
+    Note: Fix-up: if half_n == 1 the shifted polynomial overwrites and
+    Note: wraps the single coefficient; we want the negated form only.
+    Let result be proc zint_poly_sub with arena, f_e_sq, shifted, half_n
+    Return result
+End Process
+
+Process called "zint_poly_norm_squared" takes arena as Integer, poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute the integer ||p||^2 = sum_k p[k]^2 as a zint.
+    @End Reasoning
+    @Implementation
+    For each k, compute p[k] * p[k] (always nonnegative) and add into
+    an accumulator zint. Returns the accumulator.
+    @End Implementation
+    @Performance_Hints
+    O(n) zint multiplications + adds.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET; norm comparison is a one-bit channel.
+    @End Security_Scope
+    Let acc_cap be 16
+    Let acc be Z.zint_create(arena, acc_cap)
+    Let k be 0
+    While k is less than n:
+        Let c be proc zint_poly_get with poly, k
+        Let sq be Z.zint_mul(arena, c, c)
+        Let acc_used be Z.zint_get_used(acc)
+        Let sq_used be Z.zint_get_used(sq)
+        Let new_cap be acc_used
+        If sq_used is greater than new_cap:
+            Set new_cap to sq_used
+        End If
+        Set new_cap to new_cap plus 2
+        Let new_acc be Z.zint_create(arena, new_cap)
+        Z.zint_add(new_acc, acc, sq)
+        Set acc to new_acc
+        Set k to k plus 1
+    End While
+    Return acc
+End Process
+
+Process called "zint_poly_from_int_array" takes arena as Integer, int_coeffs as Integer, n as Integer, elem_size as Integer returns Integer:
+    @Reasoning
+    Convert an int16/int32/int64 array (elem_size bytes per element)
+    into a zint polynomial.
+    @End Reasoning
+    @Implementation
+    For each k read the signed element from int_coeffs[k] and
+    construct a zint via zint_from_int. elem_size = 2 -> int16,
+    4 -> int32, 8 -> int64.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-supplied inputs may be SECRET.
+    @End Security_Scope
+    Let bytes be n multiplied by 8
+    Let poly be Arena.arena_allocate(arena, bytes)
+    If poly is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(poly, bytes)
+    Let k be 0
+    While k is less than n:
+        Let off be k multiplied by elem_size
+        Let v be 0
+        If elem_size is equal to 2:
+            Set v to Memory.memory_get_int16(int_coeffs, off)
+        Otherwise:
+            If elem_size is equal to 4:
+                Set v to Memory.memory_get_int32(int_coeffs, off)
+            Otherwise:
+                Set v to Memory.memory_get_int64(int_coeffs, off)
+            End If
+        End If
+        Let z be Z.zint_from_int(arena, v)
+        proc zint_poly_set with poly, k, z
+        Set k to k plus 1
+    End While
+    Return poly
+End Process
+
+Process called "zint_poly_to_int_array" takes poly as Integer, int_coeffs as Integer, n as Integer, elem_size as Integer returns Integer:
+    @Reasoning
+    Extract each coefficient as a signed integer into a fixed-width
+    array. Returns 1 on success, 0 if any coefficient falls outside
+    the elem_size-bit range (caller restarts).
+    @End Reasoning
+    @Implementation
+    Range bounds:
+      elem_size = 2 -> [-32768, 32767]
+      elem_size = 4 -> [-2147483648, 2147483647]
+      elem_size = 8 -> Int64 range (no rejection)
+    For each k convert via zint_to_int, range-check, store.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    Outputs may be SECRET. Overflow rejection is a public restart signal.
+    @End Security_Scope
+    Let lo be 0
+    Let hi be 0
+    If elem_size is equal to 2:
+        Set lo to 0 minus 32768
+        Set hi to 32767
+    Otherwise:
+        If elem_size is equal to 4:
+            Set lo to 0 minus 2147483648
+            Set hi to 2147483647
+        End If
+    End If
+    Let k be 0
+    While k is less than n:
+        Let z be proc zint_poly_get with poly, k
+        Let bits be Z.zint_bit_length(z)
+        Let bits_per_word be elem_size multiplied by 8
+        Note: A coefficient whose magnitude needs more bits than fit
+        Note: in the target word width is rejected. For elem_size==8
+        Note: we skip this check (zint_to_int returns the low 63 bits
+        Note: with sign, which is the conventional Int64 wrap).
+        If elem_size is less than 8:
+            If bits is greater than or equal to bits_per_word:
+                Return 0
+            End If
+        End If
+        Let v be Z.zint_to_int(z)
+        If elem_size is less than 8:
+            If v is less than lo:
+                Return 0
+            End If
+            If v is greater than hi:
+                Return 0
+            End If
+        End If
+        Let off be k multiplied by elem_size
+        If elem_size is equal to 2:
+            Memory.memory_set_int16(int_coeffs, off, v)
+        Otherwise:
+            If elem_size is equal to 4:
+                Memory.memory_set_int32(int_coeffs, off, v)
+            Otherwise:
+                Memory.memory_set_int64(int_coeffs, off, v)
+            End If
+        End If
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+K_n POLYNOMIAL DIVISION (Babai reduction support)
+==============================================================================
+Pornin's NTRUSolve descent uses a Babai reduction step
+
+    k = round( numer / denom )    in K_n
+    where denom = f * adj(f) + g * adj(g)
+
+The denominator D has only even-degree-of-X coefficients in K_n because
+both f*adj(f) and g*adj(g) carry only even-X terms (the cross pairing
+under conjugation cancels odd-X by sign).  Substituting Y = X^2 maps D
+to a polynomial D_half in K_{n/2} of half the length.
+
+Pornin's reference implements the resulting division in the FFT slot
+domain at fp53.  This module is the integer-domain analogue: it
+performs the division by recursive descent down to K_1, where division
+becomes a single zint divmod.
+
+Recurrence (general N in K_n, general D in K_n):
+  divide_kn_recursive(N, D, n):
+    if n == 1: return zint_div(N[0], D[0])
+    adj_D    = conjugate(D)                in K_n
+    N_prime  = N * adj_D                   in K_n
+    D_prime  = D * adj_D                   in K_n (even-X only)
+    D_half   = extract_even(D_prime)       in K_{n/2}
+    N_even, N_odd = split_even_odd(N_prime)
+    Q_even = divide_kn_recursive(N_even, D_half, n/2)
+    Q_odd  = divide_kn_recursive(N_odd,  D_half, n/2)
+    return merge_even_odd(Q_even, Q_odd)
+
+Bit growth: at each descent level both numerator and denominator's
+total bit lengths roughly double (one extra zint multiplication by
+adj_D).  After log2(n) levels the base-case scalars have bit length
+~n*b_0 where b_0 is the top-level operand bit length.  Falcon-512
+descends 9 levels so the K_1 divmod operates on ~15 kbit integers
+which zint handles via a bit-serial long division.  This is the price
+of exact integer arithmetic without FFT.
+
+Security_Scope (whole block): SECRET.
+:End Note
+
+Process called "zint_poly_split_even_odd" takes arena as Integer, src as Integer, n as Integer, out_even_ptr as Integer, out_odd_ptr as Integer returns Integer:
+    @Reasoning
+    Split a K_n polynomial into even-indexed and odd-indexed K_{n/2}
+    polynomials.  src(X) = out_even(X^2) + X * out_odd(X^2).
+    @End Reasoning
+    @Implementation
+    half_n = n / 2.
+    out_even[k] = src[2k]
+    out_odd[k]  = src[2k+1]
+    Both halves are deep-copied so the caller may mutate them
+    independently of src.
+    @End Implementation
+    @Performance_Hints
+    Linear in n; one zint_copy per coefficient.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let half_n be n shifted right by 1
+    Let bytes be half_n multiplied by 8
+
+    Let out_even be Arena.arena_allocate(arena, bytes)
+    If out_even is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(out_even, bytes)
+
+    Let out_odd be Arena.arena_allocate(arena, bytes)
+    If out_odd is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(out_odd, bytes)
+
+    Let k be 0
+    While k is less than half_n:
+        Let even_idx be k multiplied by 2
+        Let odd_idx be even_idx plus 1
+        Let ez be proc zint_poly_get with src, even_idx
+        Let oz be proc zint_poly_get with src, odd_idx
+        proc zint_poly_set with out_even, k, Z.zint_copy(arena, ez)
+        proc zint_poly_set with out_odd, k, Z.zint_copy(arena, oz)
+        Set k to k plus 1
+    End While
+
+    Memory.memory_set_int64(out_even_ptr, 0, out_even)
+    Memory.memory_set_int64(out_odd_ptr, 0, out_odd)
+    Return 1
+End Process
+
+Process called "zint_poly_merge_even_odd" takes arena as Integer, even_poly as Integer, odd_poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Inverse of zint_poly_split_even_odd.  Given two K_{n/2} polynomials
+    even_poly, odd_poly, build the K_n polynomial out where
+    out(X) = even_poly(X^2) + X * odd_poly(X^2).
+    @End Reasoning
+    @Implementation
+    half_n = n / 2.
+    out[2k]   = even_poly[k]
+    out[2k+1] = odd_poly[k]
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let half_n be n shifted right by 1
+    Let bytes be n multiplied by 8
+    Let out be Arena.arena_allocate(arena, bytes)
+    If out is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(out, bytes)
+
+    Let k be 0
+    While k is less than half_n:
+        Let ez be proc zint_poly_get with even_poly, k
+        Let oz be proc zint_poly_get with odd_poly, k
+        proc zint_poly_set with out, k multiplied by 2, Z.zint_copy(arena, ez)
+        proc zint_poly_set with out, (k multiplied by 2) plus 1, Z.zint_copy(arena, oz)
+        Set k to k plus 1
+    End While
+    Return out
+End Process
+
+Process called "zint_poly_extract_even" takes arena as Integer, src as Integer, n as Integer returns Integer:
+    @Reasoning
+    Given a K_n polynomial src whose odd-index coefficients are zero,
+    return the K_{n/2} polynomial out where out[k] = src[2k].  This is
+    the substitution Y = X^2 applied to a polynomial supported on even
+    powers of X.
+    @End Reasoning
+    @Implementation
+    half_n = n / 2.  Allocate a length-half_n polynomial; copy src[2k]
+    into out[k].  Caller is responsible for ensuring src has no odd-
+    indexed mass; we do not check.
+    @End Implementation
+    @Performance_Hints
+    Linear in n/2.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let half_n be n shifted right by 1
+    Let bytes be half_n multiplied by 8
+    Let out be Arena.arena_allocate(arena, bytes)
+    If out is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(out, bytes)
+
+    Let k be 0
+    While k is less than half_n:
+        Let ez be proc zint_poly_get with src, k multiplied by 2
+        proc zint_poly_set with out, k, Z.zint_copy(arena, ez)
+        Set k to k plus 1
+    End While
+    Return out
+End Process
+
+Process called "zint_poly_substitute_x_squared" takes arena as Integer, p_in_y as Integer, half_n as Integer returns Integer:
+    @Reasoning
+    Lift a K_{n/2} polynomial p(Y) into a K_n polynomial p(X^2).  The
+    result has zero in every odd-X coefficient.  Inverse of
+    zint_poly_extract_even.
+    @End Reasoning
+    @Implementation
+    Allocate length-n; out[2k] = p_in_y[k]; out[2k+1] = 0.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let full_n be half_n multiplied by 2
+    Let bytes be full_n multiplied by 8
+    Let out be Arena.arena_allocate(arena, bytes)
+    If out is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(out, bytes)
+
+    Let k be 0
+    While k is less than half_n:
+        Let cz be proc zint_poly_get with p_in_y, k
+        Let cz_cp be Z.zint_copy(arena, cz)
+        proc zint_poly_set with out, k multiplied by 2, cz_cp
+        proc zint_poly_set with out, (k multiplied by 2) plus 1, Z.zint_from_int(arena, 0)
+        Set k to k plus 1
+    End While
+    Return out
+End Process
+
+Process called "zint_poly_field_norm_sum" takes arena as Integer, f as Integer, g as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute D(X) = f(X) * adj(f)(X) + g(X) * adj(g)(X) in K_n.  D has
+    only even-X coefficients by construction.
+    @End Reasoning
+    @Implementation
+    1. adj_f = conjugate(f), adj_g = conjugate(g).
+    2. ff   = f * adj_f      (in K_n)
+    3. gg   = g * adj_g      (in K_n)
+    4. out  = ff + gg
+    @End Implementation
+    @Performance_Hints
+    Two K_n polynomial multiplies plus a K_n addition.  Used once per
+    Babai iteration at the top level and at most once per recursive
+    descent inside the K_n divider.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let adj_f be proc zint_poly_conjugate with arena, f, n
+    Let adj_g be proc zint_poly_conjugate with arena, g, n
+    Let ff be proc zint_poly_mul with arena, f, adj_f, n
+    Let gg be proc zint_poly_mul with arena, g, adj_g, n
+    Let out be proc zint_poly_add with arena, ff, gg, n
+    Return out
+End Process
+
+Process called "zint_poly_round_div_scalar" takes arena as Integer, num as Integer, den as Integer returns Integer:
+    @Reasoning
+    Compute round_to_nearest(num / den) for two zint scalars.  Uses the
+    standard "add half-magnitude before truncation" trick.
+    @End Reasoning
+    @Implementation
+    1. If num == 0 return zint(0).
+    2. If den == 0 return zint(0) (caller should not divide by zero; we
+       fail gracefully here to allow upstream norm checks to reject the
+       attempt rather than abort).
+    3. nr_sign = sign(num); take |num|.
+    4. dr_abs = |den|.
+    5. half = dr_abs >> 1.
+    6. adjusted = |num| + half.
+    7. q_abs = adjusted / dr_abs (truncated).
+    8. If nr_sign < 0 negate q_abs.
+    9. Return q_abs.
+    @End Implementation
+    @Performance_Hints
+    One zint_shift_right, one zint_add, one zint_div.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.  Bit-serial division leaks bit length only.
+    @End Security_Scope
+    If Z.zint_is_zero(num) is equal to 1:
+        Return Z.zint_from_int(arena, 0)
+    End If
+    If Z.zint_is_zero(den) is equal to 1:
+        Return Z.zint_from_int(arena, 0)
+    End If
+
+    Let nr_sign be Z.zint_get_sign(num)
+
+    Let nr_abs_cap be Z.zint_get_used(num) plus 2
+    Let nr_abs be Z.zint_create(arena, nr_abs_cap)
+    Z.zint_copy_into(nr_abs, num)
+    Z.zint_abs(nr_abs)
+
+    Let dr_abs_cap be Z.zint_get_used(den) plus 2
+    Let dr_abs be Z.zint_create(arena, dr_abs_cap)
+    Z.zint_copy_into(dr_abs, den)
+    Z.zint_abs(dr_abs)
+
+    Let half be Z.zint_shift_right(arena, dr_abs, 1)
+
+    Let adj_cap be Z.zint_get_used(nr_abs)
+    Let half_u be Z.zint_get_used(half)
+    If half_u is greater than adj_cap:
+        Set adj_cap to half_u
+    End If
+    Set adj_cap to adj_cap plus 2
+    Let adjusted be Z.zint_create(arena, adj_cap)
+    Z.zint_add(adjusted, nr_abs, half)
+
+    Let q_abs be Z.zint_div(arena, adjusted, dr_abs)
+    If nr_sign is equal to 1:
+        Z.zint_neg(q_abs)
+    End If
+    Return q_abs
+End Process
+
+Process called "zint_poly_divide_kn_recursive" takes arena as Integer, n_poly as Integer, d_poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute Q(X) = round( N(X) / D(X) ) in K_n by recursive descent
+    on the cyclotomic tower.  Returns a freshly allocated K_n
+    polynomial.
+    @End Reasoning
+    @Implementation
+    Base case n = 1: round_div_scalar on the single coefficient.
+
+    Recursive case n >= 2:
+      adj_D   = conjugate(D)               in K_n
+      N_prime = N * adj_D                  in K_n
+      D_prime = D * adj_D                  in K_n; even-X only
+      D_half  = extract_even(D_prime)      in K_{n/2}
+      (N_even, N_odd) = split_even_odd(N_prime)   in K_{n/2}
+      Q_even = recurse(N_even, D_half, n/2)
+      Q_odd  = recurse(N_odd,  D_half, n/2)
+      return merge_even_odd(Q_even, Q_odd)
+    @End Implementation
+    @Performance_Hints
+    O(log n) recursion levels; per level dominated by two K_n
+    polynomial multiplies (N * adj_D, D * adj_D).  Coefficient bit
+    lengths double per level; the base case is one bit-serial divmod
+    on ~n * b_0-bit operands.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.  Loop counts inside zint primitives leak bit lengths only.
+    @End Security_Scope
+    If n is equal to 1:
+        Let n_scalar be proc zint_poly_get with n_poly, 0
+        Let d_scalar be proc zint_poly_get with d_poly, 0
+        Let q_scalar be proc zint_poly_round_div_scalar with arena, n_scalar, d_scalar
+
+        Let bytes be 8
+        Let out be Arena.arena_allocate(arena, bytes)
+        If out is equal to 0:
+            Return 0
+        End If
+        Memory.memory_zero(out, bytes)
+        proc zint_poly_set with out, 0, q_scalar
+        Return out
+    End If
+
+    Let adj_d be proc zint_poly_conjugate with arena, d_poly, n
+    Let n_prime be proc zint_poly_mul with arena, n_poly, adj_d, n
+    Let d_prime be proc zint_poly_mul with arena, d_poly, adj_d, n
+
+    Let d_half be proc zint_poly_extract_even with arena, d_prime, n
+
+    Let n_even_ptr be Arena.arena_allocate(arena, 8)
+    Let n_odd_ptr be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_int64(n_even_ptr, 0, 0)
+    Memory.memory_set_int64(n_odd_ptr, 0, 0)
+    Let split_ok be proc zint_poly_split_even_odd with arena, n_prime, n, n_even_ptr, n_odd_ptr
+    If split_ok is equal to 0:
+        Return 0
+    End If
+    Let n_even be Memory.memory_get_int64(n_even_ptr, 0)
+    Let n_odd be Memory.memory_get_int64(n_odd_ptr, 0)
+
+    Let half_n be n shifted right by 1
+
+    Let q_even be proc zint_poly_divide_kn_recursive with arena, n_even, d_half, half_n
+    If q_even is equal to 0:
+        Return 0
+    End If
+    Let q_odd be proc zint_poly_divide_kn_recursive with arena, n_odd, d_half, half_n
+    If q_odd is equal to 0:
+        Return 0
+    End If
+
+    Let out be proc zint_poly_merge_even_odd with arena, q_even, q_odd, n
+    Return out
+End Process
+
+Process called "zint_poly_divide_by_kn_denominator" takes arena as Integer, numerator as Integer, denom_f as Integer, denom_g as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute Q(X) = round( numerator(X) / (denom_f * adj(denom_f) +
+    denom_g * adj(denom_g)) ) in K_n.  This is the inner kernel of
+    Pornin's Babai reduction step (Falcon spec Algorithm 6, line 6).
+    @End Reasoning
+    @Implementation
+    The K_n denominator D = f*adj(f) + g*adj(g) has only even-X
+    coefficients by construction (cross-term parity cancellation under
+    Galois conjugation in K_n).  We exploit this by taking the FIRST
+    descent step directly:
+
+      1. Compute D in K_n.
+      2. If D is identically zero (pathological f = g = 0) return a
+         length-n zero polynomial so callers see k = 0 and halt.
+      3. Project to K_{n/2}: D_half = extract_even(D).
+      4. Split numerator: N_even, N_odd = split_even_odd(numerator).
+      5. Recursively divide each half by D_half in K_{n/2} (no special
+         structure assumed on D_half from this point on).
+      6. Merge: Q(X) = Q_even(X^2) + X * Q_odd(X^2).
+
+    This top-level shortcut saves one level of recursion (and thus
+    halves the base-case bit length), reducing total work by roughly
+    4x relative to running the general recursion at the top.  Babai
+    convergence is unaffected: this is mathematically the same
+    quotient.
+    @End Implementation
+    @Performance_Hints
+    Top-level cost: one zint_poly_field_norm_sum (two K_n muls plus an
+    add) plus two K_{n/2} recursive divides.  Each recursive divide
+    further descends log2(n/2) levels.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let denom be proc zint_poly_field_norm_sum with arena, denom_f, denom_g, n
+
+    Note: Check D is not identically zero.  If it is, return zero poly
+    Note: so the caller (Babai loop) sees k = 0 and converges.
+    Let any_nonzero be 0
+    Let chk be 0
+    While chk is less than n:
+        Let c be proc zint_poly_get with denom, chk
+        If Z.zint_is_zero(c) is equal to 0:
+            Set any_nonzero to 1
+        End If
+        Set chk to chk plus 1
+    End While
+    If any_nonzero is equal to 0:
+        Let bytes be n multiplied by 8
+        Let zero_out be Arena.arena_allocate(arena, bytes)
+        Memory.memory_zero(zero_out, bytes)
+        Let i be 0
+        While i is less than n:
+            proc zint_poly_set with zero_out, i, Z.zint_from_int(arena, 0)
+            Set i to i plus 1
+        End While
+        Return zero_out
+    End If
+
+    Note: At n = 1 there is no descent; do scalar division directly.
+    If n is equal to 1:
+        Let n_scalar be proc zint_poly_get with numerator, 0
+        Let d_scalar be proc zint_poly_get with denom, 0
+        Let q_scalar be proc zint_poly_round_div_scalar with arena, n_scalar, d_scalar
+        Let bytes_1 be 8
+        Let out_1 be Arena.arena_allocate(arena, bytes_1)
+        Memory.memory_zero(out_1, bytes_1)
+        proc zint_poly_set with out_1, 0, q_scalar
+        Return out_1
+    End If
+
+    Note: Exploit even-X structure of D: skip the multiplicatioon by
+    Note: adj(D) (= D itself) at this level and descend directly.
+    Let half_n be n shifted right by 1
+    Let d_half be proc zint_poly_extract_even with arena, denom, n
+
+    Let n_even_ptr be Arena.arena_allocate(arena, 8)
+    Let n_odd_ptr be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_int64(n_even_ptr, 0, 0)
+    Memory.memory_set_int64(n_odd_ptr, 0, 0)
+    Let split_ok be proc zint_poly_split_even_odd with arena, numerator, n, n_even_ptr, n_odd_ptr
+    If split_ok is equal to 0:
+        Return 0
+    End If
+    Let n_even be Memory.memory_get_int64(n_even_ptr, 0)
+    Let n_odd be Memory.memory_get_int64(n_odd_ptr, 0)
+
+    Let q_even be proc zint_poly_divide_kn_recursive with arena, n_even, d_half, half_n
+    If q_even is equal to 0:
+        Return 0
+    End If
+    Let q_odd be proc zint_poly_divide_kn_recursive with arena, n_odd, d_half, half_n
+    If q_odd is equal to 0:
+        Return 0
+    End If
+
+    Return proc zint_poly_merge_even_odd with arena, q_even, q_odd, n
+End Process
+
+Note:
+==============================================================================
+HYBRID zint <-> FFT-fp53 INTERCONVERSION (Pornin reference Babai support)
+==============================================================================
+
+Pornin's reference Falcon performs Babai reduction in the FFT slot domain
+at fp53 precision: the rational division Q = N / D collapses to one fp
+division per slot, making each Babai iteration O(n log n) instead of the
+O(n^2 log n) cost of the exact-zint K_n polynomial division.
+
+This block adds the bridges:
+
+  zint_poly_to_fft       : convert a zint K_n polynomial to a Float64 FFT
+                           buffer by lifting each zint coefficient to its
+                           Int64 image, converting to Float, then running
+                           the forward FFT.  Returns 0 if any coefficient
+                           exceeds the safe Int64 magnitude or if the
+                           magnitudes would lose more than ~50 bits of
+                           precision under Float64 (signaling the caller
+                           to take the pure-zint fallback path).
+  fft_to_zint_poly       : inverse direction.  Runs the inverse FFT and
+                           rounds each real part to the nearest integer,
+                           rebuilding zint coefficients in the caller's
+                           arena.
+
+Precision check.  A Float64 mantissa carries 53 bits.  We accept a
+coefficient as safely representable when its absolute value fits in 50
+bits (a 3-bit margin against accumulated FFT round-off; Pornin uses a
+similar safety band).  Coefficients up to 2^50 - 1 round-trip exactly;
+anything larger triggers a precision rejection.
+
+The Babai numerator N = F * conj(f) + G * conj(g) and denominator D =
+f * conj(f) + g * conj(g) grow in magnitude with descent level.  Late
+in a Falcon-1024 descent (depth ~10) the F, G coefficients can require
+hundreds of bits, far exceeding fp53.  In those cases the hybrid path
+rejects and the caller falls back to the exact zint kernel for that
+iteration.  Pornin's reference handles this by precomputing a per-level
+scale and dividing through, but our implementation here is the simpler
+and equally correct "try fp, fall back if precision is insufficient"
+formulation.
+
+Security_Scope (whole block): SECRET.  All operations CT modulo Float
+denormal slowdowns documented in falcon_fp.runa.
+:End Note
+
+Process called "zint_poly_max_bit_length" takes poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Return the maximum bit length of any coefficient magnitude in poly.
+    Used to decide whether a polynomial fits safely inside Float64
+    mantissa range before lifting to FFT form.
+    @End Reasoning
+    @Implementation
+    Walk all n coefficients; for each, call zint_bit_length and track the
+    running maximum.  Zero coefficients contribute 0.
+    @End Implementation
+    @Performance_Hints
+    Linear in n plus total limbs.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET; bit length leakage is a Falcon-permitted side channel.
+    @End Security_Scope
+    Let max_bits be 0
+    Let k be 0
+    While k is less than n:
+        Let z be proc zint_poly_get with poly, k
+        Let bits be Z.zint_bit_length(z)
+        If bits is greater than max_bits:
+            Set max_bits to bits
+        End If
+        Set k to k plus 1
+    End While
+    Return max_bits
+End Process
+
+Process called "zint_poly_max_used" takes poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    Return the maximum `used` limb count across all coefficients of poly.
+    Used by the Babai FFT bridge to pick a common 31-bit limb baseline
+    for scaling every coefficient down to a Float64-representable range.
+    @End Reasoning
+    @Implementation
+    Walk all n coefficients calling zint_get_used; track the running
+    maximum.  Zero coefficients contribute 0.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.  Used-count leakage is bit-length leakage which Falcon
+    permits.
+    @End Security_Scope
+    Let max_used be 0
+    Let k be 0
+    While k is less than n:
+        Let z be proc zint_poly_get with poly, k
+        Let u be Z.zint_get_used(z)
+        If u is greater than max_used:
+            Set max_used to u
+        End If
+        Set k to k plus 1
+    End While
+    Return max_used
+End Process
+
+Process called "zint_to_double_scaled" takes z as Integer, baseline_used as Integer returns Float:
+    @Reasoning
+    Convert a zint to its Float64 approximation, scaled so that the limbs
+    at positions baseline_used-1 (high) and baseline_used-2 (low) become
+    bits 31..61 and 0..30 of an Int64 mantissa.  Returns sign(z) * (top62
+    bits of |z| at the baseline).  Coefficients whose used count is less
+    than baseline_used-1 round to exactly zero (their top two padded
+    limbs are both zero).
+    @End Reasoning
+    @Implementation
+    Algorithm:
+      1. used = zint_get_used(z).  If used == 0 return 0.0.
+      2. high_idx = baseline_used - 1.  Low_idx = baseline_used - 2.
+      3. high_limb = (high_idx < used) ? get_limb(z, high_idx) : 0.
+      4. low_limb  = (low_idx  < used) ? get_limb(z, low_idx)  : 0.
+      5. top62 = high_limb * 2^31 + low_limb.  Fits in Int64 (high_limb
+         is at most 2^31 - 1, so top62 < 2^62).
+      6. Convert top62 to Float64 via fp_from_int (round-to-nearest).
+      7. Apply sign: if sign(z) == 1 negate the float.
+    Note that this produces the float "top 62 bits of |z| at the
+    baseline scale".  If baseline_used == used the result is exactly the
+    top 62 bits of |z| (with the remaining low limbs of |z| treated as
+    sub-LSB residue, lost in the float rounding which is the correct
+    IEEE behaviour for a 53-bit mantissa).  If baseline_used > used the
+    result is |z| (scaled down by 31*(baseline_used - used) bits) with
+    perfect precision since |z| fits in <= 2 limbs at that point.
+    @End Implementation
+    @Performance_Hints
+    O(1) per coefficient: 2 limb reads, one multiply, one fp_from_int.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.  The output Float64 representation depends only on bit
+    pattern of the top 62 bits of |z| at the chosen baseline.
+    @End Security_Scope
+    Let used be Z.zint_get_used(z)
+    If used is equal to 0:
+        Let zero_v be proc FP.fp_zero
+        Return zero_v
+    End If
+    Let high_idx be baseline_used minus 1
+    Let low_idx be baseline_used minus 2
+    Let high_limb be 0
+    If high_idx is greater than or equal to 0:
+        If high_idx is less than used:
+            Set high_limb to Z.zint_get_limb(z, high_idx)
+        End If
+    End If
+    Let low_limb be 0
+    If low_idx is greater than or equal to 0:
+        If low_idx is less than used:
+            Set low_limb to Z.zint_get_limb(z, low_idx)
+        End If
+    End If
+    Let bits_per be Z.zint_limb_bits()
+    Let top62 be (high_limb shifted left by bits_per) plus low_limb
+    Let abs_f be proc FP.fp_from_int with top62
+    Let sign be Z.zint_get_sign(z)
+    If sign is equal to 1:
+        Let neg_f be proc FP.fp_neg with abs_f
+        Return neg_f
+    End If
+    Return abs_f
+End Process
+
+Process called "zint_poly_to_fft" takes arena as Integer, zint_poly as Integer, n as Integer, fft_buf_out as Integer, baseline_used as Integer returns Integer:
+    @Reasoning
+    Convert a length-n zint K_n polynomial into a Float64 FFT-domain
+    buffer using a UNIFORM SCALING across all coefficients so the
+    largest representable magnitude fits inside Float64's 53-bit mantissa
+    with safety margin.  Returns 1 unconditionally on success; the
+    "precision rejection" semantics of the old contract have moved into
+    a separate predicate (see ntrusolve_max_bits_in_polys) because with
+    Pornin-style uniform scaling there is no representable-range failure
+    mode for a single polynomial: the float result is always the top
+    ~62 bits of the magnitude at the chosen baseline.
+    @End Reasoning
+    @Implementation
+    Layout of fft_buf_out: 16 bytes per complex slot (real + imag
+    Float64), 16*n bytes total.
+    1. For each coefficient z, compute float = zint_to_double_scaled(z,
+       baseline_used).  This yields a signed Float64 whose magnitude is
+       the top 62 bits of |z| at the limb-position baseline_used-1.
+    2. Store as (real = float, imag = 0) at slot k.
+    3. Run forward FFT in place on fft_buf_out.
+
+    Per Pornin's reference, using a common baseline across all four
+    polys (f, g, F, G) means the resulting N/D ratio in the FFT slot
+    domain is correct to within the round-off of the largest
+    coefficient -- no per-polynomial back-scaling required.
+    @End Implementation
+    @Performance_Hints
+    O(n) lift + O(n log n) FFT.  The lift is two limb reads + one
+    Int64 multiply + one cvtsi2sd per coefficient.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET zint contents flow through fp_from_int (constant-time
+    cvtsi2sd) and the FFT butterfly tree.
+    @End Security_Scope
+    Let bytes be n multiplied by 16
+    Memory.memory_zero(fft_buf_out, bytes)
+
+    Let zero_v be proc FP.fp_zero
+    Let k be 0
+    While k is less than n:
+        Let zc be proc zint_poly_get with zint_poly, k
+        Let v_f be proc zint_to_double_scaled with zc, baseline_used
+        proc FFT.fft_set_real with fft_buf_out, k, v_f
+        proc FFT.fft_set_imag with fft_buf_out, k, zero_v
+        Set k to k plus 1
+    End While
+
+    Let ok be proc FFT.fft_forward with arena, fft_buf_out, n
+    Return ok
+End Process
+
+Process called "fft_to_zint_poly" takes arena as Integer, fft_buf as Integer, n as Integer returns Integer:
+    @Reasoning
+    Inverse of zint_poly_to_fft.  Runs an in-place inverse FFT on fft_buf,
+    rounds each real part to the nearest integer, and returns a freshly
+    allocated zint polynomial holding those integers.
+    @End Reasoning
+    @Implementation
+    1. Run fft_inverse on fft_buf (in place).  Inverse FFT applies the
+       1/n normalisation, so the resulting real parts are the
+       coefficient-domain values.
+    2. Allocate a length-n zint polynomial in the caller's arena.
+    3. For each slot k, read the real part, round to nearest Int64 via
+       FP.fp_to_int_round, and install a zint coefficient via
+       Z.zint_from_int.
+    Imaginary parts of the inverse FFT result should be near zero by
+    construction (the FFT operands originated from real-valued
+    polynomials and stayed real-conjugate-symmetric in the slot
+    domain); we discard them.
+    @End Implementation
+    @Performance_Hints
+    O(n log n) inverse FFT plus O(n) rounding and zint construction.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET; same constraints as zint_poly_to_fft.
+    @End Security_Scope
+    Note: In-place inverse FFT including the 1/n scaling pass.
+    Let inv_ok be proc FFT.fft_inverse with arena, fft_buf, n
+    If inv_ok is equal to 0:
+        Return 0
+    End If
+
+    Let bytes be n multiplied by 8
+    Let poly be Arena.arena_allocate(arena, bytes)
+    If poly is equal to 0:
+        Return 0
+    End If
+    Memory.memory_zero(poly, bytes)
+
+    Let k be 0
+    While k is less than n:
+        Let r_f be proc FFT.fft_get_real with fft_buf, k
+        Let v_int be proc FP.fp_to_int_round with r_f
+        Let zc be Z.zint_from_int(arena, v_int)
+        proc zint_poly_set with poly, k, zc
+        Set k to k plus 1
+    End While
+
+    Return poly
+End Process
+
+Process called "fft_load_from_zint_poly_no_check" takes zint_poly as Integer, n as Integer, fft_buf_out as Integer returns Integer:
+    @Reasoning
+    Load a zint polynomial's coefficients into an FFT buffer WITHOUT
+    running the forward FFT.  The caller is responsible for any
+    precision check and for calling fft_forward afterward.
+    @End Reasoning
+    @Implementation
+    For each k, lift the k-th zint coefficient to Int64, convert to
+    Float64, store as (real, imag=0) in fft_buf_out at slot k.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET.
+    @End Security_Scope
+    Let bytes be n multiplied by 16
+    Memory.memory_zero(fft_buf_out, bytes)
+    Let zero_v be proc FP.fp_zero
+    Let k be 0
+    While k is less than n:
+        Let zc be proc zint_poly_get with zint_poly, k
+        Let v_int be Z.zint_to_int(zc)
+        Let v_f be proc FP.fp_from_int with v_int
+        proc FFT.fft_set_real with fft_buf_out, k, v_f
+        proc FFT.fft_set_imag with fft_buf_out, k, zero_v
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+END falcon_zint_poly
+==============================================================================
+:End Note

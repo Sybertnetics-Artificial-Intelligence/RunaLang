@@ -32,6 +32,9 @@ FEATURES:
 This system focuses on simplicity and reliability over advanced features.
 :End Note
 
+Note: Stage1 bootstrap: opt out of name-mangling (see codegen.runa task #86).
+Let __runa_no_mangle__ be 1
+
 Note: ============================================================================
 Note: Simple Import Context Structure
 Note: ============================================================================
@@ -832,6 +835,15 @@ Process called "process_imports_with_context" takes program as Integer, arena as
             End While
         End If
 
+        Note: Wave MANGLING-SYMMETRIC: tag the imported program's Function
+        Note: records with no_mangle=1 when the imported file declares
+        Note: `Let __runa_no_mangle__ be 1`. The flag travels with each Function
+        Note: through merge_imported_functions into the consumer's program table.
+        Note: Codegen reads the per-Function flag at both definition and call
+        Note: emission, so a mangling-enabled caller correctly emits the plain
+        Note: symbol name that this file's definitions export.
+        program_tag_no_mangle_flags(import_program)
+
         Let tag_type_count be memory_get_int32(import_program, 24)
         Let tag_types_ptr be memory_get_pointer(import_program, 16)
         If tag_types_ptr is not equal to 0:
@@ -908,14 +920,23 @@ Process called "process_imports_with_context" takes program as Integer, arena as
 End Process
 
 Process called "merge_imported_functions" takes main_program as Integer, import_program as Integer, arena as Integer returns Integer:
-    Note: Merge functions from imported program into main program, skipping any
-    Note: function whose name already exists in the destination. Without the
-    Note: dedup pass, two transitive import paths to the same module (e.g.
-    Note: validation.runa importing StringCore directly AND through MemoryLayout)
-    Note: would each pull StringCore's functions into the destination, and the
-    Note: assembler would refuse the resulting .s output with "symbol already
-    Note: defined" errors. The dedup pass mirrors the behavior already present
-    Note: in merge_imported_globals.
+    Note: Merge functions from imported program into main program. Dedup keys off
+    Note: (name, source_file) pairs rather than name alone (task #86 fix).
+    Note: Two distinct files may legitimately define a Process with the same
+    Note: name (e.g. core/atomic_core.runa::atomic_load_acquire AND
+    Note: assembly/atomic.runa::atomic_load_acquire -- core dispatches to
+    Note: assembly, assembly dispatches to per-platform impls). Both must remain
+    Note: visible to the codegen so qualified-call sites can resolve to the
+    Note: correct definition via alias disambiguation in
+    Note: codegen_lookup_qualified_target.
+    Note: Without (name, source_file) dedup, the second-imported function would
+    Note: silently disappear and any `proc atomic_load_acquire from AtomicImpl`
+    Note: call would fall through to whichever survived -- in practice the core
+    Note: dispatcher calling itself in infinite recursion.
+    Note: We still dedup TRANSITIVE re-imports (the same physical Function
+    Note: object reaching the destination twice via two import paths) because
+    Note: source_file pointers are stable -- import_system assigns the same
+    Note: resolved_path pointer to every function in a given imported file.
     Note: Returns 0 on success, 1 on error.
 
     Let import_func_count be memory_get_int32(import_program, 8)
@@ -931,8 +952,10 @@ Process called "merge_imported_functions" takes main_program as Integer, import_
     Let main_func_count be memory_get_int32(main_program, 8)
     Let main_functions be memory_get_pointer(main_program, 0)
 
-    Note: First pass: count how many imported functions are NEW (not already
-    Note: present in main_program by name). This sizes the merged array exactly.
+    Note: First pass: count how many imported functions are NEW. Dedup key is
+    Note: (name, source_file). Same name but different source_file -> NEW
+    Note: (this is the bug-fix case). Same name AND same source_file -> duplicate
+    Note: (transitive re-import of the same physical function).
     Let new_count be 0
     Let scan_j be 0
     While scan_j is less than import_func_count:
@@ -940,16 +963,50 @@ Process called "merge_imported_functions" takes main_program as Integer, import_
         Let already_present be 0
         If scan_func is not equal to 0:
             Let scan_name be memory_get_pointer(scan_func, 0)  Note: func->name
+            Let scan_src be memory_get_pointer(scan_func, 48)  Note: func->source_file
             If scan_name is not equal to 0:
                 Let scan_i be 0
                 While scan_i is less than main_func_count:
                     Let existing_func be memory_get_pointer(main_functions, scan_i multiplied by 8)
                     If existing_func is not equal to 0:
                         Let existing_name be memory_get_pointer(existing_func, 0)
+                        Let existing_src be memory_get_pointer(existing_func, 48)
                         If existing_name is not equal to 0:
                             If string_equals(scan_name, existing_name) is equal to 1:
-                                Set already_present to 1
-                                Set scan_i to main_func_count  Note: break inner loop
+                                Note: Names match -- check source_file identity.
+                                Note: Both source_file pointers shared by the
+                                Note: import_system as the same resolved_path
+                                Note: pointer for all funcs in one file -> raw
+                                Note: pointer equality is the canonical dedup
+                                Note: signal. Defensive fallback: if either side
+                                Note: is null OR pointers differ but the
+                                Note: underlying paths are equal as strings, also
+                                Note: treat as duplicate (covers synthesized
+                                Note: functions or paths re-allocated by string
+                                Note: helpers).
+                                Let same_src be 0
+                                If scan_src is equal to existing_src:
+                                    Set same_src to 1
+                                End If
+                                If same_src is equal to 0:
+                                    If scan_src is equal to 0:
+                                        Set same_src to 1
+                                    End If
+                                End If
+                                If same_src is equal to 0:
+                                    If existing_src is equal to 0:
+                                        Set same_src to 1
+                                    End If
+                                End If
+                                If same_src is equal to 0:
+                                    If string_equals(scan_src, existing_src) is equal to 1:
+                                        Set same_src to 1
+                                    End If
+                                End If
+                                If same_src is equal to 1:
+                                    Set already_present to 1
+                                    Set scan_i to main_func_count  Note: break inner loop
+                                End If
                             End If
                         End If
                     End If
@@ -999,17 +1056,41 @@ Process called "merge_imported_functions" takes main_program as Integer, import_
         Let skip be 0
         If func_ptr is not equal to 0:
             Let import_name be memory_get_pointer(func_ptr, 0)
+            Let import_src be memory_get_pointer(func_ptr, 48)
             If import_name is not equal to 0:
-                Note: Check against original main_functions
+                Note: Check against original main_functions. Use (name, source_file)
+                Note: dedup so same-name-different-file functions both survive.
                 Let k be 0
                 While k is less than main_func_count:
                     Let dup_func be memory_get_pointer(main_functions, k multiplied by 8)
                     If dup_func is not equal to 0:
                         Let dup_name be memory_get_pointer(dup_func, 0)
+                        Let dup_src be memory_get_pointer(dup_func, 48)
                         If dup_name is not equal to 0:
                             If string_equals(import_name, dup_name) is equal to 1:
-                                Set skip to 1
-                                Set k to main_func_count  Note: break inner loop
+                                Let dup_same_src be 0
+                                If import_src is equal to dup_src:
+                                    Set dup_same_src to 1
+                                End If
+                                If dup_same_src is equal to 0:
+                                    If import_src is equal to 0:
+                                        Set dup_same_src to 1
+                                    End If
+                                End If
+                                If dup_same_src is equal to 0:
+                                    If dup_src is equal to 0:
+                                        Set dup_same_src to 1
+                                    End If
+                                End If
+                                If dup_same_src is equal to 0:
+                                    If string_equals(import_src, dup_src) is equal to 1:
+                                        Set dup_same_src to 1
+                                    End If
+                                End If
+                                If dup_same_src is equal to 1:
+                                    Set skip to 1
+                                    Set k to main_func_count  Note: break inner loop
+                                End If
                             End If
                         End If
                     End If
@@ -1023,10 +1104,32 @@ Process called "merge_imported_functions" takes main_program as Integer, import_
                         Let prev_func be memory_get_pointer(new_functions, m multiplied by 8)
                         If prev_func is not equal to 0:
                             Let prev_name be memory_get_pointer(prev_func, 0)
+                            Let prev_src be memory_get_pointer(prev_func, 48)
                             If prev_name is not equal to 0:
                                 If string_equals(import_name, prev_name) is equal to 1:
-                                    Set skip to 1
-                                    Set m to dest_index  Note: break
+                                    Let prev_same_src be 0
+                                    If import_src is equal to prev_src:
+                                        Set prev_same_src to 1
+                                    End If
+                                    If prev_same_src is equal to 0:
+                                        If import_src is equal to 0:
+                                            Set prev_same_src to 1
+                                        End If
+                                    End If
+                                    If prev_same_src is equal to 0:
+                                        If prev_src is equal to 0:
+                                            Set prev_same_src to 1
+                                        End If
+                                    End If
+                                    If prev_same_src is equal to 0:
+                                        If string_equals(import_src, prev_src) is equal to 1:
+                                            Set prev_same_src to 1
+                                        End If
+                                    End If
+                                    If prev_same_src is equal to 1:
+                                        Set skip to 1
+                                        Set m to dest_index  Note: break
+                                    End If
                                 End If
                             End If
                         End If
@@ -1096,30 +1199,48 @@ Process called "merge_imported_globals" takes main_program as Integer, import_pr
     End While
 
     Note: Append imported globals, skipping duplicates by name.
+    Note: Wave MANGLING-SYMMETRIC: filter the `__runa_no_mangle__` sentinel
+    Note: from import-merged globals. The sentinel is a compile-time-only
+    Note: marker that signals the IMPORTED FILE's per-Function mangling policy
+    Note: -- it must NOT propagate to the consumer's program globals, because
+    Note: codegen_is_mangling_disabled (which only fires as a legacy safety
+    Note: net) would then mistakenly treat the consumer as opt-out and emit
+    Note: every definition plain, breaking symmetric mangling. The
+    Note: per-Function is_no_mangle flag (set by program_tag_no_mangle_flags
+    Note: on the imported program BEFORE this merge) carries the policy
+    Note: forward via the merged Function records.
     Let actual_count be main_global_count
     Let j be 0
     While j is less than import_global_count:
         Let imp_ptr be memory_get_pointer(import_globals, j multiplied by 8)
         If imp_ptr is not equal to 0:
             Let imp_name be memory_get_pointer(imp_ptr, 0)
-            Let dup_found be 0
-            Let k be 0
-            While k is less than actual_count:
-                Let exist_ptr be memory_get_pointer(new_globals, k multiplied by 8)
-                If exist_ptr is not equal to 0:
-                    Let exist_name be memory_get_pointer(exist_ptr, 0)
-                    If string_equals(exist_name, imp_name) is equal to 1:
-                        Set dup_found to 1
-                        Set k to actual_count
-                    End If
+            Let skip_sentinel be 0
+            If imp_name is not equal to 0:
+                If string_equals(imp_name, "__runa_no_mangle__") is equal to 1:
+                    Set skip_sentinel to 1
                 End If
-                Set k to k plus 1
-            End While
+            End If
+            If skip_sentinel is equal to 0:
+                Let dup_found be 0
+                Let k be 0
+                While k is less than actual_count:
+                    Let exist_ptr be memory_get_pointer(new_globals, k multiplied by 8)
+                    If exist_ptr is not equal to 0:
+                        Let exist_name be memory_get_pointer(exist_ptr, 0)
+                        If string_equals(exist_name, imp_name) is equal to 1:
+                            Set dup_found to 1
+                            Set k to actual_count
+                        End If
+                    End If
+                    Set k to k plus 1
+                End While
 
-            If dup_found is equal to 0:
-                Let dest_offset be actual_count multiplied by 8
-                memory_set_pointer(new_globals, dest_offset, imp_ptr)
-                Set actual_count to actual_count plus 1
+                If dup_found is equal to 0:
+                    Let dest_offset be actual_count multiplied by 8
+                    memory_set_pointer(new_globals, dest_offset, imp_ptr)
+                    Set actual_count to actual_count plus 1
+                End If
             End If
         End If
         Set j to j plus 1

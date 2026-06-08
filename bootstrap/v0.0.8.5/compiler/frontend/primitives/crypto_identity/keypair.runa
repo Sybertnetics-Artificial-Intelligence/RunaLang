@@ -90,6 +90,7 @@ Import "compiler/frontend/import_system/crypto/bigint.runa" as BigInt
 Import "compiler/frontend/import_system/crypto/pq/ml_kem.runa" as MlKem
 Import "compiler/frontend/import_system/crypto/pq/ml_dsa.runa" as MlDsa
 Import "compiler/frontend/import_system/crypto/pq/slh_dsa.runa" as SlhDsa
+Import "compiler/frontend/import_system/crypto/pq/falcon.runa" as Falcon
 
 Note: ============================================================================
 Note: SECTION 1: Error codes for keypair_keygen_capability_check
@@ -103,11 +104,12 @@ Note: SECTION 2: Algorithm capability probe
 Note: ============================================================================
 
 @Reasoning
-FALCON keygen requires Float64 SSE2 because the NTRU-lattice basis
-generator runs an FFT over IEEE 754 doubles (Fast Fourier sampling per
-Falcon spec section 3.8). Until the in-tree Float64 SSE2 path is wired
-in, keygen requests for FALCON-512 and FALCON-1024 return a hard error
-rather than silently stubbing or producing an invalid key.
+FALCON keygen runs an NTRU-lattice basis generator that performs an FFT
+over IEEE 754 doubles (Fast Fourier sampling per Falcon spec section 3.8).
+The stage1 Float64 SSE2 path is operational and Falcon-{512,1024} keygen
+orchestration (NTRUSolve descent, LDL decomposition, FFS sampler) is
+wired in through falcon_512_keygen and falcon_1024_keygen, so both
+Falcon parameter sets report KEYPAIR_CAP_OK on every supported host.
 
 ML-KEM (FIPS 203), ML-DSA (FIPS 204), and SLH-DSA (FIPS 205) all run on
 integer-only arithmetic: ML-KEM and ML-DSA use a Montgomery-form NTT
@@ -117,13 +119,19 @@ supported on every host.
 The classical algorithms (Ed25519/Ed448, X25519/X448, ECDSA over the NIST
 curves, RSA-{2048,3072,4096}) are integer-only and supported on every
 host. This proc is the single authoritative capability check that gates
-the keypair_create dispatcher.
+the keypair_create dispatcher. KEYPAIR_CAP_FLOAT64_REQUIRED remains the
+defined sentinel for any future algorithm that adds a hard Float64
+hardware dependency before its software fallback lands.
 @End Reasoning
 
 @Implementation
-Returns KEYPAIR_CAP_OK (1) for every algorithm whose keygen path runs on
-integer arithmetic alone. Returns KEYPAIR_CAP_FLOAT64_REQUIRED (0) for
-FALCON-512 and FALCON-1024, whose keygen depends on the Float64 SSE2 FFT.
+Single dispatch table over the algorithm tag. Returns KEYPAIR_CAP_OK (1)
+for every algorithm enumerated in the supported set (Ed25519, Ed448,
+X25519, X448, ECDSA P-256/P-384/P-521, RSA via the alg-table modulus
+lookup, ML-KEM 512/768/1024, ML-DSA 44/65/87, SLH-DSA across the six
+SHA-2 parameter sets, FALCON-512, FALCON-1024). Returns
+KEYPAIR_CAP_FLOAT64_REQUIRED (0) for any unrecognized algorithm tag,
+acting as a deny-by-default guard for the keypair_create dispatcher.
 @End Implementation
 
 @Performance_Hints
@@ -198,8 +206,16 @@ Process called "keypair_keygen_capability_check" takes algorithm as Integer retu
     If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_256F:
         Return KEYPAIR_CAP_OK
     End If
-    Note: FALCON keygen runs the NTRU-lattice FFT over Float64; refuse until
-    Note: the Float64 SSE2 path is wired into the in-tree backend.
+    Note: FALCON keygen runs the NTRU-lattice FFT over Float64. The stage1
+    Note: Float64 SSE2 path drives the FFT and the full Falcon keygen
+    Note: orchestration (NTRUSolve descent, LDL decomposition, FFS sampler)
+    Note: dispatches through falcon_512_keygen / falcon_1024_keygen.
+    If algorithm is equal to Alg.ALG_FALCON_512:
+        Return KEYPAIR_CAP_OK
+    End If
+    If algorithm is equal to Alg.ALG_FALCON_1024:
+        Return KEYPAIR_CAP_OK
+    End If
     Return KEYPAIR_CAP_FLOAT64_REQUIRED
 End Process
 
@@ -327,6 +343,14 @@ Process called "keypair_create" takes arena as Integer, algorithm as Integer ret
     End If
     If algorithm is equal to Alg.ALG_SLH_DSA_SHA2_256F:
         Return keypair_create_slh_dsa(arena, algorithm, 6, 32, 64, 128)
+    End If
+
+    Note: FALCON-512 (pk=897, sk=1281) and FALCON-1024 (pk=1793, sk=2305).
+    If algorithm is equal to Alg.ALG_FALCON_512:
+        Return keypair_create_falcon(arena, algorithm, 1, 897, 1281)
+    End If
+    If algorithm is equal to Alg.ALG_FALCON_1024:
+        Return keypair_create_falcon(arena, algorithm, 2, 1793, 2305)
     End If
 
     Return 0
@@ -602,6 +626,90 @@ Process called "keypair_create_slh_dsa" takes arena as Integer, algorithm as Int
 
     Secure.secure_zero(sk_seed, n)
     Secure.secure_zero(sk_prf, n)
+    If rc is equal to 0:
+        Secure.secure_zero(sk_buf, sk_bytes)
+        Return 0
+    End If
+
+    Let pk be PK.public_key_create(arena, algorithm, pk_buf, pk_bytes)
+    If pk is equal to 0:
+        Secure.secure_zero(sk_buf, sk_bytes)
+        Return 0
+    End If
+    Let sk be SK.private_key_create(arena, algorithm, sk_buf, sk_bytes)
+    If sk is equal to 0:
+        Secure.secure_zero(sk_buf, sk_bytes)
+        Return 0
+    End If
+    Secure.secure_zero(sk_buf, sk_bytes)
+    Return KP.keypair_from_keys(arena, sk, pk)
+End Process
+
+Note: ============================================================================
+Note: SECTION 4.FALCON: keypair_create_falcon helper
+Note: ============================================================================
+
+@Reasoning
+FALCON keygen helper.  Draws a 48-byte seed from OS entropy, calls the
+level-specific Falcon keygen entry point (which orchestrates short-poly
+sampling, NTRUSolve, h computation, and packed-key encoding), and wraps
+the resulting pk and sk as PublicKey + PrivateKey holders.  level=1
+selects Falcon-512 (pk=897, sk=1281), level=2 selects Falcon-1024
+(pk=1793, sk=2305).
+@End Reasoning
+
+@Implementation
+Steps:
+  1. Allocate a 48-byte seed buffer; fill with OS entropy.
+  2. Allocate pk and sk buffers of the level-specific sizes.
+  3. Call Falcon.falcon_512_keygen (level=1) or falcon_1024_keygen
+     (level=2) with the seed and output buffers.
+  4. Wrap pk as PublicKey, sk as PrivateKey, bundle via keypair_from_keys.
+@End Implementation
+
+@Performance_Hints
+Falcon keygen dominates with the NTRU-tower descent (NTRUSolve at log(n)
+levels) and the LDL tree build.  At level=1 (n=512) typical wall-clock
+on x86_64 is in the tens of milliseconds; level=2 (n=1024) approaches
+hundreds of milliseconds.  The rejection rate on the norm bound is well
+below 5% in expectation per the spec.
+@End Performance_Hints
+
+@Security_Scope
+The 48-byte seed is SECRET.  Securely wipe after Falcon keygen returns.
+The sk buffer carries the bit-packed (f, g, F) trapdoor and must be
+treated as secret by private_key_create.
+@End Security_Scope
+Process called "keypair_create_falcon" takes arena as Integer, algorithm as Integer, level as Integer, pk_bytes as Integer, sk_bytes as Integer returns Integer:
+    Let seed_buf be Arena.arena_allocate(arena, 48)
+    If seed_buf is equal to 0:
+        Return 0
+    End If
+    Let rc_seed be Entropy.entropy_random_bytes(arena, seed_buf, 48)
+    If rc_seed is equal to 0:
+        Return 0
+    End If
+
+    Let pk_buf be Arena.arena_allocate(arena, pk_bytes)
+    If pk_buf is equal to 0:
+        Secure.secure_zero(seed_buf, 48)
+        Return 0
+    End If
+    Let sk_buf be Arena.arena_allocate(arena, sk_bytes)
+    If sk_buf is equal to 0:
+        Secure.secure_zero(seed_buf, 48)
+        Return 0
+    End If
+
+    Let rc be 0
+    If level is equal to 1:
+        Set rc to Falcon.falcon_512_keygen(arena, seed_buf, pk_buf, sk_buf)
+    End If
+    If level is equal to 2:
+        Set rc to Falcon.falcon_1024_keygen(arena, seed_buf, pk_buf, sk_buf)
+    End If
+
+    Secure.secure_zero(seed_buf, 48)
     If rc is equal to 0:
         Secure.secure_zero(sk_buf, sk_bytes)
         Return 0

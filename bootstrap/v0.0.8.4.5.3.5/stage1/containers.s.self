@@ -1,3 +1,5 @@
+.section .data
+
 .text
 print_string:
     pushq %rbp

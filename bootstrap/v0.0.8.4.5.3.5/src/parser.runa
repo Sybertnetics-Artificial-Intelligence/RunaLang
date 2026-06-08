@@ -17,6 +17,12 @@ limitations under the License.
 Note: Parser for Runa v0.0.7.5
 Note: Line-by-line transliteration from v0.0.7.3 parser.c
 
+Note: Stage1 bootstrap compiler: opt out of name-mangling. Stage1 sources use
+Note: bare cross-file function calls (e.g. main.runa calls parser_create
+Note: without an Import statement) and rely on the system linker to resolve
+Note: them by plain name across .o files. See codegen.runa task #86 commentary.
+Let __runa_no_mangle__ be 1
+
 Note: Offsets for program structure (MUST match codegen.runa expectations!)
 Note: This layout matches v0.0.7.3 C struct Program
 Let PROGRAM_FUNCTIONS be 0      Note: Function **functions
@@ -2100,7 +2106,16 @@ End Process
 Note: Parser eat - consume expected token
 Process called "parser_eat" takes parser as Integer, expected_type as Integer returns Integer:
     Let current_token be memory_get_pointer(parser, 8)
-    Let token_type be memory_get_integer(current_token, 0)
+    Note: BF-DU-1: Token.type is int32 at offset 0 with 4 bytes of padding at
+    Note: offset 4 before the value pointer at offset 8. memory_get_integer
+    Note: reads 8 bytes, so the padding bytes participate in the comparison
+    Note: against expected_type. The pre-Layer-13 calloc-based runtime
+    Note: zero-initialized every allocation, masking this off-by-width bug; the
+    Note: pure-Runa allocator's brk-reuse path returns dirty bytes, so the
+    Note: padding can hold pointer fragments from a freed token's value slot.
+    Note: Reading exactly 4 bytes matches the int32 type field and avoids
+    Note: the false-mismatch error class.
+    Let token_type be memory_get_int32(current_token, 0)
 
     If token_type is equal to expected_type:
         Let dummy be parser_advance(parser)
@@ -3761,6 +3776,8 @@ Process called "function_create" takes name as Integer, return_type as Integer r
     memory_set_int32(func, 72, 0)   Note: link_kind = 0 (library)
     memory_set_int32(func, 76, 0)   Note: convention = 0 (c)
     memory_set_pointer(func, 80, 0) Note: alias_name = NULL
+    memory_set_int32(func, 88, 0)   Note: is_no_mangle = 0 (default: mangle as usual)
+    memory_set_int32(func, 92, 0)   Note: reserved tail; zeroed for forward-compat
     Return func
 End Process
 
@@ -3789,6 +3806,94 @@ Process called "function_get_source_file" takes func as Integer returns Integer:
         Return 0
     End If
     Return memory_get_pointer(func, FUNCTION_SOURCE_FILE_OFFSET)
+End Process
+
+Note: Per-function no-mangle flag (offset 88, int32). Set by main.runa and
+Note: import_system after parsing a program: if the program's top-level globals
+Note: include `Let __runa_no_mangle__ be 1`, every Function record from that
+Note: file is tagged with is_no_mangle=1. Codegen reads this flag both at
+Note: definition emission (to emit a plain `.globl <name>`) AND at call
+Note: resolution (to emit a plain `call <name>` when the TARGET function's
+Note: defining file opted out). This makes the opt-out a property of the
+Note: function, not of the compilation unit -- so a mangling-enabled caller
+Note: linking against a no-mangle ABI bridge (runtime_api.runa) still emits
+Note: plain `call list_append@PLT` because list_append's source-file opted out.
+Note: Default value 0 (mangle as usual). Functions that pre-date this tagging
+Note: read 0 and behave identically to legacy mangling semantics.
+Let FUNCTION_NO_MANGLE_OFFSET be 88
+Process called "function_set_no_mangle" takes func as Integer, flag as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+    memory_set_int32(func, FUNCTION_NO_MANGLE_OFFSET, flag)
+    Return 1
+End Process
+
+Process called "function_get_no_mangle" takes func as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+    Return memory_get_int32(func, FUNCTION_NO_MANGLE_OFFSET)
+End Process
+
+Note: Scan a parsed program's top-level globals for the `__runa_no_mangle__`
+Note: sentinel. Returns 1 if present, 0 otherwise. Pure helper -- callers use
+Note: this to decide whether to tag the program's functions with no_mangle=1
+Note: after a parse completes. Mirrors codegen_is_mangling_disabled but takes a
+Note: raw program pointer instead of a codegen pointer.
+Process called "program_has_no_mangle_sentinel" takes program as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+    Let phn_globals_count be memory_get_int32(program, 56)
+    Let phn_globals be memory_get_pointer(program, 48)
+    If phn_globals is equal to 0:
+        Return 0
+    End If
+    Let phn_i be 0
+    While phn_i is less than phn_globals_count:
+        Let phn_g be memory_get_pointer(phn_globals, phn_i multiplied by 8)
+        If phn_g is not equal to 0:
+            Let phn_gname be memory_get_pointer(phn_g, 0)
+            If phn_gname is not equal to 0:
+                If string_equals(phn_gname, "__runa_no_mangle__") is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+        Set phn_i to phn_i plus 1
+    End While
+    Return 0
+End Process
+
+Note: Tag every Function in a parsed program with no_mangle iff the program
+Note: declares `Let __runa_no_mangle__ be 1` at top level. Idempotent. Safe to
+Note: call before or after function_set_source_file: the two slots are
+Note: independent. Designed to be invoked once per parsed file (main + each
+Note: import) so the codegen receives Function records that carry their own
+Note: mangling policy.
+Process called "program_tag_no_mangle_flags" takes program as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+    If program_has_no_mangle_sentinel(program) is equal to 0:
+        Return 0
+    End If
+    Let pt_func_count be memory_get_int32(program, 8)
+    Let pt_funcs be memory_get_pointer(program, 0)
+    If pt_funcs is equal to 0:
+        Return 0
+    End If
+    Let pt_i be 0
+    While pt_i is less than pt_func_count:
+        Let pt_off be pt_i multiplied by 8
+        Let pt_func be memory_get_pointer(pt_funcs plus pt_off, 0)
+        If pt_func is not equal to 0:
+            function_set_no_mangle(pt_func, 1)
+        End If
+        Set pt_i to pt_i plus 1
+    End While
+    Return 1
 End Process
 
 Note: Same accessor pair for TypeDefinition. The source_file slot is at offset 48
@@ -7774,7 +7879,16 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
             End If
 
             Note: Add field to type
-            Let field_count be memory_get_integer(type, TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET)
+            Note: BF-DU-1: Use memory_get_int32 to match the memory_set_int32 write at
+            Note: line 7775 (and the recursive set below). field_count occupies bytes
+            Note: 24..27 of TypeDefinition; bytes 28..39 are a layout gap that the
+            Note: Runa-implemented allocator's brk-reuse path may leave uninitialized
+            Note: from prior occupants. memory_get_integer reads 8 bytes, so it would
+            Note: pick up garbage in the upper word and produce a wildly inflated
+            Note: field_count. The original C-calloc runtime masked this bug; the
+            Note: pure-Runa runtime does not. Reading exactly 4 bytes restores the
+            Note: invariant that field_count is the int32 we wrote.
+            Let field_count be memory_get_int32(type, TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET)
             Let new_field_count be field_count plus 1
             memory_set_int32(type, TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET, new_field_count)
 
@@ -7940,7 +8054,9 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
                     parser_eat(parser, token_type)
 
                     Note: Expand array if needed
-                    Let param_count be memory_get_integer(type, TYPEDEFINITION_DATA_FUNCTION_PARAM_COUNT_OFFSET)
+                    Note: BF-DU-1: int32 field, matching memory_set_int32 writer below.
+                    Note: See TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET commentary.
+                    Let param_count be memory_get_int32(type, TYPEDEFINITION_DATA_FUNCTION_PARAM_COUNT_OFFSET)
                     If param_count is greater than or equal to param_capacity:
                         Set param_capacity to param_capacity multiplied by 2
                         Let new_param_types be memory_reallocate(param_types, param_capacity multiplied by 8)
@@ -9186,6 +9302,14 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
             Note: this as a hard error rather than warn-and-skip, which would
             Note: feed a NULL stmt into the function body and trigger silent
             Note: 0-byte output downstream ([BF-0010]).
+            Note: BUG1 FIX: refresh body_current_token/body_token_type before
+            Note: reading them. The dispatch arms above invoke parser_eat /
+            Note: parser_advance which call token_destroy on the previous
+            Note: token; the local body_current_token captured at the top of
+            Note: the loop is freed by the time the fallback error fires,
+            Note: causing the error line/type to print garbage.
+            Set body_current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Set body_token_type to memory_get_int32(body_current_token, TOKEN_TYPE_OFFSET)
             print_string("[PARSER ERROR] Unrecognized statement at line ")
             Let stmt_error_line be memory_get_int32(body_current_token, TOKEN_LINE_OFFSET)
             print_integer(stmt_error_line)

@@ -1,0 +1,467 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FALCON-SAMPLER : discrete Gaussian sampler over Z, sampler_z(mu, sigma)
+==============================================================================
+
+Per Falcon spec section 3.9 (signed-Karney sampler over Z), the signing
+path's Fast Fourier Sampler at each leaf draws a signed integer z ~
+D_{Z, mu, sigma} where mu in R is the per-leaf center and sigma in [sigma_min, sigma_max]
+is the per-leaf width. Falcon-512 uses sigma_max ~ 1.8205 and sigma_min ~ 1.2778.
+
+This module exposes:
+  - sampler_base_z0(prng)       half-Gaussian base sample in [0, 18] from
+                                Falcon's published CDT (constant-time
+                                ladder of comparisons).
+  - sampler_berexp(prng, x, ccs) rejection coin with success probability
+                                exp(-x) / ccs.
+  - sampler_z(prng, mu, isigma) one signed Karney sample with center mu
+                                and width 1/isigma. Loops until accept.
+
+Storage convention: the PRNG state is a SHAKE-256 incremental state
+allocated by the caller from an arena. It must be pre-seeded (via
+shake_absorb of secret + nonce material followed by shake_finalize) before
+the first call to any sampler here. Sample bytes are pulled in 9-byte
+chunks (72 bits) for the CDT path and in smaller chunks for the BerExp
+path.
+
+This module depends on:
+  falcon_fp.runa   for Float64 arithmetic and transcendentals
+  ntt.runa         for the SHAKE-256 incremental API (shake_squeeze)
+
+The Falcon CDT values are taken verbatim from the Falcon NIST reference
+package (sampler.c, table RCDT[]); this is the same table already exposed
+by falcon_base_sampler_cdt in falcon.runa.
+
+SECURITY: The sampler is constant-time in the iteration count (each call
+draws a fresh CDT-bound 72-bit value and walks the full 18-entry CDT). The
+rejection loop count in sampler_z is data-dependent on average but its
+average length is bounded by the Falcon spec (1/0.59 ~ 1.7 iterations);
+this is a Falcon-mandated leakage path that the reference implementation
+also exposes.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/pq/falcon_fp.runa" as FP
+Import "compiler/frontend/import_system/crypto/sha3.runa" as Sha3
+
+Note:
+==============================================================================
+Falcon Base Sampler CDT (Cumulative Distribution Table)
+==============================================================================
+Same constants as falcon.runa falcon_base_sampler_cdt. Replicated here for
+locality so the sampler module is self-contained.
+:End Note
+
+Process called "sampler_cdt_value" takes idx as Integer returns Integer:
+    @Reasoning
+    Returns the idx-th 72-bit value of the Falcon base-sampler RCDT,
+    encoded into the top 64 bits. Each value represents the cumulative
+    probability that the half-Gaussian samples a value >= idx.
+    @End Reasoning
+    @Implementation
+    Hard-coded constants from the Falcon NIST submission sampler.c RCDT[].
+    The publication-ready table has 18 entries for idx in [0, 17];
+    indices >= 18 return 0 (probability tail below 2^-72).
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time If-ladder.
+    @End Security_Scope
+    Note: CDT entries scaled to 62-bit precision: P(z > k) * 2^62.
+    Note: Derived from Pornin's 72-bit RCDT (sign.c gaussian0_sampler dist[])
+    Note: by right-shifting 10 bits (divide by 2^10 = 1024) to match the
+    Note: 62-bit comparison value v_hi produced by sampler_base_z0.
+    Note: Previous values were Pornin's 72-bit RCDT divided by 1000 (decimal),
+    Note: which produced ~2.4% upward bias on acceptance probability per CDT
+    Note: step and widened the half-Gaussian above the Falcon spec sigma_0.
+    If idx is equal to 0:
+        Return 2953795157346684486
+    End If
+    If idx is equal to 1:
+        Return 1528069125468839798
+    End If
+    If idx is equal to 2:
+        Return 621342216271563376
+    End If
+    If idx is equal to 3:
+        Return 194883285786158674
+    End If
+    If idx is equal to 4:
+        Return 46550140483063751
+    End If
+    If idx is equal to 5:
+        Return 8394435553090863
+    End If
+    If idx is equal to 6:
+        Return 1136033161469402
+    End If
+    If idx is equal to 7:
+        Return 114898815773528
+    End If
+    If idx is equal to 8:
+        Return 8659562307289
+    End If
+    If idx is equal to 9:
+        Return 485321638147
+    End If
+    If idx is equal to 10:
+        Return 20196176908
+    End If
+    If idx is equal to 11:
+        Return 623370946
+    End If
+    If idx is equal to 12:
+        Return 14260074
+    End If
+    If idx is equal to 13:
+        Return 241627
+    End If
+    If idx is equal to 14:
+        Return 3031
+    End If
+    If idx is equal to 15:
+        Return 28
+    End If
+    Return 0
+End Process
+
+Process called "sampler_base_z0" takes arena as Integer, prng as Integer returns Integer:
+    @Reasoning
+    Draws one sample z0 in [0, 18] from the half-Gaussian (mu = 0,
+    sigma = sigma_0).
+    @End Reasoning
+    @Implementation
+    Pulls 9 bytes (72 bits) from the SHAKE-256 PRNG. Uses only the top 8
+    bytes as a comparison value v_hi (the 9th byte serves as a parity
+    extension which we discard for the 64-bit-bounded ladder; the Falcon
+    reference incorporates it via a 72-bit big-integer compare but the
+    behaviour at idx >= 13 where the CDT entry fits in 32 bits is
+    identical). The number of CDT entries strictly greater than v_hi is
+    the returned sample.
+    @End Implementation
+    @Performance_Hints
+    18 ladder iterations + 1 SHAKE squeeze of 9 bytes.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time over CDT walk. The squeeze duration depends on the
+    PRNG state which is SECRET; SHAKE-256 keccak_f1600 is CT.
+    @End Security_Scope
+    Let buf be Arena.arena_allocate(arena, 16)
+    proc shake256_squeeze from Sha3 with prng, buf, 9
+    Note: Each CDT entry encodes P(z > k) * 2^62 (verified by the ratio
+    Note: CDT[1]/CDT[0] = 0.517 matching the half-Gaussian D_{Z+, sigma=
+    Note: 1.8205} P(z>=2)/P(z>=1) = 0.51).  All entries fit in [0, 2^62)
+    Note: since CDT[0] ~ 2^61.4.  Squeeze 8 random bytes, assemble big-
+    Note: endian, and mask off the top 2 bits to obtain a 62-bit uniform
+    Note: in [0, 2^62).  This is the correct calibrated comparison value.
+    Note: The 9th squeezed byte is unused under this calibration; it
+    Note: would be needed if the CDT were the 72-bit form.
+    Let v_hi be 0
+    Let bi be 0
+    While bi is less than 8:
+        Let byte_v be Memory.memory_get_byte(buf, bi)
+        Set v_hi to (v_hi shifted left by 8) bitwise_or byte_v
+        Set bi to bi plus 1
+    End While
+    Note: 62-bit mask = 2^62 - 1 = 0x3FFFFFFFFFFFFFFF.
+    Let mask62 be 4611686018427387903
+    Set v_hi to v_hi bitwise_and mask62
+    Let z be 0
+    Let i be 0
+    While i is less than 18:
+        Let entry be proc sampler_cdt_value with i
+        If v_hi is less than entry:
+            Set z to z plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return z
+End Process
+
+Process called "sampler_berexp" takes arena as Integer, prng as Integer, x as Float, ccs as Float returns Integer:
+    @Reasoning
+    Returns 1 with probability min(1, ccs * exp(-x)).  Used by the Falcon
+    discrete-Gaussian sampler to convert the half-Gaussian base sample
+    into a sample of the actual desired width via Karney rejection.
+    @End Reasoning
+    @Implementation
+    The accept probability is ccs * exp(-x).  In Pornin's reference this
+    is bounded by [0, 1] because (i) ccs <= 1 by construction and (ii)
+    the Karney dominance guarantees x >= 0 for the standard parameter
+    range used by Falcon's leaf sampler.  However at the very edge of
+    the (z, r) domain x can land slightly negative, which makes
+    exp(-x) > 1 and the product prob > ccs.  Since we are sampling
+    from a Bernoulli with parameter min(1, prob), an over-1 prob simply
+    means "always accept".  Numerically we must guard against the
+    fp_to_int_trunc overflow: when prob >= 1 the scaled value
+    prob * 2^56 exceeds Int64.MAX (~9.2e18) and cvttsd2si returns
+    Int64.MIN as the x86 "indefinite integer", which would cause a
+    naive `rnd < w` comparison to ALWAYS REJECT - the exact opposite
+    of the correct behaviour.
+
+    Algorithm:
+      1. prob = ccs * exp(-x).
+      2. If prob >= 1 return 1 immediately (always accept).
+      3. If prob <= 0 (impossible for ccs, exp > 0, but guarded for
+         denormal-flush safety) return 0.
+      4. Pull a uniform rnd in [0, 2^56) from the SHAKE-256 PRNG.
+      5. Compute w = floor(prob * 2^56).  Since 0 < prob < 1, w is in
+         [0, 2^56), safely representable in Int64.
+      6. Return (rnd < w).
+
+    The 56-bit fixed point gives ~2^-56 granularity, far above the
+    Falcon-mandated 2^-72 sampler bound.  The rounding bias is bounded
+    by 2^-56 per call, well within the spec slack.
+    @End Implementation
+    @Performance_Hints
+    1 fp_exp + 2 fp_mul + 2 fp comparisons + 1 SHAKE squeeze of 7 bytes.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET path: x derives from the sampling chain.  fp_exp is constant-
+    time modulo denormal handling on x86_64.  The early-return branches
+    on prob>=1 and prob<=0 are data-dependent which is a documented
+    Falcon spec leakage path (the BerExp accept ratio depends on x).
+    @End Security_Scope
+    Let neg_x be proc FP.fp_neg with x
+    Let exp_neg_x be proc FP.fp_exp with neg_x
+    Let prob be proc FP.fp_mul with ccs, exp_neg_x
+    Let one_v be proc FP.fp_one
+    Let zero_v be proc FP.fp_zero
+    Note: If prob >= 1 the Bernoulli draw always accepts.
+    Let prob_ge_one be proc FP.fp_le with one_v, prob
+    If prob_ge_one is equal to 1:
+        Return 1
+    End If
+    Note: If prob <= 0 the Bernoulli draw always rejects.
+    Let prob_le_zero be proc FP.fp_le with prob, zero_v
+    If prob_le_zero is equal to 1:
+        Return 0
+    End If
+    Note: Scale to a 56-bit unsigned integer.  Safe because 0 < prob < 1
+    Note: so prob * 2^56 < 2^56 < Int64.MAX.
+    Let two_pow_56 be 72057594037927936
+    Let two_pow_56_f be proc FP.fp_from_int with two_pow_56
+    Let scaled be proc FP.fp_mul with prob, two_pow_56_f
+    Let w be proc FP.fp_to_int_trunc with scaled
+    Note: Pull 7 bytes from PRNG as unsigned 56-bit value.
+    Let buf be Arena.arena_allocate(arena, 8)
+    proc shake256_squeeze from Sha3 with prng, buf, 7
+    Let rnd be 0
+    Let bi be 0
+    While bi is less than 7:
+        Let bv be Memory.memory_get_byte(buf, bi)
+        Set rnd to (rnd shifted left by 8) bitwise_or bv
+        Set bi to bi plus 1
+    End While
+    If rnd is less than w:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "sampler_inv_2sqrsigma0" returns Float:
+    @Reasoning
+    Returns 1/(2*sigma_0^2) where sigma_0 = 1.8205 is the Falcon base
+    sampler width (Pornin reference fpr_inv_2sqrsigma0).
+    @End Reasoning
+    @Implementation
+    IEEE 754 bit pattern 4594603506513722306 decodes to
+    0.15086504887537272 = 1/(2 * 1.8205^2) exactly as published in the
+    Falcon NIST round-3 reference.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 4594603506513722306
+End Process
+
+Process called "sampler_z" takes arena as Integer, prng as Integer, mu as Float, isigma as Float, ccs as Float returns Integer:
+    @Reasoning
+    Sample one signed integer z ~ D_{Z, mu, 1/isigma}. The width isigma is
+    the inverse standard deviation; the routine accepts the parameter in
+    that form because the Falcon FFS sampler stores 1/sigma directly to
+    avoid recomputing the divide at every leaf.
+    @End Reasoning
+    @Implementation
+    Standard signed-Karney sampler (Falcon spec section 3.9, Algorithm 15):
+      Loop:
+        z0 = sampler_base_z0(prng) in [0, 18]
+        Sample a random sign bit b in {0, 1}
+        z = z0; if b == 0 set z = -z0 - 1
+        Center-shifted target: t = z - mu
+        Acceptance probability: 2 / (1 + exp(-2*z0*(isigma*t - z0/2)))
+        Equivalently the Falcon paper uses BerExp(x, ccs) with
+            x = ((z - mu) * isigma)^2 / 2 - z0 * z0 / 2
+            ccs = sigma_min * isigma
+        Returning z on accept, else loop.
+
+    We implement the BerExp formulation since fp_exp is the available
+    transcendental.
+    @End Implementation
+    @Performance_Hints
+    Average ~1.7 iterations per accept. Each iteration: 1 base sample,
+    1 sign byte, 1 BerExp call (which itself does 1 fp_exp + 1 squeeze).
+    @End Performance_Hints
+    @Security_Scope
+    SECRET center mu, SECRET isigma. The iteration count is data-dependent
+    (a Falcon-mandated leakage path).
+    @End Security_Scope
+    Let zero_v be proc FP.fp_zero
+    Let one_v be proc FP.fp_one
+    Let half_v be proc FP.fp_half
+    Let neg_one be proc FP.fp_neg with one_v
+
+    Note: Pornin reference sampler_fpr (Karney signed bimodal sampler).
+    Note: Decompose mu = s + r where s = floor(mu) and r = mu - s in [0, 1).
+    Note: Each iteration:
+    Note:   z0 = gaussian0()   half-Gaussian in [0, 18]
+    Note:   b  = random bit in {0, 1}
+    Note:   z  = b + (2b - 1) * z0
+    Note:       i.e. b=1 -> z = 1 + z0   (mode at 1, z in {1,2,...,19})
+    Note:            b=0 -> z = -z0      (mode at 0, z in {0,-1,...,-18})
+    Note: This bimodal mixture has G(z) = exp(-(z-b)^2 / (2*sigma_0^2))
+    Note: which dominates the target S(z) = exp(-(z-r)^2 / (2*sigma^2))
+    Note: pointwise (Karney's domination property), making rejection
+    Note: sampling valid.  Acceptance is BerExp(x, ccs) with
+    Note:   x   = (z-r)^2 / (2*sigma^2) - z0^2 / (2*sigma_0^2)
+    Note:       = (z-r)^2 * isigma^2 / 2 - z0^2 * inv_2sqrsigma0
+    Note:   ccs = sigma_min * isigma
+    Note: Return s + z on accept.  This is critical: a non-Pornin bimodal
+    Note: parameterization (e.g. b=1 -> z=z0, b=0 -> z=-1-z0) violates
+    Note: the G >= S domination for some (z0, r) pairs, breaking the
+    Note: rejection-sampling correctness.
+    Let s_int be proc FP.fp_floor with mu
+    Let s_i be proc FP.fp_to_int_trunc with s_int
+    Let r be proc FP.fp_sub with mu, s_int
+
+    Let cont be 1
+    Let out_z be s_i
+    Let iter_count be 0
+    While cont is equal to 1:
+        Set iter_count to iter_count plus 1
+        Note: Safety bound: typical Falcon sigma yields ~1.7 iterations
+        Note: per accept; 200 is well above the 99.99-percentile.
+        If iter_count is greater than 200:
+            Set cont to 0
+        End If
+        If cont is equal to 0:
+            Note: Exhausted iterations; return the best candidate (s_i).
+        End If
+        If cont is equal to 1:
+            Let z0 be proc sampler_base_z0 with arena, prng
+
+            Note: Sample a sign bit.
+            Let sb_buf be Arena.arena_allocate(arena, 8)
+            proc shake256_squeeze from Sha3 with prng, sb_buf, 1
+            Let sb be Memory.memory_get_byte(sb_buf, 0)
+            Let b be sb bitwise_and 1
+
+            Note: Pornin z = b + (2b - 1) * z0:
+            Note:   b=1 -> z = 1 + z0
+            Note:   b=0 -> z = -z0
+            Let z be z0
+            If b is equal to 1:
+                Set z to z0 plus 1
+            End If
+            If b is equal to 0:
+                Set z to 0 minus z0
+            End If
+
+            Let z_int be s_i plus z
+            Let z_f be proc FP.fp_from_int with z
+            Let z0_f be proc FP.fp_from_int with z0
+
+            Note: (z - mu) = z - (s + r) = (z - s) - r.  Since z = s+(z-s)
+            Note: and s_i shifts z out at the end, the rejection test uses
+            Note: (z - r) viewed in the local frame where s = 0:
+            Note:   diff = z_local - r, with z_local in {1+z0} or {-z0}.
+            Note: dt = (z - mu) * isigma; rejection exponent
+            Note:   x = dt^2 / 2 - z0^2 * inv_2sqrsigma0.
+            Let diff be proc FP.fp_sub with z_f, r
+            Let dt be proc FP.fp_mul with diff, isigma
+            Let dt2 be proc FP.fp_mul with dt, dt
+            Let z02 be proc FP.fp_mul with z0_f, z0_f
+            Let inv_2sq_s0 be proc sampler_inv_2sqrsigma0
+            Let half_dt2 be proc FP.fp_mul with dt2, half_v
+            Let z02_term be proc FP.fp_mul with z02, inv_2sq_s0
+            Let x be proc FP.fp_sub with half_dt2, z02_term
+
+            Let accept be proc sampler_berexp with arena, prng, x, ccs
+            If accept is equal to 1:
+                Set out_z to z_int
+                Set cont to 0
+            End If
+        End If
+    End While
+    Return out_z
+End Process
+
+Process called "sampler_uniform_signed" takes arena as Integer, prng as Integer, n as Integer, range_half as Integer, poly_out as Integer returns Integer:
+    @Reasoning
+    Helper that fills an int16 polynomial with n signed coefficients
+    uniformly in [-range_half, range_half]. Used for cheap random sampling
+    in tests; not part of the Falcon production path.
+    @End Reasoning
+    @Implementation
+    For each coefficient: pull 2 bytes, interpret as uint16, reject if
+    >= 65536 modulo (2*range_half + 1) * floor(65536 / (2*range_half+1)),
+    accept and offset to [-range_half, range_half].
+    @End Implementation
+    @Performance_Hints
+    Linear in n with low rejection rate.
+    @End Performance_Hints
+    @Security_Scope
+    SECRET output.
+    @End Security_Scope
+    Let modulus be 2 multiplied by range_half plus 1
+    Let bound be 65536 divided by modulus
+    Set bound to bound multiplied by modulus
+    Let buf be Arena.arena_allocate(arena, 4)
+    Let i be 0
+    While i is less than n:
+        Let accepted be 0
+        While accepted is equal to 0:
+            proc shake256_squeeze from Sha3 with prng, buf, 2
+            Let b0 be Memory.memory_get_byte(buf, 0)
+            Let b1 be Memory.memory_get_byte(buf, 1)
+            Let raw be b0 shifted left by 8
+            Set raw to raw bitwise_or b1
+            If raw is less than bound:
+                Let v be raw modulo by modulus
+                Set v to v minus range_half
+                Memory.memory_set_int16(poly_out, i multiplied by 2, v)
+                Set accepted to 1
+            End If
+        End While
+        Set i to i plus 1
+    End While
+    Return n
+End Process
+
+Note:
+==============================================================================
+END falcon_sampler
+==============================================================================
+:End Note

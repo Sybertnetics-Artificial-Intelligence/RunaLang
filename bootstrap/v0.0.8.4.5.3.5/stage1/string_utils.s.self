@@ -1,3 +1,5 @@
+.section .data
+
 .text
 print_string:
     pushq %rbp
@@ -4022,6 +4024,46 @@ memory_allocate:
     pushq %rax
     popq %rdi
     call allocate@PLT
+    movq %rax, -16(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1131
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L1132
+.L1131:
+.L1132:
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setg %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1141
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_fill
+    jmp .L1142
+.L1141:
+.L1142:
+    movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4110,14 +4152,14 @@ arena_create:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1131
+    jz .L1151
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1132
-.L1131:
-.L1132:
+    jmp .L1152
+.L1151:
+.L1152:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -4131,7 +4173,7 @@ arena_create:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1141
+    jz .L1161
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -4140,9 +4182,9 @@ arena_create:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1142
-.L1141:
-.L1142:
+    jmp .L1162
+.L1161:
+.L1162:
     movq -24(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -4194,14 +4236,14 @@ arena_allocate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1151
+    jz .L1171
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1152
-.L1151:
-.L1152:
+    jmp .L1172
+.L1171:
+.L1172:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4235,13 +4277,13 @@ arena_allocate:
     movq %rax, %rcx
     popq %rax
     testq %rcx, %rcx
-    jz .Ldiv_by_zero_116
+    jz .Ldiv_by_zero_118
     cqto
     idivq %rcx
-    jmp .Ldiv_done_116
-.Ldiv_by_zero_116:
+    jmp .Ldiv_done_118
+.Ldiv_by_zero_118:
     movq $0, %rax
-.Ldiv_done_116:
+.Ldiv_done_118:
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
@@ -4266,7 +4308,7 @@ arena_allocate:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1171
+    jz .L1191
     movq -32(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -4281,7 +4323,7 @@ arena_allocate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1181
+    jz .L1201
     movq -56(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -4291,9 +4333,9 @@ arena_allocate:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1182
-.L1181:
-.L1182:
+    jmp .L1202
+.L1201:
+.L1202:
     movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -4307,14 +4349,14 @@ arena_allocate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1191
+    jz .L1211
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1192
-.L1191:
-.L1192:
+    jmp .L1212
+.L1211:
+.L1212:
     movq -40(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -4354,9 +4396,9 @@ arena_allocate:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1172
-.L1171:
-.L1172:
+    jmp .L1192
+.L1191:
+.L1192:
     movq -24(%rbp), %rax
     addq -40(%rbp), %rax
     movq %rax, -80(%rbp)
@@ -4391,14 +4433,14 @@ arena_string_duplicate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1201
+    jz .L1221
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1202
-.L1201:
-.L1202:
+    jmp .L1222
+.L1221:
+.L1222:
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -4421,14 +4463,14 @@ arena_string_duplicate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1211
+    jz .L1231
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1212
-.L1211:
-.L1212:
+    jmp .L1232
+.L1231:
+.L1232:
     movq -16(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -4456,7 +4498,7 @@ arena_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1221
+    jz .L1241
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4473,9 +4515,9 @@ arena_destroy:
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L1222
-.L1221:
-.L1222:
+    jmp .L1242
+.L1241:
+.L1242:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -4496,7 +4538,7 @@ arena_reset:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1231
+    jz .L1251
     movq $0, %rax
     pushq %rax
     movq $16, %rax
@@ -4507,9 +4549,9 @@ arena_reset:
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    jmp .L1232
-.L1231:
-.L1232:
+    jmp .L1252
+.L1251:
+.L1252:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -4530,14 +4572,14 @@ arena_get_used:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1241
+    jz .L1261
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1242
-.L1241:
-.L1242:
+    jmp .L1262
+.L1261:
+.L1262:
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4564,14 +4606,14 @@ arena_get_capacity:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1251
+    jz .L1271
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1252
-.L1251:
-.L1252:
+    jmp .L1272
+.L1271:
+.L1272:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax

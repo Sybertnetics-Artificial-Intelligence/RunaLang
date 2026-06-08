@@ -58,6 +58,26 @@ Layout:
   Section 7  - Heap allocator aliases (reallocate family)
 :End Note
 
+Note: Wave MANGLING-SYMMETRIC: this file is the stable C-runtime ABI bridge.
+Note: Stage1 binaries and codegen-emitted helper stubs (print_string,
+Note: print_integer, exit_with_code, allocate, deallocate, memory_*, list_*,
+Note: dict_*, etc.) link against the plain symbol names this file defines.
+Note: Without the no-mangle sentinel the wrapper definitions emit
+Note: `.globl integration_runtime_api__list_append`, breaking every legacy
+Note: caller that emits `call list_append@PLT`. The per-Function flag
+Note: propagation (program_tag_no_mangle_flags in main.runa /
+Note: import_system.runa) tags every Function defined in this file with
+Note: no_mangle=1 -- so the codegen emits plain `.globl list_append` here,
+Note: AND any external caller importing this file emits a plain
+Note: `call list_append@PLT` (mangling logic in codegen_resolve_call_symbol
+Note: keys off the TARGET's flag, not the caller's). Calls FROM this file
+Note: into the primitive layer (e.g. List.list_push) still resolve correctly
+Note: because each target Function's own no_mangle flag is 0 (the primitive
+Note: modules don't carry this sentinel), so the codegen emits
+Note: `call collections_list__list_push@PLT` as the mangling-enabled
+Note: definition demands.
+Let __runa_no_mangle__ be 1
+
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/collections/set.runa" as SetMod
@@ -65,6 +85,7 @@ Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/memory/layout.runa" as Heap
+Import "runtime/integration/system_interface/syscall_manager.runa" as Syscall
 
 Note:
 ============================================================================
@@ -348,10 +369,10 @@ Constant CLINGER_MANTISSA_LIMIT as Integer is 9007199254740992
 Process called "integer_to_float" takes n as Integer returns Integer:
     Let result_bits be 0
     Inline Assembly:
-        # n is at -8(%rbp), result_bits is at -16(%rbp).
-        movq -8(%rbp), %rax
-        cvtsi2sdq %rax, %xmm0
-        movq %xmm0, -16(%rbp)
+        # n is at [rbp-8], result_bits is at [rbp-16].
+        mov rax, qword ptr [rbp-8]
+        cvtsi2sd xmm0, rax
+        movq qword ptr [rbp-16], xmm0
     End Assembly
     Return result_bits
 End Process
@@ -359,10 +380,10 @@ End Process
 Process called "float_to_integer" takes float_bits as Integer returns Integer:
     Let result be 0
     Inline Assembly:
-        # float_bits is at -8(%rbp), result is at -16(%rbp).
-        movq -8(%rbp), %xmm0
-        cvttsd2siq %xmm0, %rax
-        movq %rax, -16(%rbp)
+        # float_bits is at [rbp-8], result is at [rbp-16].
+        movq xmm0, qword ptr [rbp-8]
+        cvttsd2si rax, xmm0
+        mov qword ptr [rbp-16], rax
     End Assembly
     Return result
 End Process
@@ -377,11 +398,11 @@ an Integer bit-pattern. Implemented via SSE2 mulsd.
 Process called "float_multiply_bits" takes a_bits as Integer, b_bits as Integer returns Integer:
     Let result_bits be 0
     Inline Assembly:
-        # a_bits at -8(%rbp), b_bits at -16(%rbp), result_bits at -24(%rbp).
-        movq -8(%rbp), %xmm0
-        movq -16(%rbp), %xmm1
-        mulsd %xmm1, %xmm0
-        movq %xmm0, -24(%rbp)
+        # a_bits at [rbp-8], b_bits at [rbp-16], result_bits at [rbp-24].
+        movq xmm0, qword ptr [rbp-8]
+        movq xmm1, qword ptr [rbp-16]
+        mulsd xmm0, xmm1
+        movq qword ptr [rbp-24], xmm0
     End Assembly
     Return result_bits
 End Process
@@ -399,11 +420,11 @@ multiplying by the inexact reciprocal 0.1 ~= 0x3FB999999999999A.
 Process called "float_divide_bits" takes a_bits as Integer, b_bits as Integer returns Integer:
     Let result_bits be 0
     Inline Assembly:
-        # a_bits at -8(%rbp), b_bits at -16(%rbp), result_bits at -24(%rbp).
-        movq -8(%rbp), %xmm0
-        movq -16(%rbp), %xmm1
-        divsd %xmm1, %xmm0
-        movq %xmm0, -24(%rbp)
+        # a_bits at [rbp-8], b_bits at [rbp-16], result_bits at [rbp-24].
+        movq xmm0, qword ptr [rbp-8]
+        movq xmm1, qword ptr [rbp-16]
+        divsd xmm0, xmm1
+        movq qword ptr [rbp-24], xmm0
     End Assembly
     Return result_bits
 End Process
@@ -731,16 +752,16 @@ alignment; the inline block only does the call.
 Process called "call_function_pointer_2args" takes fn as Integer, arg1 as Integer, arg2 as Integer returns Integer:
     Let result be 0
     Inline Assembly:
-        # fn at -8(%rbp), arg1 at -16(%rbp), arg2 at -24(%rbp),
-        # result at -32(%rbp). Load System V argument registers
+        # fn at [rbp-8], arg1 at [rbp-16], arg2 at [rbp-24],
+        # result at [rbp-32]. Load System V argument registers
         # directly from the locals, then indirect-call the function
         # pointer in r11 (a scratch register that the callee may
         # clobber freely).
-        movq -16(%rbp), %rdi
-        movq -24(%rbp), %rsi
-        movq -8(%rbp), %r11
-        callq *%r11
-        movq %rax, -32(%rbp)
+        mov rdi, qword ptr [rbp-16]
+        mov rsi, qword ptr [rbp-24]
+        mov r11, qword ptr [rbp-8]
+        call r11
+        mov qword ptr [rbp-32], rax
     End Assembly
     Return result
 End Process
@@ -865,4 +886,25 @@ Process called "reallocate" takes ptr as Integer, old_size as Integer, new_size 
     End If
     Let _release be Heap.deallocate(ptr)
     Return new_ptr
+End Process
+
+Note:
+============================================================================
+SECTION 8 - PROCESS-EXIT BRIDGE (codegen-emitted error handler symbol)
+============================================================================
+The codegen emits `.null_pointer_error`, `.bounds_error_negative`, and
+`.bounds_error_overflow` runtime-panic stubs in every translation unit. Each
+stub ends with `call exit_with_code@PLT`. With mangling enabled, the
+canonical syscall_manager.runa exports
+`system_interface_syscall_manager__exit_with_code` -- no plain `exit_with_code`
+symbol exists in the build_runtime tree. This file is `__runa_no_mangle__`,
+so its `exit_with_code` Process definition emits a plain `.globl
+exit_with_code` that satisfies the codegen's PLT reference. The body
+delegates to the canonical syscall_manager implementation via the qualified
+call, which under per-Function mangling resolves to the mangled symbol
+(target's no_mangle=0). Zero-cost adapter: one tail-style call.
+:End Note
+
+Process called "exit_with_code" takes code as Integer returns Integer:
+    Return Syscall.exit_with_code(code)
 End Process

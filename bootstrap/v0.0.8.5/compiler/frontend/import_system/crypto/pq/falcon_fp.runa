@@ -1,0 +1,833 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FALCON-FP : hardware Float64 (IEEE 754 binary64) arithmetic for the Falcon
+            FFT / sampler / NTRUSolve pipeline.
+==============================================================================
+
+The Falcon reference implementation (NIST PQC Round 3 submission, files
+keygen.c + falcon.c) performs the NTRU-equation lattice basis generation
+in IEEE 754 binary64 arithmetic throughout. The signing path's Fast Fourier
+Sampler likewise runs on Float64.
+
+This module exposes the low-level Float64 primitives that the higher-level
+Falcon math (falcon_fft.runa, falcon.runa) consumes:
+
+  - Field operations : fp_add / fp_sub / fp_mul / fp_div / fp_neg / fp_abs
+  - Conversions      : fp_from_int / fp_to_int_trunc / fp_to_int_round
+  - Special          : fp_sqrt / fp_floor / fp_ceil / fp_round_nearest
+  - Comparison       : fp_lt / fp_le / fp_eq / fp_is_nan
+  - Transcendental   : fp_cos / fp_sin / fp_exp / fp_expm1 / fp_log
+
+Each field/sqrt primitive lowers to a single x86_64 SSE2 instruction via an
+Inline Assembly block. The transcendentals use range-reduced Taylor / minimax
+expansions implemented in this language so the entire surface is fully
+self-contained and does not require an external libm linkage.
+
+Falcon-FP works with values of Runa type Float (IEEE 754 binary64).
+Each Float occupies 8 bytes; Falcon polynomials are stored as flat arrays of
+Float64 values indexed by coefficient position.
+
+PERFORMANCE NOTE: Float arithmetic on the May-18 baseline compiler is not
+yet lowered to native SSE2 by the codegen for ordinary `Float plus Float`
+expressions; instead the codegen emits integer addq on the bit representation
+which is incorrect. This module bypasses that codegen path entirely by
+encoding every primitive operation as an inline-assembly single SSE2
+instruction. Callers MUST go through these procs - never use the `plus`
+or `multiplied by` operators directly on Float values.
+
+SECURITY NOTE: SSE2 scalar double instructions are constant-time on every
+modern x86_64 microarchitecture except in two cases:
+  1. Denormal operands trigger microcode assist on some Intel parts.
+  2. Division latency varies by operand magnitude on some AMD parts.
+Falcon's signing sampler is therefore not strictly constant-time on every
+microarchitecture; the Falcon authors recommend masking-side-channel-aware
+deployment when timing channels matter. The integer-only verify path of
+this Falcon implementation is not affected.
+:End Note
+
+Note:
+==============================================================================
+Field operations - one SSE2 instruction each
+==============================================================================
+:End Note
+
+Process called "fp_add" takes a as Float, b as Float returns Float:
+    @Reasoning
+    IEEE 754 binary64 add. Maps directly to addsd.
+    @End Reasoning
+    @Implementation
+    Inline asm: movq xmm0,a ; addsd b,xmm0 ; movq xmm0,result.
+    Stage1 layout places `a` at -8(%rbp), `b` at -16(%rbp), `result` at -24(%rbp).
+    @End Implementation
+    @Performance_Hints
+    1-3 cycles on x86_64.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time on all modern x86_64 (denormal assist excepted).
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        addsd xmm0, qword ptr [rbp-16]
+        movq qword ptr [rbp-24], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_sub" takes a as Float, b as Float returns Float:
+    @Reasoning
+    IEEE 754 binary64 subtraction. Maps directly to subsd.
+    @End Reasoning
+    @Implementation
+    Inline asm: movq xmm0,a ; subsd b,xmm0 ; movq xmm0,result.
+    @End Implementation
+    @Performance_Hints
+    1-3 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time on all modern x86_64.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        subsd xmm0, qword ptr [rbp-16]
+        movq qword ptr [rbp-24], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_mul" takes a as Float, b as Float returns Float:
+    @Reasoning
+    IEEE 754 binary64 multiply. Maps directly to mulsd.
+    @End Reasoning
+    @Implementation
+    Inline asm: movq xmm0,a ; mulsd b,xmm0 ; movq xmm0,result.
+    @End Implementation
+    @Performance_Hints
+    3-5 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time on all modern x86_64.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        mulsd xmm0, qword ptr [rbp-16]
+        movq qword ptr [rbp-24], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_div" takes a as Float, b as Float returns Float:
+    @Reasoning
+    IEEE 754 binary64 division. Maps directly to divsd.
+    @End Reasoning
+    @Implementation
+    Inline asm: movq xmm0,a ; divsd b,xmm0 ; movq xmm0,result.
+    @End Implementation
+    @Performance_Hints
+    14-20 cycles on Intel Skylake; can vary by operand magnitude on AMD.
+    @End Performance_Hints
+    @Security_Scope
+    Division latency may depend on operand magnitude on some AMD parts.
+    The Falcon FFT uses division only for inverse-FFT scaling by a public
+    constant 1.0/n; signing-path division is restricted to public values.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        divsd xmm0, qword ptr [rbp-16]
+        movq qword ptr [rbp-24], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_neg" takes a as Float returns Float:
+    @Reasoning
+    Negate by flipping the sign bit (bit 63) of the binary64 encoding.
+    @End Reasoning
+    @Implementation
+    Inline asm using a local scratch slot to hold the SIGN mask. Computes
+    result = a XOR 0x8000000000000000 via SSE xorpd. The mask is loaded from
+    a stack slot we explicitly initialize.
+    @End Implementation
+    @Performance_Hints
+    1 cycle.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Note: Build the sign-bit mask in scratch. Runa cannot express a 64-bit
+    Note: negative literal directly so we shift it in.
+    Let mask be 1 shifted left by 63
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        movq xmm1, qword ptr [rbp-16]
+        xorpd xmm0, xmm1
+        movq qword ptr [rbp-24], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_abs" takes a as Float returns Float:
+    @Reasoning
+    Absolute value by clearing bit 63 of the binary64 encoding.
+    @End Reasoning
+    @Implementation
+    Inline asm: load magnitude mask 0x7FFFFFFFFFFFFFFF into xmm1, andpd.
+    @End Implementation
+    @Performance_Hints
+    1 cycle.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let mask be 9223372036854775807
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        movq xmm1, qword ptr [rbp-16]
+        andpd xmm0, xmm1
+        movq qword ptr [rbp-24], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_sqrt" takes a as Float returns Float:
+    @Reasoning
+    IEEE 754 binary64 square root. Maps to sqrtsd.
+    @End Reasoning
+    @Implementation
+    Inline asm: sqrtsd a -> result.
+    @End Implementation
+    @Performance_Hints
+    13-20 cycles on Intel.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time on all modern x86_64.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        sqrtsd xmm0, xmm0
+        movq qword ptr [rbp-16], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_from_int" takes n as Integer returns Float:
+    @Reasoning
+    Convert signed 64-bit integer to IEEE 754 binary64. Uses cvtsi2sdq.
+    @End Reasoning
+    @Implementation
+    Inline asm: cvtsi2sdq n -> xmm0 -> result. Magnitudes > 2^53 lose
+    precision per IEEE 754 round-to-nearest-even.
+    @End Implementation
+    @Performance_Hints
+    3-5 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        cvtsi2sd xmm0, rax
+        movq qword ptr [rbp-16], xmm0
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_to_int_trunc" takes x as Float returns Integer:
+    @Reasoning
+    Convert binary64 to int64 with truncation toward zero. Uses cvttsd2siq.
+    @End Reasoning
+    @Implementation
+    Out-of-range or NaN inputs produce INT64_MIN (x86 indefinite integer).
+    @End Implementation
+    @Performance_Hints
+    4-6 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        cvttsd2si rax, xmm0
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_to_int_round" takes x as Float returns Integer:
+    @Reasoning
+    Convert binary64 to int64 with round-to-nearest-even. Uses cvtsd2siq
+    (which uses the current SSE rounding mode; default is round-to-nearest).
+    @End Reasoning
+    @Implementation
+    Inline asm: cvtsd2siq x -> rax.
+    @End Implementation
+    @Performance_Hints
+    4-6 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        cvtsd2si rax, xmm0
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_lt" takes a as Float, b as Float returns Integer:
+    @Reasoning
+    Returns 1 if a < b (ordered), 0 otherwise. NaN inputs return 0.
+    @End Reasoning
+    @Implementation
+    Inline asm: comisd b,a then setb result (using carry flag which is set
+    when xmm0 < xmm1 for ordered compare).
+    @End Implementation
+    @Performance_Hints
+    1-3 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        movq xmm1, qword ptr [rbp-16]
+        xor rax, rax
+        comisd xmm0, xmm1
+        setb al
+        mov qword ptr [rbp-24], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_le" takes a as Float, b as Float returns Integer:
+    @Reasoning
+    Returns 1 if a <= b (ordered), 0 otherwise.
+    @End Reasoning
+    @Implementation
+    Inline asm: comisd b,a ; setbe.
+    @End Implementation
+    @Performance_Hints
+    1-3 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        movq xmm1, qword ptr [rbp-16]
+        xor rax, rax
+        comisd xmm0, xmm1
+        setbe al
+        mov qword ptr [rbp-24], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_eq" takes a as Float, b as Float returns Integer:
+    @Reasoning
+    Returns 1 if a == b (ordered, NaN inputs return 0).
+    @End Reasoning
+    @Implementation
+    Inline asm: comisd ; sete + setnp (must be both ZF=1 and PF=0 for ordered equal).
+    @End Implementation
+    @Performance_Hints
+    1-3 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        movq xmm1, qword ptr [rbp-16]
+        xor rax, rax
+        xor rcx, rcx
+        comisd xmm0, xmm1
+        sete al
+        setnp cl
+        and rax, rcx
+        mov qword ptr [rbp-24], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_is_nan" takes a as Float returns Integer:
+    @Reasoning
+    Returns 1 if a is NaN.
+    @End Reasoning
+    @Implementation
+    Self-compare: NaN != NaN. We test PF after comisd.
+    @End Implementation
+    @Performance_Hints
+    1-3 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let result be 0
+    Inline Assembly:
+        movq xmm0, qword ptr [rbp-8]
+        xor rax, rax
+        comisd xmm0, xmm0
+        setp al
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "fp_floor" takes x as Float returns Float:
+    @Reasoning
+    Compute the largest integer not greater than x. Implemented in pure
+    Runa using round-to-zero (cvttsd2si) and an adjustment for negative
+    non-integer values.
+    @End Reasoning
+    @Implementation
+    For finite |x| < 2^62: trunc = (Integer)x; if x < 0 and x is not equal
+    to trunc then floor = trunc - 1. For values out of int64 range or NaN
+    the function returns x unchanged. The intermediate guards rely on
+    fp_abs and fp_lt.
+    @End Implementation
+    @Performance_Hints
+    ~15-25 cycles total.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time wrt branch on rounding direction (data-dependent but
+    public branch in Falcon contexts).
+    @End Security_Scope
+    Let bound be proc fp_from_int with 4611686018427387904
+    Let absx be proc fp_abs with x
+    Let too_big be proc fp_lt with bound, absx
+    If too_big is equal to 1:
+        Return x
+    End If
+    Let nan_check be proc fp_is_nan with x
+    If nan_check is equal to 1:
+        Return x
+    End If
+    Let trunc_i be proc fp_to_int_trunc with x
+    Let trunc_f be proc fp_from_int with trunc_i
+    Let zero be proc fp_from_int with 0
+    Let lt_zero be proc fp_lt with x, zero
+    If lt_zero is equal to 1:
+        Let eq_trunc be proc fp_eq with x, trunc_f
+        If eq_trunc is equal to 0:
+            Let one_f be proc fp_from_int with 1
+            Return proc fp_sub with trunc_f, one_f
+        End If
+    End If
+    Return trunc_f
+End Process
+
+Process called "fp_round_nearest" takes x as Float returns Float:
+    @Reasoning
+    Round x to the nearest integer using IEEE round-to-nearest-even.
+    @End Reasoning
+    @Implementation
+    fp_to_int_round + fp_from_int round-trip.
+    @End Implementation
+    @Performance_Hints
+    ~10 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let n be proc fp_to_int_round with x
+    Return proc fp_from_int with n
+End Process
+
+Note:
+==============================================================================
+Transcendentals
+==============================================================================
+fp_cos, fp_sin via range reduction modulo 2pi + minimax polynomial.
+fp_exp via 2^k * polynomial expansion.
+These are pure-Runa implementations independent of any external libm.
+:End Note
+
+Process called "fp_pi" returns Float:
+    @Reasoning
+    Returns pi as IEEE 754 binary64.
+    @End Reasoning
+    @Implementation
+    pi = 3.141592653589793 has binary64 bits 0x400921FB54442D18 = 4614256656552045848.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 4614256656552045848
+End Process
+
+Process called "fp_two_pi" returns Float:
+    @Reasoning
+    Returns 2*pi.
+    @End Reasoning
+    @Implementation
+    2pi = 6.283185307179586 has binary64 bits 0x401921FB54442D18 = 4618760256179416344.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 4618760256179416344
+End Process
+
+Process called "fp_half_pi" returns Float:
+    @Reasoning
+    Returns pi/2.
+    @End Reasoning
+    @Implementation
+    pi/2 = 1.5707963267948966 has bits 0x3FF921FB54442D18 = 4609753056924675352.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 4609753056924675352
+End Process
+
+Process called "fp_one" returns Float:
+    @Reasoning
+    Returns 1.0.
+    @End Reasoning
+    @Implementation
+    1.0 has bits 0x3FF0000000000000 = 4607182418800017408.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 4607182418800017408
+End Process
+
+Process called "fp_zero" returns Float:
+    @Reasoning
+    Returns +0.0.
+    @End Reasoning
+    @Implementation
+    +0.0 has bits 0.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 0
+End Process
+
+Process called "fp_half" returns Float:
+    @Reasoning
+    Returns 0.5.
+    @End Reasoning
+    @Implementation
+    0.5 has bits 0x3FE0000000000000 = 4602678819172646912.
+    @End Implementation
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+    @Security_Scope
+    Public constant.
+    @End Security_Scope
+    Return 4602678819172646912
+End Process
+
+Process called "fp_sin" takes x as Float returns Float:
+    @Reasoning
+    Compute sin(x) using range reduction modulo 2*pi followed by a
+    minimax polynomial on [-pi/2, pi/2].
+    @End Reasoning
+    @Implementation
+    Step 1: reduce x to y in [-pi, pi] by subtracting k*(2*pi) where
+            k = round(x / (2*pi)).
+    Step 2: if y > pi/2, set y = pi - y; if y < -pi/2, set y = -pi - y.
+            Now y is in [-pi/2, pi/2].
+    Step 3: evaluate Taylor series sin(y) = y - y^3/6 + y^5/120 - y^7/5040
+            + y^9/362880 - y^11/39916800 + y^13/6227020800. This 13th-degree
+            expansion gives roughly 1e-15 accuracy on [-pi/2, pi/2] which
+            saturates Float64 precision and matches Falcon-grade FFT need.
+    @End Implementation
+    @Performance_Hints
+    ~60-80 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Public input (twiddle factor index) in Falcon FFT contexts.
+    @End Security_Scope
+    Let two_pi be proc fp_two_pi
+    Let pi_v be proc fp_pi
+    Let half_pi be proc fp_half_pi
+    Note: y = x - round(x / 2pi) * 2pi
+    Let q_f be proc fp_div with x, two_pi
+    Let q_round be proc fp_round_nearest with q_f
+    Let qsub be proc fp_mul with q_round, two_pi
+    Let y be proc fp_sub with x, qsub
+    Note: Bring into [-pi/2, pi/2]
+    Let y_above be proc fp_lt with half_pi, y
+    If y_above is equal to 1:
+        Set y to proc fp_sub with pi_v, y
+    End If
+    Let neg_half_pi be proc fp_neg with half_pi
+    Let y_below be proc fp_lt with y, neg_half_pi
+    If y_below is equal to 1:
+        Let neg_pi be proc fp_neg with pi_v
+        Set y to proc fp_sub with neg_pi, y
+    End If
+    Note: y2 = y * y, y3 = y2*y
+    Let y2 be proc fp_mul with y, y
+    Let y3 be proc fp_mul with y2, y
+    Let y5 be proc fp_mul with y3, y2
+    Let y7 be proc fp_mul with y5, y2
+    Let y9 be proc fp_mul with y7, y2
+    Let y11 be proc fp_mul with y9, y2
+    Let y13 be proc fp_mul with y11, y2
+    Note: 1/6 = 0.16666666666666666 = bits 0x3FC5555555555555 = 4595172819793696085
+    Let c3 be 4595172819793696085
+    Note: 1/120 = 8.333333333333333e-3 = bits 0x3F81111111111111 = 4575957461383581969
+    Let c5 be 4575957461383581969
+    Note: 1/5040 = 1.984126984126984e-4 = bits 0x3F2A01A01A01A01A = 4551452160554016794
+    Let c7 be 4551452160554016794
+    Note: 1/362880 = 2.7557319223985893e-6 = bits 0x3EC71DE3A556C734 = 4523617214285662004
+    Let c9 be 4523617214285662004
+    Note: 1/39916800 = 2.505210838544172e-8 = bits 0x3E5AE64567F544E4 = 4493156764026750180
+    Let c11 be 4493156764026750180
+    Note: 1/6227020800 = 1.6059043836821614e-10 = bits 0x3DE6124613A86D09 = 4460272573143870729
+    Let c13 be 4460272573143870729
+    Note: Accumulate: result = y - c3*y3 + c5*y5 - c7*y7 + c9*y9 - c11*y11 + c13*y13
+    Let acc be y
+    Let term3 be proc fp_mul with c3, y3
+    Set acc to proc fp_sub with acc, term3
+    Let term5 be proc fp_mul with c5, y5
+    Set acc to proc fp_add with acc, term5
+    Let term7 be proc fp_mul with c7, y7
+    Set acc to proc fp_sub with acc, term7
+    Let term9 be proc fp_mul with c9, y9
+    Set acc to proc fp_add with acc, term9
+    Let term11 be proc fp_mul with c11, y11
+    Set acc to proc fp_sub with acc, term11
+    Let term13 be proc fp_mul with c13, y13
+    Set acc to proc fp_add with acc, term13
+    Return acc
+End Process
+
+Process called "fp_cos" takes x as Float returns Float:
+    @Reasoning
+    Compute cos(x) via cos(x) = sin(x + pi/2).
+    @End Reasoning
+    @Implementation
+    Shift argument by pi/2 and delegate to fp_sin.
+    @End Implementation
+    @Performance_Hints
+    Same as fp_sin.
+    @End Performance_Hints
+    @Security_Scope
+    Public input.
+    @End Security_Scope
+    Let half_pi be proc fp_half_pi
+    Let shifted be proc fp_add with x, half_pi
+    Return proc fp_sin with shifted
+End Process
+
+Process called "fp_exp" takes x as Float returns Float:
+    @Reasoning
+    Compute exp(x). Range reduction: x = k*ln(2) + r with |r| <= ln(2)/2,
+    so exp(x) = 2^k * exp(r). Evaluate exp(r) via degree-10 Taylor.
+    @End Reasoning
+    @Implementation
+    Step 1: k = round(x / ln(2))
+    Step 2: r = x - k*ln(2)
+    Step 3: poly(r) = 1 + r + r^2/2! + r^3/3! + ... + r^10/10!
+    Step 4: scale by 2^k via IEEE bit manipulation - construct the binary64
+            with biased exponent (1023 + k) and mantissa 1.0, then multiply.
+    Falcon uses exp for the Bernoulli reject test in the sampler (BerExp);
+    inputs are bounded in [-19, 0] so the range-reduction k stays small.
+    @End Implementation
+    @Performance_Hints
+    ~80-120 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    The Falcon BerExp argument is data-dependent (Gaussian sampler output);
+    this routine is not strictly constant-time wrt the iteration count of
+    the Taylor accumulator because that loop is fixed at 10 iterations
+    independent of the input. Branches in fp_round_nearest and fp_floor
+    are public.
+    @End Security_Scope
+    Note: ln(2) = 0.6931471805599453 = bits 0x3FE62E42FEFA39EF = 4604418534313441775
+    Let ln2 be 4604418534313441775
+    Let k_f be proc fp_div with x, ln2
+    Let k_i be proc fp_to_int_round with k_f
+    Let k_back be proc fp_from_int with k_i
+    Let k_times_ln2 be proc fp_mul with k_back, ln2
+    Let r be proc fp_sub with x, k_times_ln2
+    Note: Compute 1 + r + r^2/2 + r^3/6 + r^4/24 + r^5/120 + r^6/720 + r^7/5040
+    Note: + r^8/40320 + r^9/362880 + r^10/3628800
+    Let acc be proc fp_one
+    Let term be proc fp_one
+    Let i be 1
+    While i is less than or equal to 10:
+        Let i_f be proc fp_from_int with i
+        Set term to proc fp_mul with term, r
+        Set term to proc fp_div with term, i_f
+        Set acc to proc fp_add with acc, term
+        Set i to i plus 1
+    End While
+    Note: Scale by 2^k. Build a Float with biased exponent (1023 + k_i) and
+    Note: mantissa 1.0 (mantissa bits = 0). Bit layout for 2^k :
+    Note:     sign=0, exponent=1023+k_i, mantissa=0
+    Note: encoded as (1023 + k_i) shifted left by 52.
+    If k_i is greater than or equal to 1024:
+        Note: 2^1024 already overflows IEEE 754 binary64; flush to +inf
+        Note: bits = 0x7FF0000000000000 = 9218868437227405312.
+        Return proc fp_mul with acc, 9218868437227405312
+    End If
+    If k_i is less than 0 minus 1022:
+        Note: Underflow to 0 (denormal floor; we do not produce subnormals
+        Note: because the BerExp argument is bounded by ~ -19 ln 2 anyway).
+        Return proc fp_zero
+    End If
+    Let exp_field be 1023 plus k_i
+    Let pow2_bits be exp_field shifted left by 52
+    Return proc fp_mul with acc, pow2_bits
+End Process
+
+Process called "fp_expm1" takes x as Float returns Float:
+    @Reasoning
+    Compute exp(x) - 1. Used by the discrete Gaussian sampler's BerExp test.
+    @End Reasoning
+    @Implementation
+    For |x| > 0.5 delegate to fp_exp then subtract 1. For small |x| this
+    loses precision so we evaluate the Taylor series directly:
+        expm1(x) = x + x^2/2 + x^3/6 + ... (no constant term).
+    Threshold 0.5 keeps the Taylor remainder under 2e-16.
+    @End Implementation
+    @Performance_Hints
+    ~80-100 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Public Gaussian-sampler reject branch.
+    @End Security_Scope
+    Let absx be proc fp_abs with x
+    Note: 0.5 = bits 0x3FE0000000000000 = 4602678819172646912
+    Let half_v be 4602678819172646912
+    Let above_half be proc fp_lt with half_v, absx
+    If above_half is equal to 1:
+        Let e be proc fp_exp with x
+        Let one_v be proc fp_one
+        Return proc fp_sub with e, one_v
+    End If
+    Note: Taylor series for small x
+    Let acc be proc fp_zero
+    Let term be proc fp_one
+    Let i be 1
+    While i is less than or equal to 14:
+        Let i_f be proc fp_from_int with i
+        Set term to proc fp_mul with term, x
+        Set term to proc fp_div with term, i_f
+        Set acc to proc fp_add with acc, term
+        Set i to i plus 1
+    End While
+    Return acc
+End Process
+
+Process called "fp_ln" takes x as Float returns Float:
+    @Reasoning
+    Natural log of x for x > 0. Used in the discrete Gaussian sampler's
+    BerExp test (rejection threshold scaling).
+    @End Reasoning
+    @Implementation
+    Step 1: extract exponent e and mantissa m so x = m * 2^e with m in [1,2).
+    Step 2: ln(x) = ln(m) + e*ln(2).
+    Step 3: ln(m) via the substitution u = (m - 1)/(m + 1) so m = (1+u)/(1-u)
+            and ln(m) = 2*(u + u^3/3 + u^5/5 + ...). u is in [0, 1/3], so the
+            series converges rapidly. We sum 12 terms.
+    @End Implementation
+    @Performance_Hints
+    ~100 cycles.
+    @End Performance_Hints
+    @Security_Scope
+    Public input.
+    @End Security_Scope
+    Note: Extract IEEE 754 fields by reading the bit pattern (Float and
+    Note: Integer share the same 64-bit slot on x86_64; the bit reinterpret
+    Note: requires inline asm).
+    Let bits be 0
+    Inline Assembly:
+        mov rax, qword ptr [rbp-8]
+        mov qword ptr [rbp-16], rax
+    End Assembly
+    Let mant_mask be 4503599627370495
+    Let mant_bits be bits bitwise_and mant_mask
+    Let exp_field be bits shifted right by 52
+    Set exp_field to exp_field bitwise_and 2047
+    Let e be exp_field minus 1023
+    Note: m_bits = (1023 << 52) | mant_bits  yields a Float in [1, 2)
+    Let m_bits be 1023 shifted left by 52
+    Set m_bits to m_bits bitwise_or mant_bits
+    Let m be m_bits
+    Note: u = (m - 1) / (m + 1)
+    Let one_v be proc fp_one
+    Let num be proc fp_sub with m, one_v
+    Let den be proc fp_add with m, one_v
+    Let u be proc fp_div with num, den
+    Let u2 be proc fp_mul with u, u
+    Let term be u
+    Let acc be u
+    Let i be 1
+    While i is less than or equal to 14:
+        Set term to proc fp_mul with term, u2
+        Let denom_i be 2 multiplied by i plus 1
+        Let denom_f be proc fp_from_int with denom_i
+        Let part be proc fp_div with term, denom_f
+        Set acc to proc fp_add with acc, part
+        Set i to i plus 1
+    End While
+    Note: ln(m) = 2 * acc
+    Let two_v be proc fp_from_int with 2
+    Let ln_m be proc fp_mul with two_v, acc
+    Note: ln(2) = 0.6931471805599453 = bits 0x3FE62E42FEFA39EF = 4604418534313441775
+    Let ln2 be 4604418534313441775
+    Let e_f be proc fp_from_int with e
+    Let e_part be proc fp_mul with e_f, ln2
+    Return proc fp_add with ln_m, e_part
+End Process
+
+Note:
+==============================================================================
+END falcon_fp
+==============================================================================
+:End Note

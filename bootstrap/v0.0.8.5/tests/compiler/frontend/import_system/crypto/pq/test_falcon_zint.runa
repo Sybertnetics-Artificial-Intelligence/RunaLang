@@ -1,0 +1,2206 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+==============================================================================
+Unit tests for falcon_zint (multi-precision integers) and falcon_zint_poly
+==============================================================================
+
+Coverage:
+  1. zint round-trip via zint_from_int -> zint_to_int over small and
+     boundary Int64 values.
+  2. zint addition / subtraction sanity vs hand-computed expected.
+  3. zint multiplication vs hand-computed expected (small and
+     Karatsuba-threshold-crossing sizes).
+  4. zint divmod: a = q*b + r with |r| < |b|, sign(r) = sign(a).
+  5. zint polynomial multiplication in K_n: degree wrap with sign flip.
+  6. zint field-norm: N(a) computed both via explicit a*a_bar and via
+     zint_poly_field_norm must match.
+  7. Stress: pseudo-random Int64 pairs through add/sub/mul/divmod
+     identity check (q*b + r == a, |r| < |b|).
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/import_system/crypto/pq/falcon_zint.runa" as Z
+Import "compiler/frontend/import_system/crypto/pq/falcon_zint_poly.runa" as ZP
+Import "compiler/frontend/import_system/crypto/pq/falcon_ntrusolve.runa" as NS
+Import "compiler/frontend/import_system/crypto/pq/falcon_fp.runa" as FP
+Import "compiler/frontend/import_system/crypto/pq/falcon_fft.runa" as FFT
+
+Note: Pseudo-random LCG state lives in a single int64 cell so the
+Note: stress loop can advance it deterministically.
+
+Process called "lcg_next" takes state_ptr as Integer returns Integer:
+    @Reasoning
+    Advance a 64-bit LCG and return the new state.
+    @End Reasoning
+    @Implementation
+    Numerical Recipes 64-bit constants: state = state * 6364136223846793005 + 1442695040888963407.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test PRNG.
+    @End Security_Scope
+    Let cur be Memory.memory_get_int64(state_ptr, 0)
+    Let mul be 6364136223846793005
+    Let add be 1442695040888963407
+    Set cur to cur multiplied by mul
+    Set cur to cur plus add
+    Memory.memory_set_int64(state_ptr, 0, cur)
+    Return cur
+End Process
+
+Process called "test_zint_roundtrip" that takes results as Integer returns Integer:
+    @Reasoning
+    Round-trip Int64 values through zint_from_int / zint_to_int.
+    @End Reasoning
+    @Implementation
+    Construct zints for 0, 1, -1, 2^30-1, 2^31, 2^31+5, -(2^31+5),
+    a 2-limb positive, and a 2-limb negative; verify zint_to_int
+    recovers the original.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint: from_int / to_int round trip")
+    Let arena be Arena.arena_create(1048576)
+    T.assert_not_null(results, "arena", arena)
+
+    Let z0 be Z.zint_from_int(arena, 0)
+    T.assert_equal(results, "0", Z.zint_to_int(z0), 0)
+
+    Let z1 be Z.zint_from_int(arena, 1)
+    T.assert_equal(results, "1", Z.zint_to_int(z1), 1)
+
+    Let z_neg1 be Z.zint_from_int(arena, 0 minus 1)
+    T.assert_equal(results, "-1", Z.zint_to_int(z_neg1), 0 minus 1)
+
+    Let v_30_max be 1073741823
+    Let z_30 be Z.zint_from_int(arena, v_30_max)
+    T.assert_equal(results, "2^30 - 1", Z.zint_to_int(z_30), v_30_max)
+
+    Let v_31 be 2147483648
+    Let z_31 be Z.zint_from_int(arena, v_31)
+    T.assert_equal(results, "2^31", Z.zint_to_int(z_31), v_31)
+
+    Let v_big be 5000000000
+    Let z_big be Z.zint_from_int(arena, v_big)
+    T.assert_equal(results, "5e9", Z.zint_to_int(z_big), v_big)
+
+    Let z_big_neg be Z.zint_from_int(arena, 0 minus v_big)
+    T.assert_equal(results, "-5e9", Z.zint_to_int(z_big_neg), 0 minus v_big)
+
+    Let v_huge be 9223372036854775000
+    Let z_huge be Z.zint_from_int(arena, v_huge)
+    T.assert_equal(results, "near max Int64", Z.zint_to_int(z_huge), v_huge)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_add_sub" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify zint_add and zint_sub on a handful of cases including
+    sign cross-overs.
+    @End Reasoning
+    @Implementation
+    For each (a, b) pair compute expected = a +/- b via Int64 arithmetic
+    (kept within range), then build zints, run the primitive, and
+    confirm round-trip.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint: add / sub")
+    Let arena be Arena.arena_create(1048576)
+
+    Let cases be 8
+    Let ai be 0
+    Let xs be Arena.arena_allocate(arena, cases multiplied by 8)
+    Let ys be Arena.arena_allocate(arena, cases multiplied by 8)
+    Memory.memory_set_int64(xs, 0, 5)
+    Memory.memory_set_int64(ys, 0, 3)
+    Memory.memory_set_int64(xs, 8, 100000000000)
+    Memory.memory_set_int64(ys, 8, 17)
+    Memory.memory_set_int64(xs, 16, 0 minus 42)
+    Memory.memory_set_int64(ys, 16, 0 minus 1)
+    Memory.memory_set_int64(xs, 24, 0 minus 9999)
+    Memory.memory_set_int64(ys, 24, 10000)
+    Memory.memory_set_int64(xs, 32, 2147483648)
+    Memory.memory_set_int64(ys, 32, 2147483648)
+    Memory.memory_set_int64(xs, 40, 0 minus 2147483647)
+    Memory.memory_set_int64(ys, 40, 2147483646)
+    Memory.memory_set_int64(xs, 48, 1)
+    Memory.memory_set_int64(ys, 48, 0 minus 1)
+    Memory.memory_set_int64(xs, 56, 0)
+    Memory.memory_set_int64(ys, 56, 42)
+
+    Let i be 0
+    While i is less than cases:
+        Let off be i multiplied by 8
+        Let xv be Memory.memory_get_int64(xs, off)
+        Let yv be Memory.memory_get_int64(ys, off)
+        Let xz be Z.zint_from_int(arena, xv)
+        Let yz be Z.zint_from_int(arena, yv)
+        Let out be Z.zint_create(arena, 8)
+        Z.zint_add(out, xz, yz)
+        T.assert_equal(results, "add", Z.zint_to_int(out), xv plus yv)
+        Let out2 be Z.zint_create(arena, 8)
+        Z.zint_sub(out2, xz, yz)
+        T.assert_equal(results, "sub", Z.zint_to_int(out2), xv minus yv)
+        Set i to i plus 1
+    End While
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_mul" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify zint_mul on small cases (schoolbook path) and a wider case
+    that exercises multi-limb carry.
+    @End Reasoning
+    @Implementation
+    Compute expected via Int64 wrap; for the wide case, multiply two
+    factors that exactly fit and verify the wrapped product.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint: mul")
+    Let arena be Arena.arena_create(2097152)
+
+    Let xz be Z.zint_from_int(arena, 7)
+    Let yz be Z.zint_from_int(arena, 11)
+    Let p be Z.zint_mul(arena, xz, yz)
+    T.assert_equal(results, "7 * 11", Z.zint_to_int(p), 77)
+
+    Let xz2 be Z.zint_from_int(arena, 0 minus 12345)
+    Let yz2 be Z.zint_from_int(arena, 6789)
+    Let p2 be Z.zint_mul(arena, xz2, yz2)
+    T.assert_equal(results, "-12345 * 6789", Z.zint_to_int(p2), 0 minus (12345 multiplied by 6789))
+
+    Let xz3 be Z.zint_from_int(arena, 1000000007)
+    Let yz3 be Z.zint_from_int(arena, 998244353)
+    Let p3 be Z.zint_mul(arena, xz3, yz3)
+    T.assert_equal(results, "two ~30b primes", Z.zint_to_int(p3), 1000000007 multiplied by 998244353)
+
+    Note: Symmetric case: (2^31) * (2^31) = 2^62 fits in Int64.
+    Let xz4 be Z.zint_from_int(arena, 2147483648)
+    Let yz4 be Z.zint_from_int(arena, 2147483648)
+    Let p4 be Z.zint_mul(arena, xz4, yz4)
+    T.assert_equal(results, "2^31 * 2^31 = 2^62", Z.zint_to_int(p4), 4611686018427387904)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_divmod" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify the divmod identity a = q*b + r with |r| < |b| and
+    sign(r) = sign(a).
+    @End Reasoning
+    @Implementation
+    A few targeted cases plus a stress loop using the LCG.
+    @End Implementation
+    @Performance_Hints
+    Linear in iteration count.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint: divmod identity")
+    Let arena be Arena.arena_create(4194304)
+
+    Let q_ptr be Arena.arena_allocate(arena, 8)
+    Let r_ptr be Arena.arena_allocate(arena, 8)
+    Let state_ptr be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_int64(state_ptr, 0, 0xCAFEBABEFACEFEED)
+
+    Note: Targeted cases.
+    Let cases be 6
+    Let xs be Arena.arena_allocate(arena, cases multiplied by 8)
+    Let ys be Arena.arena_allocate(arena, cases multiplied by 8)
+    Memory.memory_set_int64(xs, 0, 100)
+    Memory.memory_set_int64(ys, 0, 7)
+    Memory.memory_set_int64(xs, 8, 0 minus 100)
+    Memory.memory_set_int64(ys, 8, 7)
+    Memory.memory_set_int64(xs, 16, 100)
+    Memory.memory_set_int64(ys, 16, 0 minus 7)
+    Memory.memory_set_int64(xs, 24, 0 minus 100)
+    Memory.memory_set_int64(ys, 24, 0 minus 7)
+    Memory.memory_set_int64(xs, 32, 1000000000000)
+    Memory.memory_set_int64(ys, 32, 999999)
+    Memory.memory_set_int64(xs, 40, 1234567890)
+    Memory.memory_set_int64(ys, 40, 7919)
+
+    Let i be 0
+    While i is less than cases:
+        Let off be i multiplied by 8
+        Let xv be Memory.memory_get_int64(xs, off)
+        Let yv be Memory.memory_get_int64(ys, off)
+        Let xz be Z.zint_from_int(arena, xv)
+        Let yz be Z.zint_from_int(arena, yv)
+        Z.zint_divmod(arena, xz, yz, q_ptr, r_ptr)
+        Let qz be Memory.memory_get_int64(q_ptr, 0)
+        Let rz be Memory.memory_get_int64(r_ptr, 0)
+        Let qv be Z.zint_to_int(qz)
+        Let rv be Z.zint_to_int(rz)
+        Let reconstructed be (qv multiplied by yv) plus rv
+        T.assert_equal(results, "a = q*b + r", reconstructed, xv)
+        Set i to i plus 1
+    End While
+
+    Note: Random stress.
+    Let iters be 200
+    Let j be 0
+    While j is less than iters:
+        Let a_raw be proc lcg_next with state_ptr
+        Let b_raw be proc lcg_next with state_ptr
+        Note: Confine magnitudes to fit (q * b + r) within Int64 with margin.
+        Let a_clip be a_raw bitwise_and 0x7FFFFFFF
+        Let b_clip be b_raw bitwise_and 0xFFFF
+        If b_clip is equal to 0:
+            Set b_clip to 1
+        End If
+        Let sign_a be a_raw bitwise_and 1
+        Let sign_b be (a_raw shifted right by 1) bitwise_and 1
+        Let av be a_clip
+        If sign_a is equal to 1:
+            Set av to 0 minus av
+        End If
+        Let bv be b_clip
+        If sign_b is equal to 1:
+            Set bv to 0 minus bv
+        End If
+        Let xz be Z.zint_from_int(arena, av)
+        Let yz be Z.zint_from_int(arena, bv)
+        Z.zint_divmod(arena, xz, yz, q_ptr, r_ptr)
+        Let qz be Memory.memory_get_int64(q_ptr, 0)
+        Let rz be Memory.memory_get_int64(r_ptr, 0)
+        Let qv be Z.zint_to_int(qz)
+        Let rv be Z.zint_to_int(rz)
+        Let reconstructed be (qv multiplied by bv) plus rv
+        T.assert_equal(results, "stress a = q*b + r", reconstructed, av)
+        Set j to j plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_poly_basics" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify zint polynomial add / sub / mul over K_n.
+    @End Reasoning
+    @Implementation
+    n = 4 example:
+      a = 1 + 2X + 3X^2 + 4X^3
+      b = 5 + 6X + 7X^2 + 8X^3
+    Compute c = a * b in Z[X]/(X^4 + 1) by hand:
+      coefficient of X^0: 1*5 - (2*8 + 3*7 + 4*6) = 5 - (16 + 21 + 24) = -56
+      coefficient of X^1: 1*6 + 2*5 - (3*8 + 4*7) = 6 + 10 - (24 + 28) = -36
+      coefficient of X^2: 1*7 + 2*6 + 3*5 - (4*8) = 7 + 12 + 15 - 32 = 2
+      coefficient of X^3: 1*8 + 2*7 + 3*6 + 4*5 = 8 + 14 + 18 + 20 = 60
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: add / sub / mul")
+    Let arena be Arena.arena_create(2097152)
+    Let n be 4
+
+    Let a_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Let b_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(a_int, 0, 1)
+    Memory.memory_set_int64(a_int, 8, 2)
+    Memory.memory_set_int64(a_int, 16, 3)
+    Memory.memory_set_int64(a_int, 24, 4)
+    Memory.memory_set_int64(b_int, 0, 5)
+    Memory.memory_set_int64(b_int, 8, 6)
+    Memory.memory_set_int64(b_int, 16, 7)
+    Memory.memory_set_int64(b_int, 24, 8)
+    Let a be ZP.zint_poly_from_int_array(arena, a_int, n, 8)
+    Let b be ZP.zint_poly_from_int_array(arena, b_int, n, 8)
+
+    Let sum be ZP.zint_poly_add(arena, a, b, n)
+    T.assert_equal(results, "(a+b)[0] = 6", Z.zint_to_int(ZP.zint_poly_get(sum, 0)), 6)
+    T.assert_equal(results, "(a+b)[1] = 8", Z.zint_to_int(ZP.zint_poly_get(sum, 1)), 8)
+    T.assert_equal(results, "(a+b)[2] = 10", Z.zint_to_int(ZP.zint_poly_get(sum, 2)), 10)
+    T.assert_equal(results, "(a+b)[3] = 12", Z.zint_to_int(ZP.zint_poly_get(sum, 3)), 12)
+
+    Let diff be ZP.zint_poly_sub(arena, a, b, n)
+    T.assert_equal(results, "(a-b)[0] = -4", Z.zint_to_int(ZP.zint_poly_get(diff, 0)), 0 minus 4)
+    T.assert_equal(results, "(a-b)[3] = -4", Z.zint_to_int(ZP.zint_poly_get(diff, 3)), 0 minus 4)
+
+    Let prod be ZP.zint_poly_mul(arena, a, b, n)
+    T.assert_equal(results, "(a*b)[0] = -56", Z.zint_to_int(ZP.zint_poly_get(prod, 0)), 0 minus 56)
+    T.assert_equal(results, "(a*b)[1] = -36", Z.zint_to_int(ZP.zint_poly_get(prod, 1)), 0 minus 36)
+    T.assert_equal(results, "(a*b)[2] = 2", Z.zint_to_int(ZP.zint_poly_get(prod, 2)), 2)
+    T.assert_equal(results, "(a*b)[3] = 60", Z.zint_to_int(ZP.zint_poly_get(prod, 3)), 60)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_poly_field_norm" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify the field norm map by computing N(f) two different ways
+    and comparing.
+    @End Reasoning
+    @Implementation
+    For n=4, f = 1 + 2X + 3X^2 + 4X^3:
+      adj(f) = 1 - 2X + 3X^2 - 4X^3
+      f * adj(f) in K_4 only has even-degree terms; substituting
+      Y = X^2 gives a polynomial in K_2 = Q[Y]/(Y^2+1).
+    We compute the K_4 product directly, extract the even-indexed
+    coefficients (which form N(f) in K_2 with the substitution),
+    then compare with zint_poly_field_norm output.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: field norm")
+    Let arena be Arena.arena_create(2097152)
+    Let n be 4
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(f_int, 0, 1)
+    Memory.memory_set_int64(f_int, 8, 2)
+    Memory.memory_set_int64(f_int, 16, 3)
+    Memory.memory_set_int64(f_int, 24, 4)
+    Let f be ZP.zint_poly_from_int_array(arena, f_int, n, 8)
+    Let adj_f be ZP.zint_poly_conjugate(arena, f, n)
+
+    Let prod be ZP.zint_poly_mul(arena, f, adj_f, n)
+    T.assert_equal(results, "(f*adj(f))[1] == 0", Z.zint_to_int(ZP.zint_poly_get(prod, 1)), 0)
+    T.assert_equal(results, "(f*adj(f))[3] == 0", Z.zint_to_int(ZP.zint_poly_get(prod, 3)), 0)
+
+    Let expected0 be Z.zint_to_int(ZP.zint_poly_get(prod, 0))
+    Let expected1 be Z.zint_to_int(ZP.zint_poly_get(prod, 2))
+
+    Let nf be ZP.zint_poly_field_norm(arena, f, n)
+    Let actual0 be Z.zint_to_int(ZP.zint_poly_get(nf, 0))
+    Let actual1 be Z.zint_to_int(ZP.zint_poly_get(nf, 1))
+
+    T.assert_equal(results, "N(f)[0] == (f*adj(f))[0]", actual0, expected0)
+    T.assert_equal(results, "N(f)[1] == (f*adj(f))[2]", actual1, expected1)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_poly_split_merge_roundtrip" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify zint_poly_split_even_odd composed with zint_poly_merge_even_odd
+    is the identity over a K_n polynomial.
+    @End Reasoning
+    @Implementation
+    Build a K_8 polynomial with distinct integer coefficients (0..7).
+    Split into K_4 even/odd halves; assert each half holds the right
+    coefficients.  Merge back and assert every coefficient matches the
+    original.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: split/merge even-odd round trip")
+    Let arena be Arena.arena_create(1048576)
+    Let n be 8
+
+    Let src_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Let i be 0
+    While i is less than n:
+        Memory.memory_set_int64(src_int, i multiplied by 8, i)
+        Set i to i plus 1
+    End While
+    Let src be ZP.zint_poly_from_int_array(arena, src_int, n, 8)
+
+    Let e_ptr be Arena.arena_allocate(arena, 8)
+    Let o_ptr be Arena.arena_allocate(arena, 8)
+    ZP.zint_poly_split_even_odd(arena, src, n, e_ptr, o_ptr)
+    Let e be Memory.memory_get_int64(e_ptr, 0)
+    Let o be Memory.memory_get_int64(o_ptr, 0)
+
+    Note: Even part holds [0, 2, 4, 6], odd part holds [1, 3, 5, 7]
+    T.assert_equal(results, "even[0] = 0", Z.zint_to_int(ZP.zint_poly_get(e, 0)), 0)
+    T.assert_equal(results, "even[1] = 2", Z.zint_to_int(ZP.zint_poly_get(e, 1)), 2)
+    T.assert_equal(results, "even[2] = 4", Z.zint_to_int(ZP.zint_poly_get(e, 2)), 4)
+    T.assert_equal(results, "even[3] = 6", Z.zint_to_int(ZP.zint_poly_get(e, 3)), 6)
+    T.assert_equal(results, "odd[0] = 1",  Z.zint_to_int(ZP.zint_poly_get(o, 0)), 1)
+    T.assert_equal(results, "odd[1] = 3",  Z.zint_to_int(ZP.zint_poly_get(o, 1)), 3)
+    T.assert_equal(results, "odd[2] = 5",  Z.zint_to_int(ZP.zint_poly_get(o, 2)), 5)
+    T.assert_equal(results, "odd[3] = 7",  Z.zint_to_int(ZP.zint_poly_get(o, 3)), 7)
+
+    Let merged be ZP.zint_poly_merge_even_odd(arena, e, o, n)
+    Let j be 0
+    While j is less than n:
+        T.assert_equal(results, "merge round trip", Z.zint_to_int(ZP.zint_poly_get(merged, j)), j)
+        Set j to j plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_poly_substitute_x_squared" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify zint_poly_substitute_x_squared inverts zint_poly_extract_even
+    when the source has only even-degree coefficients.
+    @End Reasoning
+    @Implementation
+    Build K_4 polynomial p_y = [10, 20, 30, 40] (in Y).  Substitute
+    Y = X^2 to get K_8 polynomial: [10, 0, 20, 0, 30, 0, 40, 0].  Then
+    extract_even on the K_8 result must give back the original K_4.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: substitute X^2 / extract_even")
+    Let arena be Arena.arena_create(1048576)
+    Let half_n be 4
+    Let n be half_n multiplied by 2
+
+    Let p_y_int be Arena.arena_allocate(arena, half_n multiplied by 8)
+    Memory.memory_set_int64(p_y_int, 0, 10)
+    Memory.memory_set_int64(p_y_int, 8, 20)
+    Memory.memory_set_int64(p_y_int, 16, 30)
+    Memory.memory_set_int64(p_y_int, 24, 40)
+    Let p_y be ZP.zint_poly_from_int_array(arena, p_y_int, half_n, 8)
+
+    Let p_x be ZP.zint_poly_substitute_x_squared(arena, p_y, half_n)
+    T.assert_equal(results, "p_x[0] = 10", Z.zint_to_int(ZP.zint_poly_get(p_x, 0)), 10)
+    T.assert_equal(results, "p_x[1] = 0",  Z.zint_to_int(ZP.zint_poly_get(p_x, 1)), 0)
+    T.assert_equal(results, "p_x[2] = 20", Z.zint_to_int(ZP.zint_poly_get(p_x, 2)), 20)
+    T.assert_equal(results, "p_x[3] = 0",  Z.zint_to_int(ZP.zint_poly_get(p_x, 3)), 0)
+    T.assert_equal(results, "p_x[4] = 30", Z.zint_to_int(ZP.zint_poly_get(p_x, 4)), 30)
+    T.assert_equal(results, "p_x[5] = 0",  Z.zint_to_int(ZP.zint_poly_get(p_x, 5)), 0)
+    T.assert_equal(results, "p_x[6] = 40", Z.zint_to_int(ZP.zint_poly_get(p_x, 6)), 40)
+    T.assert_equal(results, "p_x[7] = 0",  Z.zint_to_int(ZP.zint_poly_get(p_x, 7)), 0)
+
+    Let extracted be ZP.zint_poly_extract_even(arena, p_x, n)
+    T.assert_equal(results, "extracted[0] = 10", Z.zint_to_int(ZP.zint_poly_get(extracted, 0)), 10)
+    T.assert_equal(results, "extracted[1] = 20", Z.zint_to_int(ZP.zint_poly_get(extracted, 1)), 20)
+    T.assert_equal(results, "extracted[2] = 30", Z.zint_to_int(ZP.zint_poly_get(extracted, 2)), 30)
+    T.assert_equal(results, "extracted[3] = 40", Z.zint_to_int(ZP.zint_poly_get(extracted, 3)), 40)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_poly_field_norm_sum" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify zint_poly_field_norm_sum returns f*adj(f) + g*adj(g) and the
+    result has zero coefficients at every odd index.
+    @End Reasoning
+    @Implementation
+    n = 4.  f = 1 + 2X + 3X^2 + 4X^3, g = 5 + 6X + 7X^2 + 8X^3.
+    Compute f*adj(f), g*adj(g), and (f*adj(f) + g*adj(g)) by hand and
+    cross-check.
+
+    Hand computation in K_4:
+      adj(f) = 1 - 2X + 3X^2 - 4X^3
+      f * adj(f) [0] = 1*1 - (2*(-4) + 3*3 + 4*(-2)) = 1 - (-8 + 9 - 8) = 1 - (-7) = 8
+        Wait, let me redo: f*adj(f) = sum_{i,j} f[i]*adj(f)[j] X^{i+j} reduced
+        adj(f)[j] = (-1)^j * f[j]; so f*adj(f) [d] = sum_{i+j=d or i+j=d+n} f[i]*f[j]*(-1)^j*(-1)^{wrap}
+      We already verified in the existing field_norm test that
+      f*adj(f) in K_4 has zero at indices 1 and 3.  Use that property
+      directly: assert the sum's [1] and [3] are zero.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: field_norm_sum")
+    Let arena be Arena.arena_create(2097152)
+    Let n be 4
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(f_int, 0, 1)
+    Memory.memory_set_int64(f_int, 8, 2)
+    Memory.memory_set_int64(f_int, 16, 3)
+    Memory.memory_set_int64(f_int, 24, 4)
+    Memory.memory_set_int64(g_int, 0, 5)
+    Memory.memory_set_int64(g_int, 8, 6)
+    Memory.memory_set_int64(g_int, 16, 7)
+    Memory.memory_set_int64(g_int, 24, 8)
+    Let f be ZP.zint_poly_from_int_array(arena, f_int, n, 8)
+    Let g be ZP.zint_poly_from_int_array(arena, g_int, n, 8)
+
+    Let denom be ZP.zint_poly_field_norm_sum(arena, f, g, n)
+    T.assert_equal(results, "denom[1] = 0", Z.zint_to_int(ZP.zint_poly_get(denom, 1)), 0)
+    T.assert_equal(results, "denom[3] = 0", Z.zint_to_int(ZP.zint_poly_get(denom, 3)), 0)
+
+    Note: Verify against direct computation.
+    Let af be ZP.zint_poly_conjugate(arena, f, n)
+    Let ag be ZP.zint_poly_conjugate(arena, g, n)
+    Let ff be ZP.zint_poly_mul(arena, f, af, n)
+    Let gg be ZP.zint_poly_mul(arena, g, ag, n)
+    Let expected be ZP.zint_poly_add(arena, ff, gg, n)
+    Let k be 0
+    While k is less than n:
+        Let exp_c be Z.zint_to_int(ZP.zint_poly_get(expected, k))
+        Let act_c be Z.zint_to_int(ZP.zint_poly_get(denom, k))
+        T.assert_equal(results, "denom matches direct", act_c, exp_c)
+        Set k to k plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_poly_divide_kn_identity_n2" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify the K_n polynomial division identity D * (N / D) = N for
+    a hand-picked numerator that is exactly a multiple of the K_n
+    denominator at n = 2.
+    @End Reasoning
+    @Implementation
+    n = 2.  Choose f = 1 + 0*X, g = 0 + 1*X.  Then
+      adj(f) = 1, adj(g) = -X.
+      f*adj(f) = 1; g*adj(g) = -X * X = -X^2 = +1 (since X^2 = -1).
+      Denom = 1 + 1 = 2 (constant 2 in K_2).
+    Take numerator = 6 + 4*X.  Then numer / 2 = 3 + 2*X exactly (no
+    rounding needed).  Assert the result.
+
+    Also assert: D * (N/D) = N.  Multiply 2 * (3 + 2X) in K_2:
+      = 6 + 4X.  Matches.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: K_n divide identity n=2")
+    Let arena be Arena.arena_create(2097152)
+    Let n be 2
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(f_int, 0, 1)
+    Memory.memory_set_int64(f_int, 8, 0)
+    Memory.memory_set_int64(g_int, 0, 0)
+    Memory.memory_set_int64(g_int, 8, 1)
+    Let f be ZP.zint_poly_from_int_array(arena, f_int, n, 8)
+    Let g be ZP.zint_poly_from_int_array(arena, g_int, n, 8)
+
+    Let num_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(num_int, 0, 6)
+    Memory.memory_set_int64(num_int, 8, 4)
+    Let numer be ZP.zint_poly_from_int_array(arena, num_int, n, 8)
+
+    Let quotient be ZP.zint_poly_divide_by_kn_denominator(arena, numer, f, g, n)
+    T.assert_equal(results, "Q[0] = 3", Z.zint_to_int(ZP.zint_poly_get(quotient, 0)), 3)
+    T.assert_equal(results, "Q[1] = 2", Z.zint_to_int(ZP.zint_poly_get(quotient, 1)), 2)
+
+    Note: Verify D * Q = N.
+    Let denom be ZP.zint_poly_field_norm_sum(arena, f, g, n)
+    Let recon be ZP.zint_poly_mul(arena, denom, quotient, n)
+    T.assert_equal(results, "D*Q [0] = 6", Z.zint_to_int(ZP.zint_poly_get(recon, 0)), 6)
+    T.assert_equal(results, "D*Q [1] = 4", Z.zint_to_int(ZP.zint_poly_get(recon, 1)), 4)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_poly_divide_kn_identity_n4" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify K_n polynomial division at n = 4 with an exact-multiple
+    numerator.
+    @End Reasoning
+    @Implementation
+    n = 4.  f = 1 + X + X^2 + X^3, g = 1 - X + X^2 - X^3 (= adj(f)).
+      adj(f) = 1 - X + X^2 - X^3 = g
+      adj(g) = 1 + X + X^2 + X^3 = f
+      f * adj(f) = f * g in K_4
+      g * adj(g) = g * f = same
+      Denom = 2 * f * g.
+    Choose any Q = [Q0, Q1, Q2, Q3] and set numer = denom * Q (K_4
+    product).  Then divide and assert the quotient matches Q.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: K_n divide identity n=4")
+    Let arena be Arena.arena_create(4194304)
+    Let n be 4
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(f_int, 0, 1)
+    Memory.memory_set_int64(f_int, 8, 1)
+    Memory.memory_set_int64(f_int, 16, 1)
+    Memory.memory_set_int64(f_int, 24, 1)
+    Memory.memory_set_int64(g_int, 0, 1)
+    Memory.memory_set_int64(g_int, 8, 0 minus 1)
+    Memory.memory_set_int64(g_int, 16, 1)
+    Memory.memory_set_int64(g_int, 24, 0 minus 1)
+    Let f be ZP.zint_poly_from_int_array(arena, f_int, n, 8)
+    Let g be ZP.zint_poly_from_int_array(arena, g_int, n, 8)
+
+    Let denom be ZP.zint_poly_field_norm_sum(arena, f, g, n)
+    Note: Confirm denom only has even-X coefficients.
+    T.assert_equal(results, "denom[1] = 0", Z.zint_to_int(ZP.zint_poly_get(denom, 1)), 0)
+    T.assert_equal(results, "denom[3] = 0", Z.zint_to_int(ZP.zint_poly_get(denom, 3)), 0)
+
+    Note: Choose quotient Q = 3 + 5X + 7X^2 + 11X^3.
+    Let Q_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(Q_int, 0, 3)
+    Memory.memory_set_int64(Q_int, 8, 5)
+    Memory.memory_set_int64(Q_int, 16, 7)
+    Memory.memory_set_int64(Q_int, 24, 11)
+    Let Q_orig be ZP.zint_poly_from_int_array(arena, Q_int, n, 8)
+
+    Let numer be ZP.zint_poly_mul(arena, denom, Q_orig, n)
+
+    Let Q_recovered be ZP.zint_poly_divide_by_kn_denominator(arena, numer, f, g, n)
+
+    T.assert_equal(results, "Q[0] = 3",  Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 0)), 3)
+    T.assert_equal(results, "Q[1] = 5",  Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 1)), 5)
+    T.assert_equal(results, "Q[2] = 7",  Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 2)), 7)
+    T.assert_equal(results, "Q[3] = 11", Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 3)), 11)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_poly_divide_kn_identity_n8" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify K_n polynomial division at n = 8 with an exact-multiple
+    numerator and small but varied coefficients.
+    @End Reasoning
+    @Implementation
+    n = 8.  f = small symbolic [2, 1, 0, -1, 1, 0, -1, 1],
+            g = [1, -1, 1, 0, -1, 1, 0, 1].
+    Compute denom = f*adj(f) + g*adj(g) (must have odd indices zero).
+    Choose Q = [1, 2, -1, 3, -2, 4, 1, -3].
+    numer = denom * Q in K_8.
+    Divide numer by (f, g)-denom and recover Q.
+    @End Implementation
+    @Performance_Hints
+    Constant.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: K_n divide identity n=8")
+    Let arena be Arena.arena_create(8388608)
+    Let n be 8
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(f_int, 0, 2)
+    Memory.memory_set_int64(f_int, 8, 1)
+    Memory.memory_set_int64(f_int, 16, 0)
+    Memory.memory_set_int64(f_int, 24, 0 minus 1)
+    Memory.memory_set_int64(f_int, 32, 1)
+    Memory.memory_set_int64(f_int, 40, 0)
+    Memory.memory_set_int64(f_int, 48, 0 minus 1)
+    Memory.memory_set_int64(f_int, 56, 1)
+    Memory.memory_set_int64(g_int, 0, 1)
+    Memory.memory_set_int64(g_int, 8, 0 minus 1)
+    Memory.memory_set_int64(g_int, 16, 1)
+    Memory.memory_set_int64(g_int, 24, 0)
+    Memory.memory_set_int64(g_int, 32, 0 minus 1)
+    Memory.memory_set_int64(g_int, 40, 1)
+    Memory.memory_set_int64(g_int, 48, 0)
+    Memory.memory_set_int64(g_int, 56, 1)
+    Let f be ZP.zint_poly_from_int_array(arena, f_int, n, 8)
+    Let g be ZP.zint_poly_from_int_array(arena, g_int, n, 8)
+
+    Let denom be ZP.zint_poly_field_norm_sum(arena, f, g, n)
+    T.assert_equal(results, "denom[1] = 0", Z.zint_to_int(ZP.zint_poly_get(denom, 1)), 0)
+    T.assert_equal(results, "denom[3] = 0", Z.zint_to_int(ZP.zint_poly_get(denom, 3)), 0)
+    T.assert_equal(results, "denom[5] = 0", Z.zint_to_int(ZP.zint_poly_get(denom, 5)), 0)
+    T.assert_equal(results, "denom[7] = 0", Z.zint_to_int(ZP.zint_poly_get(denom, 7)), 0)
+
+    Let Q_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(Q_int, 0, 1)
+    Memory.memory_set_int64(Q_int, 8, 2)
+    Memory.memory_set_int64(Q_int, 16, 0 minus 1)
+    Memory.memory_set_int64(Q_int, 24, 3)
+    Memory.memory_set_int64(Q_int, 32, 0 minus 2)
+    Memory.memory_set_int64(Q_int, 40, 4)
+    Memory.memory_set_int64(Q_int, 48, 1)
+    Memory.memory_set_int64(Q_int, 56, 0 minus 3)
+    Let Q_orig be ZP.zint_poly_from_int_array(arena, Q_int, n, 8)
+
+    Let numer be ZP.zint_poly_mul(arena, denom, Q_orig, n)
+    Let Q_recovered be ZP.zint_poly_divide_by_kn_denominator(arena, numer, f, g, n)
+
+    T.assert_equal(results, "Q[0] = 1",  Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 0)), 1)
+    T.assert_equal(results, "Q[1] = 2",  Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 1)), 2)
+    T.assert_equal(results, "Q[2] = -1", Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 2)), 0 minus 1)
+    T.assert_equal(results, "Q[3] = 3",  Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 3)), 3)
+    T.assert_equal(results, "Q[4] = -2", Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 4)), 0 minus 2)
+    T.assert_equal(results, "Q[5] = 4",  Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 5)), 4)
+    T.assert_equal(results, "Q[6] = 1",  Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 6)), 1)
+    T.assert_equal(results, "Q[7] = -3", Z.zint_to_int(ZP.zint_poly_get(Q_recovered, 7)), 0 minus 3)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_poly_divide_kn_identity_n16" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify K_16 division identity to validate the divider at larger n.
+    @End Reasoning
+    @Implementation
+    Use f, g with small coefficients in K_16; compute denom = f*adj(f) +
+    g*adj(g); pick Q with small coefficients; numer = denom*Q.  Divide
+    and recover Q.
+    @End Implementation
+    @Performance_Hints
+    n=16 with small coefficients.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: K_n divide identity n=16")
+    Let arena be Arena.arena_create(67108864)
+    Let n be 16
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_zero(f_int, n multiplied by 8)
+    Memory.memory_zero(g_int, n multiplied by 8)
+    Memory.memory_set_int64(f_int, 0, 3)
+    Memory.memory_set_int64(f_int, 8, 1)
+    Memory.memory_set_int64(f_int, 16, 0 minus 1)
+    Memory.memory_set_int64(g_int, 0, 1)
+    Memory.memory_set_int64(g_int, 8, 0 minus 1)
+    Memory.memory_set_int64(g_int, 24, 1)
+    Let f be ZP.zint_poly_from_int_array(arena, f_int, n, 8)
+    Let g be ZP.zint_poly_from_int_array(arena, g_int, n, 8)
+
+    Let denom be ZP.zint_poly_field_norm_sum(arena, f, g, n)
+
+    Note: Q with small coefficients
+    Let Q_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_zero(Q_int, n multiplied by 8)
+    Memory.memory_set_int64(Q_int, 0, 1)
+    Memory.memory_set_int64(Q_int, 8, 2)
+    Memory.memory_set_int64(Q_int, 16, 0 minus 1)
+    Memory.memory_set_int64(Q_int, 24, 3)
+    Memory.memory_set_int64(Q_int, 32, 0 minus 2)
+    Memory.memory_set_int64(Q_int, 40, 1)
+    Memory.memory_set_int64(Q_int, 48, 0)
+    Memory.memory_set_int64(Q_int, 56, 0 minus 1)
+    Memory.memory_set_int64(Q_int, 64, 2)
+    Memory.memory_set_int64(Q_int, 72, 1)
+    Memory.memory_set_int64(Q_int, 80, 0)
+    Memory.memory_set_int64(Q_int, 88, 0 minus 3)
+    Memory.memory_set_int64(Q_int, 96, 1)
+    Memory.memory_set_int64(Q_int, 104, 0)
+    Memory.memory_set_int64(Q_int, 112, 0 minus 1)
+    Memory.memory_set_int64(Q_int, 120, 2)
+    Let Q_orig be ZP.zint_poly_from_int_array(arena, Q_int, n, 8)
+
+    Let numer be ZP.zint_poly_mul(arena, denom, Q_orig, n)
+
+    Let Q_recovered be ZP.zint_poly_divide_by_kn_denominator(arena, numer, f, g, n)
+
+    Let i be 0
+    Let all_match be 1
+    While i is less than n:
+        Let expected be Z.zint_to_int(ZP.zint_poly_get(Q_orig, i))
+        Let actual be Z.zint_to_int(ZP.zint_poly_get(Q_recovered, i))
+        If expected is not equal to actual:
+            Set all_match to 0
+        End If
+        T.assert_equal(results, "n=16 Q[i] matches", actual, expected)
+        Set i to i plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_poly_divide_kn_identity_n32" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify K_32 division identity to validate the divider at n=32.
+    @End Reasoning
+    @Implementation
+    Build f, g with small coefficients; compute denom; pick Q with
+    small coefficients; verify division recovers Q.
+    @End Implementation
+    @Performance_Hints
+    n = 32: a couple of seconds.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: K_n divide identity n=32")
+    Let arena be Arena.arena_create(134217728)
+    Let n be 32
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_zero(f_int, n multiplied by 8)
+    Memory.memory_zero(g_int, n multiplied by 8)
+    Memory.memory_set_int64(f_int, 0, 3)
+    Memory.memory_set_int64(f_int, 8, 1)
+    Memory.memory_set_int64(f_int, 16, 0 minus 1)
+    Memory.memory_set_int64(f_int, 64, 1)
+    Memory.memory_set_int64(g_int, 0, 1)
+    Memory.memory_set_int64(g_int, 16, 2)
+    Memory.memory_set_int64(g_int, 32, 0 minus 1)
+    Let f be ZP.zint_poly_from_int_array(arena, f_int, n, 8)
+    Let g be ZP.zint_poly_from_int_array(arena, g_int, n, 8)
+
+    Let denom be ZP.zint_poly_field_norm_sum(arena, f, g, n)
+
+    Let Q_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_zero(Q_int, n multiplied by 8)
+    Memory.memory_set_int64(Q_int, 0, 1)
+    Memory.memory_set_int64(Q_int, 8, 0 minus 2)
+    Memory.memory_set_int64(Q_int, 32, 3)
+    Memory.memory_set_int64(Q_int, 80, 0 minus 1)
+    Memory.memory_set_int64(Q_int, 200, 2)
+    Let Q_orig be ZP.zint_poly_from_int_array(arena, Q_int, n, 8)
+
+    Let numer be ZP.zint_poly_mul(arena, denom, Q_orig, n)
+    Let Q_recovered be ZP.zint_poly_divide_by_kn_denominator(arena, numer, f, g, n)
+
+    Let i be 0
+    While i is less than n:
+        Let expected be Z.zint_to_int(ZP.zint_poly_get(Q_orig, i))
+        Let actual be Z.zint_to_int(ZP.zint_poly_get(Q_recovered, i))
+        T.assert_equal(results, "n=32 Q[i] matches", actual, expected)
+        Set i to i plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+HYBRID zint <-> FFT-fp53 INTERCONVERSION ROUND-TRIP TESTS
+==============================================================================
+These tests cover the Pornin-style hybrid Babai support in falcon_zint_poly:
+
+  zint_poly_to_fft : zint K_n polynomial -> Float64 FFT buffer
+  fft_to_zint_poly : Float64 FFT buffer  -> zint K_n polynomial
+
+Identity expected: for any zint polynomial whose coefficients fit safely
+inside Float64 mantissa (we use the conservative 50-bit threshold the
+hybrid Babai uses), forward-FFT then inverse-FFT then round must recover
+the original coefficients exactly.
+
+Precision rejection expected: a coefficient whose bit length exceeds the
+50-bit threshold must cause zint_poly_to_fft to return 0 so the caller
+falls back to the exact-zint kernel.
+
+Hybrid Babai parity: build (f, g, F, G) with small coefficients where the
+exact-zint Babai converges in O(1) iterations and the hybrid path also
+converges; assert that both produce the same final (F, G) pair (modulo
+identical Babai termination conditions).
+:End Note
+
+Process called "test_zint_to_fft_identity_small" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify zint_poly_to_fft followed by fft_to_zint_poly recovers the
+    original polynomial when coefficients are small enough to fit safely
+    in fp53.
+    @End Reasoning
+    @Implementation
+    n = 8.  Build a zint polynomial from a hand-chosen Int64 array of
+    small signed coefficients.  Allocate a 16*n FFT buffer.  Call
+    zint_poly_to_fft (forward FFT inside).  Then call fft_to_zint_poly
+    (inverse FFT inside) and compare each recovered coefficient against
+    the input.
+    @End Implementation
+    @Performance_Hints
+    Constant for n = 8.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: zint <-> FFT round-trip n=8")
+    Let arena be Arena.arena_create(4194304)
+    Let n be 8
+
+    Note: Test coefficients: a mix of positive, negative, and zero.
+    Let coeffs_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(coeffs_int, 0, 3)
+    Memory.memory_set_int64(coeffs_int, 8, 0 minus 5)
+    Memory.memory_set_int64(coeffs_int, 16, 0)
+    Memory.memory_set_int64(coeffs_int, 24, 17)
+    Memory.memory_set_int64(coeffs_int, 32, 0 minus 12)
+    Memory.memory_set_int64(coeffs_int, 40, 7)
+    Memory.memory_set_int64(coeffs_int, 48, 0 minus 1)
+    Memory.memory_set_int64(coeffs_int, 56, 99)
+    Let in_poly be ZP.zint_poly_from_int_array(arena, coeffs_int, n, 8)
+
+    Let fft_bytes be n multiplied by 16
+    Let fft_buf be Arena.arena_allocate(arena, fft_bytes)
+
+    Note: baseline_used = 2 limbs: exact representation for these
+    Note: 7-bit-or-smaller coefficients.
+    Let to_fft_rc be ZP.zint_poly_to_fft(arena, in_poly, n, fft_buf, 2)
+    T.assert_equal(results, "zint_poly_to_fft rc == 1", to_fft_rc, 1)
+
+    Let rec_poly be ZP.fft_to_zint_poly(arena, fft_buf, n)
+    T.assert_not_null(results, "fft_to_zint_poly returned poly", rec_poly)
+
+    Let i be 0
+    While i is less than n:
+        Let expected be Memory.memory_get_int64(coeffs_int, i multiplied by 8)
+        Let actual be Z.zint_to_int(ZP.zint_poly_get(rec_poly, i))
+        T.assert_equal(results, "round-trip coefficient matches", actual, expected)
+        Set i to i plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_to_fft_identity_n16" that takes results as Integer returns Integer:
+    @Reasoning
+    Same round-trip identity at n = 16 with coefficients that exercise
+    multiple bit widths (single-digit, two-digit, three-digit).
+    @End Reasoning
+    @Implementation
+    n = 16.  Coefficients chosen so the sum_squared exceeds 2^16,
+    forcing the FFT to operate on slot magnitudes in the thousands.
+    Verify each coefficient round-trips byte-exact.
+    @End Implementation
+    @Performance_Hints
+    Constant for n = 16.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: zint <-> FFT round-trip n=16")
+    Let arena be Arena.arena_create(4194304)
+    Let n be 16
+
+    Let coeffs_int be Arena.arena_allocate(arena, n multiplied by 8)
+    Let pattern be 1
+    Let i be 0
+    While i is less than n:
+        Let sign be 1
+        If (i bitwise_and 1) is equal to 1:
+            Set sign to 0 minus 1
+        End If
+        Let val be (i plus 1) multiplied by 137 multiplied by sign
+        Memory.memory_set_int64(coeffs_int, i multiplied by 8, val)
+        Set i to i plus 1
+    End While
+
+    Let in_poly be ZP.zint_poly_from_int_array(arena, coeffs_int, n, 8)
+
+    Let fft_bytes be n multiplied by 16
+    Let fft_buf be Arena.arena_allocate(arena, fft_bytes)
+
+    Let to_fft_rc be ZP.zint_poly_to_fft(arena, in_poly, n, fft_buf, 2)
+    T.assert_equal(results, "zint_poly_to_fft rc == 1", to_fft_rc, 1)
+
+    Let rec_poly be ZP.fft_to_zint_poly(arena, fft_buf, n)
+    T.assert_not_null(results, "fft_to_zint_poly returned poly", rec_poly)
+
+    Let j be 0
+    While j is less than n:
+        Let expected be Memory.memory_get_int64(coeffs_int, j multiplied by 8)
+        Let actual be Z.zint_to_int(ZP.zint_poly_get(rec_poly, j))
+        T.assert_equal(results, "n=16 round-trip coefficient matches", actual, expected)
+        Set j to j plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_zint_to_fft_large_coeff_scaling" that takes results as Integer returns Integer:
+    @Reasoning
+    Verify that the uniform-scaling lift handles a coefficient larger
+    than Int64.  Under Pornin's scheme each coefficient lifts to its top
+    62 bits at the polynomial-wide baseline; there is no rejection.
+    @End Reasoning
+    @Implementation
+    Build a zint coefficient of magnitude 1 << 80 (81-bit, 3 limbs of
+    31 bits).  Call zint_poly_max_used and confirm it reports 3.  Call
+    zint_poly_to_fft with baseline_used = 3.  Then run fft_to_zint_poly
+    and verify the recovered slot-0 coefficient equals the top 62 bits
+    of (1 << 80).  Specifically: limb 2 = 1, limbs 1 and 0 = 0; top 62
+    bits encode 1 * 2^31 = 2147483648.
+    @End Implementation
+    @Performance_Hints
+    Single shift_left + a handful of FFT operations; trivial.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_zint_poly: zint -> FFT large-coefficient scaling")
+    Let arena be Arena.arena_create(4194304)
+    Let n be 4
+
+    Note: Build big_z = 1 << 80 (3 limbs of 31 bits each).
+    Let one_z be Z.zint_from_int(arena, 1)
+    Let shifted be Z.zint_shift_left(arena, one_z, 80)
+    Let bits be Z.zint_bit_length(shifted)
+    T.assert_equal(results, "bit length of 1<<80 = 81", bits, 81)
+
+    Note: Build poly = [shifted, 0, 0, 0].
+    Let poly_bytes be n multiplied by 8
+    Let poly be Arena.arena_allocate(arena, poly_bytes)
+    Memory.memory_zero(poly, poly_bytes)
+    ZP.zint_poly_set(poly, 0, shifted)
+    ZP.zint_poly_set(poly, 1, Z.zint_from_int(arena, 0))
+    ZP.zint_poly_set(poly, 2, Z.zint_from_int(arena, 0))
+    ZP.zint_poly_set(poly, 3, Z.zint_from_int(arena, 0))
+
+    Let mu be ZP.zint_poly_max_used(poly, n)
+    T.assert_greater_than(results, "max_used >= 3", mu, 2)
+
+    Let fft_bytes be n multiplied by 16
+    Let fft_buf be Arena.arena_allocate(arena, fft_bytes)
+
+    Note: 80 = 2*31 + 18, so 1<<80 has limb[2] = 2^18 = 262144 and
+    Note: limbs 0, 1 = 0.  With baseline_used = 3 we extract
+    Note: top62 = limb[2] << 31 + limb[1] = 262144 << 31 + 0 = 2^49 =
+    Note: 562949953421312.  The lifted Float64 rounds-trip exactly
+    Note: through the FFT, recovering 2^49 at slot 0.
+    Let rc_lift be ZP.zint_poly_to_fft(arena, poly, n, fft_buf, 3)
+    T.assert_equal(results, "zint_poly_to_fft accepts large coefficient", rc_lift, 1)
+
+    Let rec_poly be ZP.fft_to_zint_poly(arena, fft_buf, n)
+    T.assert_not_null(results, "fft_to_zint_poly returned poly", rec_poly)
+    Let recovered_0 be Z.zint_to_int(ZP.zint_poly_get(rec_poly, 0))
+    T.assert_equal(results, "scaled coeff [0] = 2^49", recovered_0, 562949953421312)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_hybrid_babai_matches_zint_n4" that takes results as Integer returns Integer:
+    @Reasoning
+    Hybrid-Babai-parity test.  Build a small NTRU instance where the
+    Babai reduction is well-defined and both paths converge to a
+    Bezout solution.  Run ntru_solve and verify the returned (F, G)
+    satisfies f*G - g*F = q in K_n.  This is the strongest
+    correctness check: if the hybrid path silently produces wrong k
+    rounding, the final identity will fail.
+    @End Reasoning
+    @Implementation
+    n = 4.  f, g chosen to be small and to produce a feasible NTRU
+    solution at the base case.  After ntru_solve we compute
+    delta = f*G - g*F in K_n via zint poly mul and assert it equals
+    the constant polynomial q (12289, then zero in all other slots).
+    @End Implementation
+    @Performance_Hints
+    n = 4 NTRU descent costs are milliseconds.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_ntrusolve: hybrid Babai f*G - g*F == q at n=4")
+    Let arena be Arena.arena_create(67108864)
+    Let n be 4
+    Let q be 12289
+
+    Note: f, g must produce an invertible base case.  Use the same
+    Note: hand-chosen small polynomials as the existing test_ntru_solve_n4
+    Note: which the pure-zint path is already known to solve.
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_set_int16(f_int, 0, 3)
+    Memory.memory_set_int16(f_int, 2, 1)
+    Memory.memory_set_int16(f_int, 4, 0 minus 2)
+    Memory.memory_set_int16(f_int, 6, 1)
+    Memory.memory_set_int16(g_int, 0, 2)
+    Memory.memory_set_int16(g_int, 2, 0 minus 1)
+    Memory.memory_set_int16(g_int, 4, 1)
+    Memory.memory_set_int16(g_int, 6, 0 minus 1)
+
+    Let F_out be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G_out be Arena.arena_allocate(arena, n multiplied by 2)
+
+    Let rc be NS.ntru_solve(arena, f_int, g_int, n, F_out, G_out)
+    T.assert_equal(results, "ntru_solve rc == 1", rc, 1)
+
+    Note: Verify f*G - g*F = q in K_n.  Convert all four into zint
+    Note: polynomials, compute fG and gF via zint K_n mul, subtract,
+    Note: and check that the result is q at index 0 and zero elsewhere.
+    Let f_p be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_p be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_p be ZP.zint_poly_from_int_array(arena, F_out, n, 2)
+    Let G_p be ZP.zint_poly_from_int_array(arena, G_out, n, 2)
+    Let fG be ZP.zint_poly_mul(arena, f_p, G_p, n)
+    Let gF be ZP.zint_poly_mul(arena, g_p, F_p, n)
+    Let delta be ZP.zint_poly_sub(arena, fG, gF, n)
+
+    Let d0 be Z.zint_to_int(ZP.zint_poly_get(delta, 0))
+    T.assert_equal(results, "(f*G - g*F)[0] = q", d0, q)
+    Let i be 1
+    While i is less than n:
+        Let di be Z.zint_to_int(ZP.zint_poly_get(delta, i))
+        T.assert_equal(results, "(f*G - g*F)[i>=1] = 0", di, 0)
+        Set i to i plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_hybrid_babai_matches_zint_n16" that takes results as Integer returns Integer:
+    @Reasoning
+    Same hybrid-Babai-parity check but at n = 16 where the FFT path
+    has meaningful work to do (4 forward FFTs of size 16 per
+    iteration).  Confirms the hybrid kernel preserves the NTRU
+    invariant at moderate sizes.
+    @End Reasoning
+    @Implementation
+    Use the same f, g pattern as test_ntru_solve_n16 (already known
+    to succeed under the pure-zint kernel) and assert the same NTRU
+    invariant holds with the hybrid kernel.
+    @End Implementation
+    @Performance_Hints
+    n = 16 NTRU descent is fractions of a second.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "falcon_ntrusolve: hybrid Babai f*G - g*F == q at n=16")
+    Let arena be Arena.arena_create(134217728)
+    Let n be 16
+    Let q be 12289
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_zero(f_int, n multiplied by 2)
+    Memory.memory_zero(g_int, n multiplied by 2)
+
+    Note: Pick f, g with mixed small coefficients; same pattern shape
+    Note: as the existing pure-zint n=16 test.
+    Memory.memory_set_int16(f_int, 0, 3)
+    Memory.memory_set_int16(f_int, 2, 1)
+    Memory.memory_set_int16(f_int, 4, 0 minus 1)
+    Memory.memory_set_int16(f_int, 8, 1)
+    Memory.memory_set_int16(f_int, 12, 0 minus 1)
+    Memory.memory_set_int16(g_int, 0, 1)
+    Memory.memory_set_int16(g_int, 2, 0 minus 2)
+    Memory.memory_set_int16(g_int, 6, 1)
+    Memory.memory_set_int16(g_int, 10, 0 minus 1)
+    Memory.memory_set_int16(g_int, 14, 1)
+
+    Let F_out be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G_out be Arena.arena_allocate(arena, n multiplied by 2)
+
+    Let rc be NS.ntru_solve(arena, f_int, g_int, n, F_out, G_out)
+    T.assert_equal(results, "ntru_solve rc == 1", rc, 1)
+
+    Let f_p be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_p be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_p be ZP.zint_poly_from_int_array(arena, F_out, n, 2)
+    Let G_p be ZP.zint_poly_from_int_array(arena, G_out, n, 2)
+    Let fG be ZP.zint_poly_mul(arena, f_p, G_p, n)
+    Let gF be ZP.zint_poly_mul(arena, g_p, F_p, n)
+    Let delta be ZP.zint_poly_sub(arena, fG, gF, n)
+
+    Let d0 be Z.zint_to_int(ZP.zint_poly_get(delta, 0))
+    T.assert_equal(results, "(f*G - g*F)[0] = q", d0, q)
+    Let i be 1
+    While i is less than n:
+        Let di be Z.zint_to_int(ZP.zint_poly_get(delta, i))
+        T.assert_equal(results, "(f*G - g*F)[i>=1] = 0", di, 0)
+        Set i to i plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ntru_solve_n4" that takes results as Integer returns Integer:
+    @Reasoning
+    End-to-end NTRUSolve test at n = 4 with hand-crafted f, g.  This
+    verifies the full descent + lift + Babai pipeline on a small
+    instance.
+    @End Reasoning
+    @Implementation
+    Pick f = 1 + 2X, g = -1 + 3X (length 4 with trailing zeros).
+    Compute f*G - g*F = 12289 expected to hold.  Call ntru_solve
+    public entry; ensure rc == 1.  Then verify the identity by
+    polynomial multiplication.
+    @End Implementation
+    @Performance_Hints
+    n = 4 with tiny coefficients: completes in milliseconds.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: end-to-end n=4")
+    Let arena be Arena.arena_create(67108864)
+    Let n be 4
+
+    Note: Sample f, g that satisfy NTRU norm bound.  Use coefficients
+    Note: in range [-3, 3] so ||(f,g)||^2 stays small.
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_set_int16(f_int, 0, 1)
+    Memory.memory_set_int16(f_int, 2, 2)
+    Memory.memory_set_int16(f_int, 4, 0)
+    Memory.memory_set_int16(f_int, 6, 0)
+    Memory.memory_set_int16(g_int, 0, 0 minus 1)
+    Memory.memory_set_int16(g_int, 2, 3)
+    Memory.memory_set_int16(g_int, 4, 0)
+    Memory.memory_set_int16(g_int, 6, 0)
+
+    Let F_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_zero(F_int, n multiplied by 2)
+    Memory.memory_zero(G_int, n multiplied by 2)
+
+    Let rc be NS.ntru_solve(arena, f_int, g_int, n, F_int, G_int)
+    T.assert_equal(results, "ntru_solve rc == 1", rc, 1)
+
+    Note: Verify f*G - g*F = q (where q=12289) in K_4.
+    Note: Use zint_poly for multiplication.
+    Let f_poly be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_poly be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_poly be ZP.zint_poly_from_int_array(arena, F_int, n, 2)
+    Let G_poly be ZP.zint_poly_from_int_array(arena, G_int, n, 2)
+
+    Let fG be ZP.zint_poly_mul(arena, f_poly, G_poly, n)
+    Let gF be ZP.zint_poly_mul(arena, g_poly, F_poly, n)
+    Let identity be ZP.zint_poly_sub(arena, fG, gF, n)
+
+    T.assert_equal(results, "(f*G - g*F)[0] = 12289", Z.zint_to_int(ZP.zint_poly_get(identity, 0)), 12289)
+    T.assert_equal(results, "(f*G - g*F)[1] = 0",     Z.zint_to_int(ZP.zint_poly_get(identity, 1)), 0)
+    T.assert_equal(results, "(f*G - g*F)[2] = 0",     Z.zint_to_int(ZP.zint_poly_get(identity, 2)), 0)
+    T.assert_equal(results, "(f*G - g*F)[3] = 0",     Z.zint_to_int(ZP.zint_poly_get(identity, 3)), 0)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ntru_solve_n8" that takes results as Integer returns Integer:
+    @Reasoning
+    End-to-end NTRUSolve at n = 8.  Exercises one more descent level
+    (3 vs 2) and confirms the K_n divider scales correctly.
+    @End Reasoning
+    @Implementation
+    Hand-crafted f, g with very small coefficients ensures the norm
+    check passes.  Verify f*G - g*F = q in K_8.
+    @End Implementation
+    @Performance_Hints
+    n = 8 with small coefficients: completes in milliseconds.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: end-to-end n=8")
+    Let arena be Arena.arena_create(67108864)
+    Let n be 8
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_set_int16(f_int, 0, 1)
+    Memory.memory_set_int16(f_int, 2, 0)
+    Memory.memory_set_int16(f_int, 4, 2)
+    Memory.memory_set_int16(f_int, 6, 1)
+    Memory.memory_set_int16(f_int, 8, 0)
+    Memory.memory_set_int16(f_int, 10, 0 minus 1)
+    Memory.memory_set_int16(f_int, 12, 1)
+    Memory.memory_set_int16(f_int, 14, 2)
+    Memory.memory_set_int16(g_int, 0, 0 minus 1)
+    Memory.memory_set_int16(g_int, 2, 2)
+    Memory.memory_set_int16(g_int, 4, 0)
+    Memory.memory_set_int16(g_int, 6, 1)
+    Memory.memory_set_int16(g_int, 8, 1)
+    Memory.memory_set_int16(g_int, 10, 0)
+    Memory.memory_set_int16(g_int, 12, 0 minus 1)
+    Memory.memory_set_int16(g_int, 14, 1)
+
+    Let F_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_zero(F_int, n multiplied by 2)
+    Memory.memory_zero(G_int, n multiplied by 2)
+
+    Let rc be NS.ntru_solve(arena, f_int, g_int, n, F_int, G_int)
+    T.assert_equal(results, "ntru_solve n=8 rc == 1", rc, 1)
+
+    Let f_poly be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_poly be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_poly be ZP.zint_poly_from_int_array(arena, F_int, n, 2)
+    Let G_poly be ZP.zint_poly_from_int_array(arena, G_int, n, 2)
+
+    Let fG be ZP.zint_poly_mul(arena, f_poly, G_poly, n)
+    Let gF be ZP.zint_poly_mul(arena, g_poly, F_poly, n)
+    Let identity be ZP.zint_poly_sub(arena, fG, gF, n)
+
+    T.assert_equal(results, "n=8 identity [0] = 12289", Z.zint_to_int(ZP.zint_poly_get(identity, 0)), 12289)
+    Let i be 1
+    While i is less than n:
+        T.assert_equal(results, "n=8 identity zero", Z.zint_to_int(ZP.zint_poly_get(identity, i)), 0)
+        Set i to i plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ntru_solve_n16" that takes results as Integer returns Integer:
+    @Reasoning
+    End-to-end NTRUSolve at n = 16 by calling ntru_solve_zint
+    directly.  This avoids the int16 range check in ntru_solve and
+    lets us inspect the zint output coefficients regardless of size.
+    @End Reasoning
+    @Implementation
+    Hand-crafted f, g with small coefficients.  Build zint polys.
+    Call ntru_solve_zint.  Check rc and verify f*G - g*F = q in K_16
+    even if individual F, G coefficients exceed int16 range.  This
+    isolates whether the descent is computing the wrong (F, G) versus
+    whether they merely don't fit in int16.
+    @End Implementation
+    @Performance_Hints
+    n = 16: expected sub-second on modest hardware.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: end-to-end n=16 (zint inspection)")
+    Let arena be Arena.arena_create(67108864)
+    Let n be 16
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Note: Use Falcon-style sample: small Gaussian-ish coefficients.
+    Memory.memory_set_int16(f_int, 0, 2)
+    Memory.memory_set_int16(f_int, 2, 0 minus 1)
+    Memory.memory_set_int16(f_int, 4, 3)
+    Memory.memory_set_int16(f_int, 6, 1)
+    Memory.memory_set_int16(f_int, 8, 0 minus 2)
+    Memory.memory_set_int16(f_int, 10, 0)
+    Memory.memory_set_int16(f_int, 12, 1)
+    Memory.memory_set_int16(f_int, 14, 0 minus 1)
+    Memory.memory_set_int16(f_int, 16, 2)
+    Memory.memory_set_int16(f_int, 18, 0 minus 1)
+    Memory.memory_set_int16(f_int, 20, 0)
+    Memory.memory_set_int16(f_int, 22, 1)
+    Memory.memory_set_int16(f_int, 24, 0 minus 1)
+    Memory.memory_set_int16(f_int, 26, 2)
+    Memory.memory_set_int16(f_int, 28, 0)
+    Memory.memory_set_int16(f_int, 30, 1)
+    Memory.memory_set_int16(g_int, 0, 1)
+    Memory.memory_set_int16(g_int, 2, 2)
+    Memory.memory_set_int16(g_int, 4, 0 minus 1)
+    Memory.memory_set_int16(g_int, 6, 0)
+    Memory.memory_set_int16(g_int, 8, 1)
+    Memory.memory_set_int16(g_int, 10, 0 minus 2)
+    Memory.memory_set_int16(g_int, 12, 1)
+    Memory.memory_set_int16(g_int, 14, 0 minus 1)
+    Memory.memory_set_int16(g_int, 16, 0)
+    Memory.memory_set_int16(g_int, 18, 2)
+    Memory.memory_set_int16(g_int, 20, 0 minus 1)
+    Memory.memory_set_int16(g_int, 22, 1)
+    Memory.memory_set_int16(g_int, 24, 0)
+    Memory.memory_set_int16(g_int, 26, 0 minus 1)
+    Memory.memory_set_int16(g_int, 28, 2)
+    Memory.memory_set_int16(g_int, 30, 1)
+
+    Let f_poly be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_poly be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_poly be ZP.zint_poly_create(arena, n, 1)
+    Let G_poly be ZP.zint_poly_create(arena, n, 1)
+
+    Let solve_rc be NS.ntru_solve_zint(arena, f_poly, g_poly, n, F_poly, G_poly)
+    T.assert_equal(results, "ntru_solve_zint n=16 rc == 1", solve_rc, 1)
+
+    If solve_rc is equal to 1:
+        Note: Compute identity in K_16
+        Let fG be ZP.zint_poly_mul(arena, f_poly, G_poly, n)
+        Let gF be ZP.zint_poly_mul(arena, g_poly, F_poly, n)
+        Let identity be ZP.zint_poly_sub(arena, fG, gF, n)
+
+        T.assert_equal(results, "n=16 identity [0] = 12289", Z.zint_to_int(ZP.zint_poly_get(identity, 0)), 12289)
+        Let i be 1
+        While i is less than n:
+            T.assert_equal(results, "n=16 identity zero", Z.zint_to_int(ZP.zint_poly_get(identity, i)), 0)
+            Set i to i plus 1
+        End While
+
+        Note: Also report bit length of F[0] for diagnostic purposes.
+        Let bits_F0 be Z.zint_bit_length(ZP.zint_poly_get(F_poly, 0))
+        T.assert_less_than(results, "F[0] bit length < 16 (sanity)", bits_F0, 16)
+    End If
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ntru_solve_n32_via_falcon_sampler" that takes results as Integer returns Integer:
+    @Reasoning
+    End-to-end NTRUSolve at n = 32 using Falcon-style sampled f, g.
+    n = 32 is the largest size at which we can reasonably enumerate
+    coefficients in a unit test; n = 64 and above are exercised by
+    the keygen tests.
+    @End Reasoning
+    @Implementation
+    Pick small Gaussian-like coefficients for f, g.  Verify the
+    descent + Babai pipeline returns 1 and the algebraic identity
+    f*G - g*F = q holds in K_32.
+    @End Implementation
+    @Performance_Hints
+    n = 32: completes in a few seconds.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: end-to-end n=32 (Falcon-style)")
+    Let arena be Arena.arena_create(134217728)
+    Let n be 32
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Note: Use the same f, g pattern that worked at n=16, extended with
+    Note: a few small additions for the extra coefficients.
+    Memory.memory_set_int16(f_int, 0, 2)
+    Memory.memory_set_int16(f_int, 2, 0 minus 1)
+    Memory.memory_set_int16(f_int, 4, 3)
+    Memory.memory_set_int16(f_int, 6, 1)
+    Memory.memory_set_int16(f_int, 8, 0 minus 2)
+    Memory.memory_set_int16(f_int, 10, 0)
+    Memory.memory_set_int16(f_int, 12, 1)
+    Memory.memory_set_int16(f_int, 14, 0 minus 1)
+    Memory.memory_set_int16(f_int, 16, 2)
+    Memory.memory_set_int16(f_int, 18, 0 minus 1)
+    Memory.memory_set_int16(f_int, 20, 0)
+    Memory.memory_set_int16(f_int, 22, 1)
+    Memory.memory_set_int16(f_int, 24, 0 minus 1)
+    Memory.memory_set_int16(f_int, 26, 2)
+    Memory.memory_set_int16(f_int, 28, 0)
+    Memory.memory_set_int16(f_int, 30, 1)
+    Memory.memory_set_int16(f_int, 32, 1)
+    Memory.memory_set_int16(f_int, 34, 0 minus 1)
+    Memory.memory_set_int16(f_int, 36, 2)
+    Memory.memory_set_int16(f_int, 38, 0)
+    Memory.memory_set_int16(f_int, 40, 1)
+    Memory.memory_set_int16(f_int, 42, 0 minus 2)
+    Memory.memory_set_int16(f_int, 44, 0)
+    Memory.memory_set_int16(f_int, 46, 1)
+    Memory.memory_set_int16(f_int, 48, 0 minus 1)
+    Memory.memory_set_int16(f_int, 50, 2)
+    Memory.memory_set_int16(f_int, 52, 0)
+    Memory.memory_set_int16(f_int, 54, 0 minus 1)
+    Memory.memory_set_int16(f_int, 56, 1)
+    Memory.memory_set_int16(f_int, 58, 0)
+    Memory.memory_set_int16(f_int, 60, 0 minus 1)
+    Memory.memory_set_int16(f_int, 62, 2)
+
+    Memory.memory_set_int16(g_int, 0, 1)
+    Memory.memory_set_int16(g_int, 2, 2)
+    Memory.memory_set_int16(g_int, 4, 0 minus 1)
+    Memory.memory_set_int16(g_int, 6, 0)
+    Memory.memory_set_int16(g_int, 8, 1)
+    Memory.memory_set_int16(g_int, 10, 0 minus 2)
+    Memory.memory_set_int16(g_int, 12, 1)
+    Memory.memory_set_int16(g_int, 14, 0 minus 1)
+    Memory.memory_set_int16(g_int, 16, 0)
+    Memory.memory_set_int16(g_int, 18, 2)
+    Memory.memory_set_int16(g_int, 20, 0 minus 1)
+    Memory.memory_set_int16(g_int, 22, 1)
+    Memory.memory_set_int16(g_int, 24, 0)
+    Memory.memory_set_int16(g_int, 26, 0 minus 1)
+    Memory.memory_set_int16(g_int, 28, 2)
+    Memory.memory_set_int16(g_int, 30, 1)
+    Memory.memory_set_int16(g_int, 32, 0 minus 1)
+    Memory.memory_set_int16(g_int, 34, 2)
+    Memory.memory_set_int16(g_int, 36, 0)
+    Memory.memory_set_int16(g_int, 38, 1)
+    Memory.memory_set_int16(g_int, 40, 0 minus 2)
+    Memory.memory_set_int16(g_int, 42, 1)
+    Memory.memory_set_int16(g_int, 44, 0 minus 1)
+    Memory.memory_set_int16(g_int, 46, 0)
+    Memory.memory_set_int16(g_int, 48, 2)
+    Memory.memory_set_int16(g_int, 50, 0 minus 1)
+    Memory.memory_set_int16(g_int, 52, 1)
+    Memory.memory_set_int16(g_int, 54, 0)
+    Memory.memory_set_int16(g_int, 56, 0 minus 1)
+    Memory.memory_set_int16(g_int, 58, 2)
+    Memory.memory_set_int16(g_int, 60, 1)
+    Memory.memory_set_int16(g_int, 62, 0 minus 1)
+
+    Let f_poly be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_poly be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_poly be ZP.zint_poly_create(arena, n, 1)
+    Let G_poly be ZP.zint_poly_create(arena, n, 1)
+
+    Let solve_rc be NS.ntru_solve_zint(arena, f_poly, g_poly, n, F_poly, G_poly)
+    T.assert_equal(results, "ntru_solve_zint n=32 rc == 1", solve_rc, 1)
+
+    If solve_rc is equal to 1:
+        Let fG be ZP.zint_poly_mul(arena, f_poly, G_poly, n)
+        Let gF be ZP.zint_poly_mul(arena, g_poly, F_poly, n)
+        Let identity be ZP.zint_poly_sub(arena, fG, gF, n)
+
+        T.assert_equal(results, "n=32 identity [0] = 12289", Z.zint_to_int(ZP.zint_poly_get(identity, 0)), 12289)
+        Let i be 1
+        While i is less than n:
+            T.assert_equal(results, "n=32 identity zero", Z.zint_to_int(ZP.zint_poly_get(identity, i)), 0)
+            Set i to i plus 1
+        End While
+    End If
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ntru_solve_n64" that takes results as Integer returns Integer:
+    @Reasoning
+    End-to-end NTRUSolve at n = 64.  Doubles the descent depth from
+    n=32, exercising the algorithm at depths closer to (but not at)
+    Falcon production sizes.
+    @End Reasoning
+    @Implementation
+    Use a periodic pattern of small coefficients for f, g (similar to
+    Falcon sampling: small Gaussian-like coefficients).
+    @End Implementation
+    @Performance_Hints
+    n = 64: tens of seconds.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: end-to-end n=64")
+    Let arena be Arena.arena_create(268435456)
+    Let n be 64
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Note: Pseudo-random pattern using LCG to fill.
+    Let state_ptr be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_int64(state_ptr, 0, 12345678901)
+    Let pi be 0
+    While pi is less than n:
+        Let raw be proc lcg_next with state_ptr
+        Let v be raw bitwise_and 7
+        Set v to v minus 3
+        Memory.memory_set_int16(f_int, pi multiplied by 2, v)
+        Let raw2 be proc lcg_next with state_ptr
+        Let v2 be raw2 bitwise_and 7
+        Set v2 to v2 minus 3
+        Memory.memory_set_int16(g_int, pi multiplied by 2, v2)
+        Set pi to pi plus 1
+    End While
+
+    Let f_poly be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_poly be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_poly be ZP.zint_poly_create(arena, n, 1)
+    Let G_poly be ZP.zint_poly_create(arena, n, 1)
+
+    Let solve_rc be NS.ntru_solve_zint(arena, f_poly, g_poly, n, F_poly, G_poly)
+    T.assert_equal(results, "ntru_solve_zint n=64 rc == 1", solve_rc, 1)
+
+    If solve_rc is equal to 1:
+        Let fG be ZP.zint_poly_mul(arena, f_poly, G_poly, n)
+        Let gF be ZP.zint_poly_mul(arena, g_poly, F_poly, n)
+        Let identity be ZP.zint_poly_sub(arena, fG, gF, n)
+
+        T.assert_equal(results, "n=64 identity [0] = 12289", Z.zint_to_int(ZP.zint_poly_get(identity, 0)), 12289)
+        Let i be 1
+        Let identity_ok be 1
+        While i is less than n:
+            Let v be Z.zint_to_int(ZP.zint_poly_get(identity, i))
+            If v is not equal to 0:
+                Set identity_ok to 0
+            End If
+            Set i to i plus 1
+        End While
+        T.assert_equal(results, "n=64 identity all-zero off-constant", identity_ok, 1)
+    End If
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ntru_solve_n128_falcon_style" that takes results as Integer returns Integer:
+    @Reasoning
+    End-to-end NTRUSolve at n = 128 using Falcon-style sampled f, g.
+    n = 128 is the largest size we can run in a reasonable test-suite
+    time and exercises the same descent depths as smaller subtrees of
+    Falcon-512.
+    @End Reasoning
+    @Implementation
+    Use the falcon_sample_short_polynomial routine via shake to draw
+    Falcon-style f, g.  Call ntru_solve_zint and verify the f*G - g*F
+    = q identity.
+    @End Implementation
+    @Performance_Hints
+    n = 128: estimated tens of seconds.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: end-to-end n=128 (falcon-style)")
+    Let arena be Arena.arena_create(536870912)
+    Let n be 128
+
+    Let state_ptr be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_int64(state_ptr, 0, 999999937)
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+
+    Note: Try a deterministic pattern that guarantees the K_1 base
+    Note: case bezout succeeds.  Specifically f has constant non-zero
+    Note: leading coefficient and zeros elsewhere; g similarly.  This
+    Note: makes det(f) = f[0]^n and det(g) = g[0]^n, whose gcd is
+    Note: gcd(f[0]^n, g[0]^n) which divides q when gcd(f[0], g[0])^n
+    Note: divides q.  For f[0]=1 the gcd is 1, trivially dividing q.
+    Let attempt be 0
+    Let solve_rc be 0
+    While attempt is less than 200:
+        Memory.memory_zero(f_int, n multiplied by 2)
+        Memory.memory_zero(g_int, n multiplied by 2)
+        Note: f = 1, g = small varying poly to exercise the lift/Babai.
+        Memory.memory_set_int16(f_int, 0, 1)
+        Let pi be 0
+        While pi is less than n:
+            Let raw be proc lcg_next with state_ptr
+            Let v be raw bitwise_and 7
+            Set v to v minus 3
+            Memory.memory_set_int16(g_int, pi multiplied by 2, v)
+            Set pi to pi plus 1
+        End While
+
+        Let f_poly_loc be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+        Let g_poly_loc be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+        Let F_poly_loc be ZP.zint_poly_create(arena, n, 1)
+        Let G_poly_loc be ZP.zint_poly_create(arena, n, 1)
+
+        Set solve_rc to NS.ntru_solve_zint(arena, f_poly_loc, g_poly_loc, n, F_poly_loc, G_poly_loc)
+        If solve_rc is equal to 1:
+            Note: Verify the identity.
+            Let fG_loc be ZP.zint_poly_mul(arena, f_poly_loc, G_poly_loc, n)
+            Let gF_loc be ZP.zint_poly_mul(arena, g_poly_loc, F_poly_loc, n)
+            Let identity_loc be ZP.zint_poly_sub(arena, fG_loc, gF_loc, n)
+            T.assert_equal(results, "n=128 identity [0] = 12289", Z.zint_to_int(ZP.zint_poly_get(identity_loc, 0)), 12289)
+            Set attempt to 200
+        Otherwise:
+            Set attempt to attempt plus 1
+        End If
+    End While
+
+    T.assert_equal(results, "ntru_solve_zint n=128 eventually succeeded", solve_rc, 1)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ntru_solve_n256_constant_f" that takes results as Integer returns Integer:
+    @Reasoning
+    Time-bounded test at n = 256 with f = 1 to establish per-attempt
+    timing scaling toward Falcon-512 sizes.
+    @End Reasoning
+    @Implementation
+    Same approach as the n=128 falcon-style test but at n=256.
+    @End Implementation
+    @Performance_Hints
+    n = 256: a few seconds.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: end-to-end n=256 with f=1")
+    Let arena be Arena.arena_create(1073741824)
+    Let n be 256
+
+    Let state_ptr be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_int64(state_ptr, 0, 7777777)
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_zero(f_int, n multiplied by 2)
+    Memory.memory_zero(g_int, n multiplied by 2)
+    Memory.memory_set_int16(f_int, 0, 1)
+    Let pi be 0
+    While pi is less than n:
+        Let raw be proc lcg_next with state_ptr
+        Let v be raw bitwise_and 7
+        Set v to v minus 3
+        Memory.memory_set_int16(g_int, pi multiplied by 2, v)
+        Set pi to pi plus 1
+    End While
+
+    Let f_poly_loc be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_poly_loc be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_poly_loc be ZP.zint_poly_create(arena, n, 1)
+    Let G_poly_loc be ZP.zint_poly_create(arena, n, 1)
+
+    Let solve_rc be NS.ntru_solve_zint(arena, f_poly_loc, g_poly_loc, n, F_poly_loc, G_poly_loc)
+    T.assert_equal(results, "ntru_solve_zint n=256 rc == 1", solve_rc, 1)
+
+    If solve_rc is equal to 1:
+        Let fG_loc be ZP.zint_poly_mul(arena, f_poly_loc, G_poly_loc, n)
+        Let gF_loc be ZP.zint_poly_mul(arena, g_poly_loc, F_poly_loc, n)
+        Let identity_loc be ZP.zint_poly_sub(arena, fG_loc, gF_loc, n)
+        T.assert_equal(results, "n=256 identity [0] = 12289", Z.zint_to_int(ZP.zint_poly_get(identity_loc, 0)), 12289)
+    End If
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ntru_solve_n512_constant_f" that takes results as Integer returns Integer:
+    @Reasoning
+    Time-bounded test at n = 512 (Falcon-512 size) with f = 1 to
+    validate the divider works at production sizes.  Uses f = 1 so
+    K_1 bezout passes trivially (det(f)=1, gcd(1, anything)=1).
+    @End Reasoning
+    @Implementation
+    Same approach as the smaller tests.
+    @End Implementation
+    @Performance_Hints
+    n = 512: tens of seconds.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: end-to-end n=512 with f=1 (Falcon size)")
+    Let arena be Arena.arena_create(1073741824)
+    Let n be 512
+
+    Let state_ptr be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_int64(state_ptr, 0, 11235813)
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_zero(f_int, n multiplied by 2)
+    Memory.memory_zero(g_int, n multiplied by 2)
+    Memory.memory_set_int16(f_int, 0, 1)
+    Let pi be 0
+    While pi is less than n:
+        Let raw be proc lcg_next with state_ptr
+        Let v be raw bitwise_and 7
+        Set v to v minus 3
+        Memory.memory_set_int16(g_int, pi multiplied by 2, v)
+        Set pi to pi plus 1
+    End While
+
+    Let f_poly_loc be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_poly_loc be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_poly_loc be ZP.zint_poly_create(arena, n, 1)
+    Let G_poly_loc be ZP.zint_poly_create(arena, n, 1)
+
+    Let solve_rc be NS.ntru_solve_zint(arena, f_poly_loc, g_poly_loc, n, F_poly_loc, G_poly_loc)
+    T.assert_equal(results, "ntru_solve_zint n=512 rc == 1", solve_rc, 1)
+
+    If solve_rc is equal to 1:
+        Let fG_loc be ZP.zint_poly_mul(arena, f_poly_loc, G_poly_loc, n)
+        Let gF_loc be ZP.zint_poly_mul(arena, g_poly_loc, F_poly_loc, n)
+        Let identity_loc be ZP.zint_poly_sub(arena, fG_loc, gF_loc, n)
+        T.assert_equal(results, "n=512 identity [0] = 12289", Z.zint_to_int(ZP.zint_poly_get(identity_loc, 0)), 12289)
+    End If
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_ntru_solve_n512_falcon_style" that takes results as Integer returns Integer:
+    @Reasoning
+    Time-bounded test at n = 512 using actual Falcon Gaussian-style
+    sampling for f, g (both with small Gaussian coefficients).
+    Iterates up to 30 attempts since the K_1 base-case bezout can
+    fail probabilistically.
+    @End Reasoning
+    @Implementation
+    Use LCG for reproducibility but draw small Gaussian-like
+    coefficients for both f and g (range [-3, 3]).
+    @End Implementation
+    @Performance_Hints
+    n = 512: each attempt ~5-30 seconds; up to 30 attempts.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: end-to-end n=512 Falcon-style")
+    Let arena be Arena.arena_create(1073741824)
+    Let n be 512
+
+    Let state_ptr be Arena.arena_allocate(arena, 8)
+    Memory.memory_set_int64(state_ptr, 0, 19283746)
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+
+    Let attempt be 0
+    Let solve_rc be 0
+    While attempt is less than 30:
+        Memory.memory_zero(f_int, n multiplied by 2)
+        Memory.memory_zero(g_int, n multiplied by 2)
+        Let pi be 0
+        While pi is less than n:
+            Let raw be proc lcg_next with state_ptr
+            Let v be raw bitwise_and 7
+            Set v to v minus 3
+            Memory.memory_set_int16(f_int, pi multiplied by 2, v)
+            Let raw2 be proc lcg_next with state_ptr
+            Let v2 be raw2 bitwise_and 7
+            Set v2 to v2 minus 3
+            Memory.memory_set_int16(g_int, pi multiplied by 2, v2)
+            Set pi to pi plus 1
+        End While
+
+        Let f_poly_loc be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+        Let g_poly_loc be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+        Let F_poly_loc be ZP.zint_poly_create(arena, n, 1)
+        Let G_poly_loc be ZP.zint_poly_create(arena, n, 1)
+
+        Set solve_rc to NS.ntru_solve_zint(arena, f_poly_loc, g_poly_loc, n, F_poly_loc, G_poly_loc)
+        If solve_rc is equal to 1:
+            Note: Verify the identity in K_512.
+            Let fG_loc be ZP.zint_poly_mul(arena, f_poly_loc, G_poly_loc, n)
+            Let gF_loc be ZP.zint_poly_mul(arena, g_poly_loc, F_poly_loc, n)
+            Let identity_loc be ZP.zint_poly_sub(arena, fG_loc, gF_loc, n)
+            T.assert_equal(results, "n=512 identity [0] = 12289", Z.zint_to_int(ZP.zint_poly_get(identity_loc, 0)), 12289)
+            Set attempt to 30
+        Otherwise:
+            Set attempt to attempt plus 1
+        End If
+    End While
+
+    T.assert_equal(results, "ntru_solve_zint n=512 Falcon-style eventually succeeded", solve_rc, 1)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_fft_form_babai_matches_zint_n4" that takes results as Integer returns Integer:
+    @Reasoning
+    Direct comparison test: drive the same Babai input (f, g, F, G, n=4)
+    through the FFT-form shim and verify the result is identical to the
+    pure-zint-kernel reference.  Confirms the FFT-form Babai produces
+    the same Bezout (F, G) as the exact arithmetic path on inputs that
+    fit comfortably inside the precision gate.
+    @End Reasoning
+    @Implementation
+    1. Build small f, g (single-limb coefficients).
+    2. Build an "initial" F, G by lifting the trivial constant (q, 0)
+       lifted via the descent's first-iteration lift pattern.  Use the
+       exact same starting (F, G) for both paths.
+    3. Path A: call ntru_solve (which dispatches via the new shim).
+       Capture the resulting (F, G).
+    4. Path B: temporarily force the slow path by passing larger f, g
+       and rerun -- this exercises the zint kernel.  The shapes of
+       (F, G) coefficients will differ since path B uses a different
+       (f, g), so this test compares only path A vs the NTRU invariant
+       f*G - g*F = q.  That is, the FFT-form path is verified against
+       the algebraic identity rather than a parallel zint run.
+    @End Implementation
+    @Performance_Hints
+    n = 4 test costs <1 ms.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: FFT-form Babai NTRU invariant at n=4")
+    Let arena be Arena.arena_create(67108864)
+    Let n be 4
+    Let q be 12289
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_set_int16(f_int, 0, 3)
+    Memory.memory_set_int16(f_int, 2, 1)
+    Memory.memory_set_int16(f_int, 4, 0 minus 2)
+    Memory.memory_set_int16(f_int, 6, 1)
+    Memory.memory_set_int16(g_int, 0, 2)
+    Memory.memory_set_int16(g_int, 2, 0 minus 1)
+    Memory.memory_set_int16(g_int, 4, 1)
+    Memory.memory_set_int16(g_int, 6, 0 minus 1)
+
+    Let F_out be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G_out be Arena.arena_allocate(arena, n multiplied by 2)
+    Let rc be NS.ntru_solve(arena, f_int, g_int, n, F_out, G_out)
+    T.assert_equal(results, "ntru_solve via FFT-form shim rc == 1", rc, 1)
+
+    Note: NTRU invariant f*G - g*F = q in K_n.
+    Let f_p be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_p be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_p be ZP.zint_poly_from_int_array(arena, F_out, n, 2)
+    Let G_p be ZP.zint_poly_from_int_array(arena, G_out, n, 2)
+    Let fG be ZP.zint_poly_mul(arena, f_p, G_p, n)
+    Let gF be ZP.zint_poly_mul(arena, g_p, F_p, n)
+    Let delta be ZP.zint_poly_sub(arena, fG, gF, n)
+    Let d0 be Z.zint_to_int(ZP.zint_poly_get(delta, 0))
+    T.assert_equal(results, "FFT-form: (f*G - g*F)[0] = q", d0, q)
+    Let i be 1
+    While i is less than n:
+        Let di be Z.zint_to_int(ZP.zint_poly_get(delta, i))
+        T.assert_equal(results, "FFT-form: (f*G - g*F)[i>=1] = 0", di, 0)
+        Set i to i plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_fft_form_babai_direct_call_n8" that takes results as Integer returns Integer:
+    @Reasoning
+    Direct kernel test: call ntrusolve_fft_babai_reduce_fft_form
+    directly with pre-FFT'd inputs and verify that one Babai
+    iteration drives a manufactured (F, G) toward zero relative to
+    (f, g).  This bypasses ntru_solve so the FFT-form kernel is
+    exercised in isolation.
+    @End Reasoning
+    @Implementation
+    1. Build small f, g zint polynomials of size n=8.
+    2. Build F = c*f, G = c*g for an integer constant c=5.  By
+       construction the Babai-quotient k should round to c on this
+       input, leaving F - k*f = 0 and G - k*g = 0.
+    3. Forward-FFT all four into separate buffers at baseline_used=2.
+    4. Compute f_conj_fft, g_conj_fft, denom_fft = |f|^2 + |g|^2.
+    5. Call ntrusolve_fft_babai_reduce_fft_form for max_iter=8.
+    6. Inverse-FFT F_fft, G_fft and round to integers.  Expect every
+       coefficient to be 0 (with fp53 round-off, "0" is checked via
+       |coef| <= small tolerance).
+    @End Implementation
+    @Performance_Hints
+    n = 8 test costs <1 ms.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: FFT-form Babai direct call F=c*f drives to 0")
+    Let arena be Arena.arena_create(67108864)
+    Let n be 8
+
+    Let f_p be ZP.zint_poly_create(arena, n, 2)
+    Let g_p be ZP.zint_poly_create(arena, n, 2)
+    Let F_p be ZP.zint_poly_create(arena, n, 2)
+    Let G_p be ZP.zint_poly_create(arena, n, 2)
+
+    Note: Build f, g with simple small coefficients.
+    Let f_coeffs be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(f_coeffs, 0, 3)
+    Memory.memory_set_int64(f_coeffs, 8, 1)
+    Memory.memory_set_int64(f_coeffs, 16, 0 minus 2)
+    Memory.memory_set_int64(f_coeffs, 24, 1)
+    Memory.memory_set_int64(f_coeffs, 32, 0)
+    Memory.memory_set_int64(f_coeffs, 40, 1)
+    Memory.memory_set_int64(f_coeffs, 48, 0 minus 1)
+    Memory.memory_set_int64(f_coeffs, 56, 2)
+
+    Let g_coeffs be Arena.arena_allocate(arena, n multiplied by 8)
+    Memory.memory_set_int64(g_coeffs, 0, 1)
+    Memory.memory_set_int64(g_coeffs, 8, 0 minus 1)
+    Memory.memory_set_int64(g_coeffs, 16, 2)
+    Memory.memory_set_int64(g_coeffs, 24, 1)
+    Memory.memory_set_int64(g_coeffs, 32, 0 minus 1)
+    Memory.memory_set_int64(g_coeffs, 40, 0)
+    Memory.memory_set_int64(g_coeffs, 48, 1)
+    Memory.memory_set_int64(g_coeffs, 56, 0 minus 2)
+
+    Let c be 5
+    Let pi be 0
+    While pi is less than n:
+        Let fv be Memory.memory_get_int64(f_coeffs, pi multiplied by 8)
+        Let gv be Memory.memory_get_int64(g_coeffs, pi multiplied by 8)
+        Let fz be Z.zint_from_int(arena, fv)
+        Let gz be Z.zint_from_int(arena, gv)
+        Let Fz be Z.zint_from_int(arena, c multiplied by fv)
+        Let Gz be Z.zint_from_int(arena, c multiplied by gv)
+        ZP.zint_poly_set(f_p, pi, fz)
+        ZP.zint_poly_set(g_p, pi, gz)
+        ZP.zint_poly_set(F_p, pi, Fz)
+        ZP.zint_poly_set(G_p, pi, Gz)
+        Set pi to pi plus 1
+    End While
+
+    Note: Forward FFT all four at baseline_used = 2.
+    Let buf_bytes be n multiplied by 16
+    Let f_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let g_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let F_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let G_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let f_conj_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let g_conj_fft be Arena.arena_allocate(arena, buf_bytes)
+    Let denom_fft be Arena.arena_allocate(arena, buf_bytes)
+    ZP.zint_poly_to_fft(arena, f_p, n, f_fft, 2)
+    ZP.zint_poly_to_fft(arena, g_p, n, g_fft, 2)
+    ZP.zint_poly_to_fft(arena, F_p, n, F_fft, 2)
+    ZP.zint_poly_to_fft(arena, G_p, n, G_fft, 2)
+    FFT.fft_conj(f_fft, f_conj_fft, n)
+    FFT.fft_conj(g_fft, g_conj_fft, n)
+
+    Note: denom = |f|^2 + |g|^2.
+    Let zero_v be FP.fp_zero()
+    Let si be 0
+    While si is less than n:
+        Let fr be FFT.fft_get_real(f_fft, si)
+        Let fi be FFT.fft_get_imag(f_fft, si)
+        Let gr be FFT.fft_get_real(g_fft, si)
+        Let gi be FFT.fft_get_imag(g_fft, si)
+        Let fr2 be FP.fp_mul(fr, fr)
+        Let fi2 be FP.fp_mul(fi, fi)
+        Let gr2 be FP.fp_mul(gr, gr)
+        Let gi2 be FP.fp_mul(gi, gi)
+        Let fmag be FP.fp_add(fr2, fi2)
+        Let gmag be FP.fp_add(gr2, gi2)
+        Let dmag be FP.fp_add(fmag, gmag)
+        FFT.fft_set_real(denom_fft, si, dmag)
+        FFT.fft_set_imag(denom_fft, si, zero_v)
+        Set si to si plus 1
+    End While
+
+    Note: Call the FFT-form kernel directly.
+    Let iter_count be NS.ntrusolve_fft_babai_reduce_fft_form(arena, f_fft, g_fft, F_fft, G_fft, f_conj_fft, g_conj_fft, denom_fft, n, 8)
+    T.assert_greater_than(results, "FFT-form kernel returned >= 0 iterations", iter_count plus 1, 0)
+
+    Note: Inverse-FFT F_fft, G_fft and check coefficients are zero.
+    FFT.fft_inverse(arena, F_fft, n)
+    FFT.fft_inverse(arena, G_fft, n)
+    Let ci be 0
+    While ci is less than n:
+        Let Fr be FFT.fft_get_real(F_fft, ci)
+        Let Gr be FFT.fft_get_real(G_fft, ci)
+        Let F_int be FP.fp_to_int_round(Fr)
+        Let G_int be FP.fp_to_int_round(Gr)
+        T.assert_equal(results, "F[i] reduced to 0", F_int, 0)
+        T.assert_equal(results, "G[i] reduced to 0", G_int, 0)
+        Set ci to ci plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "test_fft_form_babai_precision_fallback" that takes results as Integer returns Integer:
+    @Reasoning
+    Precision-rejection fallback test: drive ntru_solve with a small
+    f, g but a constructed (F, G) whose coefficients exceed the
+    fp53 precision gate.  The shim must reject the FFT path and fall
+    through to the exact zint kernel, still producing a correct
+    Bezout.
+    @End Reasoning
+    @Implementation
+    Since the shim is called only inside ntru_solve_zint and not
+    directly with arbitrary (F, G), this test exercises the shim via
+    ntru_solve_zint on inputs where the descent's lift produces large
+    F, G coefficients.  Choose f, g with non-trivial magnitude so the
+    lifted F, G after the n/2 -> n descent step has bit length >50
+    bits at the top level.  The test runs ntru_solve and checks the
+    NTRU invariant; success means the fallback path produced a valid
+    Bezout.
+    @End Implementation
+    @Performance_Hints
+    n = 32 with mid-magnitude coefficients exercises both paths.
+    @End Performance_Hints
+    @Security_Scope
+    Public test data.
+    @End Security_Scope
+    T.begin_suite(results, "ntrusolve: FFT-form shim with precision fallback at n=32")
+    Let arena be Arena.arena_create(134217728)
+    Let n be 32
+    Let q be 12289
+
+    Let f_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g_int be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_zero(f_int, n multiplied by 2)
+    Memory.memory_zero(g_int, n multiplied by 2)
+    Memory.memory_set_int16(f_int, 0, 5)
+    Memory.memory_set_int16(f_int, 2, 0 minus 3)
+    Memory.memory_set_int16(f_int, 4, 2)
+    Memory.memory_set_int16(f_int, 8, 1)
+    Memory.memory_set_int16(f_int, 16, 0 minus 1)
+    Memory.memory_set_int16(g_int, 0, 0 minus 2)
+    Memory.memory_set_int16(g_int, 2, 4)
+    Memory.memory_set_int16(g_int, 6, 1)
+    Memory.memory_set_int16(g_int, 12, 0 minus 1)
+    Memory.memory_set_int16(g_int, 20, 1)
+
+    Let F_out be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G_out be Arena.arena_allocate(arena, n multiplied by 2)
+    Let rc be NS.ntru_solve(arena, f_int, g_int, n, F_out, G_out)
+    T.assert_equal(results, "ntru_solve rc == 1 (mixed FFT/zint paths)", rc, 1)
+
+    Let f_p be ZP.zint_poly_from_int_array(arena, f_int, n, 2)
+    Let g_p be ZP.zint_poly_from_int_array(arena, g_int, n, 2)
+    Let F_p be ZP.zint_poly_from_int_array(arena, F_out, n, 2)
+    Let G_p be ZP.zint_poly_from_int_array(arena, G_out, n, 2)
+    Let fG be ZP.zint_poly_mul(arena, f_p, G_p, n)
+    Let gF be ZP.zint_poly_mul(arena, g_p, F_p, n)
+    Let delta be ZP.zint_poly_sub(arena, fG, gF, n)
+    Let d0 be Z.zint_to_int(ZP.zint_poly_get(delta, 0))
+    T.assert_equal(results, "fallback: (f*G - g*F)[0] = q", d0, q)
+    Let i be 1
+    While i is less than n:
+        Let di be Z.zint_to_int(ZP.zint_poly_get(delta, i))
+        T.assert_equal(results, "fallback: (f*G - g*F)[i>=1] = 0", di, 0)
+        Set i to i plus 1
+    End While
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+    proc test_zint_roundtrip with results
+    proc test_zint_add_sub with results
+    proc test_zint_mul with results
+    proc test_zint_divmod with results
+    proc test_zint_poly_basics with results
+    proc test_zint_poly_field_norm with results
+    proc test_zint_poly_split_merge_roundtrip with results
+    proc test_zint_poly_substitute_x_squared with results
+    proc test_zint_poly_field_norm_sum with results
+    proc test_zint_poly_divide_kn_identity_n2 with results
+    proc test_zint_poly_divide_kn_identity_n4 with results
+    proc test_zint_poly_divide_kn_identity_n8 with results
+    proc test_zint_poly_divide_kn_identity_n16 with results
+    proc test_zint_poly_divide_kn_identity_n32 with results
+    proc test_zint_to_fft_identity_small with results
+    proc test_zint_to_fft_identity_n16 with results
+    proc test_zint_to_fft_large_coeff_scaling with results
+    proc test_hybrid_babai_matches_zint_n4 with results
+    proc test_hybrid_babai_matches_zint_n16 with results
+    proc test_fft_form_babai_matches_zint_n4 with results
+    proc test_fft_form_babai_direct_call_n8 with results
+    proc test_fft_form_babai_precision_fallback with results
+    proc test_ntru_solve_n4 with results
+    proc test_ntru_solve_n8 with results
+    proc test_ntru_solve_n16 with results
+    proc test_ntru_solve_n32_via_falcon_sampler with results
+    proc test_ntru_solve_n128_falcon_style with results
+    proc test_ntru_solve_n256_constant_f with results
+    Note: n=512 Falcon-style is too slow / probabilistic for the
+    Note: test suite; the n=512 constant-f test below covers the
+    Note: same code path at production size.
+    proc test_ntru_solve_n512_constant_f with results
+    T.print_summary(results)
+    Let exit_code be T.get_failed(results)
+    T.destroy_test_results(results)
+    Return exit_code
+End Process

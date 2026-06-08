@@ -1,3 +1,7 @@
+# Imports:#   Import compiler/frontend/primitives/platform/platform_selector.runa as Selector
+
+.section .data
+
 .text
 print_string:
     pushq %rbp
@@ -114,19 +118,65 @@ print_integer:
 .STR0:    .string "[MAIN ERROR] Could not open input file '"
 .STR1:    .string "'"
 .STR2:    .string "compiler/"
-.STR3:    .string "Usage: "
-.STR4:    .string " <input.runa> <output.s>"
-.STR5:    .string "[ERROR] Failed to read source file"
-.STR6:    .string "[ERROR] Failed to create arena allocator"
-.STR7:    .string "[ERROR] main: Parsing failed - program is NULL"
-.STR8:    .string "[PHASE_TIMING_US] lex="
-.STR9:    .string " parse="
-.STR10:    .string " imports="
-.STR11:    .string " codegen="
-.STR12:    .string " total="
-.STR13:    .string ""
-.STR14:    .string "Successfully compiled '"
-.STR15:    .string "' to '"
+.STR3:    .string "linux_x86_64"
+.STR4:    .string "linux_arm64"
+.STR5:    .string "linux_arm32"
+.STR6:    .string "mips32"
+.STR7:    .string "mips64"
+.STR8:    .string "darwin_x86_64"
+.STR9:    .string "darwin_arm64"
+.STR10:    .string "freebsd_x64"
+.STR11:    .string "freebsd_arm64"
+.STR12:    .string "netbsd_x64"
+.STR13:    .string "netbsd_arm64"
+.STR14:    .string "openbsd_x64"
+.STR15:    .string "openbsd_arm64"
+.STR16:    .string "windows_x86_64"
+.STR17:    .string "windows_arm64"
+.STR18:    .string "powerpc"
+.STR19:    .string "riscv32"
+.STR20:    .string "riscv64"
+.STR21:    .string "Linux"
+.STR22:    .string "x86_64"
+.STR23:    .string "aarch64"
+.STR24:    .string "arm64"
+.STR25:    .string "armv7l"
+.STR26:    .string "armv7"
+.STR27:    .string "arm"
+.STR28:    .string "mips"
+.STR29:    .string "ppc64"
+.STR30:    .string "ppc64le"
+.STR31:    .string "powerpc64"
+.STR32:    .string "powerpc64le"
+.STR33:    .string "Darwin"
+.STR34:    .string "FreeBSD"
+.STR35:    .string "amd64"
+.STR36:    .string "NetBSD"
+.STR37:    .string "OpenBSD"
+.STR38:    .string "Windows_NT"
+.STR39:    .string "AMD64"
+.STR40:    .string "Usage: "
+.STR41:    .string " <input.runa> <output.s> [--target <key>] [--verbose]"
+.STR42:    .string "[ERROR] Missing trailing flag"
+.STR43:    .string "--verbose"
+.STR44:    .string "[ERROR] Unrecognized option: "
+.STR45:    .string "[ERROR] Missing --target flag"
+.STR46:    .string "--target"
+.STR47:    .string "[ERROR] --target requires a platform key argument"
+.STR48:    .string "[ERROR] Unknown --target platform key: "
+.STR49:    .string "[ERROR] Missing trailing flag after --target value"
+.STR50:    .string "[ERROR] Could not detect host platform - uname failed or the host os/arch is not a supported Runa target. Pass --target <key> explicitly."
+.STR51:    .string "[ERROR] Failed to read source file"
+.STR52:    .string "[ERROR] Failed to create arena allocator"
+.STR53:    .string "[ERROR] main: Parsing failed - program is NULL"
+.STR54:    .string "[PHASE_TIMING_US] lex="
+.STR55:    .string " parse="
+.STR56:    .string " imports="
+.STR57:    .string " codegen="
+.STR58:    .string " total="
+.STR59:    .string ""
+.STR60:    .string "Successfully compiled '"
+.STR61:    .string "' to '"
 .text
 
 
@@ -134,7 +184,7 @@ print_integer:
 read_file_internal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1064, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -195,7 +245,7 @@ read_file_internal:
 extract_base_dir:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1064, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -268,6 +318,1302 @@ extract_base_dir:
     movq %rbp, %rsp
     popq %rbp
     ret
+
+
+.globl is_known_platform_key
+is_known_platform_key:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $1048, %rsp  # Per-function frame size
+    movq %rdi, -8(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L41
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L42
+.L41:
+.L42:
+    leaq .STR3(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L51
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L52
+.L51:
+.L52:
+    leaq .STR4(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L61
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L62
+.L61:
+.L62:
+    leaq .STR5(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L71
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L72
+.L71:
+.L72:
+    leaq .STR6(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L81
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L82
+.L81:
+.L82:
+    leaq .STR7(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L91
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L92
+.L91:
+.L92:
+    leaq .STR8(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L101
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L102
+.L101:
+.L102:
+    leaq .STR9(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L111
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L112
+.L111:
+.L112:
+    leaq .STR10(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L121
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L122
+.L121:
+.L122:
+    leaq .STR11(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L131
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L132
+.L131:
+.L132:
+    leaq .STR12(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L141
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L142
+.L141:
+.L142:
+    leaq .STR13(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L151
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L152
+.L151:
+.L152:
+    leaq .STR14(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L161
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L162
+.L161:
+.L162:
+    leaq .STR15(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L171
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L172
+.L171:
+.L172:
+    leaq .STR16(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L181
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L182
+.L181:
+.L182:
+    leaq .STR17(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L191
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L192
+.L191:
+.L192:
+    leaq .STR18(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L201
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L202
+.L201:
+.L202:
+    leaq .STR19(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L211
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L212
+.L211:
+.L212:
+    leaq .STR20(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L221
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L222
+.L221:
+.L222:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl detect_host_platform_key
+detect_host_platform_key:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $1064, %rsp  # Per-function frame size
+    movq $512, %rax
+    pushq %rax
+    popq %rdi
+    call allocate@PLT
+    movq %rax, -8(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L231
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L232
+.L231:
+.L232:
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call syscall_uname
+    movq %rax, -16(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L241
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L242
+.L241:
+.L242:
+    movq -8(%rbp), %rax
+    movq %rax, -24(%rbp)
+    movq -8(%rbp), %rax
+    addq $260, %rax
+    movq %rax, -32(%rbp)
+    leaq .STR21(%rip), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L251
+    leaq .STR22(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L261
+    leaq .STR3(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L262
+.L261:
+.L262:
+    leaq .STR23(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L271
+    leaq .STR4(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L272
+.L271:
+.L272:
+    leaq .STR24(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L281
+    leaq .STR4(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L282
+.L281:
+.L282:
+    leaq .STR25(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L291
+    leaq .STR5(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L292
+.L291:
+.L292:
+    leaq .STR26(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L301
+    leaq .STR5(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L302
+.L301:
+.L302:
+    leaq .STR27(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L311
+    leaq .STR5(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L312
+.L311:
+.L312:
+    leaq .STR28(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L321
+    leaq .STR6(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L322
+.L321:
+.L322:
+    leaq .STR7(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L331
+    leaq .STR7(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L332
+.L331:
+.L332:
+    leaq .STR29(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L341
+    leaq .STR18(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L342
+.L341:
+.L342:
+    leaq .STR30(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L351
+    leaq .STR18(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L352
+.L351:
+.L352:
+    leaq .STR31(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L361
+    leaq .STR18(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L362
+.L361:
+.L362:
+    leaq .STR32(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L371
+    leaq .STR18(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L372
+.L371:
+.L372:
+    leaq .STR19(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L381
+    leaq .STR19(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L382
+.L381:
+.L382:
+    leaq .STR20(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L391
+    leaq .STR20(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L392
+.L391:
+.L392:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L252
+.L251:
+.L252:
+    leaq .STR33(%rip), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L401
+    leaq .STR22(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L411
+    leaq .STR8(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L412
+.L411:
+.L412:
+    leaq .STR24(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L421
+    leaq .STR9(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L422
+.L421:
+.L422:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L402
+.L401:
+.L402:
+    leaq .STR34(%rip), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L431
+    leaq .STR35(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L441
+    leaq .STR10(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L442
+.L441:
+.L442:
+    leaq .STR22(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L451
+    leaq .STR10(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L452
+.L451:
+.L452:
+    leaq .STR24(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L461
+    leaq .STR11(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L462
+.L461:
+.L462:
+    leaq .STR23(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L471
+    leaq .STR11(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L472
+.L471:
+.L472:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L432
+.L431:
+.L432:
+    leaq .STR36(%rip), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L481
+    leaq .STR35(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L491
+    leaq .STR12(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L492
+.L491:
+.L492:
+    leaq .STR22(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L501
+    leaq .STR12(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L502
+.L501:
+.L502:
+    leaq .STR24(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L511
+    leaq .STR13(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L512
+.L511:
+.L512:
+    leaq .STR23(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L521
+    leaq .STR13(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L522
+.L521:
+.L522:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L482
+.L481:
+.L482:
+    leaq .STR37(%rip), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L531
+    leaq .STR35(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L541
+    leaq .STR14(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L542
+.L541:
+.L542:
+    leaq .STR22(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L551
+    leaq .STR14(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L552
+.L551:
+.L552:
+    leaq .STR24(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L561
+    leaq .STR15(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L562
+.L561:
+.L562:
+    leaq .STR23(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L571
+    leaq .STR15(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L572
+.L571:
+.L572:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L532
+.L531:
+.L532:
+    leaq .STR38(%rip), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L581
+    leaq .STR22(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L591
+    leaq .STR16(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L592
+.L591:
+.L592:
+    leaq .STR39(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L601
+    leaq .STR16(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L602
+.L601:
+.L602:
+    leaq .STR24(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L611
+    leaq .STR17(%rip), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L612
+.L611:
+.L612:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L582
+.L581:
+.L582:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
 .globl main
 
 
@@ -281,10 +1627,12 @@ main:
     call runtime_set_command_line_args@PLT
     popq %rsi   # Restore argv
     popq %rdi   # Restore argc
-    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    subq $1464, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     call __module_init  # Initialize runtime-initialized globals
+    movq $0, %rax
+    movq %rax, -24(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
     movq $3, %rax
@@ -293,67 +1641,580 @@ main:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L41
+    jz .L621
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $4, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L631
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $5, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L641
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $6, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L651
     movq $0, %rax
     pushq %rax
     popq %rdi
     call get_command_line_arg@PLT
-    movq %rax, -24(%rbp)
-    movq -24(%rbp), %rax
-    pushq %rax
-    leaq .STR3(%rip), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_concat@PLT
     movq %rax, -32(%rbp)
-    leaq .STR4(%rip), %rax
-    pushq %rax
     movq -32(%rbp), %rax
+    pushq %rax
+    leaq .STR40(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
     movq %rax, -40(%rbp)
+    leaq .STR41(%rip), %rax
+    pushq %rax
+    movq -40(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -48(%rbp)
+    movq -40(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -48(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -48(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -40(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -40(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L42
-.L41:
-.L42:
+    jmp .L652
+.L651:
+.L652:
+    jmp .L642
+.L641:
+.L642:
+    jmp .L632
+.L631:
+.L632:
+    jmp .L622
+.L621:
+.L622:
     movq $1, %rax
-    pushq %rax
-    popq %rdi
-    call get_command_line_arg@PLT
-    movq %rax, -48(%rbp)
-    movq $2, %rax
     pushq %rax
     popq %rdi
     call get_command_line_arg@PLT
     movq %rax, -56(%rbp)
-    movq -48(%rbp), %rax
+    movq $2, %rax
+    pushq %rax
+    popq %rdi
+    call get_command_line_arg@PLT
+    movq %rax, -64(%rbp)
+    movq $0, %rax
+    movq %rax, -72(%rbp)
+    movq $0, %rax
+    movq %rax, -80(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $5, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L661
+    movq $1, %rax
+    pushq %rax
+    leaq -80(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L662
+.L661:
+.L662:
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $6, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L671
+    movq $1, %rax
+    pushq %rax
+    leaq -80(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L672
+.L671:
+.L672:
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $4, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L681
+    movq $3, %rax
+    pushq %rax
+    popq %rdi
+    call get_command_line_arg@PLT
+    movq %rax, -88(%rbp)
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L691
+    leaq .STR42(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L692
+.L691:
+.L692:
+    leaq .STR43(%rip), %rax
+    pushq %rax
+    movq -88(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L701
+    movq -88(%rbp), %rax
+    pushq %rax
+    leaq .STR44(%rip), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -96(%rbp)
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -88(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L702
+.L701:
+.L702:
+    movq $1, %rax
+    pushq %rax
+    leaq -24(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -88(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    jmp .L682
+.L681:
+.L682:
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L711
+    movq $3, %rax
+    pushq %rax
+    popq %rdi
+    call get_command_line_arg@PLT
+    movq %rax, -104(%rbp)
+    movq $4, %rax
+    pushq %rax
+    popq %rdi
+    call get_command_line_arg@PLT
+    movq %rax, -112(%rbp)
+    movq -104(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L721
+    leaq .STR45(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L722
+.L721:
+.L722:
+    leaq .STR46(%rip), %rax
+    pushq %rax
+    movq -104(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L731
+    movq -104(%rbp), %rax
+    pushq %rax
+    leaq .STR44(%rip), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -120(%rbp)
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -104(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L732
+.L731:
+.L732:
+    movq -112(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L741
+    leaq .STR47(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -104(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L742
+.L741:
+.L742:
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call is_known_platform_key
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L751
+    movq -112(%rbp), %rax
+    pushq %rax
+    leaq .STR48(%rip), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -128(%rbp)
+    movq -128(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -128(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -104(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L752
+.L751:
+.L752:
+    movq -104(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -112(%rbp), %rax
+    pushq %rax
+    leaq -72(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $6, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L761
+    movq $5, %rax
+    pushq %rax
+    popq %rdi
+    call get_command_line_arg@PLT
+    movq %rax, -136(%rbp)
+    movq -136(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L771
+    leaq .STR49(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L772
+.L771:
+.L772:
+    leaq .STR43(%rip), %rax
+    pushq %rax
+    movq -136(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L781
+    movq -136(%rbp), %rax
+    pushq %rax
+    leaq .STR44(%rip), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -144(%rbp)
+    movq -144(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -144(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -136(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L782
+.L781:
+.L782:
+    movq $1, %rax
+    pushq %rax
+    leaq -24(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -136(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    jmp .L762
+.L761:
+.L762:
+    jmp .L712
+.L711:
+    call detect_host_platform_key
+    movq %rax, -152(%rbp)
+    movq -152(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L791
+    leaq .STR50(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L792
+.L791:
+.L792:
+    movq -152(%rbp), %rax
+    pushq %rax
+    leaq -72(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L712:
+    movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     call read_file_internal@PLT
-    movq %rax, -64(%rbp)
-    movq -64(%rbp), %rax
+    movq %rax, -160(%rbp)
+    movq -160(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -361,16 +2222,16 @@ main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L51
-    leaq .STR5(%rip), %rax
+    jz .L801
+    leaq .STR51(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -48(%rbp), %rax
+    movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -56(%rbp), %rax
+    movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -378,17 +2239,17 @@ main:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L52
-.L51:
-.L52:
+    jmp .L802
+.L801:
+.L802:
     movq $65536, %rax
-    movq %rax, -72(%rbp)
-    movq -72(%rbp), %rax
+    movq %rax, -168(%rbp)
+    movq -168(%rbp), %rax
     pushq %rax
     popq %rdi
     call arena_create
-    movq %rax, -80(%rbp)
-    movq -80(%rbp), %rax
+    movq %rax, -176(%rbp)
+    movq -176(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -396,16 +2257,12 @@ main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L61
-    leaq .STR6(%rip), %rax
+    jz .L811
+    leaq .STR52(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -64(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -48(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -413,41 +2270,45 @@ main:
     pushq %rax
     popq %rdi
     call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L62
-.L61:
-.L62:
+    jmp .L812
+.L811:
+.L812:
     call get_time_us
-    movq %rax, -88(%rbp)
-    movq -80(%rbp), %rax
+    movq %rax, -184(%rbp)
+    movq -176(%rbp), %rax
     pushq %rax
-    movq -64(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call lexer_create
-    movq %rax, -96(%rbp)
-    movq -80(%rbp), %rax
+    movq %rax, -192(%rbp)
+    movq -176(%rbp), %rax
     pushq %rax
-    movq -96(%rbp), %rax
+    movq -192(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call parser_create
-    movq %rax, -104(%rbp)
+    movq %rax, -200(%rbp)
     call get_time_us
-    movq %rax, -112(%rbp)
-    movq -104(%rbp), %rax
+    movq %rax, -208(%rbp)
+    movq -200(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_parse_program
-    movq %rax, -120(%rbp)
+    movq %rax, -216(%rbp)
     call get_time_us
-    movq %rax, -128(%rbp)
-    movq -120(%rbp), %rax
+    movq %rax, -224(%rbp)
+    movq -216(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -455,28 +2316,24 @@ main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L71
-    leaq .STR7(%rip), %rax
+    jz .L821
+    leaq .STR53(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -104(%rbp), %rax
+    movq -200(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_destroy
-    movq -96(%rbp), %rax
+    movq -192(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_destroy
-    movq -80(%rbp), %rax
+    movq -176(%rbp), %rax
     pushq %rax
     popq %rdi
     call arena_destroy
-    movq -64(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -48(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -484,270 +2341,67 @@ main:
     pushq %rax
     popq %rdi
     call deallocate@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L72
-.L71:
-.L72:
+    jmp .L822
+.L821:
+.L822:
     movq $8, %rax
     pushq %rax
-    movq -120(%rbp), %rax
+    movq -216(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -136(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -120(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -144(%rbp)
-    movq -144(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L81
-    movq $0, %rax
-    movq %rax, -152(%rbp)
-.L91:    movq -152(%rbp), %rax
-    pushq %rax
-    movq -136(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setl %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L92
-    movq -152(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -160(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -144(%rbp), %rax
-    addq -160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -168(%rbp)
-    movq -168(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L101
-    movq -48(%rbp), %rax
-    pushq %rax
-    movq -168(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call function_set_source_file
-    jmp .L102
-.L101:
-.L102:
-    movq -152(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -152(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L91
-.L92:
-    jmp .L82
-.L81:
-.L82:
-    movq $24, %rax
-    pushq %rax
-    movq -120(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -176(%rbp)
-    movq $16, %rax
-    pushq %rax
-    movq -120(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -184(%rbp)
-    movq -184(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L111
-    movq $0, %rax
-    movq %rax, -192(%rbp)
-.L121:    movq -192(%rbp), %rax
-    pushq %rax
-    movq -176(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setl %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L122
-    movq -192(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -200(%rbp)
-    movq -200(%rbp), %rax
-    pushq %rax
-    movq -184(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -208(%rbp)
-    movq -208(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L131
-    movq -48(%rbp), %rax
-    pushq %rax
-    movq -208(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call type_definition_set_source_file
-    jmp .L132
-.L131:
-.L132:
-    movq -192(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -192(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L121
-.L122:
-    jmp .L112
-.L111:
-.L112:
-    movq -48(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call extract_base_dir
-    movq %rax, -216(%rbp)
-    movq -216(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L141
-    movq -216(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call set_import_base_dir
-    jmp .L142
-.L141:
-.L142:
-    movq -48(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call extract_directory
-    movq %rax, -224(%rbp)
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L151
-    movq -216(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L161
-    movq -216(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_length@PLT
     movq %rax, -232(%rbp)
-    movq -224(%rbp), %rax
+    movq $0, %rax
+    pushq %rax
+    movq -216(%rbp), %rax
     pushq %rax
     popq %rdi
-    call string_length@PLT
+    popq %rsi
+    call memory_get_pointer@PLT
     movq %rax, -240(%rbp)
     movq -240(%rbp), %rax
     pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L831
+    movq $0, %rax
+    movq %rax, -248(%rbp)
+.L841:    movq -248(%rbp), %rax
+    pushq %rax
     movq -232(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
-    setg %al
+    setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L171
-    movq -240(%rbp), %rax
-    pushq %rax
-    movq -232(%rbp), %rax
-    pushq %rax
-    movq -224(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call string_substring@PLT
-    movq %rax, -248(%rbp)
+    jz .L842
     movq -248(%rbp), %rax
     pushq %rax
-    popq %rdi
-    call set_import_source_dir
-    jmp .L172
-.L171:
-.L172:
-    jmp .L162
-.L161:
-.L162:
-    jmp .L152
-.L151:
-.L152:
-    call get_time_us
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
     movq %rax, -256(%rbp)
-    movq -80(%rbp), %rax
+    movq $0, %rax
     pushq %rax
-    movq -120(%rbp), %rax
+    movq -240(%rbp), %rax
+    addq -256(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call process_imports_recursive
+    call memory_get_pointer@PLT
     movq %rax, -264(%rbp)
     movq -264(%rbp), %rax
     pushq %rax
@@ -757,32 +2411,275 @@ main:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L181
-    movq -120(%rbp), %rax
+    jz .L851
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq -264(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call function_set_source_file
+    jmp .L852
+.L851:
+.L852:
+    movq -248(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -248(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L841
+.L842:
+    jmp .L832
+.L831:
+.L832:
+    movq -216(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call program_tag_no_mangle_flags
+    movq $24, %rax
+    pushq %rax
+    movq -216(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -272(%rbp)
+    movq $16, %rax
+    pushq %rax
+    movq -216(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -280(%rbp)
+    movq -280(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L861
+    movq $0, %rax
+    movq %rax, -288(%rbp)
+.L871:    movq -288(%rbp), %rax
+    pushq %rax
+    movq -272(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L872
+    movq -288(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -296(%rbp)
+    movq -296(%rbp), %rax
+    pushq %rax
+    movq -280(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -304(%rbp)
+    movq -304(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L881
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq -304(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call type_definition_set_source_file
+    jmp .L882
+.L881:
+.L882:
+    movq -288(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -288(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L871
+.L872:
+    jmp .L862
+.L861:
+.L862:
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call extract_base_dir
+    movq %rax, -312(%rbp)
+    movq -312(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L891
+    movq -312(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call set_import_base_dir
+    jmp .L892
+.L891:
+.L892:
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call extract_directory
+    movq %rax, -320(%rbp)
+    movq -320(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L901
+    movq -312(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L911
+    movq -312(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_length@PLT
+    movq %rax, -328(%rbp)
+    movq -320(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_length@PLT
+    movq %rax, -336(%rbp)
+    movq -336(%rbp), %rax
+    pushq %rax
+    movq -328(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setg %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L921
+    movq -336(%rbp), %rax
+    pushq %rax
+    movq -328(%rbp), %rax
+    pushq %rax
+    movq -320(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call string_substring@PLT
+    movq %rax, -344(%rbp)
+    movq -344(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call set_import_source_dir
+    jmp .L922
+.L921:
+.L922:
+    jmp .L912
+.L911:
+.L912:
+    jmp .L902
+.L901:
+.L902:
+    call get_time_us
+    movq %rax, -352(%rbp)
+    movq $56, %rax
+    pushq %rax
+    movq -216(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -360(%rbp)
+    movq -360(%rbp), %rax
+    pushq %rax
+    movq $64, %rax
+    pushq %rax
+    movq -216(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq $1, %rax
+    pushq %rax
+    movq $68, %rax
+    pushq %rax
+    movq -216(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -72(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call set_target_platform_key
+    movq -176(%rbp), %rax
+    pushq %rax
+    movq -216(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call process_imports_recursive
+    movq %rax, -368(%rbp)
+    movq -368(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L931
+    movq -216(%rbp), %rax
     pushq %rax
     popq %rdi
     call program_destroy
-    movq -104(%rbp), %rax
+    movq -200(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_destroy
-    movq -96(%rbp), %rax
+    movq -192(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_destroy
-    movq -80(%rbp), %rax
+    movq -176(%rbp), %rax
     pushq %rax
     popq %rdi
     call arena_destroy
-    movq -64(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -48(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -790,20 +2687,20 @@ main:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L182
-.L181:
-.L182:
+    jmp .L932
+.L931:
+.L932:
     call get_time_us
-    movq %rax, -272(%rbp)
-    movq -80(%rbp), %rax
+    movq %rax, -376(%rbp)
+    movq -176(%rbp), %rax
     pushq %rax
-    movq -56(%rbp), %rax
+    movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call codegen_create
-    movq %rax, -280(%rbp)
-    movq -280(%rbp), %rax
+    movq %rax, -384(%rbp)
+    movq -384(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -811,32 +2708,32 @@ main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L191
-    movq -80(%rbp), %rax
+    jz .L941
+    movq -176(%rbp), %rax
     pushq %rax
     popq %rdi
     call arena_destroy
-    movq -120(%rbp), %rax
+    movq -216(%rbp), %rax
     pushq %rax
     popq %rdi
     call program_destroy
-    movq -104(%rbp), %rax
+    movq -200(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_destroy
-    movq -96(%rbp), %rax
+    movq -192(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_destroy
-    movq -64(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -48(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -844,160 +2741,176 @@ main:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L192
-.L191:
-.L192:
-    movq -120(%rbp), %rax
+    jmp .L942
+.L941:
+.L942:
+    movq -72(%rbp), %rax
     pushq %rax
-    movq -280(%rbp), %rax
+    popq %rdi
+    call set_codegen_target_platform_key
+    movq -216(%rbp), %rax
+    pushq %rax
+    movq -384(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call codegen_generate
     call get_time_us
-    movq %rax, -288(%rbp)
+    movq %rax, -392(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -280(%rbp), %rax
+    movq -384(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -296(%rbp)
-    movq -296(%rbp), %rax
+    movq %rax, -400(%rbp)
+    movq -400(%rbp), %rax
     pushq %rax
     popq %rdi
     call file_close_buffered@PLT
-    leaq .STR8(%rip), %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L951
+    leaq .STR54(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -112(%rbp), %rax
-    subq -88(%rbp), %rax
+    movq -208(%rbp), %rax
+    subq -184(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
-    leaq .STR9(%rip), %rax
+    leaq .STR55(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -128(%rbp), %rax
-    subq -112(%rbp), %rax
+    movq -224(%rbp), %rax
+    subq -208(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
-    leaq .STR10(%rip), %rax
+    leaq .STR56(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -272(%rbp), %rax
-    subq -256(%rbp), %rax
+    movq -376(%rbp), %rax
+    subq -352(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
-    leaq .STR11(%rip), %rax
+    leaq .STR57(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -288(%rbp), %rax
-    subq -272(%rbp), %rax
+    movq -392(%rbp), %rax
+    subq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
-    leaq .STR12(%rip), %rax
+    leaq .STR58(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -288(%rbp), %rax
-    subq -88(%rbp), %rax
+    movq -392(%rbp), %rax
+    subq -184(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
-    leaq .STR13(%rip), %rax
+    leaq .STR59(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -48(%rbp), %rax
+    jmp .L952
+.L951:
+.L952:
+    movq -56(%rbp), %rax
     pushq %rax
-    leaq .STR14(%rip), %rax
+    leaq .STR60(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -304(%rbp)
-    leaq .STR15(%rip), %rax
+    movq %rax, -408(%rbp)
+    leaq .STR61(%rip), %rax
     pushq %rax
-    movq -304(%rbp), %rax
+    movq -408(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -312(%rbp)
-    movq -304(%rbp), %rax
+    movq %rax, -416(%rbp)
+    movq -408(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -56(%rbp), %rax
+    movq -64(%rbp), %rax
     pushq %rax
-    movq -312(%rbp), %rax
+    movq -416(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -320(%rbp)
-    movq -312(%rbp), %rax
+    movq %rax, -424(%rbp)
+    movq -416(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     leaq .STR1(%rip), %rax
     pushq %rax
-    movq -320(%rbp), %rax
+    movq -424(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -328(%rbp)
-    movq -320(%rbp), %rax
+    movq %rax, -432(%rbp)
+    movq -424(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -328(%rbp), %rax
+    movq -432(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -328(%rbp), %rax
+    movq -432(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -280(%rbp), %rax
+    movq -384(%rbp), %rax
     pushq %rax
     popq %rdi
     call codegen_destroy
-    movq -120(%rbp), %rax
+    movq -216(%rbp), %rax
     pushq %rax
     popq %rdi
     call program_destroy
-    movq -104(%rbp), %rax
+    movq -200(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_destroy
-    movq -96(%rbp), %rax
+    movq -192(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_destroy
-    movq -80(%rbp), %rax
+    movq -176(%rbp), %rax
     pushq %rax
     popq %rdi
     call arena_destroy
-    movq -64(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -48(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -1010,7 +2923,7 @@ main:
 __module_init:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16384, %rsp  # Stack space for global initializers
+    subq $2056, %rsp  # Stack space for global initializer expression spills
     leave
     ret
 

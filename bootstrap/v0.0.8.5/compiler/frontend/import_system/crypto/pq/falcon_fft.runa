@@ -1,0 +1,873 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+==============================================================================
+FALCON-FFT : complex Float64 FFT over the cyclotomic ring Z[X]/(X^n + 1)
+==============================================================================
+
+Per the Falcon NIST PQC submission (keygen.c falcon.c), the lattice basis
+generator and the Fast Fourier Sampler operate in the FFT domain of the
+2*n-th cyclotomic root structure. The forward FFT maps a real polynomial
+of degree n-1 over Z[X]/(X^n + 1) into a length-n array of complex numbers
+whose entries are the polynomial evaluated at the primitive 2*n-th roots of
+unity zeta_k = exp(i * (2k+1) * pi / n) for k = 0..n-1.
+
+Equivalent formulation (radix-2 Cooley-Tukey, DIT):
+  A polynomial f(X) of degree < n in Z[X]/(X^n + 1) is represented as a
+  flat array of n complex numbers a[k] = f(zeta_{2k+1}) for k = 0..n-1
+  where zeta_j = exp(i * j * pi / n) is a primitive 2*n-th root of unity.
+
+Storage layout:
+  An FFT-domain polynomial occupies 16*n bytes of arena memory. Each pair
+  of 8-byte Float64 values (real, imaginary) is stored at offset 16*k
+  and 16*k + 8 respectively, indexed by k = 0..n-1.
+
+A polynomial in coefficient form (input to fft_forward) likewise occupies
+16*n bytes: the real part of the k-th coefficient at offset 16*k, the
+imaginary part (zero for real input) at offset 16*k + 8.
+
+Operations provided:
+  - fft_forward         : in-place forward FFT
+  - fft_inverse         : in-place inverse FFT (with 1/n scaling)
+  - fft_mul_pointwise   : c[k] = a[k] * b[k]
+  - fft_add_pointwise   : c[k] = a[k] + b[k]
+  - fft_sub_pointwise   : c[k] = a[k] - b[k]
+  - fft_conj_pointwise  : c[k] = conj(a[k])
+  - fft_load_from_int_poly  : real coefs read from int16 array
+  - fft_load_from_int_poly_signed : signed integer coefs (Falcon f, g)
+  - fft_extract_real_round  : write real-part-rounded ints back
+
+This module depends on falcon_fp.runa for hardware Float64 arithmetic.
+
+Cost analysis for Falcon-512 (n=512):
+  - Forward FFT: log2(512) = 9 passes, each pass 256 butterflies. Each
+    butterfly is 6 fp_add/fp_sub + 4 fp_mul (complex mul). Total:
+    9 * 256 * (6 + 4) = 23040 SSE2 ops, plus 256 twiddle factor lookups
+    via fp_cos and fp_sin.
+  - Inverse FFT: same complexity plus a final n-scaling pass.
+  - Pointwise mul: 256 complex multiplies (4 fp_mul + 2 fp_sub per coef).
+
+Memory: one in-place FFT scratch = 16*n bytes = 8192 bytes for n=512.
+
+Constant-time considerations:
+  All butterfly indexing depends on the public parameter n; the only
+  data-dependent operation is FP add/sub/mul which is approximately
+  constant-time on modern x86_64. See falcon_fp.runa security notes for
+  the denormal-assist and division-latency caveats.
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/import_system/crypto/pq/falcon_fp.runa" as FP
+
+Note:
+==============================================================================
+Helpers for storing complex Float64 pairs into arena buffers
+==============================================================================
+:End Note
+
+Process called "fft_get_real" takes buf as Integer, idx as Integer returns Float:
+    @Reasoning
+    Loads the real part of the idx-th complex coefficient.
+    @End Reasoning
+    @Implementation
+    Returns the 8-byte value at offset 16*idx.
+    @End Implementation
+    @Performance_Hints
+    Single 64-bit load.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer must be 8-aligned arena memory.
+    @End Security_Scope
+    Let off be idx multiplied by 16
+    Return Memory.memory_get_int64(buf, off)
+End Process
+
+Process called "fft_get_imag" takes buf as Integer, idx as Integer returns Float:
+    @Reasoning
+    Loads the imaginary part of the idx-th complex coefficient.
+    @End Reasoning
+    @Implementation
+    Returns the 8-byte value at offset 16*idx + 8.
+    @End Implementation
+    @Performance_Hints
+    Single 64-bit load.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer must be 8-aligned arena memory.
+    @End Security_Scope
+    Let off be idx multiplied by 16
+    Set off to off plus 8
+    Return Memory.memory_get_int64(buf, off)
+End Process
+
+Process called "fft_set_real" takes buf as Integer, idx as Integer, value as Float returns Integer:
+    @Reasoning
+    Stores the real part of the idx-th complex coefficient.
+    @End Reasoning
+    @Implementation
+    Writes the 8-byte value at offset 16*idx.
+    @End Implementation
+    @Performance_Hints
+    Single 64-bit store.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer must be writable arena memory.
+    @End Security_Scope
+    Let off be idx multiplied by 16
+    Memory.memory_set_int64(buf, off, value)
+    Return 1
+End Process
+
+Process called "fft_set_imag" takes buf as Integer, idx as Integer, value as Float returns Integer:
+    @Reasoning
+    Stores the imaginary part of the idx-th complex coefficient.
+    @End Reasoning
+    @Implementation
+    Writes the 8-byte value at offset 16*idx + 8.
+    @End Implementation
+    @Performance_Hints
+    Single 64-bit store.
+    @End Performance_Hints
+    @Security_Scope
+    Pointer must be writable arena memory.
+    @End Security_Scope
+    Let off be idx multiplied by 16
+    Set off to off plus 8
+    Memory.memory_set_int64(buf, off, value)
+    Return 1
+End Process
+
+Process called "fft_zero" takes buf as Integer, n as Integer returns Integer:
+    @Reasoning
+    Zero an n-coefficient FFT buffer.
+    @End Reasoning
+    @Implementation
+    Sets 16*n bytes to zero via Memory.memory_zero.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    Public sizes.
+    @End Security_Scope
+    Let bytes be n multiplied by 16
+    Memory.memory_zero(buf, bytes)
+    Return 1
+End Process
+
+Process called "fft_copy" takes dest as Integer, src as Integer, n as Integer returns Integer:
+    @Reasoning
+    Copy an n-coefficient FFT buffer.
+    @End Reasoning
+    @Implementation
+    Copies 16*n bytes via Memory.memory_copy.
+    @End Implementation
+    @Performance_Hints
+    Linear in n.
+    @End Performance_Hints
+    @Security_Scope
+    Caller-managed alignment.
+    @End Security_Scope
+    Let bytes be n multiplied by 16
+    Memory.memory_copy(dest, src, bytes)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+TWIDDLE FACTOR COMPUTATION
+==============================================================================
+For Z[X]/(X^n + 1) the FFT evaluation points are the primitive 2n-th roots
+of unity at odd positions: zeta_k = exp(i * (2k+1) * pi / n) for k = 0..n-1.
+:End Note
+
+Process called "fft_twiddle" takes k as Integer, n as Integer, result_real_ptr as Integer, result_imag_ptr as Integer returns Integer:
+    @Reasoning
+    Computes zeta_k = exp(i * (2k+1) * pi / n) and writes its real and
+    imaginary parts to the two pointer locations.
+    @End Reasoning
+    @Implementation
+    Argument theta = (2k+1) * pi / n. Real part = cos(theta), imag = sin(theta).
+    @End Implementation
+    @Performance_Hints
+    O(1) with constant transcendental cost (~150 cycles per call).
+    @End Performance_Hints
+    @Security_Scope
+    Public twiddle index.
+    @End Security_Scope
+    Let two_k_plus_1 be 2 multiplied by k plus 1
+    Let two_k_plus_1_f be proc FP.fp_from_int with two_k_plus_1
+    Let n_f be proc FP.fp_from_int with n
+    Let pi_v be proc FP.fp_pi
+    Let prod1 be proc FP.fp_mul with two_k_plus_1_f, pi_v
+    Let theta be proc FP.fp_div with prod1, n_f
+    Let cr be proc FP.fp_cos with theta
+    Let ci be proc FP.fp_sin with theta
+    Memory.memory_set_int64(result_real_ptr, 0, cr)
+    Memory.memory_set_int64(result_imag_ptr, 0, ci)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+COMPLEX MULTIPLY HELPER
+==============================================================================
+(a + bi)(c + di) = (ac - bd) + (ad + bc) i
+:End Note
+
+Process called "fft_complex_mul" takes a_real as Float, a_imag as Float, b_real as Float, b_imag as Float, out_real_ptr as Integer, out_imag_ptr as Integer returns Integer:
+    @Reasoning
+    Complex multiply.
+    @End Reasoning
+    @Implementation
+    Real part = a_real*b_real - a_imag*b_imag.
+    Imag part = a_real*b_imag + a_imag*b_real.
+    @End Implementation
+    @Performance_Hints
+    4 mulsd + 2 addsd/subsd.
+    @End Performance_Hints
+    @Security_Scope
+    Constant-time.
+    @End Security_Scope
+    Let ar_br be proc FP.fp_mul with a_real, b_real
+    Let ai_bi be proc FP.fp_mul with a_imag, b_imag
+    Let real_out be proc FP.fp_sub with ar_br, ai_bi
+    Let ar_bi be proc FP.fp_mul with a_real, b_imag
+    Let ai_br be proc FP.fp_mul with a_imag, b_real
+    Let imag_out be proc FP.fp_add with ar_bi, ai_br
+    Memory.memory_set_int64(out_real_ptr, 0, real_out)
+    Memory.memory_set_int64(out_imag_ptr, 0, imag_out)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+FORWARD FFT
+==============================================================================
+Cooley-Tukey radix-2 DIT FFT for Z[X]/(X^n + 1).
+
+For Z[X]/(X^n + 1), the structure differs slightly from the standard DFT.
+Each "split" pass uses twiddles that are primitive 2n-th roots of unity
+indexed by the bit-reversal of the current block position. We compute the
+required twiddle at each butterfly site using fft_twiddle.
+
+The pass structure: levels = log2(n). At level L (counting from 0 at the
+top), the array is partitioned into 2^L blocks of size n/2^L. Each block
+is butterflied with one twiddle, then halved by the next pass.
+:End Note
+
+Process called "fft_bit_reverse" takes value as Integer, width as Integer returns Integer:
+    @Reasoning
+    Bit-reverse an integer interpreted as a width-bit number.
+    Used by fft_forward / fft_inverse to compute the correct twiddle
+    indices at each FFT pass (the gm_tab in Pornin's reference embeds
+    this bit-reverse into the precomputed table; we materialise it
+    inline here).
+    @End Reasoning
+    @Implementation
+    Iteratively reads the low bit of value into the high end of result,
+    width times.  Returns 0 when width is 0 (which is the case at the
+    top-most FFT pass with m=1).
+    @End Implementation
+    @Performance_Hints
+    O(width).  For Falcon-1024, width <= 9 inside fft_forward; the cost
+    is dominated by the surrounding transcendentals anyway.
+    @End Performance_Hints
+    @Security_Scope
+    Public sizes only.
+    @End Security_Scope
+    Let result be 0
+    Let v be value
+    Let i be 0
+    While i is less than width:
+        Let bit be v bitwise_and 1
+        Set result to result shifted left by 1
+        Set result to result bitwise_or bit
+        Set v to v shifted right by 1
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+Process called "fft_forward" takes arena as Integer, buf as Integer, n as Integer returns Integer:
+    @Reasoning
+    In-place forward FFT for an n-coefficient cyclotomic Z[X]/(X^n+1) buffer.
+    @End Reasoning
+    @Implementation
+    Cooley-Tukey DIT. At each level, walk the array in blocks of size m,
+    applying the appropriate twiddle to each butterfly pair (a, b):
+        a' = a + zeta * b
+        b' = a - zeta * b
+    The twiddle index for block index j at level with block size m must be
+    computed so that the resulting transform matches evaluation at the
+    primitive 2n-th odd roots of unity zeta_k = exp(i*(2k+1)*pi/n).
+
+    Recursive factorisation of X^n+1:
+      Pass 1 (m=1):
+        X^n+1 = (X^(n/2) - i)(X^(n/2) + i)
+        Single twiddle = i = exp(i*pi/2).
+      Pass 2 (m=2):
+        X^(n/2) - i = (X^(n/4) - omega_0)(X^(n/4) + omega_0)
+                       where omega_0 = exp(i*pi/4) = sqrt(i)
+        X^(n/2) + i = (X^(n/4) - omega_1)(X^(n/4) + omega_1)
+                       where omega_1 = exp(i*3pi/4) = sqrt(-i)
+        Twiddles: omega_0, omega_1 = exp(i*pi/4), exp(i*3pi/4).
+      Pass u (m = 2^u):
+        Twiddle for sub-block j is exp(i*(2*revbits_u(j)+1)*pi/(2*m))
+        where revbits_u is bit-reversal over u bits.
+
+    The bit-reversal is essential: Pornin's reference embeds it in the
+    precomputed gm_tab, which has gm_tab[m+i] = (cos(theta), sin(theta))
+    with theta = (2*revbits_u(i)+1)*pi/(2*m).  We materialise the
+    bit-reversal inline via fft_bit_reverse.
+
+    Implementation outline:
+      hn = n / 2; t = hn; m = 1; u = 0
+      Repeat while t > 0:
+          For each j in 0..m-1:
+              s_inner = revbits_u(j)
+              theta = (2*s_inner + 1) * pi / (2*m)
+              zeta = exp(i*theta)
+              For each i in 0..t-1:
+                  k = 2*j*t + i
+                  a = buf[k]
+                  b = zeta * buf[k+t]
+                  buf[k]   = a + b
+                  buf[k+t] = a - b
+          m = m * 2; t = t / 2; u = u + 1
+    @End Implementation
+    @Performance_Hints
+    O(n log n) Float64 ops. Twiddle factors are recomputed on the fly via
+    cos/sin; an optional cache could halve transcendental cost but is not
+    used here.
+    @End Performance_Hints
+    @Security_Scope
+    Operates on public dimension n; only Float arithmetic on coefficients
+    is data-dependent.
+    @End Security_Scope
+    Let hn be n shifted right by 1
+    Let t be hn
+    Let m be 1
+    Let u be 0
+    While t is greater than 0:
+        Let j be 0
+        While j is less than m:
+            Note: Twiddle: zeta = exp(i*(2*revbits_u(j)+1)*pi/(2*m)).
+            Note: At pass u (m=2^u sub-blocks), revbits over u bits is
+            Note: required so the inner-loop ordering matches Pornin's
+            Note: pre-computed bit-reversed gm_tab.
+            Let s_inner be proc fft_bit_reverse with j, u
+            Let s_eff be 2 multiplied by s_inner plus 1
+            Let s_eff_f be proc FP.fp_from_int with s_eff
+            Let m2 be m multiplied by 2
+            Let m2_f be proc FP.fp_from_int with m2
+            Let pi_v be proc FP.fp_pi
+            Let prod1 be proc FP.fp_mul with s_eff_f, pi_v
+            Let theta be proc FP.fp_div with prod1, m2_f
+            Let zr be proc FP.fp_cos with theta
+            Let zi be proc FP.fp_sin with theta
+
+            Let i be 0
+            While i is less than t:
+                Let k be 2 multiplied by j multiplied by t plus i
+                Let kp be k plus t
+                Let ar be proc fft_get_real with buf, k
+                Let ai be proc fft_get_imag with buf, k
+                Let br_raw be proc fft_get_real with buf, kp
+                Let bi_raw be proc fft_get_imag with buf, kp
+
+                Note: b' = zeta * b = (zr*br_raw - zi*bi_raw) + (zr*bi_raw + zi*br_raw)i
+                Let zr_br be proc FP.fp_mul with zr, br_raw
+                Let zi_bi be proc FP.fp_mul with zi, bi_raw
+                Let br be proc FP.fp_sub with zr_br, zi_bi
+                Let zr_bi be proc FP.fp_mul with zr, bi_raw
+                Let zi_br be proc FP.fp_mul with zi, br_raw
+                Let bi be proc FP.fp_add with zr_bi, zi_br
+
+                Let new_ar be proc FP.fp_add with ar, br
+                Let new_ai be proc FP.fp_add with ai, bi
+                Let new_br be proc FP.fp_sub with ar, br
+                Let new_bi be proc FP.fp_sub with ai, bi
+
+                proc fft_set_real with buf, k, new_ar
+                proc fft_set_imag with buf, k, new_ai
+                proc fft_set_real with buf, kp, new_br
+                proc fft_set_imag with buf, kp, new_bi
+
+                Set i to i plus 1
+            End While
+
+            Set j to j plus 1
+        End While
+        Set m to m multiplied by 2
+        Set t to t shifted right by 1
+        Set u to u plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+INVERSE FFT
+==============================================================================
+:End Note
+
+Process called "fft_inverse" takes arena as Integer, buf as Integer, n as Integer returns Integer:
+    @Reasoning
+    In-place inverse FFT.
+    @End Reasoning
+    @Implementation
+    Gentleman-Sande DIF inverse. Mirrors fft_forward with twiddle direction
+    reversed (negated imaginary part) and an outer 1/n scaling pass.
+
+    Loop structure (reverse of forward):
+      m = n; t = 1
+      Repeat while m > 1:
+          For each j in 0..(m/2)-1:
+              s_eff = (m/2) + j
+              theta = s_eff * pi / m, twiddle = exp(-i*theta) = (cos, -sin)
+              For each i in 0..t-1:
+                  k = 2*j*t + i
+                  a = buf[k]; b = buf[k+t]
+                  buf[k]   = a + b
+                  buf[k+t] = (a - b) * twiddle*
+          m = m/2; t = t*2
+      Final scaling: buf[k] = buf[k] * (1/n) for all k.
+    @End Implementation
+    @Performance_Hints
+    O(n log n).
+    @End Performance_Hints
+    @Security_Scope
+    Operates on FFT-domain data.
+    @End Security_Scope
+    Note: Compute log2(hm) for each pass so we can bit-reverse j.
+    Note: At each inverse pass with current m, the corresponding forward
+    Note: pass used forward_m = hm = m/2 sub-blocks, with log2(hm) bits
+    Note: of bit-reversal needed for the twiddle index.
+    Let m be n
+    Let t be 1
+    Note: log2_hm starts at log2(n/2).
+    Let log2_hm be 0
+    Let tmp be n shifted right by 1
+    While tmp is greater than 1:
+        Set log2_hm to log2_hm plus 1
+        Set tmp to tmp shifted right by 1
+    End While
+    While m is greater than 1:
+        Let hm be m shifted right by 1
+        Let j be 0
+        While j is less than hm:
+            Note: Twiddle index: s_inner = revbits_{log2(hm)}(j), then
+            Note: theta = (2*s_inner + 1) * pi / m (matches forward pass
+            Note: for that m; conjugation via negated sin gives the inverse).
+            Let s_inner be proc fft_bit_reverse with j, log2_hm
+            Let s_eff be 2 multiplied by s_inner plus 1
+            Let s_eff_f be proc FP.fp_from_int with s_eff
+            Let m_f be proc FP.fp_from_int with m
+            Let pi_v be proc FP.fp_pi
+            Let prod1 be proc FP.fp_mul with s_eff_f, pi_v
+            Let theta be proc FP.fp_div with prod1, m_f
+            Let zr be proc FP.fp_cos with theta
+            Let zi_pos be proc FP.fp_sin with theta
+            Let zi be proc FP.fp_neg with zi_pos
+
+            Let i be 0
+            While i is less than t:
+                Let k be 2 multiplied by j multiplied by t plus i
+                Let kp be k plus t
+                Let ar be proc fft_get_real with buf, k
+                Let ai be proc fft_get_imag with buf, k
+                Let br be proc fft_get_real with buf, kp
+                Let bi be proc fft_get_imag with buf, kp
+
+                Let sum_r be proc FP.fp_add with ar, br
+                Let sum_i be proc FP.fp_add with ai, bi
+                Let dif_r be proc FP.fp_sub with ar, br
+                Let dif_i be proc FP.fp_sub with ai, bi
+
+                Note: (dif_r + dif_i i) * (zr + zi i)
+                Let nr1 be proc FP.fp_mul with dif_r, zr
+                Let ni1 be proc FP.fp_mul with dif_i, zi
+                Let new_br be proc FP.fp_sub with nr1, ni1
+                Let nr2 be proc FP.fp_mul with dif_r, zi
+                Let ni2 be proc FP.fp_mul with dif_i, zr
+                Let new_bi be proc FP.fp_add with nr2, ni2
+
+                proc fft_set_real with buf, k, sum_r
+                proc fft_set_imag with buf, k, sum_i
+                proc fft_set_real with buf, kp, new_br
+                proc fft_set_imag with buf, kp, new_bi
+
+                Set i to i plus 1
+            End While
+            Set j to j plus 1
+        End While
+        Set m to m shifted right by 1
+        Set t to t multiplied by 2
+        Set log2_hm to log2_hm minus 1
+    End While
+
+    Note: Final 1/n scaling
+    Let one_v be proc FP.fp_one
+    Let n_f be proc FP.fp_from_int with n
+    Let inv_n be proc FP.fp_div with one_v, n_f
+    Let k2 be 0
+    While k2 is less than n:
+        Let r be proc fft_get_real with buf, k2
+        Let i_v be proc fft_get_imag with buf, k2
+        Let nr be proc FP.fp_mul with r, inv_n
+        Let ni be proc FP.fp_mul with i_v, inv_n
+        proc fft_set_real with buf, k2, nr
+        proc fft_set_imag with buf, k2, ni
+        Set k2 to k2 plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+Pointwise operations in FFT domain
+==============================================================================
+:End Note
+
+Process called "fft_mul_pointwise" takes a as Integer, b as Integer, c as Integer, n as Integer returns Integer:
+    @Reasoning
+    c[k] = a[k] * b[k] across complex pairs.
+    @End Reasoning
+    @Implementation
+    Loop over n coefficients, complex multiply each.
+    @End Implementation
+    @Performance_Hints
+    n complex muls = 4*n mulsd + 2*n addsd/subsd.
+    @End Performance_Hints
+    @Security_Scope
+    FFT-domain data may be secret; operations are CT-friendly.
+    @End Security_Scope
+    Let k be 0
+    While k is less than n:
+        Let ar be proc fft_get_real with a, k
+        Let ai be proc fft_get_imag with a, k
+        Let br be proc fft_get_real with b, k
+        Let bi be proc fft_get_imag with b, k
+
+        Let p1 be proc FP.fp_mul with ar, br
+        Let p2 be proc FP.fp_mul with ai, bi
+        Let new_r be proc FP.fp_sub with p1, p2
+        Let p3 be proc FP.fp_mul with ar, bi
+        Let p4 be proc FP.fp_mul with ai, br
+        Let new_i be proc FP.fp_add with p3, p4
+
+        proc fft_set_real with c, k, new_r
+        proc fft_set_imag with c, k, new_i
+
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fft_add_pointwise" takes a as Integer, b as Integer, c as Integer, n as Integer returns Integer:
+    @Reasoning
+    c[k] = a[k] + b[k].
+    @End Reasoning
+    @Implementation
+    Loop over real and imaginary parts.
+    @End Implementation
+    @Performance_Hints
+    2*n addsd.
+    @End Performance_Hints
+    @Security_Scope
+    CT.
+    @End Security_Scope
+    Let k be 0
+    While k is less than n:
+        Let ar be proc fft_get_real with a, k
+        Let ai be proc fft_get_imag with a, k
+        Let br be proc fft_get_real with b, k
+        Let bi be proc fft_get_imag with b, k
+        Let sum_r be proc FP.fp_add with ar, br
+        Let sum_i be proc FP.fp_add with ai, bi
+        proc fft_set_real with c, k, sum_r
+        proc fft_set_imag with c, k, sum_i
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fft_sub_pointwise" takes a as Integer, b as Integer, c as Integer, n as Integer returns Integer:
+    @Reasoning
+    c[k] = a[k] - b[k].
+    @End Reasoning
+    @Implementation
+    Loop over real and imaginary parts.
+    @End Implementation
+    @Performance_Hints
+    2*n subsd.
+    @End Performance_Hints
+    @Security_Scope
+    CT.
+    @End Security_Scope
+    Let k be 0
+    While k is less than n:
+        Let ar be proc fft_get_real with a, k
+        Let ai be proc fft_get_imag with a, k
+        Let br be proc fft_get_real with b, k
+        Let bi be proc fft_get_imag with b, k
+        Let dif_r be proc FP.fp_sub with ar, br
+        Let dif_i be proc FP.fp_sub with ai, bi
+        proc fft_set_real with c, k, dif_r
+        proc fft_set_imag with c, k, dif_i
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fft_conj" takes a as Integer, c as Integer, n as Integer returns Integer:
+    @Reasoning
+    c[k] = conj(a[k]) = (real, -imag).
+    @End Reasoning
+    @Implementation
+    Loop over coefficients negating the imaginary part.
+    @End Implementation
+    @Performance_Hints
+    n fp_neg.
+    @End Performance_Hints
+    @Security_Scope
+    CT.
+    @End Security_Scope
+    Let k be 0
+    While k is less than n:
+        Let ar be proc fft_get_real with a, k
+        Let ai be proc fft_get_imag with a, k
+        Let neg_ai be proc FP.fp_neg with ai
+        proc fft_set_real with c, k, ar
+        proc fft_set_imag with c, k, neg_ai
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fft_div_pointwise" takes a as Integer, b as Integer, c as Integer, n as Integer returns Integer:
+    @Reasoning
+    c[k] = a[k] / b[k] = a[k] * conj(b[k]) / |b[k]|^2.
+    @End Reasoning
+    @Implementation
+    For each coefficient compute numer = a * conj(b), denom = |b|^2,
+    then divide each numer part by denom.
+    @End Implementation
+    @Performance_Hints
+    n complex divides ~= 6 mulsd + 1 addsd + 2 divsd per coefficient.
+    @End Performance_Hints
+    @Security_Scope
+    Division latency may depend on operand magnitude on some AMD parts.
+    @End Security_Scope
+    Let k be 0
+    While k is less than n:
+        Let ar be proc fft_get_real with a, k
+        Let ai be proc fft_get_imag with a, k
+        Let br be proc fft_get_real with b, k
+        Let bi be proc fft_get_imag with b, k
+        Note: numer = (ar + ai*i)(br - bi*i) = (ar*br + ai*bi) + (ai*br - ar*bi)i
+        Let m1 be proc FP.fp_mul with ar, br
+        Let m2 be proc FP.fp_mul with ai, bi
+        Let nr be proc FP.fp_add with m1, m2
+        Let m3 be proc FP.fp_mul with ai, br
+        Let m4 be proc FP.fp_mul with ar, bi
+        Let ni be proc FP.fp_sub with m3, m4
+        Let m5 be proc FP.fp_mul with br, br
+        Let m6 be proc FP.fp_mul with bi, bi
+        Let denom be proc FP.fp_add with m5, m6
+        Let div_r be proc FP.fp_div with nr, denom
+        Let div_i be proc FP.fp_div with ni, denom
+        proc fft_set_real with c, k, div_r
+        proc fft_set_imag with c, k, div_i
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Note:
+==============================================================================
+Conversion between integer polynomial form and FFT input form
+==============================================================================
+The Falcon keygen produces small-integer polynomials f, g with coefficients
+in roughly [-127, 127]. The signing path's c polynomial has coefficients in
+[0, q-1]. Both must be lifted into the complex FFT input format.
+:End Note
+
+Process called "fft_load_from_int16_signed" takes int_poly as Integer, fft_buf as Integer, n as Integer returns Integer:
+    @Reasoning
+    Loads n int16 (signed) values from int_poly into the real parts of
+    fft_buf with zero imaginary parts.
+    @End Reasoning
+    @Implementation
+    For each k, reads int16 from int_poly[k*2], converts to Float via
+    fp_from_int, writes to fft_buf as (real, 0).
+    @End Implementation
+    @Performance_Hints
+    n cvtsi2sd.
+    @End Performance_Hints
+    @Security_Scope
+    int_poly may be SECRET; loop count public.
+    @End Security_Scope
+    Let k be 0
+    While k is less than n:
+        Let off be k multiplied by 2
+        Let v_raw be Memory.memory_get_int16(int_poly, off)
+        Note: memory_get_int16 returns sign-extended already.
+        Let v_f be proc FP.fp_from_int with v_raw
+        proc fft_set_real with fft_buf, k, v_f
+        Let zero_v be proc FP.fp_zero
+        proc fft_set_imag with fft_buf, k, zero_v
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fft_load_from_int16_modq" takes int_poly as Integer, fft_buf as Integer, n as Integer returns Integer:
+    @Reasoning
+    Loads n int16 values interpreted as elements of Z/(q=12289) and centers
+    them in [-q/2, q/2] before lifting to Float.
+    @End Reasoning
+    @Implementation
+    For each k, reads int16; if value > q/2 subtract q; convert to Float.
+    @End Implementation
+    @Performance_Hints
+    n loads + cvtsi2sd.
+    @End Performance_Hints
+    @Security_Scope
+    Used in the Falcon hash-to-point lift; data is public per spec.
+    @End Security_Scope
+    Let q be 12289
+    Let half_q be 6144
+    Let k be 0
+    While k is less than n:
+        Let off be k multiplied by 2
+        Let raw be Memory.memory_get_int16(int_poly, off)
+        If raw is greater than half_q:
+            Set raw to raw minus q
+        End If
+        Let v_f be proc FP.fp_from_int with raw
+        proc fft_set_real with fft_buf, k, v_f
+        Let zero_v be proc FP.fp_zero
+        proc fft_set_imag with fft_buf, k, zero_v
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fft_extract_real_round" takes fft_buf as Integer, int_poly as Integer, n as Integer returns Integer:
+    @Reasoning
+    For each coefficient writes round-to-nearest-even of the real part as
+    an int16 to int_poly.
+    @End Reasoning
+    @Implementation
+    fp_to_int_round then sign-truncated 16-bit store.
+    @End Implementation
+    @Performance_Hints
+    n cvtsd2si.
+    @End Performance_Hints
+    @Security_Scope
+    Used in the inverse-FFT extraction; data may be SECRET in the keygen
+    path (output of NTRUSolve descent levels).
+    @End Security_Scope
+    Let k be 0
+    While k is less than n:
+        Let v_f be proc fft_get_real with fft_buf, k
+        Let v_int be proc FP.fp_to_int_round with v_f
+        Let off be k multiplied by 2
+        Memory.memory_set_int16(int_poly, off, v_int)
+        Set k to k plus 1
+    End While
+    Return 1
+End Process
+
+Process called "fft_squared_norm" takes fft_buf as Integer, n as Integer returns Float:
+    @Reasoning
+    Compute the squared L2 norm of an FFT-domain polynomial.
+    @End Reasoning
+    @Implementation
+    Sum over k of |buf[k]|^2 = sum over k of (real_k^2 + imag_k^2).
+    For an FFT-form polynomial this corresponds to n times the coefficient
+    domain squared norm (Parseval's identity for the cyclotomic transform).
+    Caller can divide by n if coefficient-domain norm is required.
+    @End Implementation
+    @Performance_Hints
+    2n mulsd + 2n addsd.
+    @End Performance_Hints
+    @Security_Scope
+    The accumulated value depends on potentially SECRET coefficient
+    magnitudes but addsd is constant-time.
+    @End Security_Scope
+    Let acc be proc FP.fp_zero
+    Let k be 0
+    While k is less than n:
+        Let r be proc fft_get_real with fft_buf, k
+        Let i_v be proc fft_get_imag with fft_buf, k
+        Let r2 be proc FP.fp_mul with r, r
+        Let i2 be proc FP.fp_mul with i_v, i_v
+        Set acc to proc FP.fp_add with acc, r2
+        Set acc to proc FP.fp_add with acc, i2
+        Set k to k plus 1
+    End While
+    Return acc
+End Process
+
+Note:
+==============================================================================
+Polynomial multiplication in Z[X]/(X^n+1) via FFT round-trip
+==============================================================================
+Two int16-array inputs, one int16-array output. The output is rounded to
+nearest integer.
+:End Note
+
+Process called "fft_poly_multiply_int_via_fft" takes arena as Integer, a_int as Integer, b_int as Integer, c_int as Integer, n as Integer returns Integer:
+    @Reasoning
+    Compute c = a * b in Z[X]/(X^n+1) using the FFT round-trip.
+    @End Reasoning
+    @Implementation
+    1. Allocate two scratch buffers of 16*n bytes each.
+    2. Load a, b into the buffers (real coefs, zero imag).
+    3. fft_forward both.
+    4. Pointwise multiply into buf_a.
+    5. fft_inverse the product.
+    6. fft_extract_real_round into c_int.
+    @End Implementation
+    @Performance_Hints
+    Three FFTs + one pointwise mul = O(n log n).
+    @End Performance_Hints
+    @Security_Scope
+    Inputs may be SECRET (Falcon keygen secret polynomials).
+    @End Security_Scope
+    Let bytes be n multiplied by 16
+    Let buf_a be Arena.arena_allocate(arena, bytes)
+    Let buf_b be Arena.arena_allocate(arena, bytes)
+    proc fft_load_from_int16_signed with a_int, buf_a, n
+    proc fft_load_from_int16_signed with b_int, buf_b, n
+    proc fft_forward with arena, buf_a, n
+    proc fft_forward with arena, buf_b, n
+    proc fft_mul_pointwise with buf_a, buf_b, buf_a, n
+    proc fft_inverse with arena, buf_a, n
+    proc fft_extract_real_round with buf_a, c_int, n
+    Return 1
+End Process
+
+Note:
+==============================================================================
+END falcon_fft
+==============================================================================
+:End Note

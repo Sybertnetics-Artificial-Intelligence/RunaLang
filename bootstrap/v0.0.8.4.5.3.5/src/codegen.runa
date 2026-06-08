@@ -20,6 +20,9 @@ Transliterated from codegen_x86.c (v0.0.7.3)
 Generates x86-64 assembly from parsed AST
 :End Note
 
+Note: Stage1 bootstrap: opt out of name-mangling (see task #86 commentary below).
+Let __runa_no_mangle__ be 1
+
 Note: Program structure offsets (defined in parser.runa)
 Note: Using numeric values to avoid duplicate symbol errors
 Note: PROGRAM_FUNCTIONS = 0
@@ -1062,13 +1065,34 @@ Process called "codegen_add_variable_with_type_and_param_flag" takes codegen as 
 
                     Note: Update the type slot only when the new declaration carries
                     Note: a more specific type (refining Integer or matching).
+                    Note:
+                    CLEANUP-SEGV FIX: codegen_destroy at the bottom of the file
+                    iterates variables[] and deallocate()s every Variable.type_name
+                    pointer. Therefore every type_name we WRITE into the slot must
+                    be a heap-owned string_duplicate result. The previous code
+                    here stored the raw incoming type_name pointer directly,
+                    which (a) leaked the existing heap copy at offset 16, and
+                    (b) on cleanup tried to deallocate a pointer that, for the
+                    codegen_add_variable(name) entry path, is the .rodata
+                    address of the compiler's own "Integer" string literal
+                    (line 1180: codegen_add_variable_with_type(codegen, name,
+                    "Integer")). Freeing a .rodata address triggers glibc's
+                    munmap_chunk(): invalid pointer abort observed on
+                    primitives/assembly/syscall.runa.
+                    Fix: dup the incoming type_name, free the previous heap
+                    copy, then store the dup. Same lifetime contract as the
+                    initial-creation path at line 1131.
+                    :End Note
                     If type_name is not equal to 0:
                         If check_existing_type is not equal to 0:
                             If string_equals(check_existing_type, "Integer") is equal to 1:
-                                memory_set_pointer(check_var_ptr, 16, type_name)
+                                Let refined_type_dup be string_duplicate(type_name)
+                                deallocate(check_existing_type)
+                                memory_set_pointer(check_var_ptr, 16, refined_type_dup)
                             End If
                         Otherwise:
-                            memory_set_pointer(check_var_ptr, 16, type_name)
+                            Let new_type_dup be string_duplicate(type_name)
+                            memory_set_pointer(check_var_ptr, 16, new_type_dup)
                         End If
                     End If
                     Return 0
@@ -2913,7 +2937,7 @@ Process called "codegen_generate_comparison" takes codegen as Integer, expr as I
             emit_line(output_file, "    pushq %rax")
             emit_line(output_file, "    popq %rdi")
             emit_line(output_file, "    popq %rsi")
-            emit_line(output_file, "    call string_equals@PLT")
+            emit_line(output_file, "    call core_string_core__string_equals@PLT")
             Return 0
         End If
     End If
@@ -2943,7 +2967,7 @@ Process called "codegen_generate_comparison" takes codegen as Integer, expr as I
             emit_line(output_file, "    pushq %rax")
             emit_line(output_file, "    popq %rdi")
             emit_line(output_file, "    popq %rsi")
-            emit_line(output_file, "    call string_equals@PLT")
+            emit_line(output_file, "    call core_string_core__string_equals@PLT")
             emit_line(output_file, "    testq %rax, %rax")
             emit_line(output_file, "    sete %al")
             emit_line(output_file, "    movzbq %al, %rax")
@@ -3195,6 +3219,452 @@ Process called "codegen_lookup_function_by_name" takes codegen as Integer, fn_na
         Set lf_i to lf_i plus 1
     End While
     Return 0
+End Process
+
+Note:
+============================================================================
+NAME-MANGLING SUPPORT (task #86)
+
+Cross-module call collisions arise when two different files define a
+Process with the same name (e.g. core/atomic_core.runa::atomic_load_acquire
+AND assembly/atomic.runa::atomic_load_acquire). Without mangling, both
+definitions emit `.globl atomic_load_acquire`, both call-site
+`proc atomic_load_acquire from AtomicImpl with ptr` references emit
+`call atomic_load_acquire@PLT`, and the linker collapses every call to a
+single definition -- producing infinite self-recursion.
+
+The fix mangles each cross-module call to <module_key>__<func_name> where
+<module_key> is derived from the basename of the defining file (extension
+stripped, dots replaced with underscores). Function definitions in NON-MAIN
+source files emit the same mangled label, ensuring caller and callee agree.
+
+Mangling is NOT applied to:
+  * the entry-point `main` function (must keep its plain name for ld)
+  * external/runtime symbols (functions not found in the program table;
+    resolved by the system linker against librunatime.so / libc / etc.)
+  * bare same-file function calls (target's source_file == main_source_file)
+============================================================================
+:End Note
+
+Note: Derive a module key from a source file path. The key encodes parent
+Note: directory + basename (without extension) to disambiguate files that share
+Note: a basename across the directory tree. Examples:
+Note:   "compiler/frontend/primitives/core/atomic_core.runa"          -> "core_atomic_core"
+Note:   "compiler/frontend/primitives/assembly/atomic.runa"           -> "assembly_atomic"
+Note:   "compiler/frontend/primitives/platform/linux_x86_64/atomic.runa" -> "linux_x86_64_atomic"
+Note:   "platform_selector.runa"                                      -> "platform_selector"
+Note:   "/abs/path/to/assembly/atomic.runa"                           -> "assembly_atomic"
+Note: Returns a freshly heap-allocated string. Caller takes ownership.
+Note: Returns 0 (NULL) if the input path is NULL or yields an empty basename.
+Note: Path separators ('/', '\\'), dots, dashes, and other non-identifier
+Note: characters are normalized to underscores so the result is a valid
+Note: assembler symbol fragment.
+Process called "codegen_module_key_from_path" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+    Let path_len be string_length(path)
+    If path_len is equal to 0:
+        Return 0
+    End If
+
+    Note: Locate the last and second-to-last path separators. The basename
+    Note: lives after the last separator; the parent directory lives between
+    Note: the second-to-last and last separators. When no parent separator
+    Note: exists (e.g. "platform_selector.runa"), the key is just the basename.
+    Let last_sep be 0  Note: 1-based -- 0 means "no separator found"
+    Let prev_sep be 0
+    Let scan_i be 0
+    While scan_i is less than path_len:
+        Let ch be memory_get_byte(path, scan_i)
+        Let is_sep be 0
+        If ch is equal to 47:  Note: '/'
+            Set is_sep to 1
+        End If
+        If ch is equal to 92:  Note: '\\'
+            Set is_sep to 1
+        End If
+        If is_sep is equal to 1:
+            Set prev_sep to last_sep
+            Set last_sep to scan_i plus 1  Note: store 1-based; 0 = none
+        End If
+        Set scan_i to scan_i plus 1
+    End While
+
+    Let basename_start be 0
+    If last_sep is greater than 0:
+        Set basename_start to last_sep minus 1 plus 1  Note: index after last separator
+    End If
+
+    Note: Find the basename's extension boundary (last '.' after basename_start).
+    Let basename_end be path_len
+    Let scan_j be basename_start
+    Let last_dot be 0  Note: 0 = none; otherwise 1-based dot position
+    While scan_j is less than path_len:
+        Let ch2 be memory_get_byte(path, scan_j)
+        If ch2 is equal to 46:  Note: '.'
+            Set last_dot to scan_j plus 1
+        End If
+        Set scan_j to scan_j plus 1
+    End While
+    If last_dot is greater than 0:
+        Set basename_end to last_dot minus 1
+    End If
+
+    Let basename_len be basename_end minus basename_start
+    If basename_len is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Parent directory slice: characters between prev_sep and (last_sep-1).
+    Note: prev_sep == 0 means no second separator -> no parent component to prefix.
+    Let parent_start be 0
+    Let parent_end be 0
+    Let parent_len be 0
+    If last_sep is greater than 0:
+        If prev_sep is greater than 0:
+            Set parent_start to prev_sep minus 1 plus 1  Note: char after prev_sep
+            Set parent_end to last_sep minus 1 minus 1  Note: char before last_sep
+            If parent_end is greater than or equal to parent_start:
+                Set parent_len to parent_end minus parent_start plus 1
+            End If
+        Otherwise:
+            Note: Only one separator and it's at position last_sep. The parent
+            Note: directory is the substring [0 .. last_sep-2]. Use it only if
+            Note: non-empty (i.e. the path didn't start with the separator).
+            Set parent_end to last_sep minus 2
+            If parent_end is greater than or equal to parent_start:
+                Set parent_len to parent_end minus parent_start plus 1
+            End If
+        End If
+    End If
+
+    Note: Total key length: parent + "_" separator + basename, or just basename.
+    Let total_len be basename_len
+    If parent_len is greater than 0:
+        Set total_len to parent_len plus 1 plus basename_len  Note: +1 for '_' separator
+    End If
+
+    Let key_buf be allocate(total_len plus 1)
+    If key_buf is equal to 0:
+        Return 0
+    End If
+
+    Let write_idx be 0
+    If parent_len is greater than 0:
+        Let pi be 0
+        While pi is less than parent_len:
+            Let psrc be memory_get_byte(path, parent_start plus pi)
+            Note: Normalize: dots and dashes -> underscore. Other separator-ish
+            Note: characters likewise. Identifier-safe characters pass through.
+            If psrc is equal to 46:
+                Set psrc to 95
+            End If
+            If psrc is equal to 45:
+                Set psrc to 95
+            End If
+            memory_set_byte(key_buf, write_idx, psrc)
+            Set write_idx to write_idx plus 1
+            Set pi to pi plus 1
+        End While
+        memory_set_byte(key_buf, write_idx, 95)  Note: '_' separator between parent and basename
+        Set write_idx to write_idx plus 1
+    End If
+    Let bi be 0
+    While bi is less than basename_len:
+        Let bsrc be memory_get_byte(path, basename_start plus bi)
+        If bsrc is equal to 46:
+            Set bsrc to 95
+        End If
+        If bsrc is equal to 45:
+            Set bsrc to 95
+        End If
+        memory_set_byte(key_buf, write_idx, bsrc)
+        Set write_idx to write_idx plus 1
+        Set bi to bi plus 1
+    End While
+    memory_set_byte(key_buf, write_idx, 0)  Note: NUL terminator
+
+    Return key_buf
+End Process
+
+Note: Look up the resolved file path for an import alias. Walks the program's
+Note: imports array (Imports at offset 32, count at 40; each Import is 16 bytes:
+Note: filename@0, module_name@8). Returns the raw filename string (as written in
+Note: the source Import statement) on match, or 0 if no import has this alias.
+Note: The returned filename may not be path-equal to the resolved_path stored on
+Note: a Function's source_file slot -- callers that need module-key parity must
+Note: compare by basename via codegen_module_key_from_path on both ends.
+Process called "codegen_lookup_import_filename_by_alias" takes codegen as Integer, alias as Integer returns Integer:
+    If alias is equal to 0:
+        Return 0
+    End If
+    Let li_program be memory_get_pointer(codegen, 48)
+    If li_program is equal to 0:
+        Return 0
+    End If
+    Let li_imports be memory_get_pointer(li_program, 32)
+    Let li_import_count be memory_get_int32(li_program, 40)
+    If li_imports is equal to 0:
+        Return 0
+    End If
+    Let li_i be 0
+    While li_i is less than li_import_count:
+        Let li_offset be li_i multiplied by 8
+        Let li_import_stmt be memory_get_pointer(li_imports, li_offset)
+        If li_import_stmt is not equal to 0:
+            Let li_module_name be memory_get_pointer(li_import_stmt, 8)
+            If li_module_name is not equal to 0:
+                If string_equals(li_module_name, alias) is equal to 1:
+                    Let li_filename be memory_get_pointer(li_import_stmt, 0)
+                    Return li_filename
+                End If
+            End If
+        End If
+        Set li_i to li_i plus 1
+    End While
+    Return 0
+End Process
+
+Note: Check whether the program has an explicit opt-out from name-mangling.
+Note: Files declaring `Let __runa_no_mangle__ be 1` at the top level disable
+Note: mangling for the entire compilation unit. This is the escape hatch for
+Note: the stage1 bootstrap compiler whose source files use bare cross-file
+Note: function calls (e.g. main.runa calling lexer_create without an Import
+Note: statement); under mangling the bare calls would emit plain symbols while
+Note: the callee definitions emit mangled labels, causing link failure.
+Note: New v0.0.8.5 source files do NOT add this sentinel -- they use Import
+Note: statements + qualified or program-table-resolvable bare calls so the
+Note: codegen has the type info to mangle consistently across files.
+Process called "codegen_is_mangling_disabled" takes codegen as Integer returns Integer:
+    Let nd_program be memory_get_pointer(codegen, 48)
+    If nd_program is equal to 0:
+        Return 0
+    End If
+    Let nd_globals_count be memory_get_int32(nd_program, 56)
+    Let nd_globals be memory_get_pointer(nd_program, 48)
+    If nd_globals is equal to 0:
+        Return 0
+    End If
+    Let nd_i be 0
+    While nd_i is less than nd_globals_count:
+        Let nd_g be memory_get_pointer(nd_globals, nd_i multiplied by 8)
+        If nd_g is not equal to 0:
+            Let nd_gname be memory_get_pointer(nd_g, 0)
+            If nd_gname is not equal to 0:
+                If string_equals(nd_gname, "__runa_no_mangle__") is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+        Set nd_i to nd_i plus 1
+    End While
+    Return 0
+End Process
+
+Note: Determine whether a Function's emitted symbol should be mangled. Mangle iff:
+Note:   * the program does NOT carry the __runa_no_mangle__ opt-out
+Note:   * func has a non-null source_file
+Note:   * the func's name is NOT "main" (entry point keeps its plain name for ld)
+Note: Returns a freshly heap-allocated mangled name like "module_key__func_name",
+Note: or 0 (NULL) if no mangling should be applied. Caller takes ownership of the
+Note: returned string. The codegen pointer is passed so we can check the
+Note: program-level opt-out flag.
+Process called "codegen_mangled_name_for_func_in" takes codegen as Integer, func as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+    Note: Wave MANGLING-SYMMETRIC: per-Function no-mangle flag (offset 88) is
+    Note: the authoritative opt-out source. Set by main.runa /
+    Note: process_imports_with_context when the function's source file declares
+    Note: `Let __runa_no_mangle__ be 1`. Reading the flag here (instead of the
+    Note: compilation-unit-level codegen_is_mangling_disabled) means that even
+    Note: when the CURRENT compilation enables mangling, a Function whose
+    Note: SOURCE FILE opted out still emits a plain `.globl <name>`. Symmetric
+    Note: counterpart in codegen_resolve_call_symbol uses the same per-target
+    Note: check so the caller's emitted symbol always matches the callee's.
+    If memory_get_int32(func, 88) is equal to 1:
+        Return 0
+    End If
+    Note: Legacy compilation-unit-wide opt-out remains as a safety net for
+    Note: Function records that pre-date tag-time propagation (e.g. compiler-
+    Note: synthesized __module_init bodies, or functions parsed before
+    Note: program_tag_no_mangle_flags ran). Skipping mangling when the
+    Note: compilation unit declares no-mangle preserves stage1-style
+    Note: bootstrap behavior where every callable in the unit is opt-out.
+    If codegen is not equal to 0:
+        If codegen_is_mangling_disabled(codegen) is equal to 1:
+            Return 0
+        End If
+    End If
+    Let mf_name be memory_get_pointer(func, 0)  Note: func->name
+    If mf_name is equal to 0:
+        Return 0
+    End If
+    Note: Entry point always keeps its plain name.
+    If string_equals(mf_name, "main") is equal to 1:
+        Return 0
+    End If
+    Let mf_source_file be memory_get_pointer(func, 48)  Note: func->source_file
+    If mf_source_file is equal to 0:
+        Return 0
+    End If
+    Let mf_module_key be codegen_module_key_from_path(mf_source_file)
+    If mf_module_key is equal to 0:
+        Return 0
+    End If
+    Note: Concatenate module_key + "__" + func_name.
+    Let mf_sep_tmp be string_concat(mf_module_key, "__")
+    Let mf_full be string_concat(mf_sep_tmp, mf_name)
+    deallocate(mf_module_key)
+    deallocate(mf_sep_tmp)
+    Return mf_full
+End Process
+
+Note: Backward-compat shim: previous callers used codegen_mangled_name_for_func
+Note: without passing codegen. Forward to the _in form with codegen=0 (mangling
+Note: opt-out check is skipped in that branch -- callers using this shim are
+Note: never inside the codegen entry path).
+Process called "codegen_mangled_name_for_func" takes func as Integer returns Integer:
+    Return codegen_mangled_name_for_func_in(0, func)
+End Process
+
+Note: Resolve the emitted symbol for a callsite given a target Function pointer
+Note: and a call-context flag. The call-context flag distinguishes:
+Note:   * call_context = 0: bare EXPR_FUNCTION_CALL (foo(x))
+Note:   * call_context = 1: qualified EXPR_QUALIFIED_CALL (proc foo from M with x)
+Note: For bare calls, returns the mangled name ONLY when the target's source_file
+Note: differs from the current compilation unit's main source file -- this keeps
+Note: in-file bare calls plain (the most common case) while letting bare calls
+Note: into imported modules pick up the mangled symbol.
+Note: For qualified calls, always returns the mangled name (the source-level
+Note: `from Module` qualifier signals a deliberate cross-module reference).
+Note: Returns 0 (NULL) if mangling does not apply -- caller should fall through
+Note: to emitting the plain function name.
+Process called "codegen_resolve_call_symbol" takes codegen as Integer, target_func as Integer, call_context as Integer returns Integer:
+    If target_func is equal to 0:
+        Return 0
+    End If
+    Note: Wave MANGLING-SYMMETRIC: per-Function no-mangle flag (offset 88) on
+    Note: the TARGET function determines the emitted call symbol. When the
+    Note: target's defining file declares `Let __runa_no_mangle__ be 1`, the
+    Note: target's definition emits plain `.globl <name>` (see
+    Note: codegen_mangled_name_for_func_in's matching check), so the caller
+    Note: must also emit `call <name>` -- regardless of the caller's own
+    Note: mangling state. Without this check a mangling-enabled compilation
+    Note: that imports a no-mangle ABI bridge (runtime_api.runa) would emit
+    Note: `call integration_runtime_api__list_append@PLT` against a definition
+    Note: that exports plain `list_append`, producing a link failure.
+    If memory_get_int32(target_func, 88) is equal to 1:
+        Return 0
+    End If
+    Note: NO legacy compilation-unit-wide opt-out here. The per-target check
+    Note: above is authoritative. Falling back to a caller-side opt-out would
+    Note: break the ABI-bridge pattern: when runtime_api.runa (opt-out) calls
+    Note: into the primitive layer (mangling-enabled), the caller-side opt-out
+    Note: would mistakenly skip mangling for `proc list_push from List` and
+    Note: emit `call list_push@PLT` against a `.globl
+    Note: collections_list__list_push` definition. Symmetric mangling demands
+    Note: the call mirror the callee's actual emission.
+    Let rc_name be memory_get_pointer(target_func, 0)
+    If rc_name is equal to 0:
+        Return 0
+    End If
+    Note: External Process declarations (is_external=1 at offset 56) carry a
+    Note: foreign symbol binding (e.g. libc's `sqrt`). Never mangle these --
+    Note: the linker must see the original name.
+    Let rc_is_external be memory_get_int32(target_func, 56)
+    If rc_is_external is equal to 1:
+        Return 0
+    End If
+    Note: Entry-point exception.
+    If string_equals(rc_name, "main") is equal to 1:
+        Return 0
+    End If
+    Let rc_source_file be memory_get_pointer(target_func, 48)
+    If rc_source_file is equal to 0:
+        Return 0
+    End If
+    Note: With program-wide mangling on, EVERY callable definition (bare or
+    Note: qualified, same-file or cross-file) carries the mangled label. Callers
+    Note: must emit the same mangled symbol to link, regardless of the
+    Note: source-level call form. The legacy distinction between
+    Note: same-file (plain) vs cross-file (mangled) is incorrect because the
+    Note: defining file's label is always mangled when mangling is enabled --
+    Note: keeping same-file callers plain produces an immediate link mismatch.
+    Let rc_module_key be codegen_module_key_from_path(rc_source_file)
+    If rc_module_key is equal to 0:
+        Return 0
+    End If
+    Let rc_sep_tmp be string_concat(rc_module_key, "__")
+    Let rc_full be string_concat(rc_sep_tmp, rc_name)
+    deallocate(rc_module_key)
+    deallocate(rc_sep_tmp)
+    Return rc_full
+End Process
+
+Note: Resolve an EXPR_QUALIFIED_CALL's target Function by alias + plain name. If
+Note: the alias maps to an imported file, search the program table for a function
+Note: whose name matches AND whose source_file's basename matches the import's
+Note: filename basename. Falls back to first-name-match when no alias-disambiguated
+Note: target is found (legacy behavior).
+Process called "codegen_lookup_qualified_target" takes codegen as Integer, alias as Integer, fn_name as Integer returns Integer:
+    If fn_name is equal to 0:
+        Return 0
+    End If
+    Let qt_program be memory_get_pointer(codegen, 48)
+    If qt_program is equal to 0:
+        Return 0
+    End If
+    Let qt_fcount be memory_get_int32(qt_program, 8)
+    Let qt_funcs be memory_get_pointer(qt_program, 0)
+    If qt_funcs is equal to 0:
+        Return 0
+    End If
+
+    Note: First pass: alias-disambiguated lookup. Try to map the alias to an
+    Note: import filename, derive its module key, and prefer functions whose
+    Note: source_file's module key matches.
+    Let qt_alias_key be 0
+    If alias is not equal to 0:
+        Let qt_import_filename be codegen_lookup_import_filename_by_alias(codegen, alias)
+        If qt_import_filename is not equal to 0:
+            Set qt_alias_key to codegen_module_key_from_path(qt_import_filename)
+        End If
+    End If
+
+    If qt_alias_key is not equal to 0:
+        Let qt_i be 0
+        While qt_i is less than qt_fcount:
+            Let qt_func be memory_get_pointer(qt_funcs, qt_i multiplied by 8)
+            If qt_func is not equal to 0:
+                Let qt_name be memory_get_pointer(qt_func, 0)
+                If qt_name is not equal to 0:
+                    If string_equals(qt_name, fn_name) is equal to 1:
+                        Let qt_src be memory_get_pointer(qt_func, 48)
+                        If qt_src is not equal to 0:
+                            Let qt_src_key be codegen_module_key_from_path(qt_src)
+                            If qt_src_key is not equal to 0:
+                                If string_equals(qt_src_key, qt_alias_key) is equal to 1:
+                                    deallocate(qt_src_key)
+                                    deallocate(qt_alias_key)
+                                    Return qt_func
+                                End If
+                                deallocate(qt_src_key)
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+            Set qt_i to qt_i plus 1
+        End While
+        deallocate(qt_alias_key)
+    End If
+
+    Note: Fallback: first-name-match (legacy behavior, preserved for backwards
+    Note: compatibility when import alias does not correspond to an Import
+    Note: statement in this compilation unit -- e.g. transitively-merged callers).
+    Return codegen_lookup_function_by_name(codegen, fn_name)
 End Process
 
 Note: SysV AMD64 ABI helper -- classify a Runa type-name string as either SSE
@@ -3516,9 +3986,23 @@ Process called "codegen_generate_function_call" takes codegen as Integer, expr a
         End If
     End If
 
+    Note: Resolve mangled symbol for cross-module bare calls (task #86). Same-file
+    Note: bare calls and unresolved-target calls (runtime/external symbols) keep
+    Note: their plain name; cross-file bare calls into imported modules pick up
+    Note: the `<module_key>__<func_name>` symbol so caller and definition agree.
+    Let fc_emit_name be function_name
+    Let fc_owned_name be 0
+    If target_func is not equal to 0:
+        Let fc_mangled be codegen_resolve_call_symbol(codegen, target_func, 0)
+        If fc_mangled is not equal to 0:
+            Set fc_emit_name to fc_mangled
+            Set fc_owned_name to fc_mangled
+        End If
+    End If
+
     Note: Call the function - add @PLT for external runtime functions
     file_write_buffered(output_file, "    call ", 0)
-    file_write_buffered(output_file, function_name, 0)
+    file_write_buffered(output_file, fc_emit_name, 0)
 
     Note: Check if this is a runtime function that needs @PLT
     Let needs_plt be 0
@@ -3583,6 +4067,11 @@ Process called "codegen_generate_function_call" takes codegen as Integer, expr a
         If inl_ret_is_sse is equal to 1:
             file_write_buffered(output_file, "    movq %xmm0, %rax\n", 0)
         End If
+    End If
+
+    Note: Free the mangled name if we allocated one for this call site.
+    If fc_owned_name is not equal to 0:
+        deallocate(fc_owned_name)
     End If
 
     Note: Result is now in %rax (x86_64 calling convention)
@@ -6032,15 +6521,33 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Let qual_arg_count be memory_get_int32(expr, 32)
         Let qual_arg_names be memory_get_pointer(expr, 40)
 
-        Note: Use plain function name for the call
-        Note: Module prefix is source-level only; imported functions have plain names
-        Let qual_name be qual_function_name
+        Note: ====================================================================
+        Note: NAME-MANGLING for cross-module calls (task #86 fix).
+        Note: Each `proc fn_name from <Alias> with args` must emit a symbol that
+        Note: uniquely identifies the defining module. We derive the module key
+        Note: from the alias's import filename when available, and fall back to
+        Note: the looked-up target Function's source_file when the alias isn't a
+        Note: known Import in this compilation unit (e.g. transitively-merged
+        Note: callers). External Process targets keep their plain names so that
+        Note: foreign symbols (libc's sqrt, runtime exports, etc.) resolve at
+        Note: link time against the actual library symbol.
+        Note: ====================================================================
+        Let qual_target_func be codegen_lookup_qualified_target(codegen, qual_module_name, qual_function_name)
+
+        Let qual_emit_name be qual_function_name  Note: default to plain
+        Let qual_owned_name be 0  Note: tracks heap-allocated mangled name for cleanup
+        If qual_target_func is not equal to 0:
+            Let qual_mangled be codegen_resolve_call_symbol(codegen, qual_target_func, 1)
+            If qual_mangled is not equal to 0:
+                Set qual_emit_name to qual_mangled
+                Set qual_owned_name to qual_mangled
+            End If
+        End If
 
         Note: Reorder named args according to the target function's parameter
-        Note: declaration. Uses plain (post-import-merge) function name lookup;
-        Note: import flattening puts qualified functions under their plain names
-        Note: in the program's function table.
-        codegen_reorder_named_args(codegen, qual_name, qual_arguments, qual_arg_names, qual_arg_count)
+        Note: declaration. Always done by plain name because the program-table
+        Note: lookup keys off plain names (mangling lives only in emission).
+        codegen_reorder_named_args(codegen, qual_function_name, qual_arguments, qual_arg_names, qual_arg_count)
 
         Note: Push arguments in reverse order (x86-64 calling convention)
         Let qual_i be qual_arg_count minus 1
@@ -6058,7 +6565,6 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Note: `External Process called "sqrt" ...`) route Float args to
         Note: %xmm registers and bit-cast %xmm0 returns back to %rax.
         Note: Internal calls continue using the existing GPR-pop path.
-        Let qual_target_func be codegen_lookup_function_by_name(codegen, qual_name)
         Let qual_is_external be 0
         If qual_target_func is not equal to 0:
             Set qual_is_external to memory_get_int32(qual_target_func, 56)
@@ -6107,9 +6613,9 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
             End If
         End If
 
-        Note: Generate call to qualified function
+        Note: Generate call to qualified function -- mangled when applicable.
         file_write_buffered(output_file, "    call ", 0)
-        file_write_buffered(output_file, qual_name, 0)
+        file_write_buffered(output_file, qual_emit_name, 0)
         file_write_buffered(output_file, "@PLT\n", 0)
 
         Note: External-call cleanup: undo stack spills + alignment pad and
@@ -6127,7 +6633,10 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
             End If
         End If
 
-        Note: No cleanup needed - qual_name points to function name from AST
+        Note: Free the heap-allocated mangled name if we allocated one.
+        If qual_owned_name is not equal to 0:
+            deallocate(qual_owned_name)
+        End If
 
         Return 0
     End If
@@ -7673,6 +8182,44 @@ Process called "codegen_create" takes output_filename as Integer, arena as Integ
     memory_set_pointer(codegen, 96, mut_globals)  Note: codegen->mutated_globals (pointer array)
     memory_set_int32(codegen, 104, 0)  Note: codegen->mutated_globals_count
 
+    Note:
+    BUG2 FIX: Explicitly zero string_hashtable at offset 136. The legacy
+    comment above claimed allocate() returns zeroed memory (calloc-style),
+    but the current runtime allocator does NOT reliably zero its returns -
+    it ships with whatever the underlying mmap/sbrk page contains. The
+    string-literal dedup arm in codegen_collect_strings_from_expression
+    reads codegen+136 with `If string_hashtable is not equal to 0:` and
+    dereferences it via hashtable_get; uninitialized garbage at offset 136
+    therefore triggers SEGV the first time a non-trivial source file
+    contains a string-literal comparison (e.g.
+    `If key is equal to "linux_x86_64":` in _get_backend_index_for_key
+    from primitives/assembly/register_map.runa, reached transitively via
+    any atomic_core / bitwise_core / layout import chain).
+    Mirrors the explicit-zero pattern already applied to var_hashtable at
+    offset 72.
+    Also defensively zero current_function (offset 112) and
+    field_cache_buf (offset 120) / field_cache_count (offset 128) which
+    share the same calloc-assumption-without-guarantee in older code paths.
+    :End Note
+    memory_set_pointer(codegen, 112, 0)  Note: codegen->current_function (initially NULL)
+    memory_set_pointer(codegen, 120, 0)  Note: codegen->field_cache_buf (initially NULL, lazy)
+    memory_set_int32(codegen, 128, 0)    Note: codegen->field_cache_count (initially 0)
+    memory_set_pointer(codegen, 136, 0)  Note: codegen->string_hashtable (initially NULL, lazy)
+    Note:
+    Defensive zero of call_graph (offset 80). codegen_destroy reads
+    codegen+80 and, if non-zero, calls callgraph_destroy on it. The
+    pointer is set unconditionally in codegen_generate_code (line 8840)
+    BEFORE any normal cleanup path, so under the standard pipeline the
+    field is always live by destroy time. But the runtime allocator
+    backing allocate() is mmap-anonymous + 32-byte-headered freelist;
+    a freed-then-reused block may carry stale bytes that look like a
+    non-NULL pointer, which would trigger an invalid-pointer
+    dereference in callgraph_destroy on an error-path cleanup that
+    runs before codegen_generate_code. Mirrors the explicit-zero
+    pattern applied to the rest of the pointer fields above.
+    :End Note
+    memory_set_pointer(codegen, 80, 0)   Note: codegen->call_graph (initially NULL, set by codegen_generate_code)
+
     If output_file is equal to 0:
         deallocate(variables)
         deallocate(strings)
@@ -8164,13 +8711,28 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
     Let output_file be memory_get_integer(codegen, 0)  Note: codegen->output_file
     Let func_name be memory_get_pointer(func, 0)  Note: func->name
 
+    Note: Name-mangling for cross-module symbol uniqueness (task #86).
+    Note: Non-main-file functions get a `<module_key>__<func_name>` label so
+    Note: that two files defining the same Process name (e.g. atomic_load_acquire
+    Note: in both core/atomic_core.runa and assembly/atomic.runa) produce
+    Note: distinct emitted symbols. Caller sites emit the same mangled name via
+    Note: codegen_resolve_call_symbol so caller and callee agree at link time.
+    Note: The `main` entry-point function is exempt -- it must keep its plain
+    Note: name for the system linker / runtime startup code. Programs declaring
+    Note: `Let __runa_no_mangle__ be 1` opt out entirely (stage1 bootstrap mode).
+    Let func_mangled_label be codegen_mangled_name_for_func_in(codegen, func)
+    Let func_emit_label be func_name
+    If func_mangled_label is not equal to 0:
+        Set func_emit_label to func_mangled_label
+    End If
+
     Note: Export function as global symbol for cross-module linking
     file_write_buffered(output_file, ".globl ", 0)
-    file_write_buffered(output_file, func_name, 0)
+    file_write_buffered(output_file, func_emit_label, 0)
     file_write_buffered(output_file, "\n", 0)
 
     Note: Function label
-    file_write_buffered(output_file, func_name, 0)
+    file_write_buffered(output_file, func_emit_label, 0)
     file_write_buffered(output_file, ":\n", 0)
 
     Note: Compute per-function frame size up front so both the probe and
@@ -8337,6 +8899,11 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
         emit_line(output_file, "    movq %rbp, %rsp")
         emit_line(output_file, "    popq %rbp")
         emit_line(output_file, "    ret")
+    End If
+
+    Note: Free the mangled label string if we allocated one for this function.
+    If func_mangled_label is not equal to 0:
+        deallocate(func_mangled_label)
     End If
 
     deallocate(param_registers)
@@ -8523,6 +9090,20 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
                 Continue
             End If
             Let global_name be memory_get_pointer(global, 0)  Note: global->name
+            Note: Wave MANGLING-SYMMETRIC: skip the `__runa_no_mangle__` sentinel
+            Note: -- it's a compile-time mangling-policy marker, not actual runtime
+            Note: data. Emitting it produces a `.globl __runa_no_mangle__` in
+            Note: every translation unit that opts out, which causes multiple-
+            Note: definition link errors when more than one such .o is linked
+            Note: together (every stage1 .o exports it). The codegen reads the
+            Note: sentinel at compile time via program_has_no_mangle_sentinel /
+            Note: codegen_is_mangling_disabled; no runtime storage is required.
+            If global_name is not equal to 0:
+                If string_equals(global_name, "__runa_no_mangle__") is equal to 1:
+                    Set i to i plus 1
+                    Continue
+                End If
+            End If
             Set initial_value to memory_get_pointer(global, 16)  Note: global->initial_value
             If initial_value is not equal to 0:
                 file_write_buffered(output_file, ".globl ", 0)
@@ -8641,6 +9222,15 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
         While i is less than global_count:
             Set global to memory_get_pointer(globals, i multiplied by 8)
             Set global_name to memory_get_pointer(global, 0)  Note: global->name
+            Note: Wave MANGLING-SYMMETRIC: skip the `__runa_no_mangle__` sentinel
+            Note: (compile-time mangling marker, never runtime data). Mirrors the
+            Note: corresponding .data-section skip above.
+            If global_name is not equal to 0:
+                If string_equals(global_name, "__runa_no_mangle__") is equal to 1:
+                    Set i to i plus 1
+                    Continue
+                End If
+            End If
             Set initial_value to memory_get_pointer(global, 16)  Note: global->initial_value
             If initial_value is equal to 0:
                 file_write_buffered(output_file, ".globl ", 0)

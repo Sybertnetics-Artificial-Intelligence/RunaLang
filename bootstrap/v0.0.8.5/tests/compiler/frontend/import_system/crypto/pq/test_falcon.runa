@@ -4,18 +4,27 @@ Licensed under Apache 2.0
 :End Note
 
 Note:
-Structural tests for Falcon.
+==============================================================================
+Unit tests for compiler/frontend/import_system/crypto/pq/falcon.runa
+==============================================================================
 
-Tests:
+Coverage:
   1. Parameter accessors for Falcon-512 and Falcon-1024.
   2. Modular arithmetic helpers modulo q = 12289.
-  3. NTT round-trip identity on a known polynomial.
-  4. Signature pack/unpack round-trip.
+  3. Discrete Gaussian sampler over Z (Step 1 of Falcon-step plan):
+     - Empirical mean and variance match the target sigma to within
+       statistical tolerance over 10000 samples.
+     - falcon_sample_short_polynomial fills n coefficients each bounded
+       by the spec sanity bound.
+     - falcon_short_polynomial_norm_check matches the expected predicate
+       on hand-picked f, g pairs.
+  4. Convolution count selector and base-sampler shake-bridge consistency.
 :End Note
 
 Import "tests/test_utils.runa" as T
 Import "runtime/core/memory/arena.runa" as Arena
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/import_system/crypto/sha3.runa" as Sha3
 Import "compiler/frontend/import_system/crypto/pq/falcon.runa" as Falcon
 
 Process called "test_param_accessors" that takes results as Integer returns Integer:
@@ -31,6 +40,10 @@ Process called "test_param_accessors" that takes results as Integer returns Inte
     T.assert_equal(results, "Falcon-1024 sk=2305", Falcon.falcon_sk_size(2), 2305)
 
     T.assert_equal(results, "Falcon q=12289", Falcon.falcon_q(), 12289)
+
+    T.assert_equal(results, "keygen_g(level=1) = 2", Falcon.falcon_keygen_g(1), 2)
+    T.assert_equal(results, "keygen_g(level=2) = 1", Falcon.falcon_keygen_g(2), 1)
+    T.assert_equal(results, "sigma_0_x1000 = 1820", Falcon.falcon_sigma_0_times_1000(), 1820)
     Return 1
 End Process
 
@@ -43,10 +56,461 @@ Process called "test_modular_arith" that takes results as Integer returns Intege
     Return 1
 End Process
 
+Note:
+==============================================================================
+Convolution count selector
+==============================================================================
+Verifies that the integer rounding in falcon_convolution_count_from_sigma
+matches the closed-form g = max(1, round((sigma / sigma_0)^2)).
+
+  sigma_x1000 = 1820 (== sigma_0): g = 1
+  sigma_x1000 = 2575 (sqrt(2) * sigma_0): g = 2
+  sigma_x1000 = 4054 (Falcon-512 sigma_max): g = 5
+  sigma_x1000 = 2865 (Falcon-1024 sigma_max): g = 2 (round of 2.48)
+:End Note
+
+Process called "test_convolution_count" that takes results as Integer returns Integer:
+    T.begin_suite(results, "falcon: convolution count selector")
+    T.assert_equal(results, "g(1820) = 1", Falcon.falcon_convolution_count_from_sigma(1820), 1)
+    T.assert_equal(results, "g(1000) = 1 (clamp below sigma_0)", Falcon.falcon_convolution_count_from_sigma(1000), 1)
+    T.assert_equal(results, "g(2575) = 2", Falcon.falcon_convolution_count_from_sigma(2575), 2)
+    T.assert_equal(results, "g(4054) = 5", Falcon.falcon_convolution_count_from_sigma(4054), 5)
+    T.assert_equal(results, "g(2865) = 2", Falcon.falcon_convolution_count_from_sigma(2865), 2)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+Statistical Gaussian sampler test
+==============================================================================
+Draws 10000 samples from D_{Z, 0, sigma_0} (g = 1 path: a single signed
+base sample per draw) and verifies:
+  - empirical mean is within +/- 0.05 of 0 (scaled: |sum| <= 500)
+  - empirical sum of squares is within +/- 10% of n * sigma_0^2
+    (n * 1.8205^2 = 10000 * 3.3142 = 33142, so range is [29828, 36456])
+  - all samples fall within +/- 18 (the half-Gaussian truncation bound)
+
+Statistical guarantee: for sigma_0 = 1.8205 and 10000 i.i.d. samples,
+the sum has std dev sqrt(10000) * 1.8205 = 182.05, so |sum| <= 500 is
+within ~2.75 standard deviations - the test fails with probability
+< 1% if the sampler is correct.
+:End Note
+
+Process called "test_gaussian_statistics_sigma0" that takes results as Integer returns Integer:
+    T.begin_suite(results, "falcon: discrete Gaussian sampler at sigma_0")
+
+    Note: 10000 samples * (9 + 1) bytes/sample * g=1 ~ 100KB plus shake ctx
+    Let arena be Arena.arena_create(2097152)
+    T.assert_not_null(results, "arena created", arena)
+
+    Let shake_ctx be Sha3.shake256_init(arena)
+    T.assert_not_null(results, "shake context created", shake_ctx)
+
+    Note: Deterministic seed for reproducible test
+    Let seed be Arena.arena_allocate(arena, 48)
+    Let si be 0
+    While si is less than 48:
+        Memory.memory_set_byte(seed, si, si)
+        Set si to si plus 1
+    End While
+    Sha3.shake256_absorb(shake_ctx, seed, 48)
+    Sha3.shake256_finalize(shake_ctx)
+
+    Let n_samples be 10000
+    Let sigma_0_x1000 be 1820
+
+    Let total be 0
+    Let sum_squares be 0
+    Let max_abs be 0
+    Let any_out_of_range be 0
+
+    Let i be 0
+    While i is less than n_samples:
+        Let s be Falcon.falcon_gaussian_sampler_z_centered(arena, shake_ctx, sigma_0_x1000)
+        Set total to total plus s
+        Set sum_squares to sum_squares plus (s multiplied by s)
+        Let abs_s be s
+        If abs_s is less than 0:
+            Set abs_s to 0 minus abs_s
+        End If
+        If abs_s is greater than max_abs:
+            Set max_abs to abs_s
+        End If
+        If abs_s is greater than 18:
+            Set any_out_of_range to 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: |total| <= 500 (about 2.75 sigma)
+    Let abs_total be total
+    If abs_total is less than 0:
+        Set abs_total to 0 minus abs_total
+    End If
+    T.assert_less_than(results, "|mean*n| <= 500", abs_total, 501)
+
+    Note: 29828 <= sum_squares <= 36456 (±10% of expected 33142)
+    T.assert_greater_than(results, "sum_squares >= 29828", sum_squares, 29827)
+    T.assert_less_than(results, "sum_squares <= 36456", sum_squares, 36457)
+
+    Note: No sample exceeds the base sampler truncation bound (18)
+    T.assert_equal(results, "all samples in [-18, 18]", any_out_of_range, 0)
+
+    Sha3.shake256_destroy(shake_ctx)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+Wider sigma statistical test (g=5, sigma_eff = sqrt(5) * sigma_0 ~ 4.071)
+==============================================================================
+Targets the Falcon-512 sigma_max ~ 4.054. With g=5 the convolutional sum
+produces samples with effective sigma ~ 4.071, very close to the spec
+value. Verifies:
+  - empirical mean is within +/- 0.1 of 0 (|sum| <= 1000 for 10000 samples)
+  - sum_squares is within +/- 10% of n * sigma_eff^2 ~ 165732
+  - max absolute value bounded by 5 * 18 = 90
+:End Note
+
+Process called "test_gaussian_statistics_wide" that takes results as Integer returns Integer:
+    T.begin_suite(results, "falcon: discrete Gaussian sampler at sigma_max_512")
+
+    Note: 10000 samples * 50 bytes/sample (g=5 * 10 bytes) ~ 500KB
+    Let arena be Arena.arena_create(2097152)
+    T.assert_not_null(results, "arena created", arena)
+
+    Let shake_ctx be Sha3.shake256_init(arena)
+    T.assert_not_null(results, "shake context created", shake_ctx)
+
+    Let seed be Arena.arena_allocate(arena, 48)
+    Let si be 0
+    While si is less than 48:
+        Memory.memory_set_byte(seed, si, si plus 128)
+        Set si to si plus 1
+    End While
+    Sha3.shake256_absorb(shake_ctx, seed, 48)
+    Sha3.shake256_finalize(shake_ctx)
+
+    Let n_samples be 10000
+    Let sigma_target_x1000 be 4054
+
+    Let total be 0
+    Let sum_squares be 0
+    Let max_abs be 0
+    Let any_out_of_range be 0
+
+    Let i be 0
+    While i is less than n_samples:
+        Let s be Falcon.falcon_gaussian_sampler_z_centered(arena, shake_ctx, sigma_target_x1000)
+        Set total to total plus s
+        Set sum_squares to sum_squares plus (s multiplied by s)
+        Let abs_s be s
+        If abs_s is less than 0:
+            Set abs_s to 0 minus abs_s
+        End If
+        If abs_s is greater than max_abs:
+            Set max_abs to abs_s
+        End If
+        If abs_s is greater than 90:
+            Set any_out_of_range to 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Let abs_total be total
+    If abs_total is less than 0:
+        Set abs_total to 0 minus abs_total
+    End If
+    T.assert_less_than(results, "|mean*n| <= 1000", abs_total, 1001)
+
+    Note: Expected sum_squares ~ 10000 * 4.071^2 = 165732. Range +/- 10%
+    T.assert_greater_than(results, "sum_squares >= 149159", sum_squares, 149158)
+    T.assert_less_than(results, "sum_squares <= 182305", sum_squares, 182306)
+    T.assert_equal(results, "all samples in [-90, 90]", any_out_of_range, 0)
+
+    Sha3.shake256_destroy(shake_ctx)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+falcon_sample_short_polynomial: 512 coeffs at Falcon-512 sigma
+==============================================================================
+Samples a length-512 polynomial and verifies:
+  - returns n (512)
+  - every coefficient is in [-90, 90] (sigma=4.054 * 5 = 20 plus the
+    base sampler bound of 18 -> 90 absolute max for g=5)
+  - the total squared norm reflects the wider sigma proposal but is
+    primarily checked as a sanity bound (the per-coefficient range
+    suffices for the unit-test assertion)
+:End Note
+
+Process called "test_sample_short_polynomial" that takes results as Integer returns Integer:
+    T.begin_suite(results, "falcon: sample_short_polynomial 512")
+
+    Let arena be Arena.arena_create(524288)
+    T.assert_not_null(results, "arena created", arena)
+
+    Let shake_ctx be Sha3.shake256_init(arena)
+    Let seed be Arena.arena_allocate(arena, 48)
+    Let si be 0
+    While si is less than 48:
+        Memory.memory_set_byte(seed, si, si)
+        Set si to si plus 1
+    End While
+    Sha3.shake256_absorb(shake_ctx, seed, 48)
+    Sha3.shake256_finalize(shake_ctx)
+
+    Let n be 512
+    Let coeffs be Arena.arena_allocate(arena, 1024)
+    Let rc be Falcon.falcon_sample_short_polynomial(arena, shake_ctx, n, 4054, coeffs)
+    T.assert_equal(results, "rc == 512", rc, n)
+
+    Let i be 0
+    Let any_out_of_range be 0
+    While i is less than n:
+        Let c be Memory.memory_get_int16(coeffs, i multiplied by 2)
+        Let abs_c be c
+        If abs_c is less than 0:
+            Set abs_c to 0 minus abs_c
+        End If
+        If abs_c is greater than 90:
+            Set any_out_of_range to 1
+        End If
+        Set i to i plus 1
+    End While
+    T.assert_equal(results, "all coeffs in [-90, 90]", any_out_of_range, 0)
+
+    Sha3.shake256_destroy(shake_ctx)
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+Norm squared and norm check predicates
+==============================================================================
+Hand-crafted polynomials with known squared norms:
+  f0[i] = 1 for all i in [0..n), so ||f0||^2 = n
+  g0[i] = 2 for all i in [0..n), so ||g0||^2 = 4n
+  ||(f0, g0)||^2 = 5n
+
+For n=512 and q=12289:
+  ||(f0, g0)||^2 = 512 + 2048 = 2560
+  bound = 16823 (per Falcon round-3 reference)
+  predicate: 2560 <= 16823 -> 1 (accept)
+
+For n=512 with deliberately large polynomials:
+  f1[i] = 50, g1[i] = 50: ||f1||^2 = 50^2 * 512 = 1280000
+  predicate: 1280000 > 16823 -> 0 (reject)
+:End Note
+
+Process called "test_norm_check" that takes results as Integer returns Integer:
+    T.begin_suite(results, "falcon: norm squared and norm check")
+
+    Let arena be Arena.arena_create(262144)
+    T.assert_not_null(results, "arena created", arena)
+
+    Let n be 512
+    Let q be 12289
+
+    Let f0 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g0 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let i be 0
+    While i is less than n:
+        Memory.memory_set_int16(f0, i multiplied by 2, 1)
+        Memory.memory_set_int16(g0, i multiplied by 2, 2)
+        Set i to i plus 1
+    End While
+    Let norm_f0 be Falcon.falcon_short_polynomial_norm_squared(f0, n)
+    Let norm_g0 be Falcon.falcon_short_polynomial_norm_squared(g0, n)
+    T.assert_equal(results, "||f0||^2 = 512", norm_f0, 512)
+    T.assert_equal(results, "||g0||^2 = 2048", norm_g0, 2048)
+    Let check0 be Falcon.falcon_short_polynomial_norm_check(f0, g0, n, q)
+    T.assert_equal(results, "(f0,g0) accepted", check0, 1)
+
+    Let f1 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g1 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let j be 0
+    While j is less than n:
+        Memory.memory_set_int16(f1, j multiplied by 2, 50)
+        Memory.memory_set_int16(g1, j multiplied by 2, 50)
+        Set j to j plus 1
+    End While
+    Let norm_f1 be Falcon.falcon_short_polynomial_norm_squared(f1, n)
+    T.assert_equal(results, "||f1||^2 = 1280000", norm_f1, 1280000)
+    Let check1 be Falcon.falcon_short_polynomial_norm_check(f1, g1, n, q)
+    T.assert_equal(results, "(f1,g1) rejected", check1, 0)
+
+    Note: Boundary case: ||(f, g)||^2 exactly at bound 16823.
+    Note: Use f[0]=129, g all zero -> ||f||^2 = 16641 (passes)
+    Note: Then f[0]=130 -> ||f||^2 = 16900 (fails)
+    Let f2 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let g2 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let k be 0
+    While k is less than n:
+        Memory.memory_set_int16(f2, k multiplied by 2, 0)
+        Memory.memory_set_int16(g2, k multiplied by 2, 0)
+        Set k to k plus 1
+    End While
+    Memory.memory_set_int16(f2, 0, 129)
+    Let norm_f2 be Falcon.falcon_short_polynomial_norm_squared(f2, n)
+    T.assert_equal(results, "||f2||^2 = 16641", norm_f2, 16641)
+    Let check2 be Falcon.falcon_short_polynomial_norm_check(f2, g2, n, q)
+    T.assert_equal(results, "(f2,g2) accepted at 16641", check2, 1)
+
+    Memory.memory_set_int16(f2, 0, 130)
+    Let norm_f2_b be Falcon.falcon_short_polynomial_norm_squared(f2, n)
+    T.assert_equal(results, "||f2_b||^2 = 16900", norm_f2_b, 16900)
+    Let check3 be Falcon.falcon_short_polynomial_norm_check(f2, g2, n, q)
+    T.assert_equal(results, "(f2_b,g2) rejected at 16900", check3, 0)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
+Note:
+==============================================================================
+Test: (F, G) per-coefficient bound predicate.
+
+Per Falcon round-3 spec section 3.11.4 + Pornin reference implementation
+(falcon-impl-20211101 keygen.c::solve_NTRU lim = (1 << (max_FG_bits[logn] - 1)) - 1
+which evaluates to 127 for every Falcon parameter set), the (F, G) output
+of NTRUSolve must satisfy |F[i]| <= 127 AND |G[i]| <= 127 for all i, so
+the int8 secret-key encoding (bits_per = 8 for F) is lossless.
+
+This test exercises:
+  1. All-zero (F, G): accepted.
+  2. (F, G) with every coefficient = 100, 127, -127: accepted (boundary).
+  3. (F, G) with one coefficient = 128 in F: rejected (just over bound).
+  4. (F, G) with one coefficient = -128 in G: rejected (just over bound).
+  5. (F, G) with a coefficient deep beyond bound (e.g., 500): rejected.
+  6. Asymmetric: F all in-bound, G has one out-of-bound: rejected.
+  7. The wrong (f, g)-style 1.17^2 q predicate WOULD reject a plausible
+     NTRUSolve output (every coeff = 100): proving the predicates are
+     not interchangeable.
+:End Note
+
+Process called "test_FG_coefficient_bound_check" that takes results as Integer returns Integer:
+    T.begin_suite(results, "falcon: (F, G) per-coefficient bound check")
+
+    Let arena be Arena.arena_create(262144)
+    T.assert_not_null(results, "arena created", arena)
+
+    Let n be 512
+    Let q be 12289
+
+    Note: Case 1: all-zero (F, G) accepted.
+    Let F0 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G0 be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_zero(F0, n multiplied by 2)
+    Memory.memory_zero(G0, n multiplied by 2)
+    Let bound0 be Falcon.falcon_FG_coefficient_bound_check(F0, G0, n)
+    T.assert_equal(results, "(F0=0, G0=0) accepted", bound0, 1)
+
+    Note: Case 2: every coefficient = 100 (well below 127): accepted.
+    Let F1 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G1 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let i be 0
+    While i is less than n:
+        Memory.memory_set_int16(F1, i multiplied by 2, 100)
+        Memory.memory_set_int16(G1, i multiplied by 2, 100)
+        Set i to i plus 1
+    End While
+    Let bound1 be Falcon.falcon_FG_coefficient_bound_check(F1, G1, n)
+    T.assert_equal(results, "(F1=100, G1=100) accepted", bound1, 1)
+
+    Note: Demonstrate the (f, g)-style predicate WOULD reject this same
+    Note: (F1, G1). ||F1||^2 = 100^2 * 512 = 5_120_000 >> 16823.  This
+    Note: proves the two predicates measure different things and cannot
+    Note: substitute for each other.
+    Let wrong_predicate_result be Falcon.falcon_short_polynomial_norm_check(F1, G1, n, q)
+    T.assert_equal(results, "(F1, G1) rejected by (f,g)-style bound (predicate mismatch)", wrong_predicate_result, 0)
+
+    Note: Case 3: F[0] = 127 (exact upper boundary): accepted.
+    Let F2 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G2 be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_zero(F2, n multiplied by 2)
+    Memory.memory_zero(G2, n multiplied by 2)
+    Memory.memory_set_int16(F2, 0, 127)
+    Memory.memory_set_int16(G2, 0, 127)
+    Let bound2 be Falcon.falcon_FG_coefficient_bound_check(F2, G2, n)
+    T.assert_equal(results, "(F2[0]=127, G2[0]=127) accepted at boundary", bound2, 1)
+
+    Note: Case 4: F[0] = -127 (exact lower boundary): accepted.
+    Memory.memory_set_int16(F2, 0, 0 minus 127)
+    Memory.memory_set_int16(G2, 0, 0 minus 127)
+    Let bound3 be Falcon.falcon_FG_coefficient_bound_check(F2, G2, n)
+    T.assert_equal(results, "(F2[0]=-127, G2[0]=-127) accepted at boundary", bound3, 1)
+
+    Note: Case 5: F[0] = 128 (just over): rejected.
+    Let F3 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G3 be Arena.arena_allocate(arena, n multiplied by 2)
+    Memory.memory_zero(F3, n multiplied by 2)
+    Memory.memory_zero(G3, n multiplied by 2)
+    Memory.memory_set_int16(F3, 0, 128)
+    Let bound4 be Falcon.falcon_FG_coefficient_bound_check(F3, G3, n)
+    T.assert_equal(results, "(F3[0]=128) rejected above upper bound", bound4, 0)
+
+    Note: Case 6: G[10] = -128 (just under lower bound): rejected.
+    Memory.memory_zero(F3, n multiplied by 2)
+    Memory.memory_zero(G3, n multiplied by 2)
+    Memory.memory_set_int16(G3, 20, 0 minus 128)
+    Let bound5 be Falcon.falcon_FG_coefficient_bound_check(F3, G3, n)
+    T.assert_equal(results, "(G3[10]=-128) rejected below lower bound", bound5, 0)
+
+    Note: Case 7: large positive coefficient (typical NTRUSolve precision-loss
+    Note: artifact in the worst case): rejected.
+    Memory.memory_zero(F3, n multiplied by 2)
+    Memory.memory_zero(G3, n multiplied by 2)
+    Memory.memory_set_int16(F3, 100, 500)
+    Let bound6 be Falcon.falcon_FG_coefficient_bound_check(F3, G3, n)
+    T.assert_equal(results, "(F3[100]=500) rejected far above bound", bound6, 0)
+
+    Note: Case 8: asymmetric -- F all in-bound, G has single out-of-bound
+    Note: at high index (ensures G is fully scanned, not just F).
+    Let F4 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let G4 be Arena.arena_allocate(arena, n multiplied by 2)
+    Let k be 0
+    While k is less than n:
+        Memory.memory_set_int16(F4, k multiplied by 2, 50)
+        Memory.memory_set_int16(G4, k multiplied by 2, 50)
+        Set k to k plus 1
+    End While
+    Memory.memory_set_int16(G4, (n minus 1) multiplied by 2, 129)
+    Let bound7 be Falcon.falcon_FG_coefficient_bound_check(F4, G4, n)
+    T.assert_equal(results, "asymmetric G[n-1]=129 rejected", bound7, 0)
+
+    Note: Case 9: smaller n=2 to verify the loop terminates correctly at
+    Note: tight bounds and the predicate is n-agnostic.
+    Let F_small be Arena.arena_allocate(arena, 2 multiplied by 2)
+    Let G_small be Arena.arena_allocate(arena, 2 multiplied by 2)
+    Memory.memory_set_int16(F_small, 0, 127)
+    Memory.memory_set_int16(F_small, 2, 0 minus 127)
+    Memory.memory_set_int16(G_small, 0, 0)
+    Memory.memory_set_int16(G_small, 2, 127)
+    Let bound_small_a be Falcon.falcon_FG_coefficient_bound_check(F_small, G_small, 2)
+    T.assert_equal(results, "n=2 boundary case accepted", bound_small_a, 1)
+    Memory.memory_set_int16(F_small, 2, 0 minus 200)
+    Let bound_small_b be Falcon.falcon_FG_coefficient_bound_check(F_small, G_small, 2)
+    T.assert_equal(results, "n=2 with F[1]=-200 rejected", bound_small_b, 0)
+
+    Arena.arena_destroy(arena)
+    Return 1
+End Process
+
 Process called "main" returns Integer:
     Let results be T.create_test_results()
     test_param_accessors(results)
     test_modular_arith(results)
+    test_convolution_count(results)
+    test_norm_check(results)
+    test_FG_coefficient_bound_check(results)
+    test_gaussian_statistics_sigma0(results)
+    test_gaussian_statistics_wide(results)
+    test_sample_short_polynomial(results)
     T.print_summary(results)
     Let exit_code be T.get_failed(results)
     T.destroy_test_results(results)
