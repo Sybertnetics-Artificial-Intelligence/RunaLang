@@ -191,3 +191,262 @@ Process called "pset_is_empty" takes ps as Integer returns Integer:
     Let pm be proc memory_get_int64 from Memory with ps, 0
     Return proc pmap_is_empty from PMap with pm
 End Process
+
+@Reasoning
+Persistent remove. Returns a new set whose backing map has the
+underlying key dissociated. The old set remains valid.
+@End Reasoning
+
+@Implementation
+1) Call pmap_dissoc on the underlying map.
+2) Allocate a new set header pointing at the new map.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pset_remove" takes ps as Integer, value as Integer returns Integer:
+    If ps is equal to 0:
+        Return 0
+    End If
+    Let old_map be proc memory_get_int64 from Memory with ps, 0
+    Let new_map be proc pmap_dissoc from PMap with old_map, value
+    If new_map is equal to 0:
+        Return 0
+    End If
+    Let new_ps be proc allocate from Layout with PSET_HEADER_SIZE
+    If new_ps is equal to 0:
+        proc pmap_destroy from PMap with new_map
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with new_ps, 0, new_map
+    Return new_ps
+End Process
+
+@Reasoning
+Union of two persistent sets: returns a new set containing every
+element that appears in either input. Original sets are unchanged.
+@End Reasoning
+
+@Implementation
+1) Start with a path-copy of set_a's backing map.
+2) Collect every key from set_b's underlying map into a buffer.
+3) For each key not already in the running result, fold it in via
+   pmap_assoc. Each iteration allocates a new map; the intermediate
+   maps are destroyed so memory accumulation is bounded to the final
+   union map plus one transient.
+@End Implementation
+
+@Performance_Hints
+Time: O(|B| log(|A|+|B|)). The cost is dominated by the smaller-set
+keys being folded into the larger map.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pset_union" takes set_a as Integer, set_b as Integer returns Integer:
+    If set_a is equal to 0:
+        Return 0
+    End If
+    If set_b is equal to 0:
+        Return 0
+    End If
+    Let map_a be proc memory_get_int64 from Memory with set_a, 0
+    Let map_b be proc memory_get_int64 from Memory with set_b, 0
+    Note: Build a fresh result map. Fold every key from set_a, then
+    Note: every key from set_b. HAMT assoc is idempotent: a duplicate
+    Note: key produces a map with the same logical contents. Keeping
+    Note: result independent of map_a / map_b lets the caller destroy
+    Note: each independently.
+    Let running be proc pmap_create from PMap
+    If running is equal to 0:
+        Return 0
+    End If
+    Let keys_a be proc pmap_collect_keys from PMap with map_a
+    If keys_a is equal to 0:
+        proc pmap_destroy from PMap with running
+        Return 0
+    End If
+    Let count_a be proc memory_get_int64 from Memory with keys_a, 0
+    Let i be 0
+    While i is less than count_a:
+        Let k_off be 8 plus (i multiplied by 8)
+        Let k be proc memory_get_int64 from Memory with keys_a, k_off
+        Let next_map be proc pmap_assoc from PMap with running, k, 1
+        If next_map is equal to 0:
+            proc deallocate from Layout with keys_a
+            proc pmap_destroy from PMap with running
+            Return 0
+        End If
+        proc pmap_destroy from PMap with running
+        Set running to next_map
+        Set i to i plus 1
+    End While
+    proc deallocate from Layout with keys_a
+    Let keys_b be proc pmap_collect_keys from PMap with map_b
+    If keys_b is equal to 0:
+        proc pmap_destroy from PMap with running
+        Return 0
+    End If
+    Let count_b be proc memory_get_int64 from Memory with keys_b, 0
+    Let j be 0
+    While j is less than count_b:
+        Let k_off2 be 8 plus (j multiplied by 8)
+        Let k2 be proc memory_get_int64 from Memory with keys_b, k_off2
+        Let next_map2 be proc pmap_assoc from PMap with running, k2, 1
+        If next_map2 is equal to 0:
+            proc deallocate from Layout with keys_b
+            proc pmap_destroy from PMap with running
+            Return 0
+        End If
+        proc pmap_destroy from PMap with running
+        Set running to next_map2
+        Set j to j plus 1
+    End While
+    proc deallocate from Layout with keys_b
+    Let new_ps be proc allocate from Layout with PSET_HEADER_SIZE
+    If new_ps is equal to 0:
+        proc pmap_destroy from PMap with running
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with new_ps, 0, running
+    Return new_ps
+End Process
+
+@Reasoning
+Intersection of two persistent sets: returns a new set containing
+every element that appears in both inputs.
+@End Reasoning
+
+@Implementation
+Iterate the keys of the smaller of the two sets; for each key, if it
+exists in the other set, add it to a fresh result set. Starting from
+the empty set keeps the running structure small.
+
+To keep the comparison directional and simple, the implementation
+iterates set_a's keys and tests pmap_contains against set_b. (A more
+optimal version would pick the smaller of the two; for correctness
+and clarity the direction is fixed.)
+@End Implementation
+
+@Performance_Hints
+Time: O(|A| log |B|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pset_intersect" takes set_a as Integer, set_b as Integer returns Integer:
+    If set_a is equal to 0:
+        Return 0
+    End If
+    If set_b is equal to 0:
+        Return 0
+    End If
+    Let map_a be proc memory_get_int64 from Memory with set_a, 0
+    Let map_b be proc memory_get_int64 from Memory with set_b, 0
+    Let keys_buf be proc pmap_collect_keys from PMap with map_a
+    If keys_buf is equal to 0:
+        Return 0
+    End If
+    Let key_count be proc memory_get_int64 from Memory with keys_buf, 0
+    Let running be proc pmap_create from PMap
+    If running is equal to 0:
+        proc deallocate from Layout with keys_buf
+        Return 0
+    End If
+    Let i be 0
+    While i is less than key_count:
+        Let k_off be 8 plus (i multiplied by 8)
+        Let k be proc memory_get_int64 from Memory with keys_buf, k_off
+        Let in_b be proc pmap_contains from PMap with map_b, k
+        If in_b is equal to 1:
+            Let next_map be proc pmap_assoc from PMap with running, k, 1
+            If next_map is equal to 0:
+                proc deallocate from Layout with keys_buf
+                proc pmap_destroy from PMap with running
+                Return 0
+            End If
+            proc pmap_destroy from PMap with running
+            Set running to next_map
+        End If
+        Set i to i plus 1
+    End While
+    proc deallocate from Layout with keys_buf
+    Let new_ps be proc allocate from Layout with PSET_HEADER_SIZE
+    If new_ps is equal to 0:
+        proc pmap_destroy from PMap with running
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with new_ps, 0, running
+    Return new_ps
+End Process
+
+@Reasoning
+Set difference: returns a new set containing every element of set_a
+that is not in set_b. set_a \\ set_b.
+@End Reasoning
+
+@Implementation
+Iterate set_a's keys; for each key not in set_b, add it to a fresh
+result set. Symmetric to pset_intersect but the membership test is
+inverted.
+@End Implementation
+
+@Performance_Hints
+Time: O(|A| log |B|).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pset_diff" takes set_a as Integer, set_b as Integer returns Integer:
+    If set_a is equal to 0:
+        Return 0
+    End If
+    If set_b is equal to 0:
+        Return 0
+    End If
+    Let map_a be proc memory_get_int64 from Memory with set_a, 0
+    Let map_b be proc memory_get_int64 from Memory with set_b, 0
+    Let keys_buf be proc pmap_collect_keys from PMap with map_a
+    If keys_buf is equal to 0:
+        Return 0
+    End If
+    Let key_count be proc memory_get_int64 from Memory with keys_buf, 0
+    Let running be proc pmap_create from PMap
+    If running is equal to 0:
+        proc deallocate from Layout with keys_buf
+        Return 0
+    End If
+    Let i be 0
+    While i is less than key_count:
+        Let k_off be 8 plus (i multiplied by 8)
+        Let k be proc memory_get_int64 from Memory with keys_buf, k_off
+        Let in_b be proc pmap_contains from PMap with map_b, k
+        If in_b is equal to 0:
+            Let next_map be proc pmap_assoc from PMap with running, k, 1
+            If next_map is equal to 0:
+                proc deallocate from Layout with keys_buf
+                proc pmap_destroy from PMap with running
+                Return 0
+            End If
+            proc pmap_destroy from PMap with running
+            Set running to next_map
+        End If
+        Set i to i plus 1
+    End While
+    proc deallocate from Layout with keys_buf
+    Let new_ps be proc allocate from Layout with PSET_HEADER_SIZE
+    If new_ps is equal to 0:
+        proc pmap_destroy from PMap with running
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with new_ps, 0, running
+    Return new_ps
+End Process

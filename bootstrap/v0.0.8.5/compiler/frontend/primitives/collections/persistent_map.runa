@@ -708,6 +708,454 @@ Process called "pmap_assoc" takes pm as Integer, key as Integer, value as Intege
     Return new_pm
 End Process
 
+Note: ============================================================================
+Note: DELETE
+Note: ============================================================================
+
+@Reasoning
+Build a new BITMAP node by removing the slot at logical index `idx`
+(which must be currently present in `bnode.bitmap`). Returns a fresh
+node that shares structure with the old children except the removed
+slot. Children are retained (refcount incremented) for the new node's
+ownership.
+
+Caller responsibilities:
+- The old slot must be present (`bnode.bitmap & (1 << idx) != 0`).
+- The old node must have at least 2 children (so the result has >= 1
+  child). For the single-child case, callers compress to either 0
+  (signal "subtree empty") or to the surviving child directly.
+@End Reasoning
+
+@Implementation
+1) Compute new bitmap = old bitmap & ~(1 << idx).
+2) Compute slot = popcount(old bitmap & (bit - 1)).
+3) Allocate new node of size 32 + (old_count - 1) * 8.
+4) Copy old children [0..slot) and (slot..old_count); retain each.
+@End Implementation
+
+@Performance_Hints
+Time: O(children). Space: O(children).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pmap_bitmap_remove" takes bnode as Integer, idx as Integer returns Integer:
+    Let bitmap be proc memory_get_int64 from Memory with bnode, 8
+    Let old_count be proc memory_get_int64 from Memory with bnode, 24
+    Let bit be 1 shifted left by idx
+    Let new_bitmap be bitmap bitwise and (0 minus 1 minus bit)
+    Let lower_bits be bitmap bitwise and (bit minus 1)
+    Let slot be proc pmap_popcount with lower_bits
+    Let new_count be old_count minus 1
+    Let new_size be 32 plus (new_count multiplied by 8)
+    Let new_node be proc allocate from Layout with new_size
+    If new_node is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with new_node, 0, PMAP_TAG_BITMAP
+    proc memory_set_int64 from Memory with new_node, 8, new_bitmap
+    proc memory_set_int64 from Memory with new_node, 16, 1
+    proc memory_set_int64 from Memory with new_node, 24, new_count
+    Let i be 0
+    While i is less than slot:
+        Let src_addr be bnode plus (32 plus (i multiplied by 8))
+        Let dst_addr be new_node plus (32 plus (i multiplied by 8))
+        Let child be proc memory_get_int64 from Memory with src_addr, 0
+        proc memory_set_int64 from Memory with dst_addr, 0, child
+        Let rc be proc memory_get_int64 from Memory with child, 16
+        proc memory_set_int64 from Memory with child, 16, rc plus 1
+        Set i to i plus 1
+    End While
+    Let src_off be slot plus 1
+    Let dst_off be slot
+    While src_off is less than old_count:
+        Let src_addr be bnode plus (32 plus (src_off multiplied by 8))
+        Let dst_addr be new_node plus (32 plus (dst_off multiplied by 8))
+        Let child be proc memory_get_int64 from Memory with src_addr, 0
+        proc memory_set_int64 from Memory with dst_addr, 0, child
+        Let rc be proc memory_get_int64 from Memory with child, 16
+        proc memory_set_int64 from Memory with child, 16, rc plus 1
+        Set src_off to src_off plus 1
+        Set dst_off to dst_off plus 1
+    End While
+    Return new_node
+End Process
+
+@Reasoning
+Build a new BITMAP node that replaces the existing child at slot
+`slot` (logical index `idx`) with a new child pointer. Used when a
+recursive delete returns a structurally smaller (but still non-empty)
+subtree that we still want to occupy the same logical slot. Differs
+from pmap_bitmap_assoc in that it does NOT add the slot if absent:
+the slot is assumed present.
+@End Reasoning
+
+@Implementation
+1) Allocate new BITMAP node with same bitmap and count.
+2) Copy children except the one at slot, which becomes new_child.
+3) Retain all other children.
+@End Implementation
+
+@Performance_Hints
+Time: O(children).
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pmap_bitmap_replace" takes bnode as Integer, idx as Integer, new_child as Integer returns Integer:
+    Let bitmap be proc memory_get_int64 from Memory with bnode, 8
+    Let old_count be proc memory_get_int64 from Memory with bnode, 24
+    Let bit be 1 shifted left by idx
+    Let lower_bits be bitmap bitwise and (bit minus 1)
+    Let slot be proc pmap_popcount with lower_bits
+    Let new_size be 32 plus (old_count multiplied by 8)
+    Let new_node be proc allocate from Layout with new_size
+    If new_node is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with new_node, 0, PMAP_TAG_BITMAP
+    proc memory_set_int64 from Memory with new_node, 8, bitmap
+    proc memory_set_int64 from Memory with new_node, 16, 1
+    proc memory_set_int64 from Memory with new_node, 24, old_count
+    Let i be 0
+    While i is less than old_count:
+        Let src_addr be bnode plus (32 plus (i multiplied by 8))
+        Let dst_addr be new_node plus (32 plus (i multiplied by 8))
+        If i is equal to slot:
+            proc memory_set_int64 from Memory with dst_addr, 0, new_child
+        Otherwise:
+            Let child be proc memory_get_int64 from Memory with src_addr, 0
+            proc memory_set_int64 from Memory with dst_addr, 0, child
+            Let rc be proc memory_get_int64 from Memory with child, 16
+            proc memory_set_int64 from Memory with child, 16, rc plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return new_node
+End Process
+
+@Reasoning
+Internal dissoc: walk the trie for the key being deleted. Returns a
+fresh subtree root (or 0 if the subtree becomes empty after deletion,
+which the caller treats as "compress further"). Special-cases:
+- key absent: returns the OLD subtree unchanged but with refcount
+  bumped (sentinel: we signal "no change" by returning the input
+  node itself; the public wrapper detects this).
+- LEAF matching key: return 0 (subtree gone).
+- LEAF non-matching: return input node (no change).
+- BITMAP: descend; on a non-empty result, path-copy via
+  pmap_bitmap_replace; on an empty result (0), drop the slot via
+  pmap_bitmap_remove; if the resulting BITMAP would have 0 children,
+  return 0; if exactly 1 child and that child is a LEAF or COLLISION,
+  return the child directly (compression).
+- COLLISION: build a smaller COLLISION; if down to 1 entry, convert
+  to a LEAF.
+@End Reasoning
+
+@Implementation
+Returns a tagged result via the convention:
+- 0 means "subtree fully removed" (parent should drop its slot).
+- input node pointer means "no change" (key was absent).
+- any other pointer means "new subtree root".
+The wrapper pmap_dissoc detects the no-change case by pointer
+identity and skips the size decrement / new header allocation cost.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n).
+@End Performance_Hints
+
+@Security_Scope
+Returns the input node if key absent. Returns 0 if the entire subtree
+is gone. Otherwise returns a freshly-allocated path-copy.
+@End Security_Scope
+Process called "pmap_dissoc_node" takes node as Integer, key as Integer, hash as Integer, depth as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let tag be proc memory_get_int64 from Memory with node, 0
+    If tag is equal to PMAP_TAG_LEAF:
+        Let leaf_key be proc memory_get_int64 from Memory with node, 24
+        If leaf_key is equal to key:
+            Return 0
+        End If
+        Return node
+    End If
+    If tag is equal to PMAP_TAG_COLLISION:
+        Let coll_hash be proc memory_get_int64 from Memory with node, 8
+        Let pair_count be proc memory_get_int64 from Memory with node, 24
+        If coll_hash is not equal to hash:
+            Return node
+        End If
+        Let i be 0
+        Let match_index be 0 minus 1
+        While i is less than pair_count:
+            Let pair_addr be node plus (32 plus (i multiplied by 16))
+            Let ck be proc memory_get_int64 from Memory with pair_addr, 0
+            If ck is equal to key:
+                Set match_index to i
+                Set i to pair_count
+            Otherwise:
+                Set i to i plus 1
+            End If
+        End While
+        If match_index is equal to 0 minus 1:
+            Return node
+        End If
+        If pair_count is equal to 2:
+            Note: one entry left -> compress to leaf
+            Let survivor_idx be 1
+            If match_index is equal to 1:
+                Set survivor_idx to 0
+            End If
+            Let s_addr be node plus (32 plus (survivor_idx multiplied by 16))
+            Let sk be proc memory_get_int64 from Memory with s_addr, 0
+            Let sv be proc memory_get_int64 from Memory with s_addr, 8
+            Return proc pmap_leaf_create with sk, sv, hash
+        End If
+        Let new_pair_count be pair_count minus 1
+        Let new_size be 32 plus (new_pair_count multiplied by 16)
+        Let new_coll be proc allocate from Layout with new_size
+        If new_coll is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with new_coll, 0, PMAP_TAG_COLLISION
+        proc memory_set_int64 from Memory with new_coll, 8, coll_hash
+        proc memory_set_int64 from Memory with new_coll, 16, 1
+        proc memory_set_int64 from Memory with new_coll, 24, new_pair_count
+        Let j be 0
+        Let dst be 0
+        While j is less than pair_count:
+            If j is not equal to match_index:
+                Let src_addr be node plus (32 plus (j multiplied by 16))
+                Let dst_addr be new_coll plus (32 plus (dst multiplied by 16))
+                Let pk be proc memory_get_int64 from Memory with src_addr, 0
+                Let pv be proc memory_get_int64 from Memory with src_addr, 8
+                proc memory_set_int64 from Memory with dst_addr, 0, pk
+                proc memory_set_int64 from Memory with dst_addr, 8, pv
+                Set dst to dst plus 1
+            End If
+            Set j to j plus 1
+        End While
+        Return new_coll
+    End If
+    If tag is equal to PMAP_TAG_BITMAP:
+        Let bitmap be proc memory_get_int64 from Memory with node, 8
+        Let idx be proc pmap_level_index with hash, depth
+        Let bit be 1 shifted left by idx
+        Let present be bitmap bitwise and bit
+        If present is equal to 0:
+            Return node
+        End If
+        Let lower_bits be bitmap bitwise and (bit minus 1)
+        Let slot be proc pmap_popcount with lower_bits
+        Let child_addr be node plus (32 plus (slot multiplied by 8))
+        Let child be proc memory_get_int64 from Memory with child_addr, 0
+        Let new_child be proc pmap_dissoc_node with child, key, hash, depth plus 1
+        If new_child is equal to child:
+            Note: child didn't change -> key absent in this subtree
+            Return node
+        End If
+        Let old_count be proc memory_get_int64 from Memory with node, 24
+        If new_child is equal to 0:
+            Note: child fully removed
+            If old_count is equal to 1:
+                Return 0
+            End If
+            If old_count is equal to 2:
+                Note: one survivor; if it's a LEAF or COLLISION and we
+                Note: are not at the top level, compress upward. Top
+                Note: level (depth = 0) must remain a BITMAP because
+                Note: the root invariant expects the trie shape.
+                Let other_slot be 1 minus slot
+                Let other_addr be node plus (32 plus (other_slot multiplied by 8))
+                Let other_child be proc memory_get_int64 from Memory with other_addr, 0
+                Let other_tag be proc memory_get_int64 from Memory with other_child, 0
+                If depth is greater than 0 and (other_tag is equal to PMAP_TAG_LEAF or other_tag is equal to PMAP_TAG_COLLISION):
+                    Note: retain the other child (we are returning it
+                    Note: instead of holding a new bitmap reference)
+                    Let rc be proc memory_get_int64 from Memory with other_child, 16
+                    proc memory_set_int64 from Memory with other_child, 16, rc plus 1
+                    Return other_child
+                End If
+            End If
+            Return proc pmap_bitmap_remove with node, idx
+        End If
+        Note: child shrank but not empty -> replace in place via copy
+        Return proc pmap_bitmap_replace with node, idx, new_child
+    End If
+    Return node
+End Process
+
+@Reasoning
+Public dissoc (remove). Returns a new map with the key removed;
+the original map is unchanged. If the key was absent, returns a
+fresh header pointing to the same root (with sharing); callers can
+detect "no change" by comparing the returned size with the input.
+@End Reasoning
+
+@Implementation
+1) Compute hash; call pmap_dissoc_node on the root with depth = 0.
+2) Allocate a new header.
+3) If the returned root is identical to the old root, the key was
+   absent: copy size as-is.
+4) If the returned root differs (even to 0), set new root and
+   decrement size by 1.
+@End Implementation
+
+@Performance_Hints
+Time: O(log n). Space: O(log n) for path copies.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure.
+@End Security_Scope
+Process called "pmap_dissoc" takes pm as Integer, key as Integer returns Integer:
+    If pm is equal to 0:
+        Return 0
+    End If
+    Let new_pm be proc allocate from Layout with PMAP_HEADER_SIZE
+    If new_pm is equal to 0:
+        Return 0
+    End If
+    Let hash be proc pmap_hash with key
+    Let old_root be proc memory_get_int64 from Memory with pm, 0
+    Let old_size be proc memory_get_int64 from Memory with pm, 8
+    If old_root is equal to 0:
+        proc memory_set_int64 from Memory with new_pm, 0, 0
+        proc memory_set_int64 from Memory with new_pm, 8, 0
+        Return new_pm
+    End If
+    Let new_root be proc pmap_dissoc_node with old_root, key, hash, 0
+    If new_root is equal to old_root:
+        Note: key absent; retain old root and reuse size
+        Let rc be proc memory_get_int64 from Memory with old_root, 16
+        proc memory_set_int64 from Memory with old_root, 16, rc plus 1
+        proc memory_set_int64 from Memory with new_pm, 0, old_root
+        proc memory_set_int64 from Memory with new_pm, 8, old_size
+        Return new_pm
+    End If
+    proc memory_set_int64 from Memory with new_pm, 0, new_root
+    proc memory_set_int64 from Memory with new_pm, 8, old_size minus 1
+    Return new_pm
+End Process
+
+@Reasoning
+Collect every key in the map into a freshly-allocated buffer. The
+buffer is allocated through Layout.allocate so the caller can free it
+with Layout.deallocate when done. The first 8 bytes of the buffer
+hold the key count; subsequent bytes hold count*8 keys.
+
+This is the iteration primitive used by set-theoretic operations
+(union/intersection/difference) over PSet, which is layered on top of
+PMap.
+@End Reasoning
+
+@Implementation
+1) Read size from the header; allocate (1 + size) * 8 bytes.
+2) Walk the trie with an explicit stack of node pointers. For each
+   visited node:
+   - LEAF: write key.
+   - COLLISION: write each pair's key.
+   - BITMAP: push every child.
+3) Write count at offset 0.
+@End Implementation
+
+@Performance_Hints
+Time: O(n). Space: O(n + h) where h is trie height.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on allocation failure. Caller-owned buffer.
+@End Security_Scope
+Process called "pmap_collect_keys" takes pm as Integer returns Integer:
+    If pm is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Memory with pm, 8
+    Let buf_bytes be 8 plus (size multiplied by 8)
+    If buf_bytes is less than 16:
+        Set buf_bytes to 16
+    End If
+    Let buf be proc allocate from Layout with buf_bytes
+    If buf is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with buf, 0, 0
+    Let root be proc memory_get_int64 from Memory with pm, 0
+    If root is equal to 0:
+        Return buf
+    End If
+    Let stack_cap be 64
+    Let stack_bytes be stack_cap multiplied by 8
+    Let stack_buf be proc allocate from Layout with stack_bytes
+    If stack_buf is equal to 0:
+        proc deallocate from Layout with buf
+        Return 0
+    End If
+    Let sp be 0
+    proc memory_set_int64 from Memory with stack_buf, 0, root
+    Set sp to 1
+    Let write_count be 0
+    While sp is greater than 0:
+        Set sp to sp minus 1
+        Let off be sp multiplied by 8
+        Let node be proc memory_get_int64 from Memory with stack_buf, off
+        Let tag be proc memory_get_int64 from Memory with node, 0
+        If tag is equal to PMAP_TAG_LEAF:
+            Let k be proc memory_get_int64 from Memory with node, 24
+            Let dst_off be 8 plus (write_count multiplied by 8)
+            proc memory_set_int64 from Memory with buf, dst_off, k
+            Set write_count to write_count plus 1
+        End If
+        If tag is equal to PMAP_TAG_COLLISION:
+            Let pair_count be proc memory_get_int64 from Memory with node, 24
+            Let pi be 0
+            While pi is less than pair_count:
+                Let pair_addr be node plus (32 plus (pi multiplied by 16))
+                Let pk be proc memory_get_int64 from Memory with pair_addr, 0
+                Let dst_off be 8 plus (write_count multiplied by 8)
+                proc memory_set_int64 from Memory with buf, dst_off, pk
+                Set write_count to write_count plus 1
+                Set pi to pi plus 1
+            End While
+        End If
+        If tag is equal to PMAP_TAG_BITMAP:
+            Let child_count be proc memory_get_int64 from Memory with node, 24
+            Let ci be 0
+            While ci is less than child_count:
+                Let need be sp plus 1
+                If need is greater than stack_cap:
+                    Let new_cap be stack_cap multiplied by 2
+                    Let new_bytes be new_cap multiplied by 8
+                    Let new_stack be proc allocate from Layout with new_bytes
+                    If new_stack is equal to 0:
+                        proc deallocate from Layout with stack_buf
+                        proc deallocate from Layout with buf
+                        Return 0
+                    End If
+                    Let copy_bytes be stack_cap multiplied by 8
+                    proc memory_copy from Memory with new_stack, stack_buf, copy_bytes
+                    proc deallocate from Layout with stack_buf
+                    Set stack_buf to new_stack
+                    Set stack_cap to new_cap
+                End If
+                Let child_addr be node plus (32 plus (ci multiplied by 8))
+                Let child be proc memory_get_int64 from Memory with child_addr, 0
+                Let s_off be sp multiplied by 8
+                proc memory_set_int64 from Memory with stack_buf, s_off, child
+                Set sp to sp plus 1
+                Set ci to ci plus 1
+            End While
+        End If
+    End While
+    proc memory_set_int64 from Memory with buf, 0, write_count
+    proc deallocate from Layout with stack_buf
+    Return buf
+End Process
+
 @Reasoning
 Size accessor.
 @End Reasoning
