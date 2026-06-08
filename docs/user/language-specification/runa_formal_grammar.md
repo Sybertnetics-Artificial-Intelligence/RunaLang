@@ -745,7 +745,7 @@ dict_entry            ::= identifier "as" expression
 4. Power operator (to the power of, **) - **Precedence 6, Right associative**
 5. Multiplicative operators (multiplied by, divided by, modulo by, *, /, %) - **Precedence 5, Left associative**
 6. Additive operators (plus, minus, joined with, +, -) - **Precedence 4, Left associative**
-7. Bitwise shift operators (shifted left by, shifted right by)
+7. Bitwise shift operators (shifted left by, shifted right by - unsigned/logical)
 8. Comparison operators (equals, is greater than, <, >, <=, >=, !=)
 9. Bitwise AND (bitwise and, &)
 10. Bitwise XOR (bitwise xor, ^)
@@ -768,7 +768,13 @@ The compiler enforces operator usage based on context:
 - **Member Access**: `of`, `from` (for accessing properties/methods)
 - **Range**: `through`, `up to and including`
 - **Index Access**: `at` (for array/dictionary indexing)
-- **Bitwise**: `bitwise and`, `bitwise or`, `bitwise xor`, `bitwise not`, `shifted left by`, `shifted right by`
+- **Bitwise**: `bitwise and`, `bitwise or`, `bitwise xor`, `bitwise not`, `shifted left by`, `shifted right by` (unsigned/logical)
+
+### Shift Semantics
+
+- `shifted left by N` emits a logical left shift (x86_64: `salq`/`shlq`). For a 64-bit Integer the count is masked to 6 bits by the hardware.
+- `shifted right by N` emits a **logical (unsigned) right shift** (x86_64: `shrq`). Bit 63 of the result is always zero regardless of the input sign. This is the default because the vast majority of shift-right call sites (serialization, hashing, byte extraction, big-integer limb manipulation, masking) require unsigned semantics; using arithmetic right shift here silently corrupts values whose bit 63 is set.
+- For the rare case where an **arithmetic right shift** (sign-extending) is required (e.g. dividing a signed value by a power of two with floor-toward-negative-infinity rounding), use the `divided by 2^N` idiom: `value divided by 2` for N=1, `value divided by 4` for N=2, `value divided by 2 divided by 2 divided by 2` for N=3, etc. The compiler lowers integer division by a power-of-two constant to the appropriate sequence.
 - **Logical**: `and`, `or`, `not`, `logical and`, `logical or`, `logical not`
 
 ## Grammar Notes
