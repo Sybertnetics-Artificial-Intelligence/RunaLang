@@ -2021,6 +2021,53 @@ Process called "codegen_get_expression_type" takes codegen as Integer, expr as I
         Return "Integer"
     End If
 
+    If expr_type is equal to 2:  Note: EXPR_BINARY_OP
+        Note:
+        Result-type inference for binary arithmetic. Without this branch,
+        `Let d be a minus b` (Floats) infers d's type as 0/unknown, which
+        downstream codegen treats as Integer. The next use of d (e.g.
+        `Return 0.0 minus d` or `If d is less than 0.0`) then fails to
+        re-dispatch into the Float path because d looks Integer.
+
+        For TOKEN_PLUS(16) / TOKEN_MINUS(17) / TOKEN_MULTIPLIED_BY(35) /
+        TOKEN_DIVIDED_BY(36): the result type is Float when either
+        operand is Float-typed, otherwise Integer. Other operators
+        (modulo, bitwise, shift, logical, comparison) keep the existing
+        fall-through-to-unknown behavior because they don't operate on
+        Float operands in canonical Runa.
+
+        Layout: left at offset 8, right at offset 16, operator at offset 24
+        (see expression_create_binary_op in parser.runa).
+        :End Note
+        Let bop_op be memory_get_integer(expr, 24)
+        Let bop_is_arith be 0
+        If bop_op is equal to 16:
+            Set bop_is_arith to 1
+        Otherwise If bop_op is equal to 17:
+            Set bop_is_arith to 1
+        Otherwise If bop_op is equal to 35:
+            Set bop_is_arith to 1
+        Otherwise If bop_op is equal to 36:
+            Set bop_is_arith to 1
+        End If
+        If bop_is_arith is equal to 1:
+            Let bop_left be memory_get_pointer(expr, 8)
+            Let bop_right be memory_get_pointer(expr, 16)
+            Let bop_l_type be codegen_get_expression_type(codegen, bop_left)
+            Let bop_r_type be codegen_get_expression_type(codegen, bop_right)
+            If codegen_type_is_sse_class(bop_l_type) is equal to 1:
+                Return "Float"
+            End If
+            If codegen_type_is_sse_class(bop_r_type) is equal to 1:
+                Return "Float"
+            End If
+            Note: Both operands integer-class (or unknown) -- fall through
+            Note: to Integer result.
+            Return "Integer"
+        End If
+        Return 0
+    End If
+
     Note: Other expression types don't have determinable types in this context
     Return 0
 End Process
@@ -2484,12 +2531,150 @@ Process called "codegen_generate_string_literal" takes codegen as Integer, expr 
     Return 0
 End Process
 
+Note:
+Float binary-op dispatch helper.
+Given a Runa expression node `expr`, return 1 when the AST node is statically
+recognizable as a Float-typed value: an EXPR_FLOAT_LITERAL (type 29), an
+EXPR_CONVERT whose target type is Float/Float64, or any other expression whose
+inferred type-name (via codegen_get_expression_type) is "Float" or "Float64".
+Returns 0 otherwise (Integer-class, pointer, boolean, unknown).
+
+This drives codegen_generate_binary_op's choice between integer ALU ops
+(addq/subq/imulq/idivq) and SSE2 scalar-double ops (addsd/subsd/mulsd/divsd).
+:End Note
+Process called "codegen_expr_is_float" takes codegen as Integer, expr as Integer returns Integer:
+    If expr is less than 65536:
+        Return 0
+    End If
+    Let cfe_etype be memory_get_int32(expr, 0)
+    If cfe_etype is equal to 29:  Note: EXPR_FLOAT_LITERAL
+        Return 1
+    End If
+    Let cfe_type_name be codegen_get_expression_type(codegen, expr)
+    Return codegen_type_is_sse_class(cfe_type_name)
+End Process
+
+Note:
+Emit a Float-class binary arithmetic operation using SSE2 scalar-double ops.
+Operands are evaluated through the standard codegen_generate_expression path
+(result in %rax as the IEEE-754 binary64 bit pattern). If either operand is
+not yet Float (e.g. mixed `Float plus Integer`), it is converted in place via
+cvtsi2sd before the SSE op runs. The final IEEE-754 bit pattern returns in
+%rax so downstream codegen continues to treat Float values as GPR-resident
+int64 bit patterns -- matching how Float literals, function args, and local
+slots are already handled throughout this compiler.
+
+Supported operators (Runa token IDs):
+  16  TOKEN_PLUS            -> addsd
+  17  TOKEN_MINUS           -> subsd
+  35  TOKEN_MULTIPLIED_BY   -> mulsd
+  36  TOKEN_DIVIDED_BY      -> divsd
+
+Caller guarantees `operator` is one of the four arithmetic tokens above.
+:End Note
+Process called "codegen_emit_float_binary_op" takes codegen as Integer, left as Integer, right as Integer, operator as Integer returns Integer:
+    Let output_file be memory_get_integer(codegen, 0)
+    Let left_is_float be codegen_expr_is_float(codegen, left)
+    Let right_is_float be codegen_expr_is_float(codegen, right)
+
+    Note: Evaluate left operand, then convert to Float bits if it arrived as
+    Note: an Integer (e.g. literal `2` in `1.5 plus 2`). cvtsi2sd reads a
+    Note: signed 64-bit integer from %rax into %xmm0, then movq %xmm0,%rax
+    Note: rewrites %rax as the IEEE-754 binary64 bit pattern. For values
+    Note: already in Float form (left_is_float == 1), %rax already holds the
+    Note: correct bit pattern -- no conversion needed.
+    codegen_generate_expression(codegen, left)
+    If left_is_float is equal to 0:
+        emit_line(output_file, "    cvtsi2sd %rax, %xmm0")
+        emit_line(output_file, "    movq %xmm0, %rax")
+    End If
+    emit_line(output_file, "    pushq %rax")
+
+    Note: Evaluate right operand, mirror the conversion.
+    codegen_generate_expression(codegen, right)
+    If right_is_float is equal to 0:
+        emit_line(output_file, "    cvtsi2sd %rax, %xmm0")
+        emit_line(output_file, "    movq %xmm0, %rax")
+    End If
+
+    Note: Pop left back to %rbx, load both into SSE2 registers, perform the
+    Note: scalar-double op, and write the result bits back to %rax.
+    Note: SSE2 layout (AT&T syntax): `addsd src, dst` computes dst = dst op src.
+    Note: We want result = left op right, so dst=%xmm0 (left) and src=%xmm1 (right).
+    emit_line(output_file, "    popq %rbx")
+    emit_line(output_file, "    movq %rbx, %xmm0")
+    emit_line(output_file, "    movq %rax, %xmm1")
+
+    If operator is equal to 16:  Note: TOKEN_PLUS
+        emit_line(output_file, "    addsd %xmm1, %xmm0")
+    Otherwise If operator is equal to 17:  Note: TOKEN_MINUS
+        emit_line(output_file, "    subsd %xmm1, %xmm0")
+    Otherwise If operator is equal to 35:  Note: TOKEN_MULTIPLIED_BY
+        emit_line(output_file, "    mulsd %xmm1, %xmm0")
+    Otherwise If operator is equal to 36:  Note: TOKEN_DIVIDED_BY
+        emit_line(output_file, "    divsd %xmm1, %xmm0")
+    End If
+
+    emit_line(output_file, "    movq %xmm0, %rax")
+    Return 0
+End Process
+
 Note: Generate code for binary operation expressions
 Process called "codegen_generate_binary_op" takes codegen as Integer, expr as Integer returns Integer:
     Let output_file be memory_get_integer(codegen, 0)
     Let left be memory_get_pointer(expr, 8)         Note: binary_op.left
     Let right be memory_get_pointer(expr, 16)       Note: binary_op.right
     Let operator be memory_get_integer(expr, 24)    Note: binary_op.operator
+
+    Note:
+    Float-arithmetic dispatch. Runa's `plus`/`minus`/`multiplied by`/
+    `divided by` operators are type-overloaded: when applied to Float
+    operands they must lower to SSE2 scalar-double ops, not the integer
+    ALU. Pre-fix, codegen always emitted addq/subq/imulq/idivq regardless
+    of operand type, so `Let c be a plus b` for Float a,b silently
+    computed the bitwise integer sum of two IEEE-754 patterns -- garbage.
+
+    Detection: route to the Float path when EITHER operand is statically
+    typed Float/Float64. Cases:
+      - Float + Float       : direct addsd, no conversion
+      - Float + Integer     : cvtsi2sd the Integer operand, then addsd
+      - Integer + Float     : cvtsi2sd the Integer operand, then addsd
+      - Integer + Integer   : integer path (current behavior unchanged)
+
+    The integer-literal `0`/`1` constants commonly used in conditionals
+    (`is equal to 0`) are NOT routed here because EXPR_INTEGER_LITERAL
+    has no type annotation and codegen_get_expression_type returns 0
+    (unknown), defaulting to the integer path. Float dispatch only fires
+    when at least one operand carries a confirmed Float type.
+
+    Restricted to the four arithmetic tokens: TOKEN_PLUS(16),
+    TOKEN_MINUS(17), TOKEN_MULTIPLIED_BY(35), TOKEN_DIVIDED_BY(36).
+    Modulo, bitwise, and shift operators stay on the integer path
+    because Float modulo isn't an SSE2 primitive and bit-ops on Float
+    bit patterns are semantically Integer operations.
+    :End Note
+    Let bop_is_float_arith be 0
+    If operator is equal to 16:
+        Set bop_is_float_arith to 1
+    Otherwise If operator is equal to 17:
+        Set bop_is_float_arith to 1
+    Otherwise If operator is equal to 35:
+        Set bop_is_float_arith to 1
+    Otherwise If operator is equal to 36:
+        Set bop_is_float_arith to 1
+    End If
+    If bop_is_float_arith is equal to 1:
+        Let bop_left_float be codegen_expr_is_float(codegen, left)
+        Let bop_right_float be codegen_expr_is_float(codegen, right)
+        If bop_left_float is equal to 1:
+            codegen_emit_float_binary_op(codegen, left, right, operator)
+            Return 0
+        End If
+        If bop_right_float is equal to 1:
+            codegen_emit_float_binary_op(codegen, left, right, operator)
+            Return 0
+        End If
+    End If
 
     Note: OPTIMIZATION: For simple right operands (variables/integers), use direct register operations
     Let right_type be memory_get_int32(right, 0)
