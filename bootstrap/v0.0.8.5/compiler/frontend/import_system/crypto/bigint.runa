@@ -356,8 +356,20 @@ Process called "bigint_to_bytes_be" takes bn as Integer, out_buffer as Integer, 
         Let limb_value be proc bigint_get_limb with bn, limb_index
         Let byte_in_limb be 0
         While byte_in_limb is less than 8:
-            Let byte_value be limb_value modulo by 256
-            Set limb_value to limb_value divided by 256
+            Note: Extract bytes using bitwise_and + logical right shift so
+            Note: limbs with the high bit set (negative in signed int64) do
+            Note: not produce negative bytes via signed modulo nor skip
+            Note: high-byte content via signed division.
+            Let byte_value be limb_value bitwise_and 255
+            Note: Logical right shift by 8: strip the sign bit, divide
+            Note: the low 63 bits, then reinsert the original sign bit at
+            Note: position 55.
+            Let low63 be limb_value bitwise_and 9223372036854775807
+            Let shifted_lo be low63 divided by 256
+            If limb_value is less than 0:
+                Set shifted_lo to shifted_lo bitwise_or 36028797018963968
+            End If
+            Set limb_value to shifted_lo
             Let absolute_position be limb_index multiplied by 8 plus byte_in_limb
             Let dest_position be out_capacity minus 1 minus absolute_position
             If dest_position is greater than 0 minus 1:
@@ -383,6 +395,13 @@ Process called "bigint_compare" takes a as Integer, b as Integer returns Integer
     time over the maximum of the two limb counts, so timing does not leak
     which operand is larger. Used for ECDSA r/s in-range checks and RSA
     modulus comparison.
+
+    Treats limb values as UNSIGNED 64-bit. Because Runa Integer is signed
+    two's-complement int64, a direct `is greater than` on two limbs with
+    different high bits compares signed magnitudes, which inverts the
+    intended unsigned ordering. We canonicalize each limb by XOR-ing with
+    2^63 (the sign-bit mask) before comparing: this turns the unsigned
+    ordering into a signed ordering of the shifted values.
     @End Reasoning
 
     Let a_count be proc bigint_get_limb_count with a
@@ -391,6 +410,8 @@ Process called "bigint_compare" takes a as Integer, b as Integer returns Integer
     If b_count is greater than max_count:
         Set max_count to b_count
     End If
+
+    Let sign_bit be 0 minus 9223372036854775808
 
     Let result_code be 0
     Let i be max_count
@@ -404,11 +425,13 @@ Process called "bigint_compare" takes a as Integer, b as Integer returns Integer
         If i is less than b_count:
             Set b_limb to proc bigint_get_limb with b, i
         End If
+        Let a_shifted be a_limb bitwise_xor sign_bit
+        Let b_shifted be b_limb bitwise_xor sign_bit
         If result_code is equal to 0:
-            If a_limb is greater than b_limb:
+            If a_shifted is greater than b_shifted:
                 Set result_code to 1
             Otherwise:
-                If a_limb is less than b_limb:
+                If a_shifted is less than b_shifted:
                     Set result_code to 0 minus 1
                 End If
             End If
@@ -448,6 +471,7 @@ Process called "bigint_add" takes dest as Integer, a as Integer, b as Integer re
         Return 0
     End If
 
+    Let sign_bit be 0 minus 9223372036854775808
     Let carry be 0
     Let i be 0
     While i is less than max_count:
@@ -461,12 +485,17 @@ Process called "bigint_add" takes dest as Integer, a as Integer, b as Integer re
         End If
         Let sum1 be a_limb plus b_limb
         Let carry_from_sum1 be 0
-        If sum1 is less than a_limb:
+        Note: Unsigned compare: sum1 < a_limb (unsigned) detects 64-bit overflow.
+        Let sum1_u be sum1 bitwise_xor sign_bit
+        Let a_u be a_limb bitwise_xor sign_bit
+        If sum1_u is less than a_u:
             Set carry_from_sum1 to 1
         End If
         Let sum2 be sum1 plus carry
         Let carry_from_sum2 be 0
-        If sum2 is less than sum1:
+        Let sum2_u be sum2 bitwise_xor sign_bit
+        Let sum1_u2 be sum1 bitwise_xor sign_bit
+        If sum2_u is less than sum1_u2:
             Set carry_from_sum2 to 1
         End If
         proc bigint_set_limb with dest, i, sum2
@@ -487,6 +516,10 @@ Process called "bigint_sub" takes dest as Integer, a as Integer, b as Integer re
     @Reasoning
     Computes dest = a - b assuming a >= b. Returns 0 if borrow out occurs
     (callers should pre-check via bigint_compare).
+
+    Treats limbs as UNSIGNED 64-bit. Borrow detection uses an unsigned
+    comparison implemented via XOR with 2^63 (see bigint_compare for the
+    same trick).
     @End Reasoning
 
     Let a_count be proc bigint_get_limb_count with a
@@ -495,6 +528,8 @@ Process called "bigint_sub" takes dest as Integer, a as Integer, b as Integer re
     If a_count is greater than dest_cap:
         Return 0
     End If
+
+    Let sign_bit be 0 minus 9223372036854775808
 
     Let borrow be 0
     Let i be 0
@@ -506,13 +541,20 @@ Process called "bigint_sub" takes dest as Integer, a as Integer, b as Integer re
         End If
         Let diff1 be a_limb minus b_limb
         Let borrow_from_diff1 be 0
-        If a_limb is less than b_limb:
+        Let a_u be a_limb bitwise_xor sign_bit
+        Let b_u be b_limb bitwise_xor sign_bit
+        If a_u is less than b_u:
             Set borrow_from_diff1 to 1
         End If
         Let diff2 be diff1 minus borrow
         Let borrow_from_diff2 be 0
-        If diff1 is less than borrow:
-            Set borrow_from_diff2 to 1
+        Note: Unsigned compare: borrow_from_diff2 = (diff1 < borrow as unsigned).
+        Note: Since borrow is always 0 or 1, the only case where diff1 < borrow
+        Note: in unsigned arithmetic is diff1 == 0 and borrow == 1.
+        If borrow is equal to 1:
+            If diff1 is equal to 0:
+                Set borrow_from_diff2 to 1
+            End If
         End If
         proc bigint_set_limb with dest, i, diff2
         Set borrow to borrow_from_diff1 plus borrow_from_diff2
@@ -553,46 +595,84 @@ Process called "bigint_mul" takes dest as Integer, a as Integer, b as Integer re
         Set z_idx to z_idx plus 1
     End While
 
+    Let mask32 be 4294967295
+    Let sign_bit be 0 minus 9223372036854775808
+
     Let i be 0
     While i is less than a_count:
         Let a_limb be proc bigint_get_limb with a, i
-        Let a_lo be a_limb modulo by 4294967296
-        Let a_hi be a_limb divided by 4294967296
+        Note: Split a_limb into unsigned 32-bit halves via bitwise_and / logical
+        Note: right shift to avoid signed modulo/divide producing negative halves
+        Note: when the high bit is set.
+        Let a_lo be a_limb bitwise_and mask32
+        Let a_low63 be a_limb bitwise_and 9223372036854775807
+        Let a_hi be a_low63 divided by 4294967296
+        If a_limb is less than 0:
+            Set a_hi to a_hi bitwise_or 2147483648
+        End If
         Let j be 0
         Let carry be 0
         While j is less than b_count:
             Let b_limb be proc bigint_get_limb with b, j
-            Let b_lo be b_limb modulo by 4294967296
-            Let b_hi be b_limb divided by 4294967296
+            Let b_lo be b_limb bitwise_and mask32
+            Let b_low63 be b_limb bitwise_and 9223372036854775807
+            Let b_hi be b_low63 divided by 4294967296
+            If b_limb is less than 0:
+                Set b_hi to b_hi bitwise_or 2147483648
+            End If
 
             Let pp_ll be a_lo multiplied by b_lo
             Let pp_lh be a_lo multiplied by b_hi
             Let pp_hl be a_hi multiplied by b_lo
             Let pp_hh be a_hi multiplied by b_hi
 
+            Note: Compute (pp_lh + pp_hl) with overflow into a 33rd bit.
             Let mid be pp_lh plus pp_hl
             Let mid_carry be 0
-            If mid is less than pp_lh:
-                Set mid_carry to 4294967296
+            Let mid_u be mid bitwise_xor sign_bit
+            Let pl_u be pp_lh bitwise_xor sign_bit
+            If mid_u is less than pl_u:
+                Set mid_carry to 1
             End If
 
-            Let lower be pp_ll plus mid multiplied by 4294967296
+            Note: lower = pp_ll + (mid << 32). The (mid << 32) shifts mid's low
+            Note: 32 bits into positions 32..63 of lower; mid's high 32 bits
+            Note: contribute to upper.
+            Let mid_lo32 be mid bitwise_and mask32
+            Let mid_shifted be mid_lo32 multiplied by 4294967296
+            Let lower be pp_ll plus mid_shifted
             Let lower_carry be 0
-            If lower is less than pp_ll:
+            Let lower_u be lower bitwise_xor sign_bit
+            Let pll_u be pp_ll bitwise_xor sign_bit
+            If lower_u is less than pll_u:
                 Set lower_carry to 1
             End If
 
-            Let upper be pp_hh plus mid divided by 4294967296 plus mid_carry plus lower_carry
+            Note: upper = pp_hh + (mid >> 32) + mid_carry + lower_carry
+            Let mid_low63 be mid bitwise_and 9223372036854775807
+            Let mid_hi32 be mid_low63 divided by 4294967296
+            If mid is less than 0:
+                Set mid_hi32 to mid_hi32 bitwise_or 2147483648
+            End If
+            Note: Also include the bit that overflowed out of mid (mid_carry << 32).
+            Let mid_carry_shifted be mid_carry multiplied by 4294967296
+            Let upper be pp_hh plus mid_hi32
+            Set upper to upper plus mid_carry_shifted
+            Set upper to upper plus lower_carry
 
             Let existing be proc bigint_get_limb with dest, i plus j
             Let lower_with_carry be lower plus carry
             Let carry_propagate be 0
-            If lower_with_carry is less than lower:
+            Let lwc_u be lower_with_carry bitwise_xor sign_bit
+            Let lower_u2 be lower bitwise_xor sign_bit
+            If lwc_u is less than lower_u2:
                 Set carry_propagate to 1
             End If
             Let sum_with_existing be existing plus lower_with_carry
             Let carry_existing be 0
-            If sum_with_existing is less than existing:
+            Let swe_u be sum_with_existing bitwise_xor sign_bit
+            Let existing_u be existing bitwise_xor sign_bit
+            If swe_u is less than existing_u:
                 Set carry_existing to 1
             End If
             proc bigint_set_limb with dest, i plus j, sum_with_existing
@@ -620,11 +700,26 @@ Note: ==========================================================================
 
 Process called "bigint_mod" takes arena as Integer, dest as Integer, a as Integer, m as Integer returns Integer:
     @Reasoning
-    Computes dest = a mod m. Uses repeated subtraction shifted by powers of
-    two: this is O(n^2) but acceptable for X.509 verification workloads where
-    a single signature check happens once per import. The algorithm is:
-    while a >= m, find the highest k such that m << k <= a, then subtract.
+    Computes dest = a mod m via bit-by-bit shift-and-subtract long division.
+    For an A-bit dividend and an M-bit modulus this converges in exactly
+    A - M iterations, each performing one constant-time conditional subtract
+    of m from a working remainder. Used by both RSA verification and Ed25519
+    scalar reduction.
     @End Reasoning
+
+    @Implementation
+    Builds a working remainder R the same width as the larger of (a, m). For
+    each bit of (a) from MSB down to LSB:
+      R = (R << 1) | bit_of_a
+      if R >= m: R -= m
+    At the end, R == a mod m. Writes R into dest.
+    @End Implementation
+
+    @Security_Scope
+    Iteration count depends only on the bit lengths of a and m, both public
+    in our use cases (RSA signature verification, Ed25519 scalar reduction
+    of public-form scalars). Constant-time relative to those bit lengths.
+    @End Security_Scope
 
     If m is equal to 0:
         Return 0
@@ -636,81 +731,139 @@ Process called "bigint_mod" takes arena as Integer, dest as Integer, a as Intege
         Return 0
     End If
 
-    Note: dest <- copy of a
     Let a_count be proc bigint_get_limb_count with a
+    Let m_count be proc bigint_get_limb_count with m
     Let dest_cap be proc bigint_get_limb_capacity with dest
-    If a_count is greater than dest_cap:
+    Note: dest only needs to be large enough to hold m (since the result is
+    Note: bounded by m). The dividend `a` can have any number of limbs; we
+    Note: read from it bit-by-bit without copying it into dest.
+    If dest_cap is less than m_count plus 1:
         Return 0
     End If
-    Let z_idx2 be 0
-    While z_idx2 is less than dest_cap:
-        proc bigint_set_limb with dest, z_idx2, 0
-        Set z_idx2 to z_idx2 plus 1
-    End While
-    Let copy_i be 0
-    While copy_i is less than a_count:
-        Let a_limb_copy be proc bigint_get_limb with a, copy_i
-        proc bigint_set_limb with dest, copy_i, a_limb_copy
-        Set copy_i to copy_i plus 1
-    End While
-    proc bigint_set_limb_count with dest, a_count
-    proc bigint_normalize with dest
 
-    Note: Repeatedly subtract m left-shifted by k limbs while result >= shifted m.
-    Loop forever:
-        Let cmp_now be proc bigint_compare with dest, m
-        If cmp_now is less than 0:
+    Note: Zero dest.
+    Let z_idx be 0
+    While z_idx is less than dest_cap:
+        proc bigint_set_limb with dest, z_idx, 0
+        Set z_idx to z_idx plus 1
+    End While
+
+    Note: Working remainder R uses dest's capacity (must be >= m's limb count
+    Note: for the subtraction to fit).
+    Note: Allocate a scratch R_sub of same capacity for the subtraction
+    Note: intermediate.
+    Let R_sub be proc bigint_alloc with arena, dest_cap plus 1
+    If R_sub is equal to 0:
+        Return 0
+    End If
+    proc bigint_set_limb_count with R_sub, 0
+    proc bigint_set_limb_count with dest, 0
+
+    Note: Pre-compute total bits in `a`. We walk each bit from the top
+    Note: down. To find the top bit, scan from the highest limb that is
+    Note: non-zero, then find the highest set bit within that limb.
+    Let top_limb_index be a_count minus 1
+    While top_limb_index is greater than 0 minus 1:
+        Let limb_value be proc bigint_get_limb with a, top_limb_index
+        If limb_value is not equal to 0:
             Break
         End If
+        Set top_limb_index to top_limb_index minus 1
+    End While
 
-        Let dest_count_now be proc bigint_get_limb_count with dest
-        Let m_count_now be proc bigint_get_limb_count with m
-        Let shift_limbs be dest_count_now minus m_count_now
+    If top_limb_index is less than 0:
+        Note: a is zero - dest = 0.
+        Return 1
+    End If
 
-        If shift_limbs is less than 0:
-            Set shift_limbs to 0
-        End If
-
-        Note: Build a temporary shifted-m. We allocate a fresh BigInt each
-        Note: iteration of the outer loop from the arena. Acceptable because
-        Note: the iteration count is bounded by the limb count of a, which
-        Note: for RSA-4096 is at most 64.
-        Let shifted_cap be m_count_now plus shift_limbs plus 2
-        Let shifted_m be proc bigint_alloc with arena, shifted_cap
-        If shifted_m is equal to 0:
-            Return 0
-        End If
-        Let s_idx be 0
-        While s_idx is less than m_count_now:
-            Let m_limb_value be proc bigint_get_limb with m, s_idx
-            proc bigint_set_limb with shifted_m, s_idx plus shift_limbs, m_limb_value
-            Set s_idx to s_idx plus 1
+    Let top_limb be proc bigint_get_limb with a, top_limb_index
+    Let top_bit be 63
+    While top_bit is greater than 0:
+        Let bit_mask be 1
+        Let shift_count be 0
+        While shift_count is less than top_bit:
+            Set bit_mask to bit_mask multiplied by 2
+            Set shift_count to shift_count plus 1
         End While
-        proc bigint_set_limb_count with shifted_m, m_count_now plus shift_limbs
+        Let masked_top be top_limb bitwise_and bit_mask
+        If masked_top is not equal to 0:
+            Break
+        End If
+        Set top_bit to top_bit minus 1
+    End While
 
-        Note: If shifted_m > dest, reduce shift by 1 limb.
-        Let shifted_cmp be proc bigint_compare with shifted_m, dest
-        If shifted_cmp is greater than 0:
-            If shift_limbs is equal to 0:
-                Break
+    Note: total_bits = top_limb_index * 64 + (top_bit + 1)
+    Let total_bits be top_limb_index multiplied by 64 plus top_bit plus 1
+
+    Note: Walk bits from MSB to LSB.
+    Let sign_bit be 0 minus 9223372036854775808
+    Let bit_index be total_bits minus 1
+    While bit_index is greater than 0 minus 1:
+        Note: dest = dest << 1 (unsigned shift through limbs).
+        Let carry be 0
+        Let cur_count be proc bigint_get_limb_count with dest
+        Let li be 0
+        While li is less than dest_cap:
+            Let lv be proc bigint_get_limb with dest, li
+            Let new_carry be 0
+            If lv is less than 0:
+                Set new_carry to 1
             End If
-            Set shift_limbs to shift_limbs minus 1
-            Let shifted_m2 be proc bigint_alloc with arena, shifted_cap
-            If shifted_m2 is equal to 0:
-                Return 0
+            Let lv_low be lv bitwise_and 9223372036854775807
+            Let new_lv be lv_low multiplied by 2
+            Set new_lv to new_lv plus carry
+            proc bigint_set_limb with dest, li, new_lv
+            Set carry to new_carry
+            Set li to li plus 1
+        End While
+        Let new_count be cur_count
+        If carry is not equal to 0:
+            If cur_count is less than dest_cap:
+                Set new_count to cur_count plus 1
             End If
-            Let s2_idx be 0
-            While s2_idx is less than m_count_now:
-                Let m_limb_v2 be proc bigint_get_limb with m, s2_idx
-                proc bigint_set_limb with shifted_m2, s2_idx plus shift_limbs, m_limb_v2
-                Set s2_idx to s2_idx plus 1
-            End While
-            proc bigint_set_limb_count with shifted_m2, m_count_now plus shift_limbs
-            Set shifted_m to shifted_m2
+        End If
+        If new_count is less than cur_count:
+            Set new_count to cur_count
+        End If
+        Note: Extend count if non-zero bit fell into the next limb position.
+        If new_count is equal to cur_count:
+            If cur_count is less than dest_cap:
+                Let top_v be proc bigint_get_limb with dest, cur_count
+                If top_v is not equal to 0:
+                    Set new_count to cur_count plus 1
+                End If
+            End If
+        End If
+        proc bigint_set_limb_count with dest, new_count
+
+        Note: Extract bit_index of a and OR into dest's bit 0.
+        Let bi_limb be bit_index divided by 64
+        Let bi_off be bit_index modulo by 64
+        Let a_limb be proc bigint_get_limb with a, bi_limb
+        Let mask_v be 1
+        Let mc be 0
+        While mc is less than bi_off:
+            Set mask_v to mask_v multiplied by 2
+            Set mc to mc plus 1
+        End While
+        Let bit_is be a_limb bitwise_and mask_v
+        If bit_is is not equal to 0:
+            Let limb0 be proc bigint_get_limb with dest, 0
+            proc bigint_set_limb with dest, 0, limb0 bitwise_or 1
+            Let nc be proc bigint_get_limb_count with dest
+            If nc is equal to 0:
+                proc bigint_set_limb_count with dest, 1
+            End If
         End If
 
-        proc bigint_sub with dest, dest, shifted_m
-        proc bigint_normalize with dest
+        Note: If dest >= m, subtract.
+        Let cmp be proc bigint_compare with dest, m
+        If cmp is greater than 0 minus 1:
+            proc bigint_sub with dest, dest, m
+            proc bigint_normalize with dest
+        End If
+
+        Set bit_index to bit_index minus 1
     End While
 
     Return 1
