@@ -1059,16 +1059,16 @@ Process called "apf_from_integer" takes arena as Integer, value as Integer, prec
     Let lc be proc apf_get_limb_count with r
     Let top_idx be lc minus 1
     proc apf_set_limb with r, top_idx, mag
-    Let clz be proc count_leading_zeros from Bits with mag
-    Let high_bit_pos be 63 minus clz
-    Note: After placing mag in top limb, the value of the mantissa equals
-    Note: mag * 2^((top_idx) * 64). The unbiased exponent (binary point
-    Note: position) should make the value equal to the original integer.
-    Note: When normalized so the top bit is set, mantissa value lies in
-    Note: [0.5, 1.0). For an integer V with magnitude mag and high_bit_pos
-    Note: in [0, 63], the normalized form is (mag / 2^(high_bit_pos+1))
-    Note: * 2^(high_bit_pos+1). We set exponent = high_bit_pos + 1.
-    Let target_exp be high_bit_pos plus 1
+    Note: mag was placed at the LSB of the top limb (limb[lc-1]).
+    Note: Total mantissa bit width is lc*64. With mag in limb[lc-1] bit h,
+    Note: its overall position from the mantissa LSB is (lc-1)*64 + h.
+    Note: apf_normalize will shift left by (63 - h) so the top bit of the
+    Note: top limb becomes set, and will decrement exp by the shift count.
+    Note: For the final value to equal the integer V = mag, the normalized
+    Note: form is fraction * 2^(h+1) where fraction is in [0.5, 1.0).
+    Note: Therefore the post-normalize exponent must be (h+1), so we set
+    Note: the pre-normalize exponent to (h+1) + (63 - h) = 64.
+    Let target_exp be 64
     proc apf_set_exponent with r, target_exp
     proc apf_normalize with r
     Return r
@@ -2096,47 +2096,69 @@ Process called "apf_div" takes arena as Integer, a as Integer, b as Integer retu
         Return z_r2
     End If
 
-    Note: Long division at the target precision plus a guard limb.
-    Let working_prec be target_prec plus 64
-    Let working_lc be working_prec plus 63
-    Set working_lc to working_lc divided by 64
-
-    Note: Allocate remainder and quotient buffers.
-    Let rem_lc be working_lc plus 1
+    Note: Long division. Both inputs are normalized (top bit of top mantissa
+    Note: limb set). We compute Q = floor((a_mant_int << bits_to_produce) /
+    Note: b_mant_int) using restoring division. rem_buf and div_buf are wide
+    Note: enough to hold (a_lc + extra) limbs. a_mant_int is placed in
+    Note: rem_buf such that its top bit is at bit position
+    Note: (bits_to_produce + a_lc*64 - 1), giving headroom of bits_to_produce
+    Note: zero bits below. b_mant_int is placed in div_buf at the same
+    Note: position as a (top aligned). Then each loop iter:
+    Note:   1. shift rem_buf left by 1
+    Note:   2. if rem_buf >= div_buf, subtract; set quotient bit
+    Note:   3. quotient bit shifted into q_buf LSB
+    Note: After bits_to_produce iters, q_buf contains the integer quotient.
+    Note: Both a_mant_int and b_mant_int are in [2^(a_lc*64-1), 2^(a_lc*64)).
+    Note: So Q is in [2^(bits_to_produce-1), 2^(bits_to_produce+1)).
+    Let a_lc be proc apf_get_limb_count with a
+    Let b_lc be proc apf_get_limb_count with b
+    Let max_in_lc be a_lc
+    If b_lc is greater than max_in_lc:
+        Set max_in_lc to b_lc
+    End If
+    Let bits_to_produce be target_prec plus 64
+    Note: bit_buf_lc covers max(a_lc, b_lc)*64 + bits_to_produce + 64 bits
+    Note: of headroom (the +64 absorbs the top-bit carry during the shift).
+    Let bit_extra_lc be bits_to_produce plus 63
+    Set bit_extra_lc to bit_extra_lc divided by 64
+    Let rem_lc be max_in_lc plus bit_extra_lc plus 1
     Let rem_buf be proc arena_allocate from Arena with arena, rem_lc multiplied by 8
     proc memory_fill from Memory with rem_buf, 0, rem_lc multiplied by 8
-    Note: Place a's mantissa in the high limbs of rem_buf so the division
-    Note: aligns correctly.
-    Let a_lc be proc apf_get_limb_count with a
+    Note: a is placed so its top bit lies at bit (rem_lc*64 - 65).
+    Note: This leaves exactly 64 bits of headroom at the top of rem_buf so
+    Note: that shifting left during the loop never loses a 1 bit.
+    Let a_target_top_idx be rem_lc minus 2
     Let i_a be 0
     While i_a is less than a_lc:
         Let limb_a be proc apf_get_limb with a, i_a
-        Let target_idx be rem_lc minus a_lc plus i_a
+        Let target_idx be a_target_top_idx minus a_lc plus 1 plus i_a
         Let off_t be target_idx multiplied by 8
         proc memory_set_int64 from Memory with rem_buf, off_t, limb_a
         Set i_a to i_a plus 1
     End While
 
-    Let b_lc be proc apf_get_limb_count with b
     Let div_buf be proc arena_allocate from Arena with arena, rem_lc multiplied by 8
     proc memory_fill from Memory with div_buf, 0, rem_lc multiplied by 8
+    Note: Place b at the same top position as a so they share alignment.
+    Let b_target_top_idx be rem_lc minus 2
     Let i_b be 0
     While i_b is less than b_lc:
         Let limb_b be proc apf_get_limb with b, i_b
-        Let target_idx_b be rem_lc minus b_lc plus i_b
+        Let target_idx_b be b_target_top_idx minus b_lc plus 1 plus i_b
         Let off_tb be target_idx_b multiplied by 8
         proc memory_set_int64 from Memory with div_buf, off_tb, limb_b
         Set i_b to i_b plus 1
     End While
 
-    Let q_lc be working_lc plus 1
+    Note: q_buf accumulates the quotient bits. Top bit of Q lands at position
+    Note: bits_to_produce or bits_to_produce - 1 depending on whether a >= b.
+    Let q_lc be bit_extra_lc plus 1
     Let q_buf be proc arena_allocate from Arena with arena, q_lc multiplied by 8
     proc memory_fill from Memory with q_buf, 0, q_lc multiplied by 8
 
-    Let bits_to_produce be working_prec plus 2
     Let n_iter be 0
     While n_iter is less than bits_to_produce:
-        Note: Shift rem_buf left by 1
+        Note: Shift rem_buf left by 1.
         Let carry_sh be 0
         Let i_l be 0
         While i_l is less than rem_lc:
@@ -2164,7 +2186,8 @@ Process called "apf_div" takes arena as Integer, a as Integer, b as Integer retu
             Set carry_q to q_top
             Set i_q to i_q plus 1
         End While
-        Note: If rem >= div, subtract div from rem and set q LSB.
+        Note: If rem >= div, subtract div from rem and set q LSB. The
+        Note: pre-placement leaves 64 bits of headroom so carry_sh is always 0.
         Let cmp be 0
         Let i_c be rem_lc minus 1
         While i_c is greater than or equal to 0:
@@ -2218,14 +2241,12 @@ Process called "apf_div" takes arena as Integer, a as Integer, b as Integer retu
         Set n_iter to n_iter plus 1
     End While
 
-    Note: Build the result from q_buf. The top of q_buf has the high bits of
-    Note: the quotient. We extract the top target_lc limbs into the result.
+    Note: Build the result from q_buf. Find top set bit in q_buf.
     Let result be proc apf_alloc with arena, target_prec
     proc apf_set_sign with result, result_sign
     proc apf_set_special with result, APF_SPECIAL_NORMAL
     Let target_lc be proc apf_get_limb_count with result
 
-    Note: Find top set bit in q_buf
     Let top_q_idx be q_lc minus 1
     Let safety_t be 0
     While safety_t is less than q_lc:
@@ -2243,6 +2264,8 @@ Process called "apf_div" takes arena as Integer, a as Integer, b as Integer retu
         End If
     End While
 
+    Note: Extract top target_lc limbs of Q into result, aligned so result's
+    Note: top limb gets the limb containing the leading 1.
     Let i_r be 0
     Let any_low be 0
     While i_r is less than target_lc:
@@ -2266,15 +2289,38 @@ Process called "apf_div" takes arena as Integer, a as Integer, b as Integer retu
         End If
         Set i_lowq to i_lowq plus 1
     End While
+    Note: Also accumulate any remaining nonzero remainder bits into any_low
+    Note: (these represent the truncated fractional part of the division).
+    Let i_rrem be 0
+    While i_rrem is less than rem_lc:
+        Let off_rrem be i_rrem multiplied by 8
+        Let limb_rrem be proc memory_get_int64 from Memory with rem_buf, off_rrem
+        If limb_rrem is not equal to 0:
+            Set any_low to 1
+        End If
+        Set i_rrem to i_rrem plus 1
+    End While
 
     Let exp_a be proc apf_get_exponent with a
     Let exp_b be proc apf_get_exponent with b
+    Note: Q represents (a_mant_int * 2^bits_to_produce) / b_mant_int.
+    Note: a_mant_int / b_mant_int = a_frac / b_frac (mantissa fractions are
+    Note: both normalized to [0.5, 1.0)). Value of a/b is
+    Note: (a_frac/b_frac) * 2^(exp_a - exp_b). a_frac / b_frac is in
+    Note: (0.5, 2.0). Q has leading bit at position bits_to_produce - 1
+    Note: (a < b case) or bits_to_produce (a >= b case). result's mantissa
+    Note: was filled by extracting Q's top target_lc limbs. The leading bit
+    Note: of the extracted mantissa is at bit position p_r =
+    Note: leading_bit_pos - (top_q_idx - target_lc + 1)*64 within result's
+    Note: mantissa. After apf_normalize shifts left by (target_lc*64 - 1 - p_r),
+    Note: the normalized fraction is 0.5..1.0, and
+    Note: exp_post = pre_normalize_exp - (target_lc*64 - 1 - p_r). We want
+    Note: exp_post such that fraction_post * 2^exp_post = a/b which simplifies
+    Note: to pre_normalize_exp = exp_a - exp_b - bits_to_produce
+    Note: + (top_q_idx + 1)*64.
     Let result_exp be exp_a minus exp_b
-    Note: Need to know how many bits the quotient's top occupied to compute
-    Note: the final exponent. We placed both a and b in (rem_lc) limbs left-
-    Note: aligned, so the relative bit position of the leading quotient bit
-    Note: is roughly working_prec. After normalization (apf_normalize) the
-    Note: exponent will resolve.
+    Set result_exp to result_exp minus bits_to_produce
+    Set result_exp to result_exp plus (top_q_idx plus 1) multiplied by 64
     proc apf_set_exponent with result, result_exp
     proc apf_normalize with result
 
