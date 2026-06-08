@@ -120,6 +120,7 @@ Dependencies
 
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/core/arithmetic_core.runa" as Arithmetic
+Import "compiler/frontend/primitives/core/bitwise_core.runa" as Bitwise
 
 
 Note: ============================================================================
@@ -682,33 +683,166 @@ Note: SECTION 6 - Top-level sin / cos / tan (with argument reduction)
 Note: ============================================================================
 
 Note: sin_radians - sin(x) for x in radians, any magnitude.
-Note: Reduces x mod 2*pi to [-pi, pi], then uses sin_radians_reduced after a
-Note: further reduction to [-pi/2, pi/2] if needed via the identity
-Note:   sin(pi - x) = sin(x)    for x in [pi/2, pi]
-Note:   sin(-pi - x) = -sin(x)  for x in [-pi, -pi/2]
+Note: First reduces x mod 2*pi to (-pi, pi], then applies the quadrant
+Note: identities to bring the argument into [-pi/2, pi/2] where the
+Note: Taylor series called via sin_radians_reduced is accurate to ~1e-16:
+Note:   sin(pi - x) =  sin(x)    for x in ( pi/2,  pi]
+Note:   sin(-pi - x) = -sin(x)  ==>  sin(x) for x in [-pi, -pi/2) = -sin(x + pi)
+Note: Without this second-stage reduction the Taylor series near +/-pi
+Note: degrades to about 1e-6 absolute error (because (x - pi/2) grows past
+Note: the convergence sweet spot), which is unacceptable for callers like
+Note: complex128_exp and complex128_from_polar that require full IEEE 754
+Note: precision at boundary angles.
 Process called "sin_radians" takes x_bits as Integer returns Integer:
     Let reduced be reduce_mod_2pi(x_bits)
 
-    Note: At this point reduced is in [-pi, pi]. We need to check whether it's
-    Note: outside [-pi/2, pi/2] and apply the symmetry identity if so.
-    
-    Note: To compare we need a way to test reduced's magnitude. The
-    Note: arithmetic_core doesn't expose a direct float comparison primitive
-    Note: that returns "is greater than", but we can do it via float_subtract
-    Note: and checking the sign bit of the result.
-    
-    Note: After reduce_mod_2pi the argument is in [-pi, pi]. Within this
-    Note: window the 8-term Taylor series called via sin_radians_reduced is
-    Note: accurate to ~1e-13 at the boundary and ~1e-16 near zero. Callers
-    Note: that need full float64 precision at all angles should compose
-    Note: their inputs to stay within [-pi/2, pi/2] before calling.
+    Note: Quadrant selection. Allocate one scratch buffer wide enough to hold:
+    Note:   slot 0: reduced
+    Note:   slot 1: half_pi constant
+    Note:   slot 2: -half_pi (computed)
+    Note:   slot 3: pi constant
+    Note:   slot 4: -pi (computed)
+    Note:   slot 5: scratch_a (float_subtract scratch)
+    Note:   slot 6: cmp result (reduced - half_pi)
+    Note:   slot 7: cmp result (reduced - (-half_pi))
+    Note:   slot 8: pi - reduced
+    Note:   slot 9: reduced + pi (= reduced - (-pi))
+    Let buf be trig_buf_alloc(10)
+    If buf is equal to 0:
+        Return sin_radians_reduced(reduced)
+    End If
 
+    Let _s0 be trig_set_constant(buf, 0, reduced)
+    Let _s1 be trig_set_constant(buf, 1, half_pi())
+    Let _s3 be trig_set_constant(buf, 3, pi())
+
+    Let r_ptr be trig_slot_addr(buf, 0)
+    Let hp_ptr be trig_slot_addr(buf, 1)
+    Let nhp_ptr be trig_slot_addr(buf, 2)
+    Let pi_ptr be trig_slot_addr(buf, 3)
+    Let npi_ptr be trig_slot_addr(buf, 4)
+    Let sa_ptr be trig_slot_addr(buf, 5)
+    Let cmp_hp_ptr be trig_slot_addr(buf, 6)
+    Let cmp_nhp_ptr be trig_slot_addr(buf, 7)
+    Let pi_minus_r_ptr be trig_slot_addr(buf, 8)
+    Let r_plus_pi_ptr be trig_slot_addr(buf, 9)
+
+    Note: Compute -half_pi and -pi.
+    proc float_negate from Arithmetic with hp_ptr, nhp_ptr
+    proc float_negate from Arithmetic with pi_ptr, npi_ptr
+
+    Note: cmp_hp = reduced - half_pi. If sign bit set (negative), reduced < half_pi.
+    proc float_subtract from Arithmetic with r_ptr, hp_ptr, cmp_hp_ptr, sa_ptr
+    Let cmp_hp_bits be memory_get_integer from Memory with cmp_hp_ptr, 0
+    Let cmp_hp_sign be proc right_shift_logical from Bitwise with cmp_hp_bits, 63
+
+    Note: cmp_nhp = reduced - (-half_pi) = reduced + half_pi. If sign bit set, reduced < -half_pi.
+    proc float_subtract from Arithmetic with r_ptr, nhp_ptr, cmp_nhp_ptr, sa_ptr
+    Let cmp_nhp_bits be memory_get_integer from Memory with cmp_nhp_ptr, 0
+    Let cmp_nhp_sign be proc right_shift_logical from Bitwise with cmp_nhp_bits, 63
+
+    Note: Case A: reduced > half_pi (cmp_hp non-negative AND non-zero).
+    Note: Use sin(reduced) = sin(pi - reduced).
+    If cmp_hp_sign is equal to 0:
+        If cmp_hp_bits is not equal to 0:
+            proc float_subtract from Arithmetic with pi_ptr, r_ptr, pi_minus_r_ptr, sa_ptr
+            Let new_arg_a be memory_get_integer from Memory with pi_minus_r_ptr, 0
+            Let _free_a be trig_buf_free(buf)
+            Return sin_radians_reduced(new_arg_a)
+        End If
+    End If
+
+    Note: Case B: reduced < -half_pi.
+    Note: Use sin(reduced) = -sin(reduced + pi).
+    If cmp_nhp_sign is equal to 1:
+        proc float_subtract from Arithmetic with r_ptr, npi_ptr, r_plus_pi_ptr, sa_ptr
+        Let new_arg_b be memory_get_integer from Memory with r_plus_pi_ptr, 0
+        Let sin_b be sin_radians_reduced(new_arg_b)
+        Note: Negate sin_b.
+        Let _sb be trig_set_constant(buf, 5, sin_b)
+        Let nb_ptr be trig_slot_addr(buf, 6)
+        proc float_negate from Arithmetic with sa_ptr, nb_ptr
+        Let result_b be memory_get_integer from Memory with nb_ptr, 0
+        Let _free_b be trig_buf_free(buf)
+        Return result_b
+    End If
+
+    Note: Default: reduced is in [-pi/2, pi/2]. Use Taylor directly.
+    Let _free_c be trig_buf_free(buf)
     Return sin_radians_reduced(reduced)
 End Process
 
 Note: cos_radians - cos(x) for x in radians, any magnitude.
+Note: First reduces x mod 2*pi to (-pi, pi], then applies the identities:
+Note:   cos(pi - x)  = -cos(x)   ==>  cos(x) for x in ( pi/2,  pi] = -cos(pi - x)
+Note:   cos(-pi - x) = -cos(x)   ==>  cos(x) for x in [-pi, -pi/2) = -cos(x + pi)
+Note: bringing the argument into [-pi/2, pi/2] where cos_radians_reduced is
+Note: accurate to ~1e-16. Without this second-stage reduction the Taylor
+Note: series near +/-pi degrades to ~4e-6 absolute error.
 Process called "cos_radians" takes x_bits as Integer returns Integer:
     Let reduced be reduce_mod_2pi(x_bits)
+
+    Let buf be trig_buf_alloc(10)
+    If buf is equal to 0:
+        Return cos_radians_reduced(reduced)
+    End If
+
+    Let _s0 be trig_set_constant(buf, 0, reduced)
+    Let _s1 be trig_set_constant(buf, 1, half_pi())
+    Let _s3 be trig_set_constant(buf, 3, pi())
+
+    Let r_ptr be trig_slot_addr(buf, 0)
+    Let hp_ptr be trig_slot_addr(buf, 1)
+    Let nhp_ptr be trig_slot_addr(buf, 2)
+    Let pi_ptr be trig_slot_addr(buf, 3)
+    Let npi_ptr be trig_slot_addr(buf, 4)
+    Let sa_ptr be trig_slot_addr(buf, 5)
+    Let cmp_hp_ptr be trig_slot_addr(buf, 6)
+    Let cmp_nhp_ptr be trig_slot_addr(buf, 7)
+    Let pi_minus_r_ptr be trig_slot_addr(buf, 8)
+    Let r_plus_pi_ptr be trig_slot_addr(buf, 9)
+
+    proc float_negate from Arithmetic with hp_ptr, nhp_ptr
+    proc float_negate from Arithmetic with pi_ptr, npi_ptr
+
+    proc float_subtract from Arithmetic with r_ptr, hp_ptr, cmp_hp_ptr, sa_ptr
+    Let cmp_hp_bits be memory_get_integer from Memory with cmp_hp_ptr, 0
+    Let cmp_hp_sign be proc right_shift_logical from Bitwise with cmp_hp_bits, 63
+
+    proc float_subtract from Arithmetic with r_ptr, nhp_ptr, cmp_nhp_ptr, sa_ptr
+    Let cmp_nhp_bits be memory_get_integer from Memory with cmp_nhp_ptr, 0
+    Let cmp_nhp_sign be proc right_shift_logical from Bitwise with cmp_nhp_bits, 63
+
+    Note: Case A: reduced > half_pi. cos(reduced) = -cos(pi - reduced).
+    If cmp_hp_sign is equal to 0:
+        If cmp_hp_bits is not equal to 0:
+            proc float_subtract from Arithmetic with pi_ptr, r_ptr, pi_minus_r_ptr, sa_ptr
+            Let new_arg_a be memory_get_integer from Memory with pi_minus_r_ptr, 0
+            Let cos_a be cos_radians_reduced(new_arg_a)
+            Let _ws be trig_set_constant(buf, 5, cos_a)
+            Let neg_cos_ptr be trig_slot_addr(buf, 6)
+            proc float_negate from Arithmetic with sa_ptr, neg_cos_ptr
+            Let result_a be memory_get_integer from Memory with neg_cos_ptr, 0
+            Let _free_a be trig_buf_free(buf)
+            Return result_a
+        End If
+    End If
+
+    Note: Case B: reduced < -half_pi. cos(reduced) = -cos(reduced + pi).
+    If cmp_nhp_sign is equal to 1:
+        proc float_subtract from Arithmetic with r_ptr, npi_ptr, r_plus_pi_ptr, sa_ptr
+        Let new_arg_b be memory_get_integer from Memory with r_plus_pi_ptr, 0
+        Let cos_b be cos_radians_reduced(new_arg_b)
+        Let _wsb be trig_set_constant(buf, 5, cos_b)
+        Let neg_cosb_ptr be trig_slot_addr(buf, 6)
+        proc float_negate from Arithmetic with sa_ptr, neg_cosb_ptr
+        Let result_b be memory_get_integer from Memory with neg_cosb_ptr, 0
+        Let _free_b be trig_buf_free(buf)
+        Return result_b
+    End If
+
+    Note: Default: reduced is in [-pi/2, pi/2]. Use Taylor directly.
+    Let _free_c be trig_buf_free(buf)
     Return cos_radians_reduced(reduced)
 End Process
 
