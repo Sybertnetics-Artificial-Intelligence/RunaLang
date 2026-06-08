@@ -222,7 +222,7 @@ print_integer:
 .STR104:    .string "    xorq $"
 .STR105:    .string "    xorq %rbx, %rax"
 .STR106:    .string "    salq %cl, %rax"
-.STR107:    .string "    sarq %cl, %rax"
+.STR107:    .string "    shrq %cl, %rax"
 .STR108:    .string "    testq %rax, %rax"
 .STR109:    .string "    setz %al"
 .STR110:    .string "    movzbq %al, %rax"

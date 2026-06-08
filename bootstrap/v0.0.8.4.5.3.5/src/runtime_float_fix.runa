@@ -1,0 +1,310 @@
+Note:
+Replacement string_to_float and float_divide_bits for stage1 runtime.o.
+The legacy runtime.o has a buggy string_to_float (hardcoded 0x3fa427afc884607a
+instead of correct POW10 values), producing Float literals scaled by ~0.39365.
+
+This implementation follows the Clinger fast-path algorithm:
+  1. Parse mantissa as integer.
+  2. Convert mantissa to float via integer_to_float (cvtsi2sd).
+  3. Scale by 10^total_exp using exact POW10 constants and hardware mulsd/divsd.
+
+For |total_exp| <= 22 with |mantissa| < 2^53, the result is correctly rounded
+to nearest-even per IEEE 754. For larger exponents, multi-step scaling using
+10^22 chunks composes at most ceil(|exp|/22) IEEE rounding errors over the
+full binary64 dynamic range.
+
+Symbols already provided by the link environment:
+  - integer_to_float    (in /tmp/runac_92, uses cvtsi2sd)
+  - float_multiply_bits (in /tmp/runac_92, uses mulsd)
+  - string_length       (in legacy runtime.o)
+  - memory_get_byte     (in legacy runtime.o)
+
+This file additionally defines float_divide_bits (NOT in current runac_92,
+needed by negative-exponent path of Clinger).
+
+Linked FIRST in stage1 link order so its symbols override the legacy
+runtime.o's buggy string_to_float under --allow-multiple-definition.
+:End Note
+
+Let __runa_no_mangle__ be 1
+
+Note: ============================================================
+Note: POW10 lookup - returns IEEE 754 binary64 bit pattern for 10^n
+Note: where n in [0, 22]. Returns 0 for out-of-range n.
+Note: ============================================================
+
+Process called "pow10_bits_lookup" takes n as Integer returns Integer:
+    If n is equal to 0:
+        Return 4607182418800017408
+    End If
+    If n is equal to 1:
+        Return 4621819117588971520
+    End If
+    If n is equal to 2:
+        Return 4636737291354636288
+    End If
+    If n is equal to 3:
+        Return 4652007308841189376
+    End If
+    If n is equal to 4:
+        Return 4666723172467343360
+    End If
+    If n is equal to 5:
+        Return 4681608360884174848
+    End If
+    If n is equal to 6:
+        Return 4696837146684686336
+    End If
+    If n is equal to 7:
+        Return 4711630319722168320
+    End If
+    If n is equal to 8:
+        Return 4726483295884279808
+    End If
+    If n is equal to 9:
+        Return 4741671816366391296
+    End If
+    If n is equal to 10:
+        Return 4756540486875873280
+    End If
+    If n is equal to 11:
+        Return 4771362005757984768
+    End If
+    If n is equal to 12:
+        Return 4786511204640096256
+    End If
+    If n is equal to 13:
+        Return 4801453603149578240
+    End If
+    If n is equal to 14:
+        Return 4816244402031689728
+    End If
+    If n is equal to 15:
+        Return 4831355200913801216
+    End If
+    If n is equal to 16:
+        Return 4846369599423283200
+    End If
+    If n is equal to 17:
+        Return 4861130398305394688
+    End If
+    If n is equal to 18:
+        Return 4876203697187506176
+    End If
+    If n is equal to 19:
+        Return 4891288408196988160
+    End If
+    If n is equal to 20:
+        Return 4906019910204099648
+    End If
+    If n is equal to 21:
+        Return 4921056587992461136
+    End If
+    If n is equal to 22:
+        Return 4936209963552724370
+    End If
+    Return 0
+End Process
+
+Note: ============================================================
+Note: float_divide_bits - hardware divsd for IEEE 754 binary64.
+Note: a_bits / b_bits, both as int64 bit patterns.
+Note: ============================================================
+
+Process called "float_divide_bits" takes a_bits as Integer, b_bits as Integer returns Integer:
+    Let result_bits be 0
+    Inline Assembly:
+        # a_bits at [rbp-8], b_bits at [rbp-16], result_bits at [rbp-24].
+        movq xmm0, qword ptr [rbp-8]
+        movq xmm1, qword ptr [rbp-16]
+        divsd xmm0, xmm1
+        movq qword ptr [rbp-24], xmm0
+    End Assembly
+    Return result_bits
+End Process
+
+Note: ============================================================
+Note: string_to_float - parse decimal string to IEEE 754 binary64
+Note: bit pattern. Handles sign, integer/fraction parts, exponent
+Note: notation (e or E). Uses Clinger fast path with correctly-
+Note: rounded hardware mulsd/divsd for exponent scaling.
+Note: ============================================================
+
+Process called "string_to_float" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+
+    Let str_len be string_length(s)
+    If str_len is equal to 0:
+        Return 0
+    End If
+
+    Let pos be 0
+    Let sign be 1
+    Let first_byte be memory_get_byte(s, 0)
+
+    If first_byte is equal to 45:
+        Set sign to 0 minus 1
+        Set pos to 1
+    End If
+    If first_byte is equal to 43:
+        Set pos to 1
+    End If
+
+    Note: Accumulate integer mantissa to preserve precision; convert to
+    Note: float at the end via integer_to_float.
+    Let integer_mantissa be 0
+    Let fraction_digits be 0
+    Let saw_dot be 0
+
+    While pos is less than str_len:
+        Let ch be memory_get_byte(s, pos)
+        If ch is equal to 46:
+            If saw_dot is not equal to 0:
+                Note: second dot - stop
+                Set pos to str_len
+            Otherwise:
+                Set saw_dot to 1
+                Set pos to pos plus 1
+            End If
+        Otherwise:
+            If ch is equal to 101:
+                Set pos to str_len
+            Otherwise:
+                If ch is equal to 69:
+                    Set pos to str_len
+                Otherwise:
+                    If ch is greater than or equal to 48:
+                        If ch is less than or equal to 57:
+                            Let digit be ch minus 48
+                            Set integer_mantissa to integer_mantissa multiplied by 10
+                            Set integer_mantissa to integer_mantissa plus digit
+                            If saw_dot is equal to 1:
+                                Set fraction_digits to fraction_digits plus 1
+                            End If
+                            Set pos to pos plus 1
+                        Otherwise:
+                            Set pos to str_len
+                        End If
+                    Otherwise:
+                        Set pos to str_len
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Note: Parse optional exponent. pos may have stopped at 'e' or 'E';
+    Note: rescan from the original buffer to find it.
+    Let exp_pos be 0
+    Let exp_value be 0
+    Let exp_sign be 1
+    Let exp_scan be 0
+    While exp_scan is less than str_len:
+        Let exp_ch be memory_get_byte(s, exp_scan)
+        If exp_ch is equal to 101:
+            Set exp_pos to exp_scan plus 1
+            Set exp_scan to str_len
+        Otherwise:
+            If exp_ch is equal to 69:
+                Set exp_pos to exp_scan plus 1
+                Set exp_scan to str_len
+            Otherwise:
+                Set exp_scan to exp_scan plus 1
+            End If
+        End If
+    End While
+
+    If exp_pos is not equal to 0:
+        If exp_pos is less than str_len:
+            Let exp_first be memory_get_byte(s, exp_pos)
+            If exp_first is equal to 45:
+                Set exp_sign to 0 minus 1
+                Set exp_pos to exp_pos plus 1
+            End If
+            If exp_first is equal to 43:
+                Set exp_pos to exp_pos plus 1
+            End If
+        End If
+        While exp_pos is less than str_len:
+            Let ed be memory_get_byte(s, exp_pos)
+            If ed is greater than or equal to 48:
+                If ed is less than or equal to 57:
+                    Set exp_value to exp_value multiplied by 10
+                    Set exp_value to exp_value plus (ed minus 48)
+                    Set exp_pos to exp_pos plus 1
+                Otherwise:
+                    Set exp_pos to str_len
+                End If
+            Otherwise:
+                Set exp_pos to str_len
+            End If
+        End While
+    End If
+
+    Let total_exp be exp_value multiplied by exp_sign
+    Set total_exp to total_exp minus fraction_digits
+
+    Let mantissa_with_sign be integer_mantissa multiplied by sign
+    Let result_bits be integer_to_float(mantissa_with_sign)
+
+    If total_exp is equal to 0:
+        Return result_bits
+    End If
+
+    Note: Compute |integer_mantissa| and |total_exp| for Clinger check.
+    Let mantissa_magnitude be integer_mantissa
+    If mantissa_magnitude is less than 0:
+        Set mantissa_magnitude to 0 minus mantissa_magnitude
+    End If
+
+    Let exp_magnitude be total_exp
+    If exp_magnitude is less than 0:
+        Set exp_magnitude to 0 minus exp_magnitude
+    End If
+
+    Note: Clinger fast path: single exact mulsd (positive exponent) or
+    Note: single exact divsd (negative exponent). The result is correctly-
+    Note: rounded by IEEE 754 when both operands are exact.
+    If exp_magnitude is less than or equal to 22:
+        If mantissa_magnitude is less than 9007199254740992:
+            Let pow_bits be pow10_bits_lookup(exp_magnitude)
+            If total_exp is greater than 0:
+                Set result_bits to float_multiply_bits(result_bits, pow_bits)
+            Otherwise:
+                Set result_bits to float_divide_bits(result_bits, pow_bits)
+            End If
+            Return result_bits
+        End If
+    End If
+
+    Note: Multi-step scaling fallback. Split exp_magnitude = k*22 + r.
+    Note: Apply k operations by 10^22, then a final op by 10^r.
+    Let pow22_bits be 4936209963552724370
+    Let chunks be exp_magnitude divided by 22
+    Let residual be exp_magnitude minus (chunks multiplied by 22)
+
+    Let i be 0
+    If total_exp is greater than 0:
+        While i is less than chunks:
+            Set result_bits to float_multiply_bits(result_bits, pow22_bits)
+            Set i to i plus 1
+        End While
+        If residual is greater than 0:
+            Let residual_bits_pos be pow10_bits_lookup(residual)
+            Set result_bits to float_multiply_bits(result_bits, residual_bits_pos)
+        End If
+    Otherwise:
+        While i is less than chunks:
+            Set result_bits to float_divide_bits(result_bits, pow22_bits)
+            Set i to i plus 1
+        End While
+        If residual is greater than 0:
+            Let residual_bits_neg be pow10_bits_lookup(residual)
+            Set result_bits to float_divide_bits(result_bits, residual_bits_neg)
+        End If
+    End If
+
+    Return result_bits
+End Process
