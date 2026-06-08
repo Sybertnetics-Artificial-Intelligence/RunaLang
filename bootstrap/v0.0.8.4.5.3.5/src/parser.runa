@@ -334,57 +334,106 @@ Process called "parser_collect_multiword_identifier" takes parser as Integer ret
     Let mw_first_type be memory_get_integer(mw_first_token, 0)
     Let mw_first_value be memory_get_pointer(mw_first_token, 8)
     Let mw_first_line be memory_get_int32(mw_first_token, 16)
-    Let mw_accum be string_duplicate_parser(mw_first_value)
+
+    Note: O(N) GROWING-BUFFER ACCUMULATOR (replaces per-iteration string_concat,
+    Note: which produced O(N²) total work on long multi-word identifiers).
+    Note: Layout: mw_accum_buf is a heap byte buffer of capacity mw_accum_cap;
+    Note: mw_accum_len is the current byte length (NOT counting the trailing
+    Note: NUL). Each append writes new bytes at offset mw_accum_len and re-NULs
+    Note: the slot at the new end. Capacity grows geometrically (×2) so the
+    Note: amortized cost of each append is O(word_length), giving the function
+    Note: O(N × average_word_length) instead of O(N² × accumulated_length).
+    Let mw_first_len be string_length(mw_first_value)
+    Let mw_accum_cap be 64
+    If mw_first_len plus 1 is greater than mw_accum_cap:
+        Set mw_accum_cap to mw_first_len plus 64
+    End If
+    Let mw_accum_buf be memory_allocate(mw_accum_cap)
+    memory_copy_string(mw_accum_buf, 0, mw_first_value)
+    Let mw_accum_len be mw_first_len
     parser_eat(parser, mw_first_type)
 
     Note: Continuation loop. Each iteration inspects the freshly cached token
     Note: at parser+8 as the candidate next word. If it passes BOTH the
     Note: continuation predicate AND the same-line guard, we commit (eat it,
-    Note: append "_word" to the accumulator, and the next parser_advance
-    Note: inside parser_eat re-caches the following token). Otherwise we
-    Note: stop without consuming anything.
+    Note: append "_word" to the accumulator via in-place writes, and the next
+    Note: parser_advance inside parser_eat re-caches the following token).
+    Note: Otherwise we stop without consuming anything.
     Let mw_loop be 1
     While mw_loop is equal to 1:
         Let mw_cand_token be memory_get_pointer(parser, 8)
         Let mw_continue be 0
         Let mw_cand_type be 0
-        Let mw_cand_value_dup be 0
+        Let mw_cand_value be 0
         If mw_cand_token is not equal to 0:
             Set mw_cand_type to memory_get_integer(mw_cand_token, 0)
             Let mw_cand_line be memory_get_int32(mw_cand_token, 16)
             If mw_cand_line is equal to mw_first_line:
                 Let mw_cand_ok be token_can_continue_identifier(mw_cand_type)
                 If mw_cand_ok is equal to 1:
-                    Note: Duplicate the candidate's word value before we eat
-                    Note: the token; parser_eat -> parser_advance -> token_destroy
-                    Note: will free the token-owned string, but our duplicate
-                    Note: lives on independently.
-                    Set mw_cand_value_dup to string_duplicate_parser(memory_get_pointer(mw_cand_token, 8))
+                    Note: Capture the candidate's value pointer for length
+                    Note: measurement BEFORE parser_eat — parser_eat ->
+                    Note: parser_advance -> token_destroy will free the
+                    Note: token-owned string, so we read its bytes into
+                    Note: our growing buffer immediately, while the
+                    Note: pointer is still valid.
+                    Set mw_cand_value to memory_get_pointer(mw_cand_token, 8)
                     Set mw_continue to 1
                 End If
             End If
         End If
 
         If mw_continue is equal to 1:
-            Note: Commit: eat the candidate, then append "_word" to the
-            Note: accumulator. The accumulator's previous allocation is leaked
-            Note: here (per the parser's existing convention — string_concat
-            Note: returns a fresh allocation, and intermediate name
-            Note: allocations during parsing are not freed; the parser lives
-            Note: for one compilation).
-            parser_eat(parser, mw_cand_type)
-            Let mw_sep be memory_allocate(2)
-            memory_set_byte(mw_sep, 0, 95)  Note: '_'
-            memory_set_byte(mw_sep, 1, 0)
-            Let mw_with_sep be string_concat(mw_accum, mw_sep)
-            Let mw_joined be string_concat(mw_with_sep, mw_cand_value_dup)
-            Set mw_accum to mw_joined
+            Note: Compute how many bytes we need: current length + 1 (for the
+            Note: underscore separator) + word length + 1 (for the NUL).
+            Let mw_word_len be string_length(mw_cand_value)
+            Let mw_needed be mw_accum_len plus mw_word_len
+            Set mw_needed to mw_needed plus 2
+
+            Note: Grow the buffer geometrically if needed. Doubling guarantees
+            Note: amortized O(1) reallocations per append; we keep doubling
+            Note: until capacity covers mw_needed. The previous buffer is
+            Note: leaked by design — the parser's existing convention is that
+            Note: intermediate name allocations are not freed; the parser
+            Note: lives for one compilation.
+            If mw_needed is greater than mw_accum_cap:
+                Let mw_new_cap be mw_accum_cap multiplied by 2
+                Let mw_grow_done be 0
+                While mw_grow_done is equal to 0:
+                    If mw_new_cap is greater than or equal to mw_needed:
+                        Set mw_grow_done to 1
+                    Otherwise:
+                        Set mw_new_cap to mw_new_cap multiplied by 2
+                    End If
+                End While
+                Let mw_new_buf be memory_allocate(mw_new_cap)
+                memory_copy(mw_new_buf, mw_accum_buf, mw_accum_len)
+                Set mw_accum_buf to mw_new_buf
+                Set mw_accum_cap to mw_new_cap
+            End If
+
+            Note: Read the candidate token's type into a local BEFORE parser_eat —
+            Note: parser_eat will trigger token_destroy on the cached token, and
+            Note: we want to use the type once more for the eat call.
+            Let mw_eat_type be mw_cand_type
+
+            Note: Append "_" then the word bytes directly into mw_accum_buf.
+            Note: memory_copy_string also writes the trailing NUL, so the
+            Note: buffer remains a valid C-string after every iteration.
+            memory_set_byte(mw_accum_buf, mw_accum_len, 95)  Note: '_'
+            Set mw_accum_len to mw_accum_len plus 1
+            memory_copy_string(mw_accum_buf, mw_accum_len, mw_cand_value)
+            Set mw_accum_len to mw_accum_len plus mw_word_len
+
+            Note: Now consume the token. The token-owned string is freed by
+            Note: token_destroy, but we already copied its bytes above.
+            parser_eat(parser, mw_eat_type)
         Otherwise:
             Set mw_loop to 0
         End If
     End While
 
-    Return mw_accum
+    Return mw_accum_buf
 End Process
 
 Note:
@@ -419,7 +468,19 @@ Process called "parser_collect_multiword_identifier_binding" takes parser as Int
     Let mwb_first_type be memory_get_integer(mwb_first_token, 0)
     Let mwb_first_value be memory_get_pointer(mwb_first_token, 8)
     Let mwb_first_line be memory_get_int32(mwb_first_token, 16)
-    Let mwb_accum be string_duplicate_parser(mwb_first_value)
+
+    Note: O(N) GROWING-BUFFER ACCUMULATOR (matches the non-binding variant).
+    Note: See parser_collect_multiword_identifier for the full rationale on
+    Note: why this geometric-growth buffer replaces the previous per-iteration
+    Note: string_concat pattern (which produced O(N²) total work).
+    Let mwb_first_len be string_length(mwb_first_value)
+    Let mwb_accum_cap be 64
+    If mwb_first_len plus 1 is greater than mwb_accum_cap:
+        Set mwb_accum_cap to mwb_first_len plus 64
+    End If
+    Let mwb_accum_buf be memory_allocate(mwb_accum_cap)
+    memory_copy_string(mwb_accum_buf, 0, mwb_first_value)
+    Let mwb_accum_len be mwb_first_len
     parser_eat(parser, mwb_first_type)
 
     Let mwb_loop be 1
@@ -427,7 +488,7 @@ Process called "parser_collect_multiword_identifier_binding" takes parser as Int
         Let mwb_cand_token be memory_get_pointer(parser, 8)
         Let mwb_continue be 0
         Let mwb_cand_type be 0
-        Let mwb_cand_value_dup be 0
+        Let mwb_cand_value be 0
         If mwb_cand_token is not equal to 0:
             Set mwb_cand_type to memory_get_integer(mwb_cand_token, 0)
             Note: BINDING-context short-circuit: TOKEN_AS (34) always
@@ -441,7 +502,7 @@ Process called "parser_collect_multiword_identifier_binding" takes parser as Int
                 If mwb_cand_line is equal to mwb_first_line:
                     Let mwb_cand_ok be token_can_continue_identifier(mwb_cand_type)
                     If mwb_cand_ok is equal to 1:
-                        Set mwb_cand_value_dup to string_duplicate_parser(memory_get_pointer(mwb_cand_token, 8))
+                        Set mwb_cand_value to memory_get_pointer(mwb_cand_token, 8)
                         Set mwb_continue to 1
                     End If
                 End If
@@ -449,19 +510,40 @@ Process called "parser_collect_multiword_identifier_binding" takes parser as Int
         End If
 
         If mwb_continue is equal to 1:
-            parser_eat(parser, mwb_cand_type)
-            Let mwb_sep be memory_allocate(2)
-            memory_set_byte(mwb_sep, 0, 95)
-            memory_set_byte(mwb_sep, 1, 0)
-            Let mwb_with_sep be string_concat(mwb_accum, mwb_sep)
-            Let mwb_joined be string_concat(mwb_with_sep, mwb_cand_value_dup)
-            Set mwb_accum to mwb_joined
+            Let mwb_word_len be string_length(mwb_cand_value)
+            Let mwb_needed be mwb_accum_len plus mwb_word_len
+            Set mwb_needed to mwb_needed plus 2
+
+            If mwb_needed is greater than mwb_accum_cap:
+                Let mwb_new_cap be mwb_accum_cap multiplied by 2
+                Let mwb_grow_done be 0
+                While mwb_grow_done is equal to 0:
+                    If mwb_new_cap is greater than or equal to mwb_needed:
+                        Set mwb_grow_done to 1
+                    Otherwise:
+                        Set mwb_new_cap to mwb_new_cap multiplied by 2
+                    End If
+                End While
+                Let mwb_new_buf be memory_allocate(mwb_new_cap)
+                memory_copy(mwb_new_buf, mwb_accum_buf, mwb_accum_len)
+                Set mwb_accum_buf to mwb_new_buf
+                Set mwb_accum_cap to mwb_new_cap
+            End If
+
+            Let mwb_eat_type be mwb_cand_type
+
+            memory_set_byte(mwb_accum_buf, mwb_accum_len, 95)  Note: '_'
+            Set mwb_accum_len to mwb_accum_len plus 1
+            memory_copy_string(mwb_accum_buf, mwb_accum_len, mwb_cand_value)
+            Set mwb_accum_len to mwb_accum_len plus mwb_word_len
+
+            parser_eat(parser, mwb_eat_type)
         Otherwise:
             Set mwb_loop to 0
         End If
     End While
 
-    Return mwb_accum
+    Return mwb_accum_buf
 End Process
 
 Note:
@@ -562,9 +644,14 @@ Process called "parser_parse_logical_or" takes parser as Integer returns Integer
     Return left
 End Process
 
-Note: Parse logical AND expressions
+Note: Parse logical AND expressions. Per runa_formal_grammar.md operator
+Note: precedence (highest to lowest): mul/div > add > shift > comparison >
+Note: bit_and > bit_xor > bit_or > logical_and > logical_or. So logical_and
+Note: descends into bit_or (the highest bitwise-merge level) which in turn
+Note: recurses through bit_xor -> bit_and -> comparison -> shift -> additive
+Note: -> multiplicative -> primary.
 Process called "parser_parse_logical_and" takes parser as Integer returns Integer:
-    Let left be parser_parse_comparison_level(parser)
+    Let left be parser_parse_bit_or(parser)
 
     Let loop_and be 1
     While loop_and is equal to 1:
@@ -573,7 +660,7 @@ Process called "parser_parse_logical_and" takes parser as Integer returns Intege
 
         If token_type is equal to 30:  Note: TOKEN_AND
             parser_eat(parser, 30)
-            Let right be parser_parse_comparison_level(parser)
+            Let right be parser_parse_bit_or(parser)
             Set left to expression_create_binary_op(left, 30, right)
         Otherwise:
             Set loop_and to 0
@@ -583,9 +670,380 @@ Process called "parser_parse_logical_and" takes parser as Integer returns Intege
     Return left
 End Process
 
-Note: Parse comparison expressions (==, !=, <, >, etc.)
+Note: Parse bitwise OR expressions (bit_or, bitwise or, |). Lowest of the
+Note: three bitwise-merge levels per the formal grammar - just above logical
+Note: AND, below logical OR. Uses non-destructive lookahead for the
+Note: multi-word "bitwise or" form.
+Process called "parser_parse_bit_or" takes parser as Integer returns Integer:
+    Let left be parser_parse_bit_xor(parser)
+
+    Let loop_bor be 1
+    While loop_bor is equal to 1:
+        Let current_token be memory_get_pointer(parser, 8)
+        Let token_type be memory_get_integer(current_token, 0)
+
+        Let consumed_op be 0
+
+        If token_type is equal to 40:
+            Note: TOKEN_BIT_OR (single-token form: bit_or / |)
+            parser_eat(parser, 40)
+            Set consumed_op to 1
+        End If
+
+        If consumed_op is equal to 0:
+            If token_type is equal to 175:
+                Note: TOKEN_BITWISE - peek the discriminator. Only consume if
+                Note: it names OR (kind=2); leave the bitwise keyword in place
+                Note: otherwise so inner levels (bit_xor / bit_and) can claim
+                Note: it. parser_peek_bitwise_kind is side-effect-free.
+                Let bw_kind be parser_peek_bitwise_kind(parser)
+                If bw_kind is equal to 2:
+                    parser_eat(parser, 175)
+                    parser_eat(parser, 31)
+                    Let bo_after_op be memory_get_pointer(parser, 8)
+                    Let bo_after_op_type be memory_get_integer(bo_after_op, 0)
+                    If bo_after_op_type is equal to 38:
+                        parser_eat(parser, 38)
+                    End If
+                    Set consumed_op to 1
+                End If
+            End If
+        End If
+
+        If consumed_op is equal to 1:
+            Let right be parser_parse_bit_xor(parser)
+            Set left to expression_create_binary_op(left, 40, right)
+        Otherwise:
+            Set loop_bor to 0
+        End If
+    End While
+
+    Return left
+End Process
+
+Note: Parse bitwise XOR expressions (bit_xor, bitwise xor, ^). Sits between
+Note: bit_or (looser) and bit_and (tighter) per the formal grammar.
+Process called "parser_parse_bit_xor" takes parser as Integer returns Integer:
+    Let left be parser_parse_bit_and(parser)
+
+    Let loop_bxor be 1
+    While loop_bxor is equal to 1:
+        Let current_token be memory_get_pointer(parser, 8)
+        Let token_type be memory_get_integer(current_token, 0)
+
+        Let consumed_op be 0
+
+        If token_type is equal to 41:
+            Note: TOKEN_BIT_XOR (single-token form: bit_xor / ^)
+            parser_eat(parser, 41)
+            Set consumed_op to 1
+        End If
+
+        If consumed_op is equal to 0:
+            If token_type is equal to 175:
+                Note: TOKEN_BITWISE - peek for the XOR discriminator (kind=3).
+                Let bw_kind be parser_peek_bitwise_kind(parser)
+                If bw_kind is equal to 3:
+                    Note: The 'xor' lookahead is an identifier - eat bitwise,
+                    Note: read the cached lookahead token's actual type, then
+                    Note: eat it generically.
+                    parser_eat(parser, 175)
+                    Let bx_xor_tok be memory_get_pointer(parser, 8)
+                    Let bx_xor_type be memory_get_integer(bx_xor_tok, 0)
+                    parser_eat(parser, bx_xor_type)
+                    Let bx_after_op be memory_get_pointer(parser, 8)
+                    Let bx_after_op_type be memory_get_integer(bx_after_op, 0)
+                    If bx_after_op_type is equal to 38:
+                        parser_eat(parser, 38)
+                    End If
+                    Set consumed_op to 1
+                End If
+            End If
+        End If
+
+        If consumed_op is equal to 1:
+            Let right be parser_parse_bit_and(parser)
+            Set left to expression_create_binary_op(left, 41, right)
+        Otherwise:
+            Set loop_bxor to 0
+        End If
+    End While
+
+    Return left
+End Process
+
+Note: Parse bitwise AND expressions (bit_and, bitwise and, &). Tightest of
+Note: the three bitwise-merge levels per the formal grammar. Operands are
+Note: comparison expressions (so X bitwise_and Y is equal to Z parses as
+Note: (X bitwise_and Y) compared to Z, matching C-family expectations).
+Process called "parser_parse_bit_and" takes parser as Integer returns Integer:
+    Let left be parser_parse_comparison_level(parser)
+
+    Let loop_band be 1
+    While loop_band is equal to 1:
+        Let current_token be memory_get_pointer(parser, 8)
+        Let token_type be memory_get_integer(current_token, 0)
+
+        Let consumed_op be 0
+
+        If token_type is equal to 39:
+            Note: TOKEN_BIT_AND (single-token form: bit_and / &)
+            parser_eat(parser, 39)
+            Set consumed_op to 1
+        End If
+
+        If consumed_op is equal to 0:
+            If token_type is equal to 175:
+                Note: TOKEN_BITWISE - peek for the AND discriminator (kind=1).
+                Let bw_kind be parser_peek_bitwise_kind(parser)
+                If bw_kind is equal to 1:
+                    parser_eat(parser, 175)
+                    parser_eat(parser, 30)
+                    Let ba_after_op be memory_get_pointer(parser, 8)
+                    Let ba_after_op_type be memory_get_integer(ba_after_op, 0)
+                    If ba_after_op_type is equal to 38:
+                        parser_eat(parser, 38)
+                    End If
+                    Set consumed_op to 1
+                End If
+            End If
+        End If
+
+        If consumed_op is equal to 1:
+            Let right be parser_parse_comparison_level(parser)
+            Set left to expression_create_binary_op(left, 39, right)
+        Otherwise:
+            Set loop_band to 0
+        End If
+    End While
+
+    Return left
+End Process
+
+Note: Parse comparison expressions (==, !=, <, >, etc.). Now nested below
+Note: bit_and per the documented precedence table. Operands of comparison are
+Note: shift-level expressions (shifted left/right by sits TIGHTER than
+Note: comparison so the shift parser runs first).
 Process called "parser_parse_comparison_level" takes parser as Integer returns Integer:
     Return parser_parse_comparison(parser)
+End Process
+
+Note: Parse bitwise shift expressions (shifted left by, shifted right by,
+Note: bit_shift_left, bit_shift_right, <<, >>). Sits between comparison
+Note: (looser) and additive (tighter) per the formal grammar. Operands are
+Note: additive expressions: `X plus N shifted left by 1` -> (X+N) << 1.
+Process called "parser_parse_shift" takes parser as Integer returns Integer:
+    Let left be parser_parse_additive(parser)
+
+    Let loop_shift be 1
+    While loop_shift is equal to 1:
+        Let current_token be memory_get_pointer(parser, 8)
+        Let token_type be memory_get_integer(current_token, 0)
+
+        Let operator be 0
+        Let consumed_op be 0
+
+        If token_type is equal to 42:
+            Note: TOKEN_BIT_SHIFT_LEFT (single-token form: bit_shift_left / <<)
+            parser_eat(parser, 42)
+            Set operator to 42
+            Set consumed_op to 1
+        End If
+
+        If consumed_op is equal to 0:
+            If token_type is equal to 43:
+                Note: TOKEN_BIT_SHIFT_RIGHT (single-token form: bit_shift_right / >>)
+                parser_eat(parser, 43)
+                Set operator to 43
+                Set consumed_op to 1
+            End If
+        End If
+
+        If consumed_op is equal to 0:
+            If token_type is equal to 176:
+                Note: TOKEN_SHIFTED - multi-word "shifted left/right by".
+                parser_eat(parser, 176)
+                Let sh_dir be memory_get_pointer(parser, 8)
+                Let sh_dir_type be memory_get_integer(sh_dir, 0)
+                If sh_dir_type is equal to 177:
+                    Note: TOKEN_LEFT
+                    parser_eat(parser, 177)
+                    parser_eat(parser, 38)
+                    Set operator to 42
+                    Set consumed_op to 1
+                End If
+                If sh_dir_type is equal to 178:
+                    Note: TOKEN_RIGHT
+                    parser_eat(parser, 178)
+                    parser_eat(parser, 38)
+                    Set operator to 43
+                    Set consumed_op to 1
+                End If
+            End If
+        End If
+
+        If consumed_op is equal to 1:
+            Let right be parser_parse_additive(parser)
+            Set left to expression_create_binary_op(left, operator, right)
+        Otherwise:
+            Set loop_shift to 0
+        End If
+    End While
+
+    Return left
+End Process
+
+Note: Argument-context expression parser. Used wherever a sub-expression
+Note: must STOP at a separator like `and`, `,`, or a comparison operator -
+Note: i.e. function-call arg lists, lambda `with X, Y, Z` invocations,
+Note: dictionary-literal key/value pairs, struct-constructor field values,
+Note: and Match-pattern literals. Includes the full bitwise + shift +
+Note: arithmetic chain (so `proc f with value bitwise and 255` parses the
+Note: way the source intends) but stops BEFORE comparison, so
+Note: `proc f with X is equal to 1` parses as `(proc f with X) is equal to
+Note: 1` rather than as `f((X is equal to 1))`. This restores the v0.0.8.5
+Note: pre-precedence-fix behavior of `parser_parse_additive` at arg sites
+Note: while also exposing bitwise/shift ops at those sites - which was the
+Note: practical behavior of the pre-fix multiplicative-level dispatch.
+Process called "parser_parse_arg_expression" takes parser as Integer returns Integer:
+    Return parser_parse_arg_bit_or(parser)
+End Process
+
+Note: Arg-context bit_or - mirrors parser_parse_bit_or but the inner
+Note: operand parser is parser_parse_arg_bit_xor (which bottoms out at
+Note: shift, NOT comparison). The bitwise tokens recognized are identical.
+Process called "parser_parse_arg_bit_or" takes parser as Integer returns Integer:
+    Let left be parser_parse_arg_bit_xor(parser)
+
+    Let loop_abor be 1
+    While loop_abor is equal to 1:
+        Let current_token be memory_get_pointer(parser, 8)
+        Let token_type be memory_get_integer(current_token, 0)
+
+        Let consumed_op be 0
+
+        If token_type is equal to 40:
+            parser_eat(parser, 40)
+            Set consumed_op to 1
+        End If
+
+        If consumed_op is equal to 0:
+            If token_type is equal to 175:
+                Let bw_kind be parser_peek_bitwise_kind(parser)
+                If bw_kind is equal to 2:
+                    parser_eat(parser, 175)
+                    parser_eat(parser, 31)
+                    Let abo_after_op be memory_get_pointer(parser, 8)
+                    Let abo_after_op_type be memory_get_integer(abo_after_op, 0)
+                    If abo_after_op_type is equal to 38:
+                        parser_eat(parser, 38)
+                    End If
+                    Set consumed_op to 1
+                End If
+            End If
+        End If
+
+        If consumed_op is equal to 1:
+            Let right be parser_parse_arg_bit_xor(parser)
+            Set left to expression_create_binary_op(left, 40, right)
+        Otherwise:
+            Set loop_abor to 0
+        End If
+    End While
+
+    Return left
+End Process
+
+Note: Arg-context bit_xor - mirrors parser_parse_bit_xor but recurses into
+Note: parser_parse_arg_bit_and (no comparison).
+Process called "parser_parse_arg_bit_xor" takes parser as Integer returns Integer:
+    Let left be parser_parse_arg_bit_and(parser)
+
+    Let loop_abxor be 1
+    While loop_abxor is equal to 1:
+        Let current_token be memory_get_pointer(parser, 8)
+        Let token_type be memory_get_integer(current_token, 0)
+
+        Let consumed_op be 0
+
+        If token_type is equal to 41:
+            parser_eat(parser, 41)
+            Set consumed_op to 1
+        End If
+
+        If consumed_op is equal to 0:
+            If token_type is equal to 175:
+                Let bw_kind be parser_peek_bitwise_kind(parser)
+                If bw_kind is equal to 3:
+                    parser_eat(parser, 175)
+                    Let abx_xor_tok be memory_get_pointer(parser, 8)
+                    Let abx_xor_type be memory_get_integer(abx_xor_tok, 0)
+                    parser_eat(parser, abx_xor_type)
+                    Let abx_after_op be memory_get_pointer(parser, 8)
+                    Let abx_after_op_type be memory_get_integer(abx_after_op, 0)
+                    If abx_after_op_type is equal to 38:
+                        parser_eat(parser, 38)
+                    End If
+                    Set consumed_op to 1
+                End If
+            End If
+        End If
+
+        If consumed_op is equal to 1:
+            Let right be parser_parse_arg_bit_and(parser)
+            Set left to expression_create_binary_op(left, 41, right)
+        Otherwise:
+            Set loop_abxor to 0
+        End If
+    End While
+
+    Return left
+End Process
+
+Note: Arg-context bit_and - mirrors parser_parse_bit_and BUT recurses into
+Note: parser_parse_shift rather than parser_parse_comparison_level, so the
+Note: comparison operators don't terminate the bit_and-level operand and
+Note: the trailing `is equal to ...` falls out to the enclosing statement.
+Process called "parser_parse_arg_bit_and" takes parser as Integer returns Integer:
+    Let left be parser_parse_shift(parser)
+
+    Let loop_aband be 1
+    While loop_aband is equal to 1:
+        Let current_token be memory_get_pointer(parser, 8)
+        Let token_type be memory_get_integer(current_token, 0)
+
+        Let consumed_op be 0
+
+        If token_type is equal to 39:
+            parser_eat(parser, 39)
+            Set consumed_op to 1
+        End If
+
+        If consumed_op is equal to 0:
+            If token_type is equal to 175:
+                Let bw_kind be parser_peek_bitwise_kind(parser)
+                If bw_kind is equal to 1:
+                    parser_eat(parser, 175)
+                    parser_eat(parser, 30)
+                    Let aba_after_op be memory_get_pointer(parser, 8)
+                    Let aba_after_op_type be memory_get_integer(aba_after_op, 0)
+                    If aba_after_op_type is equal to 38:
+                        parser_eat(parser, 38)
+                    End If
+                    Set consumed_op to 1
+                End If
+            End If
+        End If
+
+        If consumed_op is equal to 1:
+            Let right be parser_parse_shift(parser)
+            Set left to expression_create_binary_op(left, 39, right)
+        Otherwise:
+            Set loop_aband to 0
+        End If
+    End While
+
+    Return left
 End Process
 
 Note: Parse additive expressions (+ and -)
@@ -625,7 +1083,11 @@ Process called "parser_parse_additive" takes parser as Integer returns Integer:
     Return left
 End Process
 
-Note: Parse multiplicative expressions (*, /, %)
+Note: Parse multiplicative expressions: *, /, %, multiplied by, divided by,
+Note: modulo by. Per the formal grammar this is the TIGHTEST binary level
+Note: above primary. Shift and bitwise operators are NOT handled here -
+Note: they have their own dedicated levels (parser_parse_shift,
+Note: parser_parse_bit_and, parser_parse_bit_xor, parser_parse_bit_or).
 Process called "parser_parse_multiplicative" takes parser as Integer returns Integer:
     Let left be parser_parse_primary_with_postfix(parser)
 
@@ -640,121 +1102,22 @@ Process called "parser_parse_multiplicative" takes parser as Integer returns Int
             parser_eat(parser, 38)
             Let right be parser_parse_primary_with_postfix(parser)
             Set left to expression_create_binary_op(left, operator, right)
+        Otherwise If token_type is equal to 36:
+            Note: TOKEN_DIVIDED
+            Set operator to token_type
+            parser_eat(parser, 36)
+            parser_eat(parser, 38)
+            Set right to parser_parse_primary_with_postfix(parser)
+            Set left to expression_create_binary_op(left, operator, right)
+        Otherwise If token_type is equal to 37:
+            Note: TOKEN_MODULO
+            Set operator to token_type
+            parser_eat(parser, 37)
+            parser_eat(parser, 38)
+            Set right to parser_parse_primary_with_postfix(parser)
+            Set left to expression_create_binary_op(left, operator, right)
         Otherwise:
-            If token_type is equal to 36:  Note: TOKEN_DIVIDED
-                Set operator to token_type
-                parser_eat(parser, 36)
-                parser_eat(parser, 38)
-                Set right to parser_parse_primary_with_postfix(parser)
-                Set left to expression_create_binary_op(left, operator, right)
-            Otherwise:
-                If token_type is equal to 37:  Note: TOKEN_MODULO
-                    Set operator to token_type
-                    parser_eat(parser, 37)
-                    parser_eat(parser, 38)
-                    Set right to parser_parse_primary_with_postfix(parser)
-                    Set left to expression_create_binary_op(left, operator, right)
-                Otherwise:
-                    If token_type is equal to 42:  Note: TOKEN_BIT_SHIFT_LEFT
-                        Set operator to token_type
-                        parser_eat(parser, 42)
-                        Set right to parser_parse_primary_with_postfix(parser)
-                        Set left to expression_create_binary_op(left, operator, right)
-                    Otherwise:
-                        If token_type is equal to 43:  Note: TOKEN_BIT_SHIFT_RIGHT
-                            Set operator to token_type
-                            parser_eat(parser, 43)
-                            Set right to parser_parse_primary_with_postfix(parser)
-                            Set left to expression_create_binary_op(left, operator, right)
-                        Otherwise:
-                            If token_type is equal to 39:  Note: TOKEN_BIT_AND
-                                Set operator to token_type
-                                parser_eat(parser, 39)
-                                Set right to parser_parse_primary_with_postfix(parser)
-                                Set left to expression_create_binary_op(left, operator, right)
-                            Otherwise:
-                                If token_type is equal to 40:  Note: TOKEN_BIT_OR
-                                    Set operator to token_type
-                                    parser_eat(parser, 40)
-                                    Set right to parser_parse_primary_with_postfix(parser)
-                                    Set left to expression_create_binary_op(left, operator, right)
-                                Otherwise:
-                                    If token_type is equal to 41:  Note: TOKEN_BIT_XOR
-                                        Set operator to token_type
-                                        parser_eat(parser, 41)
-                                        Set right to parser_parse_primary_with_postfix(parser)
-                                        Set left to expression_create_binary_op(left, operator, right)
-                                    Otherwise:
-                                        Note: Handle "bitwise and/or/xor [by]" multi-word operators
-                                        If token_type is equal to 175:
-                                            parser_eat(parser, 175)  Note: Eat 'bitwise'
-                                            Let bw_next be memory_get_pointer(parser, 8)
-                                            Let bw_next_type be memory_get_integer(bw_next, 0)
-                                            Set operator to 39  Note: Default to BIT_AND
-                                            If bw_next_type is equal to 30:
-                                                Note: TOKEN_AND -> bitwise and
-                                                parser_eat(parser, 30)
-                                                Set operator to 39
-                                            Otherwise If bw_next_type is equal to 31:
-                                                Note: TOKEN_OR -> bitwise or
-                                                parser_eat(parser, 31)
-                                                Set operator to 40
-                                            Otherwise:
-                                                Note: Check for xor (identifier)
-                                                Let bw_next_val be memory_get_pointer(bw_next, 8)
-                                                Let is_xor be 0
-                                                If bw_next_val is not equal to 0:
-                                                    Set is_xor to string_equals(bw_next_val, "xor")
-                                                End If
-                                                If is_xor is equal to 1:
-                                                    parser_eat(parser, bw_next_type)
-                                                    Set operator to 41
-                                                Otherwise:
-                                                    Note: Unknown bitwise operator - default to and
-                                                    parser_eat(parser, bw_next_type)
-                                                End If
-                                            End If
-                                            Note: Optional 'by' between operator and operand (canonical
-                                            Note: form is "bitwise and/or/xor by N" mirroring "multiplied
-                                            Note: by"; older code accepted the operator without 'by').
-                                            Let bw_after_op be memory_get_pointer(parser, 8)
-                                            Let bw_after_op_type be memory_get_integer(bw_after_op, 0)
-                                            If bw_after_op_type is equal to 38:
-                                                parser_eat(parser, 38)
-                                            End If
-                                            Set right to parser_parse_primary_with_postfix(parser)
-                                            Set left to expression_create_binary_op(left, operator, right)
-                                        Otherwise:
-                                            Note: Handle "shifted left/right by" multi-word operators
-                                            If token_type is equal to 176:
-                                                parser_eat(parser, 176)  Note: Eat 'shifted'
-                                                Let sh_dir be memory_get_pointer(parser, 8)
-                                                Let sh_dir_type be memory_get_integer(sh_dir, 0)
-                                                If sh_dir_type is equal to 177:
-                                                    Note: TOKEN_LEFT -> shifted left by
-                                                    parser_eat(parser, 177)
-                                                    parser_eat(parser, 38)  Note: Eat 'by'
-                                                    Set operator to 42  Note: TOKEN_BIT_SHIFT_LEFT
-                                                End If
-                                                If sh_dir_type is equal to 178:
-                                                    Note: TOKEN_RIGHT -> shifted right by
-                                                    parser_eat(parser, 178)
-                                                    parser_eat(parser, 38)  Note: Eat 'by'
-                                                    Set operator to 43  Note: TOKEN_BIT_SHIFT_RIGHT
-                                                End If
-                                                Set right to parser_parse_primary_with_postfix(parser)
-                                                Set left to expression_create_binary_op(left, operator, right)
-                                            Otherwise:
-                                                Set loop_multiplicative to 0
-                                            End If
-                                        End If
-                                    End If
-                                End If
-                            End If
-                        End If
-                    End If
-                End If
-            End If
+            Set loop_multiplicative to 0
         End If
     End While
 
@@ -879,7 +1242,7 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
         Let pf_name_slot be memory_allocate(8)
 
         Note: Parse first argument. Detect named-arg pattern via capture helper.
-        Set arg_expr to parser_parse_additive(parser)
+        Set arg_expr to parser_parse_arg_expression(parser)
         Set arg_expr to parser_handle_named_arg_capture(parser, arg_expr, pf_name_slot)
         Let pf_first_name be memory_get_pointer(pf_name_slot, 0)
         Let last_was_named be 0
@@ -948,7 +1311,7 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
                     End While
                 End If
 
-                Let arg_expr2 be parser_parse_additive(parser)
+                Let arg_expr2 be parser_parse_arg_expression(parser)
                 Set arg_expr2 to parser_handle_named_arg_capture(parser, arg_expr2, pf_name_slot)
                 Let pf_next_name be memory_get_pointer(pf_name_slot, 0)
                 Set last_was_named to 0
@@ -1161,7 +1524,7 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
             If at_is_index is equal to 1:
                 parser_eat(parser, token_type)  Note: index or key
 
-                Let index be parser_parse_additive(parser)
+                Let index be parser_parse_arg_expression(parser)
 
                 Let array_index be memory_allocate(32)
                 memory_set_integer(array_index, 0, 16)  Note: EXPR_ARRAY_INDEX
@@ -1209,7 +1572,7 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
         Let pwp_name_slot be memory_allocate(8)
 
         Note: Parse first argument, with named-arg detection.
-        Let pwp_arg_expr be parser_parse_additive(parser)
+        Let pwp_arg_expr be parser_parse_arg_expression(parser)
         Set pwp_arg_expr to parser_handle_named_arg_capture(parser, pwp_arg_expr, pwp_name_slot)
         Let pwp_first_name be memory_get_pointer(pwp_name_slot, 0)
         Let pwp_last_named be 0
@@ -1259,7 +1622,7 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
                         Set pwp_zi to pwp_zi plus 1
                     End While
                 End If
-                Let pwp_arg_expr2 be parser_parse_additive(parser)
+                Let pwp_arg_expr2 be parser_parse_arg_expression(parser)
                 Set pwp_arg_expr2 to parser_handle_named_arg_capture(parser, pwp_arg_expr2, pwp_name_slot)
                 Let pwp_next_name be memory_get_pointer(pwp_name_slot, 0)
                 Set pwp_last_named to 0
@@ -1318,9 +1681,12 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
     Return left
 End Process
 
-Note: Parser parse comparison - handles comparison operators
+Note: Parser parse comparison - handles comparison operators. Operands are
+Note: shift-level expressions per the formal grammar (shift is TIGHTER than
+Note: comparison: `X plus N shifted left by 1 is equal to Y` parses as
+Note: `((X + N) << 1) == Y`).
 Process called "parser_parse_comparison" takes parser as Integer returns Integer:
-    Let left be parser_parse_additive(parser)
+    Let left be parser_parse_shift(parser)
 
     Let current_token be memory_get_pointer(parser, 8)
     Let token_type be memory_get_integer(current_token, 0)
@@ -1462,7 +1828,7 @@ Process called "parser_parse_comparison" takes parser as Integer returns Integer
             Return expression_create_comparison(left, comparison_op, null_expr)
         End If
 
-        Let right be parser_parse_additive(parser)
+        Let right be parser_parse_shift(parser)
         Return expression_create_comparison(left, comparison_op, right)
     End If
 
@@ -1473,7 +1839,7 @@ Process called "parser_parse_comparison" takes parser as Integer returns Integer
         If eq_val is not equal to 0:
             If string_equals(eq_val, "equals") is equal to 1:
                 parser_eat(parser, 53)
-                Let equals_right be parser_parse_additive(parser)
+                Let equals_right be parser_parse_shift(parser)
                 Return expression_create_comparison(left, 22, equals_right)
             End If
             If string_equals(eq_val, "does") is equal to 1:
@@ -1489,14 +1855,14 @@ Process called "parser_parse_comparison" takes parser as Integer returns Integer
                     Let dne_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
                     Let dne_type be memory_get_int32(dne_tok, TOKEN_TYPE_OFFSET)
                     parser_eat(parser, dne_type)
-                    Let dne_right be parser_parse_additive(parser)
+                    Let dne_right be parser_parse_shift(parser)
                     Return expression_create_comparison(left, 23, dne_right)
                 End If
                 If does_next_val is not equal to 0:
                     If string_equals(does_next_val, "equal") is equal to 1:
                         Note: "does equal"
                         parser_eat(parser, does_next_type)
-                        Let de_right be parser_parse_additive(parser)
+                        Let de_right be parser_parse_shift(parser)
                         Return expression_create_comparison(left, 22, de_right)
                     End If
                 End If
@@ -1521,7 +1887,7 @@ Process called "parser_parse_comparison" takes parser as Integer returns Integer
         If contains_qual_type is equal to 149:
             parser_eat(parser, 149)
         End If
-        Let contains_right be parser_parse_additive(parser)
+        Let contains_right be parser_parse_shift(parser)
         Let contains_args be memory_allocate(16)
         memory_set_pointer(contains_args, 0, left)
         memory_set_pointer(contains_args, 8, contains_right)
@@ -2306,6 +2672,53 @@ Process called "parser_peek_next_token_type" takes parser as Integer returns Int
     Return pn_result
 End Process
 
+Note: Non-destructive peek for the discriminator following a TOKEN_BITWISE
+Note: lookahead. The bitwise multi-word forms are `bitwise and` (TOKEN_AND),
+Note: `bitwise or` (TOKEN_OR), and `bitwise xor` (TOKEN_IDENTIFIER with value
+Note: string "xor"). Returns:
+Note:   0 - not a recognized bitwise operator
+Note:   1 - bitwise and
+Note:   2 - bitwise or
+Note:   3 - bitwise xor
+Note: Saves and restores the lexer struct fields so the peek is observably
+Note: side-effect-free. Caller invokes this ONLY when the current cached
+Note: token type is TOKEN_BITWISE (175).
+Process called "parser_peek_bitwise_kind" takes parser as Integer returns Integer:
+    Let pb_lexer be memory_get_pointer(parser, 0)
+    Let pb_saved_pos be memory_get_int32(pb_lexer, 8)
+    Let pb_saved_line be memory_get_int32(pb_lexer, 12)
+    Let pb_saved_col be memory_get_int32(pb_lexer, 16)
+    Let pb_saved_char be memory_get_byte(pb_lexer, 20)
+    Let pb_result be 0
+    Let pb_tok be lexer_next_token(pb_lexer)
+    If pb_tok is not equal to 0:
+        Let pb_tok_type be memory_get_integer(pb_tok, 0)
+        If pb_tok_type is equal to 30:
+            Note: TOKEN_AND -> bitwise and
+            Set pb_result to 1
+        End If
+        If pb_tok_type is equal to 31:
+            Note: TOKEN_OR -> bitwise or
+            Set pb_result to 2
+        End If
+        If pb_result is equal to 0:
+            Note: Identifier-form "xor"
+            Let pb_tok_val be memory_get_pointer(pb_tok, 8)
+            If pb_tok_val is not equal to 0:
+                If string_equals(pb_tok_val, "xor") is equal to 1:
+                    Set pb_result to 3
+                End If
+            End If
+        End If
+        token_destroy(pb_tok)
+    End If
+    memory_set_int32(pb_lexer, 8, pb_saved_pos)
+    memory_set_int32(pb_lexer, 12, pb_saved_line)
+    memory_set_int32(pb_lexer, 16, pb_saved_col)
+    memory_set_byte(pb_lexer, 20, pb_saved_char)
+    Return pb_result
+End Process
+
 Note: Non-destructive peek: returns 1 if the tokens AFTER the current token form
 Note: pattern "IDENT as", which inside a struct constructor field-list signals the
 Note: start of the next field initializer.  Used to disambiguate the comma between
@@ -2586,7 +2999,7 @@ Process called "parser_parse_proc_expression" takes parser as Integer returns In
             Note: at parser_parse_primary_with_postfix. Fixes BF: `While proc f from M with
             Note: a, b is not equal to 0:` was mis-parsed with `is not equal to 0` absorbed
             Note: into arg `b`, so the proc-call result became the While condition.
-            Let proc_arg_expr be parser_parse_additive(parser)
+            Let proc_arg_expr be parser_parse_arg_expression(parser)
             Set proc_arg_expr to parser_handle_named_arg_capture(parser, proc_arg_expr, proc_name_slot)
             Let proc_arg_name be memory_get_pointer(proc_name_slot, 0)
             Set proc_last_was_named to 0
@@ -2969,7 +3382,7 @@ Process called "parser_parse_a_dictionary_literal" takes parser as Integer, dict
                 Set dl_values to memory_reallocate(dl_values, dl_pair_size)
             End If
 
-            Let dl_key_expr be parser_parse_additive(parser)
+            Let dl_key_expr be parser_parse_arg_expression(parser)
             Let dl_as_tok be memory_get_pointer(parser, 8)
             Let dl_as_type be memory_get_integer(dl_as_tok, 0)
             If dl_as_type is not equal to 34:
@@ -2980,7 +3393,7 @@ Process called "parser_parse_a_dictionary_literal" takes parser as Integer, dict
                 exit_with_code(1)
             End If
             parser_eat(parser, 34)
-            Let dl_value_expr be parser_parse_additive(parser)
+            Let dl_value_expr be parser_parse_arg_expression(parser)
 
             Let dl_offset be dl_pair_count multiplied by 8
             memory_set_pointer(dl_keys, dl_offset, dl_key_expr)
@@ -4397,7 +4810,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                     Let dummy3 be parser_eat(parser, 52)  Note: TOKEN_COMMA
                 End If
 
-                Let arg be parser_parse_additive(parser)
+                Let arg be parser_parse_arg_expression(parser)
 
                 If argument_count is greater than or equal to capacity:
                     Set capacity to capacity multiplied by 2
@@ -5009,7 +5422,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                             parser_eat(parser, 53)  Note: eat field name
 
                             Note: Parse field value (expression)
-                            Let field_value be parser_parse_additive(parser)
+                            Let field_value be parser_parse_arg_expression(parser)
 
                             Note: Grow arrays if needed
                             If field_count is greater than or equal to field_capacity:
@@ -5446,7 +5859,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                 Set values to memory_allocate(size)
 
                 Note: Parse first key-value pair
-                Let key_expr be parser_parse_additive(parser)
+                Let key_expr be parser_parse_arg_expression(parser)
 
                 Note: Expect "as"
                 Set current_token to memory_get_pointer(parser, 8)
@@ -5460,7 +5873,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                 End If
                 parser_eat(parser, 34)  Note: eat "as"
 
-                Let value_expr be parser_parse_additive(parser)
+                Let value_expr be parser_parse_arg_expression(parser)
 
                 memory_set_pointer(keys, 0, key_expr)
                 memory_set_pointer(values, 0, value_expr)
@@ -5476,7 +5889,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                         parser_eat(parser, 30)  Note: and
 
                         Note: Parse next key
-                        Let key_expr2 be parser_parse_additive(parser)
+                        Let key_expr2 be parser_parse_arg_expression(parser)
 
                         Note: Expect "as"
                         Set current_token to memory_get_pointer(parser, 8)
@@ -5491,7 +5904,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                         parser_eat(parser, 34)  Note: eat "as"
 
                         Note: Parse next value
-                        Let value_expr2 be parser_parse_additive(parser)
+                        Let value_expr2 be parser_parse_arg_expression(parser)
 
                         Note: Grow arrays if needed
                         If pair_count is greater than or equal to capacity:
@@ -5718,7 +6131,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                             parser_eat(parser, 34)  Note: TOKEN_AS
 
                             Note: Parse field value expression (use comparison_level to avoid consuming 'and')
-                            Let field_value_expr be parser_parse_comparison_level(parser)
+                            Let field_value_expr be parser_parse_arg_expression(parser)
 
                             Note: Grow array if needed
                             If field_count is greater than or equal to field_capacity:
@@ -5789,7 +6202,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                         parser_eat(parser, 34)  Note: TOKEN_AS
 
                         Note: Parse field value expression
-                        Set field_value_expr to parser_parse_comparison_level(parser)
+                        Set field_value_expr to parser_parse_arg_expression(parser)
 
                         Note: Grow array if needed
                         If field_count is greater than or equal to field_capacity:
@@ -5985,7 +6398,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                         parser_eat(parser, 34)  Note: TOKEN_AS
 
                         Note: Parse field value expression (use comparison_level to avoid consuming 'and')
-                        Set field_value_expr to parser_parse_comparison_level(parser)
+                        Set field_value_expr to parser_parse_arg_expression(parser)
 
                         Note: Grow array if needed
                         If field_count is greater than or equal to field_capacity:
@@ -6064,7 +6477,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                         Set arguments to memory_reallocate(arguments, new_size)
                     End If
 
-                    Set arg to parser_parse_additive(parser)
+                    Set arg to parser_parse_arg_expression(parser)
                     Set ptr_size to 8
                     Set offset to argument_count multiplied by ptr_size
                     Set arg_ptr to arguments plus offset
@@ -6583,7 +6996,7 @@ Process called "parser_parse_statement_block" takes parser as Integer, count_ptr
                 If id_is_add is equal to 1:
                     parser_eat(parser, 53)  Note: Eat 'Add'
                     Note: Parse the value expression to add (stop at TOKEN_TO).
-                    Let add_value_expr be parser_parse_additive(parser)
+                    Let add_value_expr be parser_parse_arg_expression(parser)
                     parser_eat(parser, 15)  Note: Eat 'to'
                     Note: Optional 'end of' qualifier (canonical form).  If 'end' follows,
                     Note: eat it and the subsequent 'of'; the bare "Add X to LIST" form is
@@ -7177,7 +7590,7 @@ Process called "parser_parse_match_statement" takes parser as Integer returns In
                     Note: pattern alternatives that follow. additive accepts integer
                     Note: literals, float literals, string literals, and simple
                     Note: arithmetic - which is what a literal pattern can validly be.
-                    Set pattern_value to parser_parse_additive(parser)
+                    Set pattern_value to parser_parse_arg_expression(parser)
                 End If
 
                 Note: Detect `or`-separated alternative patterns: `When A or B or C:`.
@@ -9260,7 +9673,7 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
             End If
             If body_is_add is equal to 1:
                 parser_eat(parser, 53)
-                Let body_add_value_expr be parser_parse_additive(parser)
+                Let body_add_value_expr be parser_parse_arg_expression(parser)
                 parser_eat(parser, 15)  Note: 'to'
                 Let body_add_after_to be memory_get_pointer(parser, 8)
                 Let body_add_after_to_type be memory_get_integer(body_add_after_to, 0)
