@@ -3577,6 +3577,26 @@ Process called "codegen_module_key_from_path" takes path as Integer returns Inte
     Return key_buf
 End Process
 
+Note: Wave MODULE-INIT-FIX
+Note: ============================================================================
+Note: Per-module __module_init via ELF `.init_array`
+Note: Replaces the legacy `.weak __module_init` design (which let the linker
+Note: collapse every per-object init function to a single chosen definition,
+Note: dropping non-constant top-level Let initializers from every other module).
+Note: Each compilation unit now emits its OWN init function under a unique name
+Note: derived from the source-file module key: `<module_key>__module_init`.
+Note: The function initializes ONLY this compilation unit's own globals (those
+Note: at indices [0, emit_global_count) per the main.runa-recorded boundary).
+Note: Each per-module init also registers its address in the ELF `.init_array`
+Note: section. The C runtime (__libc_csu_init) invokes every `.init_array`
+Note: entry before main() is called, so user code in main observes fully
+Note: initialized module globals without manual dispatch. This is the standard
+Note: SysV ELF constructor mechanism, identical to GCC's
+Note: `__attribute__((constructor))` lowering, and it works automatically for
+Note: every linked object file regardless of whether the entry-point translation
+Note: unit's compiler ever resolved its import.
+Note: ============================================================================
+
 Note: Look up the resolved file path for an import alias. Walks the program's
 Note: imports array (Imports at offset 32, count at 40; each Import is 16 bytes:
 Note: filename@0, module_name@8). Returns the raw filename string (as written in
@@ -9041,14 +9061,13 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
         Set i to i plus 1
     End While
 
-    Note: For the program entry point (main), call __module_init after all
-    Note: parameter storage so top-level `Let X be <runtime-expr>` globals are
-    Note: initialized before any user code runs. The init function is emitted
-    Note: unconditionally at the end of the function loop; its body is empty
-    Note: when no runtime-init globals exist.
-    If string_equals(func_name, "main") is equal to 1:
-        emit_line(output_file, "    call __module_init  # Initialize runtime-initialized globals")
-    End If
+    Note: Wave MODULE-INIT-FIX: per-module __module_init now runs via the ELF
+    Note: `.init_array` mechanism. Each compilation unit emits a unique
+    Note: `<module_key>__module_init` symbol AND a `.init_array` entry pointing
+    Note: at it. The C runtime (__libc_csu_init) invokes every entry before
+    Note: main() runs, so user code observes fully-initialized module globals
+    Note: without any manual dispatch from this prologue. No call is emitted
+    Note: here -- libc handles dispatch transparently.
 
     Note: Generate function body statements
     Note: Function structure has:
@@ -9676,29 +9695,69 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
         Set i to i plus 1
     End While
 
-    Note: Emit the synthesized __module_init function. It assigns runtime
+    Note: ========================================================================
+    Note: Wave MODULE-INIT-FIX
+    Note: Emit the synthesized per-module init function. It assigns runtime
     Note: values to every top-level global whose initial_value is neither an
     Note: EXPR_INTEGER literal (emitted directly in .data) nor an
-    Note: EXPR_ARRAY_LITERAL_CONST (also emitted in .data). When no such
-    Note: globals exist the function body is empty - a single ret. main calls
-    Note: this after parameter storage so user code observes fully-initialized
-    Note: globals.
-    Note: Emit __module_init as a WEAK symbol so multiple object files (main +
-    Note: parser + import_system, each compiled standalone) can be linked without
-    Note: collision. The linker picks one definition. When all top-level globals
-    Note: are constant literals (the common case for compiler source modules with
-    Note: only `Let X be 0`/`Let X be 48` declarations), every __module_init body
-    Note: is structurally identical (prologue+ret), so collapsing them is safe.
-    Note: The main program's __module_init is the one with real init code for
-    Note: non-constant globals; if it gets picked over an empty one, behavior is
-    Note: correct. If the linker happens to pick an empty one, runtime globals
-    Note: stay at .data defaults, which the language already permits.
+    Note: EXPR_ARRAY_LITERAL_CONST (also emitted in .data).
+    Note: Symbol naming: `<module_key>__module_init` where module_key is derived
+    Note: from main_source_file via codegen_module_key_from_path. NO `.weak`
+    Note: directive: each compilation unit has a globally-unique module key
+    Note: (parent_dir + basename), so per-file init symbols never collide at
+    Note: link time. The previous `.weak __module_init` design let the linker
+    Note: collapse every per-object init to one definition, silently dropping
+    Note: non-constant top-level Let initializers from every other module.
+    Note: Body scope: only the OWN module's globals (indices [0, emit_global_count))
+    Note: get init code emitted here. Imported globals are initialized by their
+    Note: own modules' per-module inits, which the C runtime invokes via
+    Note: `.init_array` before main() is called.
+    Note: Each per-module init is also registered as a `.init_array` entry, so
+    Note: the libc constructor mechanism (__libc_csu_init) calls it
+    Note: automatically before main(). No manual dispatch is needed.
+    Note: ========================================================================
+    Let mi_global_count_full be memory_get_int32(program, 56)
+    Let mi_main_count_bound be memory_get_int32(program, 64)  Note: PROGRAM_MAIN_GLOBAL_COUNT (boundary)
+    Let mi_main_count_set be memory_get_int32(program, 68)    Note: PROGRAM_MAIN_GLOBAL_COUNT_SET flag
+    Let mi_emit_count be mi_global_count_full
+    If mi_main_count_set is equal to 1:
+        Set mi_emit_count to mi_main_count_bound
+    End If
+
+    Note: Compute the per-module init symbol name from main_source_file.
+    Note: main_source_file was captured earlier from functions[0]->source_file.
+    Note: When unavailable (compilation has no Functions, e.g. globals-only file
+    Note: edge case), fall back to a generic symbol "anonymous__module_init".
+    Note: Such edge cases produce no callers either (no main() to dispatch from),
+    Note: so the fallback is dead code that never runs.
+    Let mi_module_key be 0
+    If main_source_file is not equal to 0:
+        Set mi_module_key to codegen_module_key_from_path(main_source_file)
+    End If
+
     emit_line(output_file, "")
-    emit_line(output_file, ".weak __module_init")
-    emit_line(output_file, "__module_init:")
+    Note: .globl makes the per-module init symbol available across object-file
+    Note: boundaries (required because the `.init_array` entry below uses
+    Note: cross-object relocation). NO .weak: unique per-module keys guarantee
+    Note: no link-time collision.
+    file_write_buffered(output_file, ".globl ", 0)
+    If mi_module_key is not equal to 0:
+        file_write_buffered(output_file, mi_module_key, 0)
+    Otherwise:
+        file_write_buffered(output_file, "anonymous", 0)
+    End If
+    file_write_buffered(output_file, "__module_init\n", 0)
+
+    If mi_module_key is not equal to 0:
+        file_write_buffered(output_file, mi_module_key, 0)
+    Otherwise:
+        file_write_buffered(output_file, "anonymous", 0)
+    End If
+    file_write_buffered(output_file, "__module_init:\n", 0)
+
     emit_line(output_file, "    pushq %rbp")
     emit_line(output_file, "    movq %rsp, %rbp")
-    Note: __module_init evaluates global initializer expressions. It adds no
+    Note: Per-module init evaluates global initializer expressions. It adds no
     Note: variables to codegen->stack_offset (no STMT_LET -- just direct
     Note: expression eval + RIP-relative stores into .data slots), so the
     Note: only frame need is expression-spill headroom for nested
@@ -9706,20 +9765,14 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     Note: alignment (matches the +8 rule applied in
     Note: codegen_compute_function_frame_size).
     emit_line(output_file, "    subq $2056, %rsp  # Stack space for global initializer expression spills")
-    Note: __module_init iterates ALL globals (own + imported). This is the
-    Note: weak symbol that the linker keeps a single copy of across all
-    Note: .o files. The main program's __module_init - which has the full
-    Note: merged globals table - is the one the linker should pick, so it
-    Note: must contain init code for every global that any module reaches.
-    Note: .data emission is filtered (only own-file globals emitted as data
-    Note: slots), but __module_init still WRITES to those slots; the writes
-    Note: target symbols defined in other .o files and resolve at link
-    Note: time. This pairing keeps the .data table partitioned across .o
-    Note: files while __module_init centralizes initialization in one place.
-    Let mi_global_count be memory_get_int32(program, 56)
+    Note: Iterate ONLY this compilation unit's own globals. Indices
+    Note: [0, mi_emit_count) are the file's own globals per the main.runa-
+    Note: recorded boundary; indices [mi_emit_count, mi_global_count_full)
+    Note: came in through transitive imports and will be initialized by their
+    Note: own modules' per-module inits.
     Let mi_globals be memory_get_pointer(program, 48)
     Let mi_gi be 0
-    While mi_gi is less than mi_global_count:
+    While mi_gi is less than mi_emit_count:
         Let mi_global be memory_get_pointer(mi_globals, mi_gi multiplied by 8)
         If mi_global is not equal to 0:
             Let mi_init be memory_get_pointer(mi_global, 16)
@@ -9735,14 +9788,24 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
                 End If
                 If mi_needs_init is equal to 1:
                     Let mi_g_name be memory_get_pointer(mi_global, 0)
-                    Note: Evaluate initializer (result in %rax) and store into
-                    Note: the global's .data slot via RIP-relative addressing.
-                    codegen_generate_expression(codegen, mi_init)
-                    file_write_buffered(output_file, "    movq %rax, ", 0)
-                    file_write_buffered(output_file, mi_g_name, 0)
-                    file_write_buffered(output_file, "(%rip)  # Initialize ", 0)
-                    file_write_buffered(output_file, mi_g_name, 0)
-                    file_write_buffered(output_file, "\n", 0)
+                    Note: Skip the __runa_no_mangle__ sentinel -- it is a
+                    Note: compile-time policy marker, not runtime data.
+                    Let mi_skip_sentinel be 0
+                    If mi_g_name is not equal to 0:
+                        If string_equals(mi_g_name, "__runa_no_mangle__") is equal to 1:
+                            Set mi_skip_sentinel to 1
+                        End If
+                    End If
+                    If mi_skip_sentinel is equal to 0:
+                        Note: Evaluate initializer (result in %rax) and store into
+                        Note: the global's .data slot via RIP-relative addressing.
+                        codegen_generate_expression(codegen, mi_init)
+                        file_write_buffered(output_file, "    movq %rax, ", 0)
+                        file_write_buffered(output_file, mi_g_name, 0)
+                        file_write_buffered(output_file, "(%rip)  # Initialize ", 0)
+                        file_write_buffered(output_file, mi_g_name, 0)
+                        file_write_buffered(output_file, "\n", 0)
+                    End If
                 End If
             End If
         End If
@@ -9750,6 +9813,34 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     End While
     emit_line(output_file, "    leave")
     emit_line(output_file, "    ret")
+
+    Note: Wave MODULE-INIT-FIX: Register the per-module init with .init_array so
+    Note: the C runtime invokes it before main(). .init_array is a SysV ELF
+    Note: section containing pointers to constructor functions. __libc_csu_init
+    Note: walks the array and calls each. The "aw" flags mark the section as
+    Note: allocatable + writable (relocations may apply to the function pointers
+    Note: at load time for ASLR). The 8-byte alignment matches pointer alignment
+    Note: on x86-64. We re-emit `.section .text` afterward so subsequent code
+    Note: emission stays in the executable segment.
+    Note: Even an empty per-module init (no non-constant Lets) registers itself
+    Note: -- the prologue+ret cost is negligible and uniform registration keeps
+    Note: the codegen simple. Skipping registration would require a runtime
+    Note: check (does this module have any non-constant Lets) that mirrors the
+    Note: codegen's compile-time check.
+    emit_line(output_file, "    .section .init_array,\"aw\",@init_array")
+    emit_line(output_file, "    .align 8")
+    file_write_buffered(output_file, "    .quad ", 0)
+    If mi_module_key is not equal to 0:
+        file_write_buffered(output_file, mi_module_key, 0)
+    Otherwise:
+        file_write_buffered(output_file, "anonymous", 0)
+    End If
+    file_write_buffered(output_file, "__module_init\n", 0)
+    emit_line(output_file, "    .section .text")
+
+    If mi_module_key is not equal to 0:
+        deallocate(mi_module_key)
+    End If
 
     Note: Generate stack overflow handler if any recursive functions exist
     If call_graph is not equal to 0:

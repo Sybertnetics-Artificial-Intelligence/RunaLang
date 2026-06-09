@@ -1630,7 +1630,6 @@ main:
     subq $1464, %rsp  # Per-function frame size
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
-    call __module_init  # Initialize runtime-initialized globals
     movq $0, %rax
     movq %rax, -24(%rbp)
     movq -8(%rbp), %rax
@@ -2919,13 +2918,17 @@ main:
     popq %rbp
     ret
 
-.weak __module_init
-__module_init:
+.globl src_main__module_init
+src_main__module_init:
     pushq %rbp
     movq %rsp, %rbp
     subq $2056, %rsp  # Stack space for global initializer expression spills
     leave
     ret
+    .section .init_array,"aw",@init_array
+    .align 8
+    .quad src_main__module_init
+    .section .text
 
 .null_pointer_error:
     # Print error message for null pointer

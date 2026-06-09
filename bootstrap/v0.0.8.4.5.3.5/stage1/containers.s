@@ -5738,13 +5738,17 @@ free_integer_item:
     popq %rbp
     ret
 
-.weak __module_init
-__module_init:
+.globl src_containers__module_init
+src_containers__module_init:
     pushq %rbp
     movq %rsp, %rbp
     subq $2056, %rsp  # Stack space for global initializer expression spills
     leave
     ret
+    .section .init_array,"aw",@init_array
+    .align 8
+    .quad src_containers__module_init
+    .section .text
 
 .null_pointer_error:
     # Print error message for null pointer

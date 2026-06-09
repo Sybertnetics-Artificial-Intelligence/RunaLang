@@ -4763,13 +4763,17 @@ hash_table_insert:
     popq %rbp
     ret
 
-.weak __module_init
-__module_init:
+.globl src_string_utils__module_init
+src_string_utils__module_init:
     pushq %rbp
     movq %rsp, %rbp
     subq $2056, %rsp  # Stack space for global initializer expression spills
     leave
     ret
+    .section .init_array,"aw",@init_array
+    .align 8
+    .quad src_string_utils__module_init
+    .section .text
 
 .null_pointer_error:
     # Print error message for null pointer

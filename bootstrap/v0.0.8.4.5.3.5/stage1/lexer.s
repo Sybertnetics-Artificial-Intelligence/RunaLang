@@ -10459,13 +10459,17 @@ print_newline:
     popq %rbp
     ret
 
-.weak __module_init
-__module_init:
+.globl src_lexer__module_init
+src_lexer__module_init:
     pushq %rbp
     movq %rsp, %rbp
     subq $2056, %rsp  # Stack space for global initializer expression spills
     leave
     ret
+    .section .init_array,"aw",@init_array
+    .align 8
+    .quad src_lexer__module_init
+    .section .text
 
 # Stack overflow panic handler
 .stack_overflow_panic:
