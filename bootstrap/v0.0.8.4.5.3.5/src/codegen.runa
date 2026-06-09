@@ -3164,6 +3164,96 @@ Process called "codegen_generate_comparison" takes codegen as Integer, expr as I
         End If
     End If
 
+    Note: ============================================================
+    Note: Bug #421 fix - Float comparison dispatch.
+    Note: Pre-fix, ALL comparisons used `cmpq` (signed int64) regardless
+    Note: of operand type. For negative Float values, the IEEE-754 sign
+    Note: bit makes the bit pattern appear extremely negative as int64.
+    Note: Example: -1.922 bits = -4612037299198322803, -180.0 bits =
+    Note: -4582834833314545664; signed-int compares -4612... < -4582...
+    Note: as TRUE, which is the OPPOSITE of the mathematical result
+    Note: -1.922 > -180.0.
+    Note: .
+    Note: Detection: route to the Float path when EITHER operand is
+    Note: statically typed Float/Float64. Emit `ucomisd` instead of
+    Note: `cmpq`, and use the unordered-compare flag mapping per
+    Note: Intel SDM:
+    Note:   ZF=1, PF=1, CF=1 : operands unordered (NaN involved)
+    Note:   ZF=1, PF=0, CF=0 : operands equal
+    Note:   ZF=0, PF=0, CF=0 : left > right
+    Note:   ZF=0, PF=0, CF=1 : left < right
+    Note: Using set/seta/setb/setae/setbe/setne on the same flags
+    Note: gives correct ordered float comparisons (unordered -> false
+    Note: for ordered <, <=, >, >=; unordered -> false for ==, true
+    Note: for != per IEEE 754 standard NaN semantics).
+    Note: ============================================================
+    Let cmp_left_is_float be codegen_expr_is_float(codegen, left)
+    Let cmp_right_is_float be codegen_expr_is_float(codegen, right)
+    Let cmp_use_float be 0
+    If cmp_left_is_float is equal to 1:
+        Set cmp_use_float to 1
+    End If
+    If cmp_right_is_float is equal to 1:
+        Set cmp_use_float to 1
+    End If
+
+    If cmp_use_float is equal to 1:
+        Note: Evaluate left operand into %rax (Float bit pattern).
+        codegen_generate_expression(codegen, left)
+        If cmp_left_is_float is equal to 0:
+            emit_line(output_file, "    cvtsi2sd %rax, %xmm0")
+            emit_line(output_file, "    movq %xmm0, %rax")
+        End If
+        emit_line(output_file, "    pushq %rax")
+
+        Note: Evaluate right operand into %rax (Float bit pattern).
+        codegen_generate_expression(codegen, right)
+        If cmp_right_is_float is equal to 0:
+            emit_line(output_file, "    cvtsi2sd %rax, %xmm0")
+            emit_line(output_file, "    movq %xmm0, %rax")
+        End If
+
+        Note: Pop left back into %rbx, then load both into SSE registers.
+        Note: ucomisd %src, %dst sets EFLAGS based on comparison of dst with src.
+        Note: We want left vs right, so dst=%xmm0(left) and src=%xmm1(right).
+        emit_line(output_file, "    popq %rbx")
+        emit_line(output_file, "    movq %rbx, %xmm0")
+        emit_line(output_file, "    movq %rax, %xmm1")
+        emit_line(output_file, "    ucomisd %xmm1, %xmm0")
+
+        If comparison_op is equal to 22:  Note: TOKEN_EQUAL
+            emit_line(output_file, "    sete %al")
+            Note: Mask out unordered (NaN) case: sete is true when ZF=1,
+            Note: but unordered also sets ZF=1. Clear if PF=1 (parity).
+            emit_line(output_file, "    setnp %cl")
+            emit_line(output_file, "    andb %cl, %al")
+        Otherwise If comparison_op is equal to 23:  Note: TOKEN_NOT_EQUAL
+            emit_line(output_file, "    setne %al")
+            Note: Unordered yields true for != per IEEE 754.
+            emit_line(output_file, "    setp %cl")
+            emit_line(output_file, "    orb %cl, %al")
+        Otherwise If comparison_op is equal to 24:  Note: TOKEN_LESS
+            Note: ucomisd: CF=1 means left < right (ordered)
+            Note: setb (CF=1) catches < but also unordered; setnp masks unordered
+            emit_line(output_file, "    setb %al")
+            emit_line(output_file, "    setnp %cl")
+            emit_line(output_file, "    andb %cl, %al")
+        Otherwise If comparison_op is equal to 25:  Note: TOKEN_GREATER
+            Note: ucomisd: CF=0 AND ZF=0 means left > right (ordered)
+            emit_line(output_file, "    seta %al")
+        Otherwise If comparison_op is equal to 27:  Note: TOKEN_LESS_EQUAL
+            Note: setbe catches ZF=1 OR CF=1 -- includes unordered. Mask.
+            emit_line(output_file, "    setbe %al")
+            emit_line(output_file, "    setnp %cl")
+            emit_line(output_file, "    andb %cl, %al")
+        Otherwise If comparison_op is equal to 26:  Note: TOKEN_GREATER_EQUAL
+            Note: setae catches CF=0 -- includes equal but not unordered.
+            emit_line(output_file, "    setae %al")
+        End If
+        emit_line(output_file, "    movzbq %al, %rax")
+        Return 0
+    End If
+
     Note: Generate left operand (result in %rax)
     codegen_generate_expression(codegen, left)
     emit_line(output_file, "    pushq %rax")
@@ -3867,12 +3957,32 @@ Process called "codegen_lookup_qualified_target" takes codegen as Integer, alias
             End If
             Set qt_i to qt_i plus 1
         End While
+        Note: ============================================================
+        Note: Bug #419 partial fix - aliased qualified call did not match
+        Note: a function in the named module directly. Fall through to the
+        Note: legacy first-name-match below. The legacy lookup is preserved
+        Note: because Runa imports are transitive: caller may write
+        Note: `proc f from A with ...` where A re-exports f from a module
+        Note: it imports. Without the fallback those legitimate cross-
+        Note: module calls would fail. The original Bug H scenario --
+        Note: `proc create from List` resolving to the caller's own
+        Note: `create` -- is now mitigated at the call site by the
+        Note: per-target source_file mangling in codegen_resolve_call_symbol:
+        Note: the emitted symbol always uses the FOUND target's source key,
+        Note: not the alias's key, so even if the fallback picks an
+        Note: unrelated same-name function the mangled symbol still
+        Note: identifies the correct defining module. A future hardening
+        Note: pass would walk the alias's import closure to validate that
+        Note: the fallback target is genuinely re-exported through the
+        Note: alias before accepting it.
+        Note: ============================================================
         deallocate(qt_alias_key)
     End If
 
     Note: Fallback: first-name-match (legacy behavior, preserved for backwards
     Note: compatibility when import alias does not correspond to an Import
-    Note: statement in this compilation unit -- e.g. transitively-merged callers).
+    Note: statement in this compilation unit -- e.g. transitively-merged callers
+    Note: where the alias is not a known import but the function exists by name).
     Return codegen_lookup_function_by_name(codegen, fn_name)
 End Process
 
