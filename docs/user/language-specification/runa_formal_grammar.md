@@ -141,7 +141,8 @@ hex_digit             ::= [0-9a-fA-F]
 binary_digit          ::= [01]
 octal_digit           ::= [0-7]
 
-float_literal         ::= digit+ '.' digit+ ('_' digit+)*
+float_literal         ::= digit+ '.' digit+ ('_' digit+)* float_exponent?
+float_exponent        ::= ('e' | 'E') ('+' | '-')? digit+
 
 string_literal        ::= normal_string | raw_string | formatted_string
 normal_string         ::= '"' string_content '"' | "'" string_content "'"
