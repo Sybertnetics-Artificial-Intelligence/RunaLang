@@ -592,3 +592,196 @@ Process called "hardware_concurrency" returns Integer:
 
     Return total_set
 End Process
+
+Note: ============================================================================
+Note: Thread Scheduling Priority (nice-level)
+Note: ============================================================================
+
+Process called "thread_set_priority" takes handle as Integer, priority as Integer returns Integer:
+    Note:
+    Set the nice level of the kernel-task identified by `handle` (the TID
+    returned by thread_create / thread_current_id) to `priority`. Linux
+    represents nice values directly in the range -20..19; the higher the
+    value, the lower the priority. The setpriority(2) syscall takes:
+      which (0 = PRIO_PROCESS / -task), who (tid), prio (-20..19).
+    Returns 1 on success, 0 on any failure.
+
+    Syscall number on x86_64 Linux: __NR_setpriority = 141.
+
+    Lowering nice (priority < 0) requires CAP_SYS_NICE; if the caller
+    lacks that capability the kernel returns -EPERM (-1) and we surface
+    failure to the caller. We do not auto-clamp - the API caller has
+    already validated the range to be -20..19 in thread_set_priority.
+    :End Note
+    Let result be proc syscall_3 from Syscall with 141, 0, handle, priority
+    If result is less than 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "thread_get_priority" takes handle as Integer returns Integer:
+    Note:
+    Get the current nice level of the kernel-task identified by `handle`.
+    The getpriority(2) syscall is unusual: to disambiguate -1 (a legal
+    nice level) from -errno (failure) the kernel returns `20 - nice` on
+    success. The conventional userspace decoding is:
+        raw = syscall_2(__NR_getpriority, 0, who)
+        if raw < 0: failure (raw is -errno)
+        nice = 20 - raw
+
+    We pre-zero errno is not feasible (we have no libc); we rely on the
+    fact that 20 - nice for any valid nice -20..19 lies in 1..40 - a
+    strictly positive range that does not collide with -errno.
+
+    Returns the nice value on success, -999 on error (matches the
+    sentinel used by thread_core::thread_get_priority).
+
+    Syscall number on x86_64 Linux: __NR_getpriority = 140.
+    :End Note
+    Let raw be proc syscall_2 from Syscall with 140, 0, handle
+    If raw is less than 1:
+        Note: Either an error (raw < 0) or an impossible value.
+        Return 0 minus 999
+    End If
+    If raw is greater than 40:
+        Return 0 minus 999
+    End If
+    Return 20 minus raw
+End Process
+
+Note: ============================================================================
+Note: Thread CPU Affinity
+Note: ============================================================================
+
+Process called "thread_set_affinity" takes handle as Integer, cpu_mask as Integer returns Integer:
+    Note:
+    Restrict the kernel-task identified by `handle` to the CPUs encoded
+    by `cpu_mask`. Bit N of cpu_mask = 1 means CPU N is allowed.
+    The sched_setaffinity(2) syscall takes:
+      pid, cpusetsize (bytes), mask_ptr.
+    We materialize cpu_mask as a 128-byte (1024-bit) affinity buffer.
+    Bits 0..63 are read directly from the input mask; bits 64..1023 are
+    zeroed (callers using more than 64 CPUs must extend the API).
+    Returns 1 on success, 0 on failure.
+
+    Syscall number on x86_64 Linux: __NR_sched_setaffinity = 203.
+    :End Note
+    Let mask_buf be proc syscall_mmap from Syscall with 0, 128, 3, 34, -1, 0
+    If mask_buf is less than 0:
+        Return 0
+    End If
+    Let zero_idx be 0
+    While zero_idx is less than 128:
+        proc memory_set_int8 from Memory with mask_buf, zero_idx, 0
+        Set zero_idx to zero_idx plus 1
+    End While
+    Note: Write the low-order 64 bits of cpu_mask into bytes 0..7.
+    Let bit_idx be 0
+    While bit_idx is less than 64:
+        Let one be 1
+        Let shifted be one shifted left by bit_idx
+        Let bit_value be cpu_mask bitwise and shifted
+        If bit_value is not equal to 0:
+            Let byte_offset be bit_idx divided by 8
+            Let bit_in_byte be bit_idx modulo by 8
+            Let prev be proc memory_get_byte from Memory with mask_buf, byte_offset
+            Let bit_mask be 1 shifted left by bit_in_byte
+            Let updated be prev bitwise or bit_mask
+            proc memory_set_int8 from Memory with mask_buf, byte_offset, updated
+        End If
+        Set bit_idx to bit_idx plus 1
+    End While
+    Let rc be proc syscall_3 from Syscall with 203, handle, 128, mask_buf
+    proc syscall_munmap from Syscall with mask_buf, 128
+    If rc is less than 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "thread_get_affinity" takes handle as Integer returns Integer:
+    Note:
+    Read the CPU affinity mask of the kernel-task identified by `handle`
+    and return its low-order 64 bits as a single Integer. CPUs beyond 63
+    are not representable in the return value and are silently dropped;
+    callers needing wider masks must use an extended API. Returns 0 on
+    failure (no available CPU could legitimately produce a zero mask
+    because the kernel always reports at least the running CPU).
+
+    Syscall number on x86_64 Linux: __NR_sched_getaffinity = 204.
+    :End Note
+    Let mask_buf be proc syscall_mmap from Syscall with 0, 128, 3, 34, -1, 0
+    If mask_buf is less than 0:
+        Return 0
+    End If
+    Let zero_idx be 0
+    While zero_idx is less than 128:
+        proc memory_set_int8 from Memory with mask_buf, zero_idx, 0
+        Set zero_idx to zero_idx plus 1
+    End While
+    Let written be proc syscall_3 from Syscall with 204, handle, 128, mask_buf
+    If written is less than or equal to 0:
+        proc syscall_munmap from Syscall with mask_buf, 128
+        Return 0
+    End If
+    Note: Reconstruct the low 64 bits from bytes 0..7.
+    Let result be 0
+    Let byte_offset be 0
+    While byte_offset is less than 8:
+        If byte_offset is less than written:
+            Let byte_val be proc memory_get_byte from Memory with mask_buf, byte_offset
+            Let shifted be byte_val shifted left by (byte_offset multiplied by 8)
+            Set result to result bitwise or shifted
+        End If
+        Set byte_offset to byte_offset plus 1
+    End While
+    proc syscall_munmap from Syscall with mask_buf, 128
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Current-CPU Identification
+Note: ============================================================================
+
+Process called "get_cpu_id" returns Integer:
+    Note:
+    Identify the CPU on which the calling thread is currently executing.
+    The Linux getcpu(2) syscall stores the CPU index into *cpu_ptr
+    (Integer32) and the NUMA node into *node_ptr (also Integer32). We
+    pass NULL for the obsolete tcache pointer (the kernel ignores it).
+
+    Returns the CPU index (>= 0) on success, -1 on failure.
+
+    Syscall number on x86_64 Linux: __NR_getcpu = 309.
+    :End Note
+    Let scratch be proc syscall_mmap from Syscall with 0, 16, 3, 34, -1, 0
+    If scratch is less than 0:
+        Return 0 minus 1
+    End If
+    proc memory_set_int8 from Memory with scratch, 0, 0
+    proc memory_set_int8 from Memory with scratch, 1, 0
+    proc memory_set_int8 from Memory with scratch, 2, 0
+    proc memory_set_int8 from Memory with scratch, 3, 0
+    Let cpu_ptr be scratch
+    Let node_ptr be scratch plus 8
+    Let rc be proc syscall_3 from Syscall with 309, cpu_ptr, node_ptr, 0
+    If rc is less than 0:
+        proc syscall_munmap from Syscall with scratch, 16
+        Return 0 minus 1
+    End If
+    Note: Read back the 32-bit CPU index that the kernel wrote.
+    Let b0 be proc memory_get_byte from Memory with cpu_ptr, 0
+    Let b1 be proc memory_get_byte from Memory with cpu_ptr, 1
+    Let b2 be proc memory_get_byte from Memory with cpu_ptr, 2
+    Let b3 be proc memory_get_byte from Memory with cpu_ptr, 3
+    Let cpu be b0
+    Let s1 be b1 shifted left by 8
+    Set cpu to cpu bitwise or s1
+    Let s2 be b2 shifted left by 16
+    Set cpu to cpu bitwise or s2
+    Let s3 be b3 shifted left by 24
+    Set cpu to cpu bitwise or s3
+    proc syscall_munmap from Syscall with scratch, 16
+    Return cpu
+End Process
