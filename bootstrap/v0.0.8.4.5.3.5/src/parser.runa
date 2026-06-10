@@ -379,6 +379,23 @@ Process called "parser_collect_multiword_identifier" takes parser as Integer ret
                     Note: pointer is still valid.
                     Set mw_cand_value to memory_get_pointer(mw_cand_token, 8)
                     Set mw_continue to 1
+                    Note: Task #428: the word "continuing" is the Display/Alert
+                    Note: no-newline statement modifier (see the primitives spec
+                    Note: in compiler/frontend/primitives/io/display.runa). It is
+                    Note: a contextual keyword and must NEVER be merged into a
+                    Note: multi-word identifier; otherwise `Display block_id
+                    Note: continuing` collected the bogus name
+                    Note: "block_id_continuing", which codegen then emitted as an
+                    Note: undefined leaq symbol reference. Underscore-form
+                    Note: identifiers (e.g. "foo_continuing") are single lexer
+                    Note: tokens and are unaffected by this rejection.
+                    If mw_cand_type is equal to 53:
+                        If mw_cand_value is not equal to 0:
+                            If string_equals(mw_cand_value, "continuing") is equal to 1:
+                                Set mw_continue to 0
+                            End If
+                        End If
+                    End If
                 End If
             End If
         End If
@@ -504,6 +521,19 @@ Process called "parser_collect_multiword_identifier_binding" takes parser as Int
                     If mwb_cand_ok is equal to 1:
                         Set mwb_cand_value to memory_get_pointer(mwb_cand_token, 8)
                         Set mwb_continue to 1
+                        Note: Task #428: "continuing" is the Display/Alert
+                        Note: no-newline modifier (contextual keyword) — never
+                        Note: merge it as a continuation word. Mirrors the same
+                        Note: rejection in parser_collect_multiword_identifier
+                        Note: so field-access RHS positions (e.g.
+                        Note: `Display obj.field continuing`) stop before it too.
+                        If mwb_cand_type is equal to 53:
+                            If mwb_cand_value is not equal to 0:
+                                If string_equals(mwb_cand_value, "continuing") is equal to 1:
+                                    Set mwb_continue to 0
+                                End If
+                            End If
+                        End If
                     End If
                 End If
             End If
@@ -1494,7 +1524,23 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
                 If mqc_is_module is equal to 1:
                     Note: Translate `Module.IDENTIFIER` to a bare variable reference
                     Note: against the merged global namespace.
+                    Note: Task #434: retain the module alias at offset 16 of the
+                    Note: 32-byte EXPR_VARIABLE record, exactly mirroring the
+                    Note: `IDENTIFIER from Module` form (task #430). Merged
+                    Note: constants still resolve through the local/global lookups
+                    Note: in codegen_generate_variable_expr before the fallback
+                    Note: reads this slot, so `Module.CONSTANT` inlines the
+                    Note: immediate identically to `CONSTANT from Module`. When the
+                    Note: name resolves to neither a local, a merged global, nor a
+                    Note: function defined by the aliased module, the alias routes
+                    Note: the fallback through codegen_lookup_qualified_target,
+                    Note: whose #419 alias-disambiguated lookup hard-errors --
+                    Note: killing the silent `leaq IDENTIFIER(%rip)` emission of an
+                    Note: undefined symbol for known-alias bases.
+                    Let mqc_alias_src be memory_get_pointer(left, 8)
+                    Let mqc_alias_dup be string_duplicate_parser(mqc_alias_src)
                     Set left to expression_create_variable(field_name)
+                    memory_set_pointer(left, 16, mqc_alias_dup)
                 Otherwise:
                     Note: Regular field access (not a function call, not a module constant)
                     Let field_access be memory_allocate(32)  Note: sizeof(Expression)
@@ -1932,34 +1978,177 @@ Process called "parser_parse_let_statement" takes parser as Integer returns Inte
     End If
 
     Note:
-    Multi-word identifier collection (task #95 Stage 2). The caller has
-    already verified above that the currently cached token is identifier-
-    eligible (token_can_be_identifier returned 1), which is the precondition
-    that parser_collect_multiword_identifier assumes. The collector reads
-    the first word's value, eats the first token, then loop-consumes any
-    following tokens that satisfy token_can_continue_identifier — joining
-    them with single underscores per the D8 canonicalization decision. For
-    a single-word source (e.g. "my_count"), the loop exits immediately and
-    the returned name is byte-identical to what the previous single-token
-    path produced. The compiler source itself uses no multi-word Let
-    binding names, so emitted output remains byte-identical to Stage 1.
+    Multi-word identifier collection (task #95 Stage 2, upgraded for task
+    #422). The caller has already verified above that the currently cached
+    token is identifier-eligible (token_can_be_identifier returned 1). The
+    BINDING-context collector is used so that TOKEN_AS terminates the name:
+    the pre-value typed form "Let X as Type be V" is canonical Runa (see
+    runa_language_specification.md, e.g. "Let mixed_list as
+    List[StringIntFloat] be a list containing ...") and must bind name X
+    with declared type Type. The previous USE-position collector swallowed
+    "as Type" into the binding name (producing "X_as_Type" and losing the
+    annotation entirely), which made every typed Let silently misbind.
     :End Note
-    Let var_name be parser_collect_multiword_identifier(parser)
+    Let let_first_line be memory_get_int32(current_token, 16)
+    Let var_name be parser_collect_multiword_identifier_binding(parser)
 
     Note:
-    TOKEN_AS (34) after the Let identifier is NOT a parser error. The pre-value
-    "Let X as Type be V" form was removed at v0.0.8.5 by lifting the type
-    annotation to the trailing "of type T" position, which frees the AS token
-    to serve as a normal continuation token inside multi-word natural-language
-    identifiers (e.g. "Let my grades as a highschooler be 12"). Until the
-    multi-word identifier parser lands (task #95), a source that uses the old
-    typed-let form will reach the parser_eat(parser, 13) below and fail with a
-    plain "Expected TOKEN_BE" diagnostic from the eater — same behaviour as any
-    other malformed statement. No bespoke rejection here would survive the
-    multi-word migration, so emitting one would create a false-positive trap
-    for valid future syntax. The trailing "of type T" annotation is recognised
-    below after parser_parse_expression returns.
+    Pre-value type annotation OR multi-word name continuation (task #422).
+    When the token after the collected name is TOKEN_AS (34), the source is
+    one of two shapes:
+      (1) "Let X as <TypeExpr> be V"     — typed Let (the common, spec form)
+      (2) "Let my grades as a highschooler be 12" — a USE-style multi-word
+          binding name that contains the word "as" (CEO motivating example)
+    Disambiguation uses the lexer save/restore peek pattern (mirroring the
+    trailing "of type" detection below): peek the two tokens after AS without
+    committing. The shape is a TYPE annotation iff the first peeked token
+    carries a word value and the second peeked token is TOKEN_BE (13),
+    TOKEN_DOT (51, qualified type "Module.Type"), or TOKEN_LBRACKET (127,
+    generic type "List[T]"). Otherwise the AS is treated as a name
+    continuation word and collection resumes (same-line constraint and
+    underscore joining identical to the USE-position collector).
+    The qualified ".TypeName" suffix and the generic "[...]" skip reuse the
+    exact handling of the trailing "of type" annotation arm below: the part
+    after the dot becomes the resolved type name (the module prefix is
+    source-level only; codegen looks types up by their bare name in the
+    merged program scope, where the import system has already merged the
+    module's Type definitions).
     :End Note
+    Let let_type_name be 0
+    Let pre_as_loop be 1
+    While pre_as_loop is equal to 1:
+        Set pre_as_loop to 0
+        Let pre_as_tok be memory_get_pointer(parser, 8)
+        Let pre_as_tok_type be memory_get_integer(pre_as_tok, 0)
+        If pre_as_tok_type is equal to 34:
+            Note: Peek the two tokens after AS via lexer save/restore.
+            Let pre_lexer be memory_get_pointer(parser, 0)
+            Let pre_saved_pos be memory_get_int32(pre_lexer, 8)
+            Let pre_saved_line be memory_get_int32(pre_lexer, 12)
+            Let pre_saved_col be memory_get_int32(pre_lexer, 16)
+            Let pre_saved_char be memory_get_byte(pre_lexer, 20)
+            Let pre_is_type be 0
+            Let pre_t1 be lexer_next_token(pre_lexer)
+            If pre_t1 is not equal to 0:
+                Let pre_t1_val be memory_get_pointer(pre_t1, 8)
+                If pre_t1_val is not equal to 0:
+                    Let pre_t2 be lexer_next_token(pre_lexer)
+                    If pre_t2 is not equal to 0:
+                        Let pre_t2_type be memory_get_integer(pre_t2, 0)
+                        If pre_t2_type is equal to 13:
+                            Set pre_is_type to 1
+                        End If
+                        If pre_t2_type is equal to 51:
+                            Set pre_is_type to 1
+                        End If
+                        If pre_t2_type is equal to 127:
+                            Set pre_is_type to 1
+                        End If
+                        token_destroy(pre_t2)
+                    End If
+                End If
+                token_destroy(pre_t1)
+            End If
+            memory_set_int32(pre_lexer, 8, pre_saved_pos)
+            memory_set_int32(pre_lexer, 12, pre_saved_line)
+            memory_set_int32(pre_lexer, 16, pre_saved_col)
+            memory_set_byte(pre_lexer, 20, pre_saved_char)
+
+            If pre_is_type is equal to 1:
+                Note: Typed Let — consume "as <TypeName>[.Qualified][[...]]".
+                parser_eat(parser, 34)
+                Let pre_type_tok be memory_get_pointer(parser, 8)
+                Let pre_type_tok_type be memory_get_integer(pre_type_tok, 0)
+                Let pre_type_val be memory_get_pointer(pre_type_tok, 8)
+                If pre_type_val is not equal to 0:
+                    Set let_type_name to string_duplicate_parser(pre_type_val)
+                End If
+                parser_eat(parser, pre_type_tok_type)
+
+                Note: Optional ".QualifiedTypeName" — keep the part after the
+                Note: dot, mirroring the trailing "of type" arm below.
+                Let pre_dot_tok be memory_get_pointer(parser, 8)
+                Let pre_dot_type be memory_get_integer(pre_dot_tok, 0)
+                If pre_dot_type is equal to 51:
+                    parser_eat(parser, 51)
+                    Let pre_qual_tok be memory_get_pointer(parser, 8)
+                    Let pre_qual_type be memory_get_integer(pre_qual_tok, 0)
+                    Let pre_qual_val be memory_get_pointer(pre_qual_tok, 8)
+                    If pre_qual_val is not equal to 0:
+                        Set let_type_name to string_duplicate_parser(pre_qual_val)
+                    End If
+                    Let pre_qual_can_id be token_can_be_identifier(pre_qual_type)
+                    If pre_qual_can_id is equal to 1:
+                        parser_eat(parser, pre_qual_type)
+                    Otherwise:
+                        parser_eat(parser, 53)
+                    End If
+                End If
+
+                Note: Skip generic params after the type name (List[Integer]).
+                Let pre_gen_tok be memory_get_pointer(parser, 8)
+                Let pre_gen_type be memory_get_integer(pre_gen_tok, 0)
+                If pre_gen_type is equal to 127:
+                    parser_eat(parser, 127)
+                    Let pre_bracket_depth be 1
+                    While pre_bracket_depth is greater than 0:
+                        Let pre_gen_inner_tok be memory_get_pointer(parser, 8)
+                        Let pre_gen_inner_type be memory_get_integer(pre_gen_inner_tok, 0)
+                        If pre_gen_inner_type is equal to 127:
+                            Set pre_bracket_depth to pre_bracket_depth plus 1
+                            parser_eat(parser, 127)
+                        Otherwise If pre_gen_inner_type is equal to 128:
+                            Set pre_bracket_depth to pre_bracket_depth minus 1
+                            parser_eat(parser, 128)
+                        Otherwise If pre_gen_inner_type is equal to 0:
+                            Note: TOKEN_EOF guard against runaway loops
+                            Set pre_bracket_depth to 0
+                        Otherwise:
+                            parser_eat(parser, pre_gen_inner_type)
+                        End If
+                    End While
+                End If
+            Otherwise:
+                Note: Name continuation containing "as" — append "_as" and
+                Note: resume same-line continuation-word collection, then
+                Note: re-check for a further AS (outer loop).
+                Let pre_as_line be memory_get_int32(pre_as_tok, 16)
+                If pre_as_line is equal to let_first_line:
+                    parser_eat(parser, 34)
+                    Set var_name to string_concat(var_name, "_as")
+                    Let pre_cont_loop be 1
+                    While pre_cont_loop is equal to 1:
+                        Set pre_cont_loop to 0
+                        Let pre_cont_tok be memory_get_pointer(parser, 8)
+                        If pre_cont_tok is not equal to 0:
+                            Let pre_cont_type be memory_get_integer(pre_cont_tok, 0)
+                            Let pre_cont_line be memory_get_int32(pre_cont_tok, 16)
+                            Note: TOKEN_AS (34) is deliberately NOT consumed
+                            Note: here even though it is in the continuation
+                            Note: set — the outer loop must re-run the typed
+                            Note: lookahead on every "as" so that a trailing
+                            Note: "as Type be" clause after a multi-word name
+                            Note: still parses as a type annotation.
+                            If pre_cont_line is equal to let_first_line:
+                                Let pre_cont_ok be token_can_continue_identifier(pre_cont_type)
+                                If pre_cont_type is equal to 34:
+                                    Set pre_cont_ok to 0
+                                End If
+                                If pre_cont_ok is equal to 1:
+                                    Let pre_cont_val be memory_get_pointer(pre_cont_tok, 8)
+                                    Set var_name to string_concat(var_name, "_")
+                                    Set var_name to string_concat(var_name, pre_cont_val)
+                                    parser_eat(parser, pre_cont_type)
+                                    Set pre_cont_loop to 1
+                                End If
+                            End If
+                        End If
+                    End While
+                    Set pre_as_loop to 1
+                End If
+            End If
+        End If
+    End While
 
     parser_eat(parser, 13)  Note: TOKEN_BE
 
@@ -1984,7 +2173,9 @@ Process called "parser_parse_let_statement" takes parser as Integer returns Inte
     here would corrupt those constructs when the bound expression happens to
     end on something the host expression parser could not consume.
     :End Note
-    Let let_type_name be 0
+    Note: let_type_name is declared in the pre-value annotation arm above.
+    Note: A trailing "of type T" annotation overrides a pre-value "as T"
+    Note: annotation if a source carries both (last-writer-wins).
     Let trail_check be memory_get_pointer(parser, 8)
     Let trail_check_type be memory_get_integer(trail_check, 0)
     If trail_check_type is equal to 125:
@@ -6559,9 +6750,23 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                 Let mod_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
                 Let mod_type be memory_get_int32(mod_tok, TOKEN_TYPE_OFFSET)
                 Let mod_name be memory_get_pointer(mod_tok, TOKEN_VALUE_OFFSET)
+                Note: Task #430: duplicate the alias BEFORE parser_eat —
+                Note: parser_eat -> parser_advance -> token_destroy frees the
+                Note: token-owned value string.
+                Let mod_name_dup be string_duplicate_parser(mod_name)
                 parser_eat(parser, mod_type)
-                Note: Treat as a plain variable access (constant merged during import)
+                Note: Treat as a plain variable access (constant merged during
+                Note: import), but retain the module alias at offset 16 of the
+                Note: 32-byte EXPR_VARIABLE record (zero-filled by
+                Note: memory_allocate; previously unused padding). Codegen's
+                Note: unresolved-identifier fallback uses the alias for
+                Note: alias-disambiguated, mangling-aware function-address
+                Note: resolution (`handler from Module` as a value). Constant
+                Note: accesses are unaffected: merged constants resolve through
+                Note: the local/global lookups before the fallback reads this
+                Note: slot.
                 Set expr to expression_create_variable(name)
+                memory_set_pointer(expr, 16, mod_name_dup)
                 Return expr
             End If
         End If
@@ -6793,6 +6998,7 @@ Process called "parser_parse_print_statement" takes parser as Integer returns In
     Let current_check be memory_get_pointer(parser, 8)
     Let check_type be memory_get_int32(current_check, 0)
 
+    Let print_final_expr be first_expr
     If check_type is equal to 52:  Note: TOKEN_COMMA - concatenate multiple expressions
         Note: Build concatenated string from comma-separated expressions
         Let concat_expr be first_expr
@@ -6812,11 +7018,38 @@ Process called "parser_parse_print_statement" takes parser as Integer returns In
             Set check_type to memory_get_int32(current_check, 0)
         End While
 
-        Return statement_create_print(concat_expr)
-    Otherwise:
-        Note: Single expression - return as-is
-        Return statement_create_print(first_expr)
+        Set print_final_expr to concat_expr
     End If
+
+    Note: Task #428: optional trailing "continuing" modifier — `Display expr
+    Note: continuing` / `Alert expr continuing` suppress the trailing newline
+    Note: (see compiler/frontend/primitives/io/display.runa and alert.runa).
+    Note: The multi-word identifier collectors explicitly refuse to swallow
+    Note: the word "continuing", so when the modifier is present it is still
+    Note: the cached token here regardless of the expression's shape. The flag
+    Note: is stored at statement offset 16 (the 24-byte STMT_PRINT record's
+    Note: previously unused slot); codegen selects the _nonl print helpers
+    Note: when it is set.
+    Let print_continuing be 0
+    Let cont_check_tok be memory_get_pointer(parser, 8)
+    If cont_check_tok is not equal to 0:
+        Let cont_check_type be memory_get_int32(cont_check_tok, 0)
+        If cont_check_type is equal to 53:  Note: TOKEN_IDENTIFIER
+            Let cont_check_val be memory_get_pointer(cont_check_tok, 8)
+            If cont_check_val is not equal to 0:
+                If string_equals(cont_check_val, "continuing") is equal to 1:
+                    parser_eat(parser, 53)
+                    Set print_continuing to 1
+                End If
+            End If
+        End If
+    End If
+
+    Let print_stmt be statement_create_print(print_final_expr)
+    If print_continuing is equal to 1:
+        memory_set_int32(print_stmt, 16, 1)
+    End If
+    Return print_stmt
 End Process
 
 Note: Parser parse statement block - parses block of statements until END/OTHERWISE/EOF
@@ -9392,6 +9625,24 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
         Note: Eat the type token regardless of specific type
         parser_eat(parser, token_type)
 
+        Note: Optional ".QualifiedTypeName" suffix (task #422 sibling fix):
+        Note: `takes X as Module.Type` resolves to the part after the dot,
+        Note: mirroring the typed-Let and trailing "of type" annotation arms —
+        Note: the module prefix is source-level only; codegen looks types up
+        Note: by their bare name in the merged program scope.
+        Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+        Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+        If token_type is equal to 51:
+            parser_eat(parser, 51)
+            Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+            Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
+            If token_value is not equal to 0:
+                Set param_type to string_duplicate_parser(token_value)
+            End If
+            parser_eat(parser, token_type)
+        End If
+
         Note: Skip generic type parameters: List[Integer], Dictionary[K, V], etc.
         Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
         Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
@@ -9462,6 +9713,21 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
             Note: Eat the type token regardless of specific type
             parser_eat(parser, paramtype_token_type)
 
+            Note: Optional ".QualifiedTypeName" suffix (task #422 sibling fix).
+            Note: Mirror of the first-parameter site above.
+            Set paramtype_current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Set paramtype_token_type to memory_get_int32(paramtype_current_token, TOKEN_TYPE_OFFSET)
+            If paramtype_token_type is equal to 51:
+                parser_eat(parser, 51)
+                Set paramtype_current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                Set paramtype_token_type to memory_get_int32(paramtype_current_token, TOKEN_TYPE_OFFSET)
+                Set paramtype_token_value to memory_get_pointer(paramtype_current_token, TOKEN_VALUE_OFFSET)
+                If paramtype_token_value is not equal to 0:
+                    Set param_type to string_duplicate_parser(paramtype_token_value)
+                End If
+                parser_eat(parser, paramtype_token_type)
+            End If
+
             Note: Skip generic type parameters: List[Integer], Dictionary[K, V], etc.
             Note: Mirrors the same handling done for the function return type below.
             Let pt_after be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
@@ -9519,6 +9785,22 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
             Set return_type_name to string_duplicate_parser("Integer")
         End If
         parser_eat(parser, token_type)
+
+        Note: Optional ".QualifiedTypeName" suffix (task #422 sibling fix):
+        Note: `returns Module.Type` resolves to the part after the dot, same
+        Note: convention as the parameter-type and typed-Let sites.
+        Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+        Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+        If token_type is equal to 51:
+            parser_eat(parser, 51)
+            Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+            Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
+            If token_value is not equal to 0:
+                Set return_type_name to string_duplicate_parser(token_value)
+            End If
+            parser_eat(parser, token_type)
+        End If
     End If
     memory_set_pointer(func, 24, return_type_name)
     Note: Handle generic type parameters: List[T], Dictionary[K, V], Optional[T]

@@ -2405,10 +2405,44 @@ Process called "codegen_generate_variable_expr" takes codegen as Integer, expr a
         End If
 
         Note: Not a local, not a global - assume it's a function name or external symbol
-        Note: Emit as symbol reference - assembler/linker will resolve
+        Note: Task #430: function-ADDRESS references (a function name used as a
+        Note: value: callback argument, handler stored in a struct field, etc.)
+        Note: must resolve through the SAME mangling-aware path as call
+        Note: emission. Definitions in imported modules emit
+        Note: `<module_key>__<name>` labels (codegen_mangled_name_for_func_in),
+        Note: so a plain `leaq <name>(%rip)` can never link against them. When
+        Note: the reference was written qualified (`handler from Module`, alias
+        Note: retained by the parser at expr offset 16), resolve through
+        Note: codegen_lookup_qualified_target — the #419 alias-disambiguated
+        Note: lookup, including its hard error when the named module does not
+        Note: define the function. Bare references resolve through
+        Note: codegen_lookup_function_by_name exactly like bare calls. Names
+        Note: that match no program function (true external symbols) keep the
+        Note: plain emission for the linker to resolve.
+        Let sr_alias be memory_get_pointer(expr, 16)
+        Let sr_target be 0
+        Let sr_context be 0
+        If sr_alias is not equal to 0:
+            Set sr_target to codegen_lookup_qualified_target(codegen, sr_alias, variable_name)
+            Set sr_context to 1
+        Otherwise:
+            Set sr_target to codegen_lookup_function_by_name(codegen, variable_name)
+        End If
+        Let sr_emit_name be variable_name
+        Let sr_owned_name be 0
+        If sr_target is not equal to 0:
+            Let sr_mangled be codegen_resolve_call_symbol(codegen, sr_target, sr_context)
+            If sr_mangled is not equal to 0:
+                Set sr_emit_name to sr_mangled
+                Set sr_owned_name to sr_mangled
+            End If
+        End If
         file_write_buffered(output_file, "    leaq ", 0)
-        file_write_buffered(output_file, variable_name, 0)
+        file_write_buffered(output_file, sr_emit_name, 0)
         file_write_buffered(output_file, "(%rip), %rax  # Symbol reference\n", 0)
+        If sr_owned_name is not equal to 0:
+            deallocate(sr_owned_name)
+        End If
         Return 0
     End If
 
@@ -3923,12 +3957,39 @@ Process called "codegen_lookup_qualified_target" takes codegen as Integer, alias
 
     Note: First pass: alias-disambiguated lookup. Try to map the alias to an
     Note: import filename, derive its module key, and prefer functions whose
-    Note: source_file's module key matches.
+    Note: source_file's module key matches. The import system writes the
+    Note: RESOLVED path back into the import record (slot 0) during
+    Note: process_imports_with_context, and tags every merged Function's
+    Note: source_file with the same resolved path - so the two module keys
+    Note: are derived from identical strings and match by construction
+    Note: whenever the named module actually defines the function.
     Let qt_alias_key be 0
+    Let qt_import_filename be 0
     If alias is not equal to 0:
-        Let qt_import_filename be codegen_lookup_import_filename_by_alias(codegen, alias)
+        Set qt_import_filename to codegen_lookup_import_filename_by_alias(codegen, alias)
         If qt_import_filename is not equal to 0:
             Set qt_alias_key to codegen_module_key_from_path(qt_import_filename)
+            Note: Task #445: the alias IS an Import in this compilation unit but
+            Note: its filename yields no module key (NULL/empty basename). Without
+            Note: this check the strict alias-disambiguated pass below is silently
+            Note: BYPASSED (it is gated on qt_alias_key) and the call falls through
+            Note: to bare-name resolution -- the exact misbinding #419 closed.
+            Note: A key-less import filename means the import record is corrupt or
+            Note: the source Import path is degenerate; either way the qualified
+            Note: call cannot be accounted, so it is a hard error, not a fallback.
+            If qt_alias_key is equal to 0:
+                print_string("[CODEGEN ERROR] Import '")
+                print_string(alias)
+                print_string("' has a filename ('")
+                print_string(qt_import_filename)
+                print_string("') that yields no module key -- cannot resolve 'proc ")
+                print_string(fn_name)
+                print_string(" from ")
+                print_string(alias)
+                print_string("'")
+                print_newline()
+                exit_with_code(1)
+            End If
         End If
     End If
 
@@ -3958,32 +4019,108 @@ Process called "codegen_lookup_qualified_target" takes codegen as Integer, alias
             Set qt_i to qt_i plus 1
         End While
         Note: ============================================================
-        Note: Bug #419 partial fix - aliased qualified call did not match
-        Note: a function in the named module directly. Fall through to the
-        Note: legacy first-name-match below. The legacy lookup is preserved
-        Note: because Runa imports are transitive: caller may write
-        Note: `proc f from A with ...` where A re-exports f from a module
-        Note: it imports. Without the fallback those legitimate cross-
-        Note: module calls would fail. The original Bug H scenario --
-        Note: `proc create from List` resolving to the caller's own
-        Note: `create` -- is now mitigated at the call site by the
-        Note: per-target source_file mangling in codegen_resolve_call_symbol:
-        Note: the emitted symbol always uses the FOUND target's source key,
-        Note: not the alias's key, so even if the fallback picks an
-        Note: unrelated same-name function the mangled symbol still
-        Note: identifies the correct defining module. A future hardening
-        Note: pass would walk the alias's import closure to validate that
-        Note: the fallback target is genuinely re-exported through the
-        Note: alias before accepting it.
+        Note: Bug #419 root-cause fix - the call explicitly names a module
+        Note: (the alias maps to a known Import in this compilation unit)
+        Note: and the named module's merged function table does NOT define
+        Note: the function. This is a hard error: silently falling through
+        Note: to a first-name-match across the whole program table misbinds
+        Note: the call to whatever same-named function happens to exist in
+        Note: an unrelated module (documented instance: tests calling
+        Note: `string_length from Str` silently captured
+        Note: compiler/internal/string_utils.runa's StringBuffer-ABI
+        Note: string_length instead of the intended C-string
+        Note: implementation). A source-level `from Module` qualifier is a
+        Note: deliberate, explicit binding -- if the named module does not
+        Note: provide the function, the source is wrong and must be fixed,
+        Note: not silently rebound.
         Note: ============================================================
-        deallocate(qt_alias_key)
+        print_string("[CODEGEN ERROR] Function '")
+        print_string(fn_name)
+        print_string("' is not defined in module '")
+        print_string(alias)
+        print_string("' (")
+        print_string(qt_import_filename)
+        print_string(")")
+        print_newline()
+        exit_with_code(1)
     End If
 
-    Note: Fallback: first-name-match (legacy behavior, preserved for backwards
-    Note: compatibility when import alias does not correspond to an Import
-    Note: statement in this compilation unit -- e.g. transitively-merged callers
-    Note: where the alias is not a known import but the function exists by name).
-    Return codegen_lookup_function_by_name(codegen, fn_name)
+    Note: Task #437: from-target naming a LOCAL VARIABLE is a hard error.
+    Note: `proc f from parser` (author meant `proc f with parser`) reaches this
+    Note: fallback because `parser` is not a known import alias; the bare-name
+    Note: resolution then binds f and the call is emitted with ZERO arguments --
+    Note: silently dropping the intended argument. The codegen variable table is
+    Note: authoritative for the function currently being generated (the same
+    Note: table the #431 indirect-call fix consults), so when the alias matches
+    Note: a local variable or parameter, the source is a with/from typo and must
+    Note: be fixed, not silently compiled as a zero-arg call. Precedence is
+    Note: preserved: a known import alias never reaches this check (the
+    Note: alias-disambiguated pass above either resolved or hard-errored), so an
+    Note: import alias still shadows a same-named local exactly as before.
+    If alias is not equal to 0:
+        If qt_import_filename is equal to 0:
+            Let qt_local_idx be codegen_find_variable(codegen, alias)
+            If qt_local_idx is greater than or equal to 0:
+                print_string("[CODEGEN ERROR] '")
+                print_string(alias)
+                print_string("' is a local variable, not a module -- did you mean 'proc ")
+                print_string(fn_name)
+                print_string(" with ")
+                print_string(alias)
+                print_string("'?")
+                print_newline()
+                exit_with_code(1)
+            End If
+        End If
+    End If
+
+    Note: Fallback: first-name-match. Reached ONLY when the alias does not
+    Note: correspond to an Import statement in this compilation unit -- i.e.
+    Note: transitively-merged callers. Import statements are not merged across
+    Note: modules, so when module A (imported by the main file) itself calls
+    Note: `proc f from B`, the alias B is unknown in the main compilation unit
+    Note: and the target can only be resolved by name against the merged
+    Note: program table. Explicitly-qualified calls whose alias IS a known
+    Note: import never reach this line: they either resolved in the
+    Note: alias-disambiguated pass above or hard-errored.
+    Let qt_fallback be codegen_lookup_function_by_name(codegen, fn_name)
+    Note: ============================================================
+    Note: Task #445: close the silent return-0 exit. When the bare-name
+    Note: fallback ALSO finds nothing, the function exists NOWHERE in the
+    Note: merged program table -- not in any merged module, not as an
+    Note: External Process declaration. Returning 0 here made the two
+    Note: call sites (EXPR_QUALIFIED_CALL emission and qualified symbol-
+    Note: address references) silently emit the PLAIN unmangled name
+    Note: (`call fn@PLT` / `leaq fn(%rip)`) with rc=0. At link time that
+    Note: either fails with an undefined symbol or -- far worse -- binds
+    Note: to an unrelated plain symbol that happens to share the name
+    Note: (e.g. a libc export), producing silent misbehavior. A qualified
+    Note: `from <Module>` form is a deliberate cross-module binding: every
+    Note: legitimate target is reachable through the merged program table
+    Note: (the import system merges the full transitive closure, and
+    Note: foreign symbols require an External Process declaration which
+    Note: also lands in the table). No record at all means the source is
+    Note: wrong (bad name, missing Import, or a transitive module that
+    Note: failed to merge) and must be fixed, not silently emitted.
+    Note: The transitively-merged-caller allowance is preserved: those
+    Note: callers' targets resolve by name above and return non-zero.
+    Note: ============================================================
+    If qt_fallback is equal to 0:
+        If alias is not equal to 0:
+            print_string("[CODEGEN ERROR] Qualified call 'proc ")
+            print_string(fn_name)
+            print_string(" from ")
+            print_string(alias)
+            print_string("': '")
+            print_string(alias)
+            print_string("' is not an Import in this compilation unit and '")
+            print_string(fn_name)
+            print_string("' is not defined in any merged module or External declaration. Add the Import for the defining module or fix the function name.")
+            print_newline()
+            exit_with_code(1)
+        End If
+    End If
+    Return qt_fallback
 End Process
 
 Note: SysV AMD64 ABI helper -- classify a Runa type-name string as either SSE
@@ -4216,6 +4353,41 @@ Process called "codegen_generate_function_call" takes codegen as Integer, expr a
     Let function_name be memory_get_pointer(function_call_ptr, 0)  Note: function_call.function_name
     Let arguments be memory_get_pointer(function_call_ptr, 8)      Note: function_call.arguments
     Let arg_count be memory_get_int32(function_call_ptr, 16)     Note: function_call.argument_count
+
+    Note: Task #431: indirect calls through local bindings. The parser cannot
+    Note: classify the callee (it has no binding table, and functions may be
+    Note: forward-referenced or merged from imports after the call site is
+    Note: parsed), so every `proc x with args` / `x(args)` arrives here as
+    Note: EXPR_FUNCTION_CALL. At codegen time the variable table is
+    Note: authoritative: when the callee name resolves to a LOCAL variable or
+    Note: parameter AND matches no function in the program table, the call is
+    Note: a call through a function address held in that binding — emitting a
+    Note: direct `call <name>` would reference an undefined symbol. Synthesize
+    Note: the EXPR_INDIRECT_CALL node the parser would have built and route
+    Note: through codegen_generate_indirect_call (call *%r10 with standard
+    Note: SysV GPR marshaling, matching internal direct-call argument
+    Note: passing). Known-function names keep the direct path even when a
+    Note: same-named local exists, preserving every previously-linking call.
+    If function_name is not equal to 0:
+        Let ic_var_index be codegen_find_variable(codegen, function_name)
+        If ic_var_index is greater than or equal to 0:
+            Let ic_known_func be codegen_lookup_function_by_name(codegen, function_name)
+            If ic_known_func is equal to 0:
+                Let ic_callee_expr be memory_allocate(32)
+                memory_set_int32(ic_callee_expr, 0, 1)  Note: EXPR_VARIABLE
+                memory_set_pointer(ic_callee_expr, 8, function_name)
+                Let ic_call_expr be memory_allocate(32)
+                memory_set_int32(ic_call_expr, 0, 11)  Note: EXPR_INDIRECT_CALL
+                memory_set_pointer(ic_call_expr, 8, ic_callee_expr)
+                memory_set_pointer(ic_call_expr, 16, arguments)
+                memory_set_int32(ic_call_expr, 24, arg_count)
+                codegen_generate_indirect_call(codegen, ic_call_expr)
+                deallocate(ic_call_expr)
+                deallocate(ic_callee_expr)
+                Return 0
+            End If
+        End If
+    End If
 
     Note: Named-arg reorder before code emission. arg_names lives at offset 32 of
     Note: the expression struct (allocated by expression_create_function_call when
@@ -6126,9 +6298,26 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
     Otherwise If expr_type is equal to 10:  Note: EXPR_FUNCTION_POINTER
         Let function_pointer_ptr be expr plus 8  Note: Union at offset 4
         Set func_name to memory_get_pointer(function_pointer_ptr, 0)
+        Note: Task #430: `$name` function-pointer references must emit the same
+        Note: symbol the definition emits. Resolve through the program function
+        Note: table and apply call-symbol mangling, mirroring bare-call
+        Note: emission; unknown names keep the plain symbol for the linker.
+        Let fp_target be codegen_lookup_function_by_name(codegen, func_name)
+        Let fp_emit_name be func_name
+        Let fp_owned_name be 0
+        If fp_target is not equal to 0:
+            Let fp_mangled be codegen_resolve_call_symbol(codegen, fp_target, 0)
+            If fp_mangled is not equal to 0:
+                Set fp_emit_name to fp_mangled
+                Set fp_owned_name to fp_mangled
+            End If
+        End If
         file_write_buffered(output_file, "    leaq ", 0)
-        file_write_buffered(output_file, func_name, 0)
+        file_write_buffered(output_file, fp_emit_name, 0)
         file_write_buffered(output_file, "(%rip), %rax\n", 0)
+        If fp_owned_name is not equal to 0:
+            deallocate(fp_owned_name)
+        End If
         Return 0
     Otherwise If expr_type is equal to 16:  Note: EXPR_ARRAY_INDEX
         Note: Array/List indexing: array[index] or list[index]
@@ -7834,12 +8023,24 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         Let print_expr be memory_get_pointer(stmt, 8)  Note: stmt->data.print_stmt.expression
         codegen_generate_expression(codegen, print_expr)
 
+        Note: Task #428: the parser stores the `continuing` (no-trailing-newline)
+        Note: modifier flag at statement offset 16. When set, route every print
+        Note: in this statement through the _nonl helper variants, which perform
+        Note: the identical write(2) emission minus the trailing newline write.
+        Let pr_continuing be memory_get_int32(stmt, 16)
+        Let pr_call_string be "    call print_string\n"
+        Let pr_call_integer be "    call print_integer\n"
+        If pr_continuing is equal to 1:
+            Set pr_call_string to "    call print_string_nonl\n"
+            Set pr_call_integer to "    call print_integer_nonl\n"
+        End If
+
         Note: Call appropriate print function based on expression type
         Set expr_type to memory_get_int32(print_expr, 0)  Note: expr->type
         If expr_type is equal to 5:  Note: EXPR_STRING_LITERAL
             Note: String literal - call print_string
             file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-            file_write_buffered(output_file, "    call print_string\n", 0)
+            file_write_buffered(output_file, pr_call_string, 0)
         Otherwise:
             If expr_type is equal to 8:  Note: EXPR_BUILTIN_CALL
                 Set builtin_call_ptr to print_expr plus 8  Note: &expr->data.builtin_call
@@ -7862,11 +8063,11 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                 If is_string_builtin is equal to 1:
                     Note: These functions return strings - call print_string
                     file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-                    file_write_buffered(output_file, "    call print_string\n", 0)
+                    file_write_buffered(output_file, pr_call_string, 0)
                 Otherwise:
                     Note: Integer expression - call print_integer
                     file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-                    file_write_buffered(output_file, "    call print_integer\n", 0)
+                    file_write_buffered(output_file, pr_call_integer, 0)
                 End If
             Otherwise:
                 If expr_type is equal to 4:  Note: EXPR_FUNCTION_CALL
@@ -7897,11 +8098,11 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                     If is_string_function is equal to 1:
                         Note: Function returns string - call print_string
                         file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-                        file_write_buffered(output_file, "    call print_string\n", 0)
+                        file_write_buffered(output_file, pr_call_string, 0)
                     Otherwise:
                         Note: Function returns integer - call print_integer
                         file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-                        file_write_buffered(output_file, "    call print_integer\n", 0)
+                        file_write_buffered(output_file, pr_call_integer, 0)
                     End If
                 Otherwise If expr_type is equal to 1:  Note: EXPR_VARIABLE
                     Note: Check variable type to determine appropriate print function
@@ -7914,32 +8115,32 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                             If string_equals(type_name, "String") is equal to 1:
                                 Note: This variable contains a string - call print_string
                                 file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-                                file_write_buffered(output_file, "    call print_string\n", 0)
+                                file_write_buffered(output_file, pr_call_string, 0)
                             Otherwise:
                                 If string_equals(type_name, "List") is equal to 1:
                                     Note: This variable contains a list pointer - print as integer address
                                     file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-                                    file_write_buffered(output_file, "    call print_integer\n", 0)
+                                    file_write_buffered(output_file, pr_call_integer, 0)
                                 Otherwise:
                                     Note: Assume integer for other variables
                                     file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-                                    file_write_buffered(output_file, "    call print_integer\n", 0)
+                                    file_write_buffered(output_file, pr_call_integer, 0)
                                 End If
                             End If
                         Otherwise:
                             Note: Assume integer for untyped variables
                             file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-                            file_write_buffered(output_file, "    call print_integer\n", 0)
+                            file_write_buffered(output_file, pr_call_integer, 0)
                         End If
                     Otherwise:
                         Note: Variable not found, assume integer
                         file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-                        file_write_buffered(output_file, "    call print_integer\n", 0)
+                        file_write_buffered(output_file, pr_call_integer, 0)
                     End If
                 Otherwise:
                     Note: Integer expression (literal, arithmetic) - call print_integer
                     file_write_buffered(output_file, "    movq %rax, %rdi\n", 0)
-                    file_write_buffered(output_file, "    call print_integer\n", 0)
+                    file_write_buffered(output_file, pr_call_integer, 0)
                 End If
             End If
         End If
@@ -9711,6 +9912,108 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, "    movq $1, %rdi     # fd = stdout")
     emit_line(output_file, "    leaq .newline(%rip), %rsi  # newline string")
     emit_line(output_file, "    movq $1, %rdx     # count = 1")
+    emit_line(output_file, "    movq $1, %rax     # syscall number for write")
+    emit_line(output_file, "    syscall")
+    emit_line(output_file, "")
+    emit_line(output_file, "    movq %rbp, %rsp")
+    emit_line(output_file, "    popq %rbp")
+    emit_line(output_file, "    ret")
+    emit_line(output_file, "\n")
+
+    Note: Task #428: print_string_nonl runtime helper — identical to print_string
+    Note: minus the trailing-newline write. Backs the `Display expr continuing` /
+    Note: `Alert expr continuing` no-newline statement modifier. Label prefixes
+    Note: are unique (.psn_*) because dot-prefixed assembler symbols are
+    Note: file-scoped, not function-scoped, and print_string already owns
+    Note: .strlen_loop / .strlen_done in the same emitted file.
+    emit_line(output_file, "print_string_nonl:")
+    emit_line(output_file, "    pushq %rbp")
+    emit_line(output_file, "    movq %rsp, %rbp")
+    emit_line(output_file, "")
+    emit_line(output_file, "    # Calculate string length")
+    emit_line(output_file, "    movq %rdi, %rsi  # Save string pointer")
+    emit_line(output_file, "    movq %rdi, %rcx  # Counter for strlen")
+    emit_line(output_file, "    xorq %rax, %rax  # Length accumulator")
+    emit_line(output_file, ".psn_strlen_loop:")
+    emit_line(output_file, "    cmpb $0, (%rcx)")
+    emit_line(output_file, "    je .psn_strlen_done")
+    emit_line(output_file, "    incq %rcx")
+    emit_line(output_file, "    incq %rax")
+    emit_line(output_file, "    jmp .psn_strlen_loop")
+    emit_line(output_file, ".psn_strlen_done:")
+    emit_line(output_file, "")
+    emit_line(output_file, "    # Call write syscall (sys_write = 1)")
+    emit_line(output_file, "    movq $1, %rdi     # fd = stdout")
+    emit_line(output_file, "    movq %rax, %rdx   # count = string length")
+    emit_line(output_file, "    movq $1, %rax     # syscall number for write")
+    emit_line(output_file, "    syscall")
+    emit_line(output_file, "")
+    emit_line(output_file, "    popq %rbp")
+    emit_line(output_file, "    ret")
+    emit_line(output_file, "\n")
+
+    Note: Task #428: print_integer_nonl runtime helper — identical conversion and
+    Note: write logic to print_integer minus the trailing-newline write.
+    emit_line(output_file, "print_integer_nonl:")
+    emit_line(output_file, "    pushq %rbp")
+    emit_line(output_file, "    movq %rsp, %rbp")
+    emit_line(output_file, "    subq $32, %rsp  # Space for string buffer (20 digits + null)")
+    emit_line(output_file, "")
+    emit_line(output_file, "    # Convert integer to string (signed)")
+    emit_line(output_file, "    movq %rdi, %rax  # integer value")
+    emit_line(output_file, "    xorq %r8, %r8    # r8 = 0 (negative flag)")
+    emit_line(output_file, "    testq %rax, %rax")
+    emit_line(output_file, "    jns .pin_not_negative")
+    emit_line(output_file, "    movq $1, %r8     # mark as negative")
+    emit_line(output_file, "    negq %rax        # make positive for conversion")
+    emit_line(output_file, ".pin_not_negative:")
+    emit_line(output_file, "    leaq -32(%rbp), %rsi  # buffer pointer")
+    emit_line(output_file, "    addq $19, %rsi  # point to end of buffer (for reverse building)")
+    emit_line(output_file, "    movb $0, (%rsi)  # null terminator")
+    emit_line(output_file, "    decq %rsi")
+    emit_line(output_file, "")
+    emit_line(output_file, "    # Handle zero case")
+    emit_line(output_file, "    testq %rax, %rax")
+    emit_line(output_file, "    jnz .pin_convert_loop")
+    emit_line(output_file, "    movb $48, (%rsi)  # '0' character")
+    emit_line(output_file, "    jmp .pin_convert_done")
+    emit_line(output_file, "")
+    emit_line(output_file, ".pin_convert_loop:")
+    emit_line(output_file, "    testq %rax, %rax")
+    emit_line(output_file, "    jz .pin_convert_done")
+    emit_line(output_file, "    movq %rax, %rcx")
+    emit_line(output_file, "    movq $10, %rbx")
+    emit_line(output_file, "    xorq %rdx, %rdx")
+    emit_line(output_file, "    divq %rbx  # %rax = quotient, %rdx = remainder")
+    emit_line(output_file, "    addq $48, %rdx  # convert remainder to ASCII")
+    emit_line(output_file, "    movb %dl, (%rsi)  # store digit")
+    emit_line(output_file, "    decq %rsi")
+    emit_line(output_file, "    jmp .pin_convert_loop")
+    emit_line(output_file, "")
+    emit_line(output_file, ".pin_convert_done:")
+    emit_line(output_file, "    incq %rsi  # point to first character")
+    emit_line(output_file, "    # Prepend minus sign if negative")
+    emit_line(output_file, "    testq %r8, %r8")
+    emit_line(output_file, "    jz .pin_not_neg_print")
+    emit_line(output_file, "    decq %rsi")
+    emit_line(output_file, "    movb $45, (%rsi)  # '-' character")
+    emit_line(output_file, ".pin_not_neg_print:")
+    emit_line(output_file, "")
+    emit_line(output_file, "    # Calculate string length")
+    emit_line(output_file, "    movq %rsi, %rcx  # Counter for strlen")
+    emit_line(output_file, "    xorq %rax, %rax  # Length accumulator")
+    emit_line(output_file, ".pin_strlen_loop:")
+    emit_line(output_file, "    cmpb $0, (%rcx)")
+    emit_line(output_file, "    je .pin_strlen_done")
+    emit_line(output_file, "    incq %rcx")
+    emit_line(output_file, "    incq %rax")
+    emit_line(output_file, "    jmp .pin_strlen_loop")
+    emit_line(output_file, ".pin_strlen_done:")
+    emit_line(output_file, "")
+    emit_line(output_file, "    # Call write syscall (sys_write = 1)")
+    emit_line(output_file, "    movq $1, %rdi     # fd = stdout")
+    emit_line(output_file, "    # %rsi already points to string")
+    emit_line(output_file, "    movq %rax, %rdx   # count = string length")
     emit_line(output_file, "    movq $1, %rax     # syscall number for write")
     emit_line(output_file, "    syscall")
     emit_line(output_file, "")
