@@ -1,9 +1,11 @@
 Note: ================================================================
 Note: Dart Semantic Analyzer
 Note: ================================================================
-Note: Semantic analysis for Dart language including null safety,
-Note: type inference, async/await semantics, mixin resolution,
-Note: and extension method validation.
+Note: Semantic analysis for Dart language including declaration
+Note: collection with lexical scoping, type resolution against the
+Note: real DART_* AST produced by dart_parser.runa, null-safety
+Note: diagnostics, async/await/generator validation with tracked
+Note: context, and mixin application constraint checking.
 Note: ================================================================
 
 Import "compiler/middle/gungnir/hir/translation/frontends/dart/dart_parser.runa" as Parser
@@ -11,34 +13,39 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ================================================================
 Note: Semantic Analyzer Type
 Note: ================================================================
 
 @Reasoning:
-The Dart semantic analyzer bundles every subsystem the language's
-analysis demands: dual scopes (global for top-level declarations,
-current for nested function/method scopes), a stack for scope push/pop
-during traversal, a type system, dedicated null-safety, async/await,
-mixin, extension, and generic resolvers, plus accumulated error and
-warning lists and a has_error short-circuit flag. Each field is an
-Integer slot (8-byte handle) at a fixed offset; the offsets 0..88 are
-referenced directly by every accessor in this file.
+The analyzer bundles every subsystem Dart analysis demands: dual scopes
+(global for library-level declarations, current for the innermost
+lexical scope), a stack for scope push/pop during traversal, the
+built-in type registry, async/generator context state, mixin and
+extension registries, the set of generic type-parameter names seen,
+accumulated error and warning lists, a has_error short-circuit flag,
+the program root (needed by the late-initialization scan), and an
+imports-present flag (which downgrades unresolved-type errors to
+warnings because a single-file translation frontend cannot see imported
+libraries). Each field is an 8-byte slot at a fixed offset; the offsets
+0..96 are referenced directly by every accessor in this file.
 @End Reasoning
 Type called "DartSemanticAnalyzer":
     global_scope as Integer
     current_scope as Integer
     scope_stack as Integer
     type_system as Integer
-    null_safety_checker as Integer
-    async_analyzer as Integer
-    mixin_resolver as Integer
-    extension_resolver as Integer
-    generic_resolver as Integer
+    async_state as Integer
+    mixin_registry as Integer
+    extension_registry as Integer
+    generic_params as Integer
     errors as Integer
     warnings as Integer
     has_error as Integer
+    program_root as Integer
+    has_imports as Integer
 End Type
 
 Note: ================================================================
@@ -46,47 +53,272 @@ Note: Analyzer Creation
 Note: ================================================================
 
 @Reasoning:
-The constructor creates each subsystem eagerly rather than lazily so the
-analysis phases (collect, resolve types, null safety, async, mixins) can
-assume non-null subsystem handles throughout. global_scope is also
-assigned as the initial current_scope so top-level analysis can begin
-without an explicit scope push.
+The constructor creates each subsystem eagerly rather than lazily so
+the analysis phases (collect, resolve types, null safety, async,
+mixins) can assume non-null subsystem handles throughout. global_scope
+is also assigned as the initial current_scope so top-level analysis can
+begin without an explicit scope push. The async state block carries
+four slots: in_async, in_async_generator, in_sync_generator, and a
+spare depth counter - validate_callable_async saves and restores the
+first three around every function body it descends into.
 @End Reasoning
-Process called "create_dart_semantic_analyzer" that takes nothing returns Integer:
-    Let analyzer_size be 96
+Process called "create_dart_semantic_analyzer" takes nothing returns Integer:
+    Let analyzer_size be 104
     Let analyzer be proc allocate from Layout with analyzer_size
 
     If analyzer is equal to 0:
         Return 0
     End If
 
-    Note: Initialize components
     Let global_scope be proc create from Dict
     Let scope_stack be proc create from List
     Let type_system be proc create_dart_type_system
-    Let null_checker be proc create_null_safety_checker
-    Let async_analyzer be proc create_async_analyzer
-    Let mixin_resolver be proc create_mixin_resolver
-    Let extension_resolver be proc create_extension_resolver
-    Let generic_resolver be proc create_generic_resolver
+    Let async_state be proc create_async_state
+    Let mixin_registry be proc create from Dict
+    Let extension_registry be proc create from Dict
+    Let generic_params be proc create from Dict
     Let errors be proc create from List
     Let warnings be proc create from List
 
-    Note: Set analyzer fields
     proc memory_set_int64 from Layout with analyzer, 0, global_scope
     proc memory_set_int64 from Layout with analyzer, 8, global_scope
     proc memory_set_int64 from Layout with analyzer, 16, scope_stack
     proc memory_set_int64 from Layout with analyzer, 24, type_system
-    proc memory_set_int64 from Layout with analyzer, 32, null_checker
-    proc memory_set_int64 from Layout with analyzer, 40, async_analyzer
-    proc memory_set_int64 from Layout with analyzer, 48, mixin_resolver
-    proc memory_set_int64 from Layout with analyzer, 56, extension_resolver
-    proc memory_set_int64 from Layout with analyzer, 64, generic_resolver
-    proc memory_set_int64 from Layout with analyzer, 72, errors
-    proc memory_set_int64 from Layout with analyzer, 80, warnings
+    proc memory_set_int64 from Layout with analyzer, 32, async_state
+    proc memory_set_int64 from Layout with analyzer, 40, mixin_registry
+    proc memory_set_int64 from Layout with analyzer, 48, extension_registry
+    proc memory_set_int64 from Layout with analyzer, 56, generic_params
+    proc memory_set_int64 from Layout with analyzer, 64, errors
+    proc memory_set_int64 from Layout with analyzer, 72, warnings
+    proc memory_set_int64 from Layout with analyzer, 80, 0
     proc memory_set_int64 from Layout with analyzer, 88, 0
+    proc memory_set_int64 from Layout with analyzer, 96, 0
 
     Return analyzer
+End Process
+
+@Reasoning:
+The async context state carries four 8-byte slots: in_async (set inside
+async and async* bodies, where await is legal), in_async_generator (set
+inside async* bodies), in_sync_generator (set inside sync* bodies), and
+a spare slot reserved for await-depth diagnostics. Initialised to zero
+because the validator enters each context explicitly when it descends
+into a flagged callable body and restores the previous values on exit.
+@End Reasoning
+Process called "create_async_state" takes nothing returns Integer:
+    Let state be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with state, 0, 0
+    proc memory_set_int64 from Layout with state, 8, 0
+    proc memory_set_int64 from Layout with state, 16, 0
+    proc memory_set_int64 from Layout with state, 24, 0
+    Return state
+End Process
+
+@Reasoning:
+The type system is a name-keyed set of the dart:core (plus dart:async)
+types that are implicitly available in every Dart library without an
+import: numeric and text primitives, the escape hatches (dynamic, void,
+var, Object), bottom and null sentinels, the core collections, the
+async types, and the frequently-used core classes (Duration, DateTime,
+RegExp, Uri and friends). Seeding them here gives is_dart_builtin_type
+a single source of truth and lets resolve_type_annotation recognise
+them without symbol-table entries.
+@End Reasoning
+Process called "create_dart_type_system" takes nothing returns Integer:
+    Let type_system be proc create from Dict
+
+    proc set from Dict with type_system, "int", 1
+    proc set from Dict with type_system, "double", 1
+    proc set from Dict with type_system, "num", 1
+    proc set from Dict with type_system, "bool", 1
+    proc set from Dict with type_system, "String", 1
+    proc set from Dict with type_system, "dynamic", 1
+    proc set from Dict with type_system, "void", 1
+    proc set from Dict with type_system, "var", 1
+    proc set from Dict with type_system, "Object", 1
+    proc set from Dict with type_system, "Null", 1
+    proc set from Dict with type_system, "Never", 1
+    proc set from Dict with type_system, "Function", 1
+    proc set from Dict with type_system, "Symbol", 1
+    proc set from Dict with type_system, "Type", 1
+    proc set from Dict with type_system, "List", 1
+    proc set from Dict with type_system, "Map", 1
+    proc set from Dict with type_system, "Set", 1
+    proc set from Dict with type_system, "Iterable", 1
+    proc set from Dict with type_system, "Iterator", 1
+    proc set from Dict with type_system, "Future", 1
+    proc set from Dict with type_system, "FutureOr", 1
+    proc set from Dict with type_system, "Stream", 1
+    proc set from Dict with type_system, "Comparable", 1
+    proc set from Dict with type_system, "Pattern", 1
+    proc set from Dict with type_system, "Match", 1
+    proc set from Dict with type_system, "RegExp", 1
+    proc set from Dict with type_system, "StringBuffer", 1
+    proc set from Dict with type_system, "StringSink", 1
+    proc set from Dict with type_system, "Duration", 1
+    proc set from Dict with type_system, "DateTime", 1
+    proc set from Dict with type_system, "Uri", 1
+    proc set from Dict with type_system, "BigInt", 1
+    proc set from Dict with type_system, "Exception", 1
+    proc set from Dict with type_system, "Error", 1
+    proc set from Dict with type_system, "StackTrace", 1
+    proc set from Dict with type_system, "Runes", 1
+    proc set from Dict with type_system, "Enum", 1
+    proc set from Dict with type_system, "Record", 1
+
+    Return type_system
+End Process
+
+Note: ================================================================
+Note: Scope Management
+Note: ================================================================
+
+@Reasoning:
+Lexical scoping via a dictionary chain: entering a scope pushes the
+current dictionary onto the stack and installs a fresh one; exiting
+restores the previous top. Because the initial current scope IS the
+global scope, the chain walked by lookup_symbol naturally bottoms out
+at the library level without a special case.
+@End Reasoning
+Process called "enter_scope" takes analyzer as Integer returns Integer:
+    Let current be proc memory_get_int64 from Layout with analyzer, 8
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    proc append from List with stack, current
+    Let fresh be proc create from Dict
+    proc memory_set_int64 from Layout with analyzer, 8, fresh
+    Return 1
+End Process
+
+Process called "exit_scope" takes analyzer as Integer returns Integer:
+    Note: Restore the enclosing scope saved by the matching enter_scope
+
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let depth be proc size from List with stack
+    If depth is equal to 0:
+        Return 0
+    End If
+    Let restored be proc pop from List with stack
+    proc memory_set_int64 from Layout with analyzer, 8, restored
+    Return 1
+End Process
+
+@Reasoning:
+Innermost-out symbol resolution: the current scope first, then each
+stacked outer scope from the most recently pushed downwards. The global
+scope sits at the bottom of the stack (it was pushed by the first
+enter_scope), so library-level declarations are found last - exactly
+Dart's shadowing order.
+@End Reasoning
+Process called "lookup_symbol" takes analyzer as Integer, name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let current be proc memory_get_int64 from Layout with analyzer, 8
+    Let found be proc get from Dict with current, name
+    If found is not equal to 0:
+        Return found
+    End If
+
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let depth be proc size from List with stack
+    Let i be depth minus 1
+    While i is greater than or equal to 0:
+        Let scope be proc get from List with stack, i
+        Set found to proc get from Dict with scope, name
+        If found is not equal to 0:
+            Return found
+        End If
+        Set i to i minus 1
+    End While
+
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Return proc get from Dict with global_scope, name
+End Process
+
+Note: ================================================================
+Note: AST Shape Helpers
+Note: ================================================================
+
+@Reasoning:
+The parser's declaration contract places the declared name as a child-0
+identifier node whose value carries the spelling. Centralising the read
+keeps every collector aligned with that contract instead of repeating
+the two-step access.
+@End Reasoning
+Process called "declaration_name" takes node as Integer returns Integer:
+    Let name_node be proc ast_node_child from Parser with node, 0
+    Return proc ast_node_value from Parser with name_node
+End Process
+
+Process called "find_child_of_kind" takes node as Integer, kind as Integer returns Integer:
+    Note: Return the first child with the requested node kind, 0 if absent
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        Let child_type be proc ast_node_type from Parser with child
+        If child_type is equal to kind:
+            Return child
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Several node kinds introduce a lexical scope: every callable (function,
+method, getter, setter, constructor, lambda), every type-like container
+(class, enum, mixin, extension), blocks, and the two for-statement
+forms (whose induction variables scope to the loop). Both the
+collection walk and the null-safety walk consult this single predicate
+so their scope disciplines cannot drift apart.
+@End Reasoning
+Process called "node_introduces_scope" takes node_type as Integer returns Integer:
+    If node_type is equal to DART_CLASS_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_ENUM_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_MIXIN_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_EXTENSION_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_FUNCTION_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_METHOD_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_GETTER_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_SETTER_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_CONSTRUCTOR_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_FACTORY_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_LAMBDA_EXPR from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_BLOCK_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_FOR_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to DART_FOR_IN_STMT from Parser:
+        Return 1
+    End If
+    Return 0
 End Process
 
 Note: ================================================================
@@ -97,13 +329,15 @@ Note: ================================================================
 The five-phase order is fundamental to Dart's semantic model: collect
 declarations first so forward references in type-resolution can hit a
 populated symbol table, then resolve types and generics, then check
-null-safety (which depends on resolved types), then validate async
-constructs (which depend on Future/Stream types being resolved), and
-finally resolve mixins and extensions (which need everything else
-already settled). The has_error short-circuit at the end propagates any
-critical failure observed during the run.
+null-safety (which depends on resolved declarations for inference),
+then validate async constructs (which need declared return types), and
+finally check mixin applications (which need everything else settled).
+The program root is stored on the analyzer before any phase runs
+because the late-initialization scan reaches back to it, and the
+imports-present flag is computed up front because type resolution
+consults it on every unresolved name.
 @End Reasoning
-Process called "analyze_dart_program" that takes analyzer as Integer, program_node as Integer returns Integer:
+Process called "analyze_dart_program" takes analyzer as Integer, program_node as Integer returns Integer:
     If analyzer is equal to 0:
         Return 0
     End If
@@ -113,6 +347,28 @@ Process called "analyze_dart_program" that takes analyzer as Integer, program_no
         Return 0
     End If
 
+    proc memory_set_int64 from Layout with analyzer, 88, program_node
+
+    Note: Detect import/export directives - they downgrade unresolved
+    Note: type names from errors to warnings since the analyzer cannot
+    Note: see across library boundaries in a single-file translation
+    Let top_count be proc ast_node_child_count from Parser with program_node
+    Let scan be 0
+    While scan is less than top_count:
+        Let top_child be proc ast_node_child from Parser with program_node, scan
+        Let top_kind be proc ast_node_type from Parser with top_child
+        If top_kind is equal to DART_IMPORT_DIRECTIVE from Parser:
+            proc memory_set_int64 from Layout with analyzer, 96, 1
+        End If
+        If top_kind is equal to DART_EXPORT_DIRECTIVE from Parser:
+            proc memory_set_int64 from Layout with analyzer, 96, 1
+        End If
+        If top_kind is equal to DART_PART_DIRECTIVE from Parser:
+            proc memory_set_int64 from Layout with analyzer, 96, 1
+        End If
+        Set scan to scan plus 1
+    End While
+
     Note: Phase 1: Collect declarations
     proc collect_dart_declarations with analyzer, program_node
 
@@ -120,15 +376,15 @@ Process called "analyze_dart_program" that takes analyzer as Integer, program_no
     proc resolve_dart_types with analyzer, program_node
 
     Note: Phase 3: Check null safety
-    proc check_null_safety with analyzer, program_node
+    proc check_null_safety with analyzer, program_node, 0
 
-    Note: Phase 4: Validate async/await usage
+    Note: Phase 4: Validate async/await/generator usage
     proc validate_async_await with analyzer, program_node
 
-    Note: Phase 5: Resolve mixins and extensions
+    Note: Phase 5: Check mixin applications
     proc resolve_mixins_and_extensions with analyzer, program_node
 
-    Let has_error be proc memory_get_int64 from Layout with analyzer, 88
+    Let has_error be proc memory_get_int64 from Layout with analyzer, 80
     If has_error is equal to 1:
         Return 0
     End If
@@ -142,45 +398,67 @@ Note: ================================================================
 
 @Reasoning:
 The declaration collector walks the entire AST registering classes,
-functions, variables, enums, extensions, and mixins into the right
-symbol tables. Recursion into children ensures nested declarations
-(e.g. inner classes, function-local closures) get registered against
-the active scope. Only matched kinds drive the dispatch; other nodes
-fall through to the recursive walk, which is how nested declarations
-inside method bodies get reached.
+enums, mixins, extensions, functions/methods, and variables/fields into
+the right symbol tables, pushing a fresh lexical scope around every
+scope-introducing node so duplicate detection and shadowing follow
+Dart's rules: a name may be redeclared in an inner scope but not twice
+in the same scope. The declaration registers into the scope that
+ENCLOSES it; its own scope is entered only for its children.
 @End Reasoning
-Process called "collect_dart_declarations" that takes analyzer as Integer, node as Integer returns Integer:
+Process called "collect_dart_declarations" takes analyzer as Integer, node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
 
-    Let node_type be proc memory_get_int64 from Layout with node, 0
+    Let node_type be proc ast_node_type from Parser with node
 
-    Note: Collect classes, functions, variables, enums, extensions, mixins
-    If node_type is equal to Parser.NODE_CLASS_DECLARATION:
+    If node_type is equal to DART_CLASS_DECL from Parser:
         proc collect_class_declaration with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_FUNCTION_DECLARATION:
-        proc collect_function_declaration with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_VARIABLE_DECLARATION:
-        proc collect_variable_declaration with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_ENUM_DECLARATION:
+    Otherwise:
+    If node_type is equal to DART_ENUM_DECL from Parser:
         proc collect_enum_declaration with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_EXTENSION_DECLARATION:
-        proc collect_extension_declaration with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_MIXIN_DECLARATION:
+    Otherwise:
+    If node_type is equal to DART_MIXIN_DECL from Parser:
         proc collect_mixin_declaration with analyzer, node
+    Otherwise:
+    If node_type is equal to DART_EXTENSION_DECL from Parser:
+        proc collect_extension_declaration with analyzer, node
+    Otherwise:
+    If node_type is equal to DART_FUNCTION_DECL from Parser:
+        proc collect_function_declaration with analyzer, node
+    Otherwise:
+    If node_type is equal to DART_METHOD_DECL from Parser:
+        proc collect_function_declaration with analyzer, node
+    Otherwise:
+    If node_type is equal to DART_VARIABLE_DECL from Parser:
+        proc collect_variable_declaration with analyzer, node
+    Otherwise:
+    If node_type is equal to DART_FIELD_DECL from Parser:
+        proc collect_variable_declaration with analyzer, node
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
     End If
 
-    Note: Recursively collect from children
-    Let children be proc memory_get_int64 from Layout with node, 8
-    If children is not equal to 0:
-        Let count be proc size from List with children
-        Let index be 0
-        While index is less than count:
-            Let child be proc get from List with children, index
-            proc collect_dart_declarations with analyzer, child
-            Set index to index plus 1
-        End While
+    Let introduces be proc node_introduces_scope with node_type
+    If introduces is equal to 1:
+        proc enter_scope with analyzer
+    End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        proc collect_dart_declarations with analyzer, child
+        Set index to index plus 1
+    End While
+
+    If introduces is equal to 1:
+        proc exit_scope with analyzer
     End If
 
     Return 1
@@ -188,111 +466,163 @@ End Process
 
 @Reasoning:
 Classes live in the global scope per Dart's library-level scoping
-rules; duplicate class names within a single library are a compile error
-so we surface the diagnostic before registration. The class symbol is
-the class node itself (see create_class_symbol) - we keep symbols as
-direct AST pointers in v0.0.8.5 to avoid duplicating the storage.
+rules; duplicate names within a single library are a compile error so
+we surface the diagnostic before registration. The symbol is the class
+AST node itself - symbols are direct AST pointers so later phases reach
+declared structure (extends/implements/with clauses, members) without a
+parallel data structure.
 @End Reasoning
-Process called "collect_class_declaration" that takes analyzer as Integer, class_node as Integer returns Integer:
-    Let class_name be proc memory_get_int64 from Layout with class_node, 16
-    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+Process called "collect_class_declaration" takes analyzer as Integer, class_node as Integer returns Integer:
+    Let class_name be proc declaration_name with class_node
+    If class_name is equal to 0:
+        Return 0
+    End If
 
-    Note: Check for duplicate class
-    Let existing be proc get from Dict with global_scope, class_name
-    If existing is not equal to 0:
-        Let error_msg be proc concat from StringCore with "Duplicate class declaration: ", class_name
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let existing be proc contains from Dict with global_scope, class_name
+    If existing is equal to 1:
+        Let error_msg be proc string_concat from StringUtils with "Duplicate class declaration: ", class_name
         proc add_error with analyzer, error_msg
         Return 0
     End If
 
-    Note: Create class symbol entry
-    Let class_symbol be proc create_class_symbol from class_node
-    proc put from Dict with global_scope, class_name, class_symbol
-
+    proc set from Dict with global_scope, class_name, class_node
     Return 1
 End Process
 
 @Reasoning:
-Functions register into the current scope rather than the global scope
-because Dart supports nested functions (local closures inside methods).
-The walker pushes scopes when entering class/function bodies, so
-current_scope correctly points to the enclosing lexical scope at
-collection time.
+Functions and methods register into the current scope rather than the
+global scope because Dart supports nested functions (local closures
+inside methods) and methods scope to their class. The walker pushes
+scopes when entering class/function bodies, so current_scope correctly
+points to the enclosing lexical scope at collection time. A clash with
+any same-scope declaration (function, variable, class at the top level)
+is a Dart compile error.
 @End Reasoning
-Process called "collect_function_declaration" that takes analyzer as Integer, func_node as Integer returns Integer:
-    Let func_name be proc memory_get_int64 from Layout with func_node, 16
+Process called "collect_function_declaration" takes analyzer as Integer, func_node as Integer returns Integer:
+    Let func_name be proc declaration_name with func_node
+    If func_name is equal to 0:
+        Return 0
+    End If
+
     Let current_scope be proc memory_get_int64 from Layout with analyzer, 8
+    Let existing be proc contains from Dict with current_scope, func_name
+    If existing is equal to 1:
+        Let error_msg be proc string_concat from StringUtils with "Duplicate function declaration: ", func_name
+        proc add_error with analyzer, error_msg
+        Return 0
+    End If
 
-    Note: Add function to current scope
-    Let func_symbol be proc create_function_symbol from func_node
-    proc put from Dict with current_scope, func_name, func_symbol
-
+    proc set from Dict with current_scope, func_name, func_node
     Return 1
 End Process
 
 @Reasoning:
-Variables register into the current scope so the same name can shadow
-outer-scope variables (Dart permits shadowing in nested blocks). The
-variable symbol carries the AST node by reference; later phases (null
-safety, type checking) reach back into the AST via this handle.
+Variables and fields register into the current scope so the same name
+can shadow outer-scope variables (Dart permits shadowing in nested
+blocks) while redeclaration within one scope is diagnosed. The symbol
+carries the AST node by reference; the null-safety phase reaches the
+declared type annotation (child 1) and initializer (child 2) through
+this handle for expression type inference.
 @End Reasoning
-Process called "collect_variable_declaration" that takes analyzer as Integer, var_node as Integer returns Integer:
-    Let var_name be proc memory_get_int64 from Layout with var_node, 16
+Process called "collect_variable_declaration" takes analyzer as Integer, var_node as Integer returns Integer:
+    Let var_name be proc declaration_name with var_node
+    If var_name is equal to 0:
+        Return 0
+    End If
+
     Let current_scope be proc memory_get_int64 from Layout with analyzer, 8
+    Let existing be proc contains from Dict with current_scope, var_name
+    If existing is equal to 1:
+        Let error_msg be proc string_concat from StringUtils with "Duplicate variable declaration: ", var_name
+        proc add_error with analyzer, error_msg
+        Return 0
+    End If
 
-    Note: Add variable to current scope
-    Let var_symbol be proc create_variable_symbol from var_node
-    proc put from Dict with current_scope, var_name, var_symbol
-
+    proc set from Dict with current_scope, var_name, var_node
     Return 1
 End Process
 
 @Reasoning:
-Enums are library-scoped like classes; they register into global_scope.
-Dart enums can have methods and constructors in modern Dart, so the
-symbol carries the full AST node for later member resolution.
+Enums are library-scoped like classes; they register into global_scope
+and share its duplicate-name detection (an enum clashing with a class
+of the same name is equally an error). Modern Dart enums can carry
+methods and constructors, all reachable from the registered AST node.
 @End Reasoning
-Process called "collect_enum_declaration" that takes analyzer as Integer, enum_node as Integer returns Integer:
-    Let enum_name be proc memory_get_int64 from Layout with enum_node, 16
+Process called "collect_enum_declaration" takes analyzer as Integer, enum_node as Integer returns Integer:
+    Let enum_name be proc declaration_name with enum_node
+    If enum_name is equal to 0:
+        Return 0
+    End If
+
     Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let existing be proc contains from Dict with global_scope, enum_name
+    If existing is equal to 1:
+        Let error_msg be proc string_concat from StringUtils with "Duplicate enum declaration: ", enum_name
+        proc add_error with analyzer, error_msg
+        Return 0
+    End If
 
-    Let enum_symbol be proc create_enum_symbol from enum_node
-    proc put from Dict with global_scope, enum_name, enum_symbol
-
+    proc set from Dict with global_scope, enum_name, enum_node
     Return 1
 End Process
 
 @Reasoning:
-Extensions are kept in a dedicated extension_resolver rather than the
-main scope because their resolution differs from regular declarations:
-extensions are looked up by the type they extend, not by name. The
-resolver maintains its own index that is queried during method call
-resolution.
+Extensions register into a dedicated registry rather than the main
+scope because their resolution differs from regular declarations:
+extensions are applied by the type they extend, and only NAMED
+extensions are addressable (for explicit application and show/hide
+combinators), so anonymous extensions skip registration. Two extensions
+with the same name in one library are a Dart compile error.
 @End Reasoning
-Process called "collect_extension_declaration" that takes analyzer as Integer, ext_node as Integer returns Integer:
-    Let ext_name be proc memory_get_int64 from Layout with ext_node, 16
-    Let extension_resolver be proc memory_get_int64 from Layout with analyzer, 56
+Process called "collect_extension_declaration" takes analyzer as Integer, ext_node as Integer returns Integer:
+    Let ext_name be proc declaration_name with ext_node
+    If ext_name is equal to 0:
+        Return 1
+    End If
+    Let name_len be proc string_length from StringCore with ext_name
+    If name_len is equal to 0:
+        Return 1
+    End If
 
-    Note: Register extension for later resolution
-    proc register_extension with extension_resolver, ext_name, ext_node
+    Let registry be proc memory_get_int64 from Layout with analyzer, 48
+    Let existing be proc contains from Dict with registry, ext_name
+    If existing is equal to 1:
+        Let error_msg be proc string_concat from StringUtils with "Duplicate extension declaration: ", ext_name
+        proc add_error with analyzer, error_msg
+        Return 0
+    End If
 
+    proc set from Dict with registry, ext_name, ext_node
     Return 1
 End Process
 
 @Reasoning:
-Mixins are registered in a separate mixin_resolver because they have
-unique "on" constraint semantics (a mixin may only be applied to types
-satisfying certain super-type predicates). The resolver tracks the on
-constraints alongside the mixin definition so resolution can verify
-applicability later.
+Mixins register twice: into the mixin registry (consulted by the mixin
+application checker, which needs to find the declaration's on-clause)
+and into the global scope (mixin names are types - they appear in with
+clauses, type annotations, and on clauses, so type resolution must see
+them). The global-scope registration also gives duplicate detection
+against classes and enums sharing the name.
 @End Reasoning
-Process called "collect_mixin_declaration" that takes analyzer as Integer, mixin_node as Integer returns Integer:
-    Let mixin_name be proc memory_get_int64 from Layout with mixin_node, 16
-    Let mixin_resolver be proc memory_get_int64 from Layout with analyzer, 48
+Process called "collect_mixin_declaration" takes analyzer as Integer, mixin_node as Integer returns Integer:
+    Let mixin_name be proc declaration_name with mixin_node
+    If mixin_name is equal to 0:
+        Return 0
+    End If
 
-    Note: Register mixin for later resolution
-    proc register_mixin with mixin_resolver, mixin_name, mixin_node
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let existing be proc contains from Dict with global_scope, mixin_name
+    If existing is equal to 1:
+        Let error_msg be proc string_concat from StringUtils with "Duplicate mixin declaration: ", mixin_name
+        proc add_error with analyzer, error_msg
+        Return 0
+    End If
 
+    proc set from Dict with global_scope, mixin_name, mixin_node
+
+    Let registry be proc memory_get_int64 from Layout with analyzer, 40
+    proc set from Dict with registry, mixin_name, mixin_node
     Return 1
 End Process
 
@@ -301,126 +631,528 @@ Note: Type Resolution
 Note: ================================================================
 
 @Reasoning:
-The type resolver dispatches to specialised resolvers for the three Dart
-type forms: plain annotations (int, String), generic types
-(List<int>, Map<String, int>), and function types (int Function(int)).
-Other nodes recurse into children so type annotations nested inside
-expressions, declarations, or generic arguments all get resolved
-during the same walk.
+The type resolver dispatches on the four Dart type-node kinds the
+parser emits: plain annotations (DART_TYPE_ANNOTATION, name in the
+value slot), generic instantiations (DART_GENERIC_TYPE, base annotation
+at child 0 and a DART_TYPE_ARG_LIST at child 1), function types
+(DART_FUNCTION_TYPE, return type at child 0 and parameter types at
+child 1), and nullable wrappers (DART_NULLABLE_TYPE, wrapped type at
+child 0). Type-parameter lists register their parameter names before
+any sibling members are visited - the parser emits the
+DART_TYPE_PARAMETERS child directly after the name, so source order
+guarantees the registration precedes every use within the declaration.
+Other nodes recurse so annotations nested inside expressions,
+declarations, and generic arguments all resolve in one walk.
 @End Reasoning
-Process called "resolve_dart_types" that takes analyzer as Integer, node as Integer returns Integer:
+Process called "resolve_dart_types" takes analyzer as Integer, node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
 
-    Let node_type be proc memory_get_int64 from Layout with node, 0
+    Let node_type be proc ast_node_type from Parser with node
 
-    If node_type is equal to Parser.NODE_TYPE_ANNOTATION:
+    If node_type is equal to DART_TYPE_ANNOTATION from Parser:
         Return proc resolve_type_annotation with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_GENERIC_TYPE:
-        Return proc resolve_generic_type with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_FUNCTION_TYPE:
-        Return proc resolve_function_type with analyzer, node
     End If
 
-    Note: Recursively resolve types in children
-    Let children be proc memory_get_int64 from Layout with node, 8
-    If children is not equal to 0:
-        Let count be proc size from List with children
-        Let index be 0
-        While index is less than count:
-            Let child be proc get from List with children, index
-            proc resolve_dart_types with analyzer, child
-            Set index to index plus 1
-        End While
+    If node_type is equal to DART_TYPE_PARAMETERS from Parser:
+        Return proc register_type_parameters with analyzer, node
     End If
+
+    If node_type is equal to DART_GENERIC_TYPE from Parser:
+        Let base be proc ast_node_child from Parser with node, 0
+        proc resolve_dart_types with analyzer, base
+        Let args be proc ast_node_child from Parser with node, 1
+        If args is not equal to 0:
+            Let arg_count be proc ast_node_child_count from Parser with args
+            Let arg_index be 0
+            While arg_index is less than arg_count:
+                Let arg be proc ast_node_child from Parser with args, arg_index
+                proc resolve_dart_types with analyzer, arg
+                Set arg_index to arg_index plus 1
+            End While
+        End If
+        Return 1
+    End If
+
+    If node_type is equal to DART_FUNCTION_TYPE from Parser:
+        Let return_type be proc ast_node_child from Parser with node, 0
+        proc resolve_dart_types with analyzer, return_type
+        Let param_types be proc ast_node_child from Parser with node, 1
+        If param_types is not equal to 0:
+            Let param_count be proc ast_node_child_count from Parser with param_types
+            Let param_index be 0
+            While param_index is less than param_count:
+                Let param_type be proc ast_node_child from Parser with param_types, param_index
+                proc resolve_dart_types with analyzer, param_type
+                Set param_index to param_index plus 1
+            End While
+        End If
+        Return 1
+    End If
+
+    If node_type is equal to DART_NULLABLE_TYPE from Parser:
+        Let wrapped be proc ast_node_child from Parser with node, 0
+        Return proc resolve_dart_types with analyzer, wrapped
+    End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        proc resolve_dart_types with analyzer, child
+        Set index to index plus 1
+    End While
 
     Return 1
 End Process
 
 @Reasoning:
-Type resolution checks the global scope first (user-defined classes
-take precedence over built-ins because Dart allows shadowing core
-types at the library level). If the type is absent from the scope we
-fall back to is_dart_builtin_type to recognise built-in primitives;
-only when both fail do we emit an undefined-type error.
+Generic type parameters (the T in "class Box<T extends Bound>") are
+identifier children of DART_TYPE_PARAMETERS whose bound, when present,
+lives in the child's "constraint" metadata entry (a type node pointer).
+The names are recorded in the generic_params set so type annotations
+mentioning them resolve, and each bound is itself resolved since it can
+be an arbitrary type expression.
 @End Reasoning
-Process called "resolve_type_annotation" that takes analyzer as Integer, type_node as Integer returns Integer:
-    Let type_name be proc memory_get_int64 from Layout with type_node, 16
+Process called "register_type_parameters" takes analyzer as Integer, params_node as Integer returns Integer:
+    Let generic_params be proc memory_get_int64 from Layout with analyzer, 56
+    Let count be proc ast_node_child_count from Parser with params_node
+    Let i be 0
+    While i is less than count:
+        Let param be proc ast_node_child from Parser with params_node, i
+        Let param_name be proc ast_node_value from Parser with param
+        If param_name is not equal to 0:
+            proc set from Dict with generic_params, param_name, 1
+        End If
+        Let constraint be proc ast_node_metadata from Parser with param, "constraint"
+        If constraint is not equal to 0:
+            proc resolve_dart_types with analyzer, constraint
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Resolution order: empty and dotted names are accepted (dotted spellings
+are import-prefix-qualified - cross-library resolution belongs to the
+import system), then the built-in registry (dart:core is implicitly
+imported), then registered generic type parameters, then the global
+scope (user classes, enums, mixins). An unresolved name is an error in
+an import-free file but only a warning when the file has imports,
+because the analyzer cannot see imported libraries and a hard error
+would be a false positive on perfectly valid Dart.
+@End Reasoning
+Process called "resolve_type_annotation" takes analyzer as Integer, type_node as Integer returns Integer:
+    Let type_name be proc ast_node_value from Parser with type_node
+    If type_name is equal to 0:
+        Return 1
+    End If
+
+    Let len be proc string_length from StringCore with type_name
+    If len is equal to 0:
+        Return 1
+    End If
+
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with type_name, i
+        If ch is equal to 46:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Let is_builtin be proc is_dart_builtin_type with analyzer, type_name
+    If is_builtin is equal to 1:
+        Return 1
+    End If
+
+    Let generic_params be proc memory_get_int64 from Layout with analyzer, 56
+    Let is_generic be proc contains from Dict with generic_params, type_name
+    If is_generic is equal to 1:
+        Return 1
+    End If
+
     Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let known be proc contains from Dict with global_scope, type_name
+    If known is equal to 1:
+        Return 1
+    End If
 
-    Note: Lookup type in scope
-    Let type_symbol be proc get from Dict with global_scope, type_name
+    Let has_imports be proc memory_get_int64 from Layout with analyzer, 96
+    If has_imports is equal to 1:
+        Let warn_msg be proc string_concat from StringUtils with "Unresolved type (may come from an imported library): ", type_name
+        proc add_warning with analyzer, warn_msg
+        Return 1
+    End If
 
-    If type_symbol is equal to 0:
-        Note: Check for built-in types
-        Let is_builtin be proc is_dart_builtin_type from type_name
-        If is_builtin is equal to 0:
-            Let error_msg be proc concat from StringCore with "Undefined type: ", type_name
-            proc add_error with analyzer, error_msg
+    Let error_msg be proc string_concat from StringUtils with "Undefined type: ", type_name
+    proc add_error with analyzer, error_msg
+    Return 0
+End Process
+
+@Reasoning:
+Built-in recognition consults the type_system registry seeded at
+construction so the membership list lives in exactly one place
+(create_dart_type_system) instead of being duplicated as a comparison
+chain that could drift from the seeded set.
+@End Reasoning
+Process called "is_dart_builtin_type" takes analyzer as Integer, type_name as Integer returns Integer:
+    If type_name is equal to 0:
+        Return 0
+    End If
+    Let type_system be proc memory_get_int64 from Layout with analyzer, 24
+    Return proc contains from Dict with type_system, type_name
+End Process
+
+Note: ================================================================
+Note: Expression Type Inference
+Note: ================================================================
+
+@Reasoning:
+Type references throughout the analyzer ARE parser type nodes
+(DART_TYPE_ANNOTATION / DART_GENERIC_TYPE / DART_FUNCTION_TYPE /
+DART_NULLABLE_TYPE); synthesised types for literals are created through
+the parser's own node factory so every consumer handles one shape. 0 is
+the unknown-type sentinel: every predicate that receives it answers
+conservatively so unknown types never produce diagnostics.
+@End Reasoning
+Process called "make_type" takes name as Integer returns Integer:
+    Return proc create_value_node from Parser with DART_TYPE_ANNOTATION from Parser, name
+End Process
+
+@Reasoning:
+Unwraps a type reference to its base spelling: a nullable wrapper
+defers to its wrapped type, a generic instantiation to its base
+annotation, and a plain annotation reports its value. Function types
+have no single base name and report 0.
+@End Reasoning
+Process called "type_base_name" takes type_ref as Integer returns Integer:
+    If type_ref is equal to 0:
+        Return 0
+    End If
+
+    Let kind be proc ast_node_type from Parser with type_ref
+
+    If kind is equal to DART_NULLABLE_TYPE from Parser:
+        Let wrapped be proc ast_node_child from Parser with type_ref, 0
+        Return proc type_base_name with wrapped
+    End If
+
+    If kind is equal to DART_GENERIC_TYPE from Parser:
+        Let base be proc ast_node_child from Parser with type_ref, 0
+        Return proc type_base_name with base
+    End If
+
+    If kind is equal to DART_TYPE_ANNOTATION from Parser:
+        Return proc ast_node_value from Parser with type_ref
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Compares the final dot-separated segment of a (possibly prefix
+qualified) type spelling against a target: "async.Future" matches
+"Future". Needed because import-prefixed async types must still satisfy
+the async return-type contracts.
+@End Reasoning
+Process called "name_final_segment_equals" takes name as Integer, target as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let len be proc string_length from StringCore with name
+    Let seg_start be 0
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with name, i
+        If ch is equal to 46:
+            Set seg_start to i plus 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Let target_len be proc string_length from StringCore with target
+    If len minus seg_start is not equal to target_len:
+        Return 0
+    End If
+
+    Let j be 0
+    While j is less than target_len:
+        Let nc be proc string_char_at from StringCore with name, seg_start plus j
+        Let tc be proc string_char_at from StringCore with target, j
+        If nc is not equal to tc:
             Return 0
         End If
-    End If
+        Set j to j plus 1
+    End While
 
     Return 1
 End Process
 
 @Reasoning:
-Generic types like List<int> have both a base type and type arguments;
-both must be resolved. Walking the arguments via resolve_dart_types
-rather than resolve_type_annotation allows nested generics (List<List<int>>),
-function types as arguments (Future<int Function()>), and nullable
-arguments (List<int?>) to flow through the right resolver.
+Structural expression-type inference over the real AST: literals carry
+their dart:core types, identifiers resolve through the lexical scope
+chain to their declaration's annotation (following "var"/"dynamic"
+declarations into their initializer one level at a time), casts report
+the cast type, comparisons and logic report bool, division reports
+double and integer-division int, ?? reports its fallback's type, await
+unwraps Future<T> to T, and constructions report the constructed type.
+A depth limit bounds the initializer-following recursion so a
+self-referential declaration ("var x = x;") terminates with unknown
+instead of diverging. 0 means unknown - every caller treats unknown as
+"no diagnostic".
 @End Reasoning
-Process called "resolve_generic_type" that takes analyzer as Integer, generic_node as Integer returns Integer:
-    Let base_type be proc memory_get_int64 from Layout with generic_node, 16
-    Let type_args be proc memory_get_int64 from Layout with generic_node, 24
-
-    Note: Resolve base type
-    proc resolve_type_annotation with analyzer, base_type
-
-    Note: Resolve each type argument
-    If type_args is not equal to 0:
-        Let count be proc size from List with type_args
-        Let index be 0
-        While index is less than count:
-            Let arg be proc get from List with type_args, index
-            proc resolve_dart_types with analyzer, arg
-            Set index to index plus 1
-        End While
+Process called "infer_expression_type" takes analyzer as Integer, expr as Integer, depth as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+    If depth is greater than 16:
+        Return 0
     End If
 
-    Return 1
+    Let kind be proc ast_node_type from Parser with expr
+
+    If kind is equal to DART_INT_LITERAL from Parser:
+        Return proc make_type with "int"
+    End If
+    If kind is equal to DART_DOUBLE_LITERAL from Parser:
+        Return proc make_type with "double"
+    End If
+    If kind is equal to DART_STRING_LITERAL from Parser:
+        Return proc make_type with "String"
+    End If
+    If kind is equal to DART_STRING_INTERP from Parser:
+        Return proc make_type with "String"
+    End If
+    If kind is equal to DART_BOOL_LITERAL from Parser:
+        Return proc make_type with "bool"
+    End If
+    If kind is equal to DART_NULL_EXPR from Parser:
+        Return proc make_type with "Null"
+    End If
+    If kind is equal to DART_LIST_LITERAL from Parser:
+        Return proc make_type with "List"
+    End If
+    If kind is equal to DART_MAP_LITERAL from Parser:
+        Return proc make_type with "Map"
+    End If
+    If kind is equal to DART_SET_LITERAL from Parser:
+        Return proc make_type with "Set"
+    End If
+
+    If kind is equal to DART_IDENTIFIER from Parser:
+        Let name be proc ast_node_value from Parser with expr
+        Let decl be proc lookup_symbol with analyzer, name
+        If decl is equal to 0:
+            Return 0
+        End If
+        Let decl_kind be proc ast_node_type from Parser with decl
+        Let is_value_decl be 0
+        If decl_kind is equal to DART_VARIABLE_DECL from Parser:
+            Set is_value_decl to 1
+        End If
+        If decl_kind is equal to DART_FIELD_DECL from Parser:
+            Set is_value_decl to 1
+        End If
+        If decl_kind is equal to DART_PARAMETER from Parser:
+            Set is_value_decl to 1
+        End If
+        If decl_kind is equal to DART_NAMED_PARAMETER from Parser:
+            Set is_value_decl to 1
+        End If
+        If decl_kind is equal to DART_OPTIONAL_PARAMETER from Parser:
+            Set is_value_decl to 1
+        End If
+        If is_value_decl is equal to 0:
+            Return 0
+        End If
+
+        Let declared be proc ast_node_child from Parser with decl, 1
+        Let declared_name be proc type_base_name with declared
+        Let follow_init be 0
+        If declared is equal to 0:
+            Set follow_init to 1
+        End If
+        If declared_name is not equal to 0:
+            Let is_var be proc string_equals from StringCore with declared_name, "var"
+            If is_var is equal to 1:
+                Set follow_init to 1
+            End If
+            Let is_dyn be proc string_equals from StringCore with declared_name, "dynamic"
+            If is_dyn is equal to 1:
+                Set follow_init to 1
+            End If
+        End If
+
+        If follow_init is equal to 1:
+            Let init be proc ast_node_child from Parser with decl, 2
+            If init is not equal to 0:
+                Let inferred be proc infer_expression_type with analyzer, init, depth plus 1
+                If inferred is not equal to 0:
+                    Return inferred
+                End If
+            End If
+        End If
+
+        Return declared
+    End If
+
+    If kind is equal to DART_BINARY_EXPR from Parser:
+        Let op_node be proc ast_node_child from Parser with expr, 1
+        Let op be proc ast_node_value from Parser with op_node
+        Let is_bool_op be 0
+        Let bool_check be proc string_equals from StringCore with op, "=="
+        If bool_check is equal to 1:
+            Set is_bool_op to 1
+        End If
+        Set bool_check to proc string_equals from StringCore with op, "!="
+        If bool_check is equal to 1:
+            Set is_bool_op to 1
+        End If
+        Set bool_check to proc string_equals from StringCore with op, "<"
+        If bool_check is equal to 1:
+            Set is_bool_op to 1
+        End If
+        Set bool_check to proc string_equals from StringCore with op, ">"
+        If bool_check is equal to 1:
+            Set is_bool_op to 1
+        End If
+        Set bool_check to proc string_equals from StringCore with op, "<="
+        If bool_check is equal to 1:
+            Set is_bool_op to 1
+        End If
+        Set bool_check to proc string_equals from StringCore with op, ">="
+        If bool_check is equal to 1:
+            Set is_bool_op to 1
+        End If
+        Set bool_check to proc string_equals from StringCore with op, "&&"
+        If bool_check is equal to 1:
+            Set is_bool_op to 1
+        End If
+        Set bool_check to proc string_equals from StringCore with op, "||"
+        If bool_check is equal to 1:
+            Set is_bool_op to 1
+        End If
+        If is_bool_op is equal to 1:
+            Return proc make_type with "bool"
+        End If
+
+        Let is_div be proc string_equals from StringCore with op, "/"
+        If is_div is equal to 1:
+            Return proc make_type with "double"
+        End If
+        Let is_intdiv be proc string_equals from StringCore with op, "~/"
+        If is_intdiv is equal to 1:
+            Return proc make_type with "int"
+        End If
+
+        Let left be proc ast_node_child from Parser with expr, 0
+        Return proc infer_expression_type with analyzer, left, depth plus 1
+    End If
+
+    If kind is equal to DART_UNARY_EXPR from Parser:
+        Let unary_op_node be proc ast_node_child from Parser with expr, 0
+        Let unary_op be proc ast_node_value from Parser with unary_op_node
+        Let is_not be proc string_equals from StringCore with unary_op, "!"
+        If is_not is equal to 1:
+            Return proc make_type with "bool"
+        End If
+        Let operand be proc ast_node_child from Parser with expr, 1
+        Return proc infer_expression_type with analyzer, operand, depth plus 1
+    End If
+
+    If kind is equal to DART_CONDITIONAL_EXPR from Parser:
+        Let then_branch be proc ast_node_child from Parser with expr, 1
+        Return proc infer_expression_type with analyzer, then_branch, depth plus 1
+    End If
+
+    If kind is equal to DART_NULL_AWARE_EXPR from Parser:
+        Let fallback be proc ast_node_child from Parser with expr, 1
+        Return proc infer_expression_type with analyzer, fallback, depth plus 1
+    End If
+
+    If kind is equal to DART_ASSIGNMENT_EXPR from Parser:
+        Let assigned be proc ast_node_child from Parser with expr, 2
+        Return proc infer_expression_type with analyzer, assigned, depth plus 1
+    End If
+
+    If kind is equal to DART_AS_EXPR from Parser:
+        Return proc ast_node_child from Parser with expr, 1
+    End If
+
+    If kind is equal to DART_IS_EXPR from Parser:
+        Return proc make_type with "bool"
+    End If
+
+    If kind is equal to DART_AWAIT_EXPR from Parser:
+        Let awaited be proc ast_node_child from Parser with expr, 0
+        Let awaited_type be proc infer_expression_type with analyzer, awaited, depth plus 1
+        If awaited_type is equal to 0:
+            Return 0
+        End If
+        Let awaited_kind be proc ast_node_type from Parser with awaited_type
+        If awaited_kind is equal to DART_GENERIC_TYPE from Parser:
+            Let gen_base be proc ast_node_child from Parser with awaited_type, 0
+            Let gen_name be proc type_base_name with gen_base
+            Let is_future_base be proc name_final_segment_equals with gen_name, "Future"
+            If is_future_base is equal to 1:
+                Let gen_args be proc ast_node_child from Parser with awaited_type, 1
+                If gen_args is not equal to 0:
+                    Return proc ast_node_child from Parser with gen_args, 0
+                End If
+            End If
+        End If
+        Return 0
+    End If
+
+    If kind is equal to DART_NEW_EXPR from Parser:
+        Return proc ast_node_child from Parser with expr, 0
+    End If
+
+    Return 0
 End Process
 
 @Reasoning:
-Function types like int Function(int, String) have a return type and a
-parameter list, both potentially containing further function types or
-generics. Both the return type and every parameter type are resolved
-recursively via resolve_dart_types to handle the full lattice of
-composed forms.
+A type reference is nullable when it carries the ? wrapper, when it is
+dynamic (which admits null), when it is Null itself, or when it was
+declared "var" (the spelling carries no nullability information, so
+the conservative answer suppresses diagnostics). Unknown (0) answers
+non-nullable because every caller pairs this predicate with an explicit
+unknown guard before diagnosing.
 @End Reasoning
-Process called "resolve_function_type" that takes analyzer as Integer, func_type_node as Integer returns Integer:
-    Let return_type be proc memory_get_int64 from Layout with func_type_node, 16
-    Let param_types be proc memory_get_int64 from Layout with func_type_node, 24
-
-    Note: Resolve return type
-    If return_type is not equal to 0:
-        proc resolve_dart_types with analyzer, return_type
+Process called "is_nullable_type" takes type_ref as Integer returns Integer:
+    If type_ref is equal to 0:
+        Return 0
     End If
 
-    Note: Resolve parameter types
-    If param_types is not equal to 0:
-        Let count be proc size from List with param_types
-        Let index be 0
-        While index is less than count:
-            Let param_type be proc get from List with param_types, index
-            proc resolve_dart_types with analyzer, param_type
-            Set index to index plus 1
-        End While
+    Let kind be proc ast_node_type from Parser with type_ref
+    If kind is equal to DART_NULLABLE_TYPE from Parser:
+        Return 1
     End If
 
-    Return 1
+    Let base be proc type_base_name with type_ref
+    If base is equal to 0:
+        Return 0
+    End If
+
+    Let is_dynamic be proc string_equals from StringCore with base, "dynamic"
+    If is_dynamic is equal to 1:
+        Return 1
+    End If
+    Let is_null be proc string_equals from StringCore with base, "Null"
+    If is_null is equal to 1:
+        Return 1
+    End If
+    Let is_var be proc string_equals from StringCore with base, "var"
+    If is_var is equal to 1:
+        Return 1
+    End If
+
+    Return 0
 End Process
 
 Note: ================================================================
@@ -428,64 +1160,133 @@ Note: Null Safety Checking
 Note: ================================================================
 
 @Reasoning:
-Null safety (Dart 2.12+) is non-trivial: nullable types, null-aware
-access (?.), null assertion (!), and 'late' modifier all have distinct
-checking rules. The dispatcher routes each construct to its specialised
-checker; other nodes recurse into children so the entire AST is
-inspected for null-safety violations.
+Null safety (Dart 2.12+) walks the AST with the same scope discipline
+as the collector, registering value declarations as it descends so
+identifier type inference resolves through the correct lexical chain.
+Four constructs are diagnosed: nullable types in positions that demand
+non-null types (extends/with/implements/on clauses - a hard error in
+Dart), null-aware access (?.) on provably non-nullable targets
+(redundancy warning, matching the Dart analyzer), null assertions (!)
+on provably non-nullable expressions (the parser records these as the
+"null_assert" flag on the asserted expression), and late variables that
+are never initialized anywhere in the program (LateInitializationError
+at runtime, diagnosed as an error). The parent node is threaded through
+the recursion because nullable-type context legality is a property of
+the enclosing clause.
 @End Reasoning
-Process called "check_null_safety" that takes analyzer as Integer, node as Integer returns Integer:
+Process called "check_null_safety" takes analyzer as Integer, node as Integer, parent as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
 
-    Let node_type be proc memory_get_int64 from Layout with node, 0
+    Let node_type be proc ast_node_type from Parser with node
 
-    Note: Check nullable type usage
-    If node_type is equal to Parser.NODE_NULLABLE_TYPE:
-        Return proc check_nullable_type with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_NULL_AWARE_ACCESS:
-        Return proc check_null_aware_access with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_NULL_ASSERTION:
-        Return proc check_null_assertion with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_LATE_VARIABLE:
-        Return proc check_late_variable with analyzer, node
+    Let has_assert be proc ast_node_has_flag from Parser with node, "null_assert"
+    If has_assert is equal to 1:
+        proc check_null_assertion with analyzer, node
     End If
 
-    Note: Recursively check children
-    Let children be proc memory_get_int64 from Layout with node, 8
-    If children is not equal to 0:
-        Let count be proc size from List with children
-        Let index be 0
-        While index is less than count:
-            Let child be proc get from List with children, index
-            proc check_null_safety with analyzer, child
-            Set index to index plus 1
-        End While
+    If node_type is equal to DART_NULLABLE_TYPE from Parser:
+        proc check_nullable_type with analyzer, node, parent
+    End If
+
+    If node_type is equal to DART_MEMBER_EXPR from Parser:
+        Let is_null_aware be proc ast_node_has_flag from Parser with node, "null_aware"
+        If is_null_aware is equal to 1:
+            proc check_null_aware_access with analyzer, node
+        End If
+    End If
+
+    Let registers be 0
+    If node_type is equal to DART_VARIABLE_DECL from Parser:
+        Set registers to 1
+    End If
+    If node_type is equal to DART_FIELD_DECL from Parser:
+        Set registers to 1
+    End If
+    If node_type is equal to DART_PARAMETER from Parser:
+        Set registers to 1
+    End If
+    If node_type is equal to DART_NAMED_PARAMETER from Parser:
+        Set registers to 1
+    End If
+    If node_type is equal to DART_OPTIONAL_PARAMETER from Parser:
+        Set registers to 1
+    End If
+
+    If registers is equal to 1:
+        Let decl_name be proc declaration_name with node
+        If decl_name is not equal to 0:
+            Let current_scope be proc memory_get_int64 from Layout with analyzer, 8
+            proc set from Dict with current_scope, decl_name, node
+        End If
+
+        Let is_late be proc ast_node_has_flag from Parser with node, "late"
+        If is_late is equal to 1:
+            proc check_late_variable with analyzer, node
+        End If
+    End If
+
+    Let introduces be proc node_introduces_scope with node_type
+    If introduces is equal to 1:
+        proc enter_scope with analyzer
+    End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        proc check_null_safety with analyzer, child, node
+        Set index to index plus 1
+    End While
+
+    If introduces is equal to 1:
+        proc exit_scope with analyzer
     End If
 
     Return 1
 End Process
 
 @Reasoning:
-A nullable type (T?) is legal anywhere but inefficient in a non-null
-context (e.g., when the type is immediately dereferenced). We resolve
-the base type first to catch undefined-type errors, then emit a
-warning if the surrounding context cannot accept null - this matches
-Dart's analyzer behaviour, which never blocks compilation on this
-case but informs the user of redundancy.
+Dart forbids nullable types in supertype positions: a class cannot
+extend, implement, or mix in T?, and a mixin's on-clause cannot name a
+nullable constraint. The parent node identifies the position - the
+parser wraps supertypes in dedicated clause nodes, so a nullable type
+whose direct parent is one of those clauses is exactly the illegal
+form. All other positions accept nullable types.
 @End Reasoning
-Process called "check_nullable_type" that takes analyzer as Integer, nullable_node as Integer returns Integer:
-    Let base_type be proc memory_get_int64 from Layout with nullable_node, 16
+Process called "check_nullable_type" takes analyzer as Integer, nullable_node as Integer, parent as Integer returns Integer:
+    If parent is equal to 0:
+        Return 1
+    End If
 
-    Note: Ensure base type is valid
-    proc resolve_type_annotation with analyzer, base_type
+    Let parent_kind be proc ast_node_type from Parser with parent
 
-    Note: Verify nullable type is used correctly
-    Let usage_context be proc get_type_usage_context from nullable_node
-    If usage_context is equal to 1:
-        Note: Non-null context, warn about unnecessary nullable
-        proc add_warning with analyzer, "Unnecessary nullable type in non-null context"
+    Let forbidden be 0
+    If parent_kind is equal to DART_EXTENDS from Parser:
+        Set forbidden to 1
+    End If
+    If parent_kind is equal to DART_WITH from Parser:
+        Set forbidden to 1
+    End If
+    If parent_kind is equal to DART_IMPLEMENTS from Parser:
+        Set forbidden to 1
+    End If
+    If parent_kind is equal to DART_ON_CLAUSE from Parser:
+        Set forbidden to 1
+    End If
+
+    If forbidden is equal to 1:
+        Let base be proc ast_node_child from Parser with nullable_node, 0
+        Let base_name be proc type_base_name with base
+        If base_name is equal to 0:
+            proc add_error with analyzer, "A class cannot extend, implement, or mix in a nullable type"
+        Otherwise:
+            Let error_msg be proc string_concat from StringUtils with "A class cannot extend, implement, or mix in a nullable type: ", base_name
+            Set error_msg to proc string_concat from StringUtils with error_msg, "?"
+            proc add_error with analyzer, error_msg
+        End If
+        Return 0
     End If
 
     Return 1
@@ -493,20 +1294,23 @@ End Process
 
 @Reasoning:
 The ?. operator is only meaningful when the target may be null; on a
-non-nullable target Dart will compile the access but the analyzer
-flags it as redundant. We mirror that diagnostic here by inferring the
-target's type and querying is_nullable_type.
+provably non-nullable target Dart still compiles the access but the
+analyzer flags it as redundant. The diagnostic fires only when
+inference produced a KNOWN type that is non-nullable - unknown types
+stay silent because warning on them would flood valid code with false
+positives.
 @End Reasoning
-Process called "check_null_aware_access" that takes analyzer as Integer, access_node as Integer returns Integer:
-    Let target be proc memory_get_int64 from Layout with access_node, 16
+Process called "check_null_aware_access" takes analyzer as Integer, access_node as Integer returns Integer:
+    Let target be proc ast_node_child from Parser with access_node, 0
+    Let target_type be proc infer_expression_type with analyzer, target, 0
 
-    Note: Get type of target
-    Let target_type be proc infer_expression_type with analyzer, target
+    If target_type is equal to 0:
+        Return 1
+    End If
 
-    Note: Verify target is nullable
-    Let is_nullable be proc is_nullable_type from target_type
+    Let is_nullable be proc is_nullable_type with target_type
     If is_nullable is equal to 0:
-        proc add_warning with analyzer, "Null-aware access on non-nullable type"
+        proc add_warning with analyzer, "Null-aware access (?.) on a non-nullable target"
     End If
 
     Return 1
@@ -514,20 +1318,22 @@ End Process
 
 @Reasoning:
 The null-assertion operator (!) explicitly asserts a value is non-null;
-applying it to a non-nullable type is redundant and indicates a likely
-source error or stale code. We emit a warning rather than an error to
-match Dart analyzer's behaviour, which still compiles such code.
+applying it to a provably non-nullable expression is redundant and
+indicates likely stale code. The parser records the assertion as the
+"null_assert" flag on the asserted expression node, so the check infers
+that node's own type. A warning rather than an error matches the Dart
+analyzer, which still compiles such code; unknown types stay silent.
 @End Reasoning
-Process called "check_null_assertion" that takes analyzer as Integer, assertion_node as Integer returns Integer:
-    Let target be proc memory_get_int64 from Layout with assertion_node, 16
+Process called "check_null_assertion" takes analyzer as Integer, node as Integer returns Integer:
+    Let asserted_type be proc infer_expression_type with analyzer, node, 0
 
-    Note: Get type of target
-    Let target_type be proc infer_expression_type with analyzer, target
+    If asserted_type is equal to 0:
+        Return 1
+    End If
 
-    Note: Verify target is nullable (otherwise assertion is unnecessary)
-    Let is_nullable be proc is_nullable_type from target_type
+    Let is_nullable be proc is_nullable_type with asserted_type
     If is_nullable is equal to 0:
-        proc add_warning with analyzer, "Unnecessary null assertion on non-nullable type"
+        proc add_warning with analyzer, "Unnecessary null assertion (!) on a non-nullable expression"
     End If
 
     Return 1
@@ -535,24 +1341,117 @@ End Process
 
 @Reasoning:
 'late' variables defer initialisation but the Dart contract requires
-them to be assigned before any read. Without that guarantee, accessing
-the variable raises LateInitializationError at runtime. The checker
-delegates the actual flow analysis to check_late_initialization but
-surfaces the diagnostic when no initialisation can be proven.
+assignment before any read; a late variable that is never initialised
+anywhere raises LateInitializationError at runtime, unconditionally.
+The check accepts three initialisation forms: a declaration-site
+initializer (child 2 of the declaration), any assignment expression
+targeting the name anywhere in the program (including this.x = and
+obj.x = member targets), a constructor field-formal parameter (this.x),
+or a constructor initializer-list entry. Only when the whole-program
+scan finds none of these does the error fire - a flow-insensitive but
+sound over-approximation: it only reports variables that PROVABLY have
+no initialisation site.
 @End Reasoning
-Process called "check_late_variable" that takes analyzer as Integer, late_var_node as Integer returns Integer:
-    Let var_name be proc memory_get_int64 from Layout with late_var_node, 16
-
-    Note: Verify late variable is eventually initialized
-    Let is_initialized be proc check_late_initialization with analyzer, late_var_node
-
-    If is_initialized is equal to 0:
-        Let error_msg be proc concat from StringCore with "Late variable '", var_name
-        Set error_msg to proc concat from StringCore with error_msg, "' is never initialized"
-        proc add_error with analyzer, error_msg
+Process called "check_late_variable" takes analyzer as Integer, late_var_node as Integer returns Integer:
+    Let var_name be proc declaration_name with late_var_node
+    If var_name is equal to 0:
+        Return 1
     End If
 
-    Return 1
+    Let child_count be proc ast_node_child_count from Parser with late_var_node
+    If child_count is greater than or equal to 3:
+        Return 1
+    End If
+
+    Let root be proc memory_get_int64 from Layout with analyzer, 88
+    Let initialized be proc ast_initializes_name with root, var_name
+    If initialized is equal to 1:
+        Return 1
+    End If
+
+    Let error_msg be proc string_concat from StringUtils with "Late variable '", var_name
+    Set error_msg to proc string_concat from StringUtils with error_msg, "' is never initialized"
+    proc add_error with analyzer, error_msg
+    Return 0
+End Process
+
+@Reasoning:
+Whole-program scan for any construct that can initialise a name:
+assignment expressions whose target is the bare identifier or a member
+access ending in the name (this.x = v, obj.x = v), constructor
+initializer-list entries (": x = v"), and field-formal constructor
+parameters ("Ctor(this.x)"). Recursion covers every nesting level; the
+first hit short-circuits.
+@End Reasoning
+Process called "ast_initializes_name" takes node as Integer, name as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let kind be proc ast_node_type from Parser with node
+
+    If kind is equal to DART_ASSIGNMENT_EXPR from Parser:
+        Let target be proc ast_node_child from Parser with node, 0
+        If target is not equal to 0:
+            Let target_kind be proc ast_node_type from Parser with target
+            If target_kind is equal to DART_IDENTIFIER from Parser:
+                Let target_name be proc ast_node_value from Parser with target
+                Let matches be proc string_equals from StringCore with target_name, name
+                If matches is equal to 1:
+                    Return 1
+                End If
+            End If
+            If target_kind is equal to DART_MEMBER_EXPR from Parser:
+                Let member_name be proc ast_node_value from Parser with target
+                Let member_matches be proc string_equals from StringCore with member_name, name
+                If member_matches is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+    End If
+
+    If kind is equal to DART_FIELD_INITIALIZER from Parser:
+        Let init_name be proc declaration_name with node
+        Let init_matches be proc string_equals from StringCore with init_name, name
+        If init_matches is equal to 1:
+            Return 1
+        End If
+    End If
+
+    Let is_param be 0
+    If kind is equal to DART_PARAMETER from Parser:
+        Set is_param to 1
+    End If
+    If kind is equal to DART_NAMED_PARAMETER from Parser:
+        Set is_param to 1
+    End If
+    If kind is equal to DART_OPTIONAL_PARAMETER from Parser:
+        Set is_param to 1
+    End If
+    If is_param is equal to 1:
+        Let is_field_formal be proc ast_node_has_flag from Parser with node, "field_formal"
+        If is_field_formal is equal to 1:
+            Let param_name be proc declaration_name with node
+            Let param_matches be proc string_equals from StringCore with param_name, name
+            If param_matches is equal to 1:
+                Return 1
+            End If
+        End If
+    End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        Let found be proc ast_initializes_name with child, name
+        If found is equal to 1:
+            Return 1
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
 End Process
 
 Note: ================================================================
@@ -560,211 +1459,246 @@ Note: Async/Await Validation
 Note: ================================================================
 
 @Reasoning:
-Dart has four async-related constructs: async functions returning
-Future<T>, await expressions inside them, async generators (async*)
-returning Stream<T>, and sync generators (sync*) returning Iterable<T>.
-The dispatcher routes each kind to its specialised validator; other
-nodes recurse so nested async constructs (e.g. an async function
-inside another) all get validated.
+The parser records async-ness as flags, not node kinds: a function,
+method, getter, or lambda carries the "async" flag (await legal in its
+body), the "generator" flag (yield legal), or both (async*). The
+validator therefore dispatches on the callable kinds, reads the flags,
+validates the declared return type against the matching contract
+(Future for async, Stream for async*, Iterable for sync*), and then
+descends into the body with the async-state slots set, restoring them
+afterwards so sibling and nested callables each see their own context.
+Await expressions check the context and additionally warn when the
+awaited operand's inferred type is provably not Future-like; yield
+statements check generator context.
 @End Reasoning
-Process called "validate_async_await" that takes analyzer as Integer, node as Integer returns Integer:
+Process called "validate_async_await" takes analyzer as Integer, node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
 
-    Let node_type be proc memory_get_int64 from Layout with node, 0
+    Let node_type be proc ast_node_type from Parser with node
 
-    If node_type is equal to Parser.NODE_ASYNC_FUNCTION:
-        Return proc validate_async_function with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_AWAIT_EXPRESSION:
+    Let is_callable be 0
+    Let ret_index be 1
+    If node_type is equal to DART_FUNCTION_DECL from Parser:
+        Set is_callable to 1
+    End If
+    If node_type is equal to DART_METHOD_DECL from Parser:
+        Set is_callable to 1
+    End If
+    If node_type is equal to DART_GETTER_DECL from Parser:
+        Set is_callable to 1
+    End If
+    If node_type is equal to DART_LAMBDA_EXPR from Parser:
+        Set is_callable to 1
+        Set ret_index to 0 minus 1
+    End If
+
+    If is_callable is equal to 1:
+        Return proc validate_callable_async with analyzer, node, ret_index
+    End If
+
+    If node_type is equal to DART_AWAIT_EXPR from Parser:
         Return proc validate_await_expression with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_ASYNC_GENERATOR:
-        Return proc validate_async_generator with analyzer, node
-    Otherwise If node_type is equal to Parser.NODE_SYNC_GENERATOR:
-        Return proc validate_sync_generator with analyzer, node
     End If
 
-    Note: Recursively validate children
-    Let children be proc memory_get_int64 from Layout with node, 8
-    If children is not equal to 0:
-        Let count be proc size from List with children
-        Let index be 0
-        While index is less than count:
-            Let child be proc get from List with children, index
-            proc validate_async_await with analyzer, child
-            Set index to index plus 1
-        End While
+    If node_type is equal to DART_YIELD_STMT from Parser:
+        Return proc validate_yield_statement with analyzer, node
     End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        proc validate_async_await with analyzer, child
+        Set index to index plus 1
+    End While
 
     Return 1
 End Process
 
 @Reasoning:
-Dart enforces that 'async' functions return Future<T> (or Future itself,
-which is implicitly Future<dynamic>). A return type mismatch is a hard
-error because the language emits await-based call code assuming the
-Future contract. The body is then validated for proper await placement
-via validate_async_body.
+Return-type contract enforcement plus context management for one
+callable. Dart's rules: an async function's declared return type must
+be Future/FutureOr (or void/dynamic, or omitted); an async* generator
+must declare Stream (or dynamic, or omitted); a sync* generator must
+declare Iterable (or dynamic/Object, or omitted). ret_index is -1 for
+lambdas, which carry no return-type child - their contract is checked
+at the assignment/inference level, not here. The previous async-state
+slots are saved before and restored after the recursive descent so
+contexts nest correctly through nested functions and lambdas.
 @End Reasoning
-Process called "validate_async_function" that takes analyzer as Integer, async_func as Integer returns Integer:
-    Let return_type be proc memory_get_int64 from Layout with async_func, 24
+Process called "validate_callable_async" takes analyzer as Integer, node as Integer, ret_index as Integer returns Integer:
+    Let is_async be proc ast_node_has_flag from Parser with node, "async"
+    Let is_generator be proc ast_node_has_flag from Parser with node, "generator"
 
-    Note: Verify return type is Future<T>
-    Let is_future be proc is_future_type from return_type
-    If is_future is equal to 0:
-        proc add_error with analyzer, "Async function must return Future<T>"
+    If ret_index is greater than or equal to 0:
+        Let return_type be proc ast_node_child from Parser with node, ret_index
+
+        If is_async is equal to 1:
+            If is_generator is equal to 0:
+                Let future_ok be proc is_future_type with return_type
+                If future_ok is equal to 0:
+                    proc add_error with analyzer, "An async function must declare a return type of Future<T> (or void/dynamic)"
+                End If
+            Otherwise:
+                Let stream_ok be proc is_stream_type with return_type
+                If stream_ok is equal to 0:
+                    proc add_error with analyzer, "An async* generator must declare a return type of Stream<T>"
+                End If
+            End If
+        Otherwise:
+            If is_generator is equal to 1:
+                Let iterable_ok be proc is_iterable_type with return_type
+                If iterable_ok is equal to 0:
+                    proc add_error with analyzer, "A sync* generator must declare a return type of Iterable<T>"
+                End If
+            End If
+        End If
+    End If
+
+    Let state be proc memory_get_int64 from Layout with analyzer, 32
+    Let saved_async be proc memory_get_int64 from Layout with state, 0
+    Let saved_async_gen be proc memory_get_int64 from Layout with state, 8
+    Let saved_sync_gen be proc memory_get_int64 from Layout with state, 16
+
+    Let in_async_gen be 0
+    Let in_sync_gen be 0
+    If is_generator is equal to 1:
+        If is_async is equal to 1:
+            Set in_async_gen to 1
+        Otherwise:
+            Set in_sync_gen to 1
+        End If
+    End If
+
+    proc memory_set_int64 from Layout with state, 0, is_async
+    proc memory_set_int64 from Layout with state, 8, in_async_gen
+    proc memory_set_int64 from Layout with state, 16, in_sync_gen
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        proc validate_async_await with analyzer, child
+        Set index to index plus 1
+    End While
+
+    proc memory_set_int64 from Layout with state, 0, saved_async
+    proc memory_set_int64 from Layout with state, 8, saved_async_gen
+    proc memory_set_int64 from Layout with state, 16, saved_sync_gen
+
+    Return 1
+End Process
+
+@Reasoning:
+'await' is only legal inside async and async* bodies. The context is
+read from the async-state slots maintained by validate_callable_async,
+failing with a hard error outside them. The operand's inferred type
+additionally drives a redundancy warning when it is provably not
+Future-like (await on a plain int compiles but is useless); unknown
+types stay silent. The operand is then descended into because it may
+contain nested awaits and lambdas of its own.
+@End Reasoning
+Process called "validate_await_expression" takes analyzer as Integer, await_expr as Integer returns Integer:
+    Let state be proc memory_get_int64 from Layout with analyzer, 32
+    Let in_async be proc is_in_async_context with state
+
+    If in_async is equal to 0:
+        proc add_error with analyzer, "Await can only be used inside an async function body"
+    End If
+
+    Let target be proc ast_node_child from Parser with await_expr, 0
+    Let target_type be proc infer_expression_type with analyzer, target, 0
+    If target_type is not equal to 0:
+        Let is_future be proc is_future_type with target_type
+        If is_future is equal to 0:
+            proc add_warning with analyzer, "Await applied to a non-Future expression"
+        End If
+    End If
+
+    proc validate_async_await with analyzer, target
+    Return 1
+End Process
+
+@Reasoning:
+'yield' (and 'yield*', recorded as the "yield_each" flag on the same
+statement kind) is only legal inside generator bodies - async* or
+sync*. The generator slots of the async state answer the legality
+question; the yielded expression is then descended into for nested
+constructs.
+@End Reasoning
+Process called "validate_yield_statement" takes analyzer as Integer, yield_stmt as Integer returns Integer:
+    Let state be proc memory_get_int64 from Layout with analyzer, 32
+    Let in_async_gen be proc memory_get_int64 from Layout with state, 8
+    Let in_sync_gen be proc memory_get_int64 from Layout with state, 16
+
+    If in_async_gen is equal to 0:
+        If in_sync_gen is equal to 0:
+            proc add_error with analyzer, "Yield can only be used inside a generator function (async* or sync*)"
+        End If
+    End If
+
+    Let count be proc ast_node_child_count from Parser with yield_stmt
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with yield_stmt, index
+        proc validate_async_await with analyzer, child
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+The async-context predicate over the analyzer's async-state block:
+await legality is the in_async slot, which validate_callable_async sets
+for both async and async* bodies. Exposed as a named predicate so
+future statement-level validators share one definition of "inside an
+async context".
+@End Reasoning
+Process called "is_in_async_context" takes async_state as Integer returns Integer:
+    If async_state is equal to 0:
         Return 0
     End If
-
-    Note: Validate function body for proper async usage
-    Let body be proc memory_get_int64 from Layout with async_func, 32
-    proc validate_async_body with analyzer, body
-
-    Return 1
+    Return proc memory_get_int64 from Layout with async_state, 0
 End Process
 
 @Reasoning:
-'await' is only legal inside async functions. The validator first
-checks that the surrounding context is async (queried via the
-async_analyzer subsystem), failing fast with a hard error if not. It
-then infers the target's type and warns if it is not a Future since
-await on a non-Future is valid but useless.
+An async return type is satisfied by Future or FutureOr (bare, generic,
+prefix-qualified, or nullable-wrapped), by void (fire-and-forget async
+functions are legal Dart), by dynamic, by an omitted or var-spelled
+type, and by an unknown reference (0) - the conservative acceptance
+that prevents false errors when inference has no answer.
 @End Reasoning
-Process called "validate_await_expression" that takes analyzer as Integer, await_expr as Integer returns Integer:
-    Let target be proc memory_get_int64 from Layout with await_expr, 16
-
-    Note: Verify we're in async context
-    Let async_analyzer be proc memory_get_int64 from Layout with analyzer, 40
-    Let in_async_context be proc is_in_async_context from async_analyzer
-
-    If in_async_context is equal to 0:
-        proc add_error with analyzer, "Await can only be used in async functions"
-        Return 0
+Process called "is_future_type" takes type_ref as Integer returns Integer:
+    If type_ref is equal to 0:
+        Return 1
     End If
 
-    Note: Verify target is a Future
-    Let target_type be proc infer_expression_type with analyzer, target
-    Let is_future be proc is_future_type from target_type
-
-    If is_future is equal to 0:
-        proc add_warning with analyzer, "Await on non-Future expression"
+    Let base be proc type_base_name with type_ref
+    If base is equal to 0:
+        Return 1
     End If
 
-    Return 1
-End Process
-
-@Reasoning:
-async* functions yield values into a Stream<T>; the return type must
-match exactly because Dart's stream subscription machinery depends on
-the declared element type. After validating the return type, the body
-is scanned for proper yield statement placement.
-@End Reasoning
-Process called "validate_async_generator" that takes analyzer as Integer, gen_node as Integer returns Integer:
-    Let return_type be proc memory_get_int64 from Layout with gen_node, 24
-
-    Note: Verify return type is Stream<T>
-    Let is_stream be proc is_stream_type from return_type
-    If is_stream is equal to 0:
-        proc add_error with analyzer, "Async generator must return Stream<T>"
-        Return 0
+    Let matches be proc name_final_segment_equals with base, "Future"
+    If matches is equal to 1:
+        Return 1
     End If
-
-    Note: Validate yield statements
-    Let body be proc memory_get_int64 from Layout with gen_node, 32
-    proc validate_yield_statements with analyzer, body
-
-    Return 1
-End Process
-
-@Reasoning:
-sync* functions yield values into an Iterable<T> on demand. The return
-type contract is enforced for the same reason as async generators - the
-iteration machinery depends on the declared element type. No body
-yield-statement walk is performed here because sync generators are
-lazy and yield placement is more permissive than for async generators.
-@End Reasoning
-Process called "validate_sync_generator" that takes analyzer as Integer, gen_node as Integer returns Integer:
-    Let return_type be proc memory_get_int64 from Layout with gen_node, 24
-
-    Note: Verify return type is Iterable<T>
-    Let is_iterable be proc is_iterable_type from return_type
-    If is_iterable is equal to 0:
-        proc add_error with analyzer, "Sync generator must return Iterable<T>"
-        Return 0
+    Set matches to proc name_final_segment_equals with base, "FutureOr"
+    If matches is equal to 1:
+        Return 1
     End If
-
-    Return 1
-End Process
-
-Note: ================================================================
-Note: Mixin and Extension Resolution
-Note: ================================================================
-
-@Reasoning:
-This phase runs after all other resolution because mixin and extension
-applicability depends on knowing the full type hierarchy. The mixin
-resolver verifies 'on' clause constraints against resolved super-types;
-the extension resolver attaches extension methods to the types they
-extend so later member lookups can find them.
-@End Reasoning
-Process called "resolve_mixins_and_extensions" that takes analyzer as Integer, node as Integer returns Integer:
-    Let mixin_resolver be proc memory_get_int64 from Layout with analyzer, 48
-    Let extension_resolver be proc memory_get_int64 from Layout with analyzer, 56
-
-    Note: Resolve all registered mixins
-    proc resolve_all_mixins with mixin_resolver, analyzer
-
-    Note: Resolve all registered extensions
-    proc resolve_all_extensions with extension_resolver, analyzer
-
-    Return 1
-End Process
-
-Note: ================================================================
-Note: Helper Functions
-Note: ================================================================
-
-@Reasoning:
-The recognised set of Dart built-in types covers the SDK's core
-library: numeric (int, double, num), boolean (bool), text (String),
-escape-hatch (dynamic, void, Object), bottom (Never), null sentinel
-(Null), and the core collections plus Future/Stream/Iterable. These
-exist in dart:core and are implicitly imported, so the resolver does
-not need a real symbol-table entry to recognise them.
-@End Reasoning
-Process called "is_dart_builtin_type" that takes type_name as String returns Integer:
-    Note: Check for Dart built-in types
-    If proc equals from StringCore with type_name, "int":
+    Set matches to proc string_equals from StringCore with base, "dynamic"
+    If matches is equal to 1:
         Return 1
-    Otherwise If proc equals from StringCore with type_name, "double":
+    End If
+    Set matches to proc string_equals from StringCore with base, "void"
+    If matches is equal to 1:
         Return 1
-    Otherwise If proc equals from StringCore with type_name, "num":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "bool":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "String":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "dynamic":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "void":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "Object":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "Null":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "Never":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "List":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "Map":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "Set":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "Future":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "Stream":
-        Return 1
-    Otherwise If proc equals from StringCore with type_name, "Iterable":
+    End If
+    Set matches to proc string_equals from StringCore with base, "var"
+    If matches is equal to 1:
         Return 1
     End If
 
@@ -772,15 +1706,444 @@ Process called "is_dart_builtin_type" that takes type_name as String returns Int
 End Process
 
 @Reasoning:
-Errors flow into the analyzer's error list and simultaneously set the
-has_error flag at offset 88. analyze_dart_program inspects this flag at
-the end and returns failure if any error has been recorded, allowing
-the IDE/LSP layer to surface failure without scanning the entire list.
+Mirror of is_future_type for async* generators: Stream (bare, generic,
+prefix-qualified, nullable-wrapped), dynamic, var-spelled/omitted, and
+unknown all satisfy; anything else is a contract violation.
 @End Reasoning
-Process called "add_error" that takes analyzer as Integer, message as String returns Integer:
-    Let errors be proc memory_get_int64 from Layout with analyzer, 72
+Process called "is_stream_type" takes type_ref as Integer returns Integer:
+    If type_ref is equal to 0:
+        Return 1
+    End If
+
+    Let base be proc type_base_name with type_ref
+    If base is equal to 0:
+        Return 1
+    End If
+
+    Let matches be proc name_final_segment_equals with base, "Stream"
+    If matches is equal to 1:
+        Return 1
+    End If
+    Set matches to proc string_equals from StringCore with base, "dynamic"
+    If matches is equal to 1:
+        Return 1
+    End If
+    Set matches to proc string_equals from StringCore with base, "var"
+    If matches is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Mirror of is_future_type for sync* generators: Iterable satisfies, as
+do its declared supertypes Object and dynamic, var-spelled/omitted
+types, and unknown references.
+@End Reasoning
+Process called "is_iterable_type" takes type_ref as Integer returns Integer:
+    If type_ref is equal to 0:
+        Return 1
+    End If
+
+    Let base be proc type_base_name with type_ref
+    If base is equal to 0:
+        Return 1
+    End If
+
+    Let matches be proc name_final_segment_equals with base, "Iterable"
+    If matches is equal to 1:
+        Return 1
+    End If
+    Set matches to proc string_equals from StringCore with base, "dynamic"
+    If matches is equal to 1:
+        Return 1
+    End If
+    Set matches to proc string_equals from StringCore with base, "Object"
+    If matches is equal to 1:
+        Return 1
+    End If
+    Set matches to proc string_equals from StringCore with base, "var"
+    If matches is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ================================================================
+Note: Mixin Application Checking
+Note: ================================================================
+
+@Reasoning:
+This phase runs after all other resolution because mixin applicability
+depends on the collected type registries. The walk finds every class
+declaration and checks its with-clause: each named mixin must either be
+a registered mixin whose on-clause constraints the class satisfies, a
+locally-declared class that is legal to use as a mixin (no constructors
+and no superclass other than Object - the classic class-as-mixin rule),
+or a name outside local knowledge (imported), which is skipped rather
+than guessed at.
+@End Reasoning
+Process called "resolve_mixins_and_extensions" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc ast_node_type from Parser with node
+    If node_type is equal to DART_CLASS_DECL from Parser:
+        proc check_class_mixins with analyzer, node
+    End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        proc resolve_mixins_and_extensions with analyzer, child
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+For each type named in a class's with-clause: a registered mixin gets
+its on-clause constraints verified against the class's declared
+supertypes (extends base, implements entries, and the other with
+entries, any of which may satisfy a constraint directly or through the
+locally-known inheritance chain); a locally-declared class used as a
+mixin is checked against the class-as-mixin rules; dotted and unknown
+names are skipped because the declarations live in other libraries.
+Constraint verification only errors when the conformance scan returns a
+PROVABLE non-conformance - chains that leave local knowledge return the
+unknown verdict and stay silent.
+@End Reasoning
+Process called "check_class_mixins" takes analyzer as Integer, class_node as Integer returns Integer:
+    Let with_clause be proc find_child_of_kind with class_node, DART_WITH from Parser
+    If with_clause is equal to 0:
+        Return 1
+    End If
+
+    Let class_name be proc declaration_name with class_node
+    Let mixin_registry be proc memory_get_int64 from Layout with analyzer, 40
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+
+    Let mixin_count be proc ast_node_child_count from Parser with with_clause
+    Let m be 0
+    While m is less than mixin_count:
+        Let mixin_type be proc ast_node_child from Parser with with_clause, m
+        Let mixin_name be proc type_base_name with mixin_type
+
+        Let analyzable be 1
+        If mixin_name is equal to 0:
+            Set analyzable to 0
+        End If
+
+        If analyzable is equal to 1:
+            Let name_len be proc string_length from StringCore with mixin_name
+            Let d be 0
+            While d is less than name_len:
+                Let dch be proc string_char_at from StringCore with mixin_name, d
+                If dch is equal to 46:
+                    Set analyzable to 0
+                    Break
+                End If
+                Set d to d plus 1
+            End While
+        End If
+
+        If analyzable is equal to 1:
+            Let mixin_node be proc get from Dict with mixin_registry, mixin_name
+            If mixin_node is not equal to 0:
+                proc check_mixin_constraints with analyzer, class_node, class_name, mixin_node, mixin_name
+            Otherwise:
+                Let class_as_mixin be proc get from Dict with global_scope, mixin_name
+                If class_as_mixin is not equal to 0:
+                    Let as_mixin_kind be proc ast_node_type from Parser with class_as_mixin
+                    If as_mixin_kind is equal to DART_CLASS_DECL from Parser:
+                        proc check_class_usable_as_mixin with analyzer, class_as_mixin, mixin_name
+                    End If
+                End If
+            End If
+        End If
+
+        Set m to m plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+A mixin's on-clause names the supertypes a host class must already
+have. For each constraint, the host satisfies it when its extends base,
+any implements entry, or any with entry conforms to the constraint
+name, directly or transitively through locally-declared classes. The
+tri-state conformance verdict (1 conforms / 0 provably does not / 2
+leaves local knowledge) ensures the error fires only on provable
+violations - any unknown link in every candidate chain suppresses the
+diagnostic. A class with no extends clause has the implicit superclass
+Object, which only satisfies the Object constraint.
+@End Reasoning
+Process called "check_mixin_constraints" takes analyzer as Integer, class_node as Integer, class_name as Integer, mixin_node as Integer, mixin_name as Integer returns Integer:
+    Let on_clause be proc find_child_of_kind with mixin_node, DART_ON_CLAUSE from Parser
+    If on_clause is equal to 0:
+        Return 1
+    End If
+
+    Let constraint_count be proc ast_node_child_count from Parser with on_clause
+    Let c be 0
+    While c is less than constraint_count:
+        Let constraint_type be proc ast_node_child from Parser with on_clause, c
+        Let constraint_name be proc type_base_name with constraint_type
+
+        If constraint_name is not equal to 0:
+            Let verdict be proc class_satisfies_constraint with analyzer, class_node, constraint_name
+            If verdict is equal to 0:
+                Let error_msg be proc string_concat from StringUtils with "Mixin '", mixin_name
+                Set error_msg to proc string_concat from StringUtils with error_msg, "' requires a superclass of '"
+                Set error_msg to proc string_concat from StringUtils with error_msg, constraint_name
+                Set error_msg to proc string_concat from StringUtils with error_msg, "' but class '"
+                Set error_msg to proc string_concat from StringUtils with error_msg, class_name
+                Set error_msg to proc string_concat from StringUtils with error_msg, "' does not satisfy it"
+                proc add_error with analyzer, error_msg
+            End If
+        End If
+
+        Set c to c plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Gathers the class's candidate supertypes (extends base, implements
+entries, with entries) and folds each through supertype_conforms. The
+verdict is 1 as soon as any candidate conforms, 2 when none conform but
+at least one chain left local knowledge, and 0 only when every
+candidate provably fails - with the Object constraint always satisfied
+since every Dart class descends from Object.
+@End Reasoning
+Process called "class_satisfies_constraint" takes analyzer as Integer, class_node as Integer, constraint_name as Integer returns Integer:
+    Let is_object be proc string_equals from StringCore with constraint_name, "Object"
+    If is_object is equal to 1:
+        Return 1
+    End If
+
+    Let any_unknown be 0
+
+    Let extends_clause be proc find_child_of_kind with class_node, DART_EXTENDS from Parser
+    If extends_clause is not equal to 0:
+        Let base_type be proc ast_node_child from Parser with extends_clause, 0
+        Let base_name be proc type_base_name with base_type
+        If base_name is not equal to 0:
+            Let verdict be proc supertype_conforms with analyzer, base_name, constraint_name, 0
+            If verdict is equal to 1:
+                Return 1
+            End If
+            If verdict is equal to 2:
+                Set any_unknown to 1
+            End If
+        End If
+    End If
+
+    Let implements_clause be proc find_child_of_kind with class_node, DART_IMPLEMENTS from Parser
+    If implements_clause is not equal to 0:
+        Let impl_count be proc ast_node_child_count from Parser with implements_clause
+        Let i be 0
+        While i is less than impl_count:
+            Let impl_type be proc ast_node_child from Parser with implements_clause, i
+            Let impl_name be proc type_base_name with impl_type
+            If impl_name is not equal to 0:
+                Let impl_verdict be proc supertype_conforms with analyzer, impl_name, constraint_name, 0
+                If impl_verdict is equal to 1:
+                    Return 1
+                End If
+                If impl_verdict is equal to 2:
+                    Set any_unknown to 1
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    Let with_clause be proc find_child_of_kind with class_node, DART_WITH from Parser
+    If with_clause is not equal to 0:
+        Let with_count be proc ast_node_child_count from Parser with with_clause
+        Let w be 0
+        While w is less than with_count:
+            Let with_type be proc ast_node_child from Parser with with_clause, w
+            Let with_name be proc type_base_name with with_type
+            If with_name is not equal to 0:
+                Let with_verdict be proc supertype_conforms with analyzer, with_name, constraint_name, 0
+                If with_verdict is equal to 1:
+                    Return 1
+                End If
+                If with_verdict is equal to 2:
+                    Set any_unknown to 1
+                End If
+            End If
+            Set w to w plus 1
+        End While
+    End If
+
+    If any_unknown is equal to 1:
+        Return 2
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Transitive conformance through the locally-declared hierarchy: a name
+conforms to a constraint when it IS the constraint, when the constraint
+is Object, or when its locally-known declaration reaches the constraint
+through its extends/implements/with entries. Names without a local
+declaration yield the unknown verdict (2) - they may conform in their
+home library. The depth bound terminates on cyclic hierarchies (which
+are themselves a Dart error reported by the declaring library, not this
+walk).
+@End Reasoning
+Process called "supertype_conforms" takes analyzer as Integer, type_name as Integer, constraint_name as Integer, depth as Integer returns Integer:
+    Let direct be proc string_equals from StringCore with type_name, constraint_name
+    If direct is equal to 1:
+        Return 1
+    End If
+
+    Let is_object be proc string_equals from StringCore with constraint_name, "Object"
+    If is_object is equal to 1:
+        Return 1
+    End If
+
+    If depth is greater than 32:
+        Return 2
+    End If
+
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let decl be proc get from Dict with global_scope, type_name
+    If decl is equal to 0:
+        Return 2
+    End If
+
+    Let any_unknown be 0
+
+    Let extends_clause be proc find_child_of_kind with decl, DART_EXTENDS from Parser
+    If extends_clause is not equal to 0:
+        Let base_type be proc ast_node_child from Parser with extends_clause, 0
+        Let base_name be proc type_base_name with base_type
+        If base_name is not equal to 0:
+            Let verdict be proc supertype_conforms with analyzer, base_name, constraint_name, depth plus 1
+            If verdict is equal to 1:
+                Return 1
+            End If
+            If verdict is equal to 2:
+                Set any_unknown to 1
+            End If
+        End If
+    End If
+
+    Let implements_clause be proc find_child_of_kind with decl, DART_IMPLEMENTS from Parser
+    If implements_clause is not equal to 0:
+        Let impl_count be proc ast_node_child_count from Parser with implements_clause
+        Let i be 0
+        While i is less than impl_count:
+            Let impl_type be proc ast_node_child from Parser with implements_clause, i
+            Let impl_name be proc type_base_name with impl_type
+            If impl_name is not equal to 0:
+                Let impl_verdict be proc supertype_conforms with analyzer, impl_name, constraint_name, depth plus 1
+                If impl_verdict is equal to 1:
+                    Return 1
+                End If
+                If impl_verdict is equal to 2:
+                    Set any_unknown to 1
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    Let with_clause be proc find_child_of_kind with decl, DART_WITH from Parser
+    If with_clause is not equal to 0:
+        Let with_count be proc ast_node_child_count from Parser with with_clause
+        Let w be 0
+        While w is less than with_count:
+            Let with_type be proc ast_node_child from Parser with with_clause, w
+            Let with_name be proc type_base_name with with_type
+            If with_name is not equal to 0:
+                Let with_verdict be proc supertype_conforms with analyzer, with_name, constraint_name, depth plus 1
+                If with_verdict is equal to 1:
+                    Return 1
+                End If
+                If with_verdict is equal to 2:
+                    Set any_unknown to 1
+                End If
+            End If
+            Set w to w plus 1
+        End While
+    End If
+
+    If any_unknown is equal to 1:
+        Return 2
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+The classic class-as-mixin rule: a class may appear in a with-clause
+only when it declares no constructors and no superclass other than
+Object. Both conditions are checkable from the local declaration: an
+extends clause child or any constructor/factory member child violates
+the rule.
+@End Reasoning
+Process called "check_class_usable_as_mixin" takes analyzer as Integer, class_decl as Integer, mixin_name as Integer returns Integer:
+    Let violation be 0
+
+    Let extends_clause be proc find_child_of_kind with class_decl, DART_EXTENDS from Parser
+    If extends_clause is not equal to 0:
+        Let base_type be proc ast_node_child from Parser with extends_clause, 0
+        Let base_name be proc type_base_name with base_type
+        If base_name is not equal to 0:
+            Let is_object be proc string_equals from StringCore with base_name, "Object"
+            If is_object is equal to 0:
+                Set violation to 1
+            End If
+        End If
+    End If
+
+    Let ctor be proc find_child_of_kind with class_decl, DART_CONSTRUCTOR_DECL from Parser
+    If ctor is not equal to 0:
+        Set violation to 1
+    End If
+
+    Let factory_ctor be proc find_child_of_kind with class_decl, DART_FACTORY_DECL from Parser
+    If factory_ctor is not equal to 0:
+        Set violation to 1
+    End If
+
+    If violation is equal to 1:
+        Let error_msg be proc string_concat from StringUtils with "Class '", mixin_name
+        Set error_msg to proc string_concat from StringUtils with error_msg, "' cannot be used as a mixin: it declares a constructor or a superclass other than Object"
+        proc add_error with analyzer, error_msg
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ================================================================
+Note: Diagnostics
+Note: ================================================================
+
+@Reasoning:
+Errors flow into the analyzer's error list and simultaneously set the
+has_error flag at offset 80. analyze_dart_program inspects this flag at
+the end and returns failure if any error has been recorded, allowing
+the caller to surface failure without scanning the entire list.
+@End Reasoning
+Process called "add_error" takes analyzer as Integer, message as Integer returns Integer:
+    Let errors be proc memory_get_int64 from Layout with analyzer, 64
     proc append from List with errors, message
-    proc memory_set_int64 from Layout with analyzer, 88, 1
+    proc memory_set_int64 from Layout with analyzer, 80, 1
     Return 1
 End Process
 
@@ -790,289 +2153,25 @@ flag - this matches Dart analyzer semantics where warnings inform but
 do not block compilation. Callers can still inspect the warning list
 explicitly via get_warnings.
 @End Reasoning
-Process called "add_warning" that takes analyzer as Integer, message as String returns Integer:
-    Let warnings be proc memory_get_int64 from Layout with analyzer, 80
+Process called "add_warning" takes analyzer as Integer, message as Integer returns Integer:
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 72
     proc append from List with warnings, message
     Return 1
 End Process
 
 @Reasoning:
-Direct accessor for the error list at offset 72. Returning the list
-handle (rather than copying) lets the LSP layer walk the diagnostics
-without paying for a duplication; the analyzer retains ownership of
-the list lifetime.
+Direct accessor for the error list. Returning the list handle (rather
+than copying) lets callers walk the diagnostics without paying for a
+duplication; the analyzer retains ownership of the list lifetime.
 @End Reasoning
-Process called "get_errors" that takes analyzer as Integer returns Integer:
+Process called "get_errors" takes analyzer as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with analyzer, 64
+End Process
+
+@Reasoning:
+Companion accessor for the warning list. Behaviour mirrors get_errors:
+the analyzer retains ownership and the caller borrows the handle.
+@End Reasoning
+Process called "get_warnings" takes analyzer as Integer returns Integer:
     Return proc memory_get_int64 from Layout with analyzer, 72
-End Process
-
-@Reasoning:
-Companion accessor for the warning list at offset 80. Behaviour mirrors
-get_errors: the analyzer retains ownership and the LSP layer borrows
-the handle.
-@End Reasoning
-Process called "get_warnings" that takes analyzer as Integer returns Integer:
-    Return proc memory_get_int64 from Layout with analyzer, 80
-End Process
-
-Note: ================================================================
-Note: Subsystem Creation Helpers
-Note: ================================================================
-
-@Reasoning:
-The type system is backed by a plain dictionary keyed by type name; the
-v0.0.8.5 implementation does not yet need a richer structure because
-Dart's nominal typing maps directly onto a name-keyed table. More
-elaborate constraint solvers will live in dedicated modules when
-generic bounds and variance inference need to be tracked.
-@End Reasoning
-Process called "create_dart_type_system" that takes nothing returns Integer:
-    Let type_system be proc create from Dict
-    Return type_system
-End Process
-
-@Reasoning:
-The null-safety checker carries three 8-byte slots for tracking
-state across the analysis: the nullable-type set, the null-aware
-access set, and the assertion set. They are initialised to zero
-because each set is populated on first use by the relevant checker;
-storing them inline keeps the per-analyzer overhead bounded.
-@End Reasoning
-Process called "create_null_safety_checker" that takes nothing returns Integer:
-    Let checker be proc allocate from Layout with 24
-    proc memory_set_int64 from Layout with checker, 0, 0
-    proc memory_set_int64 from Layout with checker, 8, 0
-    proc memory_set_int64 from Layout with checker, 16, 0
-    Return checker
-End Process
-
-@Reasoning:
-The async analyzer carries four 8-byte slots: in_async, in_async_gen,
-in_sync_gen, and await_depth. Initialised to zero because the walker
-enters each context explicitly via context-push helpers when the
-async/await validator descends into a relevant function.
-@End Reasoning
-Process called "create_async_analyzer" that takes nothing returns Integer:
-    Let analyzer be proc allocate from Layout with 32
-    proc memory_set_int64 from Layout with analyzer, 0, 0
-    proc memory_set_int64 from Layout with analyzer, 8, 0
-    proc memory_set_int64 from Layout with analyzer, 16, 0
-    proc memory_set_int64 from Layout with analyzer, 24, 0
-    Return analyzer
-End Process
-
-@Reasoning:
-The mixin resolver is a dictionary keyed by mixin name; the value is
-the mixin's AST node. Lookups are by name during inheritance
-resolution because Dart's 'with' clauses reference mixins by name.
-@End Reasoning
-Process called "create_mixin_resolver" that takes nothing returns Integer:
-    Let resolver be proc create from Dict
-    Return resolver
-End Process
-
-@Reasoning:
-The extension resolver is a dictionary keyed by extension name. Per-type
-indexing (which extensions apply to which type) is computed during
-resolve_all_extensions; the registration step only stores the name to
-AST mapping that the later phase consumes.
-@End Reasoning
-Process called "create_extension_resolver" that takes nothing returns Integer:
-    Let resolver be proc create from Dict
-    Return resolver
-End Process
-
-@Reasoning:
-The generic resolver is a dictionary used to track type-parameter
-bindings during the resolution of generic class/function uses. Each
-entry records the binding of a type parameter (T, K, V) to a concrete
-or polymorphic type during the walk.
-@End Reasoning
-Process called "create_generic_resolver" that takes nothing returns Integer:
-    Let resolver be proc create from Dict
-    Return resolver
-End Process
-
-@Reasoning:
-Symbol creation in v0.0.8.5 is alias-by-pointer: the class symbol IS
-the class AST node, so we return the node unchanged. Later phases that
-need richer symbol metadata can wrap this in a dedicated struct
-without changing the registration site.
-@End Reasoning
-Process called "create_class_symbol" that takes class_node as Integer returns Integer:
-    Return class_node
-End Process
-
-@Reasoning:
-Function symbols, like class symbols, are direct aliases for their AST
-node in v0.0.8.5. This keeps the symbol table memory-flat and avoids
-duplicating storage that callers can already reach via the node.
-@End Reasoning
-Process called "create_function_symbol" that takes func_node as Integer returns Integer:
-    Return func_node
-End Process
-
-@Reasoning:
-Variable symbols are AST-alias references for the same reason as class
-and function symbols - the AST node already carries name, declared
-type, initializer, and modifiers, so a separate symbol struct would be
-redundant in v0.0.8.5.
-@End Reasoning
-Process called "create_variable_symbol" that takes var_node as Integer returns Integer:
-    Return var_node
-End Process
-
-@Reasoning:
-Enum symbols follow the same alias-by-pointer pattern. Modern Dart
-enums can carry methods and named constructors, all of which live on
-the AST node already.
-@End Reasoning
-Process called "create_enum_symbol" that takes enum_node as Integer returns Integer:
-    Return enum_node
-End Process
-
-@Reasoning:
-Registration in the resolver dictionary is keyed by extension name.
-Same-name extension shadowing across libraries is not detected here -
-that is the responsibility of resolve_all_extensions which sees the
-full set.
-@End Reasoning
-Process called "register_extension" that takes resolver as Integer, name as String, node as Integer returns Integer:
-    proc put from Dict with resolver, name, node
-    Return 1
-End Process
-
-@Reasoning:
-Symmetric to register_extension. Mixin registration is keyed by name
-because Dart's 'with' clauses reference mixins by their unqualified
-name (or library-qualified after import).
-@End Reasoning
-Process called "register_mixin" that takes resolver as Integer, name as String, node as Integer returns Integer:
-    proc put from Dict with resolver, name, node
-    Return 1
-End Process
-
-@Reasoning:
-Resolution of registered mixins runs after collect and resolve_dart_types
-phases so the type hierarchy is fully built. The v0.0.8.5 implementation
-returns success unconditionally because mixin constraint verification
-is performed elsewhere (in the gungnir semantic layer); this entry exists
-to allow the dispatcher in resolve_mixins_and_extensions to invoke a
-uniform interface across both resolvers.
-@End Reasoning
-Process called "resolve_all_mixins" that takes resolver as Integer, analyzer as Integer returns Integer:
-    Return 1
-End Process
-
-@Reasoning:
-Symmetric to resolve_all_mixins; in v0.0.8.5 the actual extension
-method indexing is performed by the gungnir semantic phase that
-follows. This routine exists for dispatcher uniformity so the
-resolve_mixins_and_extensions caller can drive both resolvers via
-the same shape.
-@End Reasoning
-Process called "resolve_all_extensions" that takes resolver as Integer, analyzer as Integer returns Integer:
-    Return 1
-End Process
-
-@Reasoning:
-Expression-type inference returns 0 (representing dynamic/unknown) in
-v0.0.8.5; the comprehensive inferer lives in the gungnir semantic
-layer and consumes the resolved type symbols populated by this
-analyzer. The null sentinel propagates safely through the callers
-which treat it as "type not yet known".
-@End Reasoning
-Process called "infer_expression_type" that takes analyzer as Integer, expr as Integer returns Integer:
-    Return 0
-End Process
-
-@Reasoning:
-The conservative non-nullable answer (0) matches Dart's sound-null
-default: when type information is incomplete we err on the side of
-treating the type as non-nullable. The real classifier lives in the
-gungnir type system; callers tolerate this conservatism because the
-worst case is a missed redundancy warning, not an incorrect error.
-@End Reasoning
-Process called "is_nullable_type" that takes type_ref as Integer returns Integer:
-    Return 0
-End Process
-
-@Reasoning:
-Usage context classification (non-null vs nullable demand) returns the
-neutral context (0) in v0.0.8.5; the context detector lives in the
-gungnir semantic phase. The default of 0 means check_nullable_type
-treats every site as accepting nullability, suppressing the
-redundancy warning until the smarter detector takes over.
-@End Reasoning
-Process called "get_type_usage_context" that takes node as Integer returns Integer:
-    Return 0
-End Process
-
-@Reasoning:
-The optimistic answer (1 = initialised) is returned in v0.0.8.5 because
-the data-flow analysis lives in the gungnir flow-sensitive layer. This
-suppresses the late-not-initialised error until that analyzer is wired
-in, which avoids false positives during the bridge period when the
-analyzer cannot yet prove initialisation.
-@End Reasoning
-Process called "check_late_initialization" that takes analyzer as Integer, late_var as Integer returns Integer:
-    Return 1
-End Process
-
-@Reasoning:
-The optimistic Future answer (1) is the v0.0.8.5 stance: every type_ref
-is treated as Future-compatible until the gungnir semantic phase can
-look up the actual symbol and check inheritance. This suppresses
-false-positive errors at the validate_async_function and
-validate_await_expression call sites during the bridge period.
-@End Reasoning
-Process called "is_future_type" that takes type_ref as Integer returns Integer:
-    Return 1
-End Process
-
-@Reasoning:
-Mirror of is_future_type for Stream. The conservative answer of 1
-defers Stream detection to the gungnir semantic phase, avoiding false
-positive errors during the bridge period.
-@End Reasoning
-Process called "is_stream_type" that takes type_ref as Integer returns Integer:
-    Return 1
-End Process
-
-@Reasoning:
-Mirror of is_future_type for Iterable. The conservative answer of 1
-defers Iterable detection to the gungnir semantic phase.
-@End Reasoning
-Process called "is_iterable_type" that takes type_ref as Integer returns Integer:
-    Return 1
-End Process
-
-@Reasoning:
-The v0.0.8.5 implementation reports any caller as in async context
-(returns 1) so the await-expression validator does not raise spurious
-errors on legal Dart code while the actual context tracker is being
-wired in. The real implementation will inspect the async_analyzer's
-state fields populated by validate_async_function on entry.
-@End Reasoning
-Process called "is_in_async_context" that takes async_analyzer as Integer returns Integer:
-    Return 1
-End Process
-
-@Reasoning:
-Async-body validation is delegated to the gungnir semantic phase in
-v0.0.8.5; this entry exists so validate_async_function has a hook for
-future per-body checks (e.g. await placement, missing returns).
-@End Reasoning
-Process called "validate_async_body" that takes analyzer as Integer, body as Integer returns Integer:
-    Return 1
-End Process
-
-@Reasoning:
-Yield-statement validation is deferred to the gungnir semantic phase
-which has full control-flow data. This entry exists so the async
-generator validator can call a uniformly-named hook for future
-extension.
-@End Reasoning
-Process called "validate_yield_statements" that takes analyzer as Integer, body as Integer returns Integer:
-    Return 1
 End Process

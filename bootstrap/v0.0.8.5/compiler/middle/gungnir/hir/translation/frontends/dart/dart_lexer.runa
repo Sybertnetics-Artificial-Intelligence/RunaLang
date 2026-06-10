@@ -91,6 +91,7 @@ Note: Literals
 Constant TOKEN_NUMBER_LITERAL as Integer is 6090
 Constant TOKEN_STRING_LITERAL as Integer is 6091
 Constant TOKEN_IDENTIFIER as Integer is 6092
+Constant TOKEN_STRING_INTERP as Integer is 6093
 
 Note: Operators
 Constant TOKEN_PLUS as Integer is 6100
@@ -206,7 +207,7 @@ Process called "create_dart_lexer" takes source as Integer returns Integer:
     Dart uses Unicode, so we track line/column for proper error reporting.
     @End Reasoning
 
-    Let lexer be proc arena_alloc from Arena with 40
+    Let lexer be proc allocate from Arena with 40
     proc memory_set_int64 from Memory with lexer, 0, source
     proc memory_set_int64 from Memory with lexer, 8, 0
     proc memory_set_int64 from Memory with lexer, 16, 1
@@ -231,13 +232,45 @@ them and are released as a single batch when the arena is reset.
 Process called "create_token" takes token_type as Integer, lexeme as Integer, line as Integer, column as Integer returns Integer:
     Note: Create token with type and metadata
 
-    Let token be proc arena_alloc from Arena with 32
+    Let token be proc allocate from Arena with 32
     proc memory_set_int64 from Memory with token, 0, token_type
     proc memory_set_int64 from Memory with token, 8, lexeme
     proc memory_set_int64 from Memory with token, 16, line
     proc memory_set_int64 from Memory with token, 24, column
 
     Return token
+End Process
+
+Note: ============================================================================
+Note: Lexeme Extraction
+Note: ============================================================================
+
+@Reasoning:
+Extracts the half-open byte range [start_pos, end_pos) of the source
+buffer into a freshly allocated NUL-terminated string. The lexer slices
+lexemes out of the single source buffer this way so tokens own stable
+string handles independent of cursor movement. Defensive clamp: a
+negative length (caller passed reversed bounds) produces the empty
+string rather than corrupting memory.
+@End Reasoning
+Process called "dart_substring" takes source as Integer, start_pos as Integer, end_pos as Integer returns Integer:
+    Note: Copy source bytes [start_pos, end_pos) into a new NUL-terminated string
+
+    Let len be end_pos minus start_pos
+    If len is less than 0:
+        Set len to 0
+    End If
+
+    Let buffer be proc allocate from Arena with len plus 1
+    Let i be 0
+    While i is less than len:
+        Let ch be proc memory_get_byte from Memory with source, start_pos plus i
+        proc memory_set_byte from Memory with buffer, i, ch
+        Set i to i plus 1
+    End While
+
+    proc memory_set_byte from Memory with buffer, len, 0
+    Return buffer
 End Process
 
 Note: ============================================================================
@@ -316,12 +349,12 @@ directly. Constant time.
 Process called "is_alnum" takes ch as Integer returns Integer:
     Note: Check if character is alphanumeric
 
-    Let digit_check be proc is_digit from ch
+    Let digit_check be proc is_digit with ch
     If digit_check is equal to 1:
         Return 1
     End If
 
-    Let alpha_check be proc is_alpha from ch
+    Let alpha_check be proc is_alpha with ch
     Return alpha_check
 End Process
 
@@ -339,7 +372,7 @@ Returns 1 if is_digit returns 1; otherwise tests 'A'..'F' (65..70) and
 Process called "is_hex_digit" takes ch as Integer returns Integer:
     Note: Check if character is hexadecimal digit
 
-    Let digit_check be proc is_digit from ch
+    Let digit_check be proc is_digit with ch
     If digit_check is equal to 1:
         Return 1
     End If
@@ -403,8 +436,8 @@ without a separate eof flag.
 
 @Implementation:
 Reads source/position/length from offsets 0/8/32. If position >= length
-returns 0. Otherwise calls StringCore.string_char_at(source, position) and
-returns the byte.
+returns 0. Otherwise calls string_char_at from StringCore with the source
+and position and returns the byte.
 @End Implementation
 
 Process called "current_char" takes lexer as Integer returns Integer:
@@ -467,7 +500,7 @@ increments column. Returns the byte that was at the original cursor.
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance position and return current character
 
-    Let ch be proc current_char from lexer
+    Let ch be proc current_char with lexer
     Let position be proc memory_get_int64 from Memory with lexer, 8
     Let column be proc memory_get_int64 from Memory with lexer, 24
 
@@ -503,12 +536,12 @@ leaving the cursor untouched. On match calls advance_char and returns 1.
 Process called "match_char" takes lexer as Integer, expected as Integer returns Integer:
     Note: Match and consume expected character
 
-    Let ch be proc current_char from lexer
+    Let ch be proc current_char with lexer
     If ch is not equal to expected:
         Return 0
     End If
 
-    proc advance_char from lexer
+    proc advance_char with lexer
     Return 1
 End Process
 
@@ -532,14 +565,14 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
     While 1 is equal to 1:
-        Let ch be proc current_char from lexer
-        Let is_ws be proc is_whitespace from ch
+        Let ch be proc current_char with lexer
+        Let is_ws be proc is_whitespace with ch
 
         If is_ws is equal to 0:
             Return 1
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Return 1
@@ -561,64 +594,81 @@ advanced past.
 Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Note: Skip // comment
 
-    proc advance_char from lexer
-    proc advance_char from lexer
+    proc advance_char with lexer
+    proc advance_char with lexer
 
     While 1 is equal to 1:
-        Let ch be proc current_char from lexer
+        Let ch be proc current_char with lexer
 
         If ch is equal to 0:
             Return 1
         End If
 
         If ch is equal to 10:
-            proc advance_char from lexer
+            proc advance_char with lexer
             Return 1
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Return 1
 End Process
 
 @Reasoning:
-Skips /* ... */ block comments. Dart's spec allows nesting of /**/
-comments but this implementation handles only the flat (non-nested)
-form because nested comments are rare in practice; if nesting is
-needed it should be added explicitly with a depth counter.
+Skips /* ... */ block comments. Dart's specification allows nesting of
+/* */ comments (unlike C), so a depth counter tracks every interior
+"/*" opener and the comment only ends when the matching "*/" closes
+the outermost level - "/* outer /* inner */ still comment */" is one
+comment.
 @End Reasoning
 
 @Implementation:
-Consumes the leading "/*" via two advance_char calls. Loops: 0 (EOF)
-exits; '*' (42) peeked-followed-by-'/' (47) consumes both and exits;
-anything else is advanced past. EOF without terminator silently exits
-to avoid hanging the lexer.
+Consumes the leading "/*" via two advance_char calls with depth 1.
+Loops: 0 (EOF) exits; "/*" increments depth and consumes both
+characters; "*/" decrements depth, consumes both, and exits when the
+depth reaches zero; anything else is advanced past. EOF without a
+terminator silently exits to avoid hanging the lexer.
 @End Implementation
 
 Process called "skip_block_comment" takes lexer as Integer returns Integer:
-    Note: Skip /* */ comment
+    Note: Skip a possibly-nested /* */ comment
 
-    proc advance_char from lexer
-    proc advance_char from lexer
+    proc advance_char with lexer
+    proc advance_char with lexer
 
-    While 1 is equal to 1:
-        Let ch be proc current_char from lexer
+    Let depth be 1
+
+    While depth is greater than 0:
+        Let ch be proc current_char with lexer
 
         If ch is equal to 0:
             Return 1
         End If
 
-        If ch is equal to 42:
-            Let next_ch be proc peek_char with lexer, 1
-            If next_ch is equal to 47:
-                proc advance_char from lexer
-                proc advance_char from lexer
-                Return 1
+        If ch is equal to 47:
+            Let open_next be proc peek_char with lexer, 1
+            If open_next is equal to 42:
+                Set depth to depth plus 1
+                proc advance_char with lexer
+                proc advance_char with lexer
+            Otherwise:
+                proc advance_char with lexer
             End If
+        Otherwise:
+        If ch is equal to 42:
+            Let close_next be proc peek_char with lexer, 1
+            If close_next is equal to 47:
+                Set depth to depth minus 1
+                proc advance_char with lexer
+                proc advance_char with lexer
+            Otherwise:
+                proc advance_char with lexer
+            End If
+        Otherwise:
+            proc advance_char with lexer
         End If
-
-        proc advance_char from lexer
+        End If
     End While
 
     Return 1
@@ -652,39 +702,34 @@ Process called "lex_number" takes lexer as Integer returns Integer:
     Let line be proc memory_get_int64 from Memory with lexer, 16
     Let column be proc memory_get_int64 from Memory with lexer, 24
 
-    Let ch be proc current_char from lexer
+    Let ch be proc current_char with lexer
 
     Note: Check for hexadecimal
     If ch is equal to 48:
         Let next_ch be proc peek_char with lexer, 1
         If next_ch is equal to 120:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
 
             While 1 is equal to 1:
-                Set ch to proc current_char from lexer
-                Let is_hex be proc is_hex_digit from ch
+                Set ch to proc current_char with lexer
+                Let is_hex be proc is_hex_digit with ch
 
                 If is_hex is equal to 1:
-                    proc advance_char from lexer
+                    proc advance_char with lexer
 
                 Otherwise:
                     If ch is equal to 95:
-                        proc advance_char from lexer
+                        proc advance_char with lexer
 
                     Otherwise:
-                        If 1 is equal to 1:
-                            Note: Break
-                            If 1 is not equal to 1:
-                                Note: Force break
-                            End If
-                        End If
+                        Break
                     End If
                 End If
             End While
 
             Let end_pos be proc memory_get_int64 from Memory with lexer, 8
-            Let lexeme be proc substring from StringCore with source, start_pos, end_pos
+            Let lexeme be proc dart_substring with source, start_pos, end_pos
             Let token be proc create_token with TOKEN_NUMBER_LITERAL, lexeme, line, column
             Return token
         End If
@@ -692,54 +737,44 @@ Process called "lex_number" takes lexer as Integer returns Integer:
 
     Note: Parse integer part
     While 1 is equal to 1:
-        Set ch to proc current_char from lexer
-        Let is_dig be proc is_digit from ch
+        Set ch to proc current_char with lexer
+        Let is_dig be proc is_digit with ch
 
         If is_dig is equal to 1:
-            proc advance_char from lexer
+            proc advance_char with lexer
 
         Otherwise:
             If ch is equal to 95:
-                proc advance_char from lexer
+                proc advance_char with lexer
 
             Otherwise:
-                If 1 is equal to 1:
-                    Note: Break
-                    If 1 is not equal to 1:
-                        Note: Force break
-                    End If
-                End If
+                Break
             End If
         End If
     End While
 
     Note: Check for decimal point
-    Set ch to proc current_char from lexer
+    Set ch to proc current_char with lexer
     If ch is equal to 46:
         Set next_ch to proc peek_char with lexer, 1
-        Set is_dig to proc is_digit from next_ch
+        Set is_dig to proc is_digit with next_ch
 
         If is_dig is equal to 1:
-            proc advance_char from lexer
+            proc advance_char with lexer
 
             While 1 is equal to 1:
-                Set ch to proc current_char from lexer
-                Set is_dig to proc is_digit from ch
+                Set ch to proc current_char with lexer
+                Set is_dig to proc is_digit with ch
 
                 If is_dig is equal to 1:
-                    proc advance_char from lexer
+                    proc advance_char with lexer
 
                 Otherwise:
                     If ch is equal to 95:
-                        proc advance_char from lexer
+                        proc advance_char with lexer
 
                     Otherwise:
-                        If 1 is equal to 1:
-                            Note: Break
-                            If 1 is not equal to 1:
-                                Note: Force break
-                            End If
-                        End If
+                        Break
                     End If
                 End If
             End While
@@ -747,44 +782,39 @@ Process called "lex_number" takes lexer as Integer returns Integer:
     End If
 
     Note: Check for exponent
-    Set ch to proc current_char from lexer
+    Set ch to proc current_char with lexer
     If ch is equal to 101:
-        proc advance_char from lexer
-        Set ch to proc current_char from lexer
+        proc advance_char with lexer
+        Set ch to proc current_char with lexer
 
         If ch is equal to 43:
-            proc advance_char from lexer
+            proc advance_char with lexer
         End If
 
         If ch is equal to 45:
-            proc advance_char from lexer
+            proc advance_char with lexer
         End If
 
         While 1 is equal to 1:
-            Set ch to proc current_char from lexer
-            Set is_dig to proc is_digit from ch
+            Set ch to proc current_char with lexer
+            Set is_dig to proc is_digit with ch
 
             If is_dig is equal to 1:
-                proc advance_char from lexer
+                proc advance_char with lexer
 
             Otherwise:
                 If ch is equal to 95:
-                    proc advance_char from lexer
+                    proc advance_char with lexer
 
                 Otherwise:
-                    If 1 is equal to 1:
-                        Note: Break
-                        If 1 is not equal to 1:
-                            Note: Force break
-                        End If
-                    End If
+                    Break
                 End If
             End If
         End While
     End If
 
     Set end_pos to proc memory_get_int64 from Memory with lexer, 8
-    Set lexeme to proc substring from StringCore with source, start_pos, end_pos
+    Set lexeme to proc dart_substring with source, start_pos, end_pos
     Set token to proc create_token with TOKEN_NUMBER_LITERAL, lexeme, line, column
     Return token
 End Process
@@ -794,12 +824,161 @@ Note: String Lexing
 Note: ============================================================================
 
 @Reasoning:
+Interpolation blocks "${expr}" inside string literals may contain
+arbitrary Dart expressions, including further string literals which in
+turn may contain further interpolations. This scanner consumes a
+balanced block starting just AFTER the opening "${" and stops just past
+the matching "}". Brace depth tracks nested map/set/lambda braces;
+encountering a quote dispatches to scan_nested_string so quotes inside
+the expression never terminate the outer string literal. The preceding
+character is tracked so the r prefix of a nested raw string is honored
+(raw strings treat backslash literally during the skip).
+@End Reasoning
+Process called "scan_interpolation_block" takes lexer as Integer returns Integer:
+    Note: Consume a balanced ${...} interpolation block body
+
+    Let depth be 1
+    Let prev be 0
+
+    While depth is greater than 0:
+        Let ch be proc current_char with lexer
+
+        If ch is equal to 0:
+            Return 0
+        End If
+
+        If ch is equal to 123:
+            Set depth to depth plus 1
+            proc advance_char with lexer
+        Otherwise:
+        If ch is equal to 125:
+            Set depth to depth minus 1
+            proc advance_char with lexer
+        Otherwise:
+        If ch is equal to 39:
+            Let raw_single be 0
+            If prev is equal to 114:
+                Set raw_single to 1
+            End If
+            proc advance_char with lexer
+            proc scan_nested_string with lexer, 39, raw_single
+        Otherwise:
+        If ch is equal to 34:
+            Let raw_double be 0
+            If prev is equal to 114:
+                Set raw_double to 1
+            End If
+            proc advance_char with lexer
+            proc scan_nested_string with lexer, 34, raw_double
+        Otherwise:
+            proc advance_char with lexer
+        End If
+        End If
+        End If
+        End If
+
+        Set prev to ch
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Consumes a string literal nested inside an interpolation expression. The
+cursor sits just after the opening quote on entry and just after the
+closing delimiter on exit. Triple-quoted forms are detected by peeking
+two more matching quotes. Escapes are honored unless the string is raw,
+and a "${" inside the nested string recurses into
+scan_interpolation_block - this mutual recursion is what makes
+arbitrarily nested string-in-interpolation-in-string forms scan
+correctly.
+@End Reasoning
+Process called "scan_nested_string" takes lexer as Integer, quote_char as Integer, is_raw as Integer returns Integer:
+    Note: Skip a nested string literal inside an interpolation expression
+
+    Let is_triple be 0
+    Let ch be proc current_char with lexer
+    If ch is equal to quote_char:
+        Let next_ch be proc peek_char with lexer, 1
+        If next_ch is equal to quote_char:
+            Set is_triple to 1
+            proc advance_char with lexer
+            proc advance_char with lexer
+        Otherwise:
+            Note: Empty string '' - the second quote closes it
+            proc advance_char with lexer
+            Return 1
+        End If
+    End If
+
+    While 1 is equal to 1:
+        Set ch to proc current_char with lexer
+
+        If ch is equal to 0:
+            Return 0
+        End If
+
+        If is_triple is equal to 1:
+            If ch is equal to quote_char:
+                Let t1 be proc peek_char with lexer, 1
+                Let t2 be proc peek_char with lexer, 2
+                If t1 is equal to quote_char:
+                    If t2 is equal to quote_char:
+                        proc advance_char with lexer
+                        proc advance_char with lexer
+                        proc advance_char with lexer
+                        Return 1
+                    End If
+                End If
+            End If
+        Otherwise:
+            If ch is equal to quote_char:
+                proc advance_char with lexer
+                Return 1
+            End If
+        End If
+
+        If is_raw is equal to 0:
+            If ch is equal to 92:
+                proc advance_char with lexer
+                proc advance_char with lexer
+            Otherwise:
+            If ch is equal to 36:
+                Let after be proc peek_char with lexer, 1
+                If after is equal to 123:
+                    proc advance_char with lexer
+                    proc advance_char with lexer
+                    proc scan_interpolation_block with lexer
+                Otherwise:
+                    proc advance_char with lexer
+                End If
+            Otherwise:
+                proc advance_char with lexer
+            End If
+            End If
+        Otherwise:
+            proc advance_char with lexer
+        End If
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
 Scans a Dart string literal of either quote variety (' or ") chosen by
 the quote_char argument. Handles escape sequences (\n, \t, \\, \", \',
-\u{XXXX} unicode), and the Dart-specific "${expr}" interpolation form
-which embeds expressions into the literal. Triple-quoted multiline
+\u{XXXX} unicode), and the Dart-specific "$id" / "${expr}" interpolation
+forms which embed expressions into the literal. Triple-quoted multiline
 strings are also detected by peeking two consecutive matching quotes
-after the opening one.
+after the opening one. Interpolation protocol: when an unescaped $
+introducing an identifier or a balanced ${...} block is seen in a
+non-raw string, the token is emitted as TOKEN_STRING_INTERP instead of
+TOKEN_STRING_LITERAL - the lexeme stays verbatim (delimiters included,
+matching the raw-string lexeme-prefix protocol) and the parser splits it
+into literal parts and sub-parsed expressions. ${...} blocks are
+consumed through scan_interpolation_block so quotes and braces inside
+the embedded expression never terminate the outer literal. Raw strings
+never interpolate, per the Dart specification.
 @End Reasoning
 
 @Security_Scope:
@@ -809,7 +988,7 @@ re-quoting, including escape decisions when re-emitting in a different
 syntax mode.
 @End Security_Scope
 
-Process called "lex_string" takes lexer as Integer, quote_char as Integer returns Integer:
+Process called "lex_string" takes lexer as Integer, quote_char as Integer, is_raw as Integer returns Integer:
     Note: Lex string literal with interpolation support
 
     @Reasoning:
@@ -826,28 +1005,36 @@ Process called "lex_string" takes lexer as Integer, quote_char as Integer return
     Let line be proc memory_get_int64 from Memory with lexer, 16
     Let column be proc memory_get_int64 from Memory with lexer, 24
 
-    proc advance_char from lexer
+    Note: Raw strings keep the leading r in the lexeme so the parser can
+    Note: tell raw content apart from escaped content when cooking values
+    If is_raw is equal to 1:
+        proc advance_char with lexer
+    End If
+
+    proc advance_char with lexer
 
     Note: Check for triple-quoted string
-    Let ch be proc current_char from lexer
+    Let ch be proc current_char with lexer
     Let is_triple be 0
 
     If ch is equal to quote_char:
         Let next_ch be proc peek_char with lexer, 1
         If next_ch is equal to quote_char:
             Set is_triple to 1
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
         End If
     End If
 
-    Note: Lex string content
+    Note: Lex string content, tracking whether interpolation appears
+    Let has_interp be 0
+
     While 1 is equal to 1:
-        Set ch to proc current_char from lexer
+        Set ch to proc current_char with lexer
 
         If ch is equal to 0:
             Let end_pos be proc memory_get_int64 from Memory with lexer, 8
-            Let lexeme be proc substring from StringCore with source, start_pos, end_pos
+            Let lexeme be proc dart_substring with source, start_pos, end_pos
             Let token be proc create_token with TOKEN_ERROR, lexeme, line, column
             Return token
         End If
@@ -859,12 +1046,16 @@ Process called "lex_string" takes lexer as Integer, quote_char as Integer return
                 Let next2 be proc peek_char with lexer, 2
                 If next1 is equal to quote_char:
                     If next2 is equal to quote_char:
-                        proc advance_char from lexer
-                        proc advance_char from lexer
-                        proc advance_char from lexer
+                        proc advance_char with lexer
+                        proc advance_char with lexer
+                        proc advance_char with lexer
                         Set end_pos to proc memory_get_int64 from Memory with lexer, 8
-                        Set lexeme to proc substring from StringCore with source, start_pos, end_pos
-                        Set token to proc create_token with TOKEN_STRING_LITERAL, lexeme, line, column
+                        Set lexeme to proc dart_substring with source, start_pos, end_pos
+                        Let triple_kind be TOKEN_STRING_LITERAL
+                        If has_interp is equal to 1:
+                            Set triple_kind to TOKEN_STRING_INTERP
+                        End If
+                        Set token to proc create_token with triple_kind, lexeme, line, column
                         Return token
                     End If
                 End If
@@ -872,59 +1063,104 @@ Process called "lex_string" takes lexer as Integer, quote_char as Integer return
 
         Otherwise:
             If ch is equal to quote_char:
-                proc advance_char from lexer
+                proc advance_char with lexer
                 Set end_pos to proc memory_get_int64 from Memory with lexer, 8
-                Set lexeme to proc substring from StringCore with source, start_pos, end_pos
-                Set token to proc create_token with TOKEN_STRING_LITERAL, lexeme, line, column
+                Set lexeme to proc dart_substring with source, start_pos, end_pos
+                Let single_kind be TOKEN_STRING_LITERAL
+                If has_interp is equal to 1:
+                    Set single_kind to TOKEN_STRING_INTERP
+                End If
+                Set token to proc create_token with single_kind, lexeme, line, column
                 Return token
             End If
         End If
 
-        Note: Handle escape sequences
+        Note: Handle escape sequences (raw strings treat backslash literally)
+        If is_raw is equal to 1:
+            proc advance_char with lexer
+        Otherwise:
+        If ch is equal to 36:
+            Note: Interpolation: ${expr} consumes the balanced block through
+            Note: scan_interpolation_block; $identifier consumes the simple
+            Note: form; a lone $ stays an ordinary character
+            Let interp_next be proc peek_char with lexer, 1
+            If interp_next is equal to 123:
+                Set has_interp to 1
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc scan_interpolation_block with lexer
+            Otherwise:
+                Let id_start be proc is_alpha with interp_next
+                If interp_next is equal to 95:
+                    Set id_start to 1
+                End If
+                If id_start is equal to 1:
+                    Set has_interp to 1
+                    proc advance_char with lexer
+                    While 1 is equal to 1:
+                        Let id_ch be proc current_char with lexer
+                        Let id_part be proc is_alnum with id_ch
+                        If id_ch is equal to 95:
+                            Set id_part to 1
+                        End If
+                        If id_part is equal to 0:
+                            Break
+                        End If
+                        proc advance_char with lexer
+                    End While
+                Otherwise:
+                    proc advance_char with lexer
+                End If
+            End If
+        Otherwise:
         If ch is equal to 92:
-            proc advance_char from lexer
-            Set ch to proc current_char from lexer
+            proc advance_char with lexer
+            Set ch to proc current_char with lexer
 
             If ch is equal to 117:
-                proc advance_char from lexer
-                Set ch to proc current_char from lexer
+                proc advance_char with lexer
+                Set ch to proc current_char with lexer
 
                 If ch is equal to 123:
-                    proc advance_char from lexer
+                    proc advance_char with lexer
                     While 1 is equal to 1:
-                        Set ch to proc current_char from lexer
-                        If ch is equal to 125:
-                            proc advance_char from lexer
-                            If 1 is equal to 1:
-                                Note: Break
-                                If 1 is not equal to 1:
-                                    Note: Force break
-                                End If
-                            End If
+                        Set ch to proc current_char with lexer
+                        If ch is equal to 0:
+                            Break
                         End If
-                        proc advance_char from lexer
+                        If ch is equal to 125:
+                            proc advance_char with lexer
+                            Break
+                        End If
+                        proc advance_char with lexer
                     End While
 
                 Otherwise:
                     Let i be 0
                     While i is less than 4:
-                        proc advance_char from lexer
+                        proc advance_char with lexer
                         Set i to i plus 1
                     End While
                 End If
 
             Otherwise:
-                proc advance_char from lexer
+                proc advance_char with lexer
             End If
 
         Otherwise:
-            proc advance_char from lexer
+            proc advance_char with lexer
+        End If
+        End If
         End If
     End While
 
     Set end_pos to proc memory_get_int64 from Memory with lexer, 8
-    Set lexeme to proc substring from StringCore with source, start_pos, end_pos
-    Set token to proc create_token with TOKEN_STRING_LITERAL, lexeme, line, column
+    Set lexeme to proc dart_substring with source, start_pos, end_pos
+    Let fallback_kind be TOKEN_STRING_LITERAL
+    If has_interp is equal to 1:
+        Set fallback_kind to TOKEN_STRING_INTERP
+    End If
+    Set token to proc create_token with fallback_kind, lexeme, line, column
     Return token
 End Process
 
@@ -950,32 +1186,27 @@ Process called "lex_identifier" takes lexer as Integer returns Integer:
     Let column be proc memory_get_int64 from Memory with lexer, 24
 
     While 1 is equal to 1:
-        Let ch be proc current_char from lexer
-        Let is_alnum be proc is_alnum from ch
+        Let ch be proc current_char with lexer
+        Let alnum_check be proc is_alnum with ch
 
-        If is_alnum is equal to 1:
-            proc advance_char from lexer
+        If alnum_check is equal to 1:
+            proc advance_char with lexer
 
         Otherwise:
             If ch is equal to 36:
-                proc advance_char from lexer
+                proc advance_char with lexer
 
             Otherwise:
-                If 1 is equal to 1:
-                    Note: Break
-                    If 1 is not equal to 1:
-                        Note: Force break
-                    End If
-                End If
+                Break
             End If
         End If
     End While
 
     Let end_pos be proc memory_get_int64 from Memory with lexer, 8
-    Let lexeme be proc substring from StringCore with source, start_pos, end_pos
+    Let lexeme be proc dart_substring with source, start_pos, end_pos
 
     Note: Check if keyword
-    Let keyword_type be proc match_dart_keyword from lexeme
+    Let keyword_type be proc match_dart_keyword with lexeme
     If keyword_type is not equal to 0:
         Let token be proc create_token with keyword_type, lexeme, line, column
         Return token
@@ -1424,43 +1655,34 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     Note: Skip whitespace and comments
     While 1 is equal to 1:
-        proc skip_whitespace from lexer
+        proc skip_whitespace with lexer
 
-        Let ch be proc current_char from lexer
+        Let ch be proc current_char with lexer
 
         If ch is equal to 47:
             Let next_ch be proc peek_char with lexer, 1
 
             If next_ch is equal to 47:
-                proc skip_line_comment from lexer
+                proc skip_line_comment with lexer
 
             Otherwise:
                 If next_ch is equal to 42:
-                    proc skip_block_comment from lexer
+                    proc skip_block_comment with lexer
 
                 Otherwise:
-                    If 1 is equal to 1:
-                        Note: Not a comment, break
-                        If 1 is not equal to 1:
-                            Note: Force break
-                        End If
-                    End If
+                    Note: Not a comment - stop skipping
+                    Break
                 End If
             End If
 
         Otherwise:
-            If 1 is equal to 1:
-                Note: Break
-                If 1 is not equal to 1:
-                    Note: Force break
-                End If
-            End If
+            Break
         End If
     End While
 
     Let line be proc memory_get_int64 from Memory with lexer, 16
     Let column be proc memory_get_int64 from Memory with lexer, 24
-    Set ch to proc current_char from lexer
+    Set ch to proc current_char with lexer
 
     Note: EOF
     If ch is equal to 0:
@@ -1469,41 +1691,39 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     Note: Numbers
-    Let is_dig be proc is_digit from ch
+    Let is_dig be proc is_digit with ch
     If is_dig is equal to 1:
-        Set token to proc lex_number from lexer
+        Set token to proc lex_number with lexer
         Return token
     End If
 
     Note: Identifiers and keywords
-    Let is_alpha be proc is_alpha from ch
+    Let is_alpha be proc is_alpha with ch
     If is_alpha is equal to 1:
-        Set token to proc lex_identifier from lexer
+        Set token to proc lex_identifier with lexer
         Return token
     End If
 
     Note: Strings
     If ch is equal to 39:
-        Set token to proc lex_string with lexer, 39
+        Set token to proc lex_string with lexer, 39, 0
         Return token
     End If
 
     If ch is equal to 34:
-        Set token to proc lex_string with lexer, 34
+        Set token to proc lex_string with lexer, 34, 0
         Return token
     End If
 
-    Note: Raw strings
+    Note: Raw strings (lexeme keeps the leading r so the parser skips escape decoding)
     If ch is equal to 114:
         Set next_ch to proc peek_char with lexer, 1
         If next_ch is equal to 39:
-            proc advance_char from lexer
-            Set token to proc lex_string with lexer, 39
+            Set token to proc lex_string with lexer, 39, 1
             Return token
         End If
         If next_ch is equal to 34:
-            proc advance_char from lexer
-            Set token to proc lex_string with lexer, 34
+            Set token to proc lex_string with lexer, 34, 1
             Return token
         End If
     End If
@@ -1516,12 +1736,12 @@ Process called "next_token" takes lexer as Integer returns Integer:
     If ch is equal to 62:
         If next_ch is equal to 62:
             If next2 is equal to 62:
-                proc advance_char from lexer
-                proc advance_char from lexer
-                proc advance_char from lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
                 Let source be proc memory_get_int64 from Memory with lexer, 0
                 Let start_pos be proc memory_get_int64 from Memory with lexer, 8
-                Let lexeme be proc substring from StringCore with source, start_pos minus 3, start_pos
+                Let lexeme be proc dart_substring with source, start_pos minus 3, start_pos
                 Set token to proc create_token with TOKEN_TRIPLE_RIGHT_SHIFT, lexeme, line, column
                 Return token
             End If
@@ -1531,21 +1751,21 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Note: Two-character operators
     If ch is equal to 61:
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_EQUAL_EQUAL, lexeme, line, column
             Return token
         End If
 
         If next_ch is equal to 62:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_ARROW, lexeme, line, column
             Return token
         End If
@@ -1553,11 +1773,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 33:
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_NOT_EQUAL, lexeme, line, column
             Return token
         End If
@@ -1565,21 +1785,21 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 60:
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_LESS_EQUAL, lexeme, line, column
             Return token
         End If
 
         If next_ch is equal to 60:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_LEFT_SHIFT, lexeme, line, column
             Return token
         End If
@@ -1587,21 +1807,21 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 62:
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_GREATER_EQUAL, lexeme, line, column
             Return token
         End If
 
         If next_ch is equal to 62:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_RIGHT_SHIFT, lexeme, line, column
             Return token
         End If
@@ -1609,21 +1829,21 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 38:
         If next_ch is equal to 38:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_AND_AND, lexeme, line, column
             Return token
         End If
 
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_AMPERSAND_EQUAL, lexeme, line, column
             Return token
         End If
@@ -1631,21 +1851,21 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 124:
         If next_ch is equal to 124:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_OR_OR, lexeme, line, column
             Return token
         End If
 
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_PIPE_EQUAL, lexeme, line, column
             Return token
         End If
@@ -1653,32 +1873,32 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 63:
         If next_ch is equal to 63:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
 
-            Let next3 be proc current_char from lexer
+            Let next3 be proc current_char with lexer
             If next3 is equal to 61:
-                proc advance_char from lexer
+                proc advance_char with lexer
                 Set source to proc memory_get_int64 from Memory with lexer, 0
                 Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-                Set lexeme to proc substring from StringCore with source, start_pos minus 3, start_pos
+                Set lexeme to proc dart_substring with source, start_pos minus 3, start_pos
                 Set token to proc create_token with TOKEN_QUESTION_QUESTION_EQUAL, lexeme, line, column
                 Return token
             End If
 
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_QUESTION_QUESTION, lexeme, line, column
             Return token
         End If
 
         If next_ch is equal to 46:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_QUESTION_DOT, lexeme, line, column
             Return token
         End If
@@ -1686,22 +1906,22 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 46:
         If next_ch is equal to 46:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
 
-            Set next3 to proc current_char from lexer
+            Set next3 to proc current_char with lexer
             If next3 is equal to 46:
-                proc advance_char from lexer
+                proc advance_char with lexer
                 Set source to proc memory_get_int64 from Memory with lexer, 0
                 Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-                Set lexeme to proc substring from StringCore with source, start_pos minus 3, start_pos
+                Set lexeme to proc dart_substring with source, start_pos minus 3, start_pos
                 Set token to proc create_token with TOKEN_DOT_DOT_DOT, lexeme, line, column
                 Return token
             End If
 
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_DOT_DOT, lexeme, line, column
             Return token
         End If
@@ -1709,21 +1929,21 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 43:
         If next_ch is equal to 43:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_PLUS_PLUS, lexeme, line, column
             Return token
         End If
 
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_PLUS_EQUAL, lexeme, line, column
             Return token
         End If
@@ -1731,21 +1951,21 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 45:
         If next_ch is equal to 45:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_MINUS_MINUS, lexeme, line, column
             Return token
         End If
 
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_MINUS_EQUAL, lexeme, line, column
             Return token
         End If
@@ -1753,11 +1973,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 42:
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_STAR_EQUAL, lexeme, line, column
             Return token
         End If
@@ -1765,11 +1985,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 47:
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_SLASH_EQUAL, lexeme, line, column
             Return token
         End If
@@ -1777,22 +1997,22 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 126:
         If next_ch is equal to 47:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
 
-            Set next3 to proc current_char from lexer
+            Set next3 to proc current_char with lexer
             If next3 is equal to 61:
-                proc advance_char from lexer
+                proc advance_char with lexer
                 Set source to proc memory_get_int64 from Memory with lexer, 0
                 Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-                Set lexeme to proc substring from StringCore with source, start_pos minus 3, start_pos
+                Set lexeme to proc dart_substring with source, start_pos minus 3, start_pos
                 Set token to proc create_token with TOKEN_TILDE_SLASH_EQUAL, lexeme, line, column
                 Return token
             End If
 
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_TILDE_SLASH, lexeme, line, column
             Return token
         End If
@@ -1800,11 +2020,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 37:
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_PERCENT_EQUAL, lexeme, line, column
             Return token
         End If
@@ -1812,11 +2032,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
     If ch is equal to 94:
         If next_ch is equal to 61:
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
             Set source to proc memory_get_int64 from Memory with lexer, 0
             Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-            Set lexeme to proc substring from StringCore with source, start_pos minus 2, start_pos
+            Set lexeme to proc dart_substring with source, start_pos minus 2, start_pos
             Set token to proc create_token with TOKEN_CARET_EQUAL, lexeme, line, column
             Return token
         End If
@@ -1825,9 +2045,9 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Note: Single-character tokens
     Set source to proc memory_get_int64 from Memory with lexer, 0
     Set start_pos to proc memory_get_int64 from Memory with lexer, 8
-    proc advance_char from lexer
+    proc advance_char with lexer
     Let end_pos be proc memory_get_int64 from Memory with lexer, 8
-    Set lexeme to proc substring from StringCore with source, start_pos, end_pos
+    Set lexeme to proc dart_substring with source, start_pos, end_pos
 
     If ch is equal to 40:
         Set token to proc create_token with TOKEN_LEFT_PAREN, lexeme, line, column

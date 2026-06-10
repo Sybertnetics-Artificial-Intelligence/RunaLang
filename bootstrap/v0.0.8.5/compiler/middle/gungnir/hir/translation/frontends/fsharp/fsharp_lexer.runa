@@ -20,6 +20,14 @@ F# Lexer - Complete tokenization for F# functional programming language
 This file provides comprehensive lexical analysis for the F# programming
 language, covering both functional programming constructs and .NET integration.
 
+Every token produced by this lexer is a 40-byte token record carrying the
+token type, the lexeme string (cooked for string/char literals: escape
+sequences are decoded at tokenization time), the numeric payload (parsed
+integer value or IEEE-754 float bits for numeric literals, the code point
+for char literals), and the source line/column. The parser stores these
+token records in AST value slots so the HIR translator can recover
+identifier names and literal payloads without re-lexing.
+
 F# Features Covered:
 - Keywords (let, match, with, function, type, module, open, etc.)
 - Functional operators (|>, <|, >>, <<, composition, piping)
@@ -27,21 +35,23 @@ F# Features Covered:
 - Type annotations and signatures (: type, -> arrow types)
 - Computation expressions (async, seq, query workflows)
 - .NET interop (member, interface, inherit, override)
-- Active patterns (|Pattern|_|, |Pattern1|Pattern2|)
-- Quotations and code generation (<@ @>, <@@ @@>)
-- Unit of measure types and literals
+- Quotations and code generation (<@ @>)
 - Record types, discriminated unions, tuples
-- Comments (line, block, XML documentation)
-- String interpolation and raw strings
-- Numeric literals with type suffixes
+- Comments (line, block with nesting, XML documentation)
+- String literals (regular with escapes, verbatim, triple-quoted, byte)
+- Numeric literals in all bases with type suffixes
 
 Dependencies:
 - compiler/frontend/primitives/core/string_core.runa
 - compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/internal/string_utils.runa
 :End Note
 
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: F# Token Type Constants
@@ -139,8 +149,8 @@ Note: ==========================================================================
 Note: Functional Operators
 Constant TOKEN_PIPE_RIGHT as Integer is 2001   Note: |> forward pipe
 Constant TOKEN_PIPE_LEFT as Integer is 2002    Note: <| backward pipe
-Constant TOKEN_COMPOSE_RIGHT as Integer is 2003 Note: shifted right by forward composition
-Constant TOKEN_COMPOSE_LEFT as Integer is 2004  Note: shifted left by backward composition
+Constant TOKEN_COMPOSE_RIGHT as Integer is 2003 Note: >> forward composition
+Constant TOKEN_COMPOSE_LEFT as Integer is 2004  Note: << backward composition
 Constant TOKEN_ARROW as Integer is 2005         Note: -> function type
 Constant TOKEN_LAMBDA as Integer is 2006        Note: fun x -> (implicit)
 Constant TOKEN_RANGE as Integer is 2007         Note: .. range operator
@@ -150,7 +160,7 @@ Note: Pattern Matching Operators
 Constant TOKEN_PIPE as Integer is 2010          Note: | pattern separator
 Constant TOKEN_WHEN_GUARD as Integer is 2011    Note: when pattern guard
 Constant TOKEN_WILDCARD as Integer is 2012      Note: _ wildcard pattern
-Constant TOKEN_AS_PATTERN as Integer is 2013    Note: as pattern binding
+Constant TOKEN_AS as Integer is 2013            Note: as pattern binding
 Constant TOKEN_ACTIVE_PATTERN_START as Integer is 2014 Note: |Pattern
 Constant TOKEN_ACTIVE_PATTERN_END as Integer is 2015   Note: Pattern|
 Constant TOKEN_ACTIVE_PATTERN_CHOICE as Integer is 2016 Note: |_|
@@ -160,6 +170,7 @@ Constant TOKEN_COLON as Integer is 2020         Note: : type annotation
 Constant TOKEN_DOUBLE_COLON as Integer is 2021  Note: :: cons operator
 Constant TOKEN_QUESTION as Integer is 2022      Note: ? optional parameter
 Constant TOKEN_QUESTION_QUESTION as Integer is 2023 Note: ?? null coalescing
+Constant TOKEN_TYPE_TEST as Integer is 2024     Note: :? dynamic type-test (match/with exception patterns)
 
 Note: Arithmetic Operators
 Constant TOKEN_PLUS as Integer is 2101          Note: +
@@ -229,6 +240,8 @@ Constant TOKEN_TRIPLE_QUOTE_STRING as Integer is 4007 Note: """triple quote"""
 Constant TOKEN_BYTE_STRING as Integer is 4008    Note: "string"B
 Constant TOKEN_CHAR as Integer is 4009           Note: 'c'
 Constant TOKEN_BYTE as Integer is 4010           Note: 42uy
+Constant TOKEN_INTERP_STRING_START as Integer is 4011 Note: $"text segment up to the first { hole or closing quote
+Constant TOKEN_INTERP_STRING_MID as Integer is 4012   Note: }text segment after a hole, up to the next { or closing quote
 
 Note: ============================================================================
 Note: F# Identifiers and Special Tokens
@@ -258,8 +271,8 @@ Note: F# Lexer State and Structure
 Note: ============================================================================
 
 @Reasoning:
-F# is indentation-sensitive (#light syntax), so the lexer must emit INDENT/
-DEDENT pseudo-tokens. paren/bracket/brace depth counters track grouping
+F# is indentation-sensitive (#light syntax), so the lexer tracks line and
+column for every token. paren/bracket/brace depth counters track grouping
 state so indentation rules can be suppressed inside expressions. in_string/
 in_comment guard against producing tokens inside quoted/commented regions.
 @End Reasoning
@@ -279,6 +292,144 @@ Type called "FSharpLexer":
 End Type
 
 Note: ============================================================================
+Note: Token Record and Accessors
+Note: ============================================================================
+
+@Reasoning:
+A 40-byte token record (5 x i64): type tag at offset 0, lexeme string
+handle at offset 8, numeric payload at offset 16, source line at offset
+24, source column at offset 32. Tokens are heap-allocated (not arena)
+because they outlive the lexer: the token list flows through the parser
+into the AST value slots and is read by the HIR translator long after
+destroy_fsharp_lexer runs. The numeric payload carries the parsed integer
+value for integer-family literals, the IEEE-754 binary64 bit pattern for
+float-family literals, and the Unicode code point for char literals;
+it is 0 for every non-literal token.
+@End Reasoning
+Process called "create_token" takes token_type as Integer, lexeme as Integer, value as Integer, line as Integer, column as Integer returns Integer:
+    Note: Create a 40-byte token record with type, lexeme, payload, and position
+
+    Let token be proc allocate from Layout with 40
+    If token is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with token, 0, token_type
+    proc memory_set_int64 from Layout with token, 8, lexeme
+    proc memory_set_int64 from Layout with token, 16, value
+    proc memory_set_int64 from Layout with token, 24, line
+    proc memory_set_int64 from Layout with token, 32, column
+
+    Return token
+End Process
+
+@Reasoning:
+Null-safe type accessor. A null token reads as TOKEN_EOF so that parser
+lookahead past the end of the token list uniformly behaves like reading
+end-of-file rather than requiring a separate bounds protocol at every
+production.
+@End Reasoning
+Process called "get_token_type" takes token as Integer returns Integer:
+    Note: Get token type tag (TOKEN_EOF for null tokens)
+
+    If token is equal to 0:
+        Return TOKEN_EOF
+    End If
+
+    Return proc memory_get_int64 from Layout with token, 0
+End Process
+
+@Reasoning:
+Lexeme accessor: returns the token's cooked text handle. For string
+literals this is the decoded content (escapes resolved, quotes stripped);
+for identifiers/keywords/operators it is the exact source spelling. Null
+tokens return 0 so callers can null-check rather than crash.
+@End Reasoning
+Process called "get_token_text" takes token as Integer returns Integer:
+    Note: Get token lexeme string (0 for null tokens)
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with token, 8
+End Process
+
+@Reasoning:
+Numeric payload accessor: parsed integer value, IEEE-754 float bits, or
+char code point depending on the token type. The caller is responsible
+for interpreting the payload according to get_token_type.
+@End Reasoning
+Process called "get_token_value" takes token as Integer returns Integer:
+    Note: Get token numeric payload (0 for null tokens)
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with token, 16
+End Process
+
+@Reasoning:
+Position accessors used by diagnostics so error messages can quote the
+source location of the offending token.
+@End Reasoning
+Process called "get_token_line" takes token as Integer returns Integer:
+    Note: Get token source line (1-based, 0 for null tokens)
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with token, 24
+End Process
+
+Process called "get_token_column" takes token as Integer returns Integer:
+    Note: Get token source column (1-based, 0 for null tokens)
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with token, 32
+End Process
+
+Note: ============================================================================
+Note: Lexeme Extraction
+Note: ============================================================================
+
+@Reasoning:
+Extracts the half-open byte range [start_pos, end_pos) of the source
+buffer into a freshly heap-allocated NUL-terminated string. Tokens own
+stable string handles independent of cursor movement and lexer lifetime.
+Defensive clamp: a negative length (reversed bounds) produces the empty
+string rather than corrupting memory.
+@End Reasoning
+Process called "fsharp_substring" takes source as Integer, start_pos as Integer, end_pos as Integer returns Integer:
+    Note: Copy source bytes [start_pos, end_pos) into a new NUL-terminated string
+
+    Let len be end_pos minus start_pos
+    If len is less than 0:
+        Set len to 0
+    End If
+
+    Let buffer be proc allocate from Layout with len plus 1
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with source, start_pos plus i
+        proc memory_set_byte from Layout with buffer, i, ch
+        Set i to i plus 1
+    End While
+
+    proc memory_set_byte from Layout with buffer, len, 0
+    Return buffer
+End Process
+
+Note: ============================================================================
 Note: Lexer Creation and Management
 Note: ============================================================================
 
@@ -291,7 +442,7 @@ string_length per byte.
 Process called "create_fsharp_lexer" takes source_code as Integer returns Integer:
     Note: Create F# lexer instance
 
-    Let lexer_size be 96  Note: FSharpLexer: 12 fields × 8 bytes
+    Let lexer_size be 96  Note: FSharpLexer: 12 fields x 8 bytes
     Let lexer be proc allocate from Layout with lexer_size
 
     If lexer is equal to 0:
@@ -299,28 +450,28 @@ Process called "create_fsharp_lexer" takes source_code as Integer returns Intege
     End If
 
     proc memory_set_int64 from Layout with lexer, 0, source_code
-    proc memory_set_int64 from Layout with lexer, 8, 0    Note: position is equal to 0
-    proc memory_set_int64 from Layout with lexer, 16, 1   Note: line is equal to 1
-    proc memory_set_int64 from Layout with lexer, 24, 1   Note: column is equal to 1
+    proc memory_set_int64 from Layout with lexer, 8, 0    Note: position starts at 0
+    proc memory_set_int64 from Layout with lexer, 16, 1   Note: line starts at 1
+    proc memory_set_int64 from Layout with lexer, 24, 1   Note: column starts at 1
 
     Let source_len be proc string_length from StringCore with source_code
     proc memory_set_int64 from Layout with lexer, 32, source_len
 
     proc memory_set_int64 from Layout with lexer, 40, 0   Note: indent_stack = null
-    proc memory_set_int64 from Layout with lexer, 48, 0   Note: current_indent is equal to 0
+    proc memory_set_int64 from Layout with lexer, 48, 0   Note: current_indent = 0
     proc memory_set_int64 from Layout with lexer, 56, 0   Note: in_string = false
     proc memory_set_int64 from Layout with lexer, 64, 0   Note: in_comment = false
-    proc memory_set_int64 from Layout with lexer, 72, 0   Note: paren_depth is equal to 0
-    proc memory_set_int64 from Layout with lexer, 80, 0   Note: bracket_depth is equal to 0
-    proc memory_set_int64 from Layout with lexer, 88, 0   Note: brace_depth is equal to 0
+    proc memory_set_int64 from Layout with lexer, 72, 0   Note: paren_depth = 0
+    proc memory_set_int64 from Layout with lexer, 80, 0   Note: bracket_depth = 0
+    proc memory_set_int64 from Layout with lexer, 88, 0   Note: brace_depth = 0
 
     Return lexer
 End Process
 
 @Reasoning:
 Null-safe destructor: frees the indent stack (if allocated) and then the
-lexer record. Stack is allocated lazily so the null-check on the inner
-pointer is required.
+lexer record. Token records and their lexemes are NOT freed here because
+ownership transferred to the token list consumer at creation time.
 @End Reasoning
 Process called "destroy_fsharp_lexer" takes lexer as Integer returns Integer:
     Note: Destroy F# lexer and free resources
@@ -329,7 +480,6 @@ Process called "destroy_fsharp_lexer" takes lexer as Integer returns Integer:
         Return 1
     End If
 
-    Note: Free indent stack if allocated
     Let indent_stack be proc memory_get_int64 from Layout with lexer, 40
     If indent_stack is not equal to 0:
         proc deallocate from Layout with indent_stack
@@ -346,8 +496,6 @@ Note: ==========================================================================
 @Reasoning:
 Returns the byte at the current position or 0 sentinel at EOF. Centralising
 EOF handling here means the recognisers don't replicate length checks.
-Returns the ASCII/UTF-8 byte, not a code-point, since F# source is ASCII
-for the lexer's purposes.
 @End Reasoning
 Process called "current_char" takes lexer as Integer returns Integer:
     Note: Get current character
@@ -365,7 +513,7 @@ End Process
 
 @Reasoning:
 Lookahead helper that does not advance the cursor. Used when distinguishing
-multi-character operators (e.g., "<-" vs "<-=" vs "<=>"). Returns 0 at EOF
+multi-character operators (e.g., "<-" vs "<|" vs "<="). Returns 0 at EOF
 just like current_char so callers can treat both uniformly.
 @End Reasoning
 Process called "peek_char" takes lexer as Integer, offset as Integer returns Integer:
@@ -398,14 +546,14 @@ Process called "advance_char" takes lexer as Integer returns Integer:
         Return 0  Note: EOF
     End If
 
-    Let current be proc current_char from lexer
+    Let current be proc current_char with lexer
 
     proc memory_set_int64 from Layout with lexer, 8, position plus 1
 
     If current is equal to 10:  Note: newline
         Let line be proc memory_get_int64 from Layout with lexer, 16
         proc memory_set_int64 from Layout with lexer, 16, line plus 1
-        proc memory_set_int64 from Layout with lexer, 24, 1  Note: column is equal to 1
+        proc memory_set_int64 from Layout with lexer, 24, 1  Note: column resets to 1
 
     Otherwise:
         Let column be proc memory_get_int64 from Layout with lexer, 24
@@ -470,7 +618,7 @@ the [0-9] range.
 Process called "is_hex_digit" takes ch as Integer returns Integer:
     Note: Check if character is hexadecimal digit
 
-    Let is_dec be proc is_digit from ch
+    Let is_dec be proc is_digit with ch
     If is_dec is equal to 1:
         Return 1
     End If
@@ -491,9 +639,38 @@ Process called "is_hex_digit" takes ch as Integer returns Integer:
 End Process
 
 @Reasoning:
+Numeric value of a hex digit byte. Returns -1 for non-hex bytes so escape
+decoders can detect malformed \xHH / \uXXXX sequences and fall back to
+literal emission instead of mis-decoding.
+@End Reasoning
+Process called "hex_digit_value" takes ch as Integer returns Integer:
+    Note: Convert hex digit character to its numeric value (-1 if not hex)
+
+    If ch is greater than or equal to 48:  Note: '0'
+        If ch is less than or equal to 57:  Note: '9'
+            Return ch minus 48
+        End If
+    End If
+
+    If ch is greater than or equal to 65:  Note: 'A'
+        If ch is less than or equal to 70:  Note: 'F'
+            Return ch minus 55
+        End If
+    End If
+
+    If ch is greater than or equal to 97:  Note: 'a'
+        If ch is less than or equal to 102: Note: 'f'
+            Return ch minus 87
+        End If
+    End If
+
+    Return 0 minus 1
+End Process
+
+@Reasoning:
 Horizontal whitespace only (space, tab, CR). Newline is excluded because
 F#'s indentation-sensitive grammar uses newlines as statement boundaries
-that must be tokenised separately for INDENT/DEDENT detection.
+that must be tokenised separately.
 @End Reasoning
 Process called "is_whitespace" takes ch as Integer returns Integer:
     Note: Check if character is whitespace (except newline)
@@ -512,277 +689,717 @@ Process called "is_whitespace" takes ch as Integer returns Integer:
 End Process
 
 Note: ============================================================================
+Note: UTF-8 Encoding for Decoded Escapes
+Note: ============================================================================
+
+@Reasoning:
+Unicode escapes (\uXXXX, \UXXXXXXXX) in F# string and char literals name
+code points; cooked lexemes are UTF-8 byte sequences, so the decoder must
+encode each code point into 1-4 bytes per the UTF-8 specification. The
+arithmetic uses division/modulo by powers of 64 rather than shifts because
+the byte-group boundaries of UTF-8 are 6-bit fields.
+@End Reasoning
+Process called "encode_utf8" takes buffer as Integer, offset as Integer, code as Integer returns Integer:
+    Note: Encode a Unicode code point as UTF-8 bytes at buffer+offset; returns byte count
+
+    If code is less than 128:
+        proc memory_set_byte from Layout with buffer, offset, code
+        Return 1
+    End If
+
+    If code is less than 2048:
+        Let b1 be 192 plus (code divided by 64)
+        Let b2 be 128 plus (code modulo by 64)
+        proc memory_set_byte from Layout with buffer, offset, b1
+        proc memory_set_byte from Layout with buffer, offset plus 1, b2
+        Return 2
+    End If
+
+    If code is less than 65536:
+        Set b1 to 224 plus (code divided by 4096)
+        Set b2 to 128 plus ((code divided by 64) modulo by 64)
+        Let b3 be 128 plus (code modulo by 64)
+        proc memory_set_byte from Layout with buffer, offset, b1
+        proc memory_set_byte from Layout with buffer, offset plus 1, b2
+        proc memory_set_byte from Layout with buffer, offset plus 2, b3
+        Return 3
+    End If
+
+    Set b1 to 240 plus (code divided by 262144)
+    Set b2 to 128 plus ((code divided by 4096) modulo by 64)
+    Set b3 to 128 plus ((code divided by 64) modulo by 64)
+    Let b4 be 128 plus (code modulo by 64)
+    proc memory_set_byte from Layout with buffer, offset, b1
+    proc memory_set_byte from Layout with buffer, offset plus 1, b2
+    proc memory_set_byte from Layout with buffer, offset plus 2, b3
+    proc memory_set_byte from Layout with buffer, offset plus 3, b4
+    Return 4
+End Process
+
+Note: ============================================================================
+Note: Escape Decoding (String Cooking)
+Note: ============================================================================
+
+@Reasoning:
+Cooks the content region [start_pos, end_pos) of a regular F# string
+literal into a fresh heap string with every escape sequence decoded:
+simple escapes (\n \t \r \b \a \f \v \\ \" \' \0), hex escapes (\xHH),
+and Unicode escapes (\uXXXX, \UXXXXXXXX) encoded as UTF-8. Malformed
+escapes (truncated hex digits) emit the escape character literally so
+cooking never fails - the worst input degrades to verbatim bytes, never
+to memory corruption. The output buffer is sized end-start+1 which is
+always sufficient because every decoded escape is no longer than its
+source spelling.
+@End Reasoning
+@Security_Scope:
+Untrusted input. All reads are bounds-checked against end_pos; the output
+write cursor can never exceed the input length, so the allocation bound
+holds for adversarial input.
+@End Security_Scope
+Process called "decode_escapes" takes source as Integer, start_pos as Integer, end_pos as Integer returns Integer:
+    Note: Decode escape sequences in [start_pos, end_pos) into a cooked string
+
+    Let max_len be end_pos minus start_pos
+    If max_len is less than 0:
+        Set max_len to 0
+    End If
+
+    Let buffer be proc allocate from Layout with max_len plus 1
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let i be start_pos
+    Let out be 0
+
+    While i is less than end_pos:
+        Let ch be proc string_char_at from StringCore with source, i
+
+        If ch is equal to 92:  Note: backslash
+            Let next_i be i plus 1
+            If next_i is less than end_pos:
+                Let esc be proc string_char_at from StringCore with source, next_i
+                Let handled be 0
+
+                If esc is equal to 110:  Note: 'n'
+                    proc memory_set_byte from Layout with buffer, out, 10
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+                If esc is equal to 116:  Note: 't'
+                    proc memory_set_byte from Layout with buffer, out, 9
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+                If esc is equal to 114:  Note: 'r'
+                    proc memory_set_byte from Layout with buffer, out, 13
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+                If esc is equal to 98:   Note: 'b'
+                    proc memory_set_byte from Layout with buffer, out, 8
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+                If esc is equal to 97:   Note: 'a'
+                    proc memory_set_byte from Layout with buffer, out, 7
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+                If esc is equal to 102:  Note: 'f'
+                    proc memory_set_byte from Layout with buffer, out, 12
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+                If esc is equal to 118:  Note: 'v'
+                    proc memory_set_byte from Layout with buffer, out, 11
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+                If esc is equal to 92:   Note: backslash
+                    proc memory_set_byte from Layout with buffer, out, 92
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+                If esc is equal to 34:   Note: double quote
+                    proc memory_set_byte from Layout with buffer, out, 34
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+                If esc is equal to 39:   Note: single quote
+                    proc memory_set_byte from Layout with buffer, out, 39
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+                If esc is equal to 48:   Note: '0' NUL escape
+                    proc memory_set_byte from Layout with buffer, out, 0
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Set handled to 1
+                End If
+
+                If esc is equal to 120:  Note: 'x' - \xHH two hex digits
+                    If handled is equal to 0:
+                        If i plus 3 is less than end_pos plus 1:
+                            Let h1 be proc string_char_at from StringCore with source, i plus 2
+                            Let h2 be proc string_char_at from StringCore with source, i plus 3
+                            Let v1 be proc hex_digit_value with h1
+                            Let v2 be proc hex_digit_value with h2
+                            If v1 is greater than or equal to 0:
+                                If v2 is greater than or equal to 0:
+                                    Let code be (v1 multiplied by 16) plus v2
+                                    Let written be proc encode_utf8 with buffer, out, code
+                                    Set out to out plus written
+                                    Set i to i plus 4
+                                    Set handled to 1
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+
+                If esc is equal to 117:  Note: 'u' - \uXXXX four hex digits
+                    If handled is equal to 0:
+                        If i plus 5 is less than end_pos plus 1:
+                            Set code to 0
+                            Let valid be 1
+                            Let d be 0
+                            While d is less than 4:
+                                Let hch be proc string_char_at from StringCore with source, i plus 2 plus d
+                                Let hv be proc hex_digit_value with hch
+                                If hv is less than 0:
+                                    Set valid to 0
+                                End If
+                                Set code to (code multiplied by 16) plus hv
+                                Set d to d plus 1
+                            End While
+                            If valid is equal to 1:
+                                Set written to proc encode_utf8 with buffer, out, code
+                                Set out to out plus written
+                                Set i to i plus 6
+                                Set handled to 1
+                            End If
+                        End If
+                    End If
+                End If
+
+                If esc is equal to 85:   Note: 'U' - \UXXXXXXXX eight hex digits
+                    If handled is equal to 0:
+                        If i plus 9 is less than end_pos plus 1:
+                            Set code to 0
+                            Set valid to 1
+                            Set d to 0
+                            While d is less than 8:
+                                Set hch to proc string_char_at from StringCore with source, i plus 2 plus d
+                                Set hv to proc hex_digit_value with hch
+                                If hv is less than 0:
+                                    Set valid to 0
+                                End If
+                                Set code to (code multiplied by 16) plus hv
+                                Set d to d plus 1
+                            End While
+                            If valid is equal to 1:
+                                Set written to proc encode_utf8 with buffer, out, code
+                                Set out to out plus written
+                                Set i to i plus 10
+                                Set handled to 1
+                            End If
+                        End If
+                    End If
+                End If
+
+                If handled is equal to 0:
+                    Note: Unknown or malformed escape - emit the escaped character literally
+                    proc memory_set_byte from Layout with buffer, out, esc
+                    Set out to out plus 1
+                    Set i to i plus 2
+                End If
+
+            Otherwise:
+                Note: Trailing lone backslash at end of content - emit it literally
+                proc memory_set_byte from Layout with buffer, out, 92
+                Set out to out plus 1
+                Set i to i plus 1
+            End If
+
+        Otherwise:
+            proc memory_set_byte from Layout with buffer, out, ch
+            Set out to out plus 1
+            Set i to i plus 1
+        End If
+    End While
+
+    proc memory_set_byte from Layout with buffer, out, 0
+    Return buffer
+End Process
+
+@Reasoning:
+Verbatim string cooking: the only transformation in @"..." content is the
+quote-doubling rule ("" inside the literal means one "). Backslashes are
+literal bytes. Output is never longer than input so the same sizing bound
+as decode_escapes applies.
+@End Reasoning
+Process called "decode_verbatim" takes source as Integer, start_pos as Integer, end_pos as Integer returns Integer:
+    Note: Cook verbatim string content: "" collapses to ", everything else verbatim
+
+    Let max_len be end_pos minus start_pos
+    If max_len is less than 0:
+        Set max_len to 0
+    End If
+
+    Let buffer be proc allocate from Layout with max_len plus 1
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let i be start_pos
+    Let out be 0
+
+    While i is less than end_pos:
+        Let ch be proc string_char_at from StringCore with source, i
+
+        If ch is equal to 34:  Note: '"'
+            Let next_i be i plus 1
+            If next_i is less than end_pos:
+                Let next_ch be proc string_char_at from StringCore with source, next_i
+                If next_ch is equal to 34:
+                    proc memory_set_byte from Layout with buffer, out, 34
+                    Set out to out plus 1
+                    Set i to i plus 2
+                    Continue
+                End If
+            End If
+        End If
+
+        proc memory_set_byte from Layout with buffer, out, ch
+        Set out to out plus 1
+        Set i to i plus 1
+    End While
+
+    proc memory_set_byte from Layout with buffer, out, 0
+    Return buffer
+End Process
+
+Note: ============================================================================
+Note: Numeric Lexeme Parsing
+Note: ============================================================================
+
+@Reasoning:
+Converts the digit region [start_pos, end_pos) of the source to a signed
+64-bit integer in the given base (2, 8, 10, or 16), skipping the '_'
+digit separators F# allows. Accumulation is result*base+digit; values
+exceeding 64 bits wrap per two's-complement arithmetic, which matches
+the bit-pattern semantics .NET integer literals have at the same width.
+@End Reasoning
+Process called "parse_integer_lexeme" takes source as Integer, start_pos as Integer, end_pos as Integer, base as Integer returns Integer:
+    Note: Parse digits [start_pos, end_pos) in the given base, skipping underscores
+
+    Let result be 0
+    Let i be start_pos
+
+    While i is less than end_pos:
+        Let ch be proc string_char_at from StringCore with source, i
+
+        If ch is equal to 95:  Note: '_' separator
+            Set i to i plus 1
+            Continue
+        End If
+
+        Let dv be proc hex_digit_value with ch
+        If dv is less than 0:
+            Set i to i plus 1
+            Continue
+        End If
+        If dv is greater than or equal to base:
+            Set i to i plus 1
+            Continue
+        End If
+
+        Set result to (result multiplied by base) plus dv
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+Float-family literals must reach string_to_float as clean decimal text:
+no '_' separators and no type suffix. This helper copies the numeric
+region into a fresh buffer dropping underscores, then delegates to the
+canonical string_to_float (compiler/internal/string_utils) which returns
+the IEEE-754 binary64 bit pattern.
+@End Reasoning
+Process called "parse_float_lexeme" takes source as Integer, start_pos as Integer, end_pos as Integer returns Integer:
+    Note: Parse a float literal region into IEEE-754 bits via string_to_float
+
+    Let max_len be end_pos minus start_pos
+    If max_len is less than 0:
+        Set max_len to 0
+    End If
+
+    Let buffer be proc allocate from Layout with max_len plus 1
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let i be start_pos
+    Let out be 0
+    While i is less than end_pos:
+        Let ch be proc string_char_at from StringCore with source, i
+        If ch is not equal to 95:  Note: drop '_' separators
+            proc memory_set_byte from Layout with buffer, out, ch
+            Set out to out plus 1
+        End If
+        Set i to i plus 1
+    End While
+    proc memory_set_byte from Layout with buffer, out, 0
+
+    Let bits be proc string_to_float from StringUtils with buffer
+    proc deallocate from Layout with buffer
+    Return bits
+End Process
+
+Note: ============================================================================
 Note: F# Keyword Recognition
 Note: ============================================================================
 
 @Reasoning:
-Linear keyword-lookup against the full F# keyword set (let, match, with,
-type, member, abstract, etc.). Returns 0 for non-keywords so the caller
-treats them as identifiers. The chain is long but each comparison is O(1)
-string-equality.
+Linear keyword-lookup against the full F# keyword set. Returns 0 for
+non-keywords so the caller treats them as identifiers. Each comparison is
+O(1) string-equality; the chain is bucketed by nothing because F# code is
+identifier-heavy and most lookups miss every arm quickly.
 @End Reasoning
 @Performance_Hints:
 Linear scan O(K) per identifier; K is around 70 F# keywords. If profiling
 shows this dominates, switch to a perfect hash on the leading character.
 @End Performance_Hints
 Process called "recognize_keyword" takes identifier as Integer returns Integer:
-    Note: Recognize F# keywords and return appropriate token type
+    Note: Recognize F# keywords; returns the keyword token type or 0 for plain identifiers
 
-    Note: Core language keywords
-    If proc string_equals from StringCore with identifier, "let":
+    Let m be proc string_equals from StringCore with identifier, "let"
+    If m is equal to 1:
         Return TOKEN_LET
     End If
-    If proc string_equals from StringCore with identifier, "and":
+    Set m to proc string_equals from StringCore with identifier, "and"
+    If m is equal to 1:
         Return TOKEN_AND
     End If
-    If proc string_equals from StringCore with identifier, "rec":
+    Set m to proc string_equals from StringCore with identifier, "rec"
+    If m is equal to 1:
         Return TOKEN_REC
     End If
-    If proc string_equals from StringCore with identifier, "in":
+    Set m to proc string_equals from StringCore with identifier, "in"
+    If m is equal to 1:
         Return TOKEN_IN
     End If
-    If proc string_equals from StringCore with identifier, "match":
+    Set m to proc string_equals from StringCore with identifier, "match"
+    If m is equal to 1:
         Return TOKEN_MATCH
     End If
-    If proc string_equals from StringCore with identifier, "with":
+    Set m to proc string_equals from StringCore with identifier, "with"
+    If m is equal to 1:
         Return TOKEN_WITH
     End If
-    If proc string_equals from StringCore with identifier, "when":
+    Set m to proc string_equals from StringCore with identifier, "when"
+    If m is equal to 1:
         Return TOKEN_WHEN
     End If
-    If proc string_equals from StringCore with identifier, "function":
+    Set m to proc string_equals from StringCore with identifier, "function"
+    If m is equal to 1:
         Return TOKEN_FUNCTION
     End If
-    If proc string_equals from StringCore with identifier, "fun":
+    Set m to proc string_equals from StringCore with identifier, "fun"
+    If m is equal to 1:
         Return TOKEN_FUN
     End If
-
-    Note: Control flow keywords
-    If proc string_equals from StringCore with identifier, "if":
+    Set m to proc string_equals from StringCore with identifier, "if"
+    If m is equal to 1:
         Return TOKEN_IF
     End If
-    If proc string_equals from StringCore with identifier, "then":
+    Set m to proc string_equals from StringCore with identifier, "then"
+    If m is equal to 1:
         Return TOKEN_THEN
     End If
-    If proc string_equals from StringCore with identifier, "else":
+    Set m to proc string_equals from StringCore with identifier, "else"
+    If m is equal to 1:
         Return TOKEN_ELSE
     End If
-    If proc string_equals from StringCore with identifier, "elif":
+    Set m to proc string_equals from StringCore with identifier, "elif"
+    If m is equal to 1:
         Return TOKEN_ELIF
     End If
-
-    Note: Exception handling
-    If proc string_equals from StringCore with identifier, "try":
+    Set m to proc string_equals from StringCore with identifier, "try"
+    If m is equal to 1:
         Return TOKEN_TRY
     End If
-    If proc string_equals from StringCore with identifier, "finally":
+    Set m to proc string_equals from StringCore with identifier, "finally"
+    If m is equal to 1:
         Return TOKEN_FINALLY
     End If
-    If proc string_equals from StringCore with identifier, "failwith":
+    Set m to proc string_equals from StringCore with identifier, "failwith"
+    If m is equal to 1:
         Return TOKEN_FAILWITH
     End If
-    If proc string_equals from StringCore with identifier, "raise":
+    Set m to proc string_equals from StringCore with identifier, "raise"
+    If m is equal to 1:
         Return TOKEN_RAISE
     End If
-
-    Note: Loop keywords
-    If proc string_equals from StringCore with identifier, "for":
+    Set m to proc string_equals from StringCore with identifier, "for"
+    If m is equal to 1:
         Return TOKEN_FOR
     End If
-    If proc string_equals from StringCore with identifier, "to":
+    Set m to proc string_equals from StringCore with identifier, "to"
+    If m is equal to 1:
         Return TOKEN_TO
     End If
-    If proc string_equals from StringCore with identifier, "downto":
+    Set m to proc string_equals from StringCore with identifier, "downto"
+    If m is equal to 1:
         Return TOKEN_DOWNTO
     End If
-    If proc string_equals from StringCore with identifier, "while":
+    Set m to proc string_equals from StringCore with identifier, "while"
+    If m is equal to 1:
         Return TOKEN_WHILE
     End If
-    If proc string_equals from StringCore with identifier, "do":
+    Set m to proc string_equals from StringCore with identifier, "do"
+    If m is equal to 1:
         Return TOKEN_DO
     End If
-    If proc string_equals from StringCore with identifier, "done":
+    Set m to proc string_equals from StringCore with identifier, "done"
+    If m is equal to 1:
         Return TOKEN_DONE
     End If
-
-    Note: Block structure
-    If proc string_equals from StringCore with identifier, "begin":
+    Set m to proc string_equals from StringCore with identifier, "begin"
+    If m is equal to 1:
         Return TOKEN_BEGIN
     End If
-    If proc string_equals from StringCore with identifier, "end":
+    Set m to proc string_equals from StringCore with identifier, "end"
+    If m is equal to 1:
         Return TOKEN_END
     End If
-
-    Note: Type system keywords
-    If proc string_equals from StringCore with identifier, "type":
+    Set m to proc string_equals from StringCore with identifier, "type"
+    If m is equal to 1:
         Return TOKEN_TYPE
     End If
-    If proc string_equals from StringCore with identifier, "val":
+    Set m to proc string_equals from StringCore with identifier, "val"
+    If m is equal to 1:
         Return TOKEN_VAL
     End If
-    If proc string_equals from StringCore with identifier, "mutable":
+    Set m to proc string_equals from StringCore with identifier, "mutable"
+    If m is equal to 1:
         Return TOKEN_MUTABLE
     End If
-    If proc string_equals from StringCore with identifier, "of":
+    Set m to proc string_equals from StringCore with identifier, "of"
+    If m is equal to 1:
         Return TOKEN_OF
     End If
-
-    Note: Object-oriented keywords
-    If proc string_equals from StringCore with identifier, "struct":
+    Set m to proc string_equals from StringCore with identifier, "struct"
+    If m is equal to 1:
         Return TOKEN_STRUCT
     End If
-    If proc string_equals from StringCore with identifier, "class":
+    Set m to proc string_equals from StringCore with identifier, "class"
+    If m is equal to 1:
         Return TOKEN_CLASS
     End If
-    If proc string_equals from StringCore with identifier, "interface":
+    Set m to proc string_equals from StringCore with identifier, "interface"
+    If m is equal to 1:
         Return TOKEN_INTERFACE
     End If
-    If proc string_equals from StringCore with identifier, "inherit":
+    Set m to proc string_equals from StringCore with identifier, "inherit"
+    If m is equal to 1:
         Return TOKEN_INHERIT
     End If
-    If proc string_equals from StringCore with identifier, "abstract":
+    Set m to proc string_equals from StringCore with identifier, "abstract"
+    If m is equal to 1:
         Return TOKEN_ABSTRACT
     End If
-    If proc string_equals from StringCore with identifier, "override":
+    Set m to proc string_equals from StringCore with identifier, "override"
+    If m is equal to 1:
         Return TOKEN_OVERRIDE
     End If
-    If proc string_equals from StringCore with identifier, "default":
+    Set m to proc string_equals from StringCore with identifier, "default"
+    If m is equal to 1:
         Return TOKEN_DEFAULT
     End If
-    If proc string_equals from StringCore with identifier, "member":
+    Set m to proc string_equals from StringCore with identifier, "member"
+    If m is equal to 1:
         Return TOKEN_MEMBER
     End If
-    If proc string_equals from StringCore with identifier, "static":
+    Set m to proc string_equals from StringCore with identifier, "static"
+    If m is equal to 1:
         Return TOKEN_STATIC
     End If
-    If proc string_equals from StringCore with identifier, "inline":
+    Set m to proc string_equals from StringCore with identifier, "inline"
+    If m is equal to 1:
         Return TOKEN_INLINE
     End If
-    If proc string_equals from StringCore with identifier, "virtual":
+    Set m to proc string_equals from StringCore with identifier, "virtual"
+    If m is equal to 1:
         Return TOKEN_VIRTUAL
     End If
-    If proc string_equals from StringCore with identifier, "new":
+    Set m to proc string_equals from StringCore with identifier, "new"
+    If m is equal to 1:
         Return TOKEN_NEW
     End If
-
-    Note: Module system
-    If proc string_equals from StringCore with identifier, "module":
-        Return TOKEN_MODULE
+    Set m to proc string_equals from StringCore with identifier, "constraint"
+    If m is equal to 1:
+        Return TOKEN_CONSTRAINT
     End If
-    If proc string_equals from StringCore with identifier, "namespace":
-        Return TOKEN_NAMESPACE
-    End If
-    If proc string_equals from StringCore with identifier, "open":
-        Return TOKEN_OPEN
-    End If
-    If proc string_equals from StringCore with identifier, "public":
-        Return TOKEN_PUBLIC
-    End If
-    If proc string_equals from StringCore with identifier, "private":
-        Return TOKEN_PRIVATE
-    End If
-    If proc string_equals from StringCore with identifier, "internal":
-        Return TOKEN_INTERNAL
-    End If
-    If proc string_equals from StringCore with identifier, "global":
-        Return TOKEN_GLOBAL
-    End If
-
-    Note: Computation expressions
-    If proc string_equals from StringCore with identifier, "async":
-        Return TOKEN_ASYNC
-    End If
-    If proc string_equals from StringCore with identifier, "seq":
-        Return TOKEN_SEQ
-    End If
-    If proc string_equals from StringCore with identifier, "query":
-        Return TOKEN_QUERY
-    End If
-    If proc string_equals from StringCore with identifier, "yield":
-        Return TOKEN_YIELD
-    End If
-    If proc string_equals from StringCore with identifier, "return":
-        Return TOKEN_RETURN
-    End If
-    If proc string_equals from StringCore with identifier, "use":
-        Return TOKEN_USE
-    End If
-
-    Note: Special keywords
-    If proc string_equals from StringCore with identifier, "upcast":
-        Return TOKEN_UPCAST
-    End If
-    If proc string_equals from StringCore with identifier, "downcast":
-        Return TOKEN_DOWNCAST
-    End If
-    If proc string_equals from StringCore with identifier, "typeof":
-        Return TOKEN_TYPEOF
-    End If
-    If proc string_equals from StringCore with identifier, "typedefof":
-        Return TOKEN_TYPEDEFOF
-    End If
-    If proc string_equals from StringCore with identifier, "sizeof":
-        Return TOKEN_SIZEOF
-    End If
-    If proc string_equals from StringCore with identifier, "nameof":
-        Return TOKEN_NAMEOF
-    End If
-    If proc string_equals from StringCore with identifier, "lazy":
-        Return TOKEN_LAZY
-    End If
-    If proc string_equals from StringCore with identifier, "assert":
-        Return TOKEN_ASSERT
-    End If
-    If proc string_equals from StringCore with identifier, "base":
-        Return TOKEN_BASE
-    End If
-    If proc string_equals from StringCore with identifier, "delegate":
-        Return TOKEN_DELEGATE
-    End If
-
-    Note: Literals
-    If proc string_equals from StringCore with identifier, "true":
-        Return TOKEN_TRUE
-    End If
-    If proc string_equals from StringCore with identifier, "false":
-        Return TOKEN_FALSE
-    End If
-    If proc string_equals from StringCore with identifier, "null":
+    Set m to proc string_equals from StringCore with identifier, "null"
+    If m is equal to 1:
         Return TOKEN_NULL
     End If
-    If proc string_equals from StringCore with identifier, "not":
+    Set m to proc string_equals from StringCore with identifier, "module"
+    If m is equal to 1:
+        Return TOKEN_MODULE
+    End If
+    Set m to proc string_equals from StringCore with identifier, "namespace"
+    If m is equal to 1:
+        Return TOKEN_NAMESPACE
+    End If
+    Set m to proc string_equals from StringCore with identifier, "open"
+    If m is equal to 1:
+        Return TOKEN_OPEN
+    End If
+    Set m to proc string_equals from StringCore with identifier, "public"
+    If m is equal to 1:
+        Return TOKEN_PUBLIC
+    End If
+    Set m to proc string_equals from StringCore with identifier, "private"
+    If m is equal to 1:
+        Return TOKEN_PRIVATE
+    End If
+    Set m to proc string_equals from StringCore with identifier, "internal"
+    If m is equal to 1:
+        Return TOKEN_INTERNAL
+    End If
+    Set m to proc string_equals from StringCore with identifier, "global"
+    If m is equal to 1:
+        Return TOKEN_GLOBAL
+    End If
+    Set m to proc string_equals from StringCore with identifier, "async"
+    If m is equal to 1:
+        Return TOKEN_ASYNC
+    End If
+    Set m to proc string_equals from StringCore with identifier, "seq"
+    If m is equal to 1:
+        Return TOKEN_SEQ
+    End If
+    Set m to proc string_equals from StringCore with identifier, "query"
+    If m is equal to 1:
+        Return TOKEN_QUERY
+    End If
+    Set m to proc string_equals from StringCore with identifier, "yield"
+    If m is equal to 1:
+        Return TOKEN_YIELD
+    End If
+    Set m to proc string_equals from StringCore with identifier, "return"
+    If m is equal to 1:
+        Return TOKEN_RETURN
+    End If
+    Set m to proc string_equals from StringCore with identifier, "use"
+    If m is equal to 1:
+        Return TOKEN_USE
+    End If
+    Set m to proc string_equals from StringCore with identifier, "upcast"
+    If m is equal to 1:
+        Return TOKEN_UPCAST
+    End If
+    Set m to proc string_equals from StringCore with identifier, "downcast"
+    If m is equal to 1:
+        Return TOKEN_DOWNCAST
+    End If
+    Set m to proc string_equals from StringCore with identifier, "typeof"
+    If m is equal to 1:
+        Return TOKEN_TYPEOF
+    End If
+    Set m to proc string_equals from StringCore with identifier, "typedefof"
+    If m is equal to 1:
+        Return TOKEN_TYPEDEFOF
+    End If
+    Set m to proc string_equals from StringCore with identifier, "sizeof"
+    If m is equal to 1:
+        Return TOKEN_SIZEOF
+    End If
+    Set m to proc string_equals from StringCore with identifier, "nameof"
+    If m is equal to 1:
+        Return TOKEN_NAMEOF
+    End If
+    Set m to proc string_equals from StringCore with identifier, "lazy"
+    If m is equal to 1:
+        Return TOKEN_LAZY
+    End If
+    Set m to proc string_equals from StringCore with identifier, "assert"
+    If m is equal to 1:
+        Return TOKEN_ASSERT
+    End If
+    Set m to proc string_equals from StringCore with identifier, "base"
+    If m is equal to 1:
+        Return TOKEN_BASE
+    End If
+    Set m to proc string_equals from StringCore with identifier, "delegate"
+    If m is equal to 1:
+        Return TOKEN_DELEGATE
+    End If
+    Set m to proc string_equals from StringCore with identifier, "true"
+    If m is equal to 1:
+        Return TOKEN_TRUE
+    End If
+    Set m to proc string_equals from StringCore with identifier, "false"
+    If m is equal to 1:
+        Return TOKEN_FALSE
+    End If
+    Set m to proc string_equals from StringCore with identifier, "not"
+    If m is equal to 1:
         Return TOKEN_NOT
     End If
-
-    Note: Reference operations
-    If proc string_equals from StringCore with identifier, "ref":
+    Set m to proc string_equals from StringCore with identifier, "ref"
+    If m is equal to 1:
         Return TOKEN_REF
     End If
+    Set m to proc string_equals from StringCore with identifier, "as"
+    If m is equal to 1:
+        Return TOKEN_AS
+    End If
 
-    Note: Not a keyword - return as identifier
-    Return TOKEN_IDENTIFIER
+    Note: Not a keyword
+    Return 0
 End Process
 
 Note: ============================================================================
-Note: F# String and Character Literal Parsing
+Note: F# String and Character Literal Recognition
 Note: ============================================================================
 
 @Reasoning:
 F# has four string-literal forms with different escape rules: regular
-"text", verbatim @"text" (no escapes), triple-quoted """text""" (multiline,
-no escapes inside the inner content), and byte strings "text"B. We probe
-prefixes/suffixes to pick the right termination rule and return the
-matching token kind.
+"text" (escapes decoded), verbatim @"text" (no escapes, "" doubling),
+triple-quoted """text""" (multiline, fully verbatim), and byte strings
+"text"B. We probe prefixes/suffixes to pick the right termination rule,
+record the content byte range, and cook the lexeme via the matching
+decoder so the token carries the final string payload.
 @End Reasoning
 @Security_Scope:
-Untrusted input. Unterminated strings return TOKEN_ERROR without
+Untrusted input. Unterminated strings return TOKEN_ERROR tokens without
 over-reading the source buffer (EOF guard at the loop head).
 @End Security_Scope
 Process called "read_string_literal" takes lexer as Integer returns Integer:
-    Note: Parse F# string literal with proper escape sequence handling
+    Note: Lex an F# string literal and return a token with cooked content
 
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let line be proc memory_get_int64 from Layout with lexer, 16
+    Let column be proc memory_get_int64 from Layout with lexer, 24
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
-    Let current be proc current_char from lexer
+
+    Let current be proc current_char with lexer
     Let is_verbatim be 0
     Let is_triple be 0
     Let is_byte be 0
@@ -790,37 +1407,44 @@ Process called "read_string_literal" takes lexer as Integer returns Integer:
     Note: Check for verbatim string @"
     If current is equal to 64:  Note: '@'
         Set is_verbatim to 1
-        proc advance_char from lexer
-        Set current to proc current_char from lexer
+        proc advance_char with lexer
+        Set current to proc current_char with lexer
     End If
 
     Note: Must start with quote
     If current is not equal to 34:  Note: '"'
-        Return TOKEN_ERROR
+        Let bad_end be proc memory_get_int64 from Layout with lexer, 8
+        Let bad_lexeme be proc fsharp_substring with source, start_pos, bad_end
+        Return proc create_token with TOKEN_ERROR, bad_lexeme, 0, line, column
     End If
 
-    proc advance_char from lexer  Note: Skip opening quote
+    proc advance_char with lexer  Note: Skip opening quote
 
     Note: Check for triple-quoted string
     Let next1 be proc peek_char with lexer, 0
     Let next2 be proc peek_char with lexer, 1
-    If next1 is equal to 34:  Note: '"'
-        If next2 is equal to 34:  Note: '"'
-            Set is_triple to 1
-            proc advance_char from lexer  Note: Skip second quote
-            proc advance_char from lexer  Note: Skip third quote
+    If is_verbatim is equal to 0:
+        If next1 is equal to 34:  Note: '"'
+            If next2 is equal to 34:  Note: '"'
+                Set is_triple to 1
+                proc advance_char with lexer  Note: Skip second quote
+                proc advance_char with lexer  Note: Skip third quote
+            End If
         End If
     End If
 
-    Note: Read string content
     Let content_start be proc memory_get_int64 from Layout with lexer, 8
+    Let content_end be content_start
     Let escaped be 0
+    Let terminated be 0
 
-    While 1:
-        Set current to proc current_char from lexer
+    While terminated is equal to 0:
+        Set current to proc current_char with lexer
 
-        If current is equal to 0:  Note: EOF
-            Return TOKEN_ERROR
+        If current is equal to 0:  Note: EOF - unterminated string
+            Set content_end to proc memory_get_int64 from Layout with lexer, 8
+            Let err_lexeme be proc fsharp_substring with source, start_pos, content_end
+            Return proc create_token with TOKEN_ERROR, err_lexeme, 0, line, column
         End If
 
         If is_triple is equal to 1:
@@ -830,661 +1454,1036 @@ Process called "read_string_literal" takes lexer as Integer returns Integer:
                 Let n2 be proc peek_char with lexer, 2
                 If n1 is equal to 34:  Note: '"'
                     If n2 is equal to 34:  Note: '"'
-                        proc advance_char from lexer
-                        proc advance_char from lexer
-                        proc advance_char from lexer
-                        Break
+                        Set content_end to proc memory_get_int64 from Layout with lexer, 8
+                        proc advance_char with lexer
+                        proc advance_char with lexer
+                        proc advance_char with lexer
+                        Set terminated to 1
+                        Continue
                     End If
                 End If
             End If
+            proc advance_char with lexer
+            Continue
+        End If
 
-        Otherwise:
-            If escaped is equal to 1:
-                Set escaped to 0
-                proc advance_char from lexer
+        If is_verbatim is equal to 1:
+            Note: Verbatim string: "" is an escaped quote, single " terminates
+            If current is equal to 34:  Note: '"'
+                Set n1 to proc peek_char with lexer, 1
+                If n1 is equal to 34:
+                    proc advance_char with lexer
+                    proc advance_char with lexer
+                    Continue
+                End If
+                Set content_end to proc memory_get_int64 from Layout with lexer, 8
+                proc advance_char with lexer
+                Set terminated to 1
                 Continue
             End If
+            proc advance_char with lexer
+            Continue
+        End If
 
-            If current is equal to 34:  Note: '"' - end of string
-                proc advance_char from lexer
-                Break
+        Note: Regular string with escape sequences
+        If escaped is equal to 1:
+            Set escaped to 0
+            proc advance_char with lexer
+            Continue
+        End If
+
+        If current is equal to 34:  Note: '"' end of string
+            Set content_end to proc memory_get_int64 from Layout with lexer, 8
+            proc advance_char with lexer
+            Set terminated to 1
+            Continue
+        End If
+
+        If current is equal to 92:  Note: backslash starts escape
+            Set escaped to 1
+        End If
+
+        proc advance_char with lexer
+    End While
+
+    Note: Check for byte string suffix
+    Set current to proc current_char with lexer
+    If current is equal to 66:  Note: 'B'
+        Set is_byte to 1
+        proc advance_char with lexer
+    End If
+
+    Note: Cook the content into the token lexeme
+    Let lexeme be 0
+    If is_verbatim is equal to 1:
+        Set lexeme to proc decode_verbatim with source, content_start, content_end
+    Otherwise:
+        If is_triple is equal to 1:
+            Set lexeme to proc fsharp_substring with source, content_start, content_end
+        Otherwise:
+            Set lexeme to proc decode_escapes with source, content_start, content_end
+        End If
+    End If
+
+    If is_byte is equal to 1:
+        Return proc create_token with TOKEN_BYTE_STRING, lexeme, 0, line, column
+    End If
+    If is_verbatim is equal to 1:
+        Return proc create_token with TOKEN_VERBATIM_STRING, lexeme, 0, line, column
+    End If
+    If is_triple is equal to 1:
+        Return proc create_token with TOKEN_TRIPLE_QUOTE_STRING, lexeme, 0, line, column
+    End If
+
+    Return proc create_token with TOKEN_STRING, lexeme, 0, line, column
+End Process
+
+@Reasoning:
+Interpolated strings ($"text {expr} text") are lexed as alternating
+segment tokens and ordinary expression tokens. This recogniser reads one
+literal segment: the run of text from the current cursor up to the next
+interpolation hole ({) or the closing quote. Doubled braces ({{ and }})
+are the F# escapes for literal braces and are collapsed during cooking;
+backslash escapes are decoded exactly like regular strings. The returned
+token's numeric payload is the continuation flag: 1 when the segment
+ended at a hole (expression tokens and a continuation segment follow),
+0 when the segment ended at the closing quote (the string is complete).
+The lexer's in_string slot (offset 56) stays raised across holes so
+next_token can route the hole-closing brace back into this recogniser,
+and the brace_depth slot (offset 88) counts braces opened INSIDE the
+hole expression so record literals in holes do not terminate the hole
+early.
+@End Reasoning
+@Security_Scope:
+Untrusted input. EOF inside a segment and a lone closing brace in
+literal text (F# requires the doubled form) both produce TOKEN_ERROR
+without over-reading the buffer, and clear in_string so the tokeniser
+does not resume string scanning after the error.
+@End Security_Scope
+Process called "read_interp_segment" takes lexer as Integer, token_kind as Integer returns Integer:
+    Note: Read one literal segment of an interpolated string
+
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let line be proc memory_get_int64 from Layout with lexer, 16
+    Let column be proc memory_get_int64 from Layout with lexer, 24
+    Let content_start be proc memory_get_int64 from Layout with lexer, 8
+    Let content_end be content_start
+    Let has_hole be 0
+    Let escaped be 0
+    Let scanning be 1
+
+    While scanning is equal to 1:
+        Let current be proc current_char with lexer
+
+        If current is equal to 0:  Note: EOF - unterminated interpolated string
+            proc memory_set_int64 from Layout with lexer, 56, 0
+            Set content_end to proc memory_get_int64 from Layout with lexer, 8
+            Let err_lexeme be proc fsharp_substring with source, content_start, content_end
+            Return proc create_token with TOKEN_ERROR, err_lexeme, 0, line, column
+        End If
+
+        If escaped is equal to 1:
+            Set escaped to 0
+            proc advance_char with lexer
+            Continue
+        End If
+
+        If current is equal to 92:  Note: backslash starts escape
+            Set escaped to 1
+            proc advance_char with lexer
+            Continue
+        End If
+
+        If current is equal to 34:  Note: closing quote ends the whole string
+            Set content_end to proc memory_get_int64 from Layout with lexer, 8
+            proc advance_char with lexer
+            proc memory_set_int64 from Layout with lexer, 56, 0
+            Set scanning to 0
+            Continue
+        End If
+
+        If current is equal to 123:  Note: open brace
+            Let next_ch be proc peek_char with lexer, 1
+            If next_ch is equal to 123:  Note: doubled brace is a literal brace
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Continue
             End If
+            Note: Interpolation hole begins; expression tokens follow
+            Set content_end to proc memory_get_int64 from Layout with lexer, 8
+            proc advance_char with lexer
+            proc memory_set_int64 from Layout with lexer, 88, 0  Note: hole brace depth = 0
+            Set has_hole to 1
+            Set scanning to 0
+            Continue
+        End If
 
-            If is_verbatim is equal to 0:
-                If current is equal to 92:  Note: '\' minus escape character
-                    Set escaped to 1
+        If current is equal to 125:  Note: close brace
+            Set next_ch to proc peek_char with lexer, 1
+            If next_ch is equal to 125:  Note: doubled brace is a literal brace
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Continue
+            End If
+            Note: A lone close brace in literal text requires the doubled form
+            proc memory_set_int64 from Layout with lexer, 56, 0
+            Set content_end to proc memory_get_int64 from Layout with lexer, 8
+            Set err_lexeme to proc fsharp_substring with source, content_start, content_end
+            Return proc create_token with TOKEN_ERROR, err_lexeme, 0, line, column
+        End If
+
+        proc advance_char with lexer
+    End While
+
+    Note: Collapse doubled braces over the RAW byte range first (escape
+    Note: decoding could synthesise brace bytes from unicode escapes, so the
+    Note: collapse must not run on decoded text), then decode backslash escapes.
+    Let raw_len be content_end minus content_start
+    Let collapsed be proc allocate from Layout with raw_len plus 1
+    If collapsed is equal to 0:
+        Return proc create_token with TOKEN_ERROR, 0, 0, line, column
+    End If
+
+    Let read_pos be content_start
+    Let write_pos be 0
+    Let last_raw be content_end minus 1
+    While read_pos is less than content_end:
+        Let ch be proc string_char_at from StringCore with source, read_pos
+
+        If ch is equal to 92:  Note: copy escape pairs verbatim for the decoder
+            proc memory_set_byte from Layout with collapsed, write_pos, ch
+            Set write_pos to write_pos plus 1
+            Set read_pos to read_pos plus 1
+            If read_pos is less than content_end:
+                Let esc_ch be proc string_char_at from StringCore with source, read_pos
+                proc memory_set_byte from Layout with collapsed, write_pos, esc_ch
+                Set write_pos to write_pos plus 1
+                Set read_pos to read_pos plus 1
+            End If
+            Continue
+        End If
+
+        Let pair be 0
+        If read_pos is less than last_raw:
+            Let ahead be proc string_char_at from StringCore with source, read_pos plus 1
+            If ch is equal to 123:
+                If ahead is equal to 123:
+                    Set pair to 1
+                End If
+            End If
+            If ch is equal to 125:
+                If ahead is equal to 125:
+                    Set pair to 1
                 End If
             End If
         End If
 
-        proc advance_char from lexer
+        proc memory_set_byte from Layout with collapsed, write_pos, ch
+        Set write_pos to write_pos plus 1
+        If pair is equal to 1:
+            Set read_pos to read_pos plus 2
+        Otherwise:
+            Set read_pos to read_pos plus 1
+        End If
     End While
+    proc memory_set_byte from Layout with collapsed, write_pos, 0
 
-    Note: Check for byte string suffix
-    Set current to proc current_char from lexer
-    If current is equal to 66:  Note: 'B'
-        Set is_byte to 1
-        proc advance_char from lexer
-    End If
+    Let lexeme be proc decode_escapes with collapsed, 0, write_pos
+    proc deallocate from Layout with collapsed
 
-    Note: Return appropriate token type
-    If is_byte is equal to 1:
-        Return TOKEN_BYTE_STRING
-    End If
-    If is_verbatim is equal to 1:
-        Return TOKEN_VERBATIM_STRING
-    End If
-    If is_triple is equal to 1:
-        Return TOKEN_TRIPLE_QUOTE_STRING
-    End If
-
-    Return TOKEN_STRING
+    Return proc create_token with token_kind, lexeme, has_hole, line, column
 End Process
 
 @Reasoning:
-F# char literal: 'X' or '\X' (single character, possibly escaped, delimited
-by single quotes). We accept any escape sequence by consuming two characters
-after the backslash. Unterminated or malformed char literals return TOKEN_ERROR.
+F# char literal: 'X' or '\X' (single character, possibly escaped,
+delimited by single quotes). The token's numeric payload carries the
+decoded code point and the lexeme carries the cooked UTF-8 bytes of the
+character. Escape decoding covers the simple escapes plus \xHH and
+\uXXXX. Unterminated or malformed char literals return TOKEN_ERROR.
 @End Reasoning
 Process called "read_char_literal" takes lexer as Integer returns Integer:
-    Note: Parse F# character literal
+    Note: Lex an F# character literal into a token with decoded code point payload
 
-    Let current be proc current_char from lexer
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let line be proc memory_get_int64 from Layout with lexer, 16
+    Let column be proc memory_get_int64 from Layout with lexer, 24
+    Let start_pos be proc memory_get_int64 from Layout with lexer, 8
 
-    If current is not equal to 39:  Note: '\''
-        Return TOKEN_ERROR
+    Let current be proc current_char with lexer
+    If current is not equal to 39:  Note: opening single quote
+        Return proc create_token with TOKEN_ERROR, 0, 0, line, column
     End If
 
-    proc advance_char from lexer  Note: Skip opening quote
-
-    Set current to proc current_char from lexer
+    proc advance_char with lexer  Note: Skip opening quote
+    Set current to proc current_char with lexer
 
     If current is equal to 0:  Note: EOF
-        Return TOKEN_ERROR
+        Let err_end be proc memory_get_int64 from Layout with lexer, 8
+        Let err_lexeme be proc fsharp_substring with source, start_pos, err_end
+        Return proc create_token with TOKEN_ERROR, err_lexeme, 0, line, column
     End If
 
-    If current is equal to 92:  Note: '\' minus escape sequence
-        proc advance_char from lexer
-        Set current to proc current_char from lexer
-        If current is equal to 0:
-            Return TOKEN_ERROR
+    Let code be 0
+
+    If current is equal to 92:  Note: backslash - escape sequence
+        proc advance_char with lexer
+        Let esc be proc current_char with lexer
+        If esc is equal to 0:
+            Set err_end to proc memory_get_int64 from Layout with lexer, 8
+            Set err_lexeme to proc fsharp_substring with source, start_pos, err_end
+            Return proc create_token with TOKEN_ERROR, err_lexeme, 0, line, column
         End If
+
+        Let decoded be 0
+        If esc is equal to 110:  Note: 'n'
+            Set code to 10
+            Set decoded to 1
+        End If
+        If esc is equal to 116:  Note: 't'
+            Set code to 9
+            Set decoded to 1
+        End If
+        If esc is equal to 114:  Note: 'r'
+            Set code to 13
+            Set decoded to 1
+        End If
+        If esc is equal to 98:   Note: 'b'
+            Set code to 8
+            Set decoded to 1
+        End If
+        If esc is equal to 97:   Note: 'a'
+            Set code to 7
+            Set decoded to 1
+        End If
+        If esc is equal to 102:  Note: 'f'
+            Set code to 12
+            Set decoded to 1
+        End If
+        If esc is equal to 118:  Note: 'v'
+            Set code to 11
+            Set decoded to 1
+        End If
+        If esc is equal to 92:   Note: backslash
+            Set code to 92
+            Set decoded to 1
+        End If
+        If esc is equal to 39:   Note: single quote
+            Set code to 39
+            Set decoded to 1
+        End If
+        If esc is equal to 34:   Note: double quote
+            Set code to 34
+            Set decoded to 1
+        End If
+        If esc is equal to 48:   Note: '0'
+            Set code to 0
+            Set decoded to 1
+        End If
+
+        If esc is equal to 120:  Note: 'x' - two hex digits
+            If decoded is equal to 0:
+                Let h1 be proc peek_char with lexer, 1
+                Let h2 be proc peek_char with lexer, 2
+                Let v1 be proc hex_digit_value with h1
+                Let v2 be proc hex_digit_value with h2
+                If v1 is greater than or equal to 0:
+                    If v2 is greater than or equal to 0:
+                        Set code to (v1 multiplied by 16) plus v2
+                        proc advance_char with lexer
+                        proc advance_char with lexer
+                        Set decoded to 1
+                    End If
+                End If
+            End If
+        End If
+
+        If esc is equal to 117:  Note: 'u' - four hex digits
+            If decoded is equal to 0:
+                Set code to 0
+                Let valid be 1
+                Let d be 0
+                While d is less than 4:
+                    Let hch be proc peek_char with lexer, 1 plus d
+                    Let hv be proc hex_digit_value with hch
+                    If hv is less than 0:
+                        Set valid to 0
+                    End If
+                    Set code to (code multiplied by 16) plus hv
+                    Set d to d plus 1
+                End While
+                If valid is equal to 1:
+                    Set d to 0
+                    While d is less than 4:
+                        proc advance_char with lexer
+                        Set d to d plus 1
+                    End While
+                    Set decoded to 1
+                End If
+            End If
+        End If
+
+        If decoded is equal to 0:
+            Note: Unknown escape - take the escaped character literally
+            Set code to esc
+        End If
+
+        proc advance_char with lexer  Note: Consume the final escape character
+
+    Otherwise:
+        Set code to current
+        proc advance_char with lexer  Note: Consume the character
     End If
 
-    proc advance_char from lexer  Note: Skip character
-
-    Set current to proc current_char from lexer
-    If current is not equal to 39:  Note: '\''
-        Return TOKEN_ERROR
+    Set current to proc current_char with lexer
+    If current is not equal to 39:  Note: closing single quote
+        Set err_end to proc memory_get_int64 from Layout with lexer, 8
+        Set err_lexeme to proc fsharp_substring with source, start_pos, err_end
+        Return proc create_token with TOKEN_ERROR, err_lexeme, 0, line, column
     End If
 
-    proc advance_char from lexer  Note: Skip closing quote
+    proc advance_char with lexer  Note: Skip closing quote
 
-    Return TOKEN_CHAR
+    Note: Build the cooked one-character lexeme (UTF-8 encoded)
+    Let lexeme be proc allocate from Layout with 5
+    If lexeme is equal to 0:
+        Return proc create_token with TOKEN_CHAR, 0, code, line, column
+    End If
+    Let written be proc encode_utf8 with lexeme, 0, code
+    proc memory_set_byte from Layout with lexeme, written, 0
+
+    Return proc create_token with TOKEN_CHAR, lexeme, code, line, column
 End Process
 
 Note: ============================================================================
-Note: F# Numeric Literal Parsing
+Note: F# Numeric Literal Recognition
 Note: ============================================================================
 
 @Reasoning:
 F# numeric literals come in many bases (decimal, hex 0x, octal 0o, binary
-0b) and many type suffixes (y/uy/s/us/L/UL/f/m). We walk digits in the
-appropriate base then peel off type suffixes to choose the precise
-token kind for downstream type inference.
+0b) and many type suffixes (uy/y/s/us/L/UL/l/f/F/m/M/I). We walk digits in
+the appropriate base, record where the numeric text ends, then peel off
+type suffixes to choose the precise token kind. The token payload carries
+the parsed value: a signed 64-bit integer for the integer family, or the
+IEEE-754 binary64 bit pattern (via the canonical string_to_float) for the
+float family. The lexeme is the full raw spelling including any suffix so
+diagnostics can quote the source exactly.
 @End Reasoning
 Process called "read_number_literal" takes lexer as Integer returns Integer:
-    Note: Parse F# numeric literals with type suffixes
+    Note: Lex an F# numeric literal into a typed, value-carrying token
 
-    Let start_char be proc current_char from lexer
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let line be proc memory_get_int64 from Layout with lexer, 16
+    Let column be proc memory_get_int64 from Layout with lexer, 24
+    Let start_pos be proc memory_get_int64 from Layout with lexer, 8
+
+    Let start_char be proc current_char with lexer
     Let is_hex be 0
     Let is_binary be 0
     Let is_octal be 0
     Let has_decimal be 0
     Let has_exponent be 0
+    Let digits_start be start_pos
 
     Note: Check for prefixed literals (0x, 0b, 0o)
     If start_char is equal to 48:  Note: '0'
         Let next_char be proc peek_char with lexer, 1
-        If next_char is equal to 120:  Note: 'x' minus hexadecimal
+        If next_char is equal to 120:  Note: 'x' hexadecimal
             Set is_hex to 1
-            proc advance_char from lexer  Note: Skip '0'
-            proc advance_char from lexer  Note: Skip 'x'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Set digits_start to start_pos plus 2
         End If
-        If next_char is equal to 98:   Note: 'b' minus binary
+        If next_char is equal to 98:   Note: 'b' binary
             Set is_binary to 1
-            proc advance_char from lexer  Note: Skip '0'
-            proc advance_char from lexer  Note: Skip 'b'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Set digits_start to start_pos plus 2
         End If
-        If next_char is equal to 111:  Note: 'o' minus octal
+        If next_char is equal to 111:  Note: 'o' octal
             Set is_octal to 1
-            proc advance_char from lexer  Note: Skip '0'
-            proc advance_char from lexer  Note: Skip 'o'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Set digits_start to start_pos plus 2
         End If
     End If
 
-    Note: Read numeric digits
-    While 1:
-        Let current be proc current_char from lexer
+    Note: Read numeric digits in the detected base
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let current be proc current_char with lexer
 
         If is_hex is equal to 1:
-            Let is_valid_hex be proc is_hex_digit from current
-            If is_valid_hex is equal to 0:
-                If current is not equal to 95:  Note: '_' digit separator
-                    Break
-                End If
+            Let is_valid_hex be proc is_hex_digit with current
+            If is_valid_hex is equal to 1:
+                proc advance_char with lexer
+                Continue
             End If
-
-        Otherwise:
-            If is_binary is equal to 1:
-                If current is not equal to 48:  Note: '0'
-                    If current is not equal to 49:  Note: '1'
-                        If current is not equal to 95:  Note: '_'
-                            Break
-                        End If
-                    End If
-                End If
-
-            Otherwise:
-                If is_octal is equal to 1:
-                    If current is less than 48:  Note: '0'
-                        Break
-                    End If
-                    If current is greater than 55:  Note: '7'
-                        If current is not equal to 95:  Note: '_'
-                            Break
-                        End If
-                    End If
-
-                Otherwise:
-                    Let is_digit_char be proc is_digit from current
-                    If is_digit_char is equal to 0:
-                        If current is equal to 46:  Note: '.' minus decimal point
-                            If has_decimal is equal to 0:
-                                If is_hex is equal to 0:
-                                    If is_binary is equal to 0:
-                                        If is_octal is equal to 0:
-                                            Set has_decimal to 1
-                                            proc advance_char from lexer
-                                            Continue
-                                        End If
-                                    End If
-                                End If
-                            End If
-                        End If
-                        If current is equal to 101:  Note: 'e' minus exponent
-                            If has_exponent is equal to 0:
-                                If is_hex is equal to 0:
-                                    If is_binary is equal to 0:
-                                        If is_octal is equal to 0:
-                                            Set has_exponent to 1
-                                            proc advance_char from lexer
-                                            Let next be proc current_char from lexer
-                                            If next is equal to 43:  Note: '+'
-                                                proc advance_char from lexer
-                                            End If
-                                            If next is equal to 45:  Note: '-'
-                                                proc advance_char from lexer
-                                            End If
-                                            Continue
-                                        End If
-                                    End If
-                                End If
-                            End If
-                        End If
-                        If current is equal to 69:  Note: 'E' minus exponent
-                            If has_exponent is equal to 0:
-                                If is_hex is equal to 0:
-                                    If is_binary is equal to 0:
-                                        If is_octal is equal to 0:
-                                            Set has_exponent to 1
-                                            proc advance_char from lexer
-                                            Set next to proc current_char from lexer
-                                            If next is equal to 43:  Note: '+'
-                                                proc advance_char from lexer
-                                            End If
-                                            If next is equal to 45:  Note: '-'
-                                                proc advance_char from lexer
-                                            End If
-                                            Continue
-                                        End If
-                                    End If
-                                End If
-                            End If
-                        End If
-                        If current is not equal to 95:  Note: '_'
-                            Break
-                        End If
-                    End If
-                End If
+            If current is equal to 95:  Note: '_'
+                proc advance_char with lexer
+                Continue
             End If
+            Set scanning to 0
+            Continue
         End If
 
-        proc advance_char from lexer
+        If is_binary is equal to 1:
+            If current is equal to 48:
+                proc advance_char with lexer
+                Continue
+            End If
+            If current is equal to 49:
+                proc advance_char with lexer
+                Continue
+            End If
+            If current is equal to 95:
+                proc advance_char with lexer
+                Continue
+            End If
+            Set scanning to 0
+            Continue
+        End If
+
+        If is_octal is equal to 1:
+            If current is greater than or equal to 48:
+                If current is less than or equal to 55:
+                    proc advance_char with lexer
+                    Continue
+                End If
+            End If
+            If current is equal to 95:
+                proc advance_char with lexer
+                Continue
+            End If
+            Set scanning to 0
+            Continue
+        End If
+
+        Note: Decimal scanning with fraction and exponent support
+        Let is_digit_char be proc is_digit with current
+        If is_digit_char is equal to 1:
+            proc advance_char with lexer
+            Continue
+        End If
+        If current is equal to 95:  Note: '_'
+            proc advance_char with lexer
+            Continue
+        End If
+        If current is equal to 46:  Note: '.' decimal point
+            If has_decimal is equal to 0:
+                If has_exponent is equal to 0:
+                    Let frac_peek be proc peek_char with lexer, 1
+                    Let frac_is_digit be proc is_digit with frac_peek
+                    If frac_is_digit is equal to 1:
+                        Set has_decimal to 1
+                        proc advance_char with lexer
+                        Continue
+                    End If
+                End If
+            End If
+            Set scanning to 0
+            Continue
+        End If
+        If current is equal to 101:  Note: 'e'
+            If has_exponent is equal to 0:
+                Set has_exponent to 1
+                proc advance_char with lexer
+                Let sign_peek be proc current_char with lexer
+                If sign_peek is equal to 43:  Note: '+'
+                    proc advance_char with lexer
+                End If
+                If sign_peek is equal to 45:  Note: '-'
+                    proc advance_char with lexer
+                End If
+                Continue
+            End If
+            Set scanning to 0
+            Continue
+        End If
+        If current is equal to 69:   Note: 'E'
+            If has_exponent is equal to 0:
+                Set has_exponent to 1
+                proc advance_char with lexer
+                Set sign_peek to proc current_char with lexer
+                If sign_peek is equal to 43:
+                    proc advance_char with lexer
+                End If
+                If sign_peek is equal to 45:
+                    proc advance_char with lexer
+                End If
+                Continue
+            End If
+            Set scanning to 0
+            Continue
+        End If
+
+        Set scanning to 0
     End While
 
-    Note: Check for type suffixes
-    Set current to proc current_char from lexer
+    Let digits_end be proc memory_get_int64 from Layout with lexer, 8
 
-    Note: BigInteger suffix 'I'
-    If current is equal to 73:  Note: 'I'
-        proc advance_char from lexer
-        Return TOKEN_BIGINT
+    Note: Determine token kind from type suffixes
+    Let token_kind be TOKEN_INTEGER
+    If has_decimal is equal to 1:
+        Set token_kind to TOKEN_FLOAT
     End If
-
-    Note: Decimal suffix 'M' or 'm'
-    If current is equal to 77:  Note: 'M'
-        proc advance_char from lexer
-        Return TOKEN_DECIMAL
-    End If
-    If current is equal to 109: Note: 'm'
-        proc advance_char from lexer
-        Return TOKEN_DECIMAL
+    If has_exponent is equal to 1:
+        Set token_kind to TOKEN_FLOAT
     End If
 
-    Note: Float suffixes 'f', 'F'
-    If current is equal to 102: Note: 'f'
-        proc advance_char from lexer
-        Return TOKEN_FLOAT
-    End If
-    If current is equal to 70:  Note: 'F'
-        proc advance_char from lexer
-        Return TOKEN_FLOAT
-    End If
+    Let current2 be proc current_char with lexer
 
-    Note: Byte suffixes
-    If current is equal to 117: Note: 'u'
-        Let next_peek be proc peek_char with lexer, 1
-        If next_peek is equal to 121: Note: 'y'
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_BYTE
+    If current2 is equal to 73:  Note: 'I' BigInteger
+        proc advance_char with lexer
+        Set token_kind to TOKEN_BIGINT
+    Otherwise:
+        If current2 is equal to 77:  Note: 'M' decimal
+            proc advance_char with lexer
+            Set token_kind to TOKEN_DECIMAL
+        Otherwise:
+            If current2 is equal to 109:  Note: 'm' decimal
+                proc advance_char with lexer
+                Set token_kind to TOKEN_DECIMAL
+            Otherwise:
+                If current2 is equal to 102:  Note: 'f' float32
+                    proc advance_char with lexer
+                    Set token_kind to TOKEN_FLOAT
+                Otherwise:
+                    If current2 is equal to 70:  Note: 'F' float32
+                        proc advance_char with lexer
+                        Set token_kind to TOKEN_FLOAT
+                    Otherwise:
+                        If current2 is equal to 117:  Note: 'u' - uy byte or UL ulong
+                            Let next_peek be proc peek_char with lexer, 1
+                            If next_peek is equal to 121:  Note: 'y' byte
+                                proc advance_char with lexer
+                                proc advance_char with lexer
+                                Set token_kind to TOKEN_BYTE
+                            Otherwise:
+                                If next_peek is equal to 115:  Note: 's' uint16
+                                    proc advance_char with lexer
+                                    proc advance_char with lexer
+                                Otherwise:
+                                    If next_peek is equal to 76:  Note: 'L' uint64
+                                        proc advance_char with lexer
+                                        proc advance_char with lexer
+                                    Otherwise:
+                                        proc advance_char with lexer  Note: bare 'u' uint32
+                                    End If
+                                End If
+                            End If
+                        Otherwise:
+                            If current2 is equal to 121:  Note: 'y' sbyte
+                                proc advance_char with lexer
+                                Set token_kind to TOKEN_BYTE
+                            Otherwise:
+                                If current2 is equal to 115:  Note: 's' int16
+                                    proc advance_char with lexer
+                                Otherwise:
+                                    If current2 is equal to 76:  Note: 'L' int64
+                                        proc advance_char with lexer
+                                    Otherwise:
+                                        If current2 is equal to 108:  Note: 'l' int64
+                                            proc advance_char with lexer
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
         End If
     End If
 
-    Note: Long suffixes 'L', 'l'
-    If current is equal to 76:  Note: 'L'
-        proc advance_char from lexer
-        Return TOKEN_INTEGER
-    End If
-    If current is equal to 108: Note: 'l'
-        proc advance_char from lexer
-        Return TOKEN_INTEGER
+    Let end_pos be proc memory_get_int64 from Layout with lexer, 8
+    Let lexeme be proc fsharp_substring with source, start_pos, end_pos
+
+    Note: Compute the numeric payload from the digit region
+    Let value be 0
+    If token_kind is equal to TOKEN_FLOAT:
+        Set value to proc parse_float_lexeme with source, digits_start, digits_end
+    Otherwise:
+        If token_kind is equal to TOKEN_DECIMAL:
+            Set value to proc parse_float_lexeme with source, digits_start, digits_end
+        Otherwise:
+            Let base be 10
+            If is_hex is equal to 1:
+                Set base to 16
+            End If
+            If is_binary is equal to 1:
+                Set base to 2
+            End If
+            If is_octal is equal to 1:
+                Set base to 8
+            End If
+            Set value to proc parse_integer_lexeme with source, digits_start, digits_end, base
+        End If
     End If
 
-    Note: Determine default type based on format
-    If has_decimal is equal to 1:
-        Return TOKEN_FLOAT
-    End If
-    If has_exponent is equal to 1:
-        Return TOKEN_FLOAT
-    End If
-
-    Return TOKEN_INTEGER
+    Return proc create_token with token_kind, lexeme, value, line, column
 End Process
 
 Note: ============================================================================
-Note: F# Identifier and Operator Parsing
+Note: F# Identifier and Operator Recognition
 Note: ============================================================================
 
 @Reasoning:
 F# identifier rules: must start with letter or underscore; subsequent
-characters include letters, digits, and apostrophe (for type-variable
-suffixes like 'a). After reading we run keyword recognition and, if it's
-a plain identifier starting with uppercase, upgrade to TOKEN_TYPE_NAME
-since F# treats capitalised identifiers as type/constructor names.
+characters include letters, digits, and apostrophe (prime suffixes like
+x'). After reading we run keyword recognition and, for a plain identifier
+starting with uppercase, upgrade to TOKEN_TYPE_NAME since F# treats
+capitalised identifiers as type/constructor names.
 @End Reasoning
 Process called "read_identifier" takes lexer as Integer returns Integer:
-    Note: Parse F# identifier (variables, types, modules)
+    Note: Lex an F# identifier or keyword into a token carrying its text
 
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let line be proc memory_get_int64 from Layout with lexer, 16
+    Let column be proc memory_get_int64 from Layout with lexer, 24
     Let start_pos be proc memory_get_int64 from Layout with lexer, 8
-    Let current be proc current_char from lexer
 
-    Note: Must start with letter or underscore
-    Let is_start_valid be proc is_letter from current
+    Let current be proc current_char with lexer
+    Let is_start_valid be proc is_letter with current
     If is_start_valid is equal to 0:
-        Return TOKEN_ERROR
+        Return proc create_token with TOKEN_ERROR, 0, 0, line, column
     End If
 
-    Note: Read identifier characters
-    While 1:
-        Set current to proc current_char from lexer
-        Let is_valid_letter be proc is_letter from current
-        Let is_valid_digit be proc is_digit from current
+    Let scanning be 1
+    While scanning is equal to 1:
+        Set current to proc current_char with lexer
+        Let is_valid_letter be proc is_letter with current
+        Let is_valid_digit be proc is_digit with current
 
-        If is_valid_letter is equal to 0:
-            If is_valid_digit is equal to 0:
-                If current is not equal to 39:  Note: '\'' minus type variable suffix
-                    Break
-                End If
-            End If
+        If is_valid_letter is equal to 1:
+            proc advance_char with lexer
+            Continue
+        End If
+        If is_valid_digit is equal to 1:
+            proc advance_char with lexer
+            Continue
+        End If
+        If current is equal to 39:  Note: apostrophe prime suffix
+            proc advance_char with lexer
+            Continue
         End If
 
-        proc advance_char from lexer
+        Set scanning to 0
     End While
 
-    Note: Extract identifier string and check if it's a keyword
     Let end_pos be proc memory_get_int64 from Layout with lexer, 8
-    Let length be end_pos minus start_pos
-    Let source be proc memory_get_int64 from Layout with lexer, 0
-    Let identifier be proc string_substring from StringCore with source, start_pos, length
+    Let identifier be proc fsharp_substring with source, start_pos, end_pos
 
-    Let token_type be proc recognize_keyword from identifier
+    Let keyword_type be proc recognize_keyword with identifier
+    If keyword_type is not equal to 0:
+        Return proc create_token with keyword_type, identifier, 0, line, column
+    End If
 
-    Note: Check if identifier starts with uppercase (type/constructor)
+    Note: Capitalised identifiers are type/constructor names
     Let first_char be proc string_char_at from StringCore with identifier, 0
     If first_char is greater than or equal to 65:  Note: 'A'
         If first_char is less than or equal to 90:  Note: 'Z'
-            If token_type is equal to TOKEN_IDENTIFIER:
-                Return TOKEN_TYPE_NAME
-            End If
+            Return proc create_token with TOKEN_TYPE_NAME, identifier, 0, line, column
         End If
     End If
 
-    Return token_type
+    Return proc create_token with TOKEN_IDENTIFIER, identifier, 0, line, column
 End Process
 
 @Reasoning:
-F# operator vocabulary includes pipe (|>, <|), composition (>>, <<),
-arrow (->), cons (::), range (..), and many others. Each multi-character
-form must be tokenised as a single unit; we peek the second character
-before committing to a single-character interpretation.
+F# operator vocabulary includes pipes (|>, <|), composition (>>, <<),
+arrow (->), cons (::), range (..), logical (&&, ||), and quotation
+brackets (<@, @>). Each multi-character form must be tokenised as a
+single unit; we peek the second character before committing to a
+single-character interpretation. The lexeme records the exact operator
+spelling so the parser can materialise operator-identifier AST nodes
+whose text round-trips through the HIR translator.
 @End Reasoning
 Process called "read_operator" takes lexer as Integer returns Integer:
-    Note: Parse F# operators (single and multi-character)
+    Note: Lex F# operators (single and multi-character) into tokens
 
-    Let current be proc current_char from lexer
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let line be proc memory_get_int64 from Layout with lexer, 16
+    Let column be proc memory_get_int64 from Layout with lexer, 24
+    Let start_pos be proc memory_get_int64 from Layout with lexer, 8
+
+    Let current be proc current_char with lexer
     Let next_char be proc peek_char with lexer, 1
+    Let token_kind be TOKEN_ERROR
+    Let consume be 1
 
-    Note: Two-character operators
     If current is equal to 124:  Note: '|'
-        If next_char is equal to 62:  Note: '>' minus pipe right |>
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_PIPE_RIGHT
+        If next_char is equal to 62:  Note: '>' pipe right |>
+            Set token_kind to TOKEN_PIPE_RIGHT
+            Set consume to 2
+        Otherwise:
+            If next_char is equal to 93:  Note: ']' end of array |]
+                Set token_kind to TOKEN_RIGHT_ARRAY
+                Set consume to 2
+            Otherwise:
+                If next_char is equal to 124:  Note: '|' logical or ||
+                    Set token_kind to TOKEN_OR_OP
+                    Set consume to 2
+                Otherwise:
+                    Set token_kind to TOKEN_PIPE
+                    Set consume to 1
+                End If
+            End If
         End If
-        If next_char is equal to 93:  Note: ']' minus end of array |]
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_RIGHT_ARRAY
-        End If
-        Return TOKEN_PIPE
     End If
 
     If current is equal to 60:   Note: '<'
-        If next_char is equal to 124: Note: '|' minus pipe left <|
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_PIPE_LEFT
+        If next_char is equal to 124: Note: '|' pipe left <|
+            Set token_kind to TOKEN_PIPE_LEFT
+            Set consume to 2
+        Otherwise:
+            If next_char is equal to 45:  Note: '-' assignment <-
+                Set token_kind to TOKEN_ASSIGN
+                Set consume to 2
+            Otherwise:
+                If next_char is equal to 62:  Note: '>' not equal <>
+                    Set token_kind to TOKEN_NOT_EQUAL
+                    Set consume to 2
+                Otherwise:
+                    If next_char is equal to 61:  Note: '=' less equal <=
+                        Set token_kind to TOKEN_LESS_EQUAL
+                        Set consume to 2
+                    Otherwise:
+                        If next_char is equal to 64:  Note: '@' quotation <@
+                            Set token_kind to TOKEN_LEFT_QUOTE
+                            Set consume to 2
+                        Otherwise:
+                            If next_char is equal to 60:  Note: '<' compose left <<
+                                Set token_kind to TOKEN_COMPOSE_LEFT
+                                Set consume to 2
+                            Otherwise:
+                                Set token_kind to TOKEN_LESS_THAN
+                                Set consume to 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
         End If
-        If next_char is equal to 45:  Note: '-' minus assignment <-
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_ASSIGN
-        End If
-        If next_char is equal to 62:  Note: '>' minus not equal <>
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_NOT_EQUAL
-        End If
-        If next_char is equal to 61:  Note: '=' minus less equal <=
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_LESS_EQUAL
-        End If
-        If next_char is equal to 64:  Note: '@' minus quotation <@
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_LEFT_QUOTE
-        End If
-        Return TOKEN_LESS_THAN
     End If
 
     If current is equal to 62:   Note: '>'
-        If next_char is equal to 62:  Note: '>' minus compose right >>
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_COMPOSE_RIGHT
+        If next_char is equal to 62:  Note: '>' compose right >>
+            Set token_kind to TOKEN_COMPOSE_RIGHT
+            Set consume to 2
+        Otherwise:
+            If next_char is equal to 61:  Note: '=' greater equal >=
+                Set token_kind to TOKEN_GREATER_EQUAL
+                Set consume to 2
+            Otherwise:
+                Set token_kind to TOKEN_GREATER_THAN
+                Set consume to 1
+            End If
         End If
-        If next_char is equal to 61:  Note: '=' minus greater equal >=
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_GREATER_EQUAL
-        End If
-        Return TOKEN_GREATER_THAN
     End If
 
     If current is equal to 45:   Note: '-'
-        If next_char is equal to 62:  Note: '>' minus arrow ->
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_ARROW
+        If next_char is equal to 62:  Note: '>' arrow ->
+            Set token_kind to TOKEN_ARROW
+            Set consume to 2
+        Otherwise:
+            Set token_kind to TOKEN_MINUS
+            Set consume to 1
         End If
-        Return TOKEN_MINUS
     End If
 
     If current is equal to 61:   Note: '='
-        If next_char is equal to 61:  Note: '=' minus equality (not F# syntax)
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_ERROR  Note: F# uses is equal to for equality
-        End If
-        Return TOKEN_EQUAL
+        Set token_kind to TOKEN_EQUAL
+        Set consume to 1
     End If
 
     If current is equal to 58:   Note: ':'
-        If next_char is equal to 58:  Note: ':' minus cons ::
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_DOUBLE_COLON
+        If next_char is equal to 58:  Note: ':' cons ::
+            Set token_kind to TOKEN_DOUBLE_COLON
+            Set consume to 2
+        Otherwise:
+            If next_char is equal to 61:  Note: '=' ref assign :=
+                Set token_kind to TOKEN_REF_ASSIGN
+                Set consume to 2
+            Otherwise:
+                If next_char is equal to 63:  Note: '?' dynamic type test :?
+                    Set token_kind to TOKEN_TYPE_TEST
+                    Set consume to 2
+                Otherwise:
+                    Set token_kind to TOKEN_COLON
+                    Set consume to 1
+                End If
+            End If
         End If
-        If next_char is equal to 61:  Note: '=' minus ref assign :=
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_REF_ASSIGN
-        End If
-        Return TOKEN_COLON
     End If
 
     If current is equal to 38:   Note: '&'
-        If next_char is equal to 38:  Note: '&' minus logical and &&
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_AND_OP
+        If next_char is equal to 38:  Note: '&' logical and &&
+            Set token_kind to TOKEN_AND_OP
+            Set consume to 2
+        Otherwise:
+            Set token_kind to TOKEN_ERROR
+            Set consume to 1
         End If
-        Return TOKEN_ERROR  Note: Single bitwise and not valid in F#
     End If
 
     If current is equal to 42:   Note: '*'
-        If next_char is equal to 42:  Note: '*' minus power **
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_POWER
+        If next_char is equal to 42:  Note: '*' power **
+            Set token_kind to TOKEN_POWER
+            Set consume to 2
+        Otherwise:
+            Set token_kind to TOKEN_MULTIPLY
+            Set consume to 1
         End If
-        Return TOKEN_MULTIPLY
     End If
 
     If current is equal to 46:   Note: '.'
-        If next_char is equal to 46:  Note: '.' minus range ..
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_RANGE
+        If next_char is equal to 46:  Note: '.' range ..
+            Set token_kind to TOKEN_RANGE
+            Set consume to 2
+        Otherwise:
+            Set token_kind to TOKEN_DOT
+            Set consume to 1
         End If
-        Return TOKEN_DOT
     End If
 
     If current is equal to 63:   Note: '?'
-        If next_char is equal to 63:  Note: '?' minus null coalescing ??
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_QUESTION_QUESTION
+        If next_char is equal to 63:  Note: '?' null coalescing ??
+            Set token_kind to TOKEN_QUESTION_QUESTION
+            Set consume to 2
+        Otherwise:
+            Set token_kind to TOKEN_QUESTION
+            Set consume to 1
         End If
-        Return TOKEN_QUESTION
     End If
 
     If current is equal to 64:   Note: '@'
-        If next_char is equal to 62:  Note: '>' minus quotation close @>
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_RIGHT_QUOTE
+        If next_char is equal to 62:  Note: '>' quotation close @>
+            Set token_kind to TOKEN_RIGHT_QUOTE
+            Set consume to 2
+        Otherwise:
+            Set token_kind to TOKEN_ERROR
+            Set consume to 1
         End If
-        Return TOKEN_ERROR  Note: @ must be part of string or quotation
     End If
 
     If current is equal to 33:   Note: '!'
-        proc advance_char from lexer
-        Return TOKEN_DEREF
+        Set token_kind to TOKEN_DEREF
+        Set consume to 1
     End If
 
     If current is equal to 91:   Note: '['
-        If next_char is equal to 124: Note: '|' minus array start [|
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return TOKEN_LEFT_ARRAY
+        If next_char is equal to 124: Note: '|' array start [|
+            Set token_kind to TOKEN_LEFT_ARRAY
+            Set consume to 2
+        Otherwise:
+            Set token_kind to TOKEN_LEFT_BRACKET
+            Set consume to 1
         End If
-        Return TOKEN_LEFT_BRACKET
     End If
 
-    Note: Single character operators
     If current is equal to 43:   Note: '+'
-        proc advance_char from lexer
-        Return TOKEN_PLUS
+        Set token_kind to TOKEN_PLUS
+        Set consume to 1
     End If
     If current is equal to 47:   Note: '/'
-        proc advance_char from lexer
-        Return TOKEN_DIVIDE
+        Set token_kind to TOKEN_DIVIDE
+        Set consume to 1
     End If
     If current is equal to 37:   Note: '%'
-        proc advance_char from lexer
-        Return TOKEN_MODULO
+        Set token_kind to TOKEN_MODULO
+        Set consume to 1
     End If
 
-    Return TOKEN_ERROR
+    Note: Consume the operator characters
+    Let c be 0
+    While c is less than consume:
+        proc advance_char with lexer
+        Set c to c plus 1
+    End While
+
+    Let end_pos be proc memory_get_int64 from Layout with lexer, 8
+    Let lexeme be proc fsharp_substring with source, start_pos, end_pos
+
+    Return proc create_token with token_kind, lexeme, 0, line, column
 End Process
 
 Note: ============================================================================
-Note: F# Comment Parsing
+Note: F# Comment Recognition
 Note: ============================================================================
 
 @Reasoning:
-"//" begins a line comment, but a third "/" upgrades it to an XML
-documentation comment (///) which is distinct because the documentation
-contents are preserved for tooling. Both forms terminate at newline (10)
-or CR (13) or EOF.
+"//" begins a line comment, and "///" an XML documentation comment. Both
+terminate at newline (10), CR (13), or EOF. These are skip routines: the
+tokeniser drops comments entirely rather than emitting comment tokens
+because no downstream consumer of the translation pipeline reads them.
 @End Reasoning
-Process called "read_line_comment" takes lexer as Integer returns Integer:
-    Note: Parse F# line comment starting with //
+Process called "skip_line_comment" takes lexer as Integer returns Integer:
+    Note: Skip a // or /// comment up to (not including) the line break
 
-    Let current be proc current_char from lexer
-    If current is not equal to 47:  Note: '/'
-        Return TOKEN_ERROR
-    End If
+    proc advance_char with lexer  Note: Skip first /
+    proc advance_char with lexer  Note: Skip second /
 
-    Let next_char be proc peek_char with lexer, 1
-    If next_char is not equal to 47:  Note: '/'
-        Return TOKEN_ERROR
-    End If
-
-    proc advance_char from lexer  Note: Skip first /
-    proc advance_char from lexer  Note: Skip second /
-
-    Note: Check for XML documentation comment ///
-    Set current to proc current_char from lexer
-    If current is equal to 47:  Note: '/' minus XML doc comment
-        proc advance_char from lexer
-
-        Note: Read until end of line
-        While 1:
-            Set current to proc current_char from lexer
-            If current is equal to 0:   Note: EOF
-                Break
-            End If
-            If current is equal to 10:  Note: newline
-                Break
-            End If
-            If current is equal to 13:  Note: carriage return
-                Break
-            End If
-            proc advance_char from lexer
-        End While
-
-        Return TOKEN_XML_DOC
-    End If
-
-    Note: Regular line comment - read until end of line
-    While 1:
-        Set current to proc current_char from lexer
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let current be proc current_char with lexer
         If current is equal to 0:   Note: EOF
-            Break
+            Set scanning to 0
+            Continue
         End If
-        If current is equal to 10:  Note: newline
-            Break
+        If current is equal to 10:  Note: newline stays for the NEWLINE token
+            Set scanning to 0
+            Continue
         End If
-        If current is equal to 13:  Note: carriage return
-            Break
-        End If
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
-    Return TOKEN_LINE_COMMENT
+    Return 1
 End Process
 
 @Reasoning:
 F# block comments (* ... *) nest, so we count depth rather than scan for
 a flat closer. Each new (* increments and *) decrements; unterminated
-comments (EOF mid-comment) return TOKEN_ERROR. Nesting is what
-distinguishes this from C-style /* */.
+comments (EOF mid-comment) return 0 so the caller can emit TOKEN_ERROR.
 @End Reasoning
-Process called "read_block_comment" takes lexer as Integer returns Integer:
-    Note: Parse F# block comment (* ... *)
+Process called "skip_block_comment" takes lexer as Integer returns Integer:
+    Note: Skip a nested (* ... *) comment; returns 1 on success, 0 if unterminated
 
-    Let current be proc current_char from lexer
-    If current is not equal to 40:  Note: '('
-        Return TOKEN_ERROR
-    End If
-
-    Let next_char be proc peek_char with lexer, 1
-    If next_char is not equal to 42:  Note: '*'
-        Return TOKEN_ERROR
-    End If
-
-    proc advance_char from lexer  Note: Skip (
-    proc advance_char from lexer  Note: Skip *
+    proc advance_char with lexer  Note: Skip (
+    proc advance_char with lexer  Note: Skip *
 
     Let nesting_level be 1
 
-    Note: F# block comments can be nested
     While nesting_level is greater than 0:
-        Set current to proc current_char from lexer
+        Let current be proc current_char with lexer
 
         If current is equal to 0:  Note: EOF
-            Return TOKEN_ERROR  Note: Unterminated comment
+            Return 0  Note: Unterminated comment
         End If
 
         If current is equal to 40:  Note: '('
-            Set next_char to proc peek_char with lexer, 1
-            If next_char is equal to 42:  Note: '*' minus nested comment start
+            Let next_char be proc peek_char with lexer, 1
+            If next_char is equal to 42:  Note: '*' nested comment start
                 Set nesting_level to nesting_level plus 1
-                proc advance_char from lexer
-                proc advance_char from lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
                 Continue
             End If
         End If
 
         If current is equal to 42:  Note: '*'
             Set next_char to proc peek_char with lexer, 1
-            If next_char is equal to 41:  Note: ')' minus comment end
+            If next_char is equal to 41:  Note: ')' comment end
                 Set nesting_level to nesting_level minus 1
-                proc advance_char from lexer
-                proc advance_char from lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
                 Continue
             End If
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
-    Return TOKEN_BLOCK_COMMENT
+    Return 1
 End Process
 
 Note: ============================================================================
@@ -1492,221 +2491,305 @@ Note: F# Main Tokenization Process
 Note: ============================================================================
 
 @Reasoning:
-Main tokeniser dispatch. Whitespace and skipped block comments restart
-the loop (Continue); other characters branch by lead-char into the
-matching recogniser. Newline produces TOKEN_NEWLINE because F#'s offside
-rule treats line breaks as statement boundaries.
+Main tokeniser dispatch. Whitespace and comments restart the loop;
+other characters branch by lead-char into the matching recogniser, each
+of which returns a complete token record. Newline produces a TOKEN_NEWLINE
+token because F#'s offside rule treats line breaks as statement
+boundaries. The single-quote dispatch distinguishes char literals from
+type-variable identifiers ('a) by checking whether a closing quote
+follows the quoted character.
 @End Reasoning
 Process called "next_token" takes lexer as Integer returns Integer:
-    Note: Get next token from F# source
+    Note: Get the next token record from F# source
 
-    While 1:
-        Let current be proc current_char from lexer
+    Let source be proc memory_get_int64 from Layout with lexer, 0
 
-        If current is equal to 0:  Note: EOF
-            Return TOKEN_EOF
+    Let dispatching be 1
+    While dispatching is equal to 1:
+        Let current be proc current_char with lexer
+        Let line be proc memory_get_int64 from Layout with lexer, 16
+        Let column be proc memory_get_int64 from Layout with lexer, 24
+        Let start_pos be proc memory_get_int64 from Layout with lexer, 8
+
+        Note: EOF
+        If current is equal to 0:
+            Return proc create_token with TOKEN_EOF, 0, 0, line, column
         End If
 
-        Note: Skip whitespace (but track for indentation)
-        Let is_ws be proc is_whitespace from current
+        Note: Skip horizontal whitespace
+        Let is_ws be proc is_whitespace with current
         If is_ws is equal to 1:
-            proc advance_char from lexer
+            proc advance_char with lexer
             Continue
         End If
 
-        Note: Handle newlines (significant in F#)
-        If current is equal to 10:  Note: newline
-            proc advance_char from lexer
-            Return TOKEN_NEWLINE
+        Note: Newlines are significant in F#
+        If current is equal to 10:
+            proc advance_char with lexer
+            Return proc create_token with TOKEN_NEWLINE, 0, 0, line, column
         End If
 
-        Note: Handle identifiers and keywords
-        Let is_id_start be proc is_letter from current
+        Note: Identifiers and keywords
+        Let is_id_start be proc is_letter with current
         If is_id_start is equal to 1:
-            Return proc read_identifier from lexer
+            Return proc read_identifier with lexer
         End If
 
-        Note: Handle numeric literals
-        Let is_num be proc is_digit from current
+        Note: Numeric literals
+        Let is_num be proc is_digit with current
         If is_num is equal to 1:
-            Return proc read_number_literal from lexer
+            Return proc read_number_literal with lexer
         End If
 
-        Note: Handle string literals
+        Note: String literals (regular, triple, byte)
         If current is equal to 34:  Note: '"'
-            Return proc read_string_literal from lexer
+            Return proc read_string_literal with lexer
         End If
-        If current is equal to 64:  Note: '@' minus possible verbatim string
+
+        Note: Interpolated strings $"text {expr} text"
+        If current is equal to 36:  Note: '$'
+            Let interp_next be proc peek_char with lexer, 1
+            If interp_next is equal to 34:  Note: '"'
+                proc advance_char with lexer  Note: Skip $
+                proc advance_char with lexer  Note: Skip opening quote
+                proc memory_set_int64 from Layout with lexer, 56, 1  Note: in_string = interpolation active
+                Return proc read_interp_segment with lexer, TOKEN_INTERP_STRING_START
+            End If
+        End If
+
+        Note: Verbatim strings @"..."
+        If current is equal to 64:  Note: '@'
             Let next_ch be proc peek_char with lexer, 1
             If next_ch is equal to 34:  Note: '"'
-                Return proc read_string_literal from lexer
+                Return proc read_string_literal with lexer
             End If
         End If
 
-        Note: Handle character literals
-        If current is equal to 39:  Note: '\''
-            Return proc read_char_literal from lexer
+        Note: Char literals vs type variables ('a)
+        If current is equal to 39:  Note: single quote
+            Set next_ch to proc peek_char with lexer, 1
+            If next_ch is equal to 92:  Note: escaped char literal
+                Return proc read_char_literal with lexer
+            End If
+            Let after be proc peek_char with lexer, 2
+            If after is equal to 39:  Note: 'X' closing quote - char literal
+                Return proc read_char_literal with lexer
+            End If
+            Note: Type variable 'a - lex as identifier including the apostrophe
+            proc advance_char with lexer
+            Let tv_check be proc is_letter with next_ch
+            If tv_check is equal to 1:
+                Let tv_token be proc read_identifier with lexer
+                Note: Rebuild the lexeme to include the leading apostrophe
+                Let tv_end be proc memory_get_int64 from Layout with lexer, 8
+                Let tv_lexeme be proc fsharp_substring with source, start_pos, tv_end
+                proc memory_set_int64 from Layout with tv_token, 8, tv_lexeme
+                Return tv_token
+            End If
+            Return proc create_token with TOKEN_ERROR, 0, 0, line, column
         End If
 
-        Note: Handle comments
+        Note: Comments
         If current is equal to 47:  Note: '/'
             Set next_ch to proc peek_char with lexer, 1
-            If next_ch is equal to 47:  Note: '/' minus line comment
-                Return proc read_line_comment from lexer
+            If next_ch is equal to 47:  Note: line comment or XML doc
+                proc skip_line_comment with lexer
+                Continue
             End If
         End If
         If current is equal to 40:  Note: '('
             Set next_ch to proc peek_char with lexer, 1
-            If next_ch is equal to 42:  Note: '*' minus block comment
-                Let comment_result be proc read_block_comment from lexer
-                If comment_result is equal to TOKEN_BLOCK_COMMENT:
-                    Continue  Note: Skip comments and continue
+            If next_ch is equal to 42:  Note: '*' block comment
+                Let comment_ok be proc skip_block_comment with lexer
+                If comment_ok is equal to 1:
+                    Continue
                 End If
-                Return comment_result  Note: Return error if comment parsing failed
+                Return proc create_token with TOKEN_ERROR, 0, 0, line, column
             End If
         End If
 
-        Note: Handle delimiters and punctuation
+        Note: Parentheses
         If current is equal to 40:  Note: '('
-            proc advance_char from lexer
-            Return TOKEN_LEFT_PAREN
+            proc advance_char with lexer
+            Let end1 be proc memory_get_int64 from Layout with lexer, 8
+            Let lex1 be proc fsharp_substring with source, start_pos, end1
+            Return proc create_token with TOKEN_LEFT_PAREN, lex1, 0, line, column
         End If
         If current is equal to 41:  Note: ')'
-            proc advance_char from lexer
-            Return TOKEN_RIGHT_PAREN
-        End If
-        If current is equal to 91:  Note: '['
-            Return proc read_operator from lexer  Note: Handles [| arrays
-        End If
-        If current is equal to 93:  Note: ']'
-            proc advance_char from lexer
-            Return TOKEN_RIGHT_BRACKET
-        End If
-        If current is equal to 123: Note: '{'
-            proc advance_char from lexer
-            Return TOKEN_LEFT_BRACE
-        End If
-        If current is equal to 125: Note: '}'
-            proc advance_char from lexer
-            Return TOKEN_RIGHT_BRACE
-        End If
-        If current is equal to 44:  Note: ','
-            proc advance_char from lexer
-            Return TOKEN_COMMA
-        End If
-        If current is equal to 59:  Note: ';'
-            Set next_ch to proc peek_char with lexer, 1
-            If next_ch is equal to 59:  Note: ';' minus double semicolon ;;
-                proc advance_char from lexer
-                proc advance_char from lexer
-                Return TOKEN_DOUBLE_SEMICOLON
-            End If
-            proc advance_char from lexer
-            Return TOKEN_SEMICOLON
-        End If
-        If current is equal to 35:  Note: '#'
-            proc advance_char from lexer
-            Return TOKEN_HASH
-        End If
-        If current is equal to 95:  Note: '_'
-            Set next_ch to proc peek_char with lexer, 1
-            Let is_next_id be proc is_letter from next_ch
-            If is_next_id is equal to 1:
-                Return proc read_identifier from lexer
-            End If
-            proc advance_char from lexer
-            Return TOKEN_UNDERSCORE
+            proc advance_char with lexer
+            Set end1 to proc memory_get_int64 from Layout with lexer, 8
+            Set lex1 to proc fsharp_substring with source, start_pos, end1
+            Return proc create_token with TOKEN_RIGHT_PAREN, lex1, 0, line, column
         End If
 
-        Note: Handle operators
+        Note: Brackets ([ handles [| in read_operator)
+        If current is equal to 91:  Note: '['
+            Return proc read_operator with lexer
+        End If
+        If current is equal to 93:  Note: ']'
+            proc advance_char with lexer
+            Set end1 to proc memory_get_int64 from Layout with lexer, 8
+            Set lex1 to proc fsharp_substring with source, start_pos, end1
+            Return proc create_token with TOKEN_RIGHT_BRACKET, lex1, 0, line, column
+        End If
+
+        Note: Braces. While an interpolated string is active (in_string set)
+        Note: the brace_depth slot counts braces opened inside the current
+        Note: hole; the hole-closing brace at depth 0 resumes segment reading.
+        If current is equal to 123: Note: '{'
+            Let interp_active be proc memory_get_int64 from Layout with lexer, 56
+            If interp_active is equal to 1:
+                Let hole_depth be proc memory_get_int64 from Layout with lexer, 88
+                proc memory_set_int64 from Layout with lexer, 88, hole_depth plus 1
+            End If
+            proc advance_char with lexer
+            Set end1 to proc memory_get_int64 from Layout with lexer, 8
+            Set lex1 to proc fsharp_substring with source, start_pos, end1
+            Return proc create_token with TOKEN_LEFT_BRACE, lex1, 0, line, column
+        End If
+        If current is equal to 125: Note: '}'
+            Set interp_active to proc memory_get_int64 from Layout with lexer, 56
+            If interp_active is equal to 1:
+                Set hole_depth to proc memory_get_int64 from Layout with lexer, 88
+                If hole_depth is equal to 0:
+                    Note: Hole ends; read the continuation segment
+                    proc advance_char with lexer
+                    Return proc read_interp_segment with lexer, TOKEN_INTERP_STRING_MID
+                End If
+                proc memory_set_int64 from Layout with lexer, 88, hole_depth minus 1
+            End If
+            proc advance_char with lexer
+            Set end1 to proc memory_get_int64 from Layout with lexer, 8
+            Set lex1 to proc fsharp_substring with source, start_pos, end1
+            Return proc create_token with TOKEN_RIGHT_BRACE, lex1, 0, line, column
+        End If
+
+        Note: Comma
+        If current is equal to 44:  Note: ','
+            proc advance_char with lexer
+            Set end1 to proc memory_get_int64 from Layout with lexer, 8
+            Set lex1 to proc fsharp_substring with source, start_pos, end1
+            Return proc create_token with TOKEN_COMMA, lex1, 0, line, column
+        End If
+
+        Note: Semicolons (single and the ;; top-level separator)
+        If current is equal to 59:  Note: ';'
+            Set next_ch to proc peek_char with lexer, 1
+            If next_ch is equal to 59:
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Set end1 to proc memory_get_int64 from Layout with lexer, 8
+                Set lex1 to proc fsharp_substring with source, start_pos, end1
+                Return proc create_token with TOKEN_DOUBLE_SEMICOLON, lex1, 0, line, column
+            End If
+            proc advance_char with lexer
+            Set end1 to proc memory_get_int64 from Layout with lexer, 8
+            Set lex1 to proc fsharp_substring with source, start_pos, end1
+            Return proc create_token with TOKEN_SEMICOLON, lex1, 0, line, column
+        End If
+
+        Note: Hash directives
+        If current is equal to 35:  Note: '#'
+            proc advance_char with lexer
+            Set end1 to proc memory_get_int64 from Layout with lexer, 8
+            Set lex1 to proc fsharp_substring with source, start_pos, end1
+            Return proc create_token with TOKEN_HASH, lex1, 0, line, column
+        End If
+
+        Note: Operators by lead character
         If current is equal to 124: Note: '|'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 60:  Note: '<'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 62:  Note: '>'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 45:  Note: '-'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 61:  Note: '='
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 58:  Note: ':'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 38:  Note: '&'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 42:  Note: '*'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 46:  Note: '.'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 63:  Note: '?'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 64:  Note: '@'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 33:  Note: '!'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 43:  Note: '+'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 47:  Note: '/'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
         If current is equal to 37:  Note: '%'
-            Return proc read_operator from lexer
+            Return proc read_operator with lexer
         End If
 
         Note: Unknown character
-        proc advance_char from lexer
-        Return TOKEN_ERROR
+        proc advance_char with lexer
+        Set end1 to proc memory_get_int64 from Layout with lexer, 8
+        Set lex1 to proc fsharp_substring with source, start_pos, end1
+        Return proc create_token with TOKEN_ERROR, lex1, 0, line, column
     End While
 
-    Return TOKEN_EOF
+    Return proc create_token with TOKEN_EOF, 0, 0, 0, 0
 End Process
 
 @Reasoning:
 Public entry point: creates a lexer, walks it to completion accumulating
-tokens, then destroys the lexer. The token list is built incrementally
-via list_push (terminal token at end). Errors break the loop so the
-caller can inspect what was produced before the failure.
+token records, then destroys the lexer. The terminal token (EOF or the
+first ERROR) is included in the list so the parser observes the boundary.
+Token records and their lexemes are heap-owned by the returned list's
+consumer; destroying the lexer does not invalidate them.
 @End Reasoning
 Process called "tokenize_fsharp" takes source_code as Integer returns Integer:
-    Note: Main entry point for F# tokenization
+    Note: Main entry point for F# tokenization; returns a List of token records
 
-    Let lexer be proc create_fsharp_lexer from source_code
+    Let lexer be proc create_fsharp_lexer with source_code
     If lexer is equal to 0:
         Return 0
     End If
 
     Let token_list be proc list_create from List
     If token_list is equal to 0:
-        proc destroy_fsharp_lexer from lexer
+        proc destroy_fsharp_lexer with lexer
         Return 0
     End If
 
-    While 1:
-        Let token be proc next_token from lexer
+    Let lexing be 1
+    While lexing is equal to 1:
+        Let token be proc next_token with lexer
 
-        proc list_push from List with token_list, token
+        proc list_append from List with token_list, token
 
-        If token is equal to TOKEN_EOF:
-            Break
+        Let token_kind be proc get_token_type with token
+        If token_kind is equal to TOKEN_EOF:
+            Set lexing to 0
         End If
-        If token is equal to TOKEN_ERROR:
-            Break
+        If token_kind is equal to TOKEN_ERROR:
+            Set lexing to 0
         End If
     End While
 
-    proc destroy_fsharp_lexer from lexer
+    proc destroy_fsharp_lexer with lexer
     Return token_list
 End Process
 

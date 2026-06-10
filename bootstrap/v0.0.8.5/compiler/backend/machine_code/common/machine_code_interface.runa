@@ -278,10 +278,10 @@ Process called "create_assembly_output" that takes arena as Integer returns Inte
     End If
 
     Note: Create string buffers for each section (initial capacity 4096 bytes)
-    Let text_buf be StringUtils.string_create(arena, 4096)
-    Let data_buf be StringUtils.string_create(arena, 4096)
-    Let rodata_buf be StringUtils.string_create(arena, 4096)
-    Let bss_buf be StringUtils.string_create(arena, 1024)
+    Let text_buf be StringUtils.stringbuffer_create(arena, 4096)
+    Let data_buf be StringUtils.stringbuffer_create(arena, 4096)
+    Let rodata_buf be StringUtils.stringbuffer_create(arena, 4096)
+    Let bss_buf be StringUtils.stringbuffer_create(arena, 1024)
 
     Note: Store section buffers
     __store(output, 0, text_buf)
@@ -337,7 +337,7 @@ Process called "asm_emit_to_section" that takes output as Integer, section as In
     End If
 
     Note: Append the text to the section buffer
-    Let result be StringUtils.string_append(buffer, text)
+    Let result be StringUtils.stringbuffer_append(buffer, text)
 
     Note: Increment line counter
     Let lines be __load(output, 80)
@@ -369,10 +369,53 @@ Process called "asm_emit_line" that takes output as Integer, section as Integer,
     End If
 
     If buffer is not 0:
-        StringUtils.string_append(buffer, "\n")
+        StringUtils.stringbuffer_append(buffer, "\n")
     End If
 
     Return 1
+End Process
+
+@Reasoning
+emit_text and emit_int are the section-implicit text emission API used by the
+MIPS, PowerPC, and WASM assembly generators. Those backends emit one linear
+instruction stream and do not pass an explicit section on every call, so these
+functions route through the AssemblyOutput's current_section field (offset 72,
+initialized to SECTION_TEXT by create_assembly_output). emit_int renders the
+value in decimal: every call site interleaves it with emit_text to build
+instruction operands (frame offsets, immediates, shift amounts, WASM local
+indices), all of which are decimal integers in the emitted assembly text.
+@End Reasoning
+
+Process called "emit_text" that takes output as Integer, text as Integer returns Integer:
+    Note: Appends null-terminated text to the currently active section of an
+    Note: AssemblyOutput. Returns 1 on success, 0 on failure.
+    If output is 0:
+        Return 0
+    End If
+    If text is 0:
+        Return 0
+    End If
+    Let section be __load(output, 72)
+    Return asm_emit_to_section(output, section, text)
+End Process
+
+Process called "emit_int" that takes output as Integer, value as Integer returns Integer:
+    Note: Appends the decimal text representation of value (negative values
+    Note: included) to the currently active section of an AssemblyOutput.
+    Note: Returns 1 on success, 0 on failure.
+    If output is 0:
+        Return 0
+    End If
+    Let text be StringUtils.integer_to_string(value)
+    If text is 0:
+        Return 0
+    End If
+    Let section be __load(output, 72)
+    Let result be asm_emit_to_section(output, section, text)
+    Note: integer_to_string returns an owned allocation; the section buffer
+    Note: copied the characters, so release the temporary here.
+    Layout.deallocate(text)
+    Return result
 End Process
 
 Process called "asm_get_unique_label" that takes output as Integer returns Integer:
@@ -406,12 +449,12 @@ Process called "asm_register_string_literal" that takes output as Integer, conte
     Note: Generate new string label (.LC0, .LC1, etc.)
     Let str_count be __load(output, 40)
     Let arena be __load(output, 88)
-    Let label_buf be StringUtils.string_create(arena, 16)
-    StringUtils.string_append(label_buf, ".LC")
+    Let label_buf be StringUtils.stringbuffer_create(arena, 16)
+    StringUtils.stringbuffer_append(label_buf, ".LC")
 
     Note: Convert counter to string and append
-    Let counter_str be StringCore.integer_to_string(str_count)
-    StringUtils.string_append(label_buf, counter_str)
+    Let counter_str be StringUtils.integer_to_string(str_count)
+    StringUtils.stringbuffer_append(label_buf, counter_str)
 
     Note: Get the label string pointer
     Let label_ptr be __load(label_buf, 0)
@@ -553,6 +596,129 @@ Process called "binary_emit_qword" that takes output as Integer, qword_val as In
     Note: Emits a 64-bit little-endian value to the code buffer
     binary_emit_dword(output, qword_val bitwise and 4294967295)
     binary_emit_dword(output, (qword_val shifted right by 32) bitwise and 4294967295)
+    Return 1
+End Process
+
+@Reasoning
+emit_byte, create_output_buffer, get_output_size, and copy_output form the
+binary emission API used by the MIPS/PowerPC/WASM instruction encoders, the
+WASM binary module encoder, and the AOTT bytecode generator. emit_byte is the
+single primitive every multi-byte encoder builds on. create_output_buffer
+produces a standalone BinaryOutput sized for a caller-chosen workload; the
+WASM encoder uses these as scratch buffers to build section bodies whose byte
+length must be measured (get_output_size) and LEB128-prefixed before the body
+is appended to the final module stream (copy_output). copy_output is
+non-destructive: the source buffer remains valid and owned by the caller.
+@End Reasoning
+
+Process called "emit_byte" that takes output as Integer, byte_val as Integer returns Integer:
+    Note: Appends one byte (the low 8 bits of byte_val) to the code buffer of
+    Note: a BinaryOutput, growing the buffer as needed.
+    Note: Returns 1 on success, 0 on failure.
+    Let masked be byte_val bitwise and 255
+    Return binary_emit_byte(output, masked)
+End Process
+
+Process called "create_output_buffer" that takes capacity as Integer returns Integer:
+    Note: Creates a standalone BinaryOutput whose code buffer starts at the
+    Note: requested capacity (minimum 64 bytes so capacity-doubling growth
+    Note: always has a non-zero base). The data/rodata buffers and the
+    Note: relocation/symbol lists are initialized small but fully valid, so
+    Note: the returned handle satisfies the complete BinaryOutput contract.
+    Note: Returns the BinaryOutput pointer, or 0 on allocation failure.
+    Let use_capacity be capacity
+    If use_capacity is less than 64:
+        Set use_capacity to 64
+    End If
+
+    Let output be Layout.allocate(112)
+    If output is 0:
+        Return 0
+    End If
+
+    Let code_buf be Layout.allocate(use_capacity)
+    If code_buf is 0:
+        Layout.deallocate(output)
+        Return 0
+    End If
+    __store(output, 0, code_buf)
+    __store(output, 8, 0)
+    __store(output, 16, use_capacity)
+
+    Let data_buf be Layout.allocate(64)
+    If data_buf is 0:
+        Layout.deallocate(code_buf)
+        Layout.deallocate(output)
+        Return 0
+    End If
+    __store(output, 24, data_buf)
+    __store(output, 32, 0)
+    __store(output, 40, 64)
+
+    Let rodata_buf be Layout.allocate(64)
+    If rodata_buf is 0:
+        Layout.deallocate(data_buf)
+        Layout.deallocate(code_buf)
+        Layout.deallocate(output)
+        Return 0
+    End If
+    __store(output, 48, rodata_buf)
+    __store(output, 56, 0)
+    __store(output, 64, 64)
+
+    Let relocs be List.list_create(8)
+    __store(output, 72, relocs)
+    __store(output, 80, 0)
+
+    Let syms be List.list_create(8)
+    __store(output, 88, syms)
+    __store(output, 96, 0)
+
+    Note: Scratch buffers are owned-heap allocations with no arena
+    __store(output, 104, 0)
+
+    Return output
+End Process
+
+Process called "get_output_size" that takes output as Integer returns Integer:
+    Note: Returns the number of bytes currently held in the code buffer of a
+    Note: BinaryOutput, or 0 if output is null.
+    If output is 0:
+        Return 0
+    End If
+    Return __load(output, 8)
+End Process
+
+Process called "copy_output" that takes source as Integer, dest as Integer returns Integer:
+    Note: Appends the entire code-buffer contents of source onto the code
+    Note: buffer of dest, growing dest as needed. The source buffer is not
+    Note: modified or freed. Returns 1 on success, 0 on failure.
+    If source is 0:
+        Return 0
+    End If
+    If dest is 0:
+        Return 0
+    End If
+
+    Let src_buf be __load(source, 0)
+    Let src_size be __load(source, 8)
+    If src_size is 0:
+        Return 1
+    End If
+    If src_buf is 0:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than src_size:
+        Let b be __load8(src_buf, i)
+        Let ok be binary_emit_byte(dest, b)
+        If ok is 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
     Return 1
 End Process
 
@@ -818,12 +984,12 @@ Process called "asm_finalize" that takes output as Integer, config as Integer re
     End If
 
     Let arena be __load(output, 88)
-    Let final_buf be StringUtils.string_create(arena, 16384)
+    Let final_buf be StringUtils.stringbuffer_create(arena, 16384)
 
     Note: Emit file-level directives
     Let arch be __load(config, 0)
     If arch is TARGET_ARCH_X86_64:
-        StringUtils.string_append(final_buf, "\t.file\t\"output.s\"\n")
+        StringUtils.stringbuffer_append(final_buf, "\t.file\t\"output.s\"\n")
     End If
 
     Note: Emit .extern declarations for external symbols
@@ -834,9 +1000,9 @@ Process called "asm_finalize" that takes output as Integer, config as Integer re
         While ei is less than ext_count:
             Let ext_name be List.list_get(externals, ei)
             If ext_name is not 0:
-                StringUtils.string_append(final_buf, "\t.extern\t")
-                StringUtils.string_append(final_buf, ext_name)
-                StringUtils.string_append(final_buf, "\n")
+                StringUtils.stringbuffer_append(final_buf, "\t.extern\t")
+                StringUtils.stringbuffer_append(final_buf, ext_name)
+                StringUtils.stringbuffer_append(final_buf, "\n")
             End If
             Set ei to ei plus 1
         End While
@@ -850,9 +1016,9 @@ Process called "asm_finalize" that takes output as Integer, config as Integer re
         While gi is less than gl_count:
             Let gl_name be List.list_get(globals, gi)
             If gl_name is not 0:
-                StringUtils.string_append(final_buf, "\t.globl\t")
-                StringUtils.string_append(final_buf, gl_name)
-                StringUtils.string_append(final_buf, "\n")
+                StringUtils.stringbuffer_append(final_buf, "\t.globl\t")
+                StringUtils.stringbuffer_append(final_buf, gl_name)
+                StringUtils.stringbuffer_append(final_buf, "\n")
             End If
             Set gi to gi plus 1
         End While
@@ -863,9 +1029,9 @@ Process called "asm_finalize" that takes output as Integer, config as Integer re
     If rodata_buf is not 0:
         Let rodata_len be __load(rodata_buf, 8)
         If rodata_len is greater than 0:
-            StringUtils.string_append(final_buf, "\n\t.section\t.rodata\n")
+            StringUtils.stringbuffer_append(final_buf, "\n\t.section\t.rodata\n")
             Let rodata_text be __load(rodata_buf, 0)
-            StringUtils.string_append(final_buf, rodata_text)
+            StringUtils.stringbuffer_append(final_buf, rodata_text)
         End If
     End If
 
@@ -874,9 +1040,9 @@ Process called "asm_finalize" that takes output as Integer, config as Integer re
     If data_buf is not 0:
         Let data_len be __load(data_buf, 8)
         If data_len is greater than 0:
-            StringUtils.string_append(final_buf, "\n\t.data\n")
+            StringUtils.stringbuffer_append(final_buf, "\n\t.data\n")
             Let data_text be __load(data_buf, 0)
-            StringUtils.string_append(final_buf, data_text)
+            StringUtils.stringbuffer_append(final_buf, data_text)
         End If
     End If
 
@@ -885,24 +1051,24 @@ Process called "asm_finalize" that takes output as Integer, config as Integer re
     If bss_buf is not 0:
         Let bss_len be __load(bss_buf, 8)
         If bss_len is greater than 0:
-            StringUtils.string_append(final_buf, "\n\t.bss\n")
+            StringUtils.stringbuffer_append(final_buf, "\n\t.bss\n")
             Let bss_text be __load(bss_buf, 0)
-            StringUtils.string_append(final_buf, bss_text)
+            StringUtils.stringbuffer_append(final_buf, bss_text)
         End If
     End If
 
     Note: Emit .text section (executable code)
     Let text_buf be __load(output, 0)
     If text_buf is not 0:
-        StringUtils.string_append(final_buf, "\n\t.text\n")
+        StringUtils.stringbuffer_append(final_buf, "\n\t.text\n")
         Let text_content be __load(text_buf, 0)
-        StringUtils.string_append(final_buf, text_content)
+        StringUtils.stringbuffer_append(final_buf, text_content)
     End If
 
     Note: Emit section note for non-executable stack (Linux security)
     Let os be __load(config, 8)
     If os is TARGET_OS_LINUX:
-        StringUtils.string_append(final_buf, "\n\t.section\t.note.GNU-stack,\"\",@progbits\n")
+        StringUtils.stringbuffer_append(final_buf, "\n\t.section\t.note.GNU-stack,\"\",@progbits\n")
     End If
 
     Return __load(final_buf, 0)

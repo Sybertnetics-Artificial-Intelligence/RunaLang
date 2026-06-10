@@ -18,34 +18,45 @@ Note:
 F# Parser - Complete parsing for F# functional programming language
 
 This file provides comprehensive parsing for the F# programming language,
-building an Abstract Syntax Tree (AST) from tokens. Handles both functional
-programming constructs and .NET integration features.
+building an Abstract Syntax Tree (AST) from token records produced by
+fsharp_lexer. Tokens are 40-byte records (type, lexeme, value, line,
+column); the parser stores token record pointers in AST value slots so
+the HIR translator can recover identifier names and literal payloads via
+the lexer's get_token_text/get_token_value/get_token_type accessors.
+
+AST node layout (48 bytes, arena-allocated):
+- node_type @0
+- value @8        (token record pointer, or an operator token-type tag for
+                   pipe nodes / the TOKEN_REC tag for recursive bindings)
+- children @16    (List of child node pointers)
+- child_count @24
+- parent @32
+- metadata @40    (optional type-annotation node for let bindings)
 
 F# Features Parsed:
-- Module declarations and namespace organization
-- Function definitions with pattern matching and guards
+- Module declarations and namespace organization (dotted paths)
+- Function definitions desugared to let + lambda
 - Type definitions (records, discriminated unions, classes, interfaces)
 - Pattern matching expressions with when guards
-- Computation expressions (async, seq, query workflows)
-- Lambda expressions and function composition
-- Pipeline operators and functional combinators
-- Object-oriented features (classes, interfaces, inheritance)
-- Exception handling (try-catch-finally, active patterns)
-- .NET interop and attribute annotations
-- Unit of measure types and numeric literals
-- Quotations and meta-programming constructs
+- Lambda expressions and the function-expression sugar
+- Pipeline operators, function/operator application with precedence
+- Exception handling (try/with/finally)
+- Loops (while/do, for/in, for/=..to/downto)
+- Collections (lists, arrays, records, tuples), quotations
 
 Dependencies:
-- fsharp_lexer.runa (token definitions and lexer)
+- fsharp_lexer.runa (token records, accessors, token type constants)
 - compiler/frontend/primitives/core/string_core.runa
 - compiler/frontend/primitives/memory/layout.runa
 - compiler/frontend/primitives/collections/list.runa
+- compiler/internal/string_utils.runa
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_lexer.runa" as Lexer
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: F# AST Node Type Constants
@@ -96,6 +107,7 @@ Constant AST_TUPLE_EXPRESSION as Integer is 4015    Note: Tuple literal
 Constant AST_RECORD_EXPRESSION as Integer is 4016   Note: Record expression
 Constant AST_LIST_EXPRESSION as Integer is 4017     Note: List literal
 Constant AST_ARRAY_EXPRESSION as Integer is 4018    Note: Array literal
+Constant AST_INTERPOLATED_STRING as Integer is 4019 Note: $"text {expr} text" interpolation
 
 Note: Patterns
 Constant AST_PATTERN_VARIABLE as Integer is 5001    Note: Variable pattern
@@ -110,6 +122,7 @@ Constant AST_PATTERN_ARRAY as Integer is 5009       Note: Array pattern
 Constant AST_PATTERN_RECORD as Integer is 5010      Note: Record pattern
 Constant AST_PATTERN_ACTIVE as Integer is 5011      Note: Active pattern
 Constant AST_PATTERN_GUARD as Integer is 5012       Note: Pattern with guard (when)
+Constant AST_PATTERN_TYPE_TEST as Integer is 5013   Note: :? Type dynamic type-test pattern
 
 Note: Types
 Constant AST_TYPE_NAME as Integer is 6001           Note: Type name
@@ -141,32 +154,22 @@ Note: F# Parser State and Structure
 Note: ============================================================================
 
 @Reasoning:
-F# parsing is more involved than a typical LL(1) parser because the
-language is layout-sensitive (indentation matters inside modules and
-type bodies) and produces a large AST. The parser carries an arena
-allocator so AST nodes can be bulk-released after parsing without
-walking the tree to free individual nodes. indent_level is tracked
-separately from position so layout-sensitive productions can compare
-the current token's column against the enclosing block's indent.
+F# parsing carries a position cursor over the token-record list plus a
+cached current token so productions avoid a second list_get when only the
+lookahead type is needed. The parser owns an arena so AST nodes can be
+bulk-allocated; on the success path the arena's ownership transfers to
+the AST consumer (the HIR translator reads the tree after the parser
+record is gone), so only the error path destroys it.
 @End Reasoning
-
 @Implementation:
-64-byte record laid out as:
-- tokens @0 - List of token integers from the lexer
-- position @8 - Index into the tokens list
-- current_token @16 - Cached token at position (refreshed by
-  advance_token)
-- token_count @24 - Length of tokens list, captured at construction
-- error_message @32 - Pointer to error message string (or 0)
-- has_error @40 - Sticky 1 on first parse error
-- indent_level @48 - Tracks the current indentation column
-- arena @56 - Arena for AST node allocations, released by
-  destroy_fsharp_parser
+64-byte record laid out as: tokens @0 (List of token record pointers),
+position @8, current_token @16 (cached token pointer), token_count @24,
+error_message @32, has_error @40, indent_level @48, arena @56.
 @End Implementation
 Type called "FSharpParser":
-    tokens as Integer           Note: List of tokens from lexer
+    tokens as Integer           Note: List of token records from lexer
     position as Integer         Note: Current position in token list
-    current_token as Integer    Note: Current token being processed
+    current_token as Integer    Note: Current token record pointer
     token_count as Integer      Note: Total number of tokens
     error_message as Integer    Note: Error message string
     has_error as Integer        Note: Error flag
@@ -179,37 +182,16 @@ Note: Parser Creation and Management
 Note: ============================================================================
 
 @Reasoning:
-F# is layout-sensitive (indentation matters for let/in, match arms,
-record fields, etc.) so the parser must thread an indent_level
-counter alongside the conventional position cursor. Caching the current
-token in the struct (offset 16) makes the inner loop avoid a second
-list_get when only the type is needed to make a continuation decision.
-The arena pinned to the parser owns every AST node allocated during
-this parse so the whole subtree can be released in a single O(1)
-destroy_arena call, regardless of how deep the program nests.
+Allocates the parser record, captures the token count once, pre-loads the
+first token into the cache, and creates the AST arena. 1 MB arena
+capacity: Layout arenas are mmap-backed with lazy page commit, so the
+large initial size costs nothing physical while guaranteeing capacity for
+a full parse run.
 @End Reasoning
-
-@Implementation:
-Allocates a 64-byte FSharpParser struct (8 fields x 8 bytes). On
-allocation failure returns 0 so callers see the same handle pattern as
-the rest of the system. Writes token_list at offset 0, zeros position
-(8), reads list_length once into offset 24, and pre-loads the first
-token into offset 16 when count > 0 (otherwise leaves it 0). The
-error_message (32), has_error (40), and indent_level (48) slots are
-zeroed, then a fresh Layout arena is created and stored at offset 56.
-The arena is the AST-node owner; the token_list pointer at offset 0 is
-borrowed - the lexer keeps ownership of it.
-@End Implementation
 Process called "create_fsharp_parser" takes token_list as Integer returns Integer:
     Note: Create F# parser instance
 
-    @Reasoning:
-    The F# parser must handle both functional programming constructs
-    and object-oriented features from .NET. It tracks indentation for
-    F#'s layout-sensitive syntax and manages memory for AST nodes.
-    @End Reasoning
-
-    Let parser_size be 64  Note: FSharpParser: 8 fields × 8 bytes
+    Let parser_size be 64  Note: FSharpParser: 8 fields x 8 bytes
     Let parser be proc allocate from Layout with parser_size
 
     If parser is equal to 0:
@@ -234,26 +216,20 @@ Process called "create_fsharp_parser" takes token_list as Integer returns Intege
     proc memory_set_int64 from Layout with parser, 40, 0  Note: has_error = false
     proc memory_set_int64 from Layout with parser, 48, 0  Note: indent_level = 0
 
-    Let arena be proc create_arena from Layout
+    Let arena be proc arena_create from Layout with 1048576
     proc memory_set_int64 from Layout with parser, 56, arena
 
     Return parser
 End Process
 
 @Reasoning:
-Releases both the AST-node arena and the parser record itself. The
-arena release is what frees every AST node in O(1) regardless of tree
-depth - that's the entire reason the parser uses an arena rather than
-per-node Layout.allocate.
+Error-path destructor: releases the AST arena (every node in O(1)) and
+the parser record. The success path of parse_fsharp_source deliberately
+does NOT call this - the arena owns the returned AST so it must outlive
+the parser record there.
 @End Reasoning
-
-@Implementation:
-Returns 1 immediately on null parser. Reads arena at offset 56; if
-non-zero calls destroy_arena to release every node allocated through
-arena_allocate. Deallocates the parser record itself. Returns 1.
-@End Implementation
 Process called "destroy_fsharp_parser" takes parser as Integer returns Integer:
-    Note: Destroy F# parser and free resources
+    Note: Destroy F# parser and free resources including the AST arena
 
     If parser is equal to 0:
         Return 1
@@ -261,7 +237,7 @@ Process called "destroy_fsharp_parser" takes parser as Integer returns Integer:
 
     Let arena be proc memory_get_int64 from Layout with parser, 56
     If arena is not equal to 0:
-        proc destroy_arena from Layout with arena
+        proc arena_destroy from Layout with arena
     End If
 
     proc deallocate from Layout with parser
@@ -273,37 +249,37 @@ Note: Token Access and Navigation
 Note: ============================================================================
 
 @Reasoning:
-Returns the parser's cached lookahead token. Cached (rather than
-re-reading from the list each call) because every grammar production
-checks current_token at least once, often several times in the same
-helper.
+Returns the cached current token record pointer. Cached because every
+grammar production reads the lookahead at least once, often several
+times in the same helper.
 @End Reasoning
-
-@Implementation:
-Reads parser offset 16 (current_token) and returns it directly.
-@End Implementation
 Process called "current_token" takes parser as Integer returns Integer:
-    Note: Get current token
+    Note: Get current token record pointer
 
     Return proc memory_get_int64 from Layout with parser, 16
 End Process
 
 @Reasoning:
-Multi-step lookahead used by productions that need to distinguish
-ambiguous forms (e.g. `()` unit value vs `(expr)` parenthesised
-expression both start with `(`). Returns 0 when peeking past the end
-so callers can compare against any expected token without first
-checking bounds.
+Type-level lookahead: the overwhelmingly common parser question is "what
+KIND of token is next", so this composes the cache read with the lexer's
+null-safe type accessor (null reads as TOKEN_EOF, giving uniform
+end-of-input behavior at every call site).
 @End Reasoning
+Process called "current_token_type" takes parser as Integer returns Integer:
+    Note: Get the type tag of the current token (TOKEN_EOF past end)
 
-@Implementation:
-Reads position (offset 8), token_count (offset 24). Computes peek_pos
-= position + offset. If peek_pos >= token_count, returns 0 (EOF
-sentinel). Otherwise reads tokens (offset 0) as a list and returns
-list_get(tokens, peek_pos).
-@End Implementation
+    Let token be proc memory_get_int64 from Layout with parser, 16
+    Return proc get_token_type from Lexer with token
+End Process
+
+@Reasoning:
+Multi-step lookahead used by productions that need to distinguish
+ambiguous forms (e.g. `()` unit vs `(expr)` parenthesised expression, or
+dotted-name continuation). Returns 0 when peeking past the end so the
+type-level wrapper reads TOKEN_EOF there.
+@End Reasoning
 Process called "peek_token" takes parser as Integer, offset as Integer returns Integer:
-    Note: Peek token at offset from current position
+    Note: Peek token record at offset from current position
 
     Let position be proc memory_get_int64 from Layout with parser, 8
     Let token_count be proc memory_get_int64 from Layout with parser, 24
@@ -317,20 +293,19 @@ Process called "peek_token" takes parser as Integer, offset as Integer returns I
     Return proc list_get from List with tokens, peek_pos
 End Process
 
+Process called "peek_token_type" takes parser as Integer, offset as Integer returns Integer:
+    Note: Peek the type tag at offset from current position (TOKEN_EOF past end)
+
+    Let token be proc peek_token with parser, offset
+    Return proc get_token_type from Lexer with token
+End Process
+
 @Reasoning:
 Consumes one token by incrementing position and refreshing the cached
-current_token slot. Setting current_token to 0 past EOF lets
-productions terminate on null-token tests rather than needing a
-separate at_eof helper.
+current_token slot. Setting the cache to 0 past EOF lets productions
+terminate on TOKEN_EOF type tests rather than needing a separate at_eof
+helper.
 @End Reasoning
-
-@Implementation:
-Reads position and token_count. If position >= token_count returns 0
-(already at EOF, no-op). Otherwise increments position by 1 and
-stores it back. If the new position is still within bounds, reads
-tokens[position] and caches it at offset 16. Otherwise zeros offset
-16. Returns 1.
-@End Implementation
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -338,7 +313,7 @@ Process called "advance_token" takes parser as Integer returns Integer:
     Let token_count be proc memory_get_int64 from Layout with parser, 24
 
     If position is greater than or equal to token_count:
-        Return 0  Note: EOF
+        Return 0  Note: already at EOF
     End If
 
     Set position to position plus 1
@@ -358,23 +333,16 @@ End Process
 
 @Reasoning:
 Implements the "this token MUST be present" contract for mandatory
-keywords (e.g. `then` after `if cond`). On mismatch sets the sticky
-error flag and returns 0 so the rest of the parse continues building
-a partial tree the caller can still inspect for diagnostics.
+syntax (e.g. `then` after `if cond`). On mismatch sets the sticky error
+flag and returns 0 so the caller can abort its production.
 @End Reasoning
+Process called "consume_token" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: Consume a token of the expected type or report an error
 
-@Implementation:
-Reads current_token. If equal to expected_token advances and returns
-1. Otherwise calls set_parse_error with a generic "Unexpected token"
-message and returns 0.
-@End Implementation
-Process called "consume_token" takes parser as Integer, expected_token as Integer returns Integer:
-    Note: Consume expected token or report error
+    Let current_type be proc current_token_type with parser
 
-    Let current be proc current_token from parser
-
-    If current is equal to expected_token:
-        proc advance_token from parser
+    If current_type is equal to expected_type:
+        proc advance_token with parser
         Return 1
     End If
 
@@ -382,32 +350,44 @@ Process called "consume_token" takes parser as Integer, expected_token as Intege
     Return 0
 End Process
 
+@Reasoning:
+F#'s offside rule treats newlines as soft statement boundaries; inside
+multi-line constructs (after `=`, after `then`, between match arms) the
+grammar permits any number of line breaks. The lexer emits TOKEN_NEWLINE
+records so this helper drains them at exactly the production points
+where line breaks are insignificant.
+@End Reasoning
+Process called "skip_newlines" takes parser as Integer returns Integer:
+    Note: Advance past any run of newline tokens
+
+    Let skipping be 1
+    While skipping is equal to 1:
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            Set skipping to 0
+        End If
+    End While
+
+    Return 1
+End Process
+
 Note: ============================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
 @Reasoning:
-Every AST node has the same fixed 48-byte layout and is arena-
-allocated so creation is essentially a pointer bump. Zero-
-initializing every field at construction means consumers can rely on
-0 to mean "absent" for value, children, parent, and metadata without
-needing extra null checks at field set points.
+Every AST node has the same fixed 48-byte layout and is arena-allocated
+so creation is essentially a pointer bump. Zero-initializing every field
+at construction means consumers can rely on 0 meaning "absent" for
+value, children, parent, and metadata without extra null checks.
 @End Reasoning
-
-@Implementation:
-Reads arena from parser offset 56. Allocates 48 bytes via
-arena_allocate. Returns 0 on allocation failure. Zeros all six
-fields:
-- node_type @0 (set to the provided type)
-- value @8, children @16, child_count @24, parent @32, metadata @40
-  (all zero).
-Returns the node pointer.
-@End Implementation
 Process called "create_ast_node" takes parser as Integer, node_type as Integer returns Integer:
     Note: Create AST node with specified type
 
     Let arena be proc memory_get_int64 from Layout with parser, 56
-    Let node_size be 48  Note: Standard AST node: type plus value plus children plus count plus parent plus metadata
+    Let node_size be 48  Note: type + value + children + count + parent + metadata
     Let node be proc arena_allocate from Layout with arena, node_size
 
     If node is equal to 0:
@@ -425,23 +405,14 @@ Process called "create_ast_node" takes parser as Integer, node_type as Integer r
 End Process
 
 @Reasoning:
-Children are stored in a fixed-size array allocated lazily on first
-add. The current implementation allocates an 8-slot array (64 bytes)
-on demand and never grows it - this is sufficient for every F#
-production in the parser but it does mean nodes with more than eight
-children would silently truncate. The parser only constructs such
-arrays for the productions that actually need them, keeping the
-common-case overhead at zero.
+Children are stored in a canonical List (compiler/frontend/primitives/
+collections/list.runa) created lazily on first add. The List grows
+without bound so wide nodes (match expressions with many arms, modules
+with many declarations) are handled correctly, and the HIR translator
+reads children through the same list_get surface. child_count at offset
+24 mirrors list_length so consumers can read the arity without a List
+call.
 @End Reasoning
-
-@Implementation:
-Returns 0 if parent or child is 0. Reads children pointer at parent
-offset 16 and child_count at offset 24. If children is 0, allocates
-an 8*8 byte array via Layout.allocate (start with 8 slots) and
-stores the pointer at offset 16. Writes child at children +
-child_count*8. Sets child's parent backpointer at child offset 32 to
-parent. Updates parent's child_count to child_count + 1. Returns 1.
-@End Implementation
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Note: Add child node to parent AST node
 
@@ -455,39 +426,27 @@ Process called "add_child" takes parent as Integer, child as Integer returns Int
     Let children be proc memory_get_int64 from Layout with parent, 16
     Let child_count be proc memory_get_int64 from Layout with parent, 24
 
-    Note: Create children array if it doesn't exist
     If children is equal to 0:
-        Let array_size be 8 multiplied by 8  Note: Start with 8 children
-        Set children to proc allocate from Layout with array_size
+        Set children to proc list_create from List
         If children is equal to 0:
             Return 0
         End If
         proc memory_set_int64 from Layout with parent, 16, children
     End If
 
-    Note: Add child to array
-    Let child_offset be child_count multiplied by 8
-    proc memory_set_int64 from Layout with children, child_offset, child
+    proc list_append from List with children, child
 
-    Note: Set parent reference
     proc memory_set_int64 from Layout with child, 32, parent
-
-    Note: Update child count
     proc memory_set_int64 from Layout with parent, 24, child_count plus 1
 
     Return 1
 End Process
 
 @Reasoning:
-Null-safe value setter so productions that conditionally store a
-value (e.g. variable patterns whose identifier token is the value)
-don't need to null-check first.
+Null-safe value setter so productions that conditionally store a value
+(token record pointers for identifiers/literals, operator tags for pipe
+nodes) don't need to null-check first.
 @End Reasoning
-
-@Implementation:
-Returns 0 if node is 0. Otherwise stores value at node offset 8.
-Returns 1.
-@End Implementation
 Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
     Note: Set value of AST node
 
@@ -505,34 +464,20 @@ Note: ==========================================================================
 
 @Reasoning:
 Records the first parse error and sets a sticky flag so subsequent
-productions can short-circuit. We don't overwrite an already-set
-error message in this implementation because the first error is
-typically the most useful, but the sticky flag is what callers
-actually test.
+productions can short-circuit. The first error is typically the most
+useful so an existing message is not overwritten.
 @End Reasoning
-
-@Implementation:
-Stores message at parser offset 32 (error_message) and writes 1 to
-offset 40 (has_error). Returns 1.
-@End Implementation
 Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
     Note: Set parse error message
 
-    proc memory_set_int64 from Layout with parser, 32, message
+    Let existing be proc memory_get_int64 from Layout with parser, 32
+    If existing is equal to 0:
+        proc memory_set_int64 from Layout with parser, 32, message
+    End If
     proc memory_set_int64 from Layout with parser, 40, 1  Note: has_error = true
     Return 1
 End Process
 
-@Reasoning:
-Returns the sticky error flag for callers that need to abort
-post-hoc (e.g. parse_fsharp_source destroys the parser and returns 0
-if any error was raised during parsing).
-@End Reasoning
-
-@Implementation:
-Returns the integer at parser offset 40 (has_error). 0 means no
-error; 1 means at least one set_parse_error call was made.
-@End Implementation
 Process called "has_parse_error" takes parser as Integer returns Integer:
     Note: Check if parser has error
 
@@ -540,126 +485,307 @@ Process called "has_parse_error" takes parser as Integer returns Integer:
 End Process
 
 Note: ============================================================================
-Note: F# Expression Parsing
+Note: Dotted Name Handling
 Note: ============================================================================
 
+@Reasoning:
+F# qualified names (List.map, System.Collections, My.App namespace
+paths) arrive from the lexer as alternating identifier and dot tokens.
+Productions that treat the whole path as one name (identifiers in
+expressions, open targets, namespace names, type references) call this
+helper: it consumes the leading name token plus any .name continuations
+and returns one token record whose lexeme is the joined dotted spelling.
+When no dot follows, the original token is returned unchanged so the
+common case allocates nothing.
+@End Reasoning
+Process called "parse_dotted_name_token" takes parser as Integer returns Integer:
+    Note: Consume identifier (.identifier)* and return a single name token
+
+    Let first be proc current_token with parser
+    Let first_type be proc get_token_type from Lexer with first
+    Let line be proc get_token_line from Lexer with first
+    Let column be proc get_token_column from Lexer with first
+    proc advance_token with parser
+
+    Let name_text be proc get_token_text from Lexer with first
+    Let saw_dot be 0
+
+    Let joining be 1
+    While joining is equal to 1:
+        Let cur_type be proc current_token_type with parser
+        If cur_type is not equal to TOKEN_DOT from Lexer:
+            Set joining to 0
+            Continue
+        End If
+
+        Let after_type be proc peek_token_type with parser, 1
+        Let is_name be 0
+        If after_type is equal to TOKEN_IDENTIFIER from Lexer:
+            Set is_name to 1
+        End If
+        If after_type is equal to TOKEN_TYPE_NAME from Lexer:
+            Set is_name to 1
+        End If
+        If is_name is equal to 0:
+            Set joining to 0
+            Continue
+        End If
+
+        proc advance_token with parser  Note: consume '.'
+        Let part be proc current_token with parser
+        Let part_text be proc get_token_text from Lexer with part
+        proc advance_token with parser
+
+        Let with_dot be proc string_concat from StringUtils with name_text, "."
+        Set name_text to proc string_concat from StringUtils with with_dot, part_text
+        Set saw_dot to 1
+    End While
+
+    If saw_dot is equal to 0:
+        Return first
+    End If
+
+    Return proc create_token from Lexer with first_type, name_text, 0, line, column
+End Process
+
+Note: ============================================================================
+Note: F# Expression Parsing - Primaries
+Note: ============================================================================
+
+@Reasoning:
+Decides whether the current token can begin a primary expression. The
+application layer (juxtaposition) iterates arguments exactly while this
+predicate holds, which is what makes `f x y` consume x and y but stop
+cleanly at keywords (`then`, `with`, `do`), operators, separators, and
+closers without raising spurious errors.
+@End Reasoning
+Process called "is_primary_start" takes parser as Integer returns Integer:
+    Note: Check whether the current token can start a primary expression
+
+    Let t be proc current_token_type with parser
+
+    If t is equal to TOKEN_INTEGER from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_FLOAT from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_DECIMAL from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_BIGINT from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_BYTE from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_STRING from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_VERBATIM_STRING from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_TRIPLE_QUOTE_STRING from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_BYTE_STRING from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_INTERP_STRING_START from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_CHAR from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_TRUE from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_FALSE from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_NULL from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_IDENTIFIER from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_TYPE_NAME from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_UNDERSCORE from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_LEFT_PAREN from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_LEFT_BRACKET from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_LEFT_ARRAY from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_LEFT_BRACE from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_LEFT_QUOTE from Lexer:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Primary expressions are the atomic building blocks: literals (every
+numeric/string/char/bool/null kind the lexer produces), identifiers
+(with dotted qualification), unit, parenthesised and tuple expressions,
+collection literals, record expressions, and quotations. Literal and
+identifier nodes store the token record pointer in the value slot - the
+single contract the HIR translator's get_token_text/get_token_value
+reads depend on.
+@End Reasoning
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
     Note: Parse primary expressions (literals, identifiers, parenthesized expressions)
 
-    @Reasoning:
-    Primary expressions are the atomic building blocks of F# expressions.
-    They include literals, identifiers, unit values, and parenthesized expressions.
-    @End Reasoning
+    Let current_type be proc current_token_type with parser
+    Let token be proc current_token with parser
 
-    Let current be proc current_token from parser
+    Note: Literal kinds all share one shape: AST_LITERAL carrying the token
+    Let is_literal be 0
+    If current_type is equal to TOKEN_INTEGER from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_FLOAT from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_DECIMAL from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_BIGINT from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_BYTE from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_STRING from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_VERBATIM_STRING from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_TRIPLE_QUOTE_STRING from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_BYTE_STRING from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_CHAR from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_TRUE from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_FALSE from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_NULL from Lexer:
+        Set is_literal to 1
+    End If
 
-    Note: Literals
-    If current is equal to TOKEN_INTEGER:
+    If is_literal is equal to 1:
         Let node be proc create_ast_node with parser, AST_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
+        proc set_node_value with node, token
+        proc advance_token with parser
         Return node
     End If
 
-    If current is equal to TOKEN_FLOAT:
-        Set node to proc create_ast_node with parser, AST_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
-        Return node
-    End If
-
-    If current is equal to TOKEN_STRING:
-        Set node to proc create_ast_node with parser, AST_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
-        Return node
-    End If
-
-    If current is equal to TOKEN_CHAR:
-        Set node to proc create_ast_node with parser, AST_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
-        Return node
-    End If
-
-    If current is equal to TOKEN_TRUE:
-        Set node to proc create_ast_node with parser, AST_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
-        Return node
-    End If
-
-    If current is equal to TOKEN_FALSE:
-        Set node to proc create_ast_node with parser, AST_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
-        Return node
-    End If
-
-    If current is equal to TOKEN_NULL:
-        Set node to proc create_ast_node with parser, AST_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
-        Return node
-    End If
-
-    Note: Unit value ()
-    If current is equal to TOKEN_LEFT_PAREN:
-        Let next_token be proc peek_token with parser, 1
-        If next_token is equal to TOKEN_RIGHT_PAREN:
+    Note: Unit value (), parenthesized expression, or tuple
+    If current_type is equal to TOKEN_LEFT_PAREN from Lexer:
+        Let next_type be proc peek_token_type with parser, 1
+        If next_type is equal to TOKEN_RIGHT_PAREN from Lexer:
             Set node to proc create_ast_node with parser, AST_UNIT
-            proc advance_token from parser  Note: Skip (
-            proc advance_token from parser  Note: Skip )
+            proc advance_token with parser  Note: Skip (
+            proc advance_token with parser  Note: Skip )
             Return node
         End If
 
-        Note: Parenthesized expression
-        proc advance_token from parser  Note: Skip (
-        Let expr be proc parse_expression from parser
-        proc consume_token with parser, TOKEN_RIGHT_PAREN
+        proc advance_token with parser  Note: Skip (
+        proc skip_newlines with parser
+        Let expr be proc parse_expression with parser
+        proc skip_newlines with parser
+
+        Note: Tuple expression (a, b, c)
+        Let sep_type be proc current_token_type with parser
+        If sep_type is equal to TOKEN_COMMA from Lexer:
+            Let tuple_node be proc create_ast_node with parser, AST_TUPLE_EXPRESSION
+            proc add_child with tuple_node, expr
+
+            Let collecting be 1
+            While collecting is equal to 1:
+                Set sep_type to proc current_token_type with parser
+                If sep_type is equal to TOKEN_COMMA from Lexer:
+                    proc advance_token with parser
+                    proc skip_newlines with parser
+                    Let element be proc parse_expression with parser
+                    proc add_child with tuple_node, element
+                    proc skip_newlines with parser
+                Otherwise:
+                    Set collecting to 0
+                End If
+            End While
+
+            proc consume_token with parser, TOKEN_RIGHT_PAREN from Lexer
+            Return tuple_node
+        End If
+
+        proc consume_token with parser, TOKEN_RIGHT_PAREN from Lexer
         Return expr
     End If
 
-    Note: Identifiers
-    If current is equal to TOKEN_IDENTIFIER:
+    Note: Identifiers (with dotted qualification) and constructor names
+    If current_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Let name_token be proc parse_dotted_name_token with parser
         Set node to proc create_ast_node with parser, AST_IDENTIFIER
-        proc set_node_value with node, current
-        proc advance_token from parser
+        proc set_node_value with node, name_token
         Return node
     End If
 
-    If current is equal to TOKEN_TYPE_NAME:
+    If current_type is equal to TOKEN_TYPE_NAME from Lexer:
+        Set name_token to proc parse_dotted_name_token with parser
         Set node to proc create_ast_node with parser, AST_IDENTIFIER
-        proc set_node_value with node, current
-        proc advance_token from parser
+        proc set_node_value with node, name_token
         Return node
     End If
 
-    Note: Wildcard pattern _
-    If current is equal to TOKEN_UNDERSCORE:
+    Note: Wildcard _ in expression position (e.g. shorthand lambda bodies)
+    If current_type is equal to TOKEN_UNDERSCORE from Lexer:
         Set node to proc create_ast_node with parser, AST_PATTERN_WILDCARD
-        proc advance_token from parser
+        proc advance_token with parser
         Return node
     End If
 
     Note: List literal [1; 2; 3]
-    If current is equal to TOKEN_LEFT_BRACKET:
-        Return proc parse_list_expression from parser
+    If current_type is equal to TOKEN_LEFT_BRACKET from Lexer:
+        Return proc parse_list_expression with parser
     End If
 
     Note: Array literal [|1; 2; 3|]
-    If current is equal to TOKEN_LEFT_ARRAY:
-        Return proc parse_array_expression from parser
+    If current_type is equal to TOKEN_LEFT_ARRAY from Lexer:
+        Return proc parse_array_expression with parser
     End If
 
     Note: Record literal {field = value}
-    If current is equal to TOKEN_LEFT_BRACE:
-        Return proc parse_record_expression from parser
+    If current_type is equal to TOKEN_LEFT_BRACE from Lexer:
+        Return proc parse_record_expression with parser
     End If
 
     Note: Quotation literal <@ expr @>
-    If current is equal to TOKEN_LEFT_QUOTE:
-        Return proc parse_quotation_expression from parser
+    If current_type is equal to TOKEN_LEFT_QUOTE from Lexer:
+        Return proc parse_quotation_expression with parser
+    End If
+
+    Note: Interpolated string $"text {expr} text"
+    If current_type is equal to TOKEN_INTERP_STRING_START from Lexer:
+        Return proc parse_interpolated_string with parser
     End If
 
     proc set_parse_error with parser, "Expected expression"
@@ -667,70 +793,114 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
 End Process
 
 @Reasoning:
-Application sits between primary expressions and the operator precedence
-ladder. Because juxtaposition is the highest-precedence operator after
-field/index access, this layer iterates greedily over primaries until it
-hits a token that cannot start a new argument - the seven terminators
-chosen (TOKEN_PIPE_RIGHT/LEFT, TOKEN_SEMICOLON, the three right brackets,
-TOKEN_EOF) are exactly the tokens that mark a precedence-level boundary,
-a sequence point, or end-of-input. Building application nodes one
-argument at a time keeps the tree left-associative without recursion.
+Interpolated strings arrive from the lexer as a START segment token,
+then ordinary expression tokens for each hole, then a MID segment token
+per hole closure. Each segment token's numeric payload is the
+continuation flag (1 = an expression hole follows, 0 = string complete).
+The AST shape is one AST_INTERPOLATED_STRING node whose children
+alternate literal segments and hole expressions: child 0 is always an
+AST_LITERAL carrying the START token, then [expression, AST_LITERAL]
+pairs follow for every hole - so the HIR translator can walk children in
+order and distinguish text from expressions by node kind. Empty text
+segments are preserved (an AST_LITERAL whose token lexeme is the empty
+string) so segment positions stay aligned with hole positions.
 @End Reasoning
+Process called "parse_interpolated_string" takes parser as Integer returns Integer:
+    Note: Parse interpolated string into alternating literal/expression children
 
-@Implementation:
-Parses one primary into expr as the seed. Enters an infinite While 1
-loop: reads current_token, breaks on any of the seven terminator tokens.
-Otherwise calls parse_primary_expression for the next argument; if that
-returns 0 (no primary at the cursor) also breaks. Allocates a new
-AST_APPLICATION node via the parser's arena, adds expr as the left
-child and arg as the right child, then assigns the new node back to
-expr so the next iteration applies on top of it. Returns whatever expr
-ended up as - a single primary if no arguments followed, or a left-
-nested application tree of arbitrary depth.
-@End Implementation
+    Let node be proc create_ast_node with parser, AST_INTERPOLATED_STRING
+
+    Let segment_token be proc current_token with parser
+    Let segment_node be proc create_ast_node with parser, AST_LITERAL
+    proc set_node_value with segment_node, segment_token
+    proc add_child with node, segment_node
+
+    Let has_hole be proc get_token_value from Lexer with segment_token
+    proc advance_token with parser
+
+    While has_hole is equal to 1:
+        Let hole_expr be proc parse_expression with parser
+        If hole_expr is equal to 0:
+            proc set_parse_error with parser, "Expected expression in string interpolation hole"
+            Return 0
+        End If
+        proc add_child with node, hole_expr
+
+        Let current_type be proc current_token_type with parser
+        If current_type is not equal to TOKEN_INTERP_STRING_MID from Lexer:
+            proc set_parse_error with parser, "Unterminated string interpolation"
+            Return 0
+        End If
+
+        Set segment_token to proc current_token with parser
+        Set segment_node to proc create_ast_node with parser, AST_LITERAL
+        proc set_node_value with segment_node, segment_token
+        proc add_child with node, segment_node
+
+        Set has_hole to proc get_token_value from Lexer with segment_token
+        proc advance_token with parser
+    End While
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: F# Expression Parsing - Application and Operator Precedence
+Note: ============================================================================
+
+@Reasoning:
+Builds an AST_APPLICATION node for a binary operator use: the callee is
+an AST_IDENTIFIER whose value is the operator's token record (so the
+HIR translator recovers the operator spelling via get_token_text), and
+the operands are the remaining children. Representing operators as
+applications matches F# semantics exactly - every infix operator is a
+function - and lets the single translate_application path in the HIR
+translator handle arithmetic without a dedicated binary-expression
+AST kind.
+@End Reasoning
+Process called "make_operator_application" takes parser as Integer, op_token as Integer, left as Integer, right as Integer returns Integer:
+    Note: Build operator application node: (op left right)
+
+    Let op_ident be proc create_ast_node with parser, AST_IDENTIFIER
+    proc set_node_value with op_ident, op_token
+
+    Let app_node be proc create_ast_node with parser, AST_APPLICATION
+    proc add_child with app_node, op_ident
+    proc add_child with app_node, left
+    proc add_child with app_node, right
+
+    Return app_node
+End Process
+
+@Reasoning:
+Application sits between primary expressions and the operator
+precedence ladder. Juxtaposition is the tightest-binding form after
+member access, so this layer iterates greedily over primaries exactly
+while is_primary_start holds. Building application nodes one argument
+at a time keeps the tree left-associative without recursion.
+@End Reasoning
 Process called "parse_application_expression" takes parser as Integer returns Integer:
     Note: Parse function application with proper left-associativity
 
-    @Reasoning:
-    Function application in F# is left-associative and has high precedence.
-    "f x y" is parsed as "(f x) y", not "f (x y)".
-    @End Reasoning
+    Let expr be proc parse_primary_expression with parser
+    If expr is equal to 0:
+        Return 0
+    End If
 
-    Let expr be proc parse_primary_expression from parser
-
-    While 1:
-        Let current be proc current_token from parser
-
-        Note: Stop at operators and keywords that end application
-        If current is equal to TOKEN_PIPE_RIGHT:
-            Break
-        End If
-        If current is equal to TOKEN_PIPE_LEFT:
-            Break
-        End If
-        If current is equal to TOKEN_SEMICOLON:
-            Break
-        End If
-        If current is equal to TOKEN_RIGHT_PAREN:
-            Break
-        End If
-        If current is equal to TOKEN_RIGHT_BRACKET:
-            Break
-        End If
-        If current is equal to TOKEN_RIGHT_BRACE:
-            Break
-        End If
-        If current is equal to TOKEN_EOF:
-            Break
+    Let applying be 1
+    While applying is equal to 1:
+        Let can_apply be proc is_primary_start with parser
+        If can_apply is equal to 0:
+            Set applying to 0
+            Continue
         End If
 
-        Note: Parse argument
-        Let arg be proc parse_primary_expression from parser
+        Let arg be proc parse_primary_expression with parser
         If arg is equal to 0:
-            Break
+            Set applying to 0
+            Continue
         End If
 
-        Note: Create application node
         Let app_node be proc create_ast_node with parser, AST_APPLICATION
         proc add_child with app_node, expr
         proc add_child with app_node, arg
@@ -741,68 +911,323 @@ Process called "parse_application_expression" takes parser as Integer returns In
 End Process
 
 @Reasoning:
-The pipeline layer sits one level below parse_expression's keyword
-dispatch and one level above parse_application_expression. Both pipeline
-forms (forward `|>` and back `<|`) are exposed as AST_PIPE_EXPRESSION
-nodes with the operator token stored as the node's value so a later
-HIR pass can distinguish them without re-tokenising. Threading the
-right-hand `<|` arm through parse_pipeline_expression (recursive) gives
-right-associativity, while threading the right-hand `|>` arm through
-parse_application_expression (non-recursive) keeps `|>` left-associative
-as the F# spec requires.
+Unary layer: prefix minus (negation), `not`, and `!` (ref dereference)
+bind looser than application (`-f x` is -(f x) in F#) but tighter than
+every infix operator. Each prefix form becomes a one-argument operator
+application so the HIR sees a uniform call shape.
 @End Reasoning
+Process called "parse_unary_expression" takes parser as Integer returns Integer:
+    Note: Parse unary expressions (-x, not x, !r)
 
-@Implementation:
-Parses one application expression as the seed (expr). In a While 1
-loop, reads current_token. If TOKEN_PIPE_RIGHT (|>): advances, parses
-another application expression as right_expr (non-recursive, so the
-chain accumulates left-associatively), allocates AST_PIPE_EXPRESSION,
-attaches expr/right_expr as children, sets the node value to
-TOKEN_PIPE_RIGHT, and reassigns expr. If TOKEN_PIPE_LEFT (<|): advances,
-recursively calls parse_pipeline_expression for the RHS (so `<|`
-right-associates), builds the same node shape with TOKEN_PIPE_LEFT as
-the value, and reassigns expr. Any other token breaks the loop and the
-accumulated expr is returned to the caller.
-@End Implementation
+    Let current_type be proc current_token_type with parser
+
+    Let is_unary be 0
+    If current_type is equal to TOKEN_MINUS from Lexer:
+        Set is_unary to 1
+    End If
+    If current_type is equal to TOKEN_NOT from Lexer:
+        Set is_unary to 1
+    End If
+    If current_type is equal to TOKEN_DEREF from Lexer:
+        Set is_unary to 1
+    End If
+
+    If is_unary is equal to 1:
+        Let op_token be proc current_token with parser
+        proc advance_token with parser
+        Let operand be proc parse_unary_expression with parser
+
+        Let op_ident be proc create_ast_node with parser, AST_IDENTIFIER
+        proc set_node_value with op_ident, op_token
+
+        Let app_node be proc create_ast_node with parser, AST_APPLICATION
+        proc add_child with app_node, op_ident
+        proc add_child with app_node, operand
+        Return app_node
+    End If
+
+    Return proc parse_application_expression with parser
+End Process
+
+@Reasoning:
+Exponentiation ** is right-associative in F# (2.0 ** 3.0 ** 2.0 is
+2^(3^2)), achieved by recursing into this same level for the right
+operand.
+@End Reasoning
+Process called "parse_power_expression" takes parser as Integer returns Integer:
+    Note: Parse ** exponentiation (right-associative)
+
+    Let left be proc parse_unary_expression with parser
+
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_POWER from Lexer:
+        Let op_token be proc current_token with parser
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let right be proc parse_power_expression with parser
+        Return proc make_operator_application with parser, op_token, left, right
+    End If
+
+    Return left
+End Process
+
+@Reasoning:
+Multiplicative level: * / % left-associative over the power level.
+@End Reasoning
+Process called "parse_multiplicative_expression" takes parser as Integer returns Integer:
+    Note: Parse * / % (left-associative)
+
+    Let expr be proc parse_power_expression with parser
+
+    Let looping be 1
+    While looping is equal to 1:
+        Let current_type be proc current_token_type with parser
+        Let is_op be 0
+        If current_type is equal to TOKEN_MULTIPLY from Lexer:
+            Set is_op to 1
+        End If
+        If current_type is equal to TOKEN_DIVIDE from Lexer:
+            Set is_op to 1
+        End If
+        If current_type is equal to TOKEN_MODULO from Lexer:
+            Set is_op to 1
+        End If
+
+        If is_op is equal to 0:
+            Set looping to 0
+            Continue
+        End If
+
+        Let op_token be proc current_token with parser
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let right be proc parse_power_expression with parser
+        Set expr to proc make_operator_application with parser, op_token, expr, right
+    End While
+
+    Return expr
+End Process
+
+@Reasoning:
+Additive level: + and - left-associative over the multiplicative level.
+@End Reasoning
+Process called "parse_additive_expression" takes parser as Integer returns Integer:
+    Note: Parse + and - (left-associative)
+
+    Let expr be proc parse_multiplicative_expression with parser
+
+    Let looping be 1
+    While looping is equal to 1:
+        Let current_type be proc current_token_type with parser
+        Let is_op be 0
+        If current_type is equal to TOKEN_PLUS from Lexer:
+            Set is_op to 1
+        End If
+        If current_type is equal to TOKEN_MINUS from Lexer:
+            Set is_op to 1
+        End If
+
+        If is_op is equal to 0:
+            Set looping to 0
+            Continue
+        End If
+
+        Let op_token be proc current_token with parser
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let right be proc parse_multiplicative_expression with parser
+        Set expr to proc make_operator_application with parser, op_token, expr, right
+    End While
+
+    Return expr
+End Process
+
+@Reasoning:
+Range level: a .. b builds a range application. F# uses ranges in list
+comprehensions and for loops; representing them as an application of
+the ".." operator keeps the call-shaped uniformity.
+@End Reasoning
+Process called "parse_range_expression" takes parser as Integer returns Integer:
+    Note: Parse a .. b range expressions
+
+    Let expr be proc parse_additive_expression with parser
+
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_RANGE from Lexer:
+        Let op_token be proc current_token with parser
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let right be proc parse_additive_expression with parser
+        Return proc make_operator_application with parser, op_token, expr, right
+    End If
+
+    Return expr
+End Process
+
+@Reasoning:
+Cons :: is right-associative (1 :: 2 :: [] is 1 :: (2 :: [])), achieved
+by recursing into this same level for the right operand.
+@End Reasoning
+Process called "parse_cons_expression" takes parser as Integer returns Integer:
+    Note: Parse :: cons (right-associative)
+
+    Let left be proc parse_range_expression with parser
+
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_DOUBLE_COLON from Lexer:
+        Let op_token be proc current_token with parser
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let right be proc parse_cons_expression with parser
+        Return proc make_operator_application with parser, op_token, left, right
+    End If
+
+    Return left
+End Process
+
+@Reasoning:
+Comparison level: = <> < > <= >= over the cons level. F# comparisons
+are non-chaining in idiomatic use; a left-associative loop accepts the
+rare chained form without a dedicated diagnostic.
+@End Reasoning
+Process called "parse_comparison_expression" takes parser as Integer returns Integer:
+    Note: Parse comparison operators (left-associative)
+
+    Let expr be proc parse_cons_expression with parser
+
+    Let looping be 1
+    While looping is equal to 1:
+        Let current_type be proc current_token_type with parser
+        Let is_op be 0
+        If current_type is equal to TOKEN_EQUAL from Lexer:
+            Set is_op to 1
+        End If
+        If current_type is equal to TOKEN_NOT_EQUAL from Lexer:
+            Set is_op to 1
+        End If
+        If current_type is equal to TOKEN_LESS_THAN from Lexer:
+            Set is_op to 1
+        End If
+        If current_type is equal to TOKEN_GREATER_THAN from Lexer:
+            Set is_op to 1
+        End If
+        If current_type is equal to TOKEN_LESS_EQUAL from Lexer:
+            Set is_op to 1
+        End If
+        If current_type is equal to TOKEN_GREATER_EQUAL from Lexer:
+            Set is_op to 1
+        End If
+
+        If is_op is equal to 0:
+            Set looping to 0
+            Continue
+        End If
+
+        Let op_token be proc current_token with parser
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let right be proc parse_cons_expression with parser
+        Set expr to proc make_operator_application with parser, op_token, expr, right
+    End While
+
+    Return expr
+End Process
+
+@Reasoning:
+Logical levels: && binds tighter than ||, both left-associative, both
+looser than comparisons - matching F# operator precedence.
+@End Reasoning
+Process called "parse_logical_and_expression" takes parser as Integer returns Integer:
+    Note: Parse && (left-associative)
+
+    Let expr be proc parse_comparison_expression with parser
+
+    Let looping be 1
+    While looping is equal to 1:
+        Let current_type be proc current_token_type with parser
+        If current_type is not equal to TOKEN_AND_OP from Lexer:
+            Set looping to 0
+            Continue
+        End If
+
+        Let op_token be proc current_token with parser
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let right be proc parse_comparison_expression with parser
+        Set expr to proc make_operator_application with parser, op_token, expr, right
+    End While
+
+    Return expr
+End Process
+
+Process called "parse_logical_or_expression" takes parser as Integer returns Integer:
+    Note: Parse || (left-associative)
+
+    Let expr be proc parse_logical_and_expression with parser
+
+    Let looping be 1
+    While looping is equal to 1:
+        Let current_type be proc current_token_type with parser
+        If current_type is not equal to TOKEN_OR_OP from Lexer:
+            Set looping to 0
+            Continue
+        End If
+
+        Let op_token be proc current_token with parser
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let right be proc parse_logical_and_expression with parser
+        Set expr to proc make_operator_application with parser, op_token, expr, right
+    End While
+
+    Return expr
+End Process
+
+@Reasoning:
+The pipeline layer is the loosest precedence level. Both pipeline forms
+(forward |> and backward <|) are exposed as AST_PIPE_EXPRESSION nodes
+with the operator's token TYPE TAG stored in the node value slot - the
+HIR translator compares that slot directly against TOKEN_PIPE_RIGHT /
+TOKEN_PIPE_LEFT to choose the call rewrite. |> accumulates left-
+associatively (loop) while <| right-associates (recursion), matching
+the F# spec.
+@End Reasoning
 Process called "parse_pipeline_expression" takes parser as Integer returns Integer:
     Note: Parse pipeline expressions with |> and <| operators
 
-    @Reasoning:
-    Pipeline operators in F# allow function composition and data flow.
-    |> is right-associative, <| is left-associative.
-    "x |> f |> g" is parsed as "x |> (f |> g)" = "g (f x)".
-    @End Reasoning
+    Let expr be proc parse_logical_or_expression with parser
 
-    Let expr be proc parse_application_expression from parser
+    Let looping be 1
+    While looping is equal to 1:
+        Let current_type be proc current_token_type with parser
 
-    While 1:
-        Let current be proc current_token from parser
-
-        If current is equal to TOKEN_PIPE_RIGHT:  Note: |>
-            proc advance_token from parser
-            Let right_expr be proc parse_application_expression from parser
+        If current_type is equal to TOKEN_PIPE_RIGHT from Lexer:  Note: |>
+            proc advance_token with parser
+            proc skip_newlines with parser
+            Let right_expr be proc parse_logical_or_expression with parser
 
             Let pipe_node be proc create_ast_node with parser, AST_PIPE_EXPRESSION
             proc add_child with pipe_node, expr
             proc add_child with pipe_node, right_expr
-            proc set_node_value with pipe_node, TOKEN_PIPE_RIGHT
+            proc set_node_value with pipe_node, TOKEN_PIPE_RIGHT from Lexer
 
             Set expr to pipe_node
 
         Otherwise:
-            If current is equal to TOKEN_PIPE_LEFT:  Note: <|
-                proc advance_token from parser
-                Set right_expr to proc parse_pipeline_expression from parser
+            If current_type is equal to TOKEN_PIPE_LEFT from Lexer:  Note: <|
+                proc advance_token with parser
+                proc skip_newlines with parser
+                Set right_expr to proc parse_pipeline_expression with parser
 
                 Set pipe_node to proc create_ast_node with parser, AST_PIPE_EXPRESSION
                 proc add_child with pipe_node, expr
                 proc add_child with pipe_node, right_expr
-                proc set_node_value with pipe_node, TOKEN_PIPE_LEFT
+                proc set_node_value with pipe_node, TOKEN_PIPE_LEFT from Lexer
 
                 Set expr to pipe_node
 
             Otherwise:
-                Break
+                Set looping to 0
             End If
         End If
     End While
@@ -811,74 +1236,50 @@ Process called "parse_pipeline_expression" takes parser as Integer returns Integ
 End Process
 
 @Reasoning:
-Top-level expression dispatcher. Keyword-led expressions (`fun`,
-`let`, `match`, `if`, `try`, `while`, `for`, `function`) each have
-their own production; everything else falls through to
-parse_pipeline_expression which handles the precedence ladder. The
-order of tests matches F# operator precedence at the keyword-prefix
-level - none of the keywords overlap so a flat sequence is correct.
+Top-level expression dispatcher. Keyword-led expressions (`fun`, `let`,
+`match`, `if`, `try`, `while`, `for`, `function`) each have their own
+production; everything else falls through to the precedence ladder via
+parse_pipeline_expression. None of the keywords overlap so a flat
+sequence is correct.
 @End Reasoning
-
-@Implementation:
-Reads current_token. Dispatches:
-- TOKEN_FUN -> parse_lambda_expression
-- TOKEN_LET -> parse_let_expression
-- TOKEN_MATCH -> parse_match_expression
-- TOKEN_IF -> parse_if_expression
-- TOKEN_TRY -> parse_try_expression
-- TOKEN_WHILE -> parse_while_expression
-- TOKEN_FOR -> parse_for_expression
-- TOKEN_FUNCTION -> parse_function_expression
-- otherwise: parse_pipeline_expression (handles `|>` chains and
-  underlying operator precedence).
-@End Implementation
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse general F# expression
 
-    Let current be proc current_token from parser
+    Let current_type be proc current_token_type with parser
 
-    Note: Lambda expression (fun x -> expr)
-    If current is equal to TOKEN_FUN:
-        Return proc parse_lambda_expression from parser
+    If current_type is equal to TOKEN_FUN from Lexer:
+        Return proc parse_lambda_expression with parser
     End If
 
-    Note: Let expression (let x = expr in expr)
-    If current is equal to TOKEN_LET:
-        Return proc parse_let_expression from parser
+    If current_type is equal to TOKEN_LET from Lexer:
+        Return proc parse_let_expression with parser
     End If
 
-    Note: Match expression (match expr with pattern -> expr)
-    If current is equal to TOKEN_MATCH:
-        Return proc parse_match_expression from parser
+    If current_type is equal to TOKEN_MATCH from Lexer:
+        Return proc parse_match_expression with parser
     End If
 
-    Note: If expression (if expr then expr else expr)
-    If current is equal to TOKEN_IF:
-        Return proc parse_if_expression from parser
+    If current_type is equal to TOKEN_IF from Lexer:
+        Return proc parse_if_expression with parser
     End If
 
-    Note: Try expression (try expr with pattern -> expr)
-    If current is equal to TOKEN_TRY:
-        Return proc parse_try_expression from parser
+    If current_type is equal to TOKEN_TRY from Lexer:
+        Return proc parse_try_expression with parser
     End If
 
-    Note: While expression (while expr do expr done)
-    If current is equal to TOKEN_WHILE:
-        Return proc parse_while_expression from parser
+    If current_type is equal to TOKEN_WHILE from Lexer:
+        Return proc parse_while_expression with parser
     End If
 
-    Note: For expression (for var in expr do expr done)
-    If current is equal to TOKEN_FOR:
-        Return proc parse_for_expression from parser
+    If current_type is equal to TOKEN_FOR from Lexer:
+        Return proc parse_for_expression with parser
     End If
 
-    Note: Function expression (function pattern -> expr)
-    If current is equal to TOKEN_FUNCTION:
-        Return proc parse_function_expression from parser
+    If current_type is equal to TOKEN_FUNCTION from Lexer:
+        Return proc parse_function_expression with parser
     End If
 
-    Note: Default to pipeline expression
-    Return proc parse_pipeline_expression from parser
+    Return proc parse_pipeline_expression with parser
 End Process
 
 Note: ============================================================================
@@ -887,66 +1288,80 @@ Note: ==========================================================================
 
 @Reasoning:
 F# patterns appear in three positions (match arms, fun parameters, let
-bindings) and share one grammar with eleven shape variants: wildcards,
-variables (with optional `as`-aliases), literals across four kinds,
-tuples, lists, arrays, records, constructor applications. Dispatching
-all of them through one entry point keeps the recursive cases (tuples
-nest patterns, constructor args nest patterns, etc.) self-routing. The
-explicit token-by-token dispatch is preferred over a tag map because
-the relative ordering of the tests is itself the disambiguation - e.g.
-TOKEN_TYPE_NAME must be checked after the literal branches so that
-constructor names do not accidentally match a literal token shape.
+bindings) and share one grammar: wildcards, variables (with optional
+`as` aliases), literals, tuples, lists, arrays, records, and
+constructor applications (both parenthesised `Cons(h, t)` and
+juxtaposed `Some x`). Dispatching through one entry point keeps the
+recursive cases self-routing. Variable/literal/constructor patterns
+store their token record in the value slot per the HIR contract.
 @End Reasoning
-
-@Implementation:
-Reads current_token. Dispatches by token:
-- TOKEN_UNDERSCORE -> AST_PATTERN_WILDCARD, advance, return.
-- TOKEN_IDENTIFIER -> AST_PATTERN_VARIABLE storing the identifier as
-  the node value. Then peeks for TOKEN_AS; if present builds an
-  AST_PATTERN_AS with the original variable as first child and the
-  aliasing identifier as second child.
-- TOKEN_INTEGER/STRING/TRUE/FALSE -> AST_PATTERN_LITERAL with the token
-  stored as the value.
-- TOKEN_LEFT_PAREN -> tuple: builds AST_PATTERN_TUPLE, parses first
-  inner pattern, then loops adding patterns while TOKEN_COMMA is seen,
-  consumes TOKEN_RIGHT_PAREN.
-- TOKEN_LEFT_BRACKET / TOKEN_LEFT_ARRAY / TOKEN_LEFT_BRACE -> delegates
-  to parse_list_pattern, parse_array_pattern, parse_record_pattern.
-- TOKEN_TYPE_NAME -> AST_PATTERN_CONSTRUCTOR storing the type-name
-  token; if followed by `(` parses a comma-separated arg pattern list
-  and consumes the matching `)`.
-- Any other token -> set_parse_error("Expected pattern") and return 0.
-@End Implementation
 Process called "parse_pattern" takes parser as Integer returns Integer:
     Note: Parse F# patterns for match expressions and function parameters
 
-    @Reasoning:
-    F# patterns are used in match expressions, function parameters,
-    and let bindings. They support constructors, literals, wildcards,
-    variables, tuples, lists, and guard conditions.
-    @End Reasoning
-
-    Let current be proc current_token from parser
+    Let current_type be proc current_token_type with parser
+    Let token be proc current_token with parser
 
     Note: Wildcard pattern _
-    If current is equal to TOKEN_UNDERSCORE:
+    If current_type is equal to TOKEN_UNDERSCORE from Lexer:
         Let node be proc create_ast_node with parser, AST_PATTERN_WILDCARD
-        proc advance_token from parser
+        proc advance_token with parser
         Return node
     End If
 
-    Note: Variable pattern
-    If current is equal to TOKEN_IDENTIFIER:
-        Set node to proc create_ast_node with parser, AST_PATTERN_VARIABLE
-        proc set_node_value with node, current
-        proc advance_token from parser
+    Note: Dynamic type-test pattern :? TypeName [as binder]. The type name
+    Note: token (dotted paths joined) lands in the value slot; the optional
+    Note: as-binder becomes an AST_PATTERN_VARIABLE child so the catch-clause
+    Note: translator reads [type name, bound variable] from one node.
+    If current_type is equal to TOKEN_TYPE_TEST from Lexer:
+        proc advance_token with parser  Note: Skip :?
 
-        Note: Check for as pattern (pattern as var)
-        Let next_token be proc current_token from parser
-        If next_token is equal to TOKEN_AS:
-            proc advance_token from parser  Note: Skip 'as'
-            Let var_token be proc current_token from parser
-            If var_token is equal to TOKEN_IDENTIFIER:
+        Let name_type be proc current_token_type with parser
+        Let is_type_name be 0
+        If name_type is equal to TOKEN_TYPE_NAME from Lexer:
+            Set is_type_name to 1
+        End If
+        If name_type is equal to TOKEN_IDENTIFIER from Lexer:
+            Set is_type_name to 1
+        End If
+        If is_type_name is equal to 0:
+            proc set_parse_error with parser, "Expected type name after :?"
+            Return 0
+        End If
+
+        Let type_token be proc parse_dotted_name_token with parser
+        Set node to proc create_ast_node with parser, AST_PATTERN_TYPE_TEST
+        proc set_node_value with node, type_token
+
+        Let after_type be proc current_token_type with parser
+        If after_type is equal to TOKEN_AS from Lexer:
+            proc advance_token with parser  Note: Skip 'as'
+            Let binder_type be proc current_token_type with parser
+            If binder_type is not equal to TOKEN_IDENTIFIER from Lexer:
+                proc set_parse_error with parser, "Expected identifier after 'as' in type-test pattern"
+                Return 0
+            End If
+            Let binder_token be proc current_token with parser
+            Let binder_node be proc create_ast_node with parser, AST_PATTERN_VARIABLE
+            proc set_node_value with binder_node, binder_token
+            proc add_child with node, binder_node
+            proc advance_token with parser
+        End If
+
+        Return node
+    End If
+
+    Note: Variable pattern (with optional as-alias)
+    If current_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Set node to proc create_ast_node with parser, AST_PATTERN_VARIABLE
+        proc set_node_value with node, token
+        proc advance_token with parser
+
+        Let next_type be proc current_token_type with parser
+        If next_type is equal to TOKEN_AS from Lexer:
+            proc advance_token with parser  Note: Skip 'as'
+            Let var_type be proc current_token_type with parser
+            If var_type is equal to TOKEN_IDENTIFIER from Lexer:
+                Let var_token be proc current_token with parser
                 Let as_node be proc create_ast_node with parser, AST_PATTERN_AS
                 proc add_child with as_node, node
 
@@ -954,7 +1369,7 @@ Process called "parse_pattern" takes parser as Integer returns Integer:
                 proc set_node_value with var_node, var_token
                 proc add_child with as_node, var_node
 
-                proc advance_token from parser
+                proc advance_token with parser
                 Return as_node
             End If
         End If
@@ -962,100 +1377,153 @@ Process called "parse_pattern" takes parser as Integer returns Integer:
         Return node
     End If
 
-    Note: Literal pattern
-    If current is equal to TOKEN_INTEGER:
+    Note: Literal patterns
+    Let is_literal be 0
+    If current_type is equal to TOKEN_INTEGER from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_FLOAT from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_STRING from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_CHAR from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_TRUE from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_FALSE from Lexer:
+        Set is_literal to 1
+    End If
+    If current_type is equal to TOKEN_NULL from Lexer:
+        Set is_literal to 1
+    End If
+
+    If is_literal is equal to 1:
         Set node to proc create_ast_node with parser, AST_PATTERN_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
+        proc set_node_value with node, token
+        proc advance_token with parser
         Return node
     End If
 
-    If current is equal to TOKEN_STRING:
-        Set node to proc create_ast_node with parser, AST_PATTERN_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
-        Return node
-    End If
+    Note: Tuple pattern (x, y, z) or parenthesised pattern (p) or unit ()
+    If current_type is equal to TOKEN_LEFT_PAREN from Lexer:
+        Set next_type to proc peek_token_type with parser, 1
+        If next_type is equal to TOKEN_RIGHT_PAREN from Lexer:
+            Note: Unit pattern () binds nothing
+            Set node to proc create_ast_node with parser, AST_PATTERN_WILDCARD
+            proc advance_token with parser
+            proc advance_token with parser
+            Return node
+        End If
 
-    If current is equal to TOKEN_TRUE:
-        Set node to proc create_ast_node with parser, AST_PATTERN_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
-        Return node
-    End If
+        proc advance_token with parser  Note: Skip (
 
-    If current is equal to TOKEN_FALSE:
-        Set node to proc create_ast_node with parser, AST_PATTERN_LITERAL
-        proc set_node_value with node, current
-        proc advance_token from parser
-        Return node
-    End If
+        Let first_pattern be proc parse_pattern with parser
 
-    Note: Tuple pattern (x, y, z)
-    If current is equal to TOKEN_LEFT_PAREN:
-        proc advance_token from parser  Note: Skip (
-
-        Let tuple_node be proc create_ast_node with parser, AST_PATTERN_TUPLE
-
-        Note: Parse first pattern
-        Let first_pattern be proc parse_pattern from parser
-        proc add_child with tuple_node, first_pattern
-
-        Note: Parse remaining patterns
-        While 1:
-            Let current_tok be proc current_token from parser
-            If current_tok is equal to TOKEN_COMMA:
-                proc advance_token from parser  Note: Skip ,
-                Let pattern be proc parse_pattern from parser
-                proc add_child with tuple_node, pattern
-            Otherwise:
-                Break
+        Note: Optional type annotation (x: type) - parsed and attached as metadata
+        Let anno_type be proc current_token_type with parser
+        If anno_type is equal to TOKEN_COLON from Lexer:
+            proc advance_token with parser
+            Let anno be proc parse_type_expression with parser
+            If first_pattern is not equal to 0:
+                proc memory_set_int64 from Layout with first_pattern, 40, anno
             End If
-        End While
+        End If
 
-        proc consume_token with parser, TOKEN_RIGHT_PAREN
-        Return tuple_node
-    End If
+        Let sep_type be proc current_token_type with parser
+        If sep_type is equal to TOKEN_COMMA from Lexer:
+            Let tuple_node be proc create_ast_node with parser, AST_PATTERN_TUPLE
+            proc add_child with tuple_node, first_pattern
 
-    Note: List pattern [x; y; z] or []
-    If current is equal to TOKEN_LEFT_BRACKET:
-        Return proc parse_list_pattern from parser
-    End If
-
-    Note: Array pattern [|x; y; z|]
-    If current is equal to TOKEN_LEFT_ARRAY:
-        Return proc parse_array_pattern from parser
-    End If
-
-    Note: Record pattern {field = pattern}
-    If current is equal to TOKEN_LEFT_BRACE:
-        Return proc parse_record_pattern from parser
-    End If
-
-    Note: Constructor pattern (Constructor args)
-    If current is equal to TOKEN_TYPE_NAME:
-        Set node to proc create_ast_node with parser, AST_PATTERN_CONSTRUCTOR
-        proc set_node_value with node, current
-        proc advance_token from parser
-
-        Note: Parse constructor arguments if present
-        Set next_token to proc current_token from parser
-        If next_token is equal to TOKEN_LEFT_PAREN:
-            proc advance_token from parser  Note: Skip (
-
-            While 1:
-                Let arg_pattern be proc parse_pattern from parser
-                proc add_child with node, arg_pattern
-
-                Set current_tok to proc current_token from parser
-                If current_tok is equal to TOKEN_COMMA:
-                    proc advance_token from parser  Note: Skip ,
+            Let collecting be 1
+            While collecting is equal to 1:
+                Set sep_type to proc current_token_type with parser
+                If sep_type is equal to TOKEN_COMMA from Lexer:
+                    proc advance_token with parser  Note: Skip ,
+                    Let pattern be proc parse_pattern with parser
+                    proc add_child with tuple_node, pattern
                 Otherwise:
-                    Break
+                    Set collecting to 0
                 End If
             End While
 
-            proc consume_token with parser, TOKEN_RIGHT_PAREN
+            proc consume_token with parser, TOKEN_RIGHT_PAREN from Lexer
+            Return tuple_node
+        End If
+
+        proc consume_token with parser, TOKEN_RIGHT_PAREN from Lexer
+        Return first_pattern
+    End If
+
+    Note: List pattern [x; y; z] or []
+    If current_type is equal to TOKEN_LEFT_BRACKET from Lexer:
+        Return proc parse_list_pattern with parser
+    End If
+
+    Note: Array pattern [|x; y; z|]
+    If current_type is equal to TOKEN_LEFT_ARRAY from Lexer:
+        Return proc parse_array_pattern with parser
+    End If
+
+    Note: Record pattern {field = pattern}
+    If current_type is equal to TOKEN_LEFT_BRACE from Lexer:
+        Return proc parse_record_pattern with parser
+    End If
+
+    Note: Constructor pattern: Name, Name(p1, p2), or juxtaposed Name p
+    If current_type is equal to TOKEN_TYPE_NAME from Lexer:
+        Set node to proc create_ast_node with parser, AST_PATTERN_CONSTRUCTOR
+        proc set_node_value with node, token
+        proc advance_token with parser
+
+        Set next_type to proc current_token_type with parser
+        If next_type is equal to TOKEN_LEFT_PAREN from Lexer:
+            proc advance_token with parser  Note: Skip (
+
+            Let arg_loop be 1
+            While arg_loop is equal to 1:
+                Let arg_pattern be proc parse_pattern with parser
+                proc add_child with node, arg_pattern
+
+                Set sep_type to proc current_token_type with parser
+                If sep_type is equal to TOKEN_COMMA from Lexer:
+                    proc advance_token with parser  Note: Skip ,
+                Otherwise:
+                    Set arg_loop to 0
+                End If
+            End While
+
+            proc consume_token with parser, TOKEN_RIGHT_PAREN from Lexer
+            Return node
+        End If
+
+        Note: Juxtaposed single argument: Some x, Cons _, Ok 1
+        Let arg_kind be 0
+        If next_type is equal to TOKEN_IDENTIFIER from Lexer:
+            Set arg_kind to 1
+        End If
+        If next_type is equal to TOKEN_UNDERSCORE from Lexer:
+            Set arg_kind to 1
+        End If
+        If next_type is equal to TOKEN_INTEGER from Lexer:
+            Set arg_kind to 1
+        End If
+        If next_type is equal to TOKEN_STRING from Lexer:
+            Set arg_kind to 1
+        End If
+        If next_type is equal to TOKEN_TRUE from Lexer:
+            Set arg_kind to 1
+        End If
+        If next_type is equal to TOKEN_FALSE from Lexer:
+            Set arg_kind to 1
+        End If
+
+        If arg_kind is equal to 1:
+            Let juxta_arg be proc parse_pattern with parser
+            proc add_child with node, juxta_arg
         End If
 
         Return node
@@ -1066,29 +1534,59 @@ Process called "parse_pattern" takes parser as Integer returns Integer:
 End Process
 
 @Reasoning:
-F# match arms allow a `when` guard expression after the pattern.
-This helper checks for `when` after a plain pattern and, if present,
-wraps both into an AST_PATTERN_GUARD node so the consumer always
-sees one piece per case regardless of guard presence.
+F# match arms allow or-pattern alternatives (`| A | B -> body`) and a
+`when` guard expression after the pattern. A pipe between a pattern and
+its arrow is unambiguously an or-alternative (an arm separator can only
+appear after an arm body), so the alternatives loop consumes pipes
+greedily here. Alternatives collect as the children of one
+AST_PATTERN_OR node; a guard then wraps whichever pattern shape resulted
+(`A | B when g` parses as (A|B) guarded by g, matching F# precedence)
+into an AST_PATTERN_GUARD node so the consumer always sees one piece per
+case regardless of guard presence.
 @End Reasoning
-
-@Implementation:
-Calls parse_pattern. If the next token is TOKEN_WHEN, consumes it,
-parses an expression for the guard, builds an AST_PATTERN_GUARD with
-the pattern as child 0 and the guard expression as child 1, and
-returns that node. Otherwise returns the bare pattern.
-@End Implementation
 Process called "parse_pattern_with_guard" takes parser as Integer returns Integer:
-    Note: Parse pattern with optional when guard
+    Note: Parse pattern with optional or-alternatives and when guard
 
-    Let pattern be proc parse_pattern from parser
+    Let pattern be proc parse_pattern with parser
+    If pattern is equal to 0:
+        Return 0
+    End If
 
-    Note: Check for when guard
-    Let current be proc current_token from parser
-    If current is equal to TOKEN_WHEN:
-        proc advance_token from parser  Note: Skip 'when'
+    Note: A pattern inside an arm is always followed by ->, when, or an
+    Note: or-alternative pipe, so line breaks here are insignificant and
+    Note: skipping them enables the idiomatic cross-line alternative layout.
+    proc skip_newlines with parser
 
-        Let guard_expr be proc parse_expression from parser
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_PIPE from Lexer:
+        Let or_node be proc create_ast_node with parser, AST_PATTERN_OR
+        proc add_child with or_node, pattern
+
+        Let collecting be 1
+        While collecting is equal to 1:
+            Set current_type to proc current_token_type with parser
+            If current_type is equal to TOKEN_PIPE from Lexer:
+                proc advance_token with parser  Note: Skip |
+                proc skip_newlines with parser
+                Let alternative be proc parse_pattern with parser
+                If alternative is equal to 0:
+                    Return 0
+                End If
+                proc add_child with or_node, alternative
+                proc skip_newlines with parser
+            Otherwise:
+                Set collecting to 0
+            End If
+        End While
+
+        Set pattern to or_node
+    End If
+
+    Set current_type to proc current_token_type with parser
+    If current_type is equal to TOKEN_WHEN from Lexer:
+        proc advance_token with parser  Note: Skip 'when'
+
+        Let guard_expr be proc parse_pipeline_expression with parser
 
         Let guard_node be proc create_ast_node with parser, AST_PATTERN_GUARD
         proc add_child with guard_node, pattern
@@ -1107,48 +1605,41 @@ Note: ==========================================================================
 @Reasoning:
 F# lambdas use `fun p1 p2 ... -> body` with one or more parameters,
 each parsed as a pattern (so destructuring lambdas like
-`fun (x, y) -> x + y` work). The body comes after `->` and is a
-single expression - multi-statement bodies are achieved by sequencing
-expressions inside the body recursively.
+`fun (x, y) -> x + y` work). The body comes after `->` and is a single
+expression. Body is distinguished from parameters by position: always
+the last child.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_FUN, creates AST_LAMBDA. Parameter loop: parses
-patterns and adds them as children until TOKEN_ARROW is seen. The
-loop has two TOKEN_ARROW tests (top of loop and after parse_pattern)
-so the arrow can break the loop regardless of where it appears.
-Consumes TOKEN_ARROW. Parses the body via parse_expression and
-appends it as the final child. Returns the lambda node. The body is
-distinguished from parameters by position: it's always the last child
-because every prior child was a pattern parsed before the arrow.
-@End Implementation
 Process called "parse_lambda_expression" takes parser as Integer returns Integer:
     Note: Parse lambda expression (fun parameters -> body)
 
-    proc consume_token with parser, TOKEN_FUN
+    proc consume_token with parser, TOKEN_FUN from Lexer
 
     Let lambda_node be proc create_ast_node with parser, AST_LAMBDA
 
-    Note: Parse parameters
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_ARROW:
-            Break
+    Let collecting be 1
+    While collecting is equal to 1:
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_ARROW from Lexer:
+            Set collecting to 0
+            Continue
+        End If
+        If current_type is equal to TOKEN_EOF from Lexer:
+            Set collecting to 0
+            Continue
         End If
 
-        Let param be proc parse_pattern from parser
+        Let param be proc parse_pattern with parser
+        If param is equal to 0:
+            Set collecting to 0
+            Continue
+        End If
         proc add_child with lambda_node, param
-
-        Set current to proc current_token from parser
-        If current is equal to TOKEN_ARROW:
-            Break
-        End If
     End While
 
-    proc consume_token with parser, TOKEN_ARROW
+    proc consume_token with parser, TOKEN_ARROW from Lexer
+    proc skip_newlines with parser
 
-    Note: Parse body
-    Let body be proc parse_expression from parser
+    Let body be proc parse_expression with parser
     proc add_child with lambda_node, body
 
     Return lambda_node
@@ -1156,66 +1647,59 @@ End Process
 
 @Reasoning:
 `match expr with | p1 -> e1 | p2 -> e2 ...` is encoded as an
-AST_MATCH_EXPRESSION whose first child is the scrutinee expression
-and remaining children are case-nodes (each an AST_PATTERN_GUARD
-holding the pattern and its arm expression). Reusing
-AST_PATTERN_GUARD as the case-container is intentional: it already
-carries the pattern + expression pair, so no dedicated case node is
-needed even when no `when` guard is present.
+AST_MATCH_EXPRESSION whose first child is the scrutinee and remaining
+children are case nodes (each an AST_PATTERN_GUARD holding the pattern
+and its arm expression). Reusing AST_PATTERN_GUARD as the case
+container is intentional: it already carries the pattern + expression
+pair. Newlines between arms are insignificant per the offside rule, so
+the arm loop skips them before testing for the next |.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_MATCH. Creates AST_MATCH_EXPRESSION. Parses the
-scrutinee via parse_expression and appends. Consumes TOKEN_WITH.
-Case loop:
-- Optional leading TOKEN_PIPE is consumed if present so both
-  `match x with A -> ...` and `match x with | A -> ...` parse.
-- Parses a pattern-with-guard, consumes TOKEN_ARROW, parses the
-  result expression.
-- Creates an AST_PATTERN_GUARD with the pattern and result as
-  children, appends to the match node.
-- Continues while the next token is TOKEN_PIPE; breaks otherwise.
-Returns the match node.
-@End Implementation
 Process called "parse_match_expression" takes parser as Integer returns Integer:
     Note: Parse match expression (match expr with cases)
 
-    proc consume_token with parser, TOKEN_MATCH
+    proc consume_token with parser, TOKEN_MATCH from Lexer
 
     Let match_node be proc create_ast_node with parser, AST_MATCH_EXPRESSION
 
-    Note: Parse expression to match
-    Let expr be proc parse_expression from parser
+    Let expr be proc parse_pipeline_expression with parser
     proc add_child with match_node, expr
 
-    proc consume_token with parser, TOKEN_WITH
+    proc consume_token with parser, TOKEN_WITH from Lexer
+    proc skip_newlines with parser
 
-    Note: Parse match cases
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_PIPE:
-            proc advance_token from parser  Note: Skip |
+    Let parsing_cases be 1
+    While parsing_cases is equal to 1:
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_PIPE from Lexer:
+            proc advance_token with parser  Note: Skip |
         End If
 
-        Note: Parse pattern
-        Let pattern be proc parse_pattern_with_guard from parser
+        Let pattern be proc parse_pattern_with_guard with parser
+        If pattern is equal to 0:
+            Set parsing_cases to 0
+            Continue
+        End If
 
-        proc consume_token with parser, TOKEN_ARROW
+        Let arrow_ok be proc consume_token with parser, TOKEN_ARROW from Lexer
+        If arrow_ok is equal to 0:
+            Set parsing_cases to 0
+            Continue
+        End If
+        proc skip_newlines with parser
 
-        Note: Parse result expression
-        Let result_expr be proc parse_expression from parser
+        Let result_expr be proc parse_expression with parser
 
-        Note: Create case node
         Let case_node be proc create_ast_node with parser, AST_PATTERN_GUARD
         proc add_child with case_node, pattern
         proc add_child with case_node, result_expr
 
         proc add_child with match_node, case_node
 
-        Note: Check for more cases
-        Set current to proc current_token from parser
-        If current is not equal to TOKEN_PIPE:
-            Break
+        Note: Look across line breaks for the next | arm
+        proc skip_newlines with parser
+        Set current_type to proc current_token_type with parser
+        If current_type is not equal to TOKEN_PIPE from Lexer:
+            Set parsing_cases to 0
         End If
     End While
 
@@ -1223,97 +1707,88 @@ Process called "parse_match_expression" takes parser as Integer returns Integer:
 End Process
 
 @Reasoning:
-F# `if/then/else/elif` is an expression (not a statement) so every
-branch produces a value. The AST stores condition, then-branch,
-then optional else-branch as children. `elif` is handled by
-recursively parsing another if-expression and attaching it as a
-child after the then-branch.
+F# `if/then/elif/else` is an expression so every branch produces a
+value. The AST stores condition, then-branch, then the optional
+else-branch (or the nested elif-if) as children. elif recurses into
+the shared tail parser so arbitrarily long chains nest as
+right-leaning if nodes.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_IF. Creates AST_IF_EXPRESSION. Parses condition,
-appends. Consumes TOKEN_THEN. Parses then expression, appends. Reads
-current_token once into `current`; if TOKEN_ELSE, advances and parses
-the else expression, appends. If current is TOKEN_ELIF (note: this
-check uses the same captured `current`), recursively calls
-parse_if_expression and appends the result. Returns the if node.
-@End Implementation
-Process called "parse_if_expression" takes parser as Integer returns Integer:
-    Note: Parse if-then-else expression
-
-    proc consume_token with parser, TOKEN_IF
+Process called "parse_if_tail" takes parser as Integer returns Integer:
+    Note: Parse the condition/then/else portion of an if expression (after if/elif)
 
     Let if_node be proc create_ast_node with parser, AST_IF_EXPRESSION
 
-    Note: Parse condition
-    Let condition be proc parse_expression from parser
+    Let condition be proc parse_pipeline_expression with parser
     proc add_child with if_node, condition
 
-    proc consume_token with parser, TOKEN_THEN
+    proc consume_token with parser, TOKEN_THEN from Lexer
+    proc skip_newlines with parser
 
-    Note: Parse then expression
-    Let then_expr be proc parse_expression from parser
+    Let then_expr be proc parse_expression with parser
     proc add_child with if_node, then_expr
 
-    Note: Parse optional else/elif
-    Let current be proc current_token from parser
-    If current is equal to TOKEN_ELSE:
-        proc advance_token from parser
-        Let else_expr be proc parse_expression from parser
+    proc skip_newlines with parser
+    Let current_type be proc current_token_type with parser
+
+    If current_type is equal to TOKEN_ELSE from Lexer:
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let else_expr be proc parse_expression with parser
         proc add_child with if_node, else_expr
+        Return if_node
     End If
 
-    If current is equal to TOKEN_ELIF:
-        Let elif_expr be proc parse_if_expression from parser
+    If current_type is equal to TOKEN_ELIF from Lexer:
+        proc advance_token with parser
+        Let elif_expr be proc parse_if_tail with parser
         proc add_child with if_node, elif_expr
+        Return if_node
     End If
 
     Return if_node
 End Process
 
+Process called "parse_if_expression" takes parser as Integer returns Integer:
+    Note: Parse if-then-elif-else expression
+
+    proc consume_token with parser, TOKEN_IF from Lexer
+    Return proc parse_if_tail with parser
+End Process
+
 @Reasoning:
 F# let-expressions combine one primary binding with zero or more
-sibling bindings (each introduced by `and`), and optionally an `in
-expr` clause. The `and`-chain supports mutually recursive function
-definitions; the trailing `in` is required when the let appears in
-an expression context but optional in module-level let bindings.
+sibling bindings (each introduced by `and`), and optionally an
+`in expr` clause. The `and` chain supports mutually recursive
+definitions; the trailing `in` makes the construct an expression with
+a body value.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_LET. Creates AST_LET_EXPRESSION. Parses the first
-let-binding via parse_let_binding and appends. Loop while current
-token is TOKEN_AND: advances, parses another binding, appends.
-Reads current; if TOKEN_IN, advances and parses the trailing
-expression via parse_expression, appends. Returns the let node.
-@End Implementation
 Process called "parse_let_expression" takes parser as Integer returns Integer:
     Note: Parse let expression (let bindings in expr)
 
-    proc consume_token with parser, TOKEN_LET
+    proc consume_token with parser, TOKEN_LET from Lexer
 
     Let let_node be proc create_ast_node with parser, AST_LET_EXPRESSION
 
-    Note: Parse let bindings
-    Let binding be proc parse_let_binding from parser
+    Let binding be proc parse_let_binding with parser
     proc add_child with let_node, binding
 
-    Note: Parse additional 'and' bindings
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_AND:
-            proc advance_token from parser
-            Let and_binding be proc parse_let_binding from parser
+    Let chaining be 1
+    While chaining is equal to 1:
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_AND from Lexer:
+            proc advance_token with parser
+            Let and_binding be proc parse_let_binding with parser
             proc add_child with let_node, and_binding
         Otherwise:
-            Break
+            Set chaining to 0
         End If
     End While
 
-    Note: Parse 'in' expression if present
-    Let current_tok be proc current_token from parser
-    If current_tok is equal to TOKEN_IN:
-        proc advance_token from parser
-        Let in_expr be proc parse_expression from parser
+    Let tail_type be proc current_token_type with parser
+    If tail_type is equal to TOKEN_IN from Lexer:
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let in_expr be proc parse_expression with parser
         proc add_child with let_node, in_expr
     End If
 
@@ -1321,588 +1796,400 @@ Process called "parse_let_expression" takes parser as Integer returns Integer:
 End Process
 
 @Reasoning:
-F# `try ... with | pat -> ... finally ...` allows both exception
-handling (via `with` patterns, like match) and an optional `finally`
-cleanup block. The AST stores try-body first, then alternating
-pattern-guarded handler children (one per match arm), then optionally
-the finally expression at the end. Handler arms use AST_PATTERN_GUARD
-shapes for the same uniform reason as match arms.
+F# `try ... with | pat -> ... finally ...` supports both exception
+handling (via `with` arms, like match) and an optional `finally`
+cleanup block. The AST stores the try body first, then one
+AST_PATTERN_GUARD child per handler arm, then optionally the finally
+expression as the last (non-guard) child - the HIR translator
+distinguishes handler arms from the finally expression by node type.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_TRY, creates AST_TRY_EXPRESSION, parses the try body
-and appends. Outer loop reads current_token; if TOKEN_WITH, advances
-and runs an inner loop:
-- consume optional TOKEN_PIPE
-- parse pattern-with-guard
-- consume TOKEN_ARROW
-- parse handler expression
-- build AST_PATTERN_GUARD(pattern, handler), append to try node
-- continue inner loop only while next token is TOKEN_PIPE.
-Outer loop otherwise breaks. Reads current; if TOKEN_FINALLY,
-advances and parses the finally expression, appends. Returns the
-try node.
-@End Implementation
 Process called "parse_try_expression" takes parser as Integer returns Integer:
-    Note: Parse try-catch-finally expression
+    Note: Parse try-with-finally expression
 
-    proc consume_token with parser, TOKEN_TRY
+    proc consume_token with parser, TOKEN_TRY from Lexer
+    proc skip_newlines with parser
 
     Let try_node be proc create_ast_node with parser, AST_TRY_EXPRESSION
 
-    Note: Parse try body
-    Let try_body be proc parse_expression from parser
+    Let try_body be proc parse_expression with parser
     proc add_child with try_node, try_body
 
-    Note: Parse catch clauses
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_WITH:
-            proc advance_token from parser
+    proc skip_newlines with parser
+    Let current_type be proc current_token_type with parser
 
-            Note: Parse exception patterns and handlers
-            While 1:
-                Set current to proc current_token from parser
-                If current is equal to TOKEN_PIPE:
-                    proc advance_token from parser
-                End If
+    If current_type is equal to TOKEN_WITH from Lexer:
+        proc advance_token with parser
+        proc skip_newlines with parser
 
-                Let pattern be proc parse_pattern_with_guard from parser
-                proc consume_token with parser, TOKEN_ARROW
-                Let handler_expr be proc parse_expression from parser
+        Let parsing_handlers be 1
+        While parsing_handlers is equal to 1:
+            Set current_type to proc current_token_type with parser
+            If current_type is equal to TOKEN_PIPE from Lexer:
+                proc advance_token with parser
+            End If
 
-                Let catch_node be proc create_ast_node with parser, AST_PATTERN_GUARD
-                proc add_child with catch_node, pattern
-                proc add_child with catch_node, handler_expr
-                proc add_child with try_node, catch_node
+            Let pattern be proc parse_pattern_with_guard with parser
+            If pattern is equal to 0:
+                Set parsing_handlers to 0
+                Continue
+            End If
 
-                Set current to proc current_token from parser
-                If current is not equal to TOKEN_PIPE:
-                    Break
-                End If
-            End While
-        Otherwise:
-            Break
-        End If
-    End While
+            Let arrow_ok be proc consume_token with parser, TOKEN_ARROW from Lexer
+            If arrow_ok is equal to 0:
+                Set parsing_handlers to 0
+                Continue
+            End If
+            proc skip_newlines with parser
 
-    Note: Parse finally clause
-    Let current_tok be proc current_token from parser
-    If current_tok is equal to TOKEN_FINALLY:
-        proc advance_token from parser
-        Let finally_expr be proc parse_expression from parser
+            Let handler_expr be proc parse_expression with parser
+
+            Let catch_node be proc create_ast_node with parser, AST_PATTERN_GUARD
+            proc add_child with catch_node, pattern
+            proc add_child with catch_node, handler_expr
+            proc add_child with try_node, catch_node
+
+            proc skip_newlines with parser
+            Set current_type to proc current_token_type with parser
+            If current_type is not equal to TOKEN_PIPE from Lexer:
+                Set parsing_handlers to 0
+            End If
+        End While
+    End If
+
+    proc skip_newlines with parser
+    Set current_type to proc current_token_type with parser
+    If current_type is equal to TOKEN_FINALLY from Lexer:
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let finally_expr be proc parse_expression with parser
         proc add_child with try_node, finally_expr
     End If
 
     Return try_node
 End Process
 
-Note: ============================================================================
-Note: F# Declaration Parsing
-Note: ============================================================================
-
 @Reasoning:
-A let-binding consists of an optional `rec` keyword, a pattern (which
-for function definitions includes the function name and parameters
-as a curried pattern), an `=`, and an expression. The `rec` flag is
-stored in the node's value slot using TOKEN_REC as a sentinel so the
-node itself can be self-describing rather than needing a sibling
-flag.
+F# while-loops: `while cond do body [done]`. Modern F# light syntax
+omits `done`, so it is consumed when present and not required.
 @End Reasoning
+Process called "parse_while_expression" takes parser as Integer returns Integer:
+    Note: Parse while expression (while condition do body)
 
-@Implementation:
-Creates AST_LET_BINDING. Reads current; if TOKEN_REC, advances and
-stores TOKEN_REC as the binding node's value via set_node_value.
-Parses pattern via parse_pattern and appends. Consumes TOKEN_EQUAL.
-Parses expression via parse_expression and appends. Returns the
-binding node.
-@End Implementation
-Process called "parse_let_binding" takes parser as Integer returns Integer:
-    Note: Parse let binding (let pattern = expression)
+    proc consume_token with parser, TOKEN_WHILE from Lexer
 
-    Let binding_node be proc create_ast_node with parser, AST_LET_BINDING
+    Let while_node be proc create_ast_node with parser, AST_WHILE_EXPRESSION
 
-    Note: Check for 'rec' keyword
-    Let current be proc current_token from parser
-    If current is equal to TOKEN_REC:
-        proc advance_token from parser
-        proc set_node_value with binding_node, TOKEN_REC
+    Let condition be proc parse_pipeline_expression with parser
+    proc add_child with while_node, condition
+
+    proc consume_token with parser, TOKEN_DO from Lexer
+    proc skip_newlines with parser
+
+    Let body be proc parse_expression with parser
+    proc add_child with while_node, body
+
+    proc skip_newlines with parser
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_DONE from Lexer:
+        proc advance_token with parser
     End If
 
-    Note: Parse pattern (function name and parameters)
-    Let pattern be proc parse_pattern from parser
-    proc add_child with binding_node, pattern
-
-    proc consume_token with parser, TOKEN_EQUAL
-
-    Note: Parse expression
-    Let expr be proc parse_expression from parser
-    proc add_child with binding_node, expr
-
-    Return binding_node
+    Return while_node
 End Process
 
 @Reasoning:
-F# type declarations have four kinds (record, discriminated union,
-class, interface) plus a type-abbreviation form, all introduced by
-`type Name = ...`. The lookahead after `=` disambiguates which kind
-based on the first token: `{` -> record, `|` -> union, `class` ->
-class, `interface` -> interface, anything else -> abbreviation. This
-makes the dispatch decision purely LL(1).
+F# has two for forms: `for x in iterable do body` and
+`for i = start to|downto finish do body`. Both produce the same
+3-child AST shape (variable, iterable, body) that the HIR translator
+expects; the counted form synthesises its iterable as a `..` range
+application so downstream code sees one iteration protocol. `done` is
+optional as with while.
 @End Reasoning
+Process called "parse_for_expression" takes parser as Integer returns Integer:
+    Note: Parse for expression (for var in expr do body / for var = a to b do body)
 
-@Implementation:
-Consumes TOKEN_TYPE. Creates AST_TYPE_DECLARATION. Reads the type
-name from the current token, stores it as the node value, advances.
-Consumes TOKEN_EQUAL. Reads current_token; if TOKEN_LEFT_BRACE
-dispatches to parse_record_type, if TOKEN_PIPE to parse_union_type,
-if TOKEN_CLASS to parse_class_type, if TOKEN_INTERFACE to
-parse_interface_type. In each case, appends the result as a single
-child and returns. Otherwise (no special-form token), falls through
-to parse_type_expression which handles the type-abbreviation case.
-@End Implementation
-Process called "parse_type_declaration" takes parser as Integer returns Integer:
-    Note: Parse type declaration
+    proc consume_token with parser, TOKEN_FOR from Lexer
 
-    proc consume_token with parser, TOKEN_TYPE
+    Let for_node be proc create_ast_node with parser, AST_FOR_EXPRESSION
 
-    Let type_node be proc create_ast_node with parser, AST_TYPE_DECLARATION
-
-    Note: Parse type name
-    Let type_name be proc current_token from parser
-    proc set_node_value with type_node, type_name
-    proc advance_token from parser
-
-    proc consume_token with parser, TOKEN_EQUAL
-
-    Note: Determine type kind and parse accordingly
-    Let current be proc current_token from parser
-
-    Note: Record type {field: type; ...}
-    If current is equal to TOKEN_LEFT_BRACE:
-        Let record_type be proc parse_record_type from parser
-        proc add_child with type_node, record_type
-        Return type_node
+    Let var_type be proc current_token_type with parser
+    If var_type is not equal to TOKEN_IDENTIFIER from Lexer:
+        proc set_parse_error with parser, "Expected variable name"
+        Return 0
     End If
 
-    Note: Union type | Case1 | Case2 of type
-    If current is equal to TOKEN_PIPE:
-        Let union_type be proc parse_union_type from parser
-        proc add_child with type_node, union_type
-        Return type_node
-    End If
+    Let var_token be proc current_token with parser
+    Let var_node be proc create_ast_node with parser, AST_IDENTIFIER
+    proc set_node_value with var_node, var_token
+    proc add_child with for_node, var_node
+    proc advance_token with parser
 
-    Note: Class type
-    If current is equal to TOKEN_CLASS:
-        Let class_type be proc parse_class_type from parser
-        proc add_child with type_node, class_type
-        Return type_node
-    End If
+    Let current_type be proc current_token_type with parser
 
-    Note: Interface type
-    If current is equal to TOKEN_INTERFACE:
-        Let interface_type be proc parse_interface_type from parser
-        proc add_child with type_node, interface_type
-        Return type_node
-    End If
+    If current_type is equal to TOKEN_EQUAL from Lexer:
+        Note: Counted form: for i = start to/downto finish do body
+        proc advance_token with parser
+        Let start_expr be proc parse_pipeline_expression with parser
 
-    Note: Type abbreviation (type alias)
-    Let type_expr be proc parse_type_expression from parser
-    proc add_child with type_node, type_expr
-
-    Return type_node
-End Process
-
-@Reasoning:
-F# modules are similar to namespaces but are also values - a module
-is a singleton instance of a synthesized type. The body is parsed as
-a sequence of declarations until EOF; nested module termination is
-detected by indent comparison in a full implementation but this
-parser uses EOF or declaration-failure as the boundary, matching the
-parse_program loop's approach.
-@End Reasoning
-
-@Implementation:
-Consumes TOKEN_MODULE. Creates AST_MODULE. Reads module name token,
-stores as node value, advances. Consumes TOKEN_EQUAL. Loop until
-TOKEN_EOF: calls parse_declaration; if non-zero, appends; on 0,
-breaks (failure or unrecognized form). Returns the module node.
-@End Implementation
-Process called "parse_module_declaration" takes parser as Integer returns Integer:
-    Note: Parse module declaration
-
-    proc consume_token with parser, TOKEN_MODULE
-
-    Let module_node be proc create_ast_node with parser, AST_MODULE
-
-    Note: Parse module name
-    Let module_name be proc current_token from parser
-    proc set_node_value with module_node, module_name
-    proc advance_token from parser
-
-    proc consume_token with parser, TOKEN_EQUAL
-
-    Note: Parse module body
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_EOF:
-            Break
+        Let dir_type be proc current_token_type with parser
+        Let dir_ok be 0
+        If dir_type is equal to TOKEN_TO from Lexer:
+            Set dir_ok to 1
+        End If
+        If dir_type is equal to TOKEN_DOWNTO from Lexer:
+            Set dir_ok to 1
+        End If
+        If dir_ok is equal to 0:
+            proc set_parse_error with parser, "Expected 'to' or 'downto'"
+            Return 0
         End If
 
-        Let declaration be proc parse_declaration from parser
-        If declaration is not equal to 0:
-            proc add_child with module_node, declaration
-        Otherwise:
-            Break
+        Note: Synthesise the range operator token carrying the loop direction
+        Let dir_token be proc current_token with parser
+        Let dir_line be proc get_token_line from Lexer with dir_token
+        Let dir_col be proc get_token_column from Lexer with dir_token
+        Let range_text be ".."
+        If dir_type is equal to TOKEN_DOWNTO from Lexer:
+            Set range_text to "..-"
+        End If
+        Let range_token be proc create_token from Lexer with TOKEN_RANGE from Lexer, range_text, 0, dir_line, dir_col
+        proc advance_token with parser
+
+        Let finish_expr be proc parse_pipeline_expression with parser
+
+        Let iterable be proc make_operator_application with parser, range_token, start_expr, finish_expr
+        proc add_child with for_node, iterable
+
+    Otherwise:
+        proc consume_token with parser, TOKEN_IN from Lexer
+        Let iter_expr be proc parse_pipeline_expression with parser
+        proc add_child with for_node, iter_expr
+    End If
+
+    proc consume_token with parser, TOKEN_DO from Lexer
+    proc skip_newlines with parser
+
+    Let body be proc parse_expression with parser
+    proc add_child with for_node, body
+
+    proc skip_newlines with parser
+    Set current_type to proc current_token_type with parser
+    If current_type is equal to TOKEN_DONE from Lexer:
+        proc advance_token with parser
+    End If
+
+    Return for_node
+End Process
+
+@Reasoning:
+F# `function p1 -> e1 | p2 -> e2` is sugar for
+`fun x -> match x with ...`. The parser materialises this as an
+AST_LAMBDA whose children are pattern-guarded case nodes - the same
+shape match expressions use - because downstream lowering recognises
+that shape uniformly.
+@End Reasoning
+Process called "parse_function_expression" takes parser as Integer returns Integer:
+    Note: Parse function expression (function pattern -> expr | ...)
+
+    proc consume_token with parser, TOKEN_FUNCTION from Lexer
+    proc skip_newlines with parser
+
+    Let function_node be proc create_ast_node with parser, AST_LAMBDA
+
+    Let parsing_cases be 1
+    While parsing_cases is equal to 1:
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_PIPE from Lexer:
+            proc advance_token with parser
+        End If
+
+        Let pattern be proc parse_pattern_with_guard with parser
+        If pattern is equal to 0:
+            Set parsing_cases to 0
+            Continue
+        End If
+
+        Let arrow_ok be proc consume_token with parser, TOKEN_ARROW from Lexer
+        If arrow_ok is equal to 0:
+            Set parsing_cases to 0
+            Continue
+        End If
+        proc skip_newlines with parser
+
+        Let expr be proc parse_expression with parser
+
+        Let case_node be proc create_ast_node with parser, AST_PATTERN_GUARD
+        proc add_child with case_node, pattern
+        proc add_child with case_node, expr
+        proc add_child with function_node, case_node
+
+        proc skip_newlines with parser
+        Set current_type to proc current_token_type with parser
+        If current_type is not equal to TOKEN_PIPE from Lexer:
+            Set parsing_cases to 0
         End If
     End While
 
-    Return module_node
+    Return function_node
 End Process
 
 Note: ============================================================================
-Note: F# Program Structure Parsing
+Note: Collection Literal Parsing
 Note: ============================================================================
 
 @Reasoning:
-Top-level declaration dispatcher. Selects between module, namespace,
-open, type, let-binding, and val-declaration based on the leading
-keyword. The decision is purely LL(1) since every supported leading
-keyword is distinct - no further lookahead is needed.
+F# list literals use `[e1; e2; e3]` with semicolons (and newlines as
+soft separators). The empty case `[]` is handled by detecting the
+closing bracket immediately after the opener.
 @End Reasoning
-
-@Implementation:
-Reads current_token and dispatches:
-- TOKEN_MODULE -> parse_module_declaration
-- TOKEN_NAMESPACE -> parse_namespace_declaration
-- TOKEN_OPEN -> parse_open_statement
-- TOKEN_TYPE -> parse_type_declaration
-- TOKEN_LET -> parse_let_binding (top-level let is a binding without
-  the surrounding let-expression wrapper)
-- TOKEN_VAL -> parse_value_declaration
-- otherwise: set_parse_error "Expected declaration", return 0.
-@End Implementation
-Process called "parse_declaration" takes parser as Integer returns Integer:
-    Note: Parse top-level declaration
-
-    Let current be proc current_token from parser
-
-    Note: Module declaration
-    If current is equal to TOKEN_MODULE:
-        Return proc parse_module_declaration from parser
-    End If
-
-    Note: Namespace declaration
-    If current is equal to TOKEN_NAMESPACE:
-        Return proc parse_namespace_declaration from parser
-    End If
-
-    Note: Open statement
-    If current is equal to TOKEN_OPEN:
-        Return proc parse_open_statement from parser
-    End If
-
-    Note: Type declaration
-    If current is equal to TOKEN_TYPE:
-        Return proc parse_type_declaration from parser
-    End If
-
-    Note: Let binding (top-level)
-    If current is equal to TOKEN_LET:
-        Return proc parse_let_binding from parser
-    End If
-
-    Note: Value declaration
-    If current is equal to TOKEN_VAL:
-        Return proc parse_value_declaration from parser
-    End If
-
-    proc set_parse_error with parser, "Expected declaration"
-    Return 0
-End Process
-
-@Reasoning:
-The program-level loop must tolerate intervening trivia (blank lines
-and both comment styles) because F# allows them between declarations.
-Recovery on a failing declaration is critical: returning early on the
-first failure would lose every later declaration in a multi-error
-parse. Instead the loop checks whether the failure raised a hard
-parse_error - in which case we propagate it - or simply returned 0
-because the current token wasn't recognized, in which case we advance
-one token and try again so unknown noise can't deadlock the parser.
-@End Reasoning
-
-@Implementation:
-Allocates an AST_PROGRAM root via the arena. In a While 1 loop:
-- Reads current_token; breaks on TOKEN_EOF.
-- Advances past TOKEN_NEWLINE, TOKEN_LINE_COMMENT, TOKEN_BLOCK_COMMENT
-  with Continue so trivia never reaches parse_declaration.
-- Calls parse_declaration. On success, adds the returned declaration
-  as a child of program_node. On failure (declaration == 0), reads
-  has_parse_error; if true returns 0 to propagate the hard error,
-  otherwise advances one token to skip the offending input and resume.
-Returns the populated AST_PROGRAM root.
-@End Implementation
-Process called "parse_program" takes parser as Integer returns Integer:
-    Note: Parse complete F# program
-
-    @Reasoning:
-    An F# program consists of declarations at the top level.
-    This includes modules, namespaces, types, functions, and values.
-    @End Reasoning
-
-    Let program_node be proc create_ast_node with parser, AST_PROGRAM
-
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_EOF:
-            Break
-        End If
-
-        Note: Skip newlines and comments
-        If current is equal to TOKEN_NEWLINE:
-            proc advance_token from parser
-            Continue
-        End If
-        If current is equal to TOKEN_LINE_COMMENT:
-            proc advance_token from parser
-            Continue
-        End If
-        If current is equal to TOKEN_BLOCK_COMMENT:
-            proc advance_token from parser
-            Continue
-        End If
-
-        Let declaration be proc parse_declaration from parser
-        If declaration is not equal to 0:
-            proc add_child with program_node, declaration
-        Otherwise:
-            Let has_error be proc has_parse_error from parser
-            If has_error is equal to 1:
-                Return 0
-            End If
-            proc advance_token from parser  Note: Skip unknown token
-        End If
-    End While
-
-    Return program_node
-End Process
-
-Note: ============================================================================
-Note: Helper Functions for Complex Constructs
-Note: ============================================================================
-
-@Reasoning:
-F# list literals use `[e1; e2; e3]` with semicolons (not commas) so
-they don't conflict with tuple syntax inside the brackets. The empty
-case `[]` is handled by detecting TOKEN_RIGHT_BRACKET immediately
-after the opener.
-@End Reasoning
-
-@Implementation:
-Consumes TOKEN_LEFT_BRACKET. Creates AST_LIST_EXPRESSION. Reads
-current; if TOKEN_RIGHT_BRACKET, advances and returns the empty
-list node. Otherwise enters a loop:
-- parses an expression, appends as child
-- if next is TOKEN_SEMICOLON, advances and continues
-- if next is TOKEN_RIGHT_BRACKET, advances and breaks
-- otherwise reports "Expected ';' or ']'" and returns 0.
-Returns the list node.
-@End Implementation
 Process called "parse_list_expression" takes parser as Integer returns Integer:
     Note: Parse list literal [1; 2; 3]
 
-    proc consume_token with parser, TOKEN_LEFT_BRACKET
+    proc consume_token with parser, TOKEN_LEFT_BRACKET from Lexer
+    proc skip_newlines with parser
 
     Let list_node be proc create_ast_node with parser, AST_LIST_EXPRESSION
 
-    Note: Empty list
-    Let current be proc current_token from parser
-    If current is equal to TOKEN_RIGHT_BRACKET:
-        proc advance_token from parser
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_RIGHT_BRACKET from Lexer:
+        proc advance_token with parser
         Return list_node
     End If
 
-    Note: Parse list elements
-    While 1:
-        Let element be proc parse_expression from parser
-        proc add_child with list_node, element
-
-        Set current to proc current_token from parser
-        If current is equal to TOKEN_SEMICOLON:
-            proc advance_token from parser
-            Continue
-        End If
-        If current is equal to TOKEN_RIGHT_BRACKET:
-            proc advance_token from parser
-            Break
-        Otherwise:
-            proc set_parse_error with parser, "Expected ';' or ']'"
+    Let collecting be 1
+    While collecting is equal to 1:
+        Let element be proc parse_expression with parser
+        If element is equal to 0:
             Return 0
         End If
+        proc add_child with list_node, element
+
+        proc skip_newlines with parser
+        Set current_type to proc current_token_type with parser
+        If current_type is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_token with parser
+            proc skip_newlines with parser
+            Continue
+        End If
+        If current_type is equal to TOKEN_RIGHT_BRACKET from Lexer:
+            proc advance_token with parser
+            Set collecting to 0
+            Continue
+        End If
+
+        proc set_parse_error with parser, "Expected ';' or ']'"
+        Return 0
     End While
 
     Return list_node
 End Process
 
 @Reasoning:
-Minimal type-expression parser accepting a single identifier or
-type-name token (e.g. `int`, `string`, `MyClass`). Function types
-with `->`, generics, and tuple types are not handled here; this
-helper is the leaf case for type abbreviations and field-type
-positions where only a name is meaningful.
+F# array literals use `[|e1; e2|]` with dedicated multi-character
+delimiter tokens, so they are distinguishable from list literals at
+the lexer level. Same element loop as lists with the array closer.
 @End Reasoning
-
-@Implementation:
-Reads current_token. If TOKEN_IDENTIFIER or TOKEN_TYPE_NAME, creates
-AST_TYPE_NAME, stores the token as its value, advances, returns the
-node. Otherwise reports "Expected type" and returns 0.
-@End Implementation
-Process called "parse_type_expression" takes parser as Integer returns Integer:
-    Note: Parse type expression
-
-    Let current be proc current_token from parser
-
-    If current is equal to TOKEN_IDENTIFIER:
-        Let type_node be proc create_ast_node with parser, AST_TYPE_NAME
-        proc set_node_value with type_node, current
-        proc advance_token from parser
-        Return type_node
-    End If
-
-    If current is equal to TOKEN_TYPE_NAME:
-        Set type_node to proc create_ast_node with parser, AST_TYPE_NAME
-        proc set_node_value with type_node, current
-        proc advance_token from parser
-        Return type_node
-    End If
-
-    proc set_parse_error with parser, "Expected type"
-    Return 0
-End Process
-
-@Reasoning:
-F# array literals use `[|e1; e2|]` so they are distinguishable from
-list literals at the lexer level (TOKEN_LEFT_ARRAY / TOKEN_RIGHT_ARRAY
-are dedicated multi-character tokens). The empty form `[||]` is
-handled by the same immediate-close path as empty lists.
-@End Reasoning
-
-@Implementation:
-Consumes TOKEN_LEFT_ARRAY. Creates AST_ARRAY_EXPRESSION. If
-TOKEN_RIGHT_ARRAY follows immediately, advances and returns the
-empty array node. Otherwise the same expression-and-separator loop
-as parse_list_expression but with TOKEN_RIGHT_ARRAY as the
-terminator. On unexpected token, reports "Expected ';' or '|]'" and
-returns 0. Returns the array node.
-@End Implementation
 Process called "parse_array_expression" takes parser as Integer returns Integer:
     Note: Parse array literal [|1; 2; 3|]
 
-    proc consume_token with parser, TOKEN_LEFT_ARRAY
+    proc consume_token with parser, TOKEN_LEFT_ARRAY from Lexer
+    proc skip_newlines with parser
 
     Let array_node be proc create_ast_node with parser, AST_ARRAY_EXPRESSION
 
-    Note: Empty array
-    Let current be proc current_token from parser
-    If current is equal to TOKEN_RIGHT_ARRAY:
-        proc advance_token from parser
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_RIGHT_ARRAY from Lexer:
+        proc advance_token with parser
         Return array_node
     End If
 
-    Note: Parse array elements
-    While 1:
-        Let element be proc parse_expression from parser
-        proc add_child with array_node, element
-
-        Set current to proc current_token from parser
-        If current is equal to TOKEN_SEMICOLON:
-            proc advance_token from parser
-            Continue
-        End If
-        If current is equal to TOKEN_RIGHT_ARRAY:
-            proc advance_token from parser
-            Break
-        Otherwise:
-            proc set_parse_error with parser, "Expected ';' or '|]'"
+    Let collecting be 1
+    While collecting is equal to 1:
+        Let element be proc parse_expression with parser
+        If element is equal to 0:
             Return 0
         End If
+        proc add_child with array_node, element
+
+        proc skip_newlines with parser
+        Set current_type to proc current_token_type with parser
+        If current_type is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_token with parser
+            proc skip_newlines with parser
+            Continue
+        End If
+        If current_type is equal to TOKEN_RIGHT_ARRAY from Lexer:
+            proc advance_token with parser
+            Set collecting to 0
+            Continue
+        End If
+
+        proc set_parse_error with parser, "Expected ';' or '|]'"
+        Return 0
     End While
 
     Return array_node
 End Process
 
 @Reasoning:
-Record literals use `{field = value; field = value}` syntax. Each
-field becomes an AST_LET_BINDING child of the record node (reusing
-the binding shape because a record field is conceptually a named
-value assignment). Field names must be identifier tokens; non-
-identifier tokens produce a parse error rather than silently
-accepting arbitrary expressions as keys.
+Record literals use `{field = value; field = value}` syntax. Each field
+becomes an AST_LET_BINDING child of the record node whose value slot
+holds the field-name TOKEN and whose single child is the field value
+expression - the exact contract translate_field_assignment in the HIR
+translator reads. Field names must be identifier tokens.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_LEFT_BRACE. Creates AST_RECORD_EXPRESSION. Empty
-case: TOKEN_RIGHT_BRACE -> advance and return. Field loop:
-- reads field_name; if not TOKEN_IDENTIFIER reports "Expected field
-  name" and returns 0
-- advances past the identifier
-- consumes TOKEN_EQUAL
-- parses the field value via parse_expression
-- creates AST_LET_BINDING with field_name as node value and the
-  value expression as a child, appends to the record node
-- on TOKEN_SEMICOLON advances and continues
-- on TOKEN_RIGHT_BRACE advances and breaks
-- otherwise reports "Expected ';' or '}'" and returns 0.
-Returns the record node.
-@End Implementation
 Process called "parse_record_expression" takes parser as Integer returns Integer:
     Note: Parse record expression {field = value; ...}
 
-    proc consume_token with parser, TOKEN_LEFT_BRACE
+    proc consume_token with parser, TOKEN_LEFT_BRACE from Lexer
+    proc skip_newlines with parser
 
     Let record_node be proc create_ast_node with parser, AST_RECORD_EXPRESSION
 
-    Note: Empty record
-    Let current be proc current_token from parser
-    If current is equal to TOKEN_RIGHT_BRACE:
-        proc advance_token from parser
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_RIGHT_BRACE from Lexer:
+        proc advance_token with parser
         Return record_node
     End If
 
-    Note: Parse record fields
-    While 1:
-        Note: Parse field name
-        Let field_name be proc current_token from parser
-        If field_name is not equal to TOKEN_IDENTIFIER:
+    Let collecting be 1
+    While collecting is equal to 1:
+        Let field_type be proc current_token_type with parser
+        If field_type is not equal to TOKEN_IDENTIFIER from Lexer:
             proc set_parse_error with parser, "Expected field name"
             Return 0
         End If
-        proc advance_token from parser
+        Let field_token be proc current_token with parser
+        proc advance_token with parser
 
-        proc consume_token with parser, TOKEN_EQUAL
+        Let eq_ok be proc consume_token with parser, TOKEN_EQUAL from Lexer
+        If eq_ok is equal to 0:
+            Return 0
+        End If
+        proc skip_newlines with parser
 
-        Note: Parse field value
-        Let field_value be proc parse_expression from parser
+        Let field_value be proc parse_expression with parser
 
-        Note: Create field assignment node
         Let field_node be proc create_ast_node with parser, AST_LET_BINDING
-        proc set_node_value with field_node, field_name
+        proc set_node_value with field_node, field_token
         proc add_child with field_node, field_value
         proc add_child with record_node, field_node
 
-        Set current to proc current_token from parser
-        If current is equal to TOKEN_SEMICOLON:
-            proc advance_token from parser
+        proc skip_newlines with parser
+        Set current_type to proc current_token_type with parser
+        If current_type is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_token with parser
+            proc skip_newlines with parser
             Continue
         End If
-        If current is equal to TOKEN_RIGHT_BRACE:
-            proc advance_token from parser
-            Break
-        Otherwise:
-            proc set_parse_error with parser, "Expected ';' or '}'"
-            Return 0
+        If current_type is equal to TOKEN_RIGHT_BRACE from Lexer:
+            proc advance_token with parser
+            Set collecting to 0
+            Continue
         End If
+
+        proc set_parse_error with parser, "Expected ';' or '}'"
+        Return 0
     End While
 
     Return record_node
@@ -1910,470 +2197,621 @@ End Process
 
 @Reasoning:
 F# code quotations `<@ expr @>` capture an expression as a typed AST
-value at runtime, enabling metaprogramming. The expression inside is
-parsed as a normal expression - the quotation just wraps it in a
-distinct AST kind so semantic analysis can lift the contained tree
-to a runtime representation.
+value at runtime. The inner expression is parsed normally; the
+quotation wraps it in a distinct AST kind so semantic analysis can
+lift the contained tree to a runtime representation.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_LEFT_QUOTE. Creates AST_QUOTE_EXPRESSION. Parses the
-inner expression via parse_expression and appends. Consumes
-TOKEN_RIGHT_QUOTE. Returns the quote node.
-@End Implementation
 Process called "parse_quotation_expression" takes parser as Integer returns Integer:
     Note: Parse quotation expression <@ expr @>
 
-    proc consume_token with parser, TOKEN_LEFT_QUOTE
+    proc consume_token with parser, TOKEN_LEFT_QUOTE from Lexer
 
     Let quote_node be proc create_ast_node with parser, AST_QUOTE_EXPRESSION
 
-    Note: Parse quoted expression
-    Let quoted_expr be proc parse_expression from parser
+    Let quoted_expr be proc parse_expression with parser
     proc add_child with quote_node, quoted_expr
 
-    proc consume_token with parser, TOKEN_RIGHT_QUOTE
+    proc consume_token with parser, TOKEN_RIGHT_QUOTE from Lexer
 
     Return quote_node
 End Process
 
+Note: ============================================================================
+Note: F# Type Expression Parsing
+Note: ============================================================================
+
 @Reasoning:
-F# while-loops always evaluate to unit so they are expressions in
-the syntactic sense but their body is essentially imperative. The
-`done` terminator (not common in modern F# but supported by the
-grammar) is required by this parser.
+Type expressions cover named types (int, string, MyType, dotted
+System.String paths, and 'a type variables, which lex as identifiers
+with an apostrophe lexeme), generic instantiations in both F# forms -
+prefix List<int> / Option<int> / Dictionary<K, V> angle-bracket
+applications and postfix int option / int list juxtaposed applications -
+plus right-associative function arrows (int -> int -> bool). Name atoms
+become AST_TYPE_NAME nodes carrying the name token; generic applications
+become AST_TYPE_APPLICATION nodes whose value slot holds the
+constructor-name token and whose children are the argument types in
+declaration order; arrows become AST_TYPE_FUNCTION nodes with
+[argument type, result type] children. Postfix application binds tighter
+than the arrow (int option -> string is (int option) -> string) and
+chains left-to-right (int option list is (int option) list), matching
+the F# specification.
 @End Reasoning
+Process called "parse_type_atom" takes parser as Integer returns Integer:
+    Note: Parse a named type, type variable, or prefix generic application
 
-@Implementation:
-Consumes TOKEN_WHILE. Creates AST_WHILE_EXPRESSION. Parses
-condition via parse_expression, appends. Consumes TOKEN_DO. Parses
-body, appends. Consumes TOKEN_DONE. Returns the while node.
-@End Implementation
-Process called "parse_while_expression" takes parser as Integer returns Integer:
-    Note: Parse while expression (while condition do body done)
+    Let current_type be proc current_token_type with parser
 
-    proc consume_token with parser, TOKEN_WHILE
+    Let is_name be 0
+    If current_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Set is_name to 1
+    End If
+    If current_type is equal to TOKEN_TYPE_NAME from Lexer:
+        Set is_name to 1
+    End If
 
-    Let while_node be proc create_ast_node with parser, AST_WHILE_EXPRESSION
+    If is_name is equal to 1:
+        Let name_token be proc parse_dotted_name_token with parser
 
-    Note: Parse condition
-    Let condition be proc parse_expression from parser
-    proc add_child with while_node, condition
+        Note: Prefix generic application List<int>, Dictionary<K, V>
+        Let after_name be proc current_token_type with parser
+        If after_name is equal to TOKEN_LESS_THAN from Lexer:
+            proc advance_token with parser  Note: Skip <
 
-    proc consume_token with parser, TOKEN_DO
+            Let app_node be proc create_ast_node with parser, AST_TYPE_APPLICATION
+            proc set_node_value with app_node, name_token
 
-    Note: Parse body
-    Let body be proc parse_expression from parser
-    proc add_child with while_node, body
+            Let collecting be 1
+            While collecting is equal to 1:
+                Let arg_node be proc parse_type_expression with parser
+                If arg_node is equal to 0:
+                    Return 0
+                End If
+                proc add_child with app_node, arg_node
 
-    proc consume_token with parser, TOKEN_DONE
+                Let sep_type be proc current_token_type with parser
+                If sep_type is equal to TOKEN_COMMA from Lexer:
+                    proc advance_token with parser  Note: Skip ,
+                Otherwise:
+                    Set collecting to 0
+                End If
+            End While
 
-    Return while_node
+            Note: Close the angle bracket. Nested generics end with >> which
+            Note: the lexer reads as the composition operator; splitting it in
+            Note: place (rewriting the token's type tag to a single > without
+            Note: advancing) lets the enclosing generic consume the second half.
+            Let close_type be proc current_token_type with parser
+            If close_type is equal to TOKEN_GREATER_THAN from Lexer:
+                proc advance_token with parser
+                Return app_node
+            End If
+            If close_type is equal to TOKEN_COMPOSE_RIGHT from Lexer:
+                Let close_token be proc current_token with parser
+                proc memory_set_int64 from Layout with close_token, 0, TOKEN_GREATER_THAN from Lexer
+                Return app_node
+            End If
+
+            proc set_parse_error with parser, "Expected '>' to close generic type application"
+            Return 0
+        End If
+
+        Let type_node be proc create_ast_node with parser, AST_TYPE_NAME
+        proc set_node_value with type_node, name_token
+        Return type_node
+    End If
+
+    Note: Parenthesised type (t)
+    If current_type is equal to TOKEN_LEFT_PAREN from Lexer:
+        proc advance_token with parser
+        Let inner be proc parse_type_expression with parser
+        proc consume_token with parser, TOKEN_RIGHT_PAREN from Lexer
+        Return inner
+    End If
+
+    proc set_parse_error with parser, "Expected type"
+    Return 0
 End Process
 
-@Reasoning:
-F# for-loops bind a single iteration variable and walk an iterable
-expression. The variable becomes the first child (as an
-AST_IDENTIFIER carrying the name), the iterable is the second child,
-and the body is the third. Position-based child ordering keeps the
-node shape simple and matches the other looping constructs.
-@End Reasoning
+Process called "parse_type_expression" takes parser as Integer returns Integer:
+    Note: Parse type expression (names, generics, postfix applications, arrows)
 
-@Implementation:
-Consumes TOKEN_FOR. Creates AST_FOR_EXPRESSION. Reads var_token;
-if not TOKEN_IDENTIFIER reports "Expected variable name" and
-returns 0. Builds AST_IDENTIFIER with the variable token as value
-and appends. Advances. Consumes TOKEN_IN. Parses the iterable
-expression, appends. Consumes TOKEN_DO. Parses the body, appends.
-Consumes TOKEN_DONE. Returns the for node.
-@End Implementation
-Process called "parse_for_expression" takes parser as Integer returns Integer:
-    Note: Parse for expression (for var in expr do body done)
-
-    proc consume_token with parser, TOKEN_FOR
-
-    Let for_node be proc create_ast_node with parser, AST_FOR_EXPRESSION
-
-    Note: Parse variable
-    Let var_token be proc current_token from parser
-    If var_token is not equal to TOKEN_IDENTIFIER:
-        proc set_parse_error with parser, "Expected variable name"
+    Let left be proc parse_type_atom with parser
+    If left is equal to 0:
         Return 0
     End If
 
-    Let var_node be proc create_ast_node with parser, AST_IDENTIFIER
-    proc set_node_value with var_node, var_token
-    proc add_child with for_node, var_node
-    proc advance_token from parser
-
-    proc consume_token with parser, TOKEN_IN
-
-    Note: Parse iterable expression
-    Let iterable be proc parse_expression from parser
-    proc add_child with for_node, iterable
-
-    proc consume_token with parser, TOKEN_DO
-
-    Note: Parse body
-    Let body be proc parse_expression from parser
-    proc add_child with for_node, body
-
-    proc consume_token with parser, TOKEN_DONE
-
-    Return for_node
-End Process
-
-@Reasoning:
-F# `function p1 -> e1 | p2 -> e2` is sugar for `fun x -> match x
-with p1 -> e1 | p2 -> e2`. The parser materializes this as an
-AST_LAMBDA whose children are pattern-guarded case nodes - the same
-shape match expressions use - because downstream lowering recognizes
-that shape uniformly.
-@End Reasoning
-
-@Implementation:
-Consumes TOKEN_FUNCTION. Creates AST_LAMBDA. Case loop:
-- consume optional TOKEN_PIPE if present
-- parse pattern-with-guard
-- consume TOKEN_ARROW
-- parse arm expression
-- build AST_PATTERN_GUARD(pattern, expr), append to the lambda
-- continue while next token is TOKEN_PIPE, otherwise break.
-Returns the lambda node.
-@End Implementation
-Process called "parse_function_expression" takes parser as Integer returns Integer:
-    Note: Parse function expression (function pattern -> expr)
-
-    proc consume_token with parser, TOKEN_FUNCTION
-
-    Let function_node be proc create_ast_node with parser, AST_LAMBDA
-
-    Note: Parse pattern cases
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_PIPE:
-            proc advance_token from parser
+    Note: Postfix type-constructor applications: int option, int list,
+    Note: 'a seq, int option list. Each juxtaposed name applies to the
+    Note: entire type built so far, chaining left-to-right.
+    Let postfixing be 1
+    While postfixing is equal to 1:
+        Let current_type be proc current_token_type with parser
+        Let is_ctor be 0
+        If current_type is equal to TOKEN_IDENTIFIER from Lexer:
+            Set is_ctor to 1
+        End If
+        If current_type is equal to TOKEN_TYPE_NAME from Lexer:
+            Set is_ctor to 1
         End If
 
-        Let pattern be proc parse_pattern_with_guard from parser
-        proc consume_token with parser, TOKEN_ARROW
-        Let expr be proc parse_expression from parser
-
-        Note: Create case node
-        Let case_node be proc create_ast_node with parser, AST_PATTERN_GUARD
-        proc add_child with case_node, pattern
-        proc add_child with case_node, expr
-        proc add_child with function_node, case_node
-
-        Set current to proc current_token from parser
-        If current is not equal to TOKEN_PIPE:
-            Break
+        If is_ctor is equal to 0:
+            Set postfixing to 0
+            Continue
         End If
+
+        Let ctor_token be proc parse_dotted_name_token with parser
+        Let app_node be proc create_ast_node with parser, AST_TYPE_APPLICATION
+        proc set_node_value with app_node, ctor_token
+        proc add_child with app_node, left
+        Set left to app_node
     End While
 
-    Return function_node
+    Set current_type to proc current_token_type with parser
+    If current_type is equal to TOKEN_ARROW from Lexer:
+        proc advance_token with parser
+        Let right be proc parse_type_expression with parser
+
+        Let fn_node be proc create_ast_node with parser, AST_TYPE_FUNCTION
+        proc add_child with fn_node, left
+        proc add_child with fn_node, right
+        Return fn_node
+    End If
+
+    Return left
 End Process
+
+Note: ============================================================================
+Note: F# Pattern Collection Parsing
+Note: ============================================================================
 
 @Reasoning:
 Pattern context counterpart to parse_list_expression: same bracket-
-and-semicolon syntax but elements are patterns (which include
-wildcards, variables, literals, and constructors) rather than
+and-semicolon syntax but elements are patterns rather than
 expressions. AST_PATTERN_LIST identifies the pattern context.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_LEFT_BRACKET. Creates AST_PATTERN_LIST. Empty case:
-TOKEN_RIGHT_BRACKET -> advance and return. Otherwise loop parsing
-patterns separated by TOKEN_SEMICOLON, terminating on
-TOKEN_RIGHT_BRACKET, with the same error handling shape as
-parse_list_expression. Returns the pattern node.
-@End Implementation
 Process called "parse_list_pattern" takes parser as Integer returns Integer:
     Note: Parse list pattern [x; y; z]
 
-    proc consume_token with parser, TOKEN_LEFT_BRACKET
+    proc consume_token with parser, TOKEN_LEFT_BRACKET from Lexer
 
     Let list_pattern be proc create_ast_node with parser, AST_PATTERN_LIST
 
-    Note: Empty list pattern
-    Let current be proc current_token from parser
-    If current is equal to TOKEN_RIGHT_BRACKET:
-        proc advance_token from parser
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_RIGHT_BRACKET from Lexer:
+        proc advance_token with parser
         Return list_pattern
     End If
 
-    Note: Parse pattern elements
-    While 1:
-        Let pattern be proc parse_pattern from parser
-        proc add_child with list_pattern, pattern
-
-        Set current to proc current_token from parser
-        If current is equal to TOKEN_SEMICOLON:
-            proc advance_token from parser
-            Continue
-        End If
-        If current is equal to TOKEN_RIGHT_BRACKET:
-            proc advance_token from parser
-            Break
-        Otherwise:
-            proc set_parse_error with parser, "Expected ';' or ']'"
+    Let collecting be 1
+    While collecting is equal to 1:
+        Let pattern be proc parse_pattern with parser
+        If pattern is equal to 0:
             Return 0
         End If
+        proc add_child with list_pattern, pattern
+
+        Set current_type to proc current_token_type with parser
+        If current_type is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If current_type is equal to TOKEN_RIGHT_BRACKET from Lexer:
+            proc advance_token with parser
+            Set collecting to 0
+            Continue
+        End If
+
+        proc set_parse_error with parser, "Expected ';' or ']'"
+        Return 0
     End While
 
     Return list_pattern
 End Process
 
 @Reasoning:
-Array-pattern counterpart of parse_array_expression. Uses
-TOKEN_LEFT_ARRAY / TOKEN_RIGHT_ARRAY delimiters and AST_PATTERN_ARRAY
-as the node kind. Pattern elements may include wildcards, variables,
-literals, and other patterns.
+Array-pattern counterpart of parse_array_expression with
+AST_PATTERN_ARRAY as the node kind.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_LEFT_ARRAY. Creates AST_PATTERN_ARRAY. Empty case:
-TOKEN_RIGHT_ARRAY -> advance and return. Otherwise loop parsing
-patterns separated by TOKEN_SEMICOLON, terminating on
-TOKEN_RIGHT_ARRAY. Returns the pattern node.
-@End Implementation
 Process called "parse_array_pattern" takes parser as Integer returns Integer:
     Note: Parse array pattern [|x; y; z|]
 
-    proc consume_token with parser, TOKEN_LEFT_ARRAY
+    proc consume_token with parser, TOKEN_LEFT_ARRAY from Lexer
 
     Let array_pattern be proc create_ast_node with parser, AST_PATTERN_ARRAY
 
-    Note: Empty array pattern
-    Let current be proc current_token from parser
-    If current is equal to TOKEN_RIGHT_ARRAY:
-        proc advance_token from parser
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_RIGHT_ARRAY from Lexer:
+        proc advance_token with parser
         Return array_pattern
     End If
 
-    Note: Parse pattern elements
-    While 1:
-        Let pattern be proc parse_pattern from parser
-        proc add_child with array_pattern, pattern
-
-        Set current to proc current_token from parser
-        If current is equal to TOKEN_SEMICOLON:
-            proc advance_token from parser
-            Continue
-        End If
-        If current is equal to TOKEN_RIGHT_ARRAY:
-            proc advance_token from parser
-            Break
-        Otherwise:
-            proc set_parse_error with parser, "Expected ';' or '|]'"
+    Let collecting be 1
+    While collecting is equal to 1:
+        Let pattern be proc parse_pattern with parser
+        If pattern is equal to 0:
             Return 0
         End If
+        proc add_child with array_pattern, pattern
+
+        Set current_type to proc current_token_type with parser
+        If current_type is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If current_type is equal to TOKEN_RIGHT_ARRAY from Lexer:
+            proc advance_token with parser
+            Set collecting to 0
+            Continue
+        End If
+
+        proc set_parse_error with parser, "Expected ';' or '|]'"
+        Return 0
     End While
 
     Return array_pattern
 End Process
 
 @Reasoning:
-Record patterns `{field = pat; field = pat}` destructure records.
-Each field becomes an AST_PATTERN_VARIABLE node carrying the field
-name in its value slot, with the field's sub-pattern attached as a
-child. This shape lets the value-slot carry the identifier without
-introducing an extra label-node kind.
+Record patterns `{field = pat; field = pat}` destructure records. Each
+field becomes an AST_PATTERN_VARIABLE node carrying the field-name
+TOKEN in its value slot with the field's sub-pattern as its single
+child - the exact contract translate_field_pattern in the HIR
+translator reads.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_LEFT_BRACE. Creates AST_PATTERN_RECORD. Empty case:
-TOKEN_RIGHT_BRACE -> advance and return. Field loop:
-- reads field_name; rejects if not TOKEN_IDENTIFIER
-- advances past identifier
-- consumes TOKEN_EQUAL
-- parses the field's sub-pattern via parse_pattern
-- creates AST_PATTERN_VARIABLE with field_name as the value and the
-  sub-pattern as a child, appends to record pattern
-- on TOKEN_SEMICOLON continues; on TOKEN_RIGHT_BRACE advances and
-  breaks; otherwise reports "Expected ';' or '}'" and returns 0.
-Returns the pattern node.
-@End Implementation
 Process called "parse_record_pattern" takes parser as Integer returns Integer:
     Note: Parse record pattern {field = pattern; ...}
 
-    proc consume_token with parser, TOKEN_LEFT_BRACE
+    proc consume_token with parser, TOKEN_LEFT_BRACE from Lexer
 
     Let record_pattern be proc create_ast_node with parser, AST_PATTERN_RECORD
 
-    Note: Empty record pattern
-    Let current be proc current_token from parser
-    If current is equal to TOKEN_RIGHT_BRACE:
-        proc advance_token from parser
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_RIGHT_BRACE from Lexer:
+        proc advance_token with parser
         Return record_pattern
     End If
 
-    Note: Parse field patterns
-    While 1:
-        Note: Parse field name
-        Let field_name be proc current_token from parser
-        If field_name is not equal to TOKEN_IDENTIFIER:
+    Let collecting be 1
+    While collecting is equal to 1:
+        Let field_type be proc current_token_type with parser
+        If field_type is not equal to TOKEN_IDENTIFIER from Lexer:
             proc set_parse_error with parser, "Expected field name"
             Return 0
         End If
-        proc advance_token from parser
+        Let field_token be proc current_token with parser
+        proc advance_token with parser
 
-        proc consume_token with parser, TOKEN_EQUAL
+        Let eq_ok be proc consume_token with parser, TOKEN_EQUAL from Lexer
+        If eq_ok is equal to 0:
+            Return 0
+        End If
 
-        Note: Parse field pattern
-        Let field_pattern be proc parse_pattern from parser
+        Let field_pattern be proc parse_pattern with parser
 
-        Note: Create field pattern node
         Let field_node be proc create_ast_node with parser, AST_PATTERN_VARIABLE
-        proc set_node_value with field_node, field_name
+        proc set_node_value with field_node, field_token
         proc add_child with field_node, field_pattern
         proc add_child with record_pattern, field_node
 
-        Set current to proc current_token from parser
-        If current is equal to TOKEN_SEMICOLON:
-            proc advance_token from parser
+        Set current_type to proc current_token_type with parser
+        If current_type is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_token with parser
             Continue
         End If
-        If current is equal to TOKEN_RIGHT_BRACE:
-            proc advance_token from parser
-            Break
-        Otherwise:
-            proc set_parse_error with parser, "Expected ';' or '}'"
-            Return 0
+        If current_type is equal to TOKEN_RIGHT_BRACE from Lexer:
+            proc advance_token with parser
+            Set collecting to 0
+            Continue
         End If
+
+        proc set_parse_error with parser, "Expected ';' or '}'"
+        Return 0
     End While
 
     Return record_pattern
 End Process
 
+Note: ============================================================================
+Note: F# Declaration Parsing
+Note: ============================================================================
+
+@Reasoning:
+A let-binding consists of an optional `rec` keyword, a name pattern,
+zero or more curried parameter patterns, an optional `: returnType`
+annotation, an `=`, and a body expression. The `rec` flag is stored in
+the value slot using the TOKEN_REC type tag as a sentinel (heap token
+pointers can never collide with the small constant). Function bindings
+(parameters present) are desugared to name + AST_LAMBDA so the binding
+node always has exactly two children [pattern, expression] - the HIR
+translator's contract.
+@End Reasoning
+Process called "parse_let_binding" takes parser as Integer returns Integer:
+    Note: Parse let binding (let [rec] name params... [: type] = expression)
+
+    Let binding_node be proc create_ast_node with parser, AST_LET_BINDING
+
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_REC from Lexer:
+        proc advance_token with parser
+        proc set_node_value with binding_node, TOKEN_REC from Lexer
+    End If
+
+    Note: Optional mutable modifier
+    Set current_type to proc current_token_type with parser
+    If current_type is equal to TOKEN_MUTABLE from Lexer:
+        proc advance_token with parser
+    End If
+
+    Let pattern be proc parse_pattern with parser
+    If pattern is equal to 0:
+        Return 0
+    End If
+    proc add_child with binding_node, pattern
+
+    Note: Collect curried function parameters until = or : or EOF
+    Let params be proc list_create from List
+    Let collecting be 1
+    While collecting is equal to 1:
+        Set current_type to proc current_token_type with parser
+
+        Let is_param_start be 0
+        If current_type is equal to TOKEN_IDENTIFIER from Lexer:
+            Set is_param_start to 1
+        End If
+        If current_type is equal to TOKEN_UNDERSCORE from Lexer:
+            Set is_param_start to 1
+        End If
+        If current_type is equal to TOKEN_LEFT_PAREN from Lexer:
+            Set is_param_start to 1
+        End If
+
+        If is_param_start is equal to 0:
+            Set collecting to 0
+            Continue
+        End If
+
+        Let param be proc parse_pattern with parser
+        If param is equal to 0:
+            Set collecting to 0
+            Continue
+        End If
+        proc list_append from List with params, param
+    End While
+
+    Note: Optional return-type annotation
+    Set current_type to proc current_token_type with parser
+    If current_type is equal to TOKEN_COLON from Lexer:
+        proc advance_token with parser
+        Let return_type be proc parse_type_expression with parser
+        proc memory_set_int64 from Layout with binding_node, 40, return_type
+    End If
+
+    Let eq_ok be proc consume_token with parser, TOKEN_EQUAL from Lexer
+    If eq_ok is equal to 0:
+        Return 0
+    End If
+    proc skip_newlines with parser
+
+    Let expr be proc parse_expression with parser
+
+    Note: Function bindings desugar to let name = fun params -> body
+    Let param_count be proc list_length from List with params
+    If param_count is greater than 0:
+        Let lambda_node be proc create_ast_node with parser, AST_LAMBDA
+        Let i be 0
+        While i is less than param_count:
+            Let p be proc list_get from List with params, i
+            proc add_child with lambda_node, p
+            Set i to i plus 1
+        End While
+        proc add_child with lambda_node, expr
+        proc add_child with binding_node, lambda_node
+    Otherwise:
+        proc add_child with binding_node, expr
+    End If
+
+    Return binding_node
+End Process
+
+@Reasoning:
+F# type declarations have four special kinds (record, discriminated
+union, class, interface) plus the type-abbreviation form, all
+introduced by `type Name = ...`. The token after `=` disambiguates:
+`{` record, `|` union (or a TYPE_NAME whose successor is `|` or `of`
+for unions without the leading pipe), `class`, `interface`, anything
+else an abbreviation.
+@End Reasoning
+Process called "parse_type_declaration" takes parser as Integer returns Integer:
+    Note: Parse type declaration
+
+    proc consume_token with parser, TOKEN_TYPE from Lexer
+
+    Let type_node be proc create_ast_node with parser, AST_TYPE_DECLARATION
+
+    Let name_type be proc current_token_type with parser
+    Let is_name be 0
+    If name_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Set is_name to 1
+    End If
+    If name_type is equal to TOKEN_TYPE_NAME from Lexer:
+        Set is_name to 1
+    End If
+    If is_name is equal to 0:
+        proc set_parse_error with parser, "Expected type name"
+        Return 0
+    End If
+
+    Let name_token be proc current_token with parser
+    proc set_node_value with type_node, name_token
+    proc advance_token with parser
+
+    Let eq_ok be proc consume_token with parser, TOKEN_EQUAL from Lexer
+    If eq_ok is equal to 0:
+        Return 0
+    End If
+    proc skip_newlines with parser
+
+    Let current_type be proc current_token_type with parser
+
+    Note: Record type {field: type; ...}
+    If current_type is equal to TOKEN_LEFT_BRACE from Lexer:
+        Let record_type be proc parse_record_type with parser
+        proc add_child with type_node, record_type
+        Return type_node
+    End If
+
+    Note: Union type | Case1 | Case2 of type
+    If current_type is equal to TOKEN_PIPE from Lexer:
+        Let union_type be proc parse_union_type with parser
+        proc add_child with type_node, union_type
+        Return type_node
+    End If
+
+    Note: Union without leading pipe: type T = A | B of int
+    If current_type is equal to TOKEN_TYPE_NAME from Lexer:
+        Let after_type be proc peek_token_type with parser, 1
+        Let is_union be 0
+        If after_type is equal to TOKEN_PIPE from Lexer:
+            Set is_union to 1
+        End If
+        If after_type is equal to TOKEN_OF from Lexer:
+            Set is_union to 1
+        End If
+        If is_union is equal to 1:
+            Set union_type to proc parse_union_type with parser
+            proc add_child with type_node, union_type
+            Return type_node
+        End If
+    End If
+
+    Note: Class type
+    If current_type is equal to TOKEN_CLASS from Lexer:
+        Let class_type be proc parse_class_type with parser
+        proc add_child with type_node, class_type
+        Return type_node
+    End If
+
+    Note: Interface type
+    If current_type is equal to TOKEN_INTERFACE from Lexer:
+        Let interface_type be proc parse_interface_type with parser
+        proc add_child with type_node, interface_type
+        Return type_node
+    End If
+
+    Note: Type abbreviation (type alias)
+    Let type_expr be proc parse_type_expression with parser
+    proc add_child with type_node, type_expr
+
+    Return type_node
+End Process
+
 @Reasoning:
 Record type declarations look like `{field: type; field: type}`,
-distinguishing themselves from record values (which use `=` between
-field and value) by the colon. Field declarations are stored as
-AST_VALUE_DECLARATION children (reusing the val-shape because a
-record field is conceptually a named-typed-slot).
+distinguished from record values by the colon. Field declarations are
+stored as AST_VALUE_DECLARATION children (value slot = field-name
+token, single child = field type) - the contract translate_type_body
+reads when building HIR field definitions.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_LEFT_BRACE. Creates AST_RECORD_TYPE. Loop:
-- if current is TOKEN_RIGHT_BRACE, advance and break (empty / end)
-- reads field_name; rejects if not TOKEN_IDENTIFIER
-- advances past identifier
-- consumes TOKEN_COLON
-- parses field type via parse_type_expression
-- creates AST_VALUE_DECLARATION with field_name as value and the
-  field type as a child, appends to record type
-- on TOKEN_SEMICOLON continues; on TOKEN_RIGHT_BRACE advances and
-  breaks; otherwise reports error and returns 0.
-Returns the record type node.
-@End Implementation
 Process called "parse_record_type" takes parser as Integer returns Integer:
     Note: Parse record type {field: type; ...}
 
-    proc consume_token with parser, TOKEN_LEFT_BRACE
+    proc consume_token with parser, TOKEN_LEFT_BRACE from Lexer
+    proc skip_newlines with parser
 
     Let record_type be proc create_ast_node with parser, AST_RECORD_TYPE
 
-    Note: Parse field declarations
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_RIGHT_BRACE:
-            proc advance_token from parser
-            Break
+    Let collecting be 1
+    While collecting is equal to 1:
+        proc skip_newlines with parser
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_RIGHT_BRACE from Lexer:
+            proc advance_token with parser
+            Set collecting to 0
+            Continue
         End If
 
-        Note: Parse field name
-        Let field_name be proc current_token from parser
-        If field_name is not equal to TOKEN_IDENTIFIER:
+        Let field_type_tag be proc current_token_type with parser
+        If field_type_tag is not equal to TOKEN_IDENTIFIER from Lexer:
             proc set_parse_error with parser, "Expected field name"
             Return 0
         End If
-        proc advance_token from parser
+        Let field_token be proc current_token with parser
+        proc advance_token with parser
 
-        proc consume_token with parser, TOKEN_COLON
+        Let colon_ok be proc consume_token with parser, TOKEN_COLON from Lexer
+        If colon_ok is equal to 0:
+            Return 0
+        End If
 
-        Note: Parse field type
-        Let field_type be proc parse_type_expression from parser
+        Let field_type be proc parse_type_expression with parser
 
-        Note: Create field declaration
         Let field_node be proc create_ast_node with parser, AST_VALUE_DECLARATION
-        proc set_node_value with field_node, field_name
+        proc set_node_value with field_node, field_token
         proc add_child with field_node, field_type
         proc add_child with record_type, field_node
 
-        Set current to proc current_token from parser
-        If current is equal to TOKEN_SEMICOLON:
-            proc advance_token from parser
+        proc skip_newlines with parser
+        Set current_type to proc current_token_type with parser
+        If current_type is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_token with parser
             Continue
         End If
-        If current is equal to TOKEN_RIGHT_BRACE:
-            proc advance_token from parser
-            Break
-        Otherwise:
-            proc set_parse_error with parser, "Expected ';' or '}'"
-            Return 0
+        If current_type is equal to TOKEN_RIGHT_BRACE from Lexer:
+            proc advance_token with parser
+            Set collecting to 0
+            Continue
         End If
+
+        proc set_parse_error with parser, "Expected ';' or '}'"
+        Return 0
     End While
 
     Return record_type
 End Process
 
 @Reasoning:
-F# discriminated unions use `| Case1 | Case2 of type1 | Case3 of
-(type1 * type2)` syntax. Each case becomes an AST_TYPE_NAME node
-holding the constructor name as its value, with the optional payload
-type as a child when `of` is present. Cases without payload have
-no children; this lets a single shape model both shapes.
+F# discriminated unions use `| Case1 | Case2 of type` syntax. Each
+case becomes an AST_TYPE_NAME node holding the constructor-name token
+as its value, with the optional payload type as a child when `of` is
+present. Newlines between cases are insignificant.
 @End Reasoning
-
-@Implementation:
-Creates AST_UNION_TYPE. Case loop:
-- consume optional TOKEN_PIPE
-- reads case_name; rejects if not TOKEN_TYPE_NAME
-- advances
-- creates AST_TYPE_NAME with the case name as its value
-- if next token is TOKEN_OF, advances and parses the payload type
-  via parse_type_expression, attaches as child
-- appends the case node to the union type
-- continues while next token is TOKEN_PIPE, otherwise breaks.
-Returns the union type node.
-@End Implementation
 Process called "parse_union_type" takes parser as Integer returns Integer:
     Note: Parse discriminated union type | Case1 | Case2 of type
 
     Let union_type be proc create_ast_node with parser, AST_UNION_TYPE
 
-    Note: Parse union cases
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_PIPE:
-            proc advance_token from parser
+    Let collecting be 1
+    While collecting is equal to 1:
+        proc skip_newlines with parser
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_PIPE from Lexer:
+            proc advance_token with parser
         End If
 
-        Note: Parse case name
-        Let case_name be proc current_token from parser
-        If case_name is not equal to TOKEN_TYPE_NAME:
+        Let case_type be proc current_token_type with parser
+        If case_type is not equal to TOKEN_TYPE_NAME from Lexer:
             proc set_parse_error with parser, "Expected case name"
             Return 0
         End If
-        proc advance_token from parser
+        Let case_token be proc current_token with parser
+        proc advance_token with parser
 
         Let case_node be proc create_ast_node with parser, AST_TYPE_NAME
-        proc set_node_value with case_node, case_name
+        proc set_node_value with case_node, case_token
 
-        Note: Parse optional case data type
-        Set current to proc current_token from parser
-        If current is equal to TOKEN_OF:
-            proc advance_token from parser
-            Let case_type be proc parse_type_expression from parser
-            proc add_child with case_node, case_type
+        Set current_type to proc current_token_type with parser
+        If current_type is equal to TOKEN_OF from Lexer:
+            proc advance_token with parser
+            Let payload_type be proc parse_type_expression with parser
+            proc add_child with case_node, payload_type
         End If
 
         proc add_child with union_type, case_node
 
-        Set current to proc current_token from parser
-        If current is not equal to TOKEN_PIPE:
-            Break
+        proc skip_newlines with parser
+        Set current_type to proc current_token_type with parser
+        If current_type is not equal to TOKEN_PIPE from Lexer:
+            Set collecting to 0
         End If
     End While
 
@@ -2383,39 +2821,37 @@ End Process
 @Reasoning:
 F# class types are bracketed with `class ... end` after the `=` of
 their type declaration. Body members come in three flavors (member
-methods, val-properties, let-bindings for fields/methods) handled by
-parse_class_member. Unrecognized tokens at member-position are
-skipped via a one-token advance to keep parsing progressing rather
-than blocking on a single bad input.
+methods, val properties, let bindings) handled by parse_class_member.
+Unrecognized tokens at member position are skipped via a one-token
+advance to keep parsing progressing.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_CLASS. Creates AST_CLASS_TYPE. Loop:
-- on TOKEN_END advances and breaks
-- calls parse_class_member; if non-zero appends as child
-- on 0 advances one token (to avoid infinite loop on unknown input).
-Returns the class type node.
-@End Implementation
 Process called "parse_class_type" takes parser as Integer returns Integer:
     Note: Parse class type declaration
 
-    proc consume_token with parser, TOKEN_CLASS
+    proc consume_token with parser, TOKEN_CLASS from Lexer
+    proc skip_newlines with parser
 
     Let class_type be proc create_ast_node with parser, AST_CLASS_TYPE
 
-    Note: Parse class body members
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_END:
-            proc advance_token from parser
-            Break
+    Let collecting be 1
+    While collecting is equal to 1:
+        proc skip_newlines with parser
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_END from Lexer:
+            proc advance_token with parser
+            Set collecting to 0
+            Continue
+        End If
+        If current_type is equal to TOKEN_EOF from Lexer:
+            Set collecting to 0
+            Continue
         End If
 
-        Let member be proc parse_class_member from parser
+        Let member be proc parse_class_member with parser
         If member is not equal to 0:
             proc add_child with class_type, member
         Otherwise:
-            proc advance_token from parser  Note: Skip unknown token
+            proc advance_token with parser  Note: Skip unknown token
         End If
     End While
 
@@ -2424,38 +2860,36 @@ End Process
 
 @Reasoning:
 Interface types use `interface ... end` containing abstract member
-declarations and val-property signatures. Same skeleton as
-parse_class_type but uses parse_interface_member, which only accepts
-those two kinds of declaration (no concrete let-bindings allowed in
-an interface).
+declarations and val-property signatures only (no concrete bindings,
+since interfaces have no implementations).
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_INTERFACE. Creates AST_INTERFACE_TYPE. Loop:
-TOKEN_END breaks; parse_interface_member's result is appended when
-non-zero, otherwise one token is consumed to skip past unknown input.
-Returns the interface type node.
-@End Implementation
 Process called "parse_interface_type" takes parser as Integer returns Integer:
     Note: Parse interface type declaration
 
-    proc consume_token with parser, TOKEN_INTERFACE
+    proc consume_token with parser, TOKEN_INTERFACE from Lexer
+    proc skip_newlines with parser
 
     Let interface_type be proc create_ast_node with parser, AST_INTERFACE_TYPE
 
-    Note: Parse interface members
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_END:
-            proc advance_token from parser
-            Break
+    Let collecting be 1
+    While collecting is equal to 1:
+        proc skip_newlines with parser
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_END from Lexer:
+            proc advance_token with parser
+            Set collecting to 0
+            Continue
+        End If
+        If current_type is equal to TOKEN_EOF from Lexer:
+            Set collecting to 0
+            Continue
         End If
 
-        Let member be proc parse_interface_member from parser
+        Let member be proc parse_interface_member with parser
         If member is not equal to 0:
             proc add_child with interface_type, member
         Otherwise:
-            proc advance_token from parser  Note: Skip unknown token
+            proc advance_token with parser  Note: Skip unknown token
         End If
     End While
 
@@ -2464,141 +2898,129 @@ End Process
 
 @Reasoning:
 Three class-member kinds dispatch by leading keyword: `member`
-introduces a method (parse_method_declaration), `val` introduces a
-property (parse_property_declaration), `let` introduces a field or
-private method (parse_let_binding). Anything else is a parse error
-at member position.
+introduces a method, `val` a property, `let` a field or private
+method. Anything else is a parse error at member position (the caller
+recovers by skipping one token).
 @End Reasoning
-
-@Implementation:
-Reads current_token. If TOKEN_MEMBER, advances and returns
-parse_method_declaration. If TOKEN_VAL, returns
-parse_property_declaration directly (it consumes its own keyword).
-If TOKEN_LET, returns parse_let_binding directly. Otherwise reports
-"Expected class member" and returns 0.
-@End Implementation
 Process called "parse_class_member" takes parser as Integer returns Integer:
     Note: Parse class member (method, property, field)
 
-    Let current be proc current_token from parser
+    Let current_type be proc current_token_type with parser
 
-    Note: Member method
-    If current is equal to TOKEN_MEMBER:
-        proc advance_token from parser
-        Return proc parse_method_declaration from parser
+    If current_type is equal to TOKEN_MEMBER from Lexer:
+        proc advance_token with parser
+        Return proc parse_method_declaration with parser
     End If
 
-    Note: Property
-    If current is equal to TOKEN_VAL:
-        Return proc parse_property_declaration from parser
+    If current_type is equal to TOKEN_VAL from Lexer:
+        Return proc parse_property_declaration with parser
     End If
 
-    Note: Let binding (field or method)
-    If current is equal to TOKEN_LET:
-        Return proc parse_let_binding from parser
+    If current_type is equal to TOKEN_LET from Lexer:
+        proc advance_token with parser
+        Return proc parse_let_binding with parser
     End If
 
-    proc set_parse_error with parser, "Expected class member"
     Return 0
 End Process
 
 @Reasoning:
 Interface members are restricted to abstract method signatures
-(`abstract` keyword) and val-property signatures. Concrete bindings
-(`let`) and `member` (which implies a body) are not allowed because
-interfaces have no implementations.
+(`abstract` keyword) and val-property signatures.
 @End Reasoning
-
-@Implementation:
-Reads current_token. If TOKEN_ABSTRACT, advances and returns
-parse_method_declaration. If TOKEN_VAL, returns
-parse_property_declaration. Otherwise reports "Expected interface
-member" and returns 0.
-@End Implementation
 Process called "parse_interface_member" takes parser as Integer returns Integer:
     Note: Parse interface member (abstract method or property)
 
-    Let current be proc current_token from parser
+    Let current_type be proc current_token_type with parser
 
-    Note: Abstract member
-    If current is equal to TOKEN_ABSTRACT:
-        proc advance_token from parser
-        Return proc parse_method_declaration from parser
+    If current_type is equal to TOKEN_ABSTRACT from Lexer:
+        proc advance_token with parser
+        Return proc parse_method_declaration with parser
     End If
 
-    Note: Property signature
-    If current is equal to TOKEN_VAL:
-        Return proc parse_property_declaration from parser
+    If current_type is equal to TOKEN_VAL from Lexer:
+        Return proc parse_property_declaration with parser
     End If
 
-    proc set_parse_error with parser, "Expected interface member"
     Return 0
 End Process
 
 @Reasoning:
-Method declarations take the shape `name [(params)] [: returnType]`.
-Parameter parens are optional (a no-arg member can omit them);
-return type is also optional. Each parameter is parsed as a full
-pattern so destructuring parameters work. Parameters and the
-optional return type are stored as siblings under the method node,
-with the return type (when present) always appearing last.
+Method declarations take the shape `[this.]name [(params)] [: type]`.
+The F# member self-identifier (`member this.Method`) is recognised and
+the method name is the token after the dot. Each parameter is parsed
+as a full pattern so destructuring parameters work. Parameters and the
+optional return type are stored as children, return type last.
 @End Reasoning
-
-@Implementation:
-Creates AST_METHOD_DECLARATION. Reads method_name; rejects if not
-TOKEN_IDENTIFIER. Stores name as node value, advances. If next is
-TOKEN_LEFT_PAREN, enters parameter loop until TOKEN_RIGHT_PAREN:
-parses a pattern, appends as child, accepts TOKEN_COMMA between
-params; TOKEN_RIGHT_PAREN advances and breaks. After params, if next
-is TOKEN_COLON advances and parses return type via
-parse_type_expression, appends. Returns the method node.
-@End Implementation
 Process called "parse_method_declaration" takes parser as Integer returns Integer:
     Note: Parse method declaration
 
     Let method_node be proc create_ast_node with parser, AST_METHOD_DECLARATION
 
-    Note: Parse method name
-    Let method_name be proc current_token from parser
-    If method_name is not equal to TOKEN_IDENTIFIER:
+    Let name_type be proc current_token_type with parser
+    If name_type is not equal to TOKEN_IDENTIFIER from Lexer:
         proc set_parse_error with parser, "Expected method name"
         Return 0
     End If
-    proc set_node_value with method_node, method_name
-    proc advance_token from parser
 
-    Note: Parse parameters if present
-    Let current be proc current_token from parser
-    If current is equal to TOKEN_LEFT_PAREN:
-        proc advance_token from parser
+    Note: member this.Name - skip the self identifier
+    Let after_type be proc peek_token_type with parser, 1
+    If after_type is equal to TOKEN_DOT from Lexer:
+        Let dotted_type be proc peek_token_type with parser, 2
+        If dotted_type is equal to TOKEN_IDENTIFIER from Lexer:
+            proc advance_token with parser  Note: skip self identifier
+            proc advance_token with parser  Note: skip dot
+        End If
+    End If
 
-        While 1:
-            Set current to proc current_token from parser
-            If current is equal to TOKEN_RIGHT_PAREN:
-                proc advance_token from parser
-                Break
-            End If
+    Let name_token be proc current_token with parser
+    proc set_node_value with method_node, name_token
+    proc advance_token with parser
 
-            Let param be proc parse_pattern from parser
-            proc add_child with method_node, param
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_LEFT_PAREN from Lexer:
+        proc advance_token with parser
 
-            Set current to proc current_token from parser
-            If current is equal to TOKEN_COMMA:
-                proc advance_token from parser
+        Let collecting be 1
+        While collecting is equal to 1:
+            Set current_type to proc current_token_type with parser
+            If current_type is equal to TOKEN_RIGHT_PAREN from Lexer:
+                proc advance_token with parser
+                Set collecting to 0
                 Continue
             End If
-            If current is equal to TOKEN_RIGHT_PAREN:
-                proc advance_token from parser
-                Break
+            If current_type is equal to TOKEN_EOF from Lexer:
+                Set collecting to 0
+                Continue
+            End If
+
+            Let param be proc parse_pattern with parser
+            If param is equal to 0:
+                Set collecting to 0
+                Continue
+            End If
+
+            Note: Optional parameter type annotation
+            Set current_type to proc current_token_type with parser
+            If current_type is equal to TOKEN_COLON from Lexer:
+                proc advance_token with parser
+                Let param_type be proc parse_type_expression with parser
+                proc memory_set_int64 from Layout with param, 40, param_type
+            End If
+
+            proc add_child with method_node, param
+
+            Set current_type to proc current_token_type with parser
+            If current_type is equal to TOKEN_COMMA from Lexer:
+                proc advance_token with parser
             End If
         End While
     End If
 
-    Note: Parse return type if present
-    Set current to proc current_token from parser
-    If current is equal to TOKEN_COLON:
-        proc advance_token from parser
-        Let return_type be proc parse_type_expression from parser
+    Set current_type to proc current_token_type with parser
+    If current_type is equal to TOKEN_COLON from Lexer:
+        proc advance_token with parser
+        Let return_type be proc parse_type_expression with parser
         proc add_child with method_node, return_type
     End If
 
@@ -2606,38 +3028,31 @@ Process called "parse_method_declaration" takes parser as Integer returns Intege
 End Process
 
 @Reasoning:
-Property declarations use `val name: Type` syntax. This procedure
-consumes the leading `val` keyword and rejects the declaration if
-the identifier or its type annotation is missing - both are
-mandatory for a property declaration to be meaningful.
+Property declarations use `val name: Type` syntax; both the identifier
+and the type annotation are mandatory.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_VAL. Creates AST_PROPERTY_DECLARATION. Reads
-property_name; rejects if not TOKEN_IDENTIFIER. Stores name as node
-value, advances. Consumes TOKEN_COLON. Parses property type via
-parse_type_expression, appends as child. Returns the property node.
-@End Implementation
 Process called "parse_property_declaration" takes parser as Integer returns Integer:
     Note: Parse property declaration
 
-    proc consume_token with parser, TOKEN_VAL
+    proc consume_token with parser, TOKEN_VAL from Lexer
 
     Let property_node be proc create_ast_node with parser, AST_PROPERTY_DECLARATION
 
-    Note: Parse property name
-    Let property_name be proc current_token from parser
-    If property_name is not equal to TOKEN_IDENTIFIER:
+    Let name_type be proc current_token_type with parser
+    If name_type is not equal to TOKEN_IDENTIFIER from Lexer:
         proc set_parse_error with parser, "Expected property name"
         Return 0
     End If
-    proc set_node_value with property_node, property_name
-    proc advance_token from parser
+    Let name_token be proc current_token with parser
+    proc set_node_value with property_node, name_token
+    proc advance_token with parser
 
-    proc consume_token with parser, TOKEN_COLON
+    Let colon_ok be proc consume_token with parser, TOKEN_COLON from Lexer
+    If colon_ok is equal to 0:
+        Return 0
+    End If
 
-    Note: Parse property type
-    Let property_type be proc parse_type_expression from parser
+    Let property_type be proc parse_type_expression with parser
     proc add_child with property_node, property_type
 
     Return property_node
@@ -2645,80 +3060,141 @@ End Process
 
 @Reasoning:
 Top-level value declarations also use `val name: Type` syntax but
-produce AST_VALUE_DECLARATION rather than AST_PROPERTY_DECLARATION
-so semantic analysis can tell module-level signatures apart from
-type-body properties.
+produce AST_VALUE_DECLARATION so semantic analysis can tell
+module-level signatures apart from type-body properties.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_VAL. Creates AST_VALUE_DECLARATION. Reads
-value_name; rejects if not TOKEN_IDENTIFIER. Stores name as node
-value, advances. Consumes TOKEN_COLON. Parses value type via
-parse_type_expression, appends. Returns the value node.
-@End Implementation
 Process called "parse_value_declaration" takes parser as Integer returns Integer:
     Note: Parse value declaration
 
-    proc consume_token with parser, TOKEN_VAL
+    proc consume_token with parser, TOKEN_VAL from Lexer
 
     Let value_node be proc create_ast_node with parser, AST_VALUE_DECLARATION
 
-    Note: Parse value name
-    Let value_name be proc current_token from parser
-    If value_name is not equal to TOKEN_IDENTIFIER:
+    Let name_type be proc current_token_type with parser
+    If name_type is not equal to TOKEN_IDENTIFIER from Lexer:
         proc set_parse_error with parser, "Expected value name"
         Return 0
     End If
-    proc set_node_value with value_node, value_name
-    proc advance_token from parser
+    Let name_token be proc current_token with parser
+    proc set_node_value with value_node, name_token
+    proc advance_token with parser
 
-    proc consume_token with parser, TOKEN_COLON
+    Let colon_ok be proc consume_token with parser, TOKEN_COLON from Lexer
+    If colon_ok is equal to 0:
+        Return 0
+    End If
 
-    Note: Parse value type
-    Let value_type be proc parse_type_expression from parser
+    Let value_type be proc parse_type_expression with parser
     proc add_child with value_node, value_type
 
     Return value_node
 End Process
 
-@Reasoning:
-Namespaces in F# group declarations without introducing values (so
-unlike modules, they cannot contain `let` bindings at the top level
-- only types and modules). This parser is more permissive and
-simply iterates declarations until EOF or parse failure; semantic
-analysis enforces the restriction later.
-@End Reasoning
+Note: ============================================================================
+Note: Module-Level Parsing
+Note: ============================================================================
 
-@Implementation:
-Consumes TOKEN_NAMESPACE. Creates AST_NAMESPACE. Reads namespace
-name, stores as node value, advances. Loop until TOKEN_EOF: calls
-parse_declaration; if non-zero appends as child; on 0 breaks.
-Returns the namespace node.
-@End Implementation
+@Reasoning:
+F# modules group declarations under a common name. The `= ` form
+(`module Name = ...`) and the top-level form (`module Name` with no
+equals) are both accepted. The body is parsed as a sequence of
+declarations until EOF or a declaration that fails without raising a
+hard error (the boundary of this parser's layout sensitivity).
+@End Reasoning
+Process called "parse_module_declaration" takes parser as Integer returns Integer:
+    Note: Parse module declaration
+
+    proc consume_token with parser, TOKEN_MODULE from Lexer
+
+    Let module_node be proc create_ast_node with parser, AST_MODULE
+
+    Let name_type be proc current_token_type with parser
+    Let is_name be 0
+    If name_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Set is_name to 1
+    End If
+    If name_type is equal to TOKEN_TYPE_NAME from Lexer:
+        Set is_name to 1
+    End If
+    If is_name is equal to 0:
+        proc set_parse_error with parser, "Expected module name"
+        Return 0
+    End If
+
+    Let name_token be proc parse_dotted_name_token with parser
+    proc set_node_value with module_node, name_token
+
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_EQUAL from Lexer:
+        proc advance_token with parser
+    End If
+
+    Let parsing be 1
+    While parsing is equal to 1:
+        proc skip_newlines with parser
+        Set current_type to proc current_token_type with parser
+        If current_type is equal to TOKEN_EOF from Lexer:
+            Set parsing to 0
+            Continue
+        End If
+        If current_type is equal to TOKEN_DOUBLE_SEMICOLON from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+
+        Let declaration be proc parse_declaration with parser
+        If declaration is not equal to 0:
+            proc add_child with module_node, declaration
+        Otherwise:
+            Set parsing to 0
+        End If
+    End While
+
+    Return module_node
+End Process
+
+@Reasoning:
+Namespaces partition declarations by dotted path. This parser is
+permissive (semantic analysis enforces the no-values restriction
+later); the body loop matches parse_module_declaration.
+@End Reasoning
 Process called "parse_namespace_declaration" takes parser as Integer returns Integer:
     Note: Parse namespace declaration
 
-    proc consume_token with parser, TOKEN_NAMESPACE
+    proc consume_token with parser, TOKEN_NAMESPACE from Lexer
 
     Let namespace_node be proc create_ast_node with parser, AST_NAMESPACE
 
-    Note: Parse namespace name
-    Let namespace_name be proc current_token from parser
-    proc set_node_value with namespace_node, namespace_name
-    proc advance_token from parser
+    Let name_type be proc current_token_type with parser
+    Let is_name be 0
+    If name_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Set is_name to 1
+    End If
+    If name_type is equal to TOKEN_TYPE_NAME from Lexer:
+        Set is_name to 1
+    End If
+    If is_name is equal to 0:
+        proc set_parse_error with parser, "Expected namespace name"
+        Return 0
+    End If
 
-    Note: Parse namespace body
-    While 1:
-        Let current be proc current_token from parser
-        If current is equal to TOKEN_EOF:
-            Break
+    Let name_token be proc parse_dotted_name_token with parser
+    proc set_node_value with namespace_node, name_token
+
+    Let parsing be 1
+    While parsing is equal to 1:
+        proc skip_newlines with parser
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_EOF from Lexer:
+            Set parsing to 0
+            Continue
         End If
 
-        Let declaration be proc parse_declaration from parser
+        Let declaration be proc parse_declaration with parser
         If declaration is not equal to 0:
             proc add_child with namespace_node, declaration
         Otherwise:
-            Break
+            Set parsing to 0
         End If
     End While
 
@@ -2727,29 +3203,170 @@ End Process
 
 @Reasoning:
 `open Module.Path` brings a module or namespace's names into scope.
-The full dotted path is captured as a single token by the lexer and
-stored as the node value. Semantic analysis resolves the path against
-known modules.
+The full dotted path is joined into a single name token stored as the
+node value so the HIR translator emits one import directive.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_OPEN. Creates AST_OPEN. Reads the module/namespace
-name token, stores it as the node value via set_node_value,
-advances. Returns the open node.
-@End Implementation
 Process called "parse_open_statement" takes parser as Integer returns Integer:
     Note: Parse open statement
 
-    proc consume_token with parser, TOKEN_OPEN
+    proc consume_token with parser, TOKEN_OPEN from Lexer
 
     Let open_node be proc create_ast_node with parser, AST_OPEN
 
-    Note: Parse module/namespace name
-    Let module_name be proc current_token from parser
-    proc set_node_value with open_node, module_name
-    proc advance_token from parser
+    Let name_type be proc current_token_type with parser
+    Let is_name be 0
+    If name_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Set is_name to 1
+    End If
+    If name_type is equal to TOKEN_TYPE_NAME from Lexer:
+        Set is_name to 1
+    End If
+    If is_name is equal to 0:
+        proc set_parse_error with parser, "Expected module path"
+        Return 0
+    End If
+
+    Let name_token be proc parse_dotted_name_token with parser
+    proc set_node_value with open_node, name_token
 
     Return open_node
+End Process
+
+Note: ============================================================================
+Note: F# Program Structure Parsing
+Note: ============================================================================
+
+@Reasoning:
+Top-level declaration dispatcher. Selects between module, namespace,
+open, type, let-binding, val-declaration, and do-/expression-
+statements based on the leading token. Top-level expressions (common
+in scripts: `printfn "hi"`) are wrapped in an AST_LET_BINDING with a
+wildcard pattern so the module body remains a uniform list of binding
+shapes for the HIR translator.
+@End Reasoning
+Process called "parse_declaration" takes parser as Integer returns Integer:
+    Note: Parse top-level declaration
+
+    Let current_type be proc current_token_type with parser
+
+    If current_type is equal to TOKEN_MODULE from Lexer:
+        Return proc parse_module_declaration with parser
+    End If
+
+    If current_type is equal to TOKEN_NAMESPACE from Lexer:
+        Return proc parse_namespace_declaration with parser
+    End If
+
+    If current_type is equal to TOKEN_OPEN from Lexer:
+        Return proc parse_open_statement with parser
+    End If
+
+    If current_type is equal to TOKEN_TYPE from Lexer:
+        Return proc parse_type_declaration with parser
+    End If
+
+    If current_type is equal to TOKEN_LET from Lexer:
+        proc advance_token with parser
+        Return proc parse_let_binding with parser
+    End If
+
+    If current_type is equal to TOKEN_VAL from Lexer:
+        Return proc parse_value_declaration with parser
+    End If
+
+    Note: do-binding: `do expr` evaluates an expression for effects
+    If current_type is equal to TOKEN_DO from Lexer:
+        proc advance_token with parser
+        proc skip_newlines with parser
+        Let do_expr be proc parse_expression with parser
+        If do_expr is equal to 0:
+            Return 0
+        End If
+        Let do_binding be proc create_ast_node with parser, AST_LET_BINDING
+        Let do_pattern be proc create_ast_node with parser, AST_PATTERN_WILDCARD
+        proc add_child with do_binding, do_pattern
+        proc add_child with do_binding, do_expr
+        Return do_binding
+    End If
+
+    Note: Bare top-level expression statement
+    Let can_expr be proc is_primary_start with parser
+    If can_expr is equal to 1:
+        Let stmt_expr be proc parse_expression with parser
+        If stmt_expr is equal to 0:
+            Return 0
+        End If
+        Let stmt_binding be proc create_ast_node with parser, AST_LET_BINDING
+        Let stmt_pattern be proc create_ast_node with parser, AST_PATTERN_WILDCARD
+        proc add_child with stmt_binding, stmt_pattern
+        proc add_child with stmt_binding, stmt_expr
+        Return stmt_binding
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+The program-level loop must tolerate intervening trivia (newlines, ;;
+separators, # directives) because F# allows them between declarations.
+Recovery on a failing declaration: a hard parse error propagates (the
+partial tree would be misleading), while an unrecognized token is
+skipped so unknown noise cannot deadlock the parser.
+@End Reasoning
+Process called "parse_program" takes parser as Integer returns Integer:
+    Note: Parse complete F# program
+
+    Let program_node be proc create_ast_node with parser, AST_PROGRAM
+
+    Let parsing be 1
+    While parsing is equal to 1:
+        Let current_type be proc current_token_type with parser
+        If current_type is equal to TOKEN_EOF from Lexer:
+            Set parsing to 0
+            Continue
+        End If
+
+        Note: Skip trivia between declarations
+        If current_type is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If current_type is equal to TOKEN_DOUBLE_SEMICOLON from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+
+        Note: Hash directives (#light, #nowarn) - skip to end of line
+        If current_type is equal to TOKEN_HASH from Lexer:
+            Let skipping be 1
+            While skipping is equal to 1:
+                Let t be proc current_token_type with parser
+                If t is equal to TOKEN_NEWLINE from Lexer:
+                    Set skipping to 0
+                    Continue
+                End If
+                If t is equal to TOKEN_EOF from Lexer:
+                    Set skipping to 0
+                    Continue
+                End If
+                proc advance_token with parser
+            End While
+            Continue
+        End If
+
+        Let declaration be proc parse_declaration with parser
+        If declaration is not equal to 0:
+            proc add_child with program_node, declaration
+        Otherwise:
+            Let has_error be proc has_parse_error with parser
+            If has_error is equal to 1:
+                Return 0
+            End If
+            proc advance_token with parser  Note: Skip unknown token
+        End If
+    End While
+
+    Return program_node
 End Process
 
 Note: ============================================================================
@@ -2757,50 +3374,38 @@ Note: Main F# Parsing Entry Point
 Note: ============================================================================
 
 @Reasoning:
-Sole public entry point for the F# parser. Couples three responsibilities
-that callers should not have to coordinate themselves: parser-instance
-construction, the actual parse_program walk, and post-parse error
-checking. Centralising the error check here means a translation-error
-path always cleans up the parser before returning 0, and success
-returns the AST_PROGRAM root directly so callers can hand it straight
-to fsharp_to_hir.
+Sole public entry point. Couples parser construction, the parse_program
+walk, and post-parse error checking. On error the parser AND its arena
+are destroyed (no partially-constructed tree escapes). On success the
+parser record is released but the arena deliberately survives: it owns
+every AST node in the returned tree, and the HIR translator reads that
+tree after this function returns. The arena's ownership transfers to
+the AST consumer.
 @End Reasoning
-
-@Implementation:
-Creates a parser via create_fsharp_parser bound to the supplied
-token_list. Returns 0 immediately if creation failed. Calls
-parse_program to drive the recursive descent. Reads has_parse_error
-on the parser; if a hard error was set during the walk, destroys the
-parser (and its arena) and returns 0 so callers can not observe a
-partially-constructed tree. On the clean path, destroys the parser and
-returns ast_root. Note: any callers that want to hold the AST past the
-parser lifetime are responsible for cloning the tree into their own
-arena before the destroy invalidates the parser-owned arena nodes.
-@End Implementation
 Process called "parse_fsharp_source" takes token_list as Integer returns Integer:
     Note: Main entry point for parsing F# source code
 
-    @Reasoning:
-    This function creates a parser from the token list and parses
-    the complete F# program, returning the root AST node.
-    It handles all F# language constructs including functional
-    programming features and .NET integration.
-    @End Reasoning
-
-    Let parser be proc create_fsharp_parser from token_list
+    Let parser be proc create_fsharp_parser with token_list
     If parser is equal to 0:
         Return 0
     End If
 
-    Let ast_root be proc parse_program from parser
+    Let ast_root be proc parse_program with parser
 
-    Let has_error be proc has_parse_error from parser
+    Let has_error be proc has_parse_error with parser
     If has_error is equal to 1:
-        proc destroy_fsharp_parser from parser
+        proc destroy_fsharp_parser with parser
         Return 0
     End If
 
-    proc destroy_fsharp_parser from parser
+    If ast_root is equal to 0:
+        proc destroy_fsharp_parser with parser
+        Return 0
+    End If
+
+    Note: Success: release the parser record but keep the arena alive -
+    Note: it owns the AST nodes the caller is about to consume
+    proc deallocate from Layout with parser
     Return ast_root
 End Process
 

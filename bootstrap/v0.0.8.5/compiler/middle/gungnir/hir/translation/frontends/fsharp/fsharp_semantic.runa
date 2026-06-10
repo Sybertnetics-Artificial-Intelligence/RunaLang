@@ -15,45 +15,63 @@ limitations under the License.
 :End Note
 
 Note:
-F# Semantic Analyzer - Complete semantic analysis for F# language constructs
+F# Semantic Analyzer - semantic analysis over the F# translation AST
 
-This file provides comprehensive semantic analysis for F# including type inference,
-pattern matching validation, module system checking, and functional programming
-construct validation. Supports F#'s unique features like computation expressions,
-units of measure, and .NET interoperability.
+Operates directly on the AST shapes the post-#442 parser produces: every
+node is the 48-byte record [type @0, value @8, children @16, child_count
+@24, parent @32, metadata @40], literal and identifier nodes carry the
+40-byte lexer token record in the value slot, children live in canonical
+Lists, function bindings arrive desugared to name + AST_LAMBDA, pipe
+nodes carry the pipe operator's token TYPE TAG (a small integer, not a
+token pointer) in the value slot, and infix operators arrive as
+AST_APPLICATION nodes whose first child is an operator identifier.
 
-Analysis Features:
-- Hindley-Milner type inference with extensions
-- Pattern matching exhaustiveness and redundancy
-- Module and namespace resolution
-- Record and discriminated union validation
-- Computation expression analysis
-- Units of measure type checking
-- .NET interoperability validation
-- Active pattern support
-- Type provider integration
-- Async and parallel construct analysis
-- Functional programming paradigm enforcement
+Analysis provided:
+- Unification-based type inference with type variables over the full
+  expression grammar (literals, identifiers, operators as functions,
+  curried application, lambdas, let/and chains with rec pre-binding,
+  match, if/elif, tuples, lists, arrays, records, pipes, sequences,
+  try/with/finally, while, for, interpolated strings, quotations)
+- Pattern validation and variable binding for every pattern shape the
+  parser emits, including or-patterns and :? type-test patterns
+- Discriminated-union constructor registration and per-use checking
+- Match exhaustiveness analysis (irrefutable cover, bool literal cover,
+  option cover, declared-union case cover) and redundant-arm detection
+- Duplicate record field detection, guard bool-typing, condition
+  bool-typing, branch type joins
+- Unused-local-binding detection (underscore-prefixed names exempt)
+- Units-of-measure and computation/async expression analysis for the
+  declared AST_MEASURE and AST_COMPUTATION_EXPRESSION shapes
+
+Type values are polymorphic the same way hir_nodes type positions are:
+values below 65536 are the bare primitive type codes declared below;
+larger values are pointers to composite type records whose first field
+is the type tag. Every record this analyzer allocates is registered in
+one ownership pool so destruction and re-analysis are leak-free.
 
 Dependencies:
-- fsharp_parser.runa (AST definitions)
-- compiler/frontend/primitives/core/string_core.runa
+- fsharp_parser.runa (AST constants and node layout contract)
+- fsharp_lexer.runa (token record accessors and token type constants)
 - compiler/frontend/primitives/memory/layout.runa
-- compiler/frontend/primitives/collections/hashtable.runa (symbol tables)
-- compiler/frontend/primitives/collections/list.runa (collections)
+- compiler/frontend/primitives/collections/hashtable.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/internal/string_utils.runa (string_concat for diagnostics)
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_lexer.runa" as Lexer
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/hashtable.runa" as Dict
 Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: F# Type System Constants
 Note: ============================================================================
 
-Note: Primitive types
+Note: Primitive types (bare codes, always below 65536)
 Constant TYPE_INT as Integer is 7001
 Constant TYPE_FLOAT as Integer is 7002
 Constant TYPE_STRING as Integer is 7003
@@ -63,7 +81,7 @@ Constant TYPE_UNIT as Integer is 7006
 Constant TYPE_BYTE as Integer is 7007
 Constant TYPE_DECIMAL as Integer is 7008
 
-Note: Compound types
+Note: Compound types (tags of heap records)
 Constant TYPE_LIST as Integer is 7101
 Constant TYPE_ARRAY as Integer is 7102
 Constant TYPE_OPTION as Integer is 7103
@@ -92,29 +110,39 @@ Note: Semantic Analyzer Structure
 Note: ============================================================================
 
 @Reasoning:
-Holds every cross-cutting analysis structure: symbol_table (current scope),
-scope_stack (nested scopes for save/restore), type_env (named-type
-bindings), constraint_solver (Hindley-Milner unification engine),
-module_table (module/namespace cross-reference), per-pass error and
-warning lists, and the measure_system (F# units-of-measure resolver). All
+Holds every cross-cutting analysis structure: symbol_table (module-level
+scope), scope_stack (nested local scopes for save/restore), type_env
+(named-type and constructor bindings), constraint_solver (substitution
+store, allocation pool, match registry, definition registry),
+module_table (module/namespace/open cross-reference), per-pass error and
+warning lists, and the measure_system (units-of-measure registry). All
 fields are pointers; the record is 64 bytes total.
 @End Reasoning
-
 @Implementation:
 Offsets: symbol_table (0), scope_stack (8), type_env (16),
 constraint_solver (24), module_table (32), error_list (40),
 warning_list (48), measure_system (56).
+
+The constraint solver is a 40-byte record: substitution List indexed by
+type-variable id (0), next fresh variable id (8), match registry List of
+16-byte [match node, scrutinee type] pairs (16), definitions List of
+32-byte symbol records (24), and the allocation pool List that owns
+every ad-hoc record this analyzer creates (32).
+
+Symbol records are 32 bytes: bound type (0), is_used flag (8), name
+string (16), is_local flag (24). Composite type records start with the
+type tag at offset 0 followed by tag-specific payload fields.
 @End Implementation
 
 Type called "FSharpSemanticAnalyzer":
-    symbol_table as Integer         Note: Current scope symbol table
-    scope_stack as Integer          Note: Stack of nested scopes
-    type_env as Integer             Note: Type environment
-    constraint_solver as Integer    Note: Type constraint solver
+    symbol_table as Integer         Note: Module-level symbol table
+    scope_stack as Integer          Note: Stack of nested local scopes
+    type_env as Integer             Note: Type and constructor environment
+    constraint_solver as Integer    Note: Substitutions, pools, registries
     module_table as Integer         Note: Module and namespace table
     error_list as Integer           Note: Semantic errors
     warning_list as Integer         Note: Semantic warnings
-    measure_system as Integer       Note: Units of measure system
+    measure_system as Integer       Note: Units of measure registry
 End Type
 
 Note: ============================================================================
@@ -123,38 +151,22 @@ Note: ==========================================================================
 
 @Reasoning:
 Allocates the analyzer record then wires up all sub-structures in order:
-two hashtables (symbol_table, type_env, module_table), a list (scope_-
-stack), a constraint solver, two diagnostic lists (errors, warnings), and
-the measure system. Finally calls setup_fsharp_builtins to populate the
-type environment with the built-in F# types (int, string, list<>, etc.)
-so user code can reference them without import.
+three hashtables (symbol_table, type_env, module_table), the scope
+stack, the constraint solver, two diagnostic lists, and the measure
+registry. Finally seeds the type environment with the built-in F# type
+names and constructors so user code resolves them without declarations.
 @End Reasoning
 
 Process called "create_fsharp_semantic_analyzer" returns Integer:
     Note: Create new F# semantic analyzer
 
-    @Reasoning:
-    Initializes analyzer with symbol tables, type environment, and constraint solver.
-    Sets up F#-specific type system including measures and computation expressions.
-    @End Reasoning
-
-    Let analyzer_size be 64  Note: 8 fields × 8 bytes each
+    Let analyzer_size be 64  Note: 8 fields x 8 bytes each
     Let analyzer be proc allocate from Layout with analyzer_size
 
     If analyzer is equal to 0:
         Return 0
     End If
 
-    proc memory_set_int64 from Layout with analyzer, 0, 0   Note: symbol_table
-    proc memory_set_int64 from Layout with analyzer, 8, 0   Note: scope_stack
-    proc memory_set_int64 from Layout with analyzer, 16, 0  Note: type_env
-    proc memory_set_int64 from Layout with analyzer, 24, 0  Note: constraint_solver
-    proc memory_set_int64 from Layout with analyzer, 32, 0  Note: module_table
-    proc memory_set_int64 from Layout with analyzer, 40, 0  Note: error_list
-    proc memory_set_int64 from Layout with analyzer, 48, 0  Note: warning_list
-    proc memory_set_int64 from Layout with analyzer, 56, 0  Note: measure_system
-
-    Note: Initialize data structures
     Let symbol_table be proc hashtable_create from Dict
     proc memory_set_int64 from Layout with analyzer, 0, symbol_table
 
@@ -164,7 +176,7 @@ Process called "create_fsharp_semantic_analyzer" returns Integer:
     Let type_env be proc hashtable_create from Dict
     proc memory_set_int64 from Layout with analyzer, 16, type_env
 
-    Let constraint_solver be proc create_constraint_solver from analyzer
+    Let constraint_solver be proc create_constraint_solver with analyzer
     proc memory_set_int64 from Layout with analyzer, 24, constraint_solver
 
     Let module_table be proc hashtable_create from Dict
@@ -176,38 +188,176 @@ Process called "create_fsharp_semantic_analyzer" returns Integer:
     Let warning_list be proc list_create from List
     proc memory_set_int64 from Layout with analyzer, 48, warning_list
 
-    Let measure_system be proc create_measure_system from analyzer
+    Let measure_system be proc create_measure_system with analyzer
     proc memory_set_int64 from Layout with analyzer, 56, measure_system
 
-    Note: Setup built-in types and functions
-    proc setup_fsharp_builtins from analyzer
+    proc setup_fsharp_builtins with analyzer
 
     Return analyzer
 End Process
 
 @Reasoning:
-Reverse of create_*: destroys each owned sub-structure (hashtables and
-lists) before deallocating the analyzer itself. Each field is null-
-checked because allocation could have failed partway through create_*
-and we want to be tolerant of partial states (used by the unit tests
-that simulate OOM).
+The constraint solver bundles every piece of analysis state that must
+survive across passes: the type-variable substitution store (a List
+indexed by variable id so integer ids need no string hashing), the next
+fresh-variable counter, the match-expression registry the late
+exhaustiveness pass walks, the definitions registry the unused-binding
+pass walks, and the allocation pool that owns every record the analyzer
+heap-allocates (type records, symbol records, constructor descriptors,
+registry pairs, diagnostic strings built with string_concat). Pooled
+ownership makes destroy and clear leak-free without per-record
+ownership bookkeeping.
+@End Reasoning
+
+Process called "create_constraint_solver" takes analyzer as Integer returns Integer:
+    Note: Create the unification and registry store (40-byte record)
+
+    Let solver be proc allocate from Layout with 40
+    If solver is equal to 0:
+        Return 0
+    End If
+
+    Let subst be proc list_create from List
+    proc memory_set_int64 from Layout with solver, 0, subst
+    proc memory_set_int64 from Layout with solver, 8, 0   Note: next variable id
+
+    Let match_registry be proc list_create from List
+    proc memory_set_int64 from Layout with solver, 16, match_registry
+
+    Let definitions be proc list_create from List
+    proc memory_set_int64 from Layout with solver, 24, definitions
+
+    Let alloc_pool be proc list_create from List
+    proc memory_set_int64 from Layout with solver, 32, alloc_pool
+
+    Return solver
+End Process
+
+@Reasoning:
+The measure registry maps base measure names to their descriptor (the
+name string itself serves as the descriptor for base units). Measures
+are user-declared in F# via [<Measure>] attributes, so the registry
+starts empty and lookup failures over the AST_MEASURE shape surface as
+"Unknown unit of measure" diagnostics - exactly F#'s behaviour for
+undeclared units.
+@End Reasoning
+
+Process called "create_measure_system" takes analyzer as Integer returns Integer:
+    Note: Create units of measure registry
+    Return proc hashtable_create from Dict
+End Process
+
+@Reasoning:
+Registers every memory block the analyzer allocates into the solver's
+ownership pool so destroy_fsharp_semantic_analyzer and
+clear_analysis_results can release everything in one sweep without
+per-record lifetime tracking. Returns the block unchanged so call sites
+compose as expressions.
+@End Reasoning
+
+Process called "pool_allocate" takes analyzer as Integer, size as Integer returns Integer:
+    Note: Allocate a pooled record owned by the analyzer
+
+    Let block be proc allocate from Layout with size
+    If block is equal to 0:
+        Return 0
+    End If
+
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    Let alloc_pool be proc memory_get_int64 from Layout with solver, 32
+    proc list_append from List with alloc_pool, block
+
+    Return block
+End Process
+
+@Reasoning:
+Diagnostic messages composed at runtime (name-bearing errors and
+warnings) are built with string_concat, which returns a Layout-owned
+allocation; registering the result in the pool keeps diagnostics alive
+exactly as long as the analyzer and frees them with it.
+@End Reasoning
+
+Process called "pool_concat" takes analyzer as Integer, left as Integer, right as Integer returns Integer:
+    Note: Concatenate two strings into a pooled diagnostic string
+
+    Let joined be proc string_concat from StringUtils with left, right
+    If joined is equal to 0:
+        Return left
+    End If
+
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    Let alloc_pool be proc memory_get_int64 from Layout with solver, 32
+    proc list_append from List with alloc_pool, joined
+
+    Return joined
+End Process
+
+@Reasoning:
+Reverse of create_*: releases every pooled record, the solver's four
+Lists and the solver itself, every remaining scope hashtable on the
+stack, the four hashtables, and the diagnostic lists, then the analyzer
+record. Each field is null-checked so partially-constructed analyzers
+(allocation failure midway through create_*) destroy cleanly.
 @End Reasoning
 
 Process called "destroy_fsharp_semantic_analyzer" takes analyzer as Integer returns Integer:
-    Note: Destroy analyzer and free all memory
+    Note: Destroy analyzer and free all owned memory
 
     If analyzer is equal to 0:
         Return 1
     End If
 
-    Let symbol_table be proc memory_get_int64 from Layout with analyzer, 0
-    If symbol_table is not equal to 0:
-        proc hashtable_destroy from Dict with symbol_table
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    If solver is not equal to 0:
+        Let alloc_pool be proc memory_get_int64 from Layout with solver, 32
+        If alloc_pool is not equal to 0:
+            Let pool_count be proc list_length from List with alloc_pool
+            Let i be 0
+            While i is less than pool_count:
+                Let block be proc list_get from List with alloc_pool, i
+                If block is not equal to 0:
+                    proc deallocate from Layout with block
+                End If
+                Set i to i plus 1
+            End While
+            proc list_destroy from List with alloc_pool
+        End If
+
+        Let subst be proc memory_get_int64 from Layout with solver, 0
+        If subst is not equal to 0:
+            proc list_destroy from List with subst
+        End If
+
+        Let match_registry be proc memory_get_int64 from Layout with solver, 16
+        If match_registry is not equal to 0:
+            proc list_destroy from List with match_registry
+        End If
+
+        Let definitions be proc memory_get_int64 from Layout with solver, 24
+        If definitions is not equal to 0:
+            proc list_destroy from List with definitions
+        End If
+
+        proc deallocate from Layout with solver
     End If
 
     Let scope_stack be proc memory_get_int64 from Layout with analyzer, 8
     If scope_stack is not equal to 0:
+        Let scope_count be proc list_length from List with scope_stack
+        Let s be 0
+        While s is less than scope_count:
+            Let scope_table be proc list_get from List with scope_stack, s
+            If scope_table is not equal to 0:
+                proc hashtable_destroy from Dict with scope_table
+            End If
+            Set s to s plus 1
+        End While
         proc list_destroy from List with scope_stack
+    End If
+
+    Let symbol_table be proc memory_get_int64 from Layout with analyzer, 0
+    If symbol_table is not equal to 0:
+        proc hashtable_destroy from Dict with symbol_table
     End If
 
     Let type_env be proc memory_get_int64 from Layout with analyzer, 16
@@ -218,6 +368,11 @@ Process called "destroy_fsharp_semantic_analyzer" takes analyzer as Integer retu
     Let module_table be proc memory_get_int64 from Layout with analyzer, 32
     If module_table is not equal to 0:
         proc hashtable_destroy from Dict with module_table
+    End If
+
+    Let measure_system be proc memory_get_int64 from Layout with analyzer, 56
+    If measure_system is not equal to 0:
+        proc hashtable_destroy from Dict with measure_system
     End If
 
     Let error_list be proc memory_get_int64 from Layout with analyzer, 40
@@ -234,556 +389,864 @@ Process called "destroy_fsharp_semantic_analyzer" takes analyzer as Integer retu
     Return 1
 End Process
 
-Note: ============================================================================
-Note: Main Analysis Entry Point
-Note: ============================================================================
-
 @Reasoning:
-Top-level module-analysis pass. Sequence: clear prior results, walk
-module structure (capture every top-level declaration), walk
-declarations (type-check each), solve_all_constraints (drain any
-remaining unification work), validate_pattern_completeness (match
-exhaustiveness), check_unused_definitions. Null AST is a hard error
-because the front end should never invoke this on absent input.
+Seeds the type environment with the built-in F# type names every program
+may reference without declaration. Integer-family aliases (int, int32,
+int64, nativeint), float-family aliases (float, float32, double,
+single), and the remaining primitives map to their bare type codes; the
+built-in polymorphic constructors Some/None (option) and Ok/Error
+(Result) are registered as constructors and receive per-use fresh
+instantiation in the constructor paths, so seeding stores only their
+names with the polymorphic marker (payload 0, union 0) - the dedicated
+built-in handling in validate_constructor_pattern and
+infer_identifier_type supplies the real types.
 @End Reasoning
 
-Process called "analyze_fsharp_module" takes analyzer as Integer, ast_root as Integer returns Integer:
-    Note: Analyze complete F# module
+Process called "setup_fsharp_builtins" takes analyzer as Integer returns Integer:
+    Note: Seed built-in type names into the type environment
 
-    @Reasoning:
-    Performs comprehensive semantic analysis of F# module including type checking,
-    pattern validation, and F#-specific construct analysis.
-    @End Reasoning
+    Let type_env be proc memory_get_int64 from Layout with analyzer, 16
 
-    If ast_root is equal to 0:
-        Let error_msg be proc create_string from StringCore with "No AST provided for analysis"
-        proc add_semantic_error with analyzer, error_msg
-        Return 0
-    End If
+    proc hashtable_set from Dict with type_env, "int", TYPE_INT
+    proc hashtable_set from Dict with type_env, "int32", TYPE_INT
+    proc hashtable_set from Dict with type_env, "int64", TYPE_INT
+    proc hashtable_set from Dict with type_env, "nativeint", TYPE_INT
+    proc hashtable_set from Dict with type_env, "uint", TYPE_INT
+    proc hashtable_set from Dict with type_env, "uint32", TYPE_INT
+    proc hashtable_set from Dict with type_env, "uint64", TYPE_INT
+    proc hashtable_set from Dict with type_env, "int16", TYPE_INT
+    proc hashtable_set from Dict with type_env, "uint16", TYPE_INT
+    proc hashtable_set from Dict with type_env, "sbyte", TYPE_INT
+    proc hashtable_set from Dict with type_env, "float", TYPE_FLOAT
+    proc hashtable_set from Dict with type_env, "float32", TYPE_FLOAT
+    proc hashtable_set from Dict with type_env, "double", TYPE_FLOAT
+    proc hashtable_set from Dict with type_env, "single", TYPE_FLOAT
+    proc hashtable_set from Dict with type_env, "decimal", TYPE_DECIMAL
+    proc hashtable_set from Dict with type_env, "string", TYPE_STRING
+    proc hashtable_set from Dict with type_env, "bool", TYPE_BOOL
+    proc hashtable_set from Dict with type_env, "char", TYPE_CHAR
+    proc hashtable_set from Dict with type_env, "unit", TYPE_UNIT
+    proc hashtable_set from Dict with type_env, "byte", TYPE_BYTE
+    proc hashtable_set from Dict with type_env, "obj", TYPE_ANY
+    proc hashtable_set from Dict with type_env, "exn", TYPE_ANY
 
-    Note: Clear previous analysis results
-    proc clear_analysis_results from analyzer
+    Return 1
+End Process
 
-    Note: Analyze module structure
-    proc analyze_module_structure with analyzer, ast_root
+@Reasoning:
+Resets analyzer state for a fresh run: empties the diagnostic lists,
+drops every substitution and fresh-variable counter, releases all pooled
+records (and clears the pool), clears the registries, pops every
+lingering local scope, clears the module-level symbol table and module
+table, and clears + re-seeds the type environment (its registered type
+records were pool-owned, so clearing prevents dangling references after
+the pool sweep; built-in codes are integers and re-seed cheaply).
+@End Reasoning
 
-    Note: Analyze all declarations
-    proc analyze_module_declarations with analyzer, ast_root
+Process called "clear_analysis_results" takes analyzer as Integer returns Integer:
+    Note: Clear previous analysis results for a fresh run
 
-    Note: Solve remaining type constraints
-    proc solve_all_constraints from analyzer
+    Let error_list be proc memory_get_int64 from Layout with analyzer, 40
+    proc list_clear from List with error_list
 
-    Note: Validate pattern completeness
-    proc validate_pattern_completeness from analyzer
+    Let warning_list be proc memory_get_int64 from Layout with analyzer, 48
+    proc list_clear from List with warning_list
 
-    Note: Check for unused variables and functions
-    proc check_unused_definitions from analyzer
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+
+    Let alloc_pool be proc memory_get_int64 from Layout with solver, 32
+    Let pool_count be proc list_length from List with alloc_pool
+    Let i be 0
+    While i is less than pool_count:
+        Let block be proc list_get from List with alloc_pool, i
+        If block is not equal to 0:
+            proc deallocate from Layout with block
+        End If
+        Set i to i plus 1
+    End While
+    proc list_clear from List with alloc_pool
+
+    Let subst be proc memory_get_int64 from Layout with solver, 0
+    proc list_clear from List with subst
+    proc memory_set_int64 from Layout with solver, 8, 0
+
+    Let match_registry be proc memory_get_int64 from Layout with solver, 16
+    proc list_clear from List with match_registry
+
+    Let definitions be proc memory_get_int64 from Layout with solver, 24
+    proc list_clear from List with definitions
+
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 8
+    Let scope_count be proc list_length from List with scope_stack
+    Let s be 0
+    While s is less than scope_count:
+        Let scope_table be proc list_get from List with scope_stack, s
+        If scope_table is not equal to 0:
+            proc hashtable_destroy from Dict with scope_table
+        End If
+        Set s to s plus 1
+    End While
+    proc list_clear from List with scope_stack
+
+    Let symbol_table be proc memory_get_int64 from Layout with analyzer, 0
+    proc hashtable_clear from Dict with symbol_table
+
+    Let module_table be proc memory_get_int64 from Layout with analyzer, 32
+    proc hashtable_clear from Dict with module_table
+
+    Let measure_system be proc memory_get_int64 from Layout with analyzer, 56
+    proc hashtable_clear from Dict with measure_system
+
+    Let type_env be proc memory_get_int64 from Layout with analyzer, 16
+    proc hashtable_clear from Dict with type_env
+    proc setup_fsharp_builtins with analyzer
 
     Return 1
 End Process
 
 Note: ============================================================================
-Note: Type Inference Engine
+Note: Type Representation
 Note: ============================================================================
 
 @Reasoning:
-Core Hindley-Milner type-inference dispatcher for F# expression nodes.
-Handles every expression shape: literals (constant types), identifiers
-(symbol-table lookup with generalisation), function application
-(unify expected param type with argument type), lambdas (introduce
-parameter binders, infer body in extended environment), match
-(scrutinee type vs case patterns), computation expressions (builder-
-method translation), async (System.Threading.Tasks.Task<T> elaboration),
-units of measure (dimensional algebra).
+Type values are polymorphic: bare primitive codes below 65536 ARE their
+own tag; larger values are pointers whose first field is the tag. This
+accessor resolves the polymorphism once so every consumer dispatches on
+one integer.
 @End Reasoning
 
-Process called "infer_expression_type" takes analyzer as Integer, expr_node as Integer returns Integer:
-    Note: Infer type of F# expression
+Process called "type_tag" takes type_value as Integer returns Integer:
+    Note: Get the type tag of a bare code or composite type record
 
-    @Reasoning:
-    F# uses Hindley-Milner type inference with extensions for units of measure,
-    computation expressions, and .NET interoperability.
-    @End Reasoning
-
-    If expr_node is equal to 0:
-        Return TYPE_UNIT
+    If type_value is equal to 0:
+        Return TYPE_UNKNOWN
     End If
-
-    Let expr_type be proc get_fsharp_ast_type from Parser with expr_node
-
-    Note: Literal expressions
-    If expr_type is equal to AST_INT_LITERAL from Parser:
-        Return TYPE_INT
+    If type_value is less than 65536:
+        Return type_value
     End If
-
-    If expr_type is equal to AST_FLOAT_LITERAL from Parser:
-        Return TYPE_FLOAT
-    End If
-
-    If expr_type is equal to AST_STRING_LITERAL from Parser:
-        Return TYPE_STRING
-    End If
-
-    If expr_type is equal to AST_BOOL_LITERAL from Parser:
-        Return TYPE_BOOL
-    End If
-
-    If expr_type is equal to AST_CHAR_LITERAL from Parser:
-        Return TYPE_CHAR
-    End If
-
-    If expr_type is equal to AST_UNIT_LITERAL from Parser:
-        Return TYPE_UNIT
-    End If
-
-    Note: Variable reference
-    If expr_type is equal to AST_IDENTIFIER from Parser:
-        Return proc infer_identifier_type with analyzer, expr_node
-    End If
-
-    Note: Function application
-    If expr_type is equal to AST_APPLICATION from Parser:
-        Return proc infer_application_type with analyzer, expr_node
-    End If
-
-    Note: Lambda expression
-    If expr_type is equal to AST_LAMBDA from Parser:
-        Return proc infer_lambda_type with analyzer, expr_node
-    End If
-
-    Note: Let expression
-    If expr_type is equal to AST_LET from Parser:
-        Return proc infer_let_type with analyzer, expr_node
-    End If
-
-    Note: Match expression
-    If expr_type is equal to AST_MATCH from Parser:
-        Return proc infer_match_type with analyzer, expr_node
-    End If
-
-    Note: If expression
-    If expr_type is equal to AST_IF from Parser:
-        Return proc infer_if_type with analyzer, expr_node
-    End If
-
-    Note: Tuple expression
-    If expr_type is equal to AST_TUPLE from Parser:
-        Return proc infer_tuple_type with analyzer, expr_node
-    End If
-
-    Note: List expression
-    If expr_type is equal to AST_LIST from Parser:
-        Return proc infer_list_type with analyzer, expr_node
-    End If
-
-    Note: Array expression
-    If expr_type is equal to AST_ARRAY from Parser:
-        Return proc infer_array_type with analyzer, expr_node
-    End If
-
-    Note: Record expression
-    If expr_type is equal to AST_RECORD from Parser:
-        Return proc infer_record_type with analyzer, expr_node
-    End If
-
-    Note: Computation expression
-    If expr_type is equal to AST_COMPUTATION from Parser:
-        Return proc infer_computation_type with analyzer, expr_node
-    End If
-
-    Note: Async expression
-    If expr_type is equal to AST_ASYNC from Parser:
-        Return proc infer_async_type with analyzer, expr_node
-    End If
-
-    Note: Sequence expression
-    If expr_type is equal to AST_SEQUENCE from Parser:
-        Return proc infer_sequence_type with analyzer, expr_node
-    End If
-
-    Note: Type-annotated expression
-    If expr_type is equal to AST_TYPE_ANNOTATED from Parser:
-        Return proc infer_annotated_type with analyzer, expr_node
-    End If
-
-    Note: Units of measure expression
-    If expr_type is equal to AST_MEASURE_LITERAL from Parser:
-        Return proc infer_measure_type with analyzer, expr_node
-    End If
-
-    Return TYPE_UNKNOWN
+    Return proc memory_get_int64 from Layout with type_value, 0
 End Process
 
 @Reasoning:
-Resolves a bare identifier through lookup_symbol (which walks the scope
-chain). On hit, returns the bound type (with generic-instantiation if
-the symbol is polymorphic); on miss, records "unbound identifier" and
-returns TYPE_ERROR so subsequent inference still proceeds rather than
-aborting on the first unknown name.
+Single-payload composite constructor (list/array/option/seq/async/
+computation element types, tuple element-list carrier, record name
+carrier, generic variable id). 16 bytes: tag, payload.
 @End Reasoning
 
-Process called "infer_identifier_type" takes analyzer as Integer, identifier_node as Integer returns Integer:
-    Note: Infer type of identifier reference
+Process called "make_type1" takes analyzer as Integer, tag as Integer, payload as Integer returns Integer:
+    Note: Allocate a pooled [tag, payload] composite type record
 
-    Let identifier_name be proc get_fsharp_ast_value from Parser with identifier_node
-    Let symbol_info be proc lookup_symbol with analyzer, identifier_name
-
-    If symbol_info is equal to 0:
-        Let error_msg be proc create_string from StringCore with "Undefined variable: "
-        Let full_error be proc string_concat from StringCore with error_msg, identifier_name
-        proc add_semantic_error with analyzer, full_error
-        proc deallocate from Layout with error_msg
-        proc deallocate from Layout with full_error
+    Let record be proc pool_allocate with analyzer, 16
+    If record is equal to 0:
         Return TYPE_ERROR
     End If
-
-    Let symbol_type be proc get_symbol_type from symbol_info
-    Return symbol_type
+    proc memory_set_int64 from Layout with record, 0, tag
+    proc memory_set_int64 from Layout with record, 8, payload
+    Return record
 End Process
 
 @Reasoning:
-Function application f(x) typing: infer f's type, ensure it's a
-function type via is_function_type, unify x's inferred type against the
-parameter type, and return the function's return type as the result.
-Curried application is handled by recursive inference — the return type
-of f(x) becomes the function type for f(x)(y).
+Two-payload composite constructor (function param/return, measure
+base/unit, union name/case-list). 24 bytes: tag, first, second.
 @End Reasoning
 
-Process called "infer_application_type" takes analyzer as Integer, app_node as Integer returns Integer:
-    Note: Infer type of function application
+Process called "make_type2" takes analyzer as Integer, tag as Integer, first as Integer, second as Integer returns Integer:
+    Note: Allocate a pooled [tag, first, second] composite type record
 
-    @Reasoning:
-    Function application type checking involves unifying function type with
-    argument types. Handles currying and partial application in F#.
-    @End Reasoning
-
-    Let app_children be proc get_fsharp_ast_children from Parser with app_node
-    Let function_expr be proc list_get from List with app_children, 0
-    Let argument_expr be proc list_get from List with app_children, 1
-
-    Let function_type be proc infer_expression_type with analyzer, function_expr
-    Let argument_type be proc infer_expression_type with analyzer, argument_expr
-
-    If function_type is equal to TYPE_ERROR:
+    Let record be proc pool_allocate with analyzer, 24
+    If record is equal to 0:
         Return TYPE_ERROR
     End If
-
-    If argument_type is equal to TYPE_ERROR:
-        Return TYPE_ERROR
-    End If
-
-    Note: Check if function type is actually a function
-    Let is_function be proc is_function_type from function_type
-    If is_function is equal to 0:
-        Let error_msg be proc create_string from StringCore with "Expression is not a function"
-        proc add_semantic_error with analyzer, error_msg
-        Return TYPE_ERROR
-    End If
-
-    Note: Extract parameter and return types
-    Let param_type be proc get_function_param_type from function_type
-    Let return_type be proc get_function_return_type from function_type
-
-    Note: Unify argument type with parameter type
-    Let unify_result be proc unify_types with analyzer, argument_type, param_type
-    If unify_result is equal to 0:
-        Set error_msg to proc create_string from StringCore with "Argument type mismatch"
-        proc add_semantic_error with analyzer, error_msg
-        Return TYPE_ERROR
-    End If
-
-    Return return_type
+    proc memory_set_int64 from Layout with record, 0, tag
+    proc memory_set_int64 from Layout with record, 8, first
+    proc memory_set_int64 from Layout with record, 16, second
+    Return record
 End Process
 
 @Reasoning:
-fun x y -> body lambda typing. Pushes a new scope, calls
-process_lambda_parameters to introduce binders with fresh type
-variables, infers the body in the extended environment, pops the scope,
-and constructs the function type via create_function_type using the
-parameter types and the inferred body type.
+Fresh type variables drive the unification engine: every unconstrained
+binder starts as a fresh variable that later unification resolves. Ids
+index the solver's substitution List directly, so creation appends one
+unbound (0) slot and the variable record carries the id.
 @End Reasoning
 
-Process called "infer_lambda_type" takes analyzer as Integer, lambda_node as Integer returns Integer:
-    Note: Infer type of lambda expression
+Process called "fresh_type_var" takes analyzer as Integer returns Integer:
+    Note: Allocate a fresh unbound type variable
 
-    @Reasoning:
-    Lambda type inference creates function types from parameter and body types.
-    Parameters may have explicit types or be inferred from usage.
-    @End Reasoning
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    Let var_id be proc memory_get_int64 from Layout with solver, 8
+    proc memory_set_int64 from Layout with solver, 8, var_id plus 1
 
-    Let lambda_children be proc get_fsharp_ast_children from Parser with lambda_node
-    Let parameter_list be proc list_get from List with lambda_children, 0
-    Let body_expr be proc list_get from List with lambda_children, 1
+    Let subst be proc memory_get_int64 from Layout with solver, 0
+    proc list_append from List with subst, 0
 
-    Note: Create new scope for lambda
-    proc push_scope from analyzer
-
-    Note: Process parameters
-    Let param_types be proc process_lambda_parameters with analyzer, parameter_list
-
-    Note: Infer body type
-    Let body_type be proc infer_expression_type with analyzer, body_expr
-
-    Note: Pop lambda scope
-    proc pop_scope from analyzer
-
-    Note: Create function type
-    Let function_type be proc create_function_type with param_types, body_type
-    Return function_type
+    Return proc make_type1 with analyzer, TYPE_GENERIC, var_id
 End Process
 
 @Reasoning:
-match expr with | PAT1 -> R1 | PAT2 -> R2 typing. Infer the scrutinee
-type, then validate every case pattern against it (rejects type-
-incompatible patterns), then infer per-case result types, then call
-find_common_type to compute the join of all case results. validate_-
-match_exhaustiveness reports non-exhaustive matches as warnings.
+Follows the substitution chain from a type variable to its current
+binding (or the variable itself when unbound). Every unification and
+inspection path resolves first so decisions are made on the most
+concrete knowledge available. Iterative (not recursive) so chains of
+any length resolve in constant stack.
 @End Reasoning
 
-Process called "infer_match_type" takes analyzer as Integer, match_node as Integer returns Integer:
-    Note: Infer type of match expression
+Process called "resolve_type" takes analyzer as Integer, type_value as Integer returns Integer:
+    Note: Resolve a type through the substitution store
 
-    @Reasoning:
-    Match expressions must have consistent result types across all patterns.
-    Pattern variables are added to scope for each case.
-    @End Reasoning
+    Let current be type_value
+    Let resolving be 1
+    While resolving is equal to 1:
+        If current is equal to 0:
+            Set resolving to 0
+            Continue
+        End If
+        If current is less than 65536:
+            Set resolving to 0
+            Continue
+        End If
 
-    Let match_children be proc get_fsharp_ast_children from Parser with match_node
-    Let scrutinee_expr be proc list_get from List with match_children, 0
-    Let case_list be proc list_get from List with match_children, 1
+        Let tag be proc memory_get_int64 from Layout with current, 0
+        If tag is not equal to TYPE_GENERIC:
+            Set resolving to 0
+            Continue
+        End If
 
-    Note: Infer scrutinee type
-    Let scrutinee_type be proc infer_expression_type with analyzer, scrutinee_expr
+        Let var_id be proc memory_get_int64 from Layout with current, 8
+        Let solver be proc memory_get_int64 from Layout with analyzer, 24
+        Let subst be proc memory_get_int64 from Layout with solver, 0
+        Let bound be proc list_get from List with subst, var_id
+        If bound is equal to 0:
+            Set resolving to 0
+            Continue
+        End If
 
-    Note: Validate exhaustiveness
-    proc validate_match_exhaustiveness with analyzer, scrutinee_type, case_list
+        Set current to bound
+    End While
 
-    Note: Infer types of all cases
-    Let case_types be proc infer_case_types with analyzer, case_list, scrutinee_type
-
-    Note: Find common type
-    Let result_type be proc find_common_type with analyzer, case_types
-    Return result_type
+    Return current
 End Process
 
-Note: ============================================================================
-Note: Pattern Analysis
-Note: ============================================================================
-
 @Reasoning:
-Type-checks one match pattern against the scrutinee's type and binds any
-introduced variables into the current scope. Pattern shapes: wildcard
-(_), variable (binds with expected_type), literal (must be compatible
-with expected_type), constructor (UnionCase args - args must match the
-case's parameter list), tuple (component-wise), record (field by field),
-type test (:? T -> downcast). Failures add a semantic error.
+The occurs check prevents infinite types: binding 'a to a composite that
+contains 'a (e.g. 'a = 'a -> int) would make resolution diverge.
+Recursive structural walk over resolved types; returns 1 when the
+variable occurs inside the candidate binding.
 @End Reasoning
 
-Process called "validate_pattern" takes analyzer as Integer, pattern_node as Integer, expected_type as Integer returns Integer:
-    Note: Validate pattern against expected type
+Process called "occurs_check" takes analyzer as Integer, var_id as Integer, type_value as Integer returns Integer:
+    Note: Check whether type variable var_id occurs inside type_value
 
-    @Reasoning:
-    Pattern validation ensures patterns match expected types and that
-    pattern variables are properly bound with correct types.
-    @End Reasoning
-
-    If pattern_node is equal to 0:
-        Return 1
+    Let resolved be proc resolve_type with analyzer, type_value
+    If resolved is equal to 0:
+        Return 0
+    End If
+    If resolved is less than 65536:
+        Return 0
     End If
 
-    Let pattern_type be proc get_fsharp_ast_type from Parser with pattern_node
+    Let tag be proc memory_get_int64 from Layout with resolved, 0
 
-    Note: Wildcard pattern
-    If pattern_type is equal to AST_PATTERN_WILDCARD from Parser:
-        Return 1
+    If tag is equal to TYPE_GENERIC:
+        Let other_id be proc memory_get_int64 from Layout with resolved, 8
+        If other_id is equal to var_id:
+            Return 1
+        End If
+        Return 0
     End If
 
-    Note: Variable pattern
-    If pattern_type is equal to AST_PATTERN_VARIABLE from Parser:
-        Let var_name be proc get_fsharp_ast_value from Parser with pattern_node
-        proc add_pattern_variable with analyzer, var_name, expected_type
-        Return 1
+    If tag is equal to TYPE_FUNCTION:
+        Let param be proc memory_get_int64 from Layout with resolved, 8
+        Let found be proc occurs_check with analyzer, var_id, param
+        If found is equal to 1:
+            Return 1
+        End If
+        Let ret be proc memory_get_int64 from Layout with resolved, 16
+        Return proc occurs_check with analyzer, var_id, ret
     End If
 
-    Note: Literal pattern
-    If pattern_type is equal to AST_PATTERN_LITERAL from Parser:
-        Let literal_type be proc infer_expression_type with analyzer, pattern_node
-        Let compatible be proc types_compatible with analyzer, literal_type, expected_type
-        Return compatible
+    If tag is equal to TYPE_TUPLE:
+        Let elems be proc memory_get_int64 from Layout with resolved, 8
+        Let count be proc list_length from List with elems
+        Let i be 0
+        While i is less than count:
+            Let elem be proc list_get from List with elems, i
+            Set found to proc occurs_check with analyzer, var_id, elem
+            If found is equal to 1:
+                Return 1
+            End If
+            Set i to i plus 1
+        End While
+        Return 0
     End If
 
-    Note: Constructor pattern
-    If pattern_type is equal to AST_PATTERN_CONSTRUCTOR from Parser:
-        Return proc validate_constructor_pattern with analyzer, pattern_node, expected_type
+    Let is_wrapper be 0
+    If tag is equal to TYPE_LIST:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ARRAY:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_OPTION:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_SEQUENCE:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ASYNC:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_COMPUTATION:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_MEASURE:
+        Set is_wrapper to 1
     End If
 
-    Note: Tuple pattern
-    If pattern_type is equal to AST_PATTERN_TUPLE from Parser:
-        Return proc validate_tuple_pattern with analyzer, pattern_node, expected_type
-    End If
-
-    Note: List pattern
-    If pattern_type is equal to AST_PATTERN_LIST from Parser:
-        Return proc validate_list_pattern with analyzer, pattern_node, expected_type
-    End If
-
-    Note: Record pattern
-    If pattern_type is equal to AST_PATTERN_RECORD from Parser:
-        Return proc validate_record_pattern with analyzer, pattern_node, expected_type
-    End If
-
-    Note: Array pattern
-    If pattern_type is equal to AST_PATTERN_ARRAY from Parser:
-        Return proc validate_array_pattern with analyzer, pattern_node, expected_type
-    End If
-
-    Note: Active pattern
-    If pattern_type is equal to AST_PATTERN_ACTIVE from Parser:
-        Return proc validate_active_pattern with analyzer, pattern_node, expected_type
+    If is_wrapper is equal to 1:
+        Let inner be proc memory_get_int64 from Layout with resolved, 8
+        Return proc occurs_check with analyzer, var_id, inner
     End If
 
     Return 0
 End Process
 
-Note: ============================================================================
-Note: F#-Specific Construct Analysis
-Note: ============================================================================
-
 @Reasoning:
-F# computation expressions (`seq { ... }`, `async { ... }`, `query
-{ ... }`, custom builders) desugar to a sequence of builder method
-calls (Bind, Return, ReturnFrom, Yield, Combine, Delay, Run, etc.).
-This pass identifies the builder, validates that it implements the
-methods invoked by the body, and produces typing constraints for each
-binding step.
+The unification primitive. Resolves both sides, succeeds immediately on
+identity, lets TYPE_ERROR and TYPE_ANY absorb anything (error recovery
+and obj-typed interop must not cascade), binds free variables (with the
+occurs check), and otherwise requires equal tags plus recursive payload
+agreement: functions unify componentwise, element wrappers unify their
+element, tuples require equal arity plus pairwise unification, records
+and unions unify by declared name, measured types unify base and unit.
+Returns 1 on success, 0 on mismatch; callers attach diagnostics because
+only they know the source construct being checked.
 @End Reasoning
 
-Process called "analyze_computation_expression" takes analyzer as Integer, comp_node as Integer returns Integer:
-    Note: Analyze computation expression
+Process called "unify_types" takes analyzer as Integer, type1 as Integer, type2 as Integer returns Integer:
+    Note: Unify two types in the substitution store
 
-    @Reasoning:
-    Computation expressions are F#'s monadic syntax. Validates that the builder
-    object has required methods and operations are properly typed.
-    @End Reasoning
+    Let t1 be proc resolve_type with analyzer, type1
+    Let t2 be proc resolve_type with analyzer, type2
 
-    Let comp_children be proc get_fsharp_ast_children from Parser with comp_node
-    Let builder_expr be proc list_get from List with comp_children, 0
-    Let comp_body be proc list_get from List with comp_children, 1
-
-    Note: Infer builder type
-    Let builder_type be proc infer_expression_type with analyzer, builder_expr
-
-    Note: Validate builder has required methods
-    Let has_bind be proc builder_has_method with analyzer, builder_type, "Bind"
-    Let has_return be proc builder_has_method with analyzer, builder_type, "Return"
-
-    If has_bind is equal to 0:
-        Let error_msg be proc create_string from StringCore with "Builder missing Bind method"
-        proc add_semantic_error with analyzer, error_msg
+    If t1 is equal to t2:
+        Return 1
     End If
 
-    If has_return is equal to 0:
-        Set error_msg to proc create_string from StringCore with "Builder missing Return method"
-        proc add_semantic_error with analyzer, error_msg
+    Let tag1 be proc type_tag with t1
+    Let tag2 be proc type_tag with t2
+
+    If tag1 is equal to TYPE_ERROR:
+        Return 1
+    End If
+    If tag2 is equal to TYPE_ERROR:
+        Return 1
+    End If
+    If tag1 is equal to TYPE_ANY:
+        Return 1
+    End If
+    If tag2 is equal to TYPE_ANY:
+        Return 1
     End If
 
-    Note: Analyze computation body with builder context
-    proc push_computation_scope with analyzer, builder_type
-    Let body_type be proc analyze_computation_body with analyzer, comp_body
-    proc pop_scope from analyzer
+    If tag1 is equal to TYPE_GENERIC:
+        Let var_id be proc memory_get_int64 from Layout with t1, 8
+        Let cyclic be proc occurs_check with analyzer, var_id, t2
+        If cyclic is equal to 1:
+            Return 0
+        End If
+        Let solver be proc memory_get_int64 from Layout with analyzer, 24
+        Let subst be proc memory_get_int64 from Layout with solver, 0
+        proc list_set from List with subst, var_id, t2
+        Return 1
+    End If
 
-    Return body_type
+    If tag2 is equal to TYPE_GENERIC:
+        Set var_id to proc memory_get_int64 from Layout with t2, 8
+        Set cyclic to proc occurs_check with analyzer, var_id, t1
+        If cyclic is equal to 1:
+            Return 0
+        End If
+        Set solver to proc memory_get_int64 from Layout with analyzer, 24
+        Set subst to proc memory_get_int64 from Layout with solver, 0
+        proc list_set from List with subst, var_id, t1
+        Return 1
+    End If
+
+    If tag1 is not equal to tag2:
+        Return 0
+    End If
+
+    If tag1 is equal to TYPE_FUNCTION:
+        Let param1 be proc memory_get_int64 from Layout with t1, 8
+        Let param2 be proc memory_get_int64 from Layout with t2, 8
+        Let ok be proc unify_types with analyzer, param1, param2
+        If ok is equal to 0:
+            Return 0
+        End If
+        Let ret1 be proc memory_get_int64 from Layout with t1, 16
+        Let ret2 be proc memory_get_int64 from Layout with t2, 16
+        Return proc unify_types with analyzer, ret1, ret2
+    End If
+
+    If tag1 is equal to TYPE_TUPLE:
+        Let elems1 be proc memory_get_int64 from Layout with t1, 8
+        Let elems2 be proc memory_get_int64 from Layout with t2, 8
+        Let count1 be proc list_length from List with elems1
+        Let count2 be proc list_length from List with elems2
+        If count1 is not equal to count2:
+            Return 0
+        End If
+        Let i be 0
+        While i is less than count1:
+            Let e1 be proc list_get from List with elems1, i
+            Let e2 be proc list_get from List with elems2, i
+            Set ok to proc unify_types with analyzer, e1, e2
+            If ok is equal to 0:
+                Return 0
+            End If
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    Let is_wrapper be 0
+    If tag1 is equal to TYPE_LIST:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_ARRAY:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_OPTION:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_SEQUENCE:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_ASYNC:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_COMPUTATION:
+        Set is_wrapper to 1
+    End If
+
+    If is_wrapper is equal to 1:
+        Let inner1 be proc memory_get_int64 from Layout with t1, 8
+        Let inner2 be proc memory_get_int64 from Layout with t2, 8
+        Return proc unify_types with analyzer, inner1, inner2
+    End If
+
+    If tag1 is equal to TYPE_RECORD:
+        Let name1 be proc memory_get_int64 from Layout with t1, 8
+        Let name2 be proc memory_get_int64 from Layout with t2, 8
+        If name1 is equal to 0:
+            Return 1
+        End If
+        If name2 is equal to 0:
+            Return 1
+        End If
+        Return proc string_equals from StringCore with name1, name2
+    End If
+
+    If tag1 is equal to TYPE_UNION:
+        Set name1 to proc memory_get_int64 from Layout with t1, 8
+        Set name2 to proc memory_get_int64 from Layout with t2, 8
+        Return proc string_equals from StringCore with name1, name2
+    End If
+
+    If tag1 is equal to TYPE_MEASURE:
+        Let base1 be proc memory_get_int64 from Layout with t1, 8
+        Let base2 be proc memory_get_int64 from Layout with t2, 8
+        Set ok to proc unify_types with analyzer, base1, base2
+        If ok is equal to 0:
+            Return 0
+        End If
+        Let unit1 be proc memory_get_int64 from Layout with t1, 16
+        Let unit2 be proc memory_get_int64 from Layout with t2, 16
+        Return proc string_equals from StringCore with unit1, unit2
+    End If
+
+    Note: Equal tags with no payload comparison remaining
+    Return 1
 End Process
 
 @Reasoning:
-F# units of measure ([<Measure>] m, [<Measure>] s, etc.) form a
-dimensional algebra: m*s/m^2 = 1/m. This analyser delegates to the
-measure_system to canonicalise the expression — products become
-multimaps of base measure -> exponent, division flips signs, and two
-measures unify iff their canonical forms are equal.
+Pure compatibility predicate: answers whether two types could describe
+the same value WITHOUT mutating the substitution store. Free variables
+are compatible with anything (they could still be bound that way);
+otherwise the structural rules mirror unify_types. Used by checks that
+must not commit speculative bindings (literal-pattern admissibility).
 @End Reasoning
 
-Process called "analyze_units_of_measure" takes analyzer as Integer, measure_expr as Integer returns Integer:
-    Note: Analyze units of measure expression
+Process called "types_compatible" takes analyzer as Integer, type1 as Integer, type2 as Integer returns Integer:
+    Note: Non-mutating structural compatibility test
 
-    @Reasoning:
-    F#'s units of measure system provides compile-time dimensional analysis.
-    Validates measure compatibility and dimensional correctness.
-    @End Reasoning
+    Let t1 be proc resolve_type with analyzer, type1
+    Let t2 be proc resolve_type with analyzer, type2
 
-    Let measure_value be proc get_measure_value from measure_expr
-    Let measure_unit be proc get_measure_unit from measure_expr
+    If t1 is equal to t2:
+        Return 1
+    End If
 
-    Note: Validate measure unit exists
-    Let unit_info be proc lookup_measure_unit with analyzer, measure_unit
-    If unit_info is equal to 0:
-        Let error_msg be proc create_string from StringCore with "Unknown unit of measure"
-        proc add_semantic_error with analyzer, error_msg
+    Let tag1 be proc type_tag with t1
+    Let tag2 be proc type_tag with t2
+
+    If tag1 is equal to TYPE_ERROR:
+        Return 1
+    End If
+    If tag2 is equal to TYPE_ERROR:
+        Return 1
+    End If
+    If tag1 is equal to TYPE_ANY:
+        Return 1
+    End If
+    If tag2 is equal to TYPE_ANY:
+        Return 1
+    End If
+    If tag1 is equal to TYPE_GENERIC:
+        Return 1
+    End If
+    If tag2 is equal to TYPE_GENERIC:
+        Return 1
+    End If
+
+    If tag1 is not equal to tag2:
+        Return 0
+    End If
+
+    If tag1 is equal to TYPE_FUNCTION:
+        Let param1 be proc memory_get_int64 from Layout with t1, 8
+        Let param2 be proc memory_get_int64 from Layout with t2, 8
+        Let ok be proc types_compatible with analyzer, param1, param2
+        If ok is equal to 0:
+            Return 0
+        End If
+        Let ret1 be proc memory_get_int64 from Layout with t1, 16
+        Let ret2 be proc memory_get_int64 from Layout with t2, 16
+        Return proc types_compatible with analyzer, ret1, ret2
+    End If
+
+    If tag1 is equal to TYPE_TUPLE:
+        Let elems1 be proc memory_get_int64 from Layout with t1, 8
+        Let elems2 be proc memory_get_int64 from Layout with t2, 8
+        Let count1 be proc list_length from List with elems1
+        Let count2 be proc list_length from List with elems2
+        If count1 is not equal to count2:
+            Return 0
+        End If
+        Let i be 0
+        While i is less than count1:
+            Let e1 be proc list_get from List with elems1, i
+            Let e2 be proc list_get from List with elems2, i
+            Set ok to proc types_compatible with analyzer, e1, e2
+            If ok is equal to 0:
+                Return 0
+            End If
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    Let is_wrapper be 0
+    If tag1 is equal to TYPE_LIST:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_ARRAY:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_OPTION:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_SEQUENCE:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_ASYNC:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_COMPUTATION:
+        Set is_wrapper to 1
+    End If
+
+    If is_wrapper is equal to 1:
+        Let inner1 be proc memory_get_int64 from Layout with t1, 8
+        Let inner2 be proc memory_get_int64 from Layout with t2, 8
+        Return proc types_compatible with analyzer, inner1, inner2
+    End If
+
+    If tag1 is equal to TYPE_RECORD:
+        Let name1 be proc memory_get_int64 from Layout with t1, 8
+        Let name2 be proc memory_get_int64 from Layout with t2, 8
+        If name1 is equal to 0:
+            Return 1
+        End If
+        If name2 is equal to 0:
+            Return 1
+        End If
+        Return proc string_equals from StringCore with name1, name2
+    End If
+
+    If tag1 is equal to TYPE_UNION:
+        Set name1 to proc memory_get_int64 from Layout with t1, 8
+        Set name2 to proc memory_get_int64 from Layout with t2, 8
+        Return proc string_equals from StringCore with name1, name2
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Predicate testing whether a value is a function type. Accepts both the
+bare TYPE_FUNCTION code (degenerate, no payload available) and composite
+function records; rejects everything else so application typing fails
+fast with a clear diagnostic.
+@End Reasoning
+
+Process called "is_function_type" takes type_info as Integer returns Integer:
+    Note: Check if a type value is a function type
+
+    Let tag be proc type_tag with type_info
+    If tag is equal to TYPE_FUNCTION:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Destructor for the parameter side of a function-type record (T1 -> T2
+stores T1 at offset 8). The bare TYPE_FUNCTION code carries no payload
+so it degrades to TYPE_ANY rather than dereferencing a non-pointer.
+@End Reasoning
+
+Process called "get_function_param_type" takes function_type as Integer returns Integer:
+    Note: Get parameter type from a function type
+
+    If function_type is less than 65536:
+        Return TYPE_ANY
+    End If
+    Let tag be proc memory_get_int64 from Layout with function_type, 0
+    If tag is not equal to TYPE_FUNCTION:
+        Return TYPE_ANY
+    End If
+    Return proc memory_get_int64 from Layout with function_type, 8
+End Process
+
+@Reasoning:
+Destructor for the return side of a function-type record (offset 16),
+with the same bare-code degradation as the parameter accessor.
+@End Reasoning
+
+Process called "get_function_return_type" takes function_type as Integer returns Integer:
+    Note: Get return type from a function type
+
+    If function_type is less than 65536:
+        Return TYPE_ANY
+    End If
+    Let tag be proc memory_get_int64 from Layout with function_type, 0
+    If tag is not equal to TYPE_FUNCTION:
+        Return TYPE_ANY
+    End If
+    Return proc memory_get_int64 from Layout with function_type, 16
+End Process
+
+@Reasoning:
+Builds the curried function type t1 -> t2 -> ... -> result from a List
+of parameter types, folding right so the chain associates exactly as F#
+applications consume it one argument at a time. An empty parameter list
+yields unit -> result (the F# thunk shape).
+@End Reasoning
+
+Process called "create_function_type" takes analyzer as Integer, param_types as Integer, return_type as Integer returns Integer:
+    Note: Create curried function type from parameter list and return type
+
+    Let count be proc list_length from List with param_types
+    If count is equal to 0:
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, TYPE_UNIT, return_type
+    End If
+
+    Let result be return_type
+    Let i be count minus 1
+    While i is greater than or equal to 0:
+        Let param be proc list_get from List with param_types, i
+        Set result to proc make_type2 with analyzer, TYPE_FUNCTION, param, result
+        Set i to i minus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+One step of application typing: applies a function type to one argument
+type and yields the result type. Free-variable callees are bound to a
+fresh param -> fresh return shape first (this is how inference learns a
+lambda parameter is itself a function), TYPE_ANY callees absorb the
+application (cross-module values), genuine function records unify the
+argument against the parameter, and everything else is the classic
+"not a function" error.
+@End Reasoning
+
+Process called "apply_function_type" takes analyzer as Integer, function_type as Integer, argument_type as Integer returns Integer:
+    Note: Apply a function type to one argument type
+
+    Let fn be proc resolve_type with analyzer, function_type
+    Let tag be proc type_tag with fn
+
+    If tag is equal to TYPE_ERROR:
         Return TYPE_ERROR
     End If
+    If tag is equal to TYPE_ANY:
+        Return TYPE_ANY
+    End If
 
-    Note: Create measured type
-    Let base_type be proc infer_expression_type with analyzer, measure_value
-    Let measured_type be proc create_measured_type with base_type, measure_unit
+    If tag is equal to TYPE_GENERIC:
+        Let fresh_param be proc fresh_type_var with analyzer
+        Let fresh_ret be proc fresh_type_var with analyzer
+        Let fn_shape be proc make_type2 with analyzer, TYPE_FUNCTION, fresh_param, fresh_ret
+        Let bound be proc unify_types with analyzer, fn, fn_shape
+        If bound is equal to 0:
+            proc add_semantic_error with analyzer, "Expression is not a function"
+            Return TYPE_ERROR
+        End If
+        Let arg_ok be proc unify_types with analyzer, argument_type, fresh_param
+        If arg_ok is equal to 0:
+            proc add_semantic_error with analyzer, "Argument type mismatch"
+            Return TYPE_ERROR
+        End If
+        Return fresh_ret
+    End If
 
-    Return measured_type
+    If tag is equal to TYPE_FUNCTION:
+        Let param be proc get_function_param_type with fn
+        Set arg_ok to proc unify_types with analyzer, argument_type, param
+        If arg_ok is equal to 0:
+            proc add_semantic_error with analyzer, "Argument type mismatch"
+            Return TYPE_ERROR
+        End If
+        Return proc get_function_return_type with fn
+    End If
+
+    proc add_semantic_error with analyzer, "Expression is not a function"
+    Return TYPE_ERROR
 End Process
 
+Note: ============================================================================
+Note: Scopes, Symbols, and Diagnostics
+Note: ============================================================================
+
 @Reasoning:
-async { ... } is a special-case computation expression backed by the
-Async builder. Its results are Async<'T> wrapping the inferred body
-type. This analyser ensures every async-context expression is properly
-elaborated (let! becomes Bind, return becomes Return) and that the
-result type is well-formed.
+Opens a new local scope frame: a fresh hashtable pushed onto
+scope_stack. Used at lambda entry, let-expression bodies, match arms,
+for-loop bodies, and computation/async bodies. The module-level
+symbol_table stays beneath the stack so locals shadow module bindings
+exactly as F# scoping requires.
 @End Reasoning
 
-Process called "analyze_async_expression" takes analyzer as Integer, async_node as Integer returns Integer:
-    Note: Analyze async expression
+Process called "push_scope" takes analyzer as Integer returns Integer:
+    Note: Push new local scope onto scope stack
 
-    @Reasoning:
-    Async expressions in F# create Async<'T> types. Validates that async
-    operations are properly structured and typed.
-    @End Reasoning
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 8
+    Let new_scope be proc hashtable_create from Dict
+    proc list_append from List with scope_stack, new_scope
 
-    Let async_body be proc get_async_body from async_node
-
-    Note: Create async context
-    proc push_async_scope from analyzer
-
-    Note: Analyze body expression
-    Let body_type be proc infer_expression_type with analyzer, async_body
-
-    Note: Pop async context
-    proc pop_scope from analyzer
-
-    Note: Wrap in Async type
-    Let async_type be proc create_async_type from body_type
-    Return async_type
+    Return 1
 End Process
 
-Note: ============================================================================
-Note: Helper Functions and Utilities
-Note: ============================================================================
+@Reasoning:
+Restores the previous scope after a nested binding region completes:
+pops and destroys the top hashtable (its symbol records remain pool-
+owned for the unused-binding sweep). Pairing push/pop is the caller's
+invariant.
+@End Reasoning
+
+Process called "pop_scope" takes analyzer as Integer returns Integer:
+    Note: Pop current local scope from scope stack
+
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 8
+    Let scope_count be proc list_length from List with scope_stack
+
+    If scope_count is greater than 0:
+        Let top_index be scope_count minus 1
+        Let scope_to_remove be proc list_get from List with scope_stack, top_index
+        proc list_remove from List with scope_stack, top_index
+        proc hashtable_destroy from Dict with scope_to_remove
+    End If
+
+    Return 1
+End Process
 
 @Reasoning:
-Walks the scope stack from innermost to outermost looking up
-symbol_name. F# permits shadowing within nested let-bindings, so inner
-scopes win. The current symbol_table is a shorthand for the top of the
-scope_stack and is checked first. Returns the type binding or 0 if
-unbound.
+The innermost binding surface: the top of scope_stack when local scopes
+are open, otherwise the module-level symbol_table. Every definition
+lands here so shadowing falls out of lookup order.
+@End Reasoning
+
+Process called "current_scope_table" takes analyzer as Integer returns Integer:
+    Note: Get the innermost scope's hashtable
+
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 8
+    Let scope_count be proc list_length from List with scope_stack
+    If scope_count is greater than 0:
+        Let top_index be scope_count minus 1
+        Return proc list_get from List with scope_stack, top_index
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 0
+End Process
+
+@Reasoning:
+Creates a symbol record (type, is_used, name, is_local) and binds it in
+the innermost scope. Local definitions (any open scope) also register in
+the definitions list for the unused-binding sweep; module-level
+definitions are exported surface and are exempt from unused analysis,
+matching the F# compiler's default warning behaviour.
+@End Reasoning
+
+Process called "define_symbol" takes analyzer as Integer, symbol_name as Integer, symbol_type as Integer returns Integer:
+    Note: Bind a name to a type in the innermost scope
+
+    If symbol_name is equal to 0:
+        Return 0
+    End If
+
+    Let symbol be proc pool_allocate with analyzer, 32
+    If symbol is equal to 0:
+        Return 0
+    End If
+
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 8
+    Let scope_count be proc list_length from List with scope_stack
+    Let is_local be 0
+    If scope_count is greater than 0:
+        Set is_local to 1
+    End If
+
+    proc memory_set_int64 from Layout with symbol, 0, symbol_type
+    proc memory_set_int64 from Layout with symbol, 8, 0   Note: is_used
+    proc memory_set_int64 from Layout with symbol, 16, symbol_name
+    proc memory_set_int64 from Layout with symbol, 24, is_local
+
+    Let scope_table be proc current_scope_table with analyzer
+    proc hashtable_set from Dict with scope_table, symbol_name, symbol
+
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    Let definitions be proc memory_get_int64 from Layout with solver, 24
+    proc list_append from List with definitions, symbol
+
+    Return symbol
+End Process
+
+@Reasoning:
+Walks the scope chain from innermost to outermost, then the module-level
+symbol_table, so shadowed names resolve to their innermost binder. Hits
+mark the symbol used (feeding the unused-binding sweep). Returns the
+symbol record or 0 when unbound.
 @End Reasoning
 
 Process called "lookup_symbol" takes analyzer as Integer, symbol_name as Integer returns Integer:
-    Note: Look up symbol in current scope chain
+    Note: Look up a symbol through the scope chain
 
-    Let symbol_table be proc memory_get_int64 from Layout with analyzer, 0
-    Let symbol_info be proc hashtable_get from Dict with symbol_table, symbol_name
-
-    If symbol_info is not equal to 0:
-        Return symbol_info
+    If symbol_name is equal to 0:
+        Return 0
     End If
 
-    Note: Search scope stack
     Let scope_stack be proc memory_get_int64 from Layout with analyzer, 8
     Let scope_count be proc list_length from List with scope_stack
     Let scope_index be scope_count minus 1
@@ -791,22 +1254,58 @@ Process called "lookup_symbol" takes analyzer as Integer, symbol_name as Integer
     While scope_index is greater than or equal to 0:
         Let scope_table be proc list_get from List with scope_stack, scope_index
         Let scope_symbol be proc hashtable_get from Dict with scope_table, symbol_name
-
         If scope_symbol is not equal to 0:
+            proc memory_set_int64 from Layout with scope_symbol, 8, 1
             Return scope_symbol
         End If
-
         Set scope_index to scope_index minus 1
     End While
+
+    Let symbol_table be proc memory_get_int64 from Layout with analyzer, 0
+    Let module_symbol be proc hashtable_get from Dict with symbol_table, symbol_name
+    If module_symbol is not equal to 0:
+        proc memory_set_int64 from Layout with module_symbol, 8, 1
+        Return module_symbol
+    End If
 
     Return 0
 End Process
 
 @Reasoning:
-Appends a diagnostic to the error_list (offset 40). Errors are fatal in
-the F# semantic model — has_semantic_errors returning true means the
-caller must not proceed to code generation. Messages are string handles
-owned by error_list (it deep-copies on append).
+Accessor hiding the symbol record layout (type lives at offset 0) from
+the inference paths.
+@End Reasoning
+
+Process called "get_symbol_type" takes symbol_info as Integer returns Integer:
+    Note: Get the bound type from a symbol record
+
+    If symbol_info is equal to 0:
+        Return TYPE_ERROR
+    End If
+    Return proc memory_get_int64 from Layout with symbol_info, 0
+End Process
+
+@Reasoning:
+Adds a pattern-introduced binding (the x in Some x) to the current
+scope with the supplied type. Shadowing rules apply automatically via
+define_symbol's innermost-scope binding.
+@End Reasoning
+
+Process called "add_pattern_variable" takes analyzer as Integer, var_name as Integer, var_type as Integer returns Integer:
+    Note: Bind a pattern variable in the current scope
+
+    Let symbol be proc define_symbol with analyzer, var_name, var_type
+    If symbol is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Appends a fatal diagnostic to the error_list (offset 40).
+has_semantic_errors returning nonzero means the driver must not proceed
+to code generation. Message strings are either static literals or
+pooled concatenations, both alive for the analyzer's lifetime.
 @End Reasoning
 
 Process called "add_semantic_error" takes analyzer as Integer, error_message as Integer returns Integer:
@@ -819,10 +1318,9 @@ Process called "add_semantic_error" takes analyzer as Integer, error_message as 
 End Process
 
 @Reasoning:
-Companion to add_semantic_error for non-fatal diagnostics (incomplete
-match, unused binding, shadowed name). Stored on warning_list (offset
-48). The driver may still proceed to code generation even if warnings
-exist.
+Companion for non-fatal diagnostics (incomplete match, redundant arm,
+unused binding). The driver may proceed to code generation when only
+warnings exist.
 @End Reasoning
 
 Process called "add_semantic_warning" takes analyzer as Integer, warning_message as Integer returns Integer:
@@ -834,294 +1332,2708 @@ Process called "add_semantic_warning" takes analyzer as Integer, warning_message
     Return 1
 End Process
 
+Note: ============================================================================
+Note: Type Names, Type Expressions, and Declaration Registration
+Note: ============================================================================
+
 @Reasoning:
-Opens a new scope frame: creates a fresh symbol_table and pushes it
-onto scope_stack. Used at lambda entry, let-binding bodies, and module
-boundaries. The previous symbol_table is preserved on the stack so
-pop_scope can restore it cleanly.
+Resolves a type name through the type environment (built-ins plus
+registered declarations). Names this single-module analysis cannot see -
+dotted .NET paths and types supplied by opened assemblies - resolve to
+TYPE_ANY because rejecting them would produce false errors on every
+interop program; TYPE_ANY then absorbs unification exactly like obj.
+Type variables ('a spellings, apostrophe lead byte) resolve to a fresh
+unification variable.
 @End Reasoning
 
-Process called "push_scope" takes analyzer as Integer returns Integer:
-    Note: Push new scope onto scope stack
+Process called "resolve_type_name" takes analyzer as Integer, type_name as Integer returns Integer:
+    Note: Resolve a type name to a type value
 
-    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 8
-    Let new_scope be proc hashtable_create from Dict
-    proc list_append from List with scope_stack, new_scope
+    If type_name is equal to 0:
+        Return TYPE_ANY
+    End If
+
+    Let first_char be proc string_char_at from StringCore with type_name, 0
+    If first_char is equal to 39:  Note: apostrophe - 'a type variable
+        Return proc fresh_type_var with analyzer
+    End If
+
+    Let type_env be proc memory_get_int64 from Layout with analyzer, 16
+    Let known be proc hashtable_get from Dict with type_env, type_name
+    If known is not equal to 0:
+        Return known
+    End If
+
+    Return TYPE_ANY
+End Process
+
+@Reasoning:
+Resolves a parsed type expression (AST_TYPE_NAME, AST_TYPE_FUNCTION,
+AST_TYPE_APPLICATION) to a type value. Generic applications map the
+well-known unary constructors (option/list/array/seq/Async and their
+prefix spellings Option/List/Array/Seq) to their dedicated composite
+shapes so inference reasons structurally about them; other constructor
+names resolve through the environment (registered abbreviations) or
+degrade to TYPE_ANY for cross-module generics.
+@End Reasoning
+
+Process called "resolve_type_expr" takes analyzer as Integer, type_node as Integer returns Integer:
+    Note: Resolve a type-expression AST node to a type value
+
+    If type_node is equal to 0:
+        Return TYPE_ANY
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with type_node, 0
+
+    If node_kind is equal to AST_TYPE_NAME from Parser:
+        Let name_token be proc memory_get_int64 from Layout with type_node, 8
+        Let type_name be proc get_token_text from Lexer with name_token
+        Return proc resolve_type_name with analyzer, type_name
+    End If
+
+    If node_kind is equal to AST_TYPE_FUNCTION from Parser:
+        Let children be proc memory_get_int64 from Layout with type_node, 16
+        Let child_count be proc memory_get_int64 from Layout with type_node, 24
+        If child_count is less than 2:
+            Return TYPE_ANY
+        End If
+        Let arg_node be proc list_get from List with children, 0
+        Let result_node be proc list_get from List with children, 1
+        Let arg_type be proc resolve_type_expr with analyzer, arg_node
+        Let result_type be proc resolve_type_expr with analyzer, result_node
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, arg_type, result_type
+    End If
+
+    If node_kind is equal to AST_TYPE_APPLICATION from Parser:
+        Set name_token to proc memory_get_int64 from Layout with type_node, 8
+        Let ctor_name be proc get_token_text from Lexer with name_token
+        Set children to proc memory_get_int64 from Layout with type_node, 16
+        Set child_count to proc memory_get_int64 from Layout with type_node, 24
+
+        Let first_arg be TYPE_ANY
+        If child_count is greater than 0:
+            Let first_node be proc list_get from List with children, 0
+            Set first_arg to proc resolve_type_expr with analyzer, first_node
+        End If
+
+        Let is_option be proc string_equals from StringCore with ctor_name, "option"
+        If is_option is equal to 0:
+            Set is_option to proc string_equals from StringCore with ctor_name, "Option"
+        End If
+        If is_option is equal to 1:
+            Return proc make_type1 with analyzer, TYPE_OPTION, first_arg
+        End If
+
+        Let is_list be proc string_equals from StringCore with ctor_name, "list"
+        If is_list is equal to 0:
+            Set is_list to proc string_equals from StringCore with ctor_name, "List"
+        End If
+        If is_list is equal to 1:
+            Return proc make_type1 with analyzer, TYPE_LIST, first_arg
+        End If
+
+        Let is_array be proc string_equals from StringCore with ctor_name, "array"
+        If is_array is equal to 0:
+            Set is_array to proc string_equals from StringCore with ctor_name, "Array"
+        End If
+        If is_array is equal to 1:
+            Return proc make_type1 with analyzer, TYPE_ARRAY, first_arg
+        End If
+
+        Let is_seq be proc string_equals from StringCore with ctor_name, "seq"
+        If is_seq is equal to 0:
+            Set is_seq to proc string_equals from StringCore with ctor_name, "Seq"
+        End If
+        If is_seq is equal to 1:
+            Return proc make_type1 with analyzer, TYPE_SEQUENCE, first_arg
+        End If
+
+        Let is_async be proc string_equals from StringCore with ctor_name, "Async"
+        If is_async is equal to 1:
+            Return proc make_type1 with analyzer, TYPE_ASYNC, first_arg
+        End If
+
+        Note: Other constructors: registered abbreviation or cross-module generic
+        Let type_env be proc memory_get_int64 from Layout with analyzer, 16
+        Let known be proc hashtable_get from Dict with type_env, ctor_name
+        If known is not equal to 0:
+            Return known
+        End If
+        Return TYPE_ANY
+    End If
+
+    Return TYPE_ANY
+End Process
+
+@Reasoning:
+Constructor descriptors live in the type environment under a "ctor:"
+prefixed key so constructor and type namespaces cannot collide. The
+24-byte descriptor carries the owning union type, the payload type, and
+the has-payload flag - everything per-use checking needs.
+@End Reasoning
+
+Process called "register_constructor" takes analyzer as Integer, ctor_name as Integer, union_type as Integer, payload_type as Integer, has_payload as Integer returns Integer:
+    Note: Register a discriminated-union constructor descriptor
+
+    Let key be proc pool_concat with analyzer, "ctor:", ctor_name
+
+    Let info be proc pool_allocate with analyzer, 24
+    If info is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with info, 0, union_type
+    proc memory_set_int64 from Layout with info, 8, payload_type
+    proc memory_set_int64 from Layout with info, 16, has_payload
+
+    Let type_env be proc memory_get_int64 from Layout with analyzer, 16
+    proc hashtable_set from Dict with type_env, key, info
 
     Return 1
 End Process
 
 @Reasoning:
-Restores the previous scope after a nested binding completes. Pops the
-top symbol_table off scope_stack and discards it (entries were local to
-that scope). Outer scope's symbol_table becomes current via the next
-peek. Pairing push/pop is the caller's invariant.
+Companion lookup over the "ctor:" namespace. The lookup key is pooled by
+pool_concat (the hashtable does not copy keys, but lookups don't store
+them either, and pooling keeps the key string alive until the analyzer
+dies, which is provably safe).
 @End Reasoning
 
-Process called "pop_scope" takes analyzer as Integer returns Integer:
-    Note: Pop current scope from scope stack
+Process called "lookup_constructor" takes analyzer as Integer, ctor_name as Integer returns Integer:
+    Note: Look up a registered constructor descriptor
 
-    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 8
-    Let scope_count be proc list_length from List with scope_stack
+    If ctor_name is equal to 0:
+        Return 0
+    End If
 
-    If scope_count is greater than 0:
-        Let scope_to_remove be proc list_get from List with scope_stack, scope_count minus 1
-        proc list_remove_at from List with scope_stack, scope_count minus 1
-        proc hashtable_destroy from Dict with scope_to_remove
+    Let key be proc pool_concat with analyzer, "ctor:", ctor_name
+    Let type_env be proc memory_get_int64 from Layout with analyzer, 16
+    Return proc hashtable_get from Dict with type_env, key
+End Process
+
+@Reasoning:
+Registers one type declaration into the environment during the structure
+pass so the declarations pass and every later inference resolve forward
+references. Record and class/interface declarations register a named
+record type (nominal identity); union declarations build the
+[TYPE_UNION, name, case-name list] record and register every case
+constructor with its resolved payload type; abbreviations register the
+resolved aliased type directly so uses see through the alias.
+@End Reasoning
+
+Process called "register_type_declaration" takes analyzer as Integer, decl_node as Integer returns Integer:
+    Note: Register a type declaration into the type environment
+
+    Let name_token be proc memory_get_int64 from Layout with decl_node, 8
+    Let type_name be proc get_token_text from Lexer with name_token
+    If type_name is equal to 0:
+        Return 0
+    End If
+
+    Let type_env be proc memory_get_int64 from Layout with analyzer, 16
+
+    Let children be proc memory_get_int64 from Layout with decl_node, 16
+    Let child_count be proc memory_get_int64 from Layout with decl_node, 24
+    If child_count is equal to 0:
+        proc hashtable_set from Dict with type_env, type_name, TYPE_ANY
+        Return 1
+    End If
+
+    Let body be proc list_get from List with children, 0
+    Let body_kind be proc memory_get_int64 from Layout with body, 0
+
+    If body_kind is equal to AST_RECORD_TYPE from Parser:
+        Let record_type be proc make_type1 with analyzer, TYPE_RECORD, type_name
+        proc hashtable_set from Dict with type_env, type_name, record_type
+        Return 1
+    End If
+
+    If body_kind is equal to AST_UNION_TYPE from Parser:
+        Let case_list be proc list_create from List
+        Let union_type be proc make_type2 with analyzer, TYPE_UNION, type_name, case_list
+
+        Let case_children be proc memory_get_int64 from Layout with body, 16
+        Let case_count be proc memory_get_int64 from Layout with body, 24
+        Let i be 0
+        While i is less than case_count:
+            Let case_node be proc list_get from List with case_children, i
+            Let case_token be proc memory_get_int64 from Layout with case_node, 8
+            Let case_name be proc get_token_text from Lexer with case_token
+            If case_name is not equal to 0:
+                proc list_append from List with case_list, case_name
+
+                Let payload_children be proc memory_get_int64 from Layout with case_node, 16
+                Let payload_count be proc memory_get_int64 from Layout with case_node, 24
+                Let payload_type be 0
+                Let has_payload be 0
+                If payload_count is greater than 0:
+                    Let payload_node be proc list_get from List with payload_children, 0
+                    Set payload_type to proc resolve_type_expr with analyzer, payload_node
+                    Set has_payload to 1
+                End If
+
+                proc register_constructor with analyzer, case_name, union_type, payload_type, has_payload
+            End If
+            Set i to i plus 1
+        End While
+
+        proc hashtable_set from Dict with type_env, type_name, union_type
+        Return 1
+    End If
+
+    If body_kind is equal to AST_CLASS_TYPE from Parser:
+        Let class_type be proc make_type1 with analyzer, TYPE_RECORD, type_name
+        proc hashtable_set from Dict with type_env, type_name, class_type
+        Return 1
+    End If
+
+    If body_kind is equal to AST_INTERFACE_TYPE from Parser:
+        Let interface_type be proc make_type1 with analyzer, TYPE_RECORD, type_name
+        proc hashtable_set from Dict with type_env, type_name, interface_type
+        Return 1
+    End If
+
+    Note: Abbreviation: the body is a type expression
+    Let aliased be proc resolve_type_expr with analyzer, body
+    proc hashtable_set from Dict with type_env, type_name, aliased
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Literal and Operator Typing
+Note: ============================================================================
+
+@Reasoning:
+Maps a literal token's lexical class to its F# type. Integer-family
+tokens (int, bigint) are TYPE_INT, byte literals TYPE_BYTE, float
+literals TYPE_FLOAT, decimal literals TYPE_DECIMAL, every string form
+(regular, verbatim, triple-quoted, byte, interpolation segments)
+TYPE_STRING, chars TYPE_CHAR, true/false TYPE_BOOL, unit TYPE_UNIT, and
+null TYPE_ANY (null inhabits reference types; obj-compatibility is the
+sound single-module reading).
+@End Reasoning
+
+Process called "literal_token_type" takes literal_token as Integer returns Integer:
+    Note: Map a literal token to its type
+
+    Let token_kind be proc get_token_type from Lexer with literal_token
+
+    If token_kind is equal to TOKEN_INTEGER from Lexer:
+        Return TYPE_INT
+    End If
+    If token_kind is equal to TOKEN_BIGINT from Lexer:
+        Return TYPE_INT
+    End If
+    If token_kind is equal to TOKEN_BYTE from Lexer:
+        Return TYPE_BYTE
+    End If
+    If token_kind is equal to TOKEN_FLOAT from Lexer:
+        Return TYPE_FLOAT
+    End If
+    If token_kind is equal to TOKEN_DECIMAL from Lexer:
+        Return TYPE_DECIMAL
+    End If
+    If token_kind is equal to TOKEN_STRING from Lexer:
+        Return TYPE_STRING
+    End If
+    If token_kind is equal to TOKEN_VERBATIM_STRING from Lexer:
+        Return TYPE_STRING
+    End If
+    If token_kind is equal to TOKEN_TRIPLE_QUOTE_STRING from Lexer:
+        Return TYPE_STRING
+    End If
+    If token_kind is equal to TOKEN_BYTE_STRING from Lexer:
+        Return TYPE_STRING
+    End If
+    If token_kind is equal to TOKEN_INTERP_STRING_START from Lexer:
+        Return TYPE_STRING
+    End If
+    If token_kind is equal to TOKEN_INTERP_STRING_MID from Lexer:
+        Return TYPE_STRING
+    End If
+    If token_kind is equal to TOKEN_CHAR from Lexer:
+        Return TYPE_CHAR
+    End If
+    If token_kind is equal to TOKEN_TRUE from Lexer:
+        Return TYPE_BOOL
+    End If
+    If token_kind is equal to TOKEN_FALSE from Lexer:
+        Return TYPE_BOOL
+    End If
+    If token_kind is equal to TOKEN_UNIT from Lexer:
+        Return TYPE_UNIT
+    End If
+    If token_kind is equal to TOKEN_NULL from Lexer:
+        Return TYPE_ANY
+    End If
+
+    Return TYPE_UNKNOWN
+End Process
+
+@Reasoning:
+The parser represents infix operators as identifier callees, so operator
+typing happens at identifier inference. Each call site receives a FRESH
+instantiation (new type variables) because F# operators are polymorphic
+per use: arithmetic and comparison operators are 'a -> 'a -> 'a and
+'a -> 'a -> bool respectively (statically-resolved member constraints
+collapse to same-type constraints in this model, which is exactly the
+constraint F# enforces on the default operator set), logical operators
+are bool-only, cons builds lists, range builds integer sequences, not
+negates bool, and ! dereferences a ref cell (modeled 'a -> 'b because
+the ref-cell type itself is opaque here). Returns 0 for non-operator
+spellings so identifier lookup proceeds.
+@End Reasoning
+
+Process called "operator_function_type" takes analyzer as Integer, op_name as Integer returns Integer:
+    Note: Build the per-use type of a built-in operator, or 0
+
+    If op_name is equal to 0:
+        Return 0
+    End If
+
+    Let is_arith be proc string_equals from StringCore with op_name, "+"
+    If is_arith is equal to 0:
+        Set is_arith to proc string_equals from StringCore with op_name, "-"
+    End If
+    If is_arith is equal to 0:
+        Set is_arith to proc string_equals from StringCore with op_name, "*"
+    End If
+    If is_arith is equal to 0:
+        Set is_arith to proc string_equals from StringCore with op_name, "/"
+    End If
+    If is_arith is equal to 0:
+        Set is_arith to proc string_equals from StringCore with op_name, "%"
+    End If
+    If is_arith is equal to 0:
+        Set is_arith to proc string_equals from StringCore with op_name, "**"
+    End If
+    If is_arith is equal to 1:
+        Let operand be proc fresh_type_var with analyzer
+        Let inner be proc make_type2 with analyzer, TYPE_FUNCTION, operand, operand
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, operand, inner
+    End If
+
+    Let is_compare be proc string_equals from StringCore with op_name, "="
+    If is_compare is equal to 0:
+        Set is_compare to proc string_equals from StringCore with op_name, "<>"
+    End If
+    If is_compare is equal to 0:
+        Set is_compare to proc string_equals from StringCore with op_name, "<"
+    End If
+    If is_compare is equal to 0:
+        Set is_compare to proc string_equals from StringCore with op_name, ">"
+    End If
+    If is_compare is equal to 0:
+        Set is_compare to proc string_equals from StringCore with op_name, "<="
+    End If
+    If is_compare is equal to 0:
+        Set is_compare to proc string_equals from StringCore with op_name, ">="
+    End If
+    If is_compare is equal to 1:
+        Set operand to proc fresh_type_var with analyzer
+        Set inner to proc make_type2 with analyzer, TYPE_FUNCTION, operand, TYPE_BOOL
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, operand, inner
+    End If
+
+    Let is_logical be proc string_equals from StringCore with op_name, "&&"
+    If is_logical is equal to 0:
+        Set is_logical to proc string_equals from StringCore with op_name, "||"
+    End If
+    If is_logical is equal to 1:
+        Set inner to proc make_type2 with analyzer, TYPE_FUNCTION, TYPE_BOOL, TYPE_BOOL
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, TYPE_BOOL, inner
+    End If
+
+    Let is_not be proc string_equals from StringCore with op_name, "not"
+    If is_not is equal to 1:
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, TYPE_BOOL, TYPE_BOOL
+    End If
+
+    Let is_cons be proc string_equals from StringCore with op_name, "::"
+    If is_cons is equal to 1:
+        Set operand to proc fresh_type_var with analyzer
+        Let list_type be proc make_type1 with analyzer, TYPE_LIST, operand
+        Set inner to proc make_type2 with analyzer, TYPE_FUNCTION, list_type, list_type
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, operand, inner
+    End If
+
+    Let is_range be proc string_equals from StringCore with op_name, ".."
+    If is_range is equal to 1:
+        Let seq_type be proc make_type1 with analyzer, TYPE_SEQUENCE, TYPE_INT
+        Set inner to proc make_type2 with analyzer, TYPE_FUNCTION, TYPE_INT, seq_type
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, TYPE_INT, inner
+    End If
+
+    Let is_deref be proc string_equals from StringCore with op_name, "!"
+    If is_deref is equal to 1:
+        Let cell be proc fresh_type_var with analyzer
+        Let content be proc fresh_type_var with analyzer
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, cell, content
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Builds the per-use type of the built-in polymorphic constructors used as
+values: Some is 'a -> 'a option, None is 'a option, Ok and Error build a
+fresh Result-named union (per-use freshness gives the polymorphism;
+same-named unions unify so Ok and Error meet in one match). Returns 0
+for other names so the caller proceeds to declared-constructor and
+symbol lookup.
+@End Reasoning
+
+Process called "builtin_constructor_type" takes analyzer as Integer, ctor_name as Integer returns Integer:
+    Note: Build the per-use type of a built-in constructor, or 0
+
+    Let is_some be proc string_equals from StringCore with ctor_name, "Some"
+    If is_some is equal to 1:
+        Let elem be proc fresh_type_var with analyzer
+        Let option_type be proc make_type1 with analyzer, TYPE_OPTION, elem
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, elem, option_type
+    End If
+
+    Let is_none be proc string_equals from StringCore with ctor_name, "None"
+    If is_none is equal to 1:
+        Set elem to proc fresh_type_var with analyzer
+        Return proc make_type1 with analyzer, TYPE_OPTION, elem
+    End If
+
+    Let is_ok be proc string_equals from StringCore with ctor_name, "Ok"
+    Let is_err be proc string_equals from StringCore with ctor_name, "Error"
+    If is_ok is equal to 1:
+        Let result_cases be proc list_create from List
+        proc list_append from List with result_cases, "Ok"
+        proc list_append from List with result_cases, "Error"
+        Let result_union be proc make_type2 with analyzer, TYPE_UNION, "Result", result_cases
+        Set elem to proc fresh_type_var with analyzer
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, elem, result_union
+    End If
+    If is_err is equal to 1:
+        Set result_cases to proc list_create from List
+        proc list_append from List with result_cases, "Ok"
+        proc list_append from List with result_cases, "Error"
+        Set result_union to proc make_type2 with analyzer, TYPE_UNION, "Result", result_cases
+        Set elem to proc fresh_type_var with analyzer
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, elem, result_union
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Expression Type Inference
+Note: ============================================================================
+
+@Reasoning:
+Resolves a bare identifier in priority order: built-in operator
+spellings (the parser routes infix operators here as identifier
+callees), built-in polymorphic constructors, declared union constructors
+(payload constructors type as payload -> union, nullary ones as the
+union itself), the scope chain, and finally dotted cross-module paths
+(List.map, System.Math.Sqrt) which type as fresh variables because their
+signatures live outside this compilation unit. Only a plain undotted
+name that none of those resolve is a genuine "Undefined variable" error
+- the same partition the F# checker applies given one file.
+@End Reasoning
+
+Process called "infer_identifier_type" takes analyzer as Integer, identifier_node as Integer returns Integer:
+    Note: Infer type of an identifier reference
+
+    Let name_token be proc memory_get_int64 from Layout with identifier_node, 8
+    Let identifier_name be proc get_token_text from Lexer with name_token
+    If identifier_name is equal to 0:
+        Return TYPE_ERROR
+    End If
+
+    Let op_type be proc operator_function_type with analyzer, identifier_name
+    If op_type is not equal to 0:
+        Return op_type
+    End If
+
+    Let builtin_ctor be proc builtin_constructor_type with analyzer, identifier_name
+    If builtin_ctor is not equal to 0:
+        Return builtin_ctor
+    End If
+
+    Let ctor_info be proc lookup_constructor with analyzer, identifier_name
+    If ctor_info is not equal to 0:
+        Let union_type be proc memory_get_int64 from Layout with ctor_info, 0
+        Let has_payload be proc memory_get_int64 from Layout with ctor_info, 16
+        If has_payload is equal to 1:
+            Let payload_type be proc memory_get_int64 from Layout with ctor_info, 8
+            Return proc make_type2 with analyzer, TYPE_FUNCTION, payload_type, union_type
+        End If
+        Return union_type
+    End If
+
+    Let symbol_info be proc lookup_symbol with analyzer, identifier_name
+    If symbol_info is not equal to 0:
+        Return proc get_symbol_type with symbol_info
+    End If
+
+    Let is_dotted be proc string_contains from StringUtils with identifier_name, "."
+    If is_dotted is equal to 1:
+        Return proc fresh_type_var with analyzer
+    End If
+
+    Let message be proc pool_concat with analyzer, "Undefined variable: ", identifier_name
+    proc add_semantic_error with analyzer, message
+    Return TYPE_ERROR
+End Process
+
+@Reasoning:
+Application typing over the parser's flattened call shape: child 0 is
+the callee (an operator identifier for infix uses), children 1..n are
+the arguments in order. Each argument applies one currying step through
+apply_function_type, which also teaches free-variable callees their
+function shape - so higher-order lambda parameters get usable types from
+their first application.
+@End Reasoning
+
+Process called "infer_application_type" takes analyzer as Integer, app_node as Integer returns Integer:
+    Note: Infer type of a function application
+
+    Let children be proc memory_get_int64 from Layout with app_node, 16
+    Let child_count be proc memory_get_int64 from Layout with app_node, 24
+    If child_count is less than 2:
+        proc add_semantic_error with analyzer, "Function application requires a callee and an argument"
+        Return TYPE_ERROR
+    End If
+
+    Let function_node be proc list_get from List with children, 0
+    Let result_type be proc infer_expression_type with analyzer, function_node
+
+    Let i be 1
+    While i is less than child_count:
+        Let arg_node be proc list_get from List with children, i
+        Let arg_type be proc infer_expression_type with analyzer, arg_node
+        Set result_type to proc apply_function_type with analyzer, result_type, arg_type
+        Set i to i plus 1
+    End While
+
+    Return result_type
+End Process
+
+@Reasoning:
+Introduces each lambda parameter into the already-pushed scope with a
+fresh type variable (or the annotated type when the pattern carries one
+in its metadata slot) and returns the parameter types in order for
+create_function_type to fold. Destructuring parameters bind all their
+variables through validate_pattern.
+@End Reasoning
+
+Process called "process_lambda_parameters" takes analyzer as Integer, parameter_list as Integer returns Integer:
+    Note: Bind lambda parameters and return their types in order
+
+    Let param_types be proc list_create from List
+
+    Let count be proc list_length from List with parameter_list
+    Let i be 0
+    While i is less than count:
+        Let param_node be proc list_get from List with parameter_list, i
+        Let param_type be proc fresh_type_var with analyzer
+
+        Let anno be proc memory_get_int64 from Layout with param_node, 40
+        If anno is not equal to 0:
+            Let declared be proc resolve_type_expr with analyzer, anno
+            proc unify_types with analyzer, param_type, declared
+        End If
+
+        proc validate_pattern with analyzer, param_node, param_type
+        proc list_append from List with param_types, param_type
+        Set i to i plus 1
+    End While
+
+    Return param_types
+End Process
+
+@Reasoning:
+Lambda typing over the parser shape (children = parameter patterns then
+body last): push a scope, bind parameters with fresh/annotated types,
+infer the body in the extended environment, pop, and fold the curried
+function type. Parameterless `fun -> e` degenerates to unit -> e via
+create_function_type's empty-list rule.
+@End Reasoning
+
+Process called "infer_lambda_type" takes analyzer as Integer, lambda_node as Integer returns Integer:
+    Note: Infer type of a lambda expression
+
+    Let children be proc memory_get_int64 from Layout with lambda_node, 16
+    Let child_count be proc memory_get_int64 from Layout with lambda_node, 24
+    If child_count is less than 1:
+        proc add_semantic_error with analyzer, "Lambda expression requires a body"
+        Return TYPE_ERROR
+    End If
+
+    Let body_index be child_count minus 1
+    Let parameter_list be proc list_create from List
+    Let i be 0
+    While i is less than body_index:
+        Let param_node be proc list_get from List with children, i
+        proc list_append from List with parameter_list, param_node
+        Set i to i plus 1
+    End While
+
+    proc push_scope with analyzer
+
+    Let param_types be proc process_lambda_parameters with analyzer, parameter_list
+
+    Let body_node be proc list_get from List with children, body_index
+    Let body_type be proc infer_expression_type with analyzer, body_node
+
+    proc pop_scope with analyzer
+
+    Let function_type be proc create_function_type with analyzer, param_types, body_type
+
+    proc list_destroy from List with parameter_list
+    proc list_destroy from List with param_types
+
+    Return function_type
+End Process
+
+@Reasoning:
+Analyzes one let binding (children [pattern, expression], metadata slot
+= optional return-type annotation, value slot = TOKEN_REC tag when
+recursive). Recursive bindings pre-bind the pattern against a fresh
+variable so the body sees itself, then unify the inferred body type back
+into that variable; non-recursive bindings infer first and bind after,
+giving correct shadowing. Function bindings (body is a lambda) check the
+annotation against the lambda's final return type by walking one
+function-arrow step per parameter; value bindings check it against the
+whole type.
+@End Reasoning
+
+Process called "analyze_let_binding_declaration" takes analyzer as Integer, binding_node as Integer returns Integer:
+    Note: Analyze one let binding and bind its pattern
+
+    Let children be proc memory_get_int64 from Layout with binding_node, 16
+    Let child_count be proc memory_get_int64 from Layout with binding_node, 24
+    If child_count is less than 2:
+        proc add_semantic_error with analyzer, "Let binding requires a pattern and an expression"
+        Return TYPE_ERROR
+    End If
+
+    Let pattern_node be proc list_get from List with children, 0
+    Let expr_node be proc list_get from List with children, 1
+
+    Let rec_flag be proc memory_get_int64 from Layout with binding_node, 8
+    Let expr_type be 0
+
+    If rec_flag is equal to TOKEN_REC from Lexer:
+        Let self_type be proc fresh_type_var with analyzer
+        proc validate_pattern with analyzer, pattern_node, self_type
+        Set expr_type to proc infer_expression_type with analyzer, expr_node
+        Let rec_ok be proc unify_types with analyzer, self_type, expr_type
+        If rec_ok is equal to 0:
+            proc add_semantic_error with analyzer, "Recursive binding body disagrees with its own type"
+        End If
+    Otherwise:
+        Set expr_type to proc infer_expression_type with analyzer, expr_node
+        proc validate_pattern with analyzer, pattern_node, expr_type
+    End If
+
+    Let anno be proc memory_get_int64 from Layout with binding_node, 40
+    If anno is not equal to 0:
+        Let declared be proc resolve_type_expr with analyzer, anno
+
+        Let expr_kind be proc memory_get_int64 from Layout with expr_node, 0
+        If expr_kind is equal to AST_LAMBDA from Parser:
+            Note: The annotation is the function's return type: walk one
+            Note: arrow per parameter to reach it
+            Let lambda_count be proc memory_get_int64 from Layout with expr_node, 24
+            Let param_count be lambda_count minus 1
+            Let walk_type be expr_type
+            Let p be 0
+            While p is less than param_count:
+                Let resolved be proc resolve_type with analyzer, walk_type
+                Set walk_type to proc get_function_return_type with resolved
+                Set p to p plus 1
+            End While
+            Let anno_ok be proc unify_types with analyzer, walk_type, declared
+            If anno_ok is equal to 0:
+                proc add_semantic_error with analyzer, "Binding does not match its declared return type"
+            End If
+        Otherwise:
+            Set anno_ok to proc unify_types with analyzer, expr_type, declared
+            If anno_ok is equal to 0:
+                proc add_semantic_error with analyzer, "Binding does not match its declared type"
+            End If
+        End If
+    End If
+
+    Return expr_type
+End Process
+
+@Reasoning:
+let-expression typing (children = one or more AST_LET_BINDING nodes from
+the and-chain, then an optional trailing body expression from `in`).
+Opens a scope so the bindings are local, analyzes each binding, infers
+the body in the extended environment, and yields the body type (unit
+when no `in` body exists - the statement form).
+@End Reasoning
+
+Process called "infer_let_type" takes analyzer as Integer, let_node as Integer returns Integer:
+    Note: Infer type of a let expression
+
+    Let children be proc memory_get_int64 from Layout with let_node, 16
+    Let child_count be proc memory_get_int64 from Layout with let_node, 24
+
+    proc push_scope with analyzer
+
+    Let result_type be TYPE_UNIT
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc memory_get_int64 from Layout with child, 0
+        If child_kind is equal to AST_LET_BINDING from Parser:
+            proc analyze_let_binding_declaration with analyzer, child
+        Otherwise:
+            Set result_type to proc infer_expression_type with analyzer, child
+        End If
+        Set i to i plus 1
+    End While
+
+    proc pop_scope with analyzer
+    Return result_type
+End Process
+
+@Reasoning:
+if/elif/else typing: the condition must be bool; with an else (or elif)
+branch present both branches unify and the join is the expression's
+type; without one the then-branch is statement-positioned and the whole
+expression is unit (F# additionally requires the then-branch to BE unit
+in that form, so the then type unifies against unit and a mismatch is
+reported).
+@End Reasoning
+
+Process called "infer_if_type" takes analyzer as Integer, if_node as Integer returns Integer:
+    Note: Infer type of an if expression
+
+    Let children be proc memory_get_int64 from Layout with if_node, 16
+    Let child_count be proc memory_get_int64 from Layout with if_node, 24
+    If child_count is less than 2:
+        proc add_semantic_error with analyzer, "If expression requires a condition and a then branch"
+        Return TYPE_ERROR
+    End If
+
+    Let condition_node be proc list_get from List with children, 0
+    Let condition_type be proc infer_expression_type with analyzer, condition_node
+    Let cond_ok be proc unify_types with analyzer, condition_type, TYPE_BOOL
+    If cond_ok is equal to 0:
+        proc add_semantic_error with analyzer, "If condition must have type bool"
+    End If
+
+    Let then_node be proc list_get from List with children, 1
+    Let then_type be proc infer_expression_type with analyzer, then_node
+
+    If child_count is greater than 2:
+        Let else_node be proc list_get from List with children, 2
+        Let else_type be proc infer_expression_type with analyzer, else_node
+        Let branch_ok be proc unify_types with analyzer, then_type, else_type
+        If branch_ok is equal to 0:
+            proc add_semantic_error with analyzer, "Branches of an if expression must have the same type"
+            Return TYPE_ERROR
+        End If
+        Return then_type
+    End If
+
+    Let unit_ok be proc unify_types with analyzer, then_type, TYPE_UNIT
+    If unit_ok is equal to 0:
+        proc add_semantic_error with analyzer, "If expression without else must produce unit"
+    End If
+    Return TYPE_UNIT
+End Process
+
+@Reasoning:
+Records a match expression with its scrutinee type in the solver's
+registry. Exhaustiveness runs late (validate_pattern_completeness) so
+the scrutinee's type variables have absorbed every constraint the rest
+of the program provides before coverage is judged.
+@End Reasoning
+
+Process called "register_match_expression" takes analyzer as Integer, match_node as Integer, scrutinee_type as Integer returns Integer:
+    Note: Register a match expression for the late completeness pass
+
+    Let pair be proc pool_allocate with analyzer, 16
+    If pair is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with pair, 0, match_node
+    proc memory_set_int64 from Layout with pair, 8, scrutinee_type
+
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    Let match_registry be proc memory_get_int64 from Layout with solver, 16
+    proc list_append from List with match_registry, pair
+
+    Return 1
+End Process
+
+@Reasoning:
+For each case container (AST_PATTERN_GUARD holding [pattern, body],
+where the pattern may itself be guard-wrapped): open a scope, validate
+the pattern against the scrutinee type (binding its variables), type a
+wrapped guard against bool, infer the body, close the scope, and collect
+the body type for the join.
+@End Reasoning
+
+Process called "infer_case_types" takes analyzer as Integer, match_node as Integer, scrutinee_type as Integer returns Integer:
+    Note: Infer the result types of every match case
+
+    Let case_types be proc list_create from List
+
+    Let children be proc memory_get_int64 from Layout with match_node, 16
+    Let child_count be proc memory_get_int64 from Layout with match_node, 24
+
+    Let i be 1
+    While i is less than child_count:
+        Let case_node be proc list_get from List with children, i
+        Let case_children be proc memory_get_int64 from Layout with case_node, 16
+        Let case_child_count be proc memory_get_int64 from Layout with case_node, 24
+
+        If case_child_count is greater than 1:
+            proc push_scope with analyzer
+
+            Let pattern_node be proc list_get from List with case_children, 0
+            proc validate_pattern with analyzer, pattern_node, scrutinee_type
+
+            Let body_node be proc list_get from List with case_children, 1
+            Let body_type be proc infer_expression_type with analyzer, body_node
+            proc list_append from List with case_types, body_type
+
+            proc pop_scope with analyzer
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return case_types
+End Process
+
+@Reasoning:
+Computes the join of all case result types by successive unification:
+every match arm must produce the same type. Failure reports once and
+yields TYPE_ERROR so downstream inference continues. The empty list
+(degenerate match) is unit.
+@End Reasoning
+
+Process called "find_common_type" takes analyzer as Integer, type_list as Integer returns Integer:
+    Note: Join a list of branch types via unification
+
+    Let count be proc list_length from List with type_list
+    If count is equal to 0:
+        Return TYPE_UNIT
+    End If
+
+    Let result_type be proc list_get from List with type_list, 0
+    Let i be 1
+    While i is less than count:
+        Let next_type be proc list_get from List with type_list, i
+        Let ok be proc unify_types with analyzer, result_type, next_type
+        If ok is equal to 0:
+            proc add_semantic_error with analyzer, "All branches of a match expression must have the same type"
+            Return TYPE_ERROR
+        End If
+        Set i to i plus 1
+    End While
+
+    Return result_type
+End Process
+
+@Reasoning:
+Match typing: infer the scrutinee, register the node for late
+exhaustiveness analysis, type every case against the scrutinee, and join
+the case results.
+@End Reasoning
+
+Process called "infer_match_type" takes analyzer as Integer, match_node as Integer returns Integer:
+    Note: Infer type of a match expression
+
+    Let children be proc memory_get_int64 from Layout with match_node, 16
+    Let child_count be proc memory_get_int64 from Layout with match_node, 24
+    If child_count is less than 2:
+        proc add_semantic_error with analyzer, "Match expression requires a scrutinee and at least one case"
+        Return TYPE_ERROR
+    End If
+
+    Let scrutinee_node be proc list_get from List with children, 0
+    Let scrutinee_type be proc infer_expression_type with analyzer, scrutinee_node
+
+    proc register_match_expression with analyzer, match_node, scrutinee_type
+
+    Let case_types be proc infer_case_types with analyzer, match_node, scrutinee_type
+    Let result_type be proc find_common_type with analyzer, case_types
+    proc list_destroy from List with case_types
+
+    Return result_type
+End Process
+
+@Reasoning:
+Tuple typing: infer each component and build the product. Components are
+collected into a pooled-record-referencing List that the tuple type
+record owns for the analyzer's lifetime.
+@End Reasoning
+
+Process called "infer_tuple_type" takes analyzer as Integer, tuple_node as Integer returns Integer:
+    Note: Infer type of a tuple expression
+
+    Let elem_types be proc list_create from List
+
+    Let children be proc memory_get_int64 from Layout with tuple_node, 16
+    Let child_count be proc memory_get_int64 from Layout with tuple_node, 24
+    Let i be 0
+    While i is less than child_count:
+        Let elem_node be proc list_get from List with children, i
+        Let elem_type be proc infer_expression_type with analyzer, elem_node
+        proc list_append from List with elem_types, elem_type
+        Set i to i plus 1
+    End While
+
+    Return proc make_type1 with analyzer, TYPE_TUPLE, elem_types
+End Process
+
+@Reasoning:
+Homogeneous-collection typing shared by lists and arrays: every element
+unifies with the first (mismatches report once per offending element);
+the element type of an empty literal is a fresh variable that later
+usage constrains.
+@End Reasoning
+
+Process called "infer_collection_type" takes analyzer as Integer, coll_node as Integer, type_tag_value as Integer returns Integer:
+    Note: Infer type of a homogeneous collection literal
+
+    Let children be proc memory_get_int64 from Layout with coll_node, 16
+    Let child_count be proc memory_get_int64 from Layout with coll_node, 24
+
+    Let elem_type be proc fresh_type_var with analyzer
+    Let i be 0
+    While i is less than child_count:
+        Let elem_node be proc list_get from List with children, i
+        Let this_type be proc infer_expression_type with analyzer, elem_node
+        Let ok be proc unify_types with analyzer, elem_type, this_type
+        If ok is equal to 0:
+            proc add_semantic_error with analyzer, "All elements of a collection must have the same type"
+        End If
+        Set i to i plus 1
+    End While
+
+    Return proc make_type1 with analyzer, type_tag_value, elem_type
+End Process
+
+Process called "infer_list_type" takes analyzer as Integer, list_node as Integer returns Integer:
+    Note: Infer type of a list literal
+    Return proc infer_collection_type with analyzer, list_node, TYPE_LIST
+End Process
+
+Process called "infer_array_type" takes analyzer as Integer, array_node as Integer returns Integer:
+    Note: Infer type of an array literal
+    Return proc infer_collection_type with analyzer, array_node, TYPE_ARRAY
+End Process
+
+@Reasoning:
+Record-expression typing over the parser shape (each field child is an
+AST_LET_BINDING whose value slot holds the field-name token and whose
+single child is the field's value expression): infers every field value
+and reports duplicate field names - the structural error decidable
+without nominal field tables. The result is an anonymous record type
+(name 0) that unifies with any named record, because F# resolves the
+nominal record from field names across modules this analysis cannot see.
+@End Reasoning
+
+Process called "infer_record_type" takes analyzer as Integer, record_node as Integer returns Integer:
+    Note: Infer type of a record expression
+
+    Let seen_names be proc list_create from List
+
+    Let children be proc memory_get_int64 from Layout with record_node, 16
+    Let child_count be proc memory_get_int64 from Layout with record_node, 24
+    Let i be 0
+    While i is less than child_count:
+        Let field_node be proc list_get from List with children, i
+
+        Let field_token be proc memory_get_int64 from Layout with field_node, 8
+        Let field_name be proc get_token_text from Lexer with field_token
+        If field_name is not equal to 0:
+            Let seen_count be proc list_length from List with seen_names
+            Let s be 0
+            While s is less than seen_count:
+                Let prior be proc list_get from List with seen_names, s
+                Let same be proc string_equals from StringCore with prior, field_name
+                If same is equal to 1:
+                    Let message be proc pool_concat with analyzer, "Duplicate record field: ", field_name
+                    proc add_semantic_error with analyzer, message
+                End If
+                Set s to s plus 1
+            End While
+            proc list_append from List with seen_names, field_name
+        End If
+
+        Let field_children be proc memory_get_int64 from Layout with field_node, 16
+        Let field_child_count be proc memory_get_int64 from Layout with field_node, 24
+        If field_child_count is greater than 0:
+            Let value_node be proc list_get from List with field_children, 0
+            proc infer_expression_type with analyzer, value_node
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc list_destroy from List with seen_names
+    Return proc make_type1 with analyzer, TYPE_RECORD, 0
+End Process
+
+@Reasoning:
+Sequence-expression typing: every child is evaluated for effect except
+the last, whose type is the sequence's value. Empty sequences are unit.
+@End Reasoning
+
+Process called "infer_sequence_type" takes analyzer as Integer, seq_node as Integer returns Integer:
+    Note: Infer type of a sequence expression
+
+    Let children be proc memory_get_int64 from Layout with seq_node, 16
+    Let child_count be proc memory_get_int64 from Layout with seq_node, 24
+
+    Let result_type be TYPE_UNIT
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Set result_type to proc infer_expression_type with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Return result_type
+End Process
+
+@Reasoning:
+try/with/finally typing over the parser shape (child 0 = protected body,
+AST_PATTERN_GUARD children = handler arms, trailing non-guard child =
+finally expression): every handler body unifies with the protected
+body's type because either path produces the expression's value; handler
+patterns bind in their own scope against TYPE_ANY (the exception value -
+System.Exception-derived, outside this module's type knowledge); the
+finally expression is effect-positioned.
+@End Reasoning
+
+Process called "infer_try_type" takes analyzer as Integer, try_node as Integer returns Integer:
+    Note: Infer type of a try expression
+
+    Let children be proc memory_get_int64 from Layout with try_node, 16
+    Let child_count be proc memory_get_int64 from Layout with try_node, 24
+    If child_count is less than 1:
+        proc add_semantic_error with analyzer, "Try expression requires a body"
+        Return TYPE_ERROR
+    End If
+
+    Let body_node be proc list_get from List with children, 0
+    Let body_type be proc infer_expression_type with analyzer, body_node
+
+    Let i be 1
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc memory_get_int64 from Layout with child, 0
+
+        If child_kind is equal to AST_PATTERN_GUARD from Parser:
+            Let handler_children be proc memory_get_int64 from Layout with child, 16
+            Let handler_count be proc memory_get_int64 from Layout with child, 24
+            If handler_count is greater than 1:
+                proc push_scope with analyzer
+
+                Let pattern_node be proc list_get from List with handler_children, 0
+                proc validate_pattern with analyzer, pattern_node, TYPE_ANY
+
+                Let handler_body be proc list_get from List with handler_children, 1
+                Let handler_type be proc infer_expression_type with analyzer, handler_body
+                Let ok be proc unify_types with analyzer, body_type, handler_type
+                If ok is equal to 0:
+                    proc add_semantic_error with analyzer, "Exception handler must have the same type as the try body"
+                End If
+
+                proc pop_scope with analyzer
+            End If
+        Otherwise:
+            proc infer_expression_type with analyzer, child
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return body_type
+End Process
+
+@Reasoning:
+while-loop typing: the condition must be bool and the loop produces
+unit. The body is inferred for nested diagnostics.
+@End Reasoning
+
+Process called "infer_while_type" takes analyzer as Integer, while_node as Integer returns Integer:
+    Note: Infer type of a while expression
+
+    Let children be proc memory_get_int64 from Layout with while_node, 16
+    Let child_count be proc memory_get_int64 from Layout with while_node, 24
+    If child_count is less than 2:
+        proc add_semantic_error with analyzer, "While expression requires a condition and a body"
+        Return TYPE_ERROR
+    End If
+
+    Let condition_node be proc list_get from List with children, 0
+    Let condition_type be proc infer_expression_type with analyzer, condition_node
+    Let cond_ok be proc unify_types with analyzer, condition_type, TYPE_BOOL
+    If cond_ok is equal to 0:
+        proc add_semantic_error with analyzer, "While condition must have type bool"
+    End If
+
+    Let body_node be proc list_get from List with children, 1
+    proc infer_expression_type with analyzer, body_node
+
+    Return TYPE_UNIT
+End Process
+
+@Reasoning:
+for-loop typing over the parser shape (children [iteration variable
+pattern, iterable, body]): the loop variable binds in a fresh scope; an
+iterable that is a known sequence shape (list/array/seq) constrains the
+variable to its element type, an integer range (the range operator
+produces int seq) constrains it to int, and anything else leaves the
+variable free. For loops produce unit.
+@End Reasoning
+
+Process called "infer_for_type" takes analyzer as Integer, for_node as Integer returns Integer:
+    Note: Infer type of a for expression
+
+    Let children be proc memory_get_int64 from Layout with for_node, 16
+    Let child_count be proc memory_get_int64 from Layout with for_node, 24
+    If child_count is less than 3:
+        proc add_semantic_error with analyzer, "For expression requires a variable, an iterable, and a body"
+        Return TYPE_ERROR
+    End If
+
+    Let iterable_node be proc list_get from List with children, 1
+    Let iterable_type be proc infer_expression_type with analyzer, iterable_node
+
+    Let elem_type be proc fresh_type_var with analyzer
+    Let resolved be proc resolve_type with analyzer, iterable_type
+    Let tag be proc type_tag with resolved
+
+    Let is_sequence_shape be 0
+    If tag is equal to TYPE_LIST:
+        Set is_sequence_shape to 1
+    End If
+    If tag is equal to TYPE_ARRAY:
+        Set is_sequence_shape to 1
+    End If
+    If tag is equal to TYPE_SEQUENCE:
+        Set is_sequence_shape to 1
+    End If
+
+    If is_sequence_shape is equal to 1:
+        Let inner be proc memory_get_int64 from Layout with resolved, 8
+        proc unify_types with analyzer, elem_type, inner
+    End If
+    If tag is equal to TYPE_INT:
+        Note: for i = a to b iterates integers
+        proc unify_types with analyzer, elem_type, TYPE_INT
+    End If
+
+    proc push_scope with analyzer
+
+    Let var_node be proc list_get from List with children, 0
+    proc validate_pattern with analyzer, var_node, elem_type
+
+    Let body_node be proc list_get from List with children, 2
+    proc infer_expression_type with analyzer, body_node
+
+    proc pop_scope with analyzer
+
+    Return TYPE_UNIT
+End Process
+
+@Reasoning:
+Pipe typing over the parser shape (value slot = pipe operator's token
+TYPE TAG, children [left, right]): x |> f applies f to x, f <| x applies
+f to x. Both reduce to one apply_function_type step, so pipes get the
+same inference quality as direct application.
+@End Reasoning
+
+Process called "infer_pipe_type" takes analyzer as Integer, pipe_node as Integer returns Integer:
+    Note: Infer type of a pipeline expression
+
+    Let children be proc memory_get_int64 from Layout with pipe_node, 16
+    Let child_count be proc memory_get_int64 from Layout with pipe_node, 24
+    If child_count is less than 2:
+        proc add_semantic_error with analyzer, "Pipeline requires two operands"
+        Return TYPE_ERROR
+    End If
+
+    Let left_node be proc list_get from List with children, 0
+    Let right_node be proc list_get from List with children, 1
+    Let left_type be proc infer_expression_type with analyzer, left_node
+    Let right_type be proc infer_expression_type with analyzer, right_node
+
+    Let operator be proc memory_get_int64 from Layout with pipe_node, 8
+    If operator is equal to TOKEN_PIPE_RIGHT from Lexer:
+        Return proc apply_function_type with analyzer, right_type, left_type
+    End If
+    If operator is equal to TOKEN_PIPE_LEFT from Lexer:
+        Return proc apply_function_type with analyzer, left_type, right_type
+    End If
+
+    proc add_semantic_error with analyzer, "Unknown pipeline operator"
+    Return TYPE_ERROR
+End Process
+
+@Reasoning:
+Interpolated strings type as string. Hole expressions are inferred for
+their own diagnostics but accept any type (F# formats holes through %O /
+ToString), and literal segment children are string by construction.
+@End Reasoning
+
+Process called "infer_interpolated_type" takes analyzer as Integer, interp_node as Integer returns Integer:
+    Note: Infer type of an interpolated string
+
+    Let children be proc memory_get_int64 from Layout with interp_node, 16
+    Let child_count be proc memory_get_int64 from Layout with interp_node, 24
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        proc infer_expression_type with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Return TYPE_STRING
+End Process
+
+Note: ============================================================================
+Note: Computation, Async, and Measure Analysis
+Note: ============================================================================
+
+@Reasoning:
+Builder-method admissibility for the AST_COMPUTATION_EXPRESSION shape
+(children [builder, body]). A primitive-typed builder can never carry
+Bind/Return members, so primitives are rejected outright; the known
+monadic shapes (async/seq/computation) are accepted; record-typed,
+obj-typed, and free-variable builders are accepted because member
+verification for them requires .NET metadata that a source-level
+translation frontend does not possess - this check rejects exactly what
+is provably wrong from source alone.
+@End Reasoning
+
+Process called "builder_has_method" takes analyzer as Integer, builder_type as Integer, method_name as Integer returns Integer:
+    Note: Decide whether a builder type can carry the named method
+
+    Let resolved be proc resolve_type with analyzer, builder_type
+    Let tag be proc type_tag with resolved
+
+    Let is_primitive be 0
+    If tag is equal to TYPE_INT:
+        Set is_primitive to 1
+    End If
+    If tag is equal to TYPE_FLOAT:
+        Set is_primitive to 1
+    End If
+    If tag is equal to TYPE_STRING:
+        Set is_primitive to 1
+    End If
+    If tag is equal to TYPE_BOOL:
+        Set is_primitive to 1
+    End If
+    If tag is equal to TYPE_CHAR:
+        Set is_primitive to 1
+    End If
+    If tag is equal to TYPE_UNIT:
+        Set is_primitive to 1
+    End If
+    If tag is equal to TYPE_BYTE:
+        Set is_primitive to 1
+    End If
+    If tag is equal to TYPE_DECIMAL:
+        Set is_primitive to 1
+    End If
+
+    If is_primitive is equal to 1:
+        Return 0
     End If
 
     Return 1
 End Process
 
+@Reasoning:
+Computation bodies open their own scope (let! / use! bindings are local
+to the builder body); the builder context needs no extra analyzer state
+because builder-specific typing happens at the builder_has_method gate.
+@End Reasoning
+
+Process called "push_computation_scope" takes analyzer as Integer, builder_type as Integer returns Integer:
+    Note: Open the computation-expression body scope
+    Return proc push_scope with analyzer
+End Process
+
+Process called "analyze_computation_body" takes analyzer as Integer, body_node as Integer returns Integer:
+    Note: Infer the type of a computation-expression body
+    Return proc infer_expression_type with analyzer, body_node
+End Process
+
+@Reasoning:
+Computation expressions (builder { body }) validate that the builder can
+carry Bind and Return, then type the body in its own scope and wrap the
+result in the computation shape so consumers see M<T> rather than T.
+@End Reasoning
+
+Process called "analyze_computation_expression" takes analyzer as Integer, comp_node as Integer returns Integer:
+    Note: Analyze a computation expression
+
+    Let children be proc memory_get_int64 from Layout with comp_node, 16
+    Let child_count be proc memory_get_int64 from Layout with comp_node, 24
+    If child_count is less than 2:
+        proc add_semantic_error with analyzer, "Computation expression requires a builder and a body"
+        Return TYPE_ERROR
+    End If
+
+    Let builder_node be proc list_get from List with children, 0
+    Let builder_type be proc infer_expression_type with analyzer, builder_node
+
+    Let has_bind be proc builder_has_method with analyzer, builder_type, "Bind"
+    If has_bind is equal to 0:
+        proc add_semantic_error with analyzer, "Computation builder cannot carry a Bind method"
+    End If
+    Let has_return be proc builder_has_method with analyzer, builder_type, "Return"
+    If has_return is equal to 0:
+        proc add_semantic_error with analyzer, "Computation builder cannot carry a Return method"
+    End If
+
+    proc push_computation_scope with analyzer, builder_type
+
+    Let body_node be proc list_get from List with children, 1
+    Let body_type be proc analyze_computation_body with analyzer, body_node
+
+    proc pop_scope with analyzer
+
+    Return proc make_type1 with analyzer, TYPE_COMPUTATION, body_type
+End Process
+
+@Reasoning:
+Async expressions are the Async-builder special case: the body types in
+its own scope and the result wraps as Async<'T>.
+@End Reasoning
+
+Process called "get_async_body" takes async_node as Integer returns Integer:
+    Note: Get the body expression of an async node
+
+    Let children be proc memory_get_int64 from Layout with async_node, 16
+    Let child_count be proc memory_get_int64 from Layout with async_node, 24
+    If child_count is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with children, 0
+End Process
+
+Process called "push_async_scope" takes analyzer as Integer returns Integer:
+    Note: Open the async body scope
+    Return proc push_scope with analyzer
+End Process
+
+Process called "create_async_type" takes analyzer as Integer, body_type as Integer returns Integer:
+    Note: Wrap a type as Async of that type
+    Return proc make_type1 with analyzer, TYPE_ASYNC, body_type
+End Process
+
+Process called "analyze_async_expression" takes analyzer as Integer, async_node as Integer returns Integer:
+    Note: Analyze an async expression
+
+    Let async_body be proc get_async_body with async_node
+    If async_body is equal to 0:
+        proc add_semantic_error with analyzer, "Async expression requires a body"
+        Return TYPE_ERROR
+    End If
+
+    proc push_async_scope with analyzer
+    Let body_type be proc infer_expression_type with analyzer, async_body
+    proc pop_scope with analyzer
+
+    Return proc create_async_type with analyzer, body_type
+End Process
+
+@Reasoning:
+Units-of-measure accessors over the AST_MEASURE shape (value slot = unit
+name token, child 0 = magnitude expression).
+@End Reasoning
+
+Process called "get_measure_value" takes measure_expr as Integer returns Integer:
+    Note: Get the magnitude expression of a measure node
+
+    Let children be proc memory_get_int64 from Layout with measure_expr, 16
+    Let child_count be proc memory_get_int64 from Layout with measure_expr, 24
+    If child_count is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with children, 0
+End Process
+
+Process called "get_measure_unit" takes measure_expr as Integer returns Integer:
+    Note: Get the unit name of a measure node
+
+    Let unit_token be proc memory_get_int64 from Layout with measure_expr, 8
+    Return proc get_token_text from Lexer with unit_token
+End Process
+
+Process called "lookup_measure_unit" takes analyzer as Integer, measure_unit as Integer returns Integer:
+    Note: Look up a declared measure unit
+
+    If measure_unit is equal to 0:
+        Return 0
+    End If
+    Let measure_system be proc memory_get_int64 from Layout with analyzer, 56
+    Return proc hashtable_get from Dict with measure_system, measure_unit
+End Process
+
+Process called "create_measured_type" takes analyzer as Integer, base_type as Integer, measure_unit as Integer returns Integer:
+    Note: Create a measured numeric type
+
+    Return proc make_type2 with analyzer, TYPE_MEASURE, base_type, measure_unit
+End Process
+
+@Reasoning:
+Measure analysis: the unit must be declared (undeclared units are the
+"Unknown unit of measure" error, F#'s behaviour for missing [<Measure>]
+declarations), and the magnitude must be numeric (int, float, decimal, a
+still-free variable that then constrains to float - F#'s default measure
+carrier - or obj). The result is the measured wrapper type whose
+unification rule demands matching units.
+@End Reasoning
+
+Process called "analyze_units_of_measure" takes analyzer as Integer, measure_expr as Integer returns Integer:
+    Note: Analyze a units-of-measure expression
+
+    Let measure_unit be proc get_measure_unit with measure_expr
+    Let unit_info be proc lookup_measure_unit with analyzer, measure_unit
+    If unit_info is equal to 0:
+        proc add_semantic_error with analyzer, "Unknown unit of measure"
+        Return TYPE_ERROR
+    End If
+
+    Let magnitude_node be proc get_measure_value with measure_expr
+    Let base_type be proc infer_expression_type with analyzer, magnitude_node
+
+    Let resolved be proc resolve_type with analyzer, base_type
+    Let tag be proc type_tag with resolved
+
+    Let is_numeric be 0
+    If tag is equal to TYPE_INT:
+        Set is_numeric to 1
+    End If
+    If tag is equal to TYPE_FLOAT:
+        Set is_numeric to 1
+    End If
+    If tag is equal to TYPE_DECIMAL:
+        Set is_numeric to 1
+    End If
+    If tag is equal to TYPE_ANY:
+        Set is_numeric to 1
+    End If
+    If tag is equal to TYPE_GENERIC:
+        proc unify_types with analyzer, resolved, TYPE_FLOAT
+        Set is_numeric to 1
+    End If
+
+    If is_numeric is equal to 0:
+        proc add_semantic_error with analyzer, "Units of measure apply only to numeric values"
+        Return TYPE_ERROR
+    End If
+
+    Return proc create_measured_type with analyzer, base_type, measure_unit
+End Process
+
 Note: ============================================================================
-Note: Semantic Analysis Helper Functions
+Note: Expression Dispatcher
 Note: ============================================================================
 
 @Reasoning:
-Seeds the type environment with the built-in F# types (int, int64, byte,
-float, float32, decimal, string, char, bool, unit, obj) plus the generic
-collection types (list, array, seq, option, Result, Map, Set). Without
-this, every program would fail to resolve even the most basic literal
-type names.
+The inference dispatcher over the REAL parser node kinds: one AST_LITERAL
+kind discriminated by token class (not per-literal AST kinds), match/if/
+let/try/while/for under their *_EXPRESSION names, AST_UNIT for (), pipe
+nodes carrying operator tags, wildcards in expression position (the F#
+shorthand-argument form) as fresh variables, and quotations typing their
+inner expression then yielding obj (Expr<'T> is a .NET reflection type
+outside this module's knowledge). Unknown kinds are TYPE_UNKNOWN rather
+than errors so one unexpected shape cannot cascade.
 @End Reasoning
 
-Process called "setup_fsharp_builtins" takes analyzer as Integer returns Integer:
-    Note: Setup F# built-in types and functions
+Process called "infer_expression_type" takes analyzer as Integer, expr_node as Integer returns Integer:
+    Note: Infer the type of an F# expression node
+
+    If expr_node is equal to 0:
+        Return TYPE_UNIT
+    End If
+
+    Let expr_kind be proc memory_get_int64 from Layout with expr_node, 0
+
+    If expr_kind is equal to AST_LITERAL from Parser:
+        Let literal_token be proc memory_get_int64 from Layout with expr_node, 8
+        Return proc literal_token_type with literal_token
+    End If
+
+    If expr_kind is equal to AST_UNIT from Parser:
+        Return TYPE_UNIT
+    End If
+
+    If expr_kind is equal to AST_IDENTIFIER from Parser:
+        Return proc infer_identifier_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_APPLICATION from Parser:
+        Return proc infer_application_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_LAMBDA from Parser:
+        Return proc infer_lambda_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_LET_EXPRESSION from Parser:
+        Return proc infer_let_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_MATCH_EXPRESSION from Parser:
+        Return proc infer_match_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_IF_EXPRESSION from Parser:
+        Return proc infer_if_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_TUPLE_EXPRESSION from Parser:
+        Return proc infer_tuple_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_LIST_EXPRESSION from Parser:
+        Return proc infer_list_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_ARRAY_EXPRESSION from Parser:
+        Return proc infer_array_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_RECORD_EXPRESSION from Parser:
+        Return proc infer_record_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_SEQUENCE_EXPRESSION from Parser:
+        Return proc infer_sequence_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_TRY_EXPRESSION from Parser:
+        Return proc infer_try_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_WHILE_EXPRESSION from Parser:
+        Return proc infer_while_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_FOR_EXPRESSION from Parser:
+        Return proc infer_for_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_PIPE_EXPRESSION from Parser:
+        Return proc infer_pipe_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_INTERPOLATED_STRING from Parser:
+        Return proc infer_interpolated_type with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_COMPUTATION_EXPRESSION from Parser:
+        Return proc analyze_computation_expression with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_MEASURE from Parser:
+        Return proc analyze_units_of_measure with analyzer, expr_node
+    End If
+
+    If expr_kind is equal to AST_QUOTE_EXPRESSION from Parser:
+        Let quote_children be proc memory_get_int64 from Layout with expr_node, 16
+        Let quote_count be proc memory_get_int64 from Layout with expr_node, 24
+        If quote_count is greater than 0:
+            Let inner be proc list_get from List with quote_children, 0
+            proc infer_expression_type with analyzer, inner
+        End If
+        Return TYPE_ANY
+    End If
+
+    If expr_kind is equal to AST_PATTERN_WILDCARD from Parser:
+        Return proc fresh_type_var with analyzer
+    End If
+
+    Return TYPE_UNKNOWN
+End Process
+
+Note: ============================================================================
+Note: Pattern Validation
+Note: ============================================================================
+
+@Reasoning:
+Constructor-pattern checking: built-in option/Result constructors get
+per-use polymorphic handling (Some x constrains the scrutinee to
+'a option and binds x at 'a; Ok/Error constrain to the Result union and
+bind payloads fresh), declared constructors constrain the scrutinee to
+their owning union and check the payload sub-pattern against the
+declared payload type (tuple payloads destructure componentwise; nullary
+constructors with arguments are an arity error), and unknown
+constructors - cross-module union cases this single-file analysis cannot
+see - bind their sub-patterns against fresh variables without error,
+because rejecting them would false-positive on every interop match.
+@End Reasoning
+
+Process called "validate_constructor_pattern" takes analyzer as Integer, pattern_node as Integer, expected_type as Integer returns Integer:
+    Note: Validate a constructor pattern against the expected type
+
+    Let ctor_token be proc memory_get_int64 from Layout with pattern_node, 8
+    Let ctor_name be proc get_token_text from Lexer with ctor_token
+    If ctor_name is equal to 0:
+        Return 0
+    End If
+
+    Let children be proc memory_get_int64 from Layout with pattern_node, 16
+    Let child_count be proc memory_get_int64 from Layout with pattern_node, 24
+
+    Let is_some be proc string_equals from StringCore with ctor_name, "Some"
+    If is_some is equal to 1:
+        Let elem be proc fresh_type_var with analyzer
+        Let option_type be proc make_type1 with analyzer, TYPE_OPTION, elem
+        Let ok be proc unify_types with analyzer, expected_type, option_type
+        If ok is equal to 0:
+            proc add_semantic_error with analyzer, "Pattern type mismatch: Some applies to option values"
+            Return 0
+        End If
+        If child_count is greater than 0:
+            Let payload_pattern be proc list_get from List with children, 0
+            Return proc validate_pattern with analyzer, payload_pattern, elem
+        End If
+        Return 1
+    End If
+
+    Let is_none be proc string_equals from StringCore with ctor_name, "None"
+    If is_none is equal to 1:
+        Set elem to proc fresh_type_var with analyzer
+        Set option_type to proc make_type1 with analyzer, TYPE_OPTION, elem
+        Set ok to proc unify_types with analyzer, expected_type, option_type
+        If ok is equal to 0:
+            proc add_semantic_error with analyzer, "Pattern type mismatch: None applies to option values"
+            Return 0
+        End If
+        If child_count is greater than 0:
+            proc add_semantic_error with analyzer, "Constructor None takes no arguments"
+            Return 0
+        End If
+        Return 1
+    End If
+
+    Let is_ok_ctor be proc string_equals from StringCore with ctor_name, "Ok"
+    Let is_err_ctor be proc string_equals from StringCore with ctor_name, "Error"
+    Let is_result be 0
+    If is_ok_ctor is equal to 1:
+        Set is_result to 1
+    End If
+    If is_err_ctor is equal to 1:
+        Set is_result to 1
+    End If
+    If is_result is equal to 1:
+        Let result_cases be proc list_create from List
+        proc list_append from List with result_cases, "Ok"
+        proc list_append from List with result_cases, "Error"
+        Let result_union be proc make_type2 with analyzer, TYPE_UNION, "Result", result_cases
+        Set ok to proc unify_types with analyzer, expected_type, result_union
+        If ok is equal to 0:
+            proc add_semantic_error with analyzer, "Pattern type mismatch: Ok/Error apply to Result values"
+            Return 0
+        End If
+        If child_count is greater than 0:
+            Set payload_pattern to proc list_get from List with children, 0
+            Set elem to proc fresh_type_var with analyzer
+            Return proc validate_pattern with analyzer, payload_pattern, elem
+        End If
+        Return 1
+    End If
+
+    Let ctor_info be proc lookup_constructor with analyzer, ctor_name
+    If ctor_info is equal to 0:
+        Note: Cross-module constructor: bind sub-patterns against fresh types
+        Let i be 0
+        While i is less than child_count:
+            Let sub_pattern be proc list_get from List with children, i
+            Let sub_type be proc fresh_type_var with analyzer
+            proc validate_pattern with analyzer, sub_pattern, sub_type
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    Let union_type be proc memory_get_int64 from Layout with ctor_info, 0
+    Set ok to proc unify_types with analyzer, expected_type, union_type
+    If ok is equal to 0:
+        Let message be proc pool_concat with analyzer, "Pattern type mismatch for constructor: ", ctor_name
+        proc add_semantic_error with analyzer, message
+        Return 0
+    End If
+
+    Let has_payload be proc memory_get_int64 from Layout with ctor_info, 16
+    If has_payload is equal to 0:
+        If child_count is greater than 0:
+            Set message to proc pool_concat with analyzer, "Constructor takes no arguments: ", ctor_name
+            proc add_semantic_error with analyzer, message
+            Return 0
+        End If
+        Return 1
+    End If
+
+    Let payload_type be proc memory_get_int64 from Layout with ctor_info, 8
+
+    If child_count is equal to 0:
+        Return 1
+    End If
+
+    If child_count is equal to 1:
+        Set payload_pattern to proc list_get from List with children, 0
+        Return proc validate_pattern with analyzer, payload_pattern, payload_type
+    End If
+
+    Note: Multiple sub-patterns destructure a tuple payload componentwise
+    Let resolved_payload be proc resolve_type with analyzer, payload_type
+    Let payload_tag be proc type_tag with resolved_payload
+    If payload_tag is equal to TYPE_TUPLE:
+        Let elems be proc memory_get_int64 from Layout with resolved_payload, 8
+        Let elem_count be proc list_length from List with elems
+        If elem_count is not equal to child_count:
+            Set message to proc pool_concat with analyzer, "Constructor pattern arity mismatch: ", ctor_name
+            proc add_semantic_error with analyzer, message
+            Return 0
+        End If
+        Set i to 0
+        Let all_ok be 1
+        While i is less than child_count:
+            Set sub_pattern to proc list_get from List with children, i
+            Let elem_type be proc list_get from List with elems, i
+            Set ok to proc validate_pattern with analyzer, sub_pattern, elem_type
+            If ok is equal to 0:
+                Set all_ok to 0
+            End If
+            Set i to i plus 1
+        End While
+        Return all_ok
+    End If
+
+    Set i to 0
+    While i is less than child_count:
+        Set sub_pattern to proc list_get from List with children, i
+        Set sub_type to proc fresh_type_var with analyzer
+        proc validate_pattern with analyzer, sub_pattern, sub_type
+        Set i to i plus 1
+    End While
     Return 1
 End Process
 
 @Reasoning:
-Allocates the union-find based Hindley-Milner unification engine that
-records every type-variable equivalence accrued during inference and
-resolves them lazily at the end of analysis (solve_all_constraints).
-The solver is per-analyzer rather than per-pass so cross-pass
-constraints survive.
+Tuple-pattern checking: a tuple-typed scrutinee must agree in arity and
+each component validates against its component type; a free-variable
+scrutinee learns the tuple shape (fresh component variables); obj/error
+scrutinees validate components freshly; any other concrete type is a
+shape mismatch.
 @End Reasoning
 
-Process called "create_constraint_solver" takes analyzer as Integer returns Integer:
-    Note: Create type constraint solver
-    Return proc hashtable_create from Dict
+Process called "validate_tuple_pattern" takes analyzer as Integer, pattern_node as Integer, expected_type as Integer returns Integer:
+    Note: Validate a tuple pattern against the expected type
+
+    Let children be proc memory_get_int64 from Layout with pattern_node, 16
+    Let child_count be proc memory_get_int64 from Layout with pattern_node, 24
+
+    Let resolved be proc resolve_type with analyzer, expected_type
+    Let tag be proc type_tag with resolved
+
+    If tag is equal to TYPE_TUPLE:
+        Let elems be proc memory_get_int64 from Layout with resolved, 8
+        Let elem_count be proc list_length from List with elems
+        If elem_count is not equal to child_count:
+            proc add_semantic_error with analyzer, "Tuple pattern arity mismatch"
+            Return 0
+        End If
+        Let i be 0
+        Let all_ok be 1
+        While i is less than child_count:
+            Let sub_pattern be proc list_get from List with children, i
+            Let elem_type be proc list_get from List with elems, i
+            Let ok be proc validate_pattern with analyzer, sub_pattern, elem_type
+            If ok is equal to 0:
+                Set all_ok to 0
+            End If
+            Set i to i plus 1
+        End While
+        Return all_ok
+    End If
+
+    If tag is equal to TYPE_GENERIC:
+        Let fresh_elems be proc list_create from List
+        Set i to 0
+        While i is less than child_count:
+            Let fresh_elem be proc fresh_type_var with analyzer
+            proc list_append from List with fresh_elems, fresh_elem
+            Set i to i plus 1
+        End While
+        Let tuple_type be proc make_type1 with analyzer, TYPE_TUPLE, fresh_elems
+        proc unify_types with analyzer, resolved, tuple_type
+        Set i to 0
+        Set all_ok to 1
+        While i is less than child_count:
+            Set sub_pattern to proc list_get from List with children, i
+            Set elem_type to proc list_get from List with fresh_elems, i
+            Set ok to proc validate_pattern with analyzer, sub_pattern, elem_type
+            If ok is equal to 0:
+                Set all_ok to 0
+            End If
+            Set i to i plus 1
+        End While
+        Return all_ok
+    End If
+
+    Let is_open be 0
+    If tag is equal to TYPE_ANY:
+        Set is_open to 1
+    End If
+    If tag is equal to TYPE_ERROR:
+        Set is_open to 1
+    End If
+    If is_open is equal to 1:
+        Set i to 0
+        While i is less than child_count:
+            Set sub_pattern to proc list_get from List with children, i
+            Set elem_type to proc fresh_type_var with analyzer
+            proc validate_pattern with analyzer, sub_pattern, elem_type
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    proc add_semantic_error with analyzer, "Tuple pattern applied to a non-tuple value"
+    Return 0
 End Process
 
 @Reasoning:
-Allocates the units-of-measure resolver: a registry of declared base
-measures plus the algebraic-canonical-form normaliser. Lives separate
-from the type environment because measures form their own dimensional
-algebra and don't participate in regular type unification.
+Element-sequence pattern checking shared by lists and arrays: the
+scrutinee constrains to the matching collection of a (possibly fresh)
+element type and every element pattern validates against that element
+type.
 @End Reasoning
 
-Process called "create_measure_system" takes analyzer as Integer returns Integer:
-    Note: Create units of measure system
-    Return proc hashtable_create from Dict
+Process called "validate_sequence_pattern" takes analyzer as Integer, pattern_node as Integer, expected_type as Integer, type_tag_value as Integer returns Integer:
+    Note: Validate a list/array pattern against the expected type
+
+    Let children be proc memory_get_int64 from Layout with pattern_node, 16
+    Let child_count be proc memory_get_int64 from Layout with pattern_node, 24
+
+    Let elem_type be proc fresh_type_var with analyzer
+    Let coll_type be proc make_type1 with analyzer, type_tag_value, elem_type
+    Let ok be proc unify_types with analyzer, expected_type, coll_type
+    If ok is equal to 0:
+        proc add_semantic_error with analyzer, "Collection pattern applied to a non-collection value"
+        Return 0
+    End If
+
+    Let i be 0
+    Let all_ok be 1
+    While i is less than child_count:
+        Let sub_pattern be proc list_get from List with children, i
+        Set ok to proc validate_pattern with analyzer, sub_pattern, elem_type
+        If ok is equal to 0:
+            Set all_ok to 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Return all_ok
+End Process
+
+Process called "validate_list_pattern" takes analyzer as Integer, pattern_node as Integer, expected_type as Integer returns Integer:
+    Note: Validate a list pattern
+    Return proc validate_sequence_pattern with analyzer, pattern_node, expected_type, TYPE_LIST
+End Process
+
+Process called "validate_array_pattern" takes analyzer as Integer, pattern_node as Integer, expected_type as Integer returns Integer:
+    Note: Validate an array pattern
+    Return proc validate_sequence_pattern with analyzer, pattern_node, expected_type, TYPE_ARRAY
 End Process
 
 @Reasoning:
-Resets analyzer state for a new run: empties error/warning lists,
-clears the constraint solver's pending list, and resets the symbol
-table to its built-in-only state. Built-in type bindings persist because
-re-seeding them on every analysis would be wasteful.
+Record-pattern checking over the parser shape (each field child is an
+AST_PATTERN_VARIABLE whose value slot is the field-name token and whose
+single child is the sub-pattern): duplicate field names report, every
+sub-pattern binds against a fresh type, and the scrutinee constrains to
+an anonymous record (nominal field typing requires the cross-module
+record tables F# resolves at assembly level).
 @End Reasoning
 
-Process called "clear_analysis_results" takes analyzer as Integer returns Integer:
-    Note: Clear previous analysis results
+Process called "validate_record_pattern" takes analyzer as Integer, pattern_node as Integer, expected_type as Integer returns Integer:
+    Note: Validate a record pattern against the expected type
+
+    Let anon_record be proc make_type1 with analyzer, TYPE_RECORD, 0
+    Let ok be proc unify_types with analyzer, expected_type, anon_record
+    If ok is equal to 0:
+        proc add_semantic_error with analyzer, "Record pattern applied to a non-record value"
+        Return 0
+    End If
+
+    Let seen_names be proc list_create from List
+
+    Let children be proc memory_get_int64 from Layout with pattern_node, 16
+    Let child_count be proc memory_get_int64 from Layout with pattern_node, 24
+    Let i be 0
+    Let all_ok be 1
+    While i is less than child_count:
+        Let field_node be proc list_get from List with children, i
+
+        Let field_token be proc memory_get_int64 from Layout with field_node, 8
+        Let field_name be proc get_token_text from Lexer with field_token
+        If field_name is not equal to 0:
+            Let seen_count be proc list_length from List with seen_names
+            Let s be 0
+            While s is less than seen_count:
+                Let prior be proc list_get from List with seen_names, s
+                Let same be proc string_equals from StringCore with prior, field_name
+                If same is equal to 1:
+                    Let message be proc pool_concat with analyzer, "Duplicate field in record pattern: ", field_name
+                    proc add_semantic_error with analyzer, message
+                    Set all_ok to 0
+                End If
+                Set s to s plus 1
+            End While
+            proc list_append from List with seen_names, field_name
+        End If
+
+        Let field_children be proc memory_get_int64 from Layout with field_node, 16
+        Let field_child_count be proc memory_get_int64 from Layout with field_node, 24
+        If field_child_count is greater than 0:
+            Let sub_pattern be proc list_get from List with field_children, 0
+            Let sub_type be proc fresh_type_var with analyzer
+            Let sub_ok be proc validate_pattern with analyzer, sub_pattern, sub_type
+            If sub_ok is equal to 0:
+                Set all_ok to 0
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc list_destroy from List with seen_names
+    Return all_ok
+End Process
+
+@Reasoning:
+The pattern dispatcher: validates one pattern against the scrutinee type
+and binds every variable the pattern introduces. Wildcards always match;
+variables bind at the expected type (honouring an annotation in the
+metadata slot); literals must be type-compatible (checked through
+unification so a free scrutinee learns the literal's type); as/or/guard
+wrappers recurse with the appropriate extra obligations (or-patterns
+validate EVERY alternative against the same type so alternative
+mismatches surface; guards must be bool); composite shapes route to
+their dedicated validators; type-test patterns bind their as-binder at
+the tested type; active patterns bind sub-patterns freshly (banks of
+active-pattern definitions are cross-module).
+@End Reasoning
+
+Process called "validate_pattern" takes analyzer as Integer, pattern_node as Integer, expected_type as Integer returns Integer:
+    Note: Validate a pattern against an expected type, binding variables
+
+    If pattern_node is equal to 0:
+        Return 1
+    End If
+
+    Let pattern_kind be proc memory_get_int64 from Layout with pattern_node, 0
+
+    If pattern_kind is equal to AST_PATTERN_WILDCARD from Parser:
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_VARIABLE from Parser:
+        Let var_token be proc memory_get_int64 from Layout with pattern_node, 8
+        Let var_name be proc get_token_text from Lexer with var_token
+
+        Let bind_type be expected_type
+        Let anno be proc memory_get_int64 from Layout with pattern_node, 40
+        If anno is not equal to 0:
+            Let declared be proc resolve_type_expr with analyzer, anno
+            Let anno_ok be proc unify_types with analyzer, expected_type, declared
+            If anno_ok is equal to 0:
+                proc add_semantic_error with analyzer, "Pattern annotation disagrees with the matched value"
+            End If
+            Set bind_type to declared
+        End If
+
+        proc add_pattern_variable with analyzer, var_name, bind_type
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_LITERAL from Parser:
+        Let literal_token be proc memory_get_int64 from Layout with pattern_node, 8
+        Let literal_type be proc literal_token_type with literal_token
+        Let lit_ok be proc unify_types with analyzer, literal_type, expected_type
+        If lit_ok is equal to 0:
+            proc add_semantic_error with analyzer, "Literal pattern type mismatch"
+            Return 0
+        End If
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_AS from Parser:
+        Let as_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let as_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If as_count is less than 2:
+            Return 0
+        End If
+        Let inner_pattern be proc list_get from List with as_children, 0
+        Let inner_ok be proc validate_pattern with analyzer, inner_pattern, expected_type
+        Let alias_pattern be proc list_get from List with as_children, 1
+        Let alias_ok be proc validate_pattern with analyzer, alias_pattern, expected_type
+        If inner_ok is equal to 0:
+            Return 0
+        End If
+        Return alias_ok
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_OR from Parser:
+        Let or_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let or_count be proc memory_get_int64 from Layout with pattern_node, 24
+        Let i be 0
+        Let all_ok be 1
+        While i is less than or_count:
+            Let alternative be proc list_get from List with or_children, i
+            Let alt_ok be proc validate_pattern with analyzer, alternative, expected_type
+            If alt_ok is equal to 0:
+                Set all_ok to 0
+            End If
+            Set i to i plus 1
+        End While
+        Return all_ok
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_GUARD from Parser:
+        Let guard_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let guard_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If guard_count is less than 2:
+            Return 0
+        End If
+        Set inner_pattern to proc list_get from List with guard_children, 0
+        Set inner_ok to proc validate_pattern with analyzer, inner_pattern, expected_type
+
+        Let guard_expr be proc list_get from List with guard_children, 1
+        Let guard_type be proc infer_expression_type with analyzer, guard_expr
+        Let guard_ok be proc unify_types with analyzer, guard_type, TYPE_BOOL
+        If guard_ok is equal to 0:
+            proc add_semantic_error with analyzer, "Pattern guard must have type bool"
+        End If
+        Return inner_ok
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_CONSTRUCTOR from Parser:
+        Return proc validate_constructor_pattern with analyzer, pattern_node, expected_type
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_TUPLE from Parser:
+        Return proc validate_tuple_pattern with analyzer, pattern_node, expected_type
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_LIST from Parser:
+        Return proc validate_list_pattern with analyzer, pattern_node, expected_type
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_ARRAY from Parser:
+        Return proc validate_array_pattern with analyzer, pattern_node, expected_type
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_RECORD from Parser:
+        Return proc validate_record_pattern with analyzer, pattern_node, expected_type
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_TYPE_TEST from Parser:
+        Let type_token be proc memory_get_int64 from Layout with pattern_node, 8
+        Let tested_name be proc get_token_text from Lexer with type_token
+        Let tested_type be proc resolve_type_name with analyzer, tested_name
+
+        Let test_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let test_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If test_count is greater than 0:
+            Let binder be proc list_get from List with test_children, 0
+            Return proc validate_pattern with analyzer, binder, tested_type
+        End If
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_ACTIVE from Parser:
+        Let active_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let active_count be proc memory_get_int64 from Layout with pattern_node, 24
+        Set i to 0
+        While i is less than active_count:
+            Let active_sub be proc list_get from List with active_children, i
+            Let active_type be proc fresh_type_var with analyzer
+            proc validate_pattern with analyzer, active_sub, active_type
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    proc add_semantic_error with analyzer, "Unsupported pattern shape"
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Match Exhaustiveness Analysis
+Note: ============================================================================
+
+@Reasoning:
+Irrefutability decides coverage without type knowledge: wildcards and
+bare variables always match; an as-pattern is irrefutable when its inner
+pattern is; an or-pattern is when ANY alternative is; a tuple pattern is
+when ALL components are. Guarded patterns are never irrefutable (the
+guard can fail at runtime). Everything else (literals, constructors,
+collections, records, type tests) is refutable.
+@End Reasoning
+
+Process called "pattern_is_irrefutable" takes pattern_node as Integer returns Integer:
+    Note: Decide whether a pattern matches every value of its type
+
+    If pattern_node is equal to 0:
+        Return 0
+    End If
+
+    Let pattern_kind be proc memory_get_int64 from Layout with pattern_node, 0
+
+    If pattern_kind is equal to AST_PATTERN_WILDCARD from Parser:
+        Return 1
+    End If
+    If pattern_kind is equal to AST_PATTERN_VARIABLE from Parser:
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_AS from Parser:
+        Let children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let child_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If child_count is greater than 0:
+            Let inner be proc list_get from List with children, 0
+            Return proc pattern_is_irrefutable with inner
+        End If
+        Return 0
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_OR from Parser:
+        Set children to proc memory_get_int64 from Layout with pattern_node, 16
+        Set child_count to proc memory_get_int64 from Layout with pattern_node, 24
+        Let i be 0
+        While i is less than child_count:
+            Let alternative be proc list_get from List with children, i
+            Let covered be proc pattern_is_irrefutable with alternative
+            If covered is equal to 1:
+                Return 1
+            End If
+            Set i to i plus 1
+        End While
+        Return 0
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_TUPLE from Parser:
+        Set children to proc memory_get_int64 from Layout with pattern_node, 16
+        Set child_count to proc memory_get_int64 from Layout with pattern_node, 24
+        Set i to 0
+        While i is less than child_count:
+            Let component be proc list_get from List with children, i
+            Set covered to proc pattern_is_irrefutable with component
+            If covered is equal to 0:
+                Return 0
+            End If
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+String-membership helper for the coverage name lists (constructor names,
+union case names). Linear scan with string_equals; coverage lists are
+small (the arm count of one match).
+@End Reasoning
+
+Process called "name_list_contains" takes name_list as Integer, name as Integer returns Integer:
+    Note: Check whether a name list contains a string
+
+    If name is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with name_list
+    Let i be 0
+    While i is less than count:
+        Let candidate be proc list_get from List with name_list, i
+        Let same be proc string_equals from StringCore with candidate, name
+        If same is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Collects one unguarded arm pattern's contribution to coverage:
+constructor names append to the covered-name list (or-patterns
+contribute every alternative), and bool literal patterns raise the
+true/false flags through a 16-byte flag record the caller owns. Guarded
+arms never contribute (the guard can decline the value).
+@End Reasoning
+
+Process called "collect_pattern_coverage" takes analyzer as Integer, pattern_node as Integer, covered_names as Integer, bool_flags as Integer returns Integer:
+    Note: Record one pattern's coverage contribution
+
+    If pattern_node is equal to 0:
+        Return 1
+    End If
+
+    Let pattern_kind be proc memory_get_int64 from Layout with pattern_node, 0
+
+    If pattern_kind is equal to AST_PATTERN_CONSTRUCTOR from Parser:
+        Let ctor_token be proc memory_get_int64 from Layout with pattern_node, 8
+        Let ctor_name be proc get_token_text from Lexer with ctor_token
+        If ctor_name is not equal to 0:
+            proc list_append from List with covered_names, ctor_name
+        End If
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_LITERAL from Parser:
+        Let literal_token be proc memory_get_int64 from Layout with pattern_node, 8
+        Let token_kind be proc get_token_type from Lexer with literal_token
+        If token_kind is equal to TOKEN_TRUE from Lexer:
+            proc memory_set_int64 from Layout with bool_flags, 0, 1
+        End If
+        If token_kind is equal to TOKEN_FALSE from Lexer:
+            proc memory_set_int64 from Layout with bool_flags, 8, 1
+        End If
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_OR from Parser:
+        Let children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let child_count be proc memory_get_int64 from Layout with pattern_node, 24
+        Let i be 0
+        While i is less than child_count:
+            Let alternative be proc list_get from List with children, i
+            proc collect_pattern_coverage with analyzer, alternative, covered_names, bool_flags
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_AS from Parser:
+        Set children to proc memory_get_int64 from Layout with pattern_node, 16
+        Set child_count to proc memory_get_int64 from Layout with pattern_node, 24
+        If child_count is greater than 0:
+            Let inner be proc list_get from List with children, 0
+            Return proc collect_pattern_coverage with analyzer, inner, covered_names, bool_flags
+        End If
+        Return 1
+    End If
+
     Return 1
 End Process
 
 @Reasoning:
-First pass over the module AST: registers every type declaration,
-module nesting, and `open` directive into the module_table so forward
-references during the declarations pass resolve correctly. F# allows
-mutually-recursive types declared with `and`, which this pass also
-gathers as a single recursive group.
+Per-match exhaustiveness and redundancy. Walks the arms in order: an arm
+positioned after coverage is already total is redundant ("This rule will
+never be matched"); unguarded irrefutable arms make coverage total;
+unguarded constructor/literal arms accumulate name and bool coverage.
+After the walk, type-directed coverage closes the remaining cases: bool
+scrutinees need true and false, option scrutinees need Some and None,
+declared unions need every registered case. Anything still open is the
+"Incomplete pattern matches" warning - a warning, not an error, exactly
+as the F# compiler reports FS0025.
+@End Reasoning
+
+Process called "validate_match_exhaustiveness" takes analyzer as Integer, scrutinee_type as Integer, match_node as Integer returns Integer:
+    Note: Check one match expression for exhaustiveness and redundancy
+
+    Let children be proc memory_get_int64 from Layout with match_node, 16
+    Let child_count be proc memory_get_int64 from Layout with match_node, 24
+
+    Let covered_names be proc list_create from List
+    Let bool_flags be proc allocate from Layout with 16
+    proc memory_set_int64 from Layout with bool_flags, 0, 0
+    proc memory_set_int64 from Layout with bool_flags, 8, 0
+
+    Let total_cover be 0
+    Let reported_redundant be 0
+
+    Let i be 1
+    While i is less than child_count:
+        Let case_node be proc list_get from List with children, i
+        Let case_children be proc memory_get_int64 from Layout with case_node, 16
+        Let case_child_count be proc memory_get_int64 from Layout with case_node, 24
+
+        If case_child_count is greater than 0:
+            If total_cover is equal to 1:
+                If reported_redundant is equal to 0:
+                    proc add_semantic_warning with analyzer, "This rule will never be matched"
+                    Set reported_redundant to 1
+                End If
+            End If
+
+            Let pattern_node be proc list_get from List with case_children, 0
+            Let pattern_kind be proc memory_get_int64 from Layout with pattern_node, 0
+
+            Let guarded be 0
+            Let effective_pattern be pattern_node
+            If pattern_kind is equal to AST_PATTERN_GUARD from Parser:
+                Set guarded to 1
+                Let guard_children be proc memory_get_int64 from Layout with pattern_node, 16
+                Let guard_count be proc memory_get_int64 from Layout with pattern_node, 24
+                If guard_count is greater than 0:
+                    Set effective_pattern to proc list_get from List with guard_children, 0
+                End If
+            End If
+
+            If guarded is equal to 0:
+                Let irrefutable be proc pattern_is_irrefutable with effective_pattern
+                If irrefutable is equal to 1:
+                    Set total_cover to 1
+                End If
+                proc collect_pattern_coverage with analyzer, effective_pattern, covered_names, bool_flags
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    If total_cover is equal to 0:
+        Let resolved be proc resolve_type with analyzer, scrutinee_type
+        Let tag be proc type_tag with resolved
+
+        If tag is equal to TYPE_BOOL:
+            Let has_true be proc memory_get_int64 from Layout with bool_flags, 0
+            Let has_false be proc memory_get_int64 from Layout with bool_flags, 8
+            If has_true is equal to 1:
+                If has_false is equal to 1:
+                    Set total_cover to 1
+                End If
+            End If
+        End If
+
+        If tag is equal to TYPE_OPTION:
+            Let has_some be proc name_list_contains with covered_names, "Some"
+            Let has_none be proc name_list_contains with covered_names, "None"
+            If has_some is equal to 1:
+                If has_none is equal to 1:
+                    Set total_cover to 1
+                End If
+            End If
+        End If
+
+        If tag is equal to TYPE_UNION:
+            Let case_list be proc memory_get_int64 from Layout with resolved, 16
+            Let case_count be proc list_length from List with case_list
+            Let all_present be 1
+            Let c be 0
+            While c is less than case_count:
+                Let case_name be proc list_get from List with case_list, c
+                Let present be proc name_list_contains with covered_names, case_name
+                If present is equal to 0:
+                    Set all_present to 0
+                End If
+                Set c to c plus 1
+            End While
+            If case_count is greater than 0:
+                If all_present is equal to 1:
+                    Set total_cover to 1
+                End If
+            End If
+        End If
+    End If
+
+    If total_cover is equal to 0:
+        proc add_semantic_warning with analyzer, "Incomplete pattern matches on this expression"
+    End If
+
+    proc list_destroy from List with covered_names
+    proc deallocate from Layout with bool_flags
+    Return total_cover
+End Process
+
+Note: ============================================================================
+Note: Module Passes
+Note: ============================================================================
+
+@Reasoning:
+First pass over the program: registers modules, namespaces, and opens
+into the module table and every type declaration into the type
+environment, recursing through module/namespace nesting so forward
+references during the declarations pass resolve. Runs before any
+inference touches expressions.
 @End Reasoning
 
 Process called "analyze_module_structure" takes analyzer as Integer, ast_root as Integer returns Integer:
-    Note: Analyze module structure and imports
+    Note: Register modules, opens, and type declarations
+
+    If ast_root is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with ast_root, 0
+
+    Let is_container be 0
+    If node_kind is equal to AST_PROGRAM from Parser:
+        Set is_container to 1
+    End If
+    If node_kind is equal to AST_MODULE from Parser:
+        Set is_container to 1
+    End If
+    If node_kind is equal to AST_NAMESPACE from Parser:
+        Set is_container to 1
+    End If
+
+    If is_container is equal to 1:
+        If node_kind is not equal to AST_PROGRAM from Parser:
+            Let name_token be proc memory_get_int64 from Layout with ast_root, 8
+            Let module_name be proc get_token_text from Lexer with name_token
+            If module_name is not equal to 0:
+                Let module_table be proc memory_get_int64 from Layout with analyzer, 32
+                proc hashtable_set from Dict with module_table, module_name, ast_root
+            End If
+        End If
+
+        Let children be proc memory_get_int64 from Layout with ast_root, 16
+        Let child_count be proc memory_get_int64 from Layout with ast_root, 24
+        Let i be 0
+        While i is less than child_count:
+            Let child be proc list_get from List with children, i
+            proc analyze_module_structure with analyzer, child
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    If node_kind is equal to AST_OPEN from Parser:
+        Set name_token to proc memory_get_int64 from Layout with ast_root, 8
+        Let open_name be proc get_token_text from Lexer with name_token
+        If open_name is not equal to 0:
+            Set module_table to proc memory_get_int64 from Layout with analyzer, 32
+            proc hashtable_set from Dict with module_table, open_name, ast_root
+        End If
+        Return 1
+    End If
+
+    If node_kind is equal to AST_TYPE_DECLARATION from Parser:
+        Return proc register_type_declaration with analyzer, ast_root
+    End If
+
     Return 1
 End Process
 
 @Reasoning:
-Second pass: type-checks each let-binding and member definition. Runs
-after analyze_module_structure so every declared type is visible during
-inference. Recursive `let rec` bindings and `and`-chained recursive
-functions are entered into the symbol table before their bodies are
-typed.
+Second pass: type-checks every declaration. Module-level let bindings
+bind their names in the module symbol table (rec pre-binding included);
+val declarations bind their declared signature; modules and namespaces
+recurse; type declarations and opens were handled by the structure pass.
+Any other shape is treated as an expression statement and inferred for
+its diagnostics.
 @End Reasoning
 
 Process called "analyze_module_declarations" takes analyzer as Integer, ast_root as Integer returns Integer:
-    Note: Analyze all module declarations
+    Note: Type-check all declarations
+
+    If ast_root is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with ast_root, 0
+
+    Let is_container be 0
+    If node_kind is equal to AST_PROGRAM from Parser:
+        Set is_container to 1
+    End If
+    If node_kind is equal to AST_MODULE from Parser:
+        Set is_container to 1
+    End If
+    If node_kind is equal to AST_NAMESPACE from Parser:
+        Set is_container to 1
+    End If
+
+    If is_container is equal to 1:
+        Let children be proc memory_get_int64 from Layout with ast_root, 16
+        Let child_count be proc memory_get_int64 from Layout with ast_root, 24
+        Let i be 0
+        While i is less than child_count:
+            Let child be proc list_get from List with children, i
+            proc analyze_module_declarations with analyzer, child
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    If node_kind is equal to AST_LET_BINDING from Parser:
+        proc analyze_let_binding_declaration with analyzer, ast_root
+        Return 1
+    End If
+
+    If node_kind is equal to AST_VALUE_DECLARATION from Parser:
+        Let name_token be proc memory_get_int64 from Layout with ast_root, 8
+        Let value_name be proc get_token_text from Lexer with name_token
+
+        Let value_type be TYPE_ANY
+        Set children to proc memory_get_int64 from Layout with ast_root, 16
+        Set child_count to proc memory_get_int64 from Layout with ast_root, 24
+        If child_count is greater than 0:
+            Let type_node be proc list_get from List with children, 0
+            Set value_type to proc resolve_type_expr with analyzer, type_node
+        End If
+
+        proc define_symbol with analyzer, value_name, value_type
+        Return 1
+    End If
+
+    If node_kind is equal to AST_TYPE_DECLARATION from Parser:
+        Return 1
+    End If
+    If node_kind is equal to AST_OPEN from Parser:
+        Return 1
+    End If
+
+    proc infer_expression_type with analyzer, ast_root
     Return 1
 End Process
 
 @Reasoning:
-Drains the constraint solver: every pending type-variable equivalence
-is unified, occurs-check failures are reported, and remaining free type
-variables are either generalised at let-binding boundaries or quantified
-as the binding's polymorphic signature. Final pass before validation.
+Drains the lazy parts of the substitution store: every bound slot is
+fully resolved through its chain and written back (path compression), so
+the late passes (exhaustiveness over resolved scrutinee types) and any
+caller reading types afterwards see one-step resolutions. Occurs checks
+already ran at bind time, so this pass cannot diverge.
 @End Reasoning
 
 Process called "solve_all_constraints" takes analyzer as Integer returns Integer:
-    Note: Solve all type constraints
+    Note: Compress all substitution chains to their final bindings
+
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    Let subst be proc memory_get_int64 from Layout with solver, 0
+    Let count be proc list_length from List with subst
+
+    Let i be 0
+    While i is less than count:
+        Let bound be proc list_get from List with subst, i
+        If bound is not equal to 0:
+            Let final be proc resolve_type with analyzer, bound
+            proc list_set from List with subst, i, final
+        End If
+        Set i to i plus 1
+    End While
+
     Return 1
 End Process
 
 @Reasoning:
-Whole-program match-exhaustiveness check. Each match expression's case
-patterns are run against the universal cover of the scrutinee's type
-(all constructors, all integer ranges, all field combinations). Missing
-cover paths become "incomplete match" warnings; overlapping cover paths
-become "redundant case" warnings.
+Late exhaustiveness pass: every registered match re-checks against its
+scrutinee type AFTER all unifications have landed, so scrutinees that
+were free variables at match-typing time are judged with their final
+types (a match over a parameter later constrained to a declared union
+gets real case coverage analysis).
 @End Reasoning
 
 Process called "validate_pattern_completeness" takes analyzer as Integer returns Integer:
-    Note: Validate pattern matching completeness
+    Note: Run exhaustiveness analysis over every registered match
+
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    Let match_registry be proc memory_get_int64 from Layout with solver, 16
+    Let count be proc list_length from List with match_registry
+
+    Let i be 0
+    While i is less than count:
+        Let pair be proc list_get from List with match_registry, i
+        Let match_node be proc memory_get_int64 from Layout with pair, 0
+        Let scrutinee_type be proc memory_get_int64 from Layout with pair, 8
+        proc validate_match_exhaustiveness with analyzer, scrutinee_type, match_node
+        Set i to i plus 1
+    End While
+
     Return 1
 End Process
 
 @Reasoning:
-Sweeps the symbol table looking for let-bindings whose names start with
-a non-underscore identifier and were never referenced after declaration.
-Emits a warning per such binding. Underscore-prefixed names are
-conventionally "intentionally unused" so they're suppressed.
+Sweeps the definitions registry for local bindings (lambda parameters,
+let-expression bindings, pattern variables) that were never looked up.
+Underscore-prefixed names are the F# convention for intentionally-unused
+binders and are exempt; module-level definitions are exported surface
+and were never registered as local. One warning per unused name.
 @End Reasoning
 
 Process called "check_unused_definitions" takes analyzer as Integer returns Integer:
-    Note: Check for unused variables and functions
+    Note: Warn about unused local bindings
+
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    Let definitions be proc memory_get_int64 from Layout with solver, 24
+    Let count be proc list_length from List with definitions
+
+    Let i be 0
+    While i is less than count:
+        Let symbol be proc list_get from List with definitions, i
+
+        Let is_local be proc memory_get_int64 from Layout with symbol, 24
+        Let is_used be proc memory_get_int64 from Layout with symbol, 8
+
+        If is_local is equal to 1:
+            If is_used is equal to 0:
+                Let symbol_name be proc memory_get_int64 from Layout with symbol, 16
+                If symbol_name is not equal to 0:
+                    Let first_char be proc string_char_at from StringCore with symbol_name, 0
+                    If first_char is not equal to 95:
+                        If first_char is not equal to 0:
+                            Let message be proc pool_concat with analyzer, "Unused binding: ", symbol_name
+                            proc add_semantic_warning with analyzer, message
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
     Return 1
 End Process
 
-@Reasoning:
-The Hindley-Milner unification primitive. Recursively matches structure
-between two types, binding any free variables found. Records the
-binding in the constraint solver. Returns 1 on successful unification,
-0 on mismatch (records an error). Includes the occurs check to prevent
-infinite types.
-@End Reasoning
-
-Process called "unify_types" takes analyzer as Integer, type1 as Integer, type2 as Integer returns Integer:
-    Note: Unify two types in constraint system
-    Return 1
-End Process
+Note: ============================================================================
+Note: Main Analysis Entry Point
+Note: ============================================================================
 
 @Reasoning:
-Predicate testing whether a type is a function type (T1 -> T2). Used
-by infer_application_type before destructuring; rejects the application
-of a non-function early with a clear error rather than producing a
-unification-failure cascade.
+Top-level analysis sequence: clear prior results, register structure
+(modules, opens, type declarations and their constructors), type-check
+every declaration, compress the substitution store, judge match
+exhaustiveness against final types, and sweep for unused locals. Null
+AST is a hard error because the front end should never invoke analysis
+on absent input.
 @End Reasoning
 
-Process called "is_function_type" takes type_info as Integer returns Integer:
-    Note: Check if type is a function type
-    Return 1
-End Process
+Process called "analyze_fsharp_module" takes analyzer as Integer, ast_root as Integer returns Integer:
+    Note: Analyze a complete F# module
 
-@Reasoning:
-Destructor for the param-side of a function type (T1 -> T2). Returns
-T1. Paired with get_function_return_type. The function type is
-internally represented as a 2-field record; this helper hides the field
-offset from the rest of the analyser.
-@End Reasoning
+    If ast_root is equal to 0:
+        proc add_semantic_error with analyzer, "No AST provided for analysis"
+        Return 0
+    End If
 
-Process called "get_function_param_type" takes function_type as Integer returns Integer:
-    Note: Get parameter type from function type
-    Return TYPE_ANY
-End Process
+    proc clear_analysis_results with analyzer
 
-@Reasoning:
-Destructor for the return-side of a function type. Returns T2 from T1
--> T2. Paired with get_function_param_type for the application typing
-algorithm.
-@End Reasoning
+    proc analyze_module_structure with analyzer, ast_root
 
-Process called "get_function_return_type" takes function_type as Integer returns Integer:
-    Note: Get return type from function type
-    Return TYPE_ANY
-End Process
+    proc analyze_module_declarations with analyzer, ast_root
 
-@Reasoning:
-Constructor for a function type. Accepts a list of parameter types
-(curried as t1 -> t2 -> ... -> return) and a return type, returns the
-function type record. Used during lambda inference to assemble the
-result type once parameter types have been determined.
-@End Reasoning
+    proc solve_all_constraints with analyzer
 
-Process called "create_function_type" takes param_types as Integer, return_type as Integer returns Integer:
-    Note: Create function type from parameter and return types
-    Return TYPE_FUNCTION
-End Process
+    proc validate_pattern_completeness with analyzer
 
-@Reasoning:
-Introduces each lambda parameter into the current (already pushed)
-scope. Each parameter gets a fresh type variable that will be
-constrained later when the lambda is applied or its body is typed.
-Pattern-binding parameters destructure into multiple binders here.
-@End Reasoning
+    proc check_unused_definitions with analyzer
 
-Process called "process_lambda_parameters" takes analyzer as Integer, parameter_list as Integer returns Integer:
-    Note: Process lambda parameters and return type list
-    Return proc list_create from List
-End Process
-
-@Reasoning:
-Per-match exhaustiveness check. Walks the scrutinee type's value space
-and confirms every value is covered by at least one case pattern. For
-unions, every constructor must have at least one matching case (or a
-wildcard); for tuples, the cartesian product of components is checked;
-for primitives, the catch-all wildcard is required.
-@End Reasoning
-
-Process called "validate_match_exhaustiveness" takes analyzer as Integer, scrutinee_type as Integer, case_list as Integer returns Integer:
-    Note: Validate match expression exhaustiveness
-    Return 1
-End Process
-
-@Reasoning:
-For each case in a match expression: validates the pattern against the
-scrutinee type, opens a fresh scope, binds the pattern's variables,
-infers the case body's type, pops the scope. Returns the list of
-inferred per-case result types for find_common_type to join.
-@End Reasoning
-
-Process called "infer_case_types" takes analyzer as Integer, case_list as Integer, scrutinee_type as Integer returns Integer:
-    Note: Infer types of all match cases
-    Return proc list_create from List
-End Process
-
-@Reasoning:
-Computes the join (least upper bound) of a list of types — the result
-type of a match expression must be a type all case bodies inhabit.
-Successive pairwise unifications: start with the first type, unify each
-subsequent into the running result. Failure becomes a "branches return
-incompatible types" diagnostic.
-@End Reasoning
-
-Process called "find_common_type" takes analyzer as Integer, type_list as Integer returns Integer:
-    Note: Find common supertype of type list
-    Return TYPE_ANY
-End Process
-
-@Reasoning:
-Subtype-aware compatibility test. Returns 1 if type1 can be used where
-type2 is expected: identical types, type-variable bindings, .NET
-subclass relationships (when known), and explicit upcasts all qualify.
-Distinct from unify_types because it does not mutate the constraint
-solver — it's a pure predicate.
-@End Reasoning
-
-Process called "types_compatible" takes analyzer as Integer, type1 as Integer, type2 as Integer returns Integer:
-    Note: Check if types are compatible
-    Return 1
-End Process
-
-@Reasoning:
-Adds a pattern-introduced binding (e.g., the `x` in `Some x` of an
-option destructure) to the current scope with the supplied inferred
-type. Shadowing rules apply: an inner pattern's `x` hides an outer
-`x` for the duration of the case body's scope.
-@End Reasoning
-
-Process called "add_pattern_variable" takes analyzer as Integer, var_name as Integer, var_type as Integer returns Integer:
-    Note: Add pattern variable to current scope
     Return 1
 End Process
 
@@ -1130,23 +4042,16 @@ Note: Public API
 Note: ============================================================================
 
 @Reasoning:
-Public driver alias for analyze_fsharp_module so callers using the
-universal-translation "<lang>_analyze_ast" naming convention can pair
-the F# analyser the same way they pair every other frontend. Forwards
-unchanged.
+Public driver alias following the universal-translation "<lang>_analyze_
+ast" naming convention. Returns 1 only when analysis ran and produced
+zero errors; warnings do not fail the run.
 @End Reasoning
 
 Process called "analyze_fsharp_ast" takes analyzer as Integer, ast_root as Integer returns Integer:
     Note: Main entry point for F# semantic analysis
 
-    @Reasoning:
-    Public API function that performs complete semantic analysis of F# AST.
-    Returns success/failure status and populates analyzer with results.
-    @End Reasoning
-
     Let analysis_result be proc analyze_fsharp_module with analyzer, ast_root
 
-    Note: Check for errors
     Let error_list be proc memory_get_int64 from Layout with analyzer, 40
     Let error_count be proc list_length from List with error_list
 
@@ -1158,9 +4063,9 @@ Process called "analyze_fsharp_ast" takes analyzer as Integer, ast_root as Integ
 End Process
 
 @Reasoning:
-Accessor returning the error_list (offset 40). The driver walks this
-list to surface diagnostics; ownership remains with the analyser until
-destroy_fsharp_semantic_analyzer is called.
+Accessor returning the error list (offset 40). The driver walks this
+list to surface diagnostics; ownership remains with the analyzer until
+destroy_fsharp_semantic_analyzer runs.
 @End Reasoning
 
 Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
@@ -1171,8 +4076,8 @@ Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
 End Process
 
 @Reasoning:
-Companion accessor for the warning list (offset 48). Same ownership
-contract as get_semantic_errors.
+Companion accessor for the warning list (offset 48) with the same
+ownership contract as get_semantic_errors.
 @End Reasoning
 
 Process called "get_semantic_warnings" takes analyzer as Integer returns Integer:
@@ -1183,9 +4088,8 @@ Process called "get_semantic_warnings" takes analyzer as Integer returns Integer
 End Process
 
 @Reasoning:
-Predicate that returns 1 if the error_list is non-empty. The driver
-uses this as the gate to decide whether to proceed to code generation
-or abort with diagnostics.
+Predicate the driver gates code generation on: nonzero when any error
+was recorded.
 @End Reasoning
 
 Process called "has_semantic_errors" takes analyzer as Integer returns Integer:

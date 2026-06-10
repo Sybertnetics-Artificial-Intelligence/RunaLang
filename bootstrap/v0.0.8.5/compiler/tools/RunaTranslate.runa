@@ -72,15 +72,21 @@ This file consists of the following functions/features/operation types:
 
 Dependencies:
 - Imports compiler/internal/string_utils.runa for string operations
-- Imports compiler/internal/file_utils.runa for file read/write operations
+- Imports runtime/io/filesystem/file_operations.runa for whole-file read/write
 - Imports compiler/frontend/primitives/memory/layout.runa for owned-heap allocate/deallocate
+- Imports compiler/frontend/primitives/core/string_core.runa for C-string length/comparison
+- Imports compiler/frontend/primitives/core/string_primitive.runa for C-string substring extraction
+- Imports compiler/frontend/primitives/collections/string_builder.runa for incremental output construction
 :End Note
 
 Import "compiler/internal/string_utils.runa" as StringUtils
-Import "compiler/internal/file_utils.runa" as FileUtils
+Import "runtime/io/filesystem/file_operations.runa" as FileOps
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/string_builder.runa" as StringBuilder
 
 Note: ============================================================================
 Note: Constants
@@ -159,10 +165,10 @@ Process called "create_language_catalog" that takes lang_id as Integer, lang_cod
     __store(catalog, 8, lang_code)
     __store(catalog, 16, lang_name)
 
-    Let to_dict be proc dictionary_create from Dictionary with 256
+    Let to_dict be proc create from Dictionary
     __store(catalog, 24, to_dict)
 
-    Let from_dict be proc dictionary_create from Dictionary with 256
+    Let from_dict be proc create from Dictionary
     __store(catalog, 32, from_dict)
 
     __store(catalog, 40, 0)
@@ -185,12 +191,12 @@ Process called "add_catalog_entry" that takes catalog as Integer, foreign_keywor
 
     Let to_dict be __load(catalog, 24)
     If to_dict is not 0:
-        proc dictionary_set from Dictionary with to_dict, foreign_keyword, canonical_keyword
+        proc set from Dictionary with to_dict, foreign_keyword, canonical_keyword
     End If
 
     Let from_dict be __load(catalog, 32)
     If from_dict is not 0:
-        proc dictionary_set from Dictionary with from_dict, canonical_keyword, foreign_keyword
+        proc set from Dictionary with from_dict, canonical_keyword, foreign_keyword
     End If
 
     Let count be __load(catalog, 40)
@@ -209,7 +215,7 @@ Process called "catalog_lookup_to_canonical" that takes catalog as Integer, fore
     If to_dict is 0:
         Return 0
     End If
-    Return proc dictionary_get from Dictionary with to_dict, foreign_keyword
+    Return proc get from Dictionary with to_dict, foreign_keyword
 End Process
 
 Process called "catalog_lookup_from_canonical" that takes catalog as Integer, canonical_keyword as Integer returns Integer:
@@ -222,7 +228,220 @@ Process called "catalog_lookup_from_canonical" that takes catalog as Integer, ca
     If from_dict is 0:
         Return 0
     End If
-    Return proc dictionary_get from Dictionary with from_dict, canonical_keyword
+    Return proc get from Dictionary with from_dict, canonical_keyword
+End Process
+
+@Reasoning
+CATALOG FILE FORMAT (line-based, UTF-8):
+
+  # comment line (first non-blank character is '#')
+  <foreign keyword> = <canonical keyword>
+
+One mapping per line. The first '=' byte on the line separates the foreign
+side from the canonical side; surrounding spaces and tabs on both sides are
+trimmed. Either side may contain internal spaces, so multi-word keywords
+("es mayor que = is greater than") round-trip exactly into the in-memory
+to_canonical/from_canonical dictionaries via add_catalog_entry. Blank lines
+and comment lines are ignored. A line with no '=' or with an empty side
+after trimming is malformed and skipped; the loader reports a single
+summary warning with the skipped-line count. '=' never occurs inside a
+Runa keyword in any supported language, so the separator is unambiguous.
+
+Serialization counterpart: emitting one "foreign = canonical" line per
+to_canonical entry reproduces a file this loader parses back into an
+identical catalog, so the format round-trips the structure both ways.
+@End Reasoning
+
+Process called "load_catalog_from_file" that takes catalog as Integer, path as Integer returns Integer:
+    Note: Loads keyword mappings from a catalog file on disk into the catalog.
+    Note: Returns the number of entries loaded. A missing or unreadable file
+    Note: returns 0 and leaves the catalog cleanly empty (identity translation).
+    If catalog is 0:
+        Return 0
+    End If
+    If path is 0:
+        Return 0
+    End If
+
+    Let content be proc read_file_data from FileOps with path
+    If content is 0:
+        Return 0
+    End If
+
+    Let content_len be proc string_length from StringCore with content
+    Let loaded be 0
+    Let malformed be 0
+    Let pos be 0
+
+    While pos is less than content_len:
+        Note: Locate the end of the current line (LF or end of buffer)
+        Let line_start be pos
+        Let line_end be line_start
+        Let scanning be 1
+        While scanning is 1:
+            If line_end is less than content_len:
+                Let line_ch be __load8(content, line_end)
+                If line_ch is 10:
+                    Set scanning to 0
+                Otherwise:
+                    Set line_end to line_end plus 1
+                End If
+            Otherwise:
+                Set scanning to 0
+            End If
+        End While
+
+        Note: Strip a trailing carriage return (Windows line endings)
+        Let effective_end be line_end
+        If effective_end is greater than line_start:
+            Let last_ch be __load8(content, effective_end minus 1)
+            If last_ch is 13:
+                Set effective_end to effective_end minus 1
+            End If
+        End If
+
+        Note: Find the first non-blank character of the line
+        Let first_content be line_start
+        Let skipping be 1
+        While skipping is 1:
+            If first_content is less than effective_end:
+                Let lead_ch be __load8(content, first_content)
+                If lead_ch is 32:
+                    Set first_content to first_content plus 1
+                Otherwise:
+                    If lead_ch is 9:
+                        Set first_content to first_content plus 1
+                    Otherwise:
+                        Set skipping to 0
+                    End If
+                End If
+            Otherwise:
+                Set skipping to 0
+            End If
+        End While
+
+        Note: Process the line unless it is blank or a '#' comment
+        If first_content is less than effective_end:
+            Let head_ch be __load8(content, first_content)
+            If head_ch is not 35:
+                Note: Find the first '=' separator on the line
+                Let eq_pos be first_content
+                Let eq_found be 0
+                Let searching be 1
+                While searching is 1:
+                    If eq_pos is less than effective_end:
+                        Let sep_ch be __load8(content, eq_pos)
+                        If sep_ch is 61:
+                            Set eq_found to 1
+                            Set searching to 0
+                        Otherwise:
+                            Set eq_pos to eq_pos plus 1
+                        End If
+                    Otherwise:
+                        Set searching to 0
+                    End If
+                End While
+
+                If eq_found is 1:
+                    Note: Trim the foreign side: [first_content, eq_pos)
+                    Let foreign_start be first_content
+                    Let foreign_end be eq_pos
+                    Let trimming be 1
+                    While trimming is 1:
+                        If foreign_end is greater than foreign_start:
+                            Let tail_ch be __load8(content, foreign_end minus 1)
+                            If tail_ch is 32:
+                                Set foreign_end to foreign_end minus 1
+                            Otherwise:
+                                If tail_ch is 9:
+                                    Set foreign_end to foreign_end minus 1
+                                Otherwise:
+                                    Set trimming to 0
+                                End If
+                            End If
+                        Otherwise:
+                            Set trimming to 0
+                        End If
+                    End While
+
+                    Note: Trim the canonical side: (eq_pos, effective_end)
+                    Let canonical_start be eq_pos plus 1
+                    Set trimming to 1
+                    While trimming is 1:
+                        If canonical_start is less than effective_end:
+                            Let lead2_ch be __load8(content, canonical_start)
+                            If lead2_ch is 32:
+                                Set canonical_start to canonical_start plus 1
+                            Otherwise:
+                                If lead2_ch is 9:
+                                    Set canonical_start to canonical_start plus 1
+                                Otherwise:
+                                    Set trimming to 0
+                                End If
+                            End If
+                        Otherwise:
+                            Set trimming to 0
+                        End If
+                    End While
+                    Let canonical_end be effective_end
+                    Set trimming to 1
+                    While trimming is 1:
+                        If canonical_end is greater than canonical_start:
+                            Let tail2_ch be __load8(content, canonical_end minus 1)
+                            If tail2_ch is 32:
+                                Set canonical_end to canonical_end minus 1
+                            Otherwise:
+                                If tail2_ch is 9:
+                                    Set canonical_end to canonical_end minus 1
+                                Otherwise:
+                                    Set trimming to 0
+                                End If
+                            End If
+                        Otherwise:
+                            Set trimming to 0
+                        End If
+                    End While
+
+                    Let foreign_len be foreign_end minus foreign_start
+                    Let canonical_len be canonical_end minus canonical_start
+                    If foreign_len is greater than 0:
+                        If canonical_len is greater than 0:
+                            Note: Both sides non-empty: register the mapping.
+                            Note: The substrings become catalog-owned (the
+                            Note: dictionaries store the key/value pointers),
+                            Note: so they are NOT deallocated here.
+                            Let foreign_kw be proc string_substring from StringPrim with content, foreign_start, foreign_len
+                            Let canonical_kw be proc string_substring from StringPrim with content, canonical_start, canonical_len
+                            Let added be add_catalog_entry(catalog, foreign_kw, canonical_kw)
+                            If added is 1:
+                                Set loaded to loaded plus 1
+                            Otherwise:
+                                Set malformed to malformed plus 1
+                            End If
+                        Otherwise:
+                            Set malformed to malformed plus 1
+                        End If
+                    Otherwise:
+                        Set malformed to malformed plus 1
+                    End If
+                Otherwise:
+                    Note: No '=' separator: malformed line
+                    Set malformed to malformed plus 1
+                End If
+            End If
+        End If
+
+        Set pos to line_end plus 1
+    End While
+
+    proc deallocate from Layout with content
+
+    If malformed is greater than 0:
+        Display "Warning: skipped malformed catalog line(s) in: "
+        Display path
+    End If
+
+    Return loaded
 End Process
 
 Note: ============================================================================
@@ -405,61 +624,119 @@ Process called "protect_literals" that takes source as Integer returns Integer:
         Return 0
     End If
 
-    Let placeholders be proc dictionary_create from Dictionary with 64
-    Let source_len be proc string_length from StringUtils with source
-    Let output be proc string_create from StringUtils with source_len plus 256
+    Let placeholders be proc create from Dictionary
+    Let source_len be proc string_length from StringCore with source
+    Let output be proc stringbuilder_create_with_capacity from StringBuilder with source_len plus 256
     Let pos be 0
     Let placeholder_id be PLACEHOLDER_PREFIX
-    Let in_string be 0
 
     While pos is less than source_len:
         Let ch be __load8(source, pos)
 
         Note: Detect string literals (between double quotes)
         If ch is 34:
-            Note: Found a quote - capture entire string literal
+            Note: Found a quote - locate the closing quote, honouring
+            Note: backslash escapes so an embedded \" does not end the literal
             Let literal_start be pos
-            Set pos to pos plus 1
-            While pos is less than source_len:
-                Let inner_ch be __load8(source, pos)
-                If inner_ch is 34:
-                    Set pos to pos plus 1
-                    Note: Extract the literal including quotes
-                    Let literal_len be pos minus literal_start
-                    Let literal be proc string_substring from StringUtils with source, literal_start, literal_len
-                    Note: Generate placeholder and store mapping
-                    proc dictionary_set from Dictionary with placeholders, placeholder_id, literal
-                    Note: Write placeholder marker to output
-                    proc string_append_char from StringUtils with output, 1
-                    proc string_append_integer from StringUtils with output, placeholder_id
-                    proc string_append_char from StringUtils with output, 1
-                    Set placeholder_id to placeholder_id plus 1
-                    Set pos to pos minus 1
-                    Note: Break out of inner loop
-                    Set pos to source_len plus literal_start
+            Let close_pos be pos plus 1
+            Let found_close be 0
+            Let scanning be 1
+            While scanning is 1:
+                If close_pos is less than source_len:
+                    Let inner_ch be __load8(source, close_pos)
+                    If inner_ch is 34:
+                        Set found_close to 1
+                        Set scanning to 0
+                    Otherwise:
+                        If inner_ch is 92:
+                            Note: Escape sequence: skip the escaped byte too
+                            Set close_pos to close_pos plus 2
+                        Otherwise:
+                            Set close_pos to close_pos plus 1
+                        End If
+                    End If
+                Otherwise:
+                    Set scanning to 0
                 End If
-                Set pos to pos plus 1
             End While
-            Note: Adjust pos if we broke out via the sentinel trick
-            If pos is greater than source_len:
-                Set pos to pos minus source_len
+
+            If found_close is 1:
+                Note: Extract the literal including both quotes
+                Let literal_len be close_pos plus 1 minus literal_start
+                Let literal be proc string_substring from StringPrim with source, literal_start, literal_len
+                Note: Generate placeholder and store mapping. Dictionary
+                Note: keys are strings, so the numeric id is stored under
+                Note: its decimal-string form (matching the marker text).
+                Let id_key be proc integer_to_string from StringUtils with placeholder_id
+                proc set from Dictionary with placeholders, id_key, literal
+                Note: Write placeholder marker to output
+                proc stringbuilder_append_char from StringBuilder with output, 1
+                proc stringbuilder_append_integer from StringBuilder with output, placeholder_id
+                proc stringbuilder_append_char from StringBuilder with output, 1
+                Set placeholder_id to placeholder_id plus 1
+                Note: Resume scanning right after the closing quote
+                Set pos to close_pos plus 1
+            Otherwise:
+                Note: Unterminated literal: emit the quote verbatim and
+                Note: continue so no source text is lost
+                proc stringbuilder_append_char from StringBuilder with output, ch
+                Set pos to pos plus 1
             End If
         Otherwise:
-            proc string_append_char from StringUtils with output, ch
+            proc stringbuilder_append_char from StringBuilder with output, ch
+            Set pos to pos plus 1
         End If
-
-        Set pos to pos plus 1
     End While
 
-    __store(result, 0, output)
+    Note: Extract the finished C string from the builder so downstream
+    Note: phases (which index the text byte-by-byte) receive a plain string
+    Let output_str be proc stringbuilder_to_string from StringBuilder with output
+    proc stringbuilder_destroy from StringBuilder with output
+
+    __store(result, 0, output_str)
     __store(result, 8, placeholders)
     Return result
 End Process
 
+Process called "is_word_character" that takes ch as Integer returns Integer:
+    Note: Returns 1 when the byte can be part of a keyword/identifier word:
+    Note: ASCII letters, digits, underscore, or any byte >= 128 (UTF-8 lead
+    Note: and continuation bytes, so non-Latin keywords form whole words).
+    If ch is greater than or equal to 65:
+        If ch is less than or equal to 90:
+            Return 1
+        End If
+    End If
+    If ch is greater than or equal to 97:
+        If ch is less than or equal to 122:
+            Return 1
+        End If
+    End If
+    If ch is greater than or equal to 48:
+        If ch is less than or equal to 57:
+            Return 1
+        End If
+    End If
+    If ch is 95:
+        Return 1
+    End If
+    If ch is greater than or equal to 128:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Constant MAX_KEYWORD_WORDS as Integer is 8
+
 Process called "apply_keyword_mapping" that takes text as Integer, catalog as Integer, direction as Integer returns Integer:
     Note: Replaces known keywords in text using the catalog's dictionary.
     Note: Uses the appropriate direction (to_canonical or from_canonical).
-    Note: Performs word-boundary-aware replacement to avoid partial matches.
+    Note: Performs word-boundary-aware, longest-match-first replacement: at
+    Note: each word boundary up to MAX_KEYWORD_WORDS consecutive words
+    Note: (separated by single spaces) are considered, and the longest
+    Note: phrase with a catalog entry wins. This is what makes multi-word
+    Note: keywords such as "is greater than or equal to" translate as one
+    Note: unit instead of word-by-word.
     If text is 0:
         Return 0
     End If
@@ -479,84 +756,115 @@ Process called "apply_keyword_mapping" that takes text as Integer, catalog as In
         Return text
     End If
 
-    Note: For each line in the text, scan for keyword matches
-    Note: This is a simplified word-by-word replacement
-    Note: A production implementation would use longest-match-first scanning
-    Let text_len be proc string_length from StringUtils with text
-    Let result be proc string_create from StringUtils with text_len plus 512
+    Note: Scan the text; at each word boundary collect up to
+    Note: MAX_KEYWORD_WORDS consecutive single-space-separated words and
+    Note: replace the LONGEST phrase that has a catalog entry. Word
+    Note: boundaries prevent partial-identifier matches.
+    Let text_len be proc string_length from StringCore with text
+    Let result be proc stringbuilder_create_with_capacity from StringBuilder with text_len plus 512
     Let pos be 0
+
+    Note: Scratch table of phrase end offsets, one 8-byte slot per word
+    Let phrase_ends be proc allocate from Layout with MAX_KEYWORD_WORDS multiplied by 8
+    If phrase_ends is 0:
+        proc stringbuilder_destroy from StringBuilder with result
+        Return 0
+    End If
 
     While pos is less than text_len:
         Let ch be __load8(text, pos)
+        Let starts_word be is_word_character(ch)
 
-        Note: If we're at a word boundary, try to match a keyword
-        Let is_alpha be 0
-        If ch is greater than or equal to 65:
-            If ch is less than or equal to 90:
-                Set is_alpha to 1
-            End If
-        End If
-        If ch is greater than or equal to 97:
-            If ch is less than or equal to 122:
-                Set is_alpha to 1
-            End If
-        End If
-
-        If is_alpha is 1:
-            Note: Extract the word starting at pos
+        If starts_word is 1:
+            Note: Collect consecutive words: record the end offset of each
+            Note: phrase prefix (1 word, 2 words, ...) in phrase_ends
             Let word_start be pos
-            While pos is less than text_len:
-                Let wch be __load8(text, pos)
-                Let still_word be 0
-                If wch is greater than or equal to 65:
-                    If wch is less than or equal to 90:
-                        Set still_word to 1
+            Let scan be pos
+            Let word_count be 0
+            Let collecting be 1
+
+            While collecting is 1:
+                Note: Consume the current word
+                Let in_word be 1
+                While in_word is 1:
+                    If scan is less than text_len:
+                        Let wch be __load8(text, scan)
+                        Let still_word be is_word_character(wch)
+                        If still_word is 1:
+                            Set scan to scan plus 1
+                        Otherwise:
+                            Set in_word to 0
+                        End If
+                    Otherwise:
+                        Set in_word to 0
+                    End If
+                End While
+
+                Note: Record this phrase prefix's end offset
+                __store(phrase_ends, word_count multiplied by 8, scan)
+                Set word_count to word_count plus 1
+
+                Note: Extend to the next word only across a single space
+                Note: followed by another word character
+                Set collecting to 0
+                If word_count is less than MAX_KEYWORD_WORDS:
+                    If scan plus 1 is less than text_len:
+                        Let gap_ch be __load8(text, scan)
+                        If gap_ch is 32:
+                            Let next_ch be __load8(text, scan plus 1)
+                            Let next_is_word be is_word_character(next_ch)
+                            If next_is_word is 1:
+                                Set scan to scan plus 1
+                                Set collecting to 1
+                            End If
+                        End If
                     End If
                 End If
-                If wch is greater than or equal to 97:
-                    If wch is less than or equal to 122:
-                        Set still_word to 1
-                    End If
-                End If
-                If wch is 95:
-                    Set still_word to 1
-                End If
-                If still_word is 0:
-                    Note: End of word
-                    Set pos to pos minus 1
-                    Note: Break
-                    Set pos to text_len plus word_start
-                End If
-                Set pos to pos plus 1
             End While
 
-            Note: Adjust if we broke out
-            If pos is greater than text_len:
-                Set pos to pos minus text_len
-            Otherwise:
-                Set pos to text_len
-            End If
+            Note: Longest-match-first: try the longest collected phrase,
+            Note: then progressively shorter prefixes
+            Let matched be 0
+            Let k be word_count
+            While k is greater than 0:
+                Let phrase_end be __load(phrase_ends, (k minus 1) multiplied by 8)
+                Let phrase_len be phrase_end minus word_start
+                Let candidate be proc string_substring from StringPrim with text, word_start, phrase_len
+                Let replacement be proc get from Dictionary with dict, candidate
+                proc deallocate from Layout with candidate
+                If replacement is not 0:
+                    proc stringbuilder_append from StringBuilder with result, replacement
+                    Set pos to phrase_end
+                    Set matched to 1
+                    Set k to 0
+                Otherwise:
+                    Set k to k minus 1
+                End If
+            End While
 
-            Let word_len be pos minus word_start
-            Let word be proc string_substring from StringUtils with text, word_start, word_len
-
-            Note: Look up in catalog
-            Let replacement be proc dictionary_get from Dictionary with dict, word
-            If replacement is not 0:
-                Note: Found a match - write the replacement
-                proc string_append from StringUtils with result, replacement
-            Otherwise:
-                Note: No match - write the original word
-                proc string_append from StringUtils with result, word
+            If matched is 0:
+                Note: No catalog entry: emit the first word unchanged and
+                Note: resume scanning right after it
+                Let first_end be __load(phrase_ends, 0)
+                Let word_len be first_end minus word_start
+                Let word be proc string_substring from StringPrim with text, word_start, word_len
+                proc stringbuilder_append from StringBuilder with result, word
+                proc deallocate from Layout with word
+                Set pos to first_end
             End If
         Otherwise:
-            Note: Non-alphabetic character - copy as-is
-            proc string_append_char from StringUtils with result, ch
+            Note: Non-word character - copy as-is
+            proc stringbuilder_append_char from StringBuilder with result, ch
             Set pos to pos plus 1
         End If
     End While
 
-    Return result
+    proc deallocate from Layout with phrase_ends
+
+    Note: Extract the finished C string from the builder for downstream phases
+    Let result_str be proc stringbuilder_to_string from StringBuilder with result
+    proc stringbuilder_destroy from StringBuilder with result
+    Return result_str
 End Process
 
 Process called "restore_literals" that takes text as Integer, placeholders as Integer returns Integer:
@@ -569,48 +877,62 @@ Process called "restore_literals" that takes text as Integer, placeholders as In
     End If
 
     Note: Scan for placeholder markers (SOH + id + SOH) and replace
-    Let text_len be proc string_length from StringUtils with text
-    Let result be proc string_create from StringUtils with text_len plus 256
+    Let text_len be proc string_length from StringCore with text
+    Let result be proc stringbuilder_create_with_capacity from StringBuilder with text_len plus 256
     Let pos be 0
 
     While pos is less than text_len:
         Let ch be __load8(text, pos)
 
         If ch is 1:
-            Note: Start of placeholder marker - read the ID
-            Set pos to pos plus 1
-            Let id_start be pos
-            While pos is less than text_len:
-                Let id_ch be __load8(text, pos)
-                If id_ch is 1:
-                    Note: End of placeholder marker
-                    Note: Extract the numeric ID
-                    Let id_len be pos minus id_start
-                    Let id_str be proc string_substring from StringUtils with text, id_start, id_len
-                    Let placeholder_id be proc string_to_integer from StringUtils with id_str
-
-                    Note: Look up original literal
-                    Let original be proc dictionary_get from Dictionary with placeholders, placeholder_id
-                    If original is not 0:
-                        proc string_append from StringUtils with result, original
+            Note: Start of placeholder marker - locate the closing SOH byte
+            Let id_start be pos plus 1
+            Let id_end be id_start
+            Let found_end be 0
+            Let scanning be 1
+            While scanning is 1:
+                If id_end is less than text_len:
+                    Let id_ch be __load8(text, id_end)
+                    If id_ch is 1:
+                        Set found_end to 1
+                        Set scanning to 0
+                    Otherwise:
+                        Set id_end to id_end plus 1
                     End If
-                    Set pos to pos plus 1
-                    Note: Break
-                    Set pos to text_len plus id_start
+                Otherwise:
+                    Set scanning to 0
                 End If
-                Set pos to pos plus 1
             End While
 
-            If pos is greater than text_len:
-                Set pos to pos minus text_len
+            If found_end is 1:
+                Note: Look up the original literal. The marker text between
+                Note: the SOH bytes is the decimal-string key under which
+                Note: protect_literals stored the literal, so it is used
+                Note: directly with no integer round-trip.
+                Let id_len be id_end minus id_start
+                Let id_str be proc string_substring from StringPrim with text, id_start, id_len
+                Let original be proc get from Dictionary with placeholders, id_str
+                proc deallocate from Layout with id_str
+                If original is not 0:
+                    proc stringbuilder_append from StringBuilder with result, original
+                End If
+                Note: Resume scanning right after the closing SOH byte
+                Set pos to id_end plus 1
+            Otherwise:
+                Note: Stray marker byte with no terminator: drop it and
+                Note: continue with the next byte
+                Set pos to pos plus 1
             End If
         Otherwise:
-            proc string_append_char from StringUtils with result, ch
+            proc stringbuilder_append_char from StringBuilder with result, ch
             Set pos to pos plus 1
         End If
     End While
 
-    Return result
+    Note: Extract the finished C string from the builder for downstream consumers
+    Let result_str be proc stringbuilder_to_string from StringBuilder with result
+    proc stringbuilder_destroy from StringBuilder with result
+    Return result_str
 End Process
 
 Note: ============================================================================
@@ -686,6 +1008,8 @@ Process called "run_translate" that takes argc as Integer, argv as Integer retur
     Let direction be DIRECTION_TO_CANONICAL
     Let do_roundtrip be 0
     Let do_list be 0
+    Let catalog_override_lang be 0
+    Let catalog_override_path be 0
     Let ptr_size be 8
     Let i be 1
 
@@ -737,6 +1061,20 @@ Process called "run_translate" that takes argc as Integer, argv as Integer retur
             Let is_list be proc string_compare from StringUtils with arg, "--list"
             If is_list is 0:
                 Set do_list to 1
+            End If
+
+            Let is_catalog be proc string_compare from StringUtils with arg, "--catalog"
+            If is_catalog is 0:
+                Set i to i plus 1
+                If i is less than argc:
+                    Set next_ptr to argv plus (i multiplied by ptr_size)
+                    Set catalog_override_lang to __load(next_ptr, 0)
+                End If
+                Set i to i plus 1
+                If i is less than argc:
+                    Set next_ptr to argv plus (i multiplied by ptr_size)
+                    Set catalog_override_path to __load(next_ptr, 0)
+                End If
             End If
 
             Note: Positional argument = source file
@@ -796,17 +1134,17 @@ Process called "run_translate" that takes argc as Integer, argv as Integer retur
         Return TRANSLATE_SUCCESS
     End If
 
-    Note: Read source file
-    Let source be proc read_file from FileUtils with source_path
+    Note: Read source file (whole-file read; returns heap buffer or 0)
+    Let source be proc read_file_data from FileOps with source_path
     If source is 0:
         Display "Error: Cannot read file: "
         Display source_path
         Return TRANSLATE_FAILURE
     End If
 
-    Note: Load the language catalog
-    Note: Catalogs are loaded from dev_tools/syntax_converter/localization/catalogs/
-    Note: For now, create an empty catalog - native speakers populate these
+    Note: Load the language catalog. Community-maintained catalog files live
+    Note: in dev_tools/syntax_converter/localization/catalogs/<lang>.catalog;
+    Note: --catalog <lang> <file> overrides the location for that language.
     Let lang_name be get_language_name(lang_id)
     Let catalog be create_language_catalog(lang_id, lang_code, lang_name)
     If catalog is 0:
@@ -814,9 +1152,33 @@ Process called "run_translate" that takes argc as Integer, argv as Integer retur
         Return TRANSLATE_FAILURE
     End If
 
-    Note: TODO: Load catalog entries from disk file
-    Note: The catalog files are community-maintained and loaded at runtime
-    Note: For now, the framework is in place for catalog loading
+    Note: Resolve the catalog file path: a --catalog override applies when
+    Note: its language code matches the active translation language (or when
+    Note: no code was supplied with the override).
+    Let catalog_path be 0
+    If catalog_override_path is not 0:
+        Let override_matches be 1
+        If catalog_override_lang is not 0:
+            Let override_cmp be proc string_compare from StringUtils with catalog_override_lang, lang_code
+            If override_cmp is not 0:
+                Set override_matches to 0
+            End If
+        End If
+        If override_matches is 1:
+            Set catalog_path to catalog_override_path
+        End If
+    End If
+    If catalog_path is 0:
+        Set catalog_path to proc string_concat from StringUtils with "dev_tools/syntax_converter/localization/catalogs/", lang_code
+        Set catalog_path to proc string_concat from StringUtils with catalog_path, ".catalog"
+    End If
+
+    Let entries_loaded be load_catalog_from_file(catalog, catalog_path)
+    If entries_loaded is 0:
+        Display "Warning: no catalog entries loaded (missing or empty catalog file): "
+        Display catalog_path
+        Display "Keywords will pass through untranslated."
+    End If
 
     Note: Handle round-trip validation
     If do_roundtrip is 1:
@@ -848,10 +1210,9 @@ Process called "run_translate" that takes argc as Integer, argv as Integer retur
         Return TRANSLATE_FAILURE
     End If
 
-    Note: Write output
+    Note: Write output (write_file returns 0 on success, non-zero on failure)
     If output_path is not 0:
-        Let write_len be proc string_length from StringUtils with translated
-        Let write_result be proc write_file from FileUtils with output_path, translated, write_len
+        Let write_result be proc write_file from FileOps with output_path, translated
         If write_result is not 0:
             Display "Error: Failed to write output file"
             Return TRANSLATE_FAILURE

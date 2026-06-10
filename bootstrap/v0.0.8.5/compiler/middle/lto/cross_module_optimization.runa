@@ -47,6 +47,7 @@ Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 @Reasoning
 Cross-module optimization (CMO) applies whole-program analysis results to perform
@@ -216,7 +217,7 @@ Initializes all fields and prepares for optimization.
 
 Process called "create_cross_module_optimizer" that takes wpa as Integer, mir as Integer returns Integer:
     Note: Allocate CrossModuleOptimizer (104 bytes)
-    Let cmo be proc memory_allocate from Layout with 104
+    Let cmo be proc allocate from Layout with 104
 
     If cmo is equal to 0:
         Return 0
@@ -504,7 +505,7 @@ Process called "select_inlining_candidates" that takes cmo as Integer returns In
         Let wpa_candidate be proc get from List with wpa_candidates, i
 
         Note: Create CrossModuleInlineCandidate
-        Let cmo_candidate be proc memory_allocate from Layout with 80
+        Let cmo_candidate be proc allocate from Layout with 80
 
         Note: Extract info from WPA candidate
         Note: WPA candidate is tuple (caller_id, callee_id, benefit)
@@ -648,7 +649,7 @@ Process called "clone_function_body" that takes cmo as Integer, function as Inte
     End If
 
     Note: Create new CFG for clone
-    Let cloned_cfg be proc memory_allocate from Layout with 96
+    Let cloned_cfg be proc allocate from Layout with 96
     proc memory_set_int64 from Layout with cloned_cfg, 0, List.create( )    Note: blocks
     proc memory_set_int64 from Layout with cloned_cfg, 8, 0 Note: entry_block
     proc memory_set_int64 from Layout with cloned_cfg, 16, List.create( )   Note: block_list
@@ -663,7 +664,7 @@ Process called "clone_function_body" that takes cmo as Integer, function as Inte
         Let block be proc get from List with blocks, i
 
         Note: Clone block
-        Let cloned_block be proc memory_allocate from Layout with 48
+        Let cloned_block be proc allocate from Layout with 48
         Let block_id be proc memory_get_int64 from Layout with block, 0
         proc memory_set_int64 from Layout with cloned_block, 0, block_id
         proc memory_set_int64 from Layout with cloned_block, 8, List.create( )   Note: predecessors
@@ -681,7 +682,7 @@ Process called "clone_function_body" that takes cmo as Integer, function as Inte
             Let inst be proc get from List with instructions, j
 
             Note: Clone instruction - field-by-field copy of all 8 MIRNode fields (64 bytes)
-            Let cloned_inst be proc memory_allocate from Layout with 64
+            Let cloned_inst be proc allocate from Layout with 64
             Let opcode be proc memory_get_int64 from Layout with inst, 0
             proc memory_set_int64 from Layout with cloned_inst, 0, opcode Note: opcode
             proc memory_set_int64 from Layout with cloned_inst, 8, Layout.memory_get_int64(inst, 8 )    Note: value_id
@@ -857,6 +858,158 @@ merge_exception_handlers merges exception handling info from inlined function.
 Ensures exception semantics preserved after inlining.
 @End Reasoning
 
+@Reasoning
+Inlining across module boundaries must preserve two pieces of function
+metadata: the exception table (which handler covers which instruction
+range) and the debug information (which source location produced which
+instruction, and through which inlining chain). The records below are the
+canonical shapes consumed by merge_exception_handlers and
+update_debug_info in this module:
+
+ExceptionTable (16 bytes): handlers List at offset 0, handler count at
+offset 8. Each handler is a 32-byte record (try_start, try_end,
+catch_block, exception_type).
+
+DebugInfo (24 bytes): line_map Dictionary at offset 0 (0 until first use;
+update_debug_info lazily creates it), inlining_chain List at offset 8,
+chain entry count at offset 16. Each chain entry is the 24-byte record
+built by update_debug_info (inlined function, call site location, callee
+debug info).
+
+An instruction's "location" is its metadata pointer (canonical MIRNode
+offset 64) - the slot the MIR contract reserves for optional metadata,
+including source positions. It is treated as an opaque token by the debug
+merge: equal tokens mean same source position, 0 means no recorded
+position.
+@End Reasoning
+
+Process called "create_exception_table" returns Integer:
+    Let table be proc allocate from Layout with 16
+    If table is equal to 0:
+        Return 0
+    End If
+
+    Let handlers be proc create from List
+    proc memory_set_int64 from Layout with table, 0, handlers
+    proc memory_set_int64 from Layout with table, 8, 0
+
+    Return table
+End Process
+
+Process called "add_exception_handler" that takes table as Integer, handler as Integer returns Integer:
+    If table is equal to 0:
+        Return 0
+    End If
+    If handler is equal to 0:
+        Return 0
+    End If
+
+    Let handlers be proc memory_get_int64 from Layout with table, 0
+    If handlers is equal to 0:
+        Set handlers to proc create from List
+        proc memory_set_int64 from Layout with table, 0, handlers
+    End If
+
+    proc append from List with handlers, handler
+
+    Let count be proc memory_get_int64 from Layout with table, 8
+    proc memory_set_int64 from Layout with table, 8, count plus 1
+
+    Return 1
+End Process
+
+Process called "create_debug_info" returns Integer:
+    Let debug be proc allocate from Layout with 24
+    If debug is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with debug, 0, 0
+
+    Let chain be proc create from List
+    proc memory_set_int64 from Layout with debug, 8, chain
+    proc memory_set_int64 from Layout with debug, 16, 0
+
+    Return debug
+End Process
+
+Process called "add_inlining_chain_entry" that takes debug as Integer, entry as Integer returns Integer:
+    If debug is equal to 0:
+        Return 0
+    End If
+    If entry is equal to 0:
+        Return 0
+    End If
+
+    Let chain be proc memory_get_int64 from Layout with debug, 8
+    If chain is equal to 0:
+        Set chain to proc create from List
+        proc memory_set_int64 from Layout with debug, 8, chain
+    End If
+
+    proc append from List with chain, entry
+
+    Let count be proc memory_get_int64 from Layout with debug, 16
+    proc memory_set_int64 from Layout with debug, 16, count plus 1
+
+    Return 1
+End Process
+
+Process called "get_instruction_location" that takes inst as Integer returns Integer:
+    If inst is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with inst, 64
+End Process
+
+@Reasoning
+After inlining, the callee's line-number mappings stay valid for the
+instructions that were copied into the caller, so they are merged into the
+caller's map. On a key collision the caller's existing entry wins - the
+caller's mapping describes the instruction as it exists in the merged
+function, while the callee's entry describes the pre-inline body. Callee
+entries with a zero value (no recorded source line) inherit the call-site
+location, which is the most precise position the merged function can
+attribute to them.
+@End Reasoning
+
+Process called "merge_line_number_mappings" that takes caller_map as Integer, callee_map as Integer, call_site_location as Integer returns Integer:
+    If caller_map is equal to 0:
+        Return 0
+    End If
+    If callee_map is equal to 0:
+        Return 0
+    End If
+
+    Let callee_keys be proc keys from Dictionary with callee_map
+    If callee_keys is equal to 0:
+        Return 0
+    End If
+
+    Let key_count be proc length from List with callee_keys
+    Let merged be 0
+
+    Let i be 0
+    While i is less than key_count:
+        Let map_key be proc get from List with callee_keys, i
+        Let existing be proc get from Dictionary with caller_map, map_key
+
+        If existing is equal to 0:
+            Let callee_value be proc get from Dictionary with callee_map, map_key
+            If callee_value is equal to 0:
+                Set callee_value to call_site_location
+            End If
+            proc set from Dictionary with caller_map, map_key, callee_value
+            Set merged to merged plus 1
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return merged
+End Process
+
 Process called "merge_exception_handlers" that takes cmo as Integer, caller_func as Integer, callee_func as Integer returns Integer:
     Note: Exception handler merging
     Note: Get caller and callee exception tables from function metadata
@@ -1029,6 +1182,56 @@ Algorithm:
 5. Fold constant expressions
 6. Eliminate dead conditionals
 @End Reasoning
+
+@Reasoning
+Constant propagation and dead-conditional elimination need to ask "is this
+SSA value a compile-time constant, and if so what is it?". The canonical
+MIRFunction record keeps its local SSA values as a List of MIRValue
+records at offset 40 with the count at offset 48; each MIRValue carries an
+is_constant flag at offset 40 and the constant payload at offset 48.
+
+The contract consumed by the callers in this module is: return a pointer
+whose offset 0 holds the constant payload, or 0 when the value is not a
+known constant. Returning the address of the MIRValue's constant_value
+field satisfies that contract with zero allocation - the "constant value
+structure" IS the tail of the MIRValue record, and it stays valid for the
+lifetime of the function's value list.
+@End Reasoning
+
+Process called "get_constant_value" that takes func as Integer, value_id as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+    If value_id is equal to 0:
+        Return 0
+    End If
+
+    Let values be proc memory_get_int64 from Layout with func, 40
+    If values is equal to 0:
+        Return 0
+    End If
+
+    Let value_count be proc memory_get_int64 from Layout with func, 48
+
+    Let i be 0
+    While i is less than value_count:
+        Let value be proc get from List with values, i
+        If value is not equal to 0:
+            Let vid be proc memory_get_int64 from Layout with value, 0
+            If vid is equal to value_id:
+                Let is_constant be proc memory_get_int64 from Layout with value, 40
+                If is_constant is equal to 1:
+                    Note: Address of the constant_value field (offset 48)
+                    Return value plus 48
+                End If
+                Return 0
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
 
 Process called "perform_global_constant_propagation" that takes cmo as Integer returns Integer:
     Note: Identify constant values
@@ -2009,6 +2212,71 @@ resolve_name_conflicts resolves name conflicts between modules.
 Renames symbols to avoid collisions.
 @End Reasoning
 
+@Reasoning
+Name-conflict resolution operates on MergeSymbol records. The canonical
+MergeSymbol shape consumed and maintained by this module is a 40-byte
+record: name pointer at offset 0, owning module ID at offset 8, symbol
+kind at offset 16, definition pointer at offset 24 (the function or global
+record the symbol names), and a references List at offset 32. Each
+reference in that List is the address of a name slot (an 8-byte cell that
+holds the symbol's name pointer) somewhere in the merged program; storing
+slot addresses rather than name copies lets a rename update every use site
+with one pointer write per reference and no string traversal.
+@End Reasoning
+
+Process called "get_symbol_module_id" that takes symbol as Integer returns Integer:
+    If symbol is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with symbol, 8
+End Process
+
+Process called "update_symbol_name" that takes symbol as Integer, new_name as Integer returns Integer:
+    If symbol is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with symbol, 0, new_name
+
+    Note: The symbol's definition record carries its own name slot at
+    Note: offset 0 (canonical for both MIRFunction records and global
+    Note: records); keep it in sync so the definition and the symbol
+    Note: table never disagree about the symbol's name.
+    Let definition be proc memory_get_int64 from Layout with symbol, 24
+    If definition is not equal to 0:
+        proc memory_set_int64 from Layout with definition, 0, new_name
+    End If
+
+    Return 1
+End Process
+
+Process called "update_symbol_references" that takes cmo as Integer, symbol as Integer, new_name as Integer returns Integer:
+    If symbol is equal to 0:
+        Return 0
+    End If
+
+    Let references be proc memory_get_int64 from Layout with symbol, 32
+    If references is equal to 0:
+        Return 0
+    End If
+
+    Let ref_count be proc length from List with references
+    Let updated be 0
+
+    Let i be 0
+    While i is less than ref_count:
+        Let name_slot be proc get from List with references, i
+        If name_slot is not equal to 0:
+            proc memory_set_int64 from Layout with name_slot, 0, new_name
+            Set updated to updated plus 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return updated
+End Process
+
 Process called "resolve_name_conflicts" that takes cmo as Integer, merge_info as Integer returns Integer:
     Let name_conflicts be proc memory_get_int64 from Layout with merge_info, 40
     Let conflict_count be proc length from List with name_conflicts
@@ -2025,13 +2293,13 @@ Process called "resolve_name_conflicts" that takes cmo as Integer, merge_info as
 
         Note: Generate unique name for symbol2 by appending module ID and counter
         Let symbol2_module be get_symbol_module_id(symbol2)
-        Let module_str be proc int_to_string from StringCore with symbol2_module
-        Let i_str be proc int_to_string from StringCore with i
-        Let unique_suffix be proc string_concat from StringCore with "_m", module_str
-        Set unique_suffix to proc string_concat from StringCore with unique_suffix, "_"
-        Set unique_suffix to proc string_concat from StringCore with unique_suffix, i_str
+        Let module_str be proc integer_to_string from StringUtils with symbol2_module
+        Let i_str be proc integer_to_string from StringUtils with i
+        Let unique_suffix be proc string_concat from StringUtils with "_m", module_str
+        Set unique_suffix to proc string_concat from StringUtils with unique_suffix, "_"
+        Set unique_suffix to proc string_concat from StringUtils with unique_suffix, i_str
 
-        Let new_name be proc string_concat from StringCore with original_name, unique_suffix
+        Let new_name be proc string_concat from StringUtils with original_name, unique_suffix
 
         Note: Update symbol name in symbol table
         update_symbol_name(symbol2, new_name)
@@ -2861,6 +3129,574 @@ apply_interprocedural_opts applies IPA-based optimizations.
 Uses WPA IPA results for optimization decisions.
 @End Reasoning
 
+@Reasoning
+The four IPA workers below consume the whole-program analysis results
+(pure_functions / const_functions Sets of function IDs, side_effect_info
+Dictionary of function_id -> IPA info with the side-effect flag word at
+offset 88) and apply them to the canonical MIR (functions List at program
+offset 0, count at 8; per-function CFG at offset 8; blocks List at CFG
+offset 16 with count at 24; per-block instruction List at offset 16 with
+the cached count at 24; instruction opcode at offset 0, defined value ID
+at offset 8, direct-call callee ID at offset 16).
+
+Soundness rules applied:
+- A call to a PURE function whose result is unused (defines no value, or
+  its MIRValue records zero uses) is dead and may be deleted.
+- Two identical direct calls to a CONST function inside one basic block
+  always produce the same value (const functions read no mutable state and
+  identical SSA operand IDs denote identical values), so the later call is
+  memoized by rewiring its uses to the earlier call's value and deleting
+  it.
+- A function is "memory-only" when its side-effect flags contain at most
+  memory read/write effects - no I/O (4), no exceptions (8), no external
+  calls (16), no global state (32).
+- A call may move earlier past an adjacent instruction only when the
+  neighbor is a pure compute instruction (opcode 20000-20099, no memory
+  access), neither instruction consumes the other's defined value, and the
+  call's own effects are read-only memory (writes do not commute with
+  anything that could observe them). Grouping read-only memory calls
+  earlier shortens their live ranges and exposes them to local CSE.
+@End Reasoning
+
+Process called "eliminate_unused_pure_calls" that takes mir as Integer, pure_functions as Integer returns Integer:
+    If mir is equal to 0:
+        Return 0
+    End If
+    If pure_functions is equal to 0:
+        Return 0
+    End If
+
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    Let function_count be proc memory_get_int64 from Layout with mir, 8
+    Let eliminated be 0
+
+    Let f be 0
+    While f is less than function_count:
+        Let func be proc get from List with functions, f
+        If func is not equal to 0:
+            Let cfg be proc memory_get_int64 from Layout with func, 8
+            If cfg is not equal to 0:
+                Let blocks be proc memory_get_int64 from Layout with cfg, 16
+                Let block_count be proc memory_get_int64 from Layout with cfg, 24
+
+                Let b be 0
+                While b is less than block_count:
+                    Let block be proc get from List with blocks, b
+                    Let instructions be proc memory_get_int64 from Layout with block, 16
+                    Let live_count be proc memory_get_int64 from Layout with block, 24
+
+                    Let i be 0
+                    While i is less than live_count:
+                        Let inst be proc get from List with instructions, i
+                        Let removed be 0
+
+                        If inst is not equal to 0:
+                            Let opcode be proc memory_get_int64 from Layout with inst, 0
+                            If opcode is equal to 20304:
+                                Let callee_id be proc memory_get_int64 from Layout with inst, 16
+                                Let is_pure be proc contains from Set with pure_functions, callee_id
+
+                                If is_pure is equal to 1:
+                                    Note: Dead when the call defines no value, or
+                                    Note: its value has no recorded uses
+                                    Let result_value be proc memory_get_int64 from Layout with inst, 8
+                                    Let is_dead be 0
+                                    If result_value is equal to 0:
+                                        Set is_dead to 1
+                                    Otherwise:
+                                        Let values be proc memory_get_int64 from Layout with func, 40
+                                        Let value_count be proc memory_get_int64 from Layout with func, 48
+                                        Let v be 0
+                                        While v is less than value_count:
+                                            Let value be proc get from List with values, v
+                                            If value is not equal to 0:
+                                                Let vid be proc memory_get_int64 from Layout with value, 0
+                                                If vid is equal to result_value:
+                                                    Let use_count be proc memory_get_int64 from Layout with value, 32
+                                                    If use_count is equal to 0:
+                                                        Set is_dead to 1
+                                                    End If
+                                                    Set v to value_count
+                                                End If
+                                            End If
+                                            Set v to v plus 1
+                                        End While
+                                    End If
+
+                                    If is_dead is equal to 1:
+                                        proc list_remove from List with instructions, i
+                                        Set live_count to live_count minus 1
+                                        proc memory_set_int64 from Layout with block, 24, live_count
+                                        Set eliminated to eliminated plus 1
+                                        Set removed to 1
+                                    End If
+                                End If
+                            End If
+                        End If
+
+                        If removed is equal to 0:
+                            Set i to i plus 1
+                        End If
+                    End While
+
+                    Set b to b plus 1
+                End While
+            End If
+        End If
+        Set f to f plus 1
+    End While
+
+    Return eliminated
+End Process
+
+Process called "memoize_const_function_calls" that takes mir as Integer, const_functions as Integer returns Integer:
+    If mir is equal to 0:
+        Return 0
+    End If
+    If const_functions is equal to 0:
+        Return 0
+    End If
+
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    Let function_count be proc memory_get_int64 from Layout with mir, 8
+    Let memoized be 0
+
+    Let f be 0
+    While f is less than function_count:
+        Let func be proc get from List with functions, f
+        If func is not equal to 0:
+            Let cfg be proc memory_get_int64 from Layout with func, 8
+            If cfg is not equal to 0:
+                Let blocks be proc memory_get_int64 from Layout with cfg, 16
+                Let block_count be proc memory_get_int64 from Layout with cfg, 24
+
+                Let b be 0
+                While b is less than block_count:
+                    Let block be proc get from List with blocks, b
+                    Let instructions be proc memory_get_int64 from Layout with block, 16
+                    Let live_count be proc memory_get_int64 from Layout with block, 24
+
+                    Let i be 0
+                    While i is less than live_count:
+                        Let inst be proc get from List with instructions, i
+                        Let removed be 0
+
+                        If inst is not equal to 0:
+                            Let opcode be proc memory_get_int64 from Layout with inst, 0
+                            If opcode is equal to 20304:
+                                Let callee_id be proc memory_get_int64 from Layout with inst, 16
+                                Let is_const be proc contains from Set with const_functions, callee_id
+                                Let result_value be proc memory_get_int64 from Layout with inst, 8
+
+                                If is_const is equal to 1:
+                                    If result_value is not equal to 0:
+                                        Note: Search earlier instructions in this
+                                        Note: block for an identical const call
+                                        Let arg2 be proc memory_get_int64 from Layout with inst, 24
+                                        Let arg3 be proc memory_get_int64 from Layout with inst, 32
+                                        Let original_value be 0
+
+                                        Let e be 0
+                                        While e is less than i:
+                                            Let earlier be proc get from List with instructions, e
+                                            If earlier is not equal to 0:
+                                                Let e_opcode be proc memory_get_int64 from Layout with earlier, 0
+                                                If e_opcode is equal to 20304:
+                                                    Let e_callee be proc memory_get_int64 from Layout with earlier, 16
+                                                    Let e_arg2 be proc memory_get_int64 from Layout with earlier, 24
+                                                    Let e_arg3 be proc memory_get_int64 from Layout with earlier, 32
+                                                    Let e_value be proc memory_get_int64 from Layout with earlier, 8
+                                                    If e_callee is equal to callee_id:
+                                                        If e_arg2 is equal to arg2:
+                                                            If e_arg3 is equal to arg3:
+                                                                If e_value is not equal to 0:
+                                                                    Set original_value to e_value
+                                                                    Set e to i
+                                                                End If
+                                                            End If
+                                                        End If
+                                                    End If
+                                                End If
+                                            End If
+                                            Set e to e plus 1
+                                        End While
+
+                                        If original_value is not equal to 0:
+                                            Note: Rewire every use of the duplicate
+                                            Note: call's value to the original value,
+                                            Note: then delete the duplicate call
+                                            rewrite_value_uses(func, result_value, original_value)
+                                            proc list_remove from List with instructions, i
+                                            Set live_count to live_count minus 1
+                                            proc memory_set_int64 from Layout with block, 24, live_count
+                                            Set memoized to memoized plus 1
+                                            Set removed to 1
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+
+                        If removed is equal to 0:
+                            Set i to i plus 1
+                        End If
+                    End While
+
+                    Set b to b plus 1
+                End While
+            End If
+        End If
+        Set f to f plus 1
+    End While
+
+    Return memoized
+End Process
+
+@Reasoning
+SSA use rewiring for memoization: every operand slot in the function that
+names old_value is repointed at new_value. The callee slot (offset 16) of
+direct and indirect calls is skipped because it holds a function ID, not
+an SSA value ID, and the two ID spaces overlap numerically. Phi nodes keep
+their incoming values in the odd slots of the pair List at offset 16, so
+they are rewritten through the pair List rather than the operand slots.
+@End Reasoning
+
+Process called "rewrite_value_uses" that takes func as Integer, old_value as Integer, new_value as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+
+    Let cfg be proc memory_get_int64 from Layout with func, 8
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let blocks be proc memory_get_int64 from Layout with cfg, 16
+    Let block_count be proc memory_get_int64 from Layout with cfg, 24
+    Let rewritten be 0
+
+    Let b be 0
+    While b is less than block_count:
+        Let block be proc get from List with blocks, b
+        Let instructions be proc memory_get_int64 from Layout with block, 16
+        Let inst_count be proc memory_get_int64 from Layout with block, 24
+
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be proc get from List with instructions, i
+            If inst is not equal to 0:
+                Let opcode be proc memory_get_int64 from Layout with inst, 0
+
+                If opcode is equal to 20300:
+                    Note: Phi node - rewrite incoming values (odd pair slots)
+                    Let incoming_pairs be proc memory_get_int64 from Layout with inst, 16
+                    Let incoming_count be proc memory_get_int64 from Layout with inst, 24
+                    If incoming_pairs is not equal to 0:
+                        Let p be 0
+                        While p is less than incoming_count:
+                            Let value_slot be p multiplied by 2 plus 1
+                            Let incoming_value be proc list_get from List with incoming_pairs, value_slot
+                            If incoming_value is equal to old_value:
+                                proc list_set from List with incoming_pairs, value_slot, new_value
+                                Set rewritten to rewritten plus 1
+                            End If
+                            Set p to p plus 1
+                        End While
+                    End If
+                Otherwise:
+                    Note: operand1 (offset 16) holds a function ID for calls -
+                    Note: skip it for call opcodes
+                    Let is_call be 0
+                    If opcode is equal to 20304:
+                        Set is_call to 1
+                    End If
+                    If opcode is equal to 20305:
+                        Set is_call to 1
+                    End If
+
+                    If is_call is equal to 0:
+                        Let operand1 be proc memory_get_int64 from Layout with inst, 16
+                        If operand1 is equal to old_value:
+                            proc memory_set_int64 from Layout with inst, 16, new_value
+                            Set rewritten to rewritten plus 1
+                        End If
+                    End If
+
+                    Let operand2 be proc memory_get_int64 from Layout with inst, 24
+                    If operand2 is equal to old_value:
+                        proc memory_set_int64 from Layout with inst, 24, new_value
+                        Set rewritten to rewritten plus 1
+                    End If
+
+                    Let operand3 be proc memory_get_int64 from Layout with inst, 32
+                    If operand3 is equal to old_value:
+                        proc memory_set_int64 from Layout with inst, 32, new_value
+                        Set rewritten to rewritten plus 1
+                    End If
+                End If
+            End If
+            Set i to i plus 1
+        End While
+
+        Set b to b plus 1
+    End While
+
+    Return rewritten
+End Process
+
+Process called "extract_memory_only_functions" that takes side_effect_info as Integer returns Integer:
+    Let result be proc create from List
+    If result is equal to 0:
+        Return 0
+    End If
+
+    If side_effect_info is equal to 0:
+        Return result
+    End If
+
+    Let function_ids be proc keys from Dictionary with side_effect_info
+    If function_ids is equal to 0:
+        Return result
+    End If
+
+    Let id_count be proc length from List with function_ids
+
+    Let i be 0
+    While i is less than id_count:
+        Let function_id be proc get from List with function_ids, i
+        Let ipa_info be proc get from Dictionary with side_effect_info, function_id
+
+        If ipa_info is not equal to 0:
+            Let flags be proc memory_get_int64 from Layout with ipa_info, 88
+
+            Note: Memory-only: no I/O (4), no exceptions (8), no external
+            Note: calls (16), no global state (32) - mask 60
+            Let non_memory_effects be flags bitwise_and 60
+            If non_memory_effects is equal to 0:
+                proc append from List with result, function_id
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+Process called "reorder_memory_operations" that takes mir as Integer, memory_only_funcs as Integer returns Integer:
+    If mir is equal to 0:
+        Return 0
+    End If
+    If memory_only_funcs is equal to 0:
+        Return 0
+    End If
+
+    Note: Build the set of read-only memory functions: memory-only AND no
+    Note: memory-write flag (2). Only calls to these commute safely.
+    Let read_only_funcs be proc create from Set
+    Let mo_count be proc length from List with memory_only_funcs
+    Let m be 0
+    While m is less than mo_count:
+        Let mo_id be proc get from List with memory_only_funcs, m
+        proc add from Set with read_only_funcs, mo_id
+        Set m to m plus 1
+    End While
+
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    Let function_count be proc memory_get_int64 from Layout with mir, 8
+    Let reordered be 0
+
+    Let f be 0
+    While f is less than function_count:
+        Let func be proc get from List with functions, f
+        If func is not equal to 0:
+            Let cfg be proc memory_get_int64 from Layout with func, 8
+            If cfg is not equal to 0:
+                Let blocks be proc memory_get_int64 from Layout with cfg, 16
+                Let block_count be proc memory_get_int64 from Layout with cfg, 24
+
+                Let b be 0
+                While b is less than block_count:
+                    Let block be proc get from List with blocks, b
+                    Let instructions be proc memory_get_int64 from Layout with block, 16
+                    Let inst_count be proc memory_get_int64 from Layout with block, 24
+
+                    Note: Bubble calls to read-only memory functions upward
+                    Note: past adjacent pure compute instructions when neither
+                    Note: consumes the other's defined value
+                    Let i be 1
+                    While i is less than inst_count:
+                        Let inst be proc get from List with instructions, i
+                        Let moved be 0
+
+                        If inst is not equal to 0:
+                            Let opcode be proc memory_get_int64 from Layout with inst, 0
+                            If opcode is equal to 20304:
+                                Let callee_id be proc memory_get_int64 from Layout with inst, 16
+                                Let is_read_only be proc contains from Set with read_only_funcs, callee_id
+
+                                If is_read_only is equal to 1:
+                                    Let prev be proc get from List with instructions, i minus 1
+                                    If prev is not equal to 0:
+                                        Let prev_opcode be proc memory_get_int64 from Layout with prev, 0
+
+                                        Note: Pure compute neighbors only
+                                        Note: (arithmetic/bitwise band 20000-20099,
+                                        Note: excluding 20000 NOP boundary effects is
+                                        Note: unnecessary - NOP commutes trivially)
+                                        If prev_opcode is greater than or equal to 20000:
+                                            If prev_opcode is less than 20100:
+                                                Let call_value be proc memory_get_int64 from Layout with inst, 8
+                                                Let prev_value be proc memory_get_int64 from Layout with prev, 8
+
+                                                Note: Dependence check both directions
+                                                Let call_arg2 be proc memory_get_int64 from Layout with inst, 24
+                                                Let call_arg3 be proc memory_get_int64 from Layout with inst, 32
+                                                Let prev_op1 be proc memory_get_int64 from Layout with prev, 16
+                                                Let prev_op2 be proc memory_get_int64 from Layout with prev, 24
+                                                Let prev_op3 be proc memory_get_int64 from Layout with prev, 32
+
+                                                Let independent be 1
+                                                If prev_value is not equal to 0:
+                                                    If call_arg2 is equal to prev_value:
+                                                        Set independent to 0
+                                                    End If
+                                                    If call_arg3 is equal to prev_value:
+                                                        Set independent to 0
+                                                    End If
+                                                End If
+                                                If call_value is not equal to 0:
+                                                    If prev_op1 is equal to call_value:
+                                                        Set independent to 0
+                                                    End If
+                                                    If prev_op2 is equal to call_value:
+                                                        Set independent to 0
+                                                    End If
+                                                    If prev_op3 is equal to call_value:
+                                                        Set independent to 0
+                                                    End If
+                                                End If
+
+                                                If independent is equal to 1:
+                                                    Note: Swap the adjacent pair
+                                                    proc list_set from List with instructions, i minus 1, inst
+                                                    proc list_set from List with instructions, i, prev
+                                                    Set reordered to reordered plus 1
+                                                    Set moved to 1
+                                                End If
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+
+                        If moved is equal to 0:
+                            Set i to i plus 1
+                        End If
+                    End While
+
+                    Set b to b plus 1
+                End While
+            End If
+        End If
+        Set f to f plus 1
+    End While
+
+    Return reordered
+End Process
+
+@Reasoning
+Stack promotion consumes the whole-program escape dictionary
+(value_id -> escape status, 1 = escapes; this is the WPA escape_info
+contract). The canonical MIR has no heap-allocation opcode - heap
+allocations appear as direct calls to the program's allocator entry point
+("allocate", whose record is present in the merged whole program that LTO
+operates on; a function's identifying handle in this representation is its
+name pointer, so the callee slot of a direct call to the allocator can be
+recognized by comparing the name's characters). A recognized allocation
+call whose result value does not escape (status 0) is rewritten in place
+into MIR_ALLOCA (20202): the base-node operand1 slot receives the size
+value (the allocator call's first argument, operand2 under the
+callee-in-operand1 call convention) and the now-meaningless second
+argument slot is cleared. Calls to anything that is not provably the
+allocator are never touched - rewriting an arbitrary call would be
+catastrophic, so recognition failure means no promotion (conservative).
+@End Reasoning
+
+Process called "promote_to_stack_allocation" that takes mir as Integer, escape_info as Integer returns Integer:
+    If mir is equal to 0:
+        Return 0
+    End If
+    If escape_info is equal to 0:
+        Return 0
+    End If
+
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    Let function_count be proc memory_get_int64 from Layout with mir, 8
+    Let promoted be 0
+
+    Let f be 0
+    While f is less than function_count:
+        Let func be proc get from List with functions, f
+        If func is not equal to 0:
+            Let cfg be proc memory_get_int64 from Layout with func, 8
+            If cfg is not equal to 0:
+                Let blocks be proc memory_get_int64 from Layout with cfg, 16
+                Let block_count be proc memory_get_int64 from Layout with cfg, 24
+
+                Let b be 0
+                While b is less than block_count:
+                    Let block be proc get from List with blocks, b
+                    Let instructions be proc memory_get_int64 from Layout with block, 16
+                    Let inst_count be proc memory_get_int64 from Layout with block, 24
+
+                    Let i be 0
+                    While i is less than inst_count:
+                        Let inst be proc get from List with instructions, i
+                        If inst is not equal to 0:
+                            Let opcode be proc memory_get_int64 from Layout with inst, 0
+
+                            If opcode is equal to 20304:
+                                Note: Recognize the canonical allocator entry
+                                Note: point by its name characters
+                                Let callee_id be proc memory_get_int64 from Layout with inst, 16
+                                Let is_allocator be 0
+                                If callee_id is not equal to 0:
+                                    Set is_allocator to proc string_equals from StringCore with callee_id, "allocate"
+                                End If
+
+                                If is_allocator is equal to 1:
+                                    Let result_value be proc memory_get_int64 from Layout with inst, 8
+                                    If result_value is not equal to 0:
+                                        Let escape_status be proc get from Dictionary with escape_info, result_value
+                                        If escape_status is equal to 0:
+                                            Note: Rewrite CALL allocate(size) into
+                                            Note: ALLOCA: opcode 20202, operand1 =
+                                            Note: size value, operand2 cleared
+                                            Let size_value be proc memory_get_int64 from Layout with inst, 24
+                                            proc memory_set_int64 from Layout with inst, 0, 20202
+                                            proc memory_set_int64 from Layout with inst, 16, size_value
+                                            proc memory_set_int64 from Layout with inst, 24, 0
+                                            Set promoted to promoted plus 1
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                        Set i to i plus 1
+                    End While
+
+                    Set b to b plus 1
+                End While
+            End If
+        End If
+        Set f to f plus 1
+    End While
+
+    Return promoted
+End Process
+
 Process called "apply_interprocedural_opts" that takes cmo as Integer returns Integer:
     Let wpa be proc memory_get_int64 from Layout with cmo, 0
     Let mir be proc memory_get_int64 from Layout with cmo, 8
@@ -3379,7 +4215,7 @@ Process called "apply_inlining_candidate" that takes cmo as Integer, index as In
     Let callee_id be proc memory_get_int64 from Layout with wpa_candidate, 8
     Let benefit be proc memory_get_int64 from Layout with wpa_candidate, 16
 
-    Let cmo_candidate be proc memory_allocate from Layout with 80
+    Let cmo_candidate be proc allocate from Layout with 80
     If cmo_candidate is equal to 0:
         Return 0
     End If
@@ -3676,7 +4512,7 @@ Process called "apply_dce_dead_function" that takes cmo as Integer, index as Int
         If func is not equal to 0:
             Let fid be proc memory_get_int64 from Layout with func, 0
             If fid is equal to target_func_id:
-                proc remove from List with functions, i
+                proc remove_at from List with functions, i
                 Note: Bump CMO dead_functions_removed counter
                 Let removed_count be proc memory_get_int64 from Layout with cmo, 48
                 Set removed_count to removed_count plus 1

@@ -168,7 +168,7 @@ Process called "set_translation_error" takes context as Integer, message as Inte
     Let new_error be proc allocate from Layout with msg_length plus 1
 
     If new_error is not equal to 0:
-        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_copy from Layout with new_error, message, msg_length
         proc memory_set_byte from Layout with new_error, msg_length, 0
     End If
 
@@ -200,8 +200,8 @@ Process called "register_anchor_translation" takes context as Integer, yaml_node
     End If
 
     Note: Use YAML node pointer as key
-    Let node_ptr_str be proc integer_to_string from yaml_node
-    proc put from Dict with anchor_mapping, node_ptr_str, hir_node
+    Let node_ptr_str be proc integer_to_string with yaml_node
+    proc set from Dict with anchor_mapping, node_ptr_str, hir_node
 
     Return 1
 End Process
@@ -223,7 +223,7 @@ Process called "get_anchor_translation" takes context as Integer, yaml_node as I
         Return 0
     End If
 
-    Let node_ptr_str be proc integer_to_string from yaml_node
+    Let node_ptr_str be proc integer_to_string with yaml_node
     Let hir_node be proc get from Dict with anchor_mapping, node_ptr_str
 
     Return hir_node
@@ -561,17 +561,32 @@ Process called "translate_yaml_scalar" takes context as Integer, yaml_node as In
         Return proc create_hir_boolean_literal from HIR with 0
     End If
 
-    Note: Check for null
+    Note: Check for null ("null" keyword or "~" shorthand)
     Let is_null be proc string_equals with value_string, "null"
-
-    If is_null is equal to 1:
-        Return proc create_hir_null_literal from HIR
-    End If
-
     Let is_tilde be proc string_equals with value_string, "~"
+    Let is_yaml_null be is_null plus is_tilde
 
-    If is_tilde is equal to 1:
-        Return proc create_hir_null_literal from HIR
+    If is_yaml_null is greater than 0:
+        Note: HIR_LITERAL with value_type tag 0 is the Null literal kind: hir.runa assigns tags 1-4 to String/Boolean/Integer/Float payloads and documents Null as the fifth HIR_LITERAL kind, leaving the zero-initialized tag as its representation
+        Let hir_literal_kind be HIR_LITERAL from HIR
+        Let null_line be proc memory_get_int64 from Layout with yaml_node, 64
+        Let null_column be proc memory_get_int64 from Layout with yaml_node, 72
+        Let hir_null be proc create_hir_node from HIR with hir_literal_kind, null_line, null_column
+
+        If hir_null is equal to 0:
+            proc set_translation_error with context, "Failed to create HIR null literal"
+            Return 0
+        End If
+
+        Note: Null carries no payload; attach Optional type info so the type checker sees the none-value type
+        Let hir_optional_kind be HIR_OPTIONAL_TYPE from HIR
+        Let null_type_info be proc create_hir_type_info from HIR with hir_optional_kind
+
+        If null_type_info is not equal to 0:
+            proc set_hir_node_type_info from HIR with hir_null, null_type_info
+        End If
+
+        Return hir_null
     End If
 
     Note: Default to string
@@ -653,7 +668,7 @@ Public entry point that hides the parse + translate + cleanup orchestration; fai
 @End Reasoning
 
 @Implementation:
-Null-check source_code; report and return 0. Create the internal translation context; on OOM report and return 0. Parse via Parser.parse_yaml; on failure report and clean up. Translate the AST root recursively. If the internal context has_error is set after translation, forward the message. Destroy the internal context and return the HIR root (or 0 on error).
+Null-check source_code; report and return 0. Create the internal translation context; on OOM report and return 0. Parse via Parser.parse_yaml; on failure report and clean up. Translate the AST root recursively. If the internal context has_error is set after translation, forward the message. Destroy the internal context and return the HIR root (or 0 on error). Error forwarding appends the message to the outer Translation context's error list (offset 48, per the documented TranslationTranslationContext ABI in translation.runa), mirroring Translation.add_translation_error inline: translation.runa imports this frontend, so importing it back would create an import cycle. Null outer context or null message is a no-op, matching the original semantics.
 @End Implementation
 
 @Security_Scope:
@@ -669,7 +684,13 @@ Process called "translate_yaml_to_hir" takes source_code as Integer, translation
     @End Reasoning
 
     If source_code is equal to 0:
-        proc add_translation_error from Translation with translation_context, "Null source code"
+        Note: Forward to outer Translation context error list (offset 48) - mirrors Translation.add_translation_error
+        If translation_context is not equal to 0:
+            Let outer_errors be proc memory_get_int64 from Layout with translation_context, 48
+            If outer_errors is not equal to 0:
+                proc append from List with outer_errors, "Null source code"
+            End If
+        End If
         Return 0
     End If
 
@@ -677,7 +698,13 @@ Process called "translate_yaml_to_hir" takes source_code as Integer, translation
     Let context be proc create_translation_context
 
     If context is equal to 0:
-        proc add_translation_error from Translation with translation_context, "Out of memory"
+        Note: Forward to outer Translation context error list (offset 48) - mirrors Translation.add_translation_error
+        If translation_context is not equal to 0:
+            Let outer_errors be proc memory_get_int64 from Layout with translation_context, 48
+            If outer_errors is not equal to 0:
+                proc append from List with outer_errors, "Out of memory"
+            End If
+        End If
         Return 0
     End If
 
@@ -685,8 +712,14 @@ Process called "translate_yaml_to_hir" takes source_code as Integer, translation
     Let yaml_ast be proc parse_yaml from Parser with source_code
 
     If yaml_ast is equal to 0:
-        proc add_translation_error from Translation with translation_context, "YAML parse failed"
-        proc destroy_translation_context from context
+        Note: Forward to outer Translation context error list (offset 48) - mirrors Translation.add_translation_error
+        If translation_context is not equal to 0:
+            Let outer_errors be proc memory_get_int64 from Layout with translation_context, 48
+            If outer_errors is not equal to 0:
+                proc append from List with outer_errors, "YAML parse failed"
+            End If
+        End If
+        proc destroy_translation_context with context
         Return 0
     End If
 
@@ -698,13 +731,23 @@ Process called "translate_yaml_to_hir" takes source_code as Integer, translation
 
     If has_error is equal to 1:
         Let error_msg be proc memory_get_int64 from Layout with context, 0
-        proc add_translation_error from Translation with translation_context, error_msg
-        proc destroy_translation_context from context
+        Note: Forward to outer Translation context error list (offset 48) - mirrors Translation.add_translation_error
+        If translation_context is not equal to 0:
+            If error_msg is not equal to 0:
+                Let outer_errors be proc memory_get_int64 from Layout with translation_context, 48
+                If outer_errors is not equal to 0:
+                    proc append from List with outer_errors, error_msg
+                    Note: Ownership of the heap message transfers to the outer consumer; clear it so destroy_translation_context does not free it and leave the outer list dangling
+                    proc memory_set_int64 from Layout with context, 0, 0
+                End If
+            End If
+        End If
+        proc destroy_translation_context with context
         Return 0
     End If
 
     Note: Cleanup
-    proc destroy_translation_context from context
+    proc destroy_translation_context with context
 
     Return hir_root
 End Process

@@ -30,39 +30,37 @@ The 1000-iteration stress loop is deterministic (uses a linear
 congruential generator seeded with a fixed value) so failures
 reproduce identically across runs.
 
-Exit code legend:
-    400 ALL PASS
-    401 First allocation returned 0 (allocator unavailable)
-    402 Repeated allocate/deallocate failed mid-stress
-    403 deallocate of NULL did not return 0
-    404 deallocate of an off-heap pointer triggered abort
-    405 Large-allocation OOM path did not return 0 cleanly
-    406 Pointer not 8-byte aligned (alignment requirement violated)
-    407 Allocation contents corrupted across deallocate/allocate cycle
+Reporting follows the canonical tests/test_utils.runa convention:
+each case is an assert against the expected outcome, the suite prints
+"ALL TESTS PASSED" and exits 0 when every case holds, and exits with
+the failure count otherwise. The stress loop reports a single status
+code (0 = clean; 402 = allocate failed mid-stress; 407 = allocation
+contents corrupted) identifying the first failure class, matching the
+original exit-code legend for this file.
 :End Note
 
+Import "tests/test_utils.runa" as T
 Import "compiler/frontend/primitives/memory/layout.runa" as Heap
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 
 Process called "main" returns Integer:
+    Let results be T.create_test_results()
+    T.begin_suite(results, "runtime.allocator_hygiene")
+
     Note: ============================================================
     Note: Case 1: basic allocate / deallocate round-trip with a
     Note: small (cache-line-sized) buffer. Establishes that the
     Note: allocator is alive and self-consistent.
     Note: ============================================================
     Let p1 be proc allocate from Heap with 64
-    If p1 is equal to 0:
-        Return 401
-    End If
+    T.assert_not_null(results, "Case 1: first allocation succeeds", p1)
 
     Note: 8-byte alignment is a hard invariant: pool slabs hand out
     Note: cells aligned to their size-class (>=8 for size 64), and
     Note: brk/mmap arms round up to 16-byte alignment for SSE
     Note: compatibility.
     Let p1_low_bits be p1 modulo by 8
-    If p1_low_bits is not equal to 0:
-        Return 406
-    End If
+    T.assert_equal(results, "Case 1: pointer 8-byte aligned", p1_low_bits, 0)
 
     Let _dealloc_r1 be proc deallocate from Heap with p1
     Note: deallocate's return value is informational (1 == path taken,
@@ -76,12 +74,16 @@ Process called "main" returns Integer:
     Note: Recipes constants - period 2^32, uniform enough for stress
     Note: rotation. Seeded with 0x9E3779B9 (the golden-ratio fractional
     Note: bits) so the size sequence is reproducible.
+    Note: stress_status: 0 = clean, 402 = allocate failed mid-stress,
+    Note: 407 = allocation contents corrupted (first failure recorded,
+    Note: loop exits early so the failing iteration is deterministic).
     Note: ============================================================
     Let lcg_state be 2654435769  Note: 0x9E3779B9
     Let lcg_a be 1664525
     Let lcg_c be 1013904223
     Let lcg_mod be 4294967296  Note: 2^32
 
+    Let stress_status be 0
     Let i be 0
     While i is less than 1000:
         Note: Step the LCG. Modulo by 2^32 to keep within 32-bit
@@ -110,28 +112,33 @@ Process called "main" returns Integer:
 
         Let stress_ptr be proc allocate from Heap with alloc_size
         If stress_ptr is equal to 0:
-            Return 402
+            Set stress_status to 402
+            Set i to 1000
+        Otherwise:
+            Note: Touch the first and last bytes of the allocation to
+            Note: catch any latent bounds-check failure. The byte writes
+            Note: also serve as the canary roundtrip for free-list
+            Note: integrity across the deallocate that follows.
+            Let _w1 be proc memory_set_byte from Memory with stress_ptr, 0, 170  Note: 0xAA
+            Let _w2 be proc memory_set_byte from Memory with stress_ptr, alloc_size minus 1, 187  Note: 0xBB
+
+            Let read_first be proc memory_get_byte from Memory with stress_ptr, 0
+            Let read_last be proc memory_get_byte from Memory with stress_ptr, alloc_size minus 1
+            If read_first is not equal to 170:
+                Set stress_status to 407
+                Set i to 1000
+            End If
+            If read_last is not equal to 187:
+                Set stress_status to 407
+                Set i to 1000
+            End If
+
+            Let _free be proc deallocate from Heap with stress_ptr
+
+            Set i to i plus 1
         End If
-
-        Note: Touch the first and last bytes of the allocation to
-        Note: catch any latent bounds-check failure. The byte writes
-        Note: also serve as the canary roundtrip in Case 5 below.
-        Let _w1 be proc memory_set_byte from Memory with stress_ptr, 0, 170  Note: 0xAA
-        Let _w2 be proc memory_set_byte from Memory with stress_ptr, alloc_size minus 1, 187  Note: 0xBB
-
-        Let read_first be proc memory_get_byte from Memory with stress_ptr, 0
-        If read_first is not equal to 170:
-            Return 407
-        End If
-        Let read_last be proc memory_get_byte from Memory with stress_ptr, alloc_size minus 1
-        If read_last is not equal to 187:
-            Return 407
-        End If
-
-        Let _free be proc deallocate from Heap with stress_ptr
-
-        Set i to i plus 1
     End While
+    T.assert_equal(results, "Case 2: 1000-iteration stress loop clean", stress_status, 0)
 
     Note: ============================================================
     Note: Case 3: deallocate(0) MUST be a safe no-op. This is the
@@ -139,9 +146,7 @@ Process called "main" returns Integer:
     Note: caller in the codebase that does not pre-check.
     Note: ============================================================
     Let dealloc_null_r be proc deallocate from Heap with 0
-    If dealloc_null_r is not equal to 0:
-        Return 403
-    End If
+    T.assert_equal(results, "Case 3: deallocate(NULL) returns 0", dealloc_null_r, 0)
 
     Note: ============================================================
     Note: Case 4: deallocate on a pointer OUTSIDE the allocator's
@@ -149,7 +154,6 @@ Process called "main" returns Integer:
     Note: owned_addr_max pre-filter (lines 3508-3513 of layout.runa)
     Note: catches stack addresses, argv pointers, and any foreign
     Note: pointer numerically below or above the brk/mmap region.
-    Note:
     Note: We pass a small positive integer (8) which is guaranteed
     Note: to be below any plausible mmap/brk region (the kernel
     Note: reserves the entire first page 0..4095 as the NULL guard,
@@ -157,20 +161,19 @@ Process called "main" returns Integer:
     Note: ptr < owned_addr_min check fires and returns 0 cleanly.
     Note: ============================================================
     Let dealloc_off_r be proc deallocate from Heap with 8
-    If dealloc_off_r is not equal to 0:
-        Return 404
-    End If
+    T.assert_equal(results, "Case 4: deallocate(off-heap) returns 0", dealloc_off_r, 0)
 
     Note: ============================================================
     Note: Case 5: large-allocation OOM path. We request a positive
     Note: but unreasonably large allocation (1 TiB) which the kernel
     Note: will reject. The allocator's mmap arm checks the syscall
     Note: return value and returns 0 cleanly when mmap fails.
-    Note:
     Note: A successful allocation here would mean the kernel actually
     Note: reserved 1 TiB of address space - the test still passes in
     Note: that case (we immediately free) but the OOM-handling code
-    Note: path went unexercised on this run.
+    Note: path went unexercised on this run. Either path is a pass:
+    Note: reaching the record_pass call at all proves the allocate
+    Note: call neither crashed nor aborted.
     Note: ============================================================
     Let oom_size be 1099511627776  Note: 1 TiB
     Let oom_ptr be proc allocate from Heap with oom_size
@@ -180,8 +183,7 @@ Process called "main" returns Integer:
         Note: a valid pointer; we freed it cleanly. No assertion
         Note: failure - OOM path simply was not triggered.
     End If
-    Note: If oom_ptr was 0, the allocator handled OOM correctly.
-    Note: Either path is a pass for this case.
+    T.record_pass(results, "Case 5: 1 TiB allocate handled without crash")
 
     Note: ============================================================
     Note: Case 6: allocate-write-allocate-write pattern to catch
@@ -192,32 +194,25 @@ Process called "main" returns Integer:
     Note: slot, the next allocate will hand out a garbage pointer.
     Note: ============================================================
     Let p_a be proc allocate from Heap with 64
-    If p_a is equal to 0:
-        Return 402
-    End If
+    T.assert_not_null(results, "Case 6: allocation A succeeds", p_a)
     Let _w_a be proc memory_set_byte from Memory with p_a, 0, 161  Note: 0xA1
 
     Let p_b be proc allocate from Heap with 64
-    If p_b is equal to 0:
-        Return 402
-    End If
+    T.assert_not_null(results, "Case 6: allocation B succeeds", p_b)
     Let _w_b be proc memory_set_byte from Memory with p_b, 0, 162  Note: 0xA2
 
-    If p_a is equal to p_b:
-        Return 402  Note: same pointer returned for two live allocations - allocator broken
-    End If
+    T.assert_not_equal(results, "Case 6: A and B are distinct live pointers", p_a, p_b)
 
     Let r_a be proc memory_get_byte from Memory with p_a, 0
     Let r_b be proc memory_get_byte from Memory with p_b, 0
-    If r_a is not equal to 161:
-        Return 407
-    End If
-    If r_b is not equal to 162:
-        Return 407
-    End If
+    T.assert_equal(results, "Case 6: A contents intact", r_a, 161)
+    T.assert_equal(results, "Case 6: B contents intact", r_b, 162)
 
     Let _fa be proc deallocate from Heap with p_a
     Let _fb be proc deallocate from Heap with p_b
 
-    Return 400
+    T.print_summary(results)
+    Let exit_code be T.get_failed(results)
+    T.destroy_test_results(results)
+    Return exit_code
 End Process

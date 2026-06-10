@@ -46,6 +46,7 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: MIR Instruction Opcode Constants (20000-20999)
@@ -142,6 +143,9 @@ Constant MIR_VECTOR_REDUCE_ADD as Integer is 20616    Note: Horizontal add reduc
 Constant MIR_VECTOR_REDUCE_MUL as Integer is 20617    Note: Horizontal multiply reduction
 Constant MIR_VECTOR_REDUCE_MIN as Integer is 20618    Note: Horizontal min reduction
 Constant MIR_VECTOR_REDUCE_MAX as Integer is 20619    Note: Horizontal max reduction
+Constant MIR_VECTOR_AND as Integer is 20620           Note: Vector bitwise AND (band extension 2026-06-09: bitwise lane ops were missing from the 20600 vector band)
+Constant MIR_VECTOR_OR as Integer is 20621            Note: Vector bitwise OR
+Constant MIR_VECTOR_XOR as Integer is 20622           Note: Vector bitwise XOR
 
 Note: Exception Handling Operations (20700-20799)
 Constant MIR_INVOKE as Integer is 20700               Note: Invoke with exception handler
@@ -157,6 +161,7 @@ Constant MIR_DEBUG_VALUE as Integer is 20800          Note: Debug value annotati
 Constant MIR_DEBUG_DECLARE as Integer is 20801        Note: Debug variable declaration
 Constant MIR_DEBUG_LOCATION as Integer is 20802       Note: Source location marker
 Constant MIR_DEBUG_SCOPE as Integer is 20803          Note: Lexical scope marker
+Constant MIR_DEBUG_LABEL as Integer is 20804          Note: Debug label marker (band extension 2026-06-09: named code-point annotation distinct from scope markers)
 
 Note: ============================================================================
 Note: MIR Core Type Definitions
@@ -1261,7 +1266,7 @@ Process called "register_value_definition" that takes function_ptr as Integer, v
     End If
 
     Note: Convert value_id to string for dictionary key
-    Let value_id_str be proc integer_to_string from StringCore with value_id
+    Let value_id_str be proc integer_to_string from StringUtils with value_id
 
     Note: Register mapping: value_id -> instruction
     proc set from Dictionary with value_map, value_id_str, inst_ptr
@@ -1302,7 +1307,7 @@ Process called "lookup_defining_instruction" that takes function_ptr as Integer,
     End If
 
     Note: Convert value_id to string for dictionary key
-    Let value_id_str be proc integer_to_string from StringCore with value_id
+    Let value_id_str be proc integer_to_string from StringUtils with value_id
 
     Note: Lookup defining instruction
     Let inst_ptr be proc get from Dictionary with value_map, value_id_str
@@ -1470,6 +1475,130 @@ Process called "add_instruction_to_block" that takes block as Integer, instructi
     proc memory_set_int64 from Layout with instruction, 56, block
 
     Return 1
+End Process
+
+@Reasoning
+The block's first and last instructions are derived views over the
+canonical instruction List (offset 16) rather than separately stored
+fields: a cached first/last pointer would have to be maintained by every
+insertion, removal, and merge, and a stale cache silently corrupts
+terminator analysis. Deriving them keeps the List as the single source of
+truth. The last instruction of a well-formed block is its terminator, so
+get_mir_basic_block_last_instruction doubles as the terminator accessor.
+@End Reasoning
+
+@Implementation
+Both read the instruction List at offset 16 and the cached count at
+offset 24 (maintained by add_instruction_to_block). An empty block (count
+0) or a null block yields 0. First is list index 0; last is index
+count - 1.
+@End Implementation
+
+Process called "get_mir_basic_block_first_instruction" that takes block as Integer returns Integer:
+    If block is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc memory_get_int64 from Layout with block, 24
+    If count is less than or equal to 0:
+        Return 0
+    End If
+
+    Let instructions be proc memory_get_int64 from Layout with block, 16
+    If instructions is equal to 0:
+        Return 0
+    End If
+
+    Return proc get from List with instructions, 0
+End Process
+
+Process called "get_mir_basic_block_last_instruction" that takes block as Integer returns Integer:
+    If block is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc memory_get_int64 from Layout with block, 24
+    If count is less than or equal to 0:
+        Return 0
+    End If
+
+    Let instructions be proc memory_get_int64 from Layout with block, 16
+    If instructions is equal to 0:
+        Return 0
+    End If
+
+    Return proc get from List with instructions, count minus 1
+End Process
+
+@Reasoning
+Accessor for the MIRFunction's CFG (offset 8 per the create_mir_function
+field contract). CFG construction and every per-function optimization pass
+opens the function record through this single accessor instead of
+hard-coding the offset at each call site.
+@End Reasoning
+
+Process called "get_mir_function_cfg" that takes function as Integer returns Integer:
+    If function is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with function, 8
+End Process
+
+@Reasoning
+The MIRFunction record does not store a flat function-level instruction
+list - instructions live inside the CFG's basic blocks. Callers that need
+the function's instructions as one flat sequence (leader-based CFG
+reconstruction, whole-function statistics) receive a freshly allocated
+List aggregating every block's instructions in block storage order, which
+matches original program order for a freshly built CFG. The caller owns
+the returned List and must list_destroy it (the elements are borrowed
+instruction pointers and must NOT be deallocated through the list).
+Returns 0 when the function, its CFG, or the CFG's block list is absent,
+so callers can distinguish "no instructions available" from "empty
+function" (which yields an empty List).
+@End Reasoning
+
+Process called "get_mir_function_instructions" that takes function as Integer returns Integer:
+    If function is equal to 0:
+        Return 0
+    End If
+
+    Let cfg be proc memory_get_int64 from Layout with function, 8
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let blocks be proc memory_get_int64 from Layout with cfg, 16
+    If blocks is equal to 0:
+        Return 0
+    End If
+
+    Let result be proc create from List
+    If result is equal to 0:
+        Return 0
+    End If
+
+    Let block_count be proc length from List with blocks
+    Let i be 0
+    While i is less than block_count:
+        Let block be proc get from List with blocks, i
+        If block is not equal to 0:
+            Let instructions be proc memory_get_int64 from Layout with block, 16
+            Let inst_count be proc memory_get_int64 from Layout with block, 24
+            If instructions is not equal to 0:
+                Let j be 0
+                While j is less than inst_count:
+                    Let inst be proc get from List with instructions, j
+                    proc append from List with result, inst
+                    Set j to j plus 1
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return result
 End Process
 
 @Reasoning
@@ -2513,34 +2642,34 @@ Process called "mir_node_to_string" that takes node as Integer returns Integer:
     Let result be proc string_duplicate from StringCore with ""
 
     If value_id is not equal to 0:
-        Let value_str be proc integer_to_string from StringCore with value_id
-        Set result to proc string_concat from StringCore with result, "%"
-        Set result to proc string_concat from StringCore with result, value_str
-        Set result to proc string_concat from StringCore with result, " = "
+        Let value_str be proc integer_to_string from StringUtils with value_id
+        Set result to proc string_concat from StringUtils with result, "%"
+        Set result to proc string_concat from StringUtils with result, value_str
+        Set result to proc string_concat from StringUtils with result, " = "
         proc deallocate from Layout with value_str
     End If
 
-    Set result to proc string_concat from StringCore with result, opcode_str
+    Set result to proc string_concat from StringUtils with result, opcode_str
     proc deallocate from Layout with opcode_str
 
     If op1 is not equal to 0:
-        Let op1_str be proc integer_to_string from StringCore with op1
-        Set result to proc string_concat from StringCore with result, " %"
-        Set result to proc string_concat from StringCore with result, op1_str
+        Let op1_str be proc integer_to_string from StringUtils with op1
+        Set result to proc string_concat from StringUtils with result, " %"
+        Set result to proc string_concat from StringUtils with result, op1_str
         proc deallocate from Layout with op1_str
     End If
 
     If op2 is not equal to 0:
-        Let op2_str be proc integer_to_string from StringCore with op2
-        Set result to proc string_concat from StringCore with result, ", %"
-        Set result to proc string_concat from StringCore with result, op2_str
+        Let op2_str be proc integer_to_string from StringUtils with op2
+        Set result to proc string_concat from StringUtils with result, ", %"
+        Set result to proc string_concat from StringUtils with result, op2_str
         proc deallocate from Layout with op2_str
     End If
 
     If op3 is not equal to 0:
-        Let op3_str be proc integer_to_string from StringCore with op3
-        Set result to proc string_concat from StringCore with result, ", %"
-        Set result to proc string_concat from StringCore with result, op3_str
+        Let op3_str be proc integer_to_string from StringUtils with op3
+        Set result to proc string_concat from StringUtils with result, ", %"
+        Set result to proc string_concat from StringUtils with result, op3_str
         proc deallocate from Layout with op3_str
     End If
 
@@ -2582,23 +2711,23 @@ Process called "mir_basic_block_to_string" that takes block as Integer returns I
     Let result be proc string_duplicate from StringCore with ""
 
     If label is not equal to 0:
-        Set result to proc string_concat from StringCore with result, label
+        Set result to proc string_concat from StringUtils with result, label
     Otherwise:
-        Let block_id_str be proc integer_to_string from StringCore with block_id
-        Set result to proc string_concat from StringCore with result, "block_"
-        Set result to proc string_concat from StringCore with result, block_id_str
+        Let block_id_str be proc integer_to_string from StringUtils with block_id
+        Set result to proc string_concat from StringUtils with result, "block_"
+        Set result to proc string_concat from StringUtils with result, block_id_str
         proc deallocate from Layout with block_id_str
     End If
 
-    Set result to proc string_concat from StringCore with result, ":\n"
+    Set result to proc string_concat from StringUtils with result, ":\n"
 
     Let i be 0
     While i is less than inst_count:
         Let inst be proc get from List with instructions, i
         Let inst_str be proc mir_node_to_string with inst
-        Set result to proc string_concat from StringCore with result, "  "
-        Set result to proc string_concat from StringCore with result, inst_str
-        Set result to proc string_concat from StringCore with result, "\n"
+        Set result to proc string_concat from StringUtils with result, "  "
+        Set result to proc string_concat from StringUtils with result, inst_str
+        Set result to proc string_concat from StringUtils with result, "\n"
         proc deallocate from Layout with inst_str
         Set i to i plus 1
     End While
@@ -2642,8 +2771,8 @@ Process called "mir_cfg_to_string" that takes cfg as Integer returns Integer:
     While i is less than block_count:
         Let block be proc get from List with blocks, i
         Let block_str be proc mir_basic_block_to_string with block
-        Set result to proc string_concat from StringCore with result, block_str
-        Set result to proc string_concat from StringCore with result, "\n"
+        Set result to proc string_concat from StringUtils with result, block_str
+        Set result to proc string_concat from StringUtils with result, "\n"
         proc deallocate from Layout with block_str
         Set i to i plus 1
     End While
@@ -2676,16 +2805,16 @@ Process called "mir_function_to_string" that takes function as Integer returns I
     Let result be proc string_duplicate from StringCore with "function "
 
     If name is not equal to 0:
-        Set result to proc string_concat from StringCore with result, name
+        Set result to proc string_concat from StringUtils with result, name
     Otherwise:
-        Set result to proc string_concat from StringCore with result, "<anonymous>"
+        Set result to proc string_concat from StringUtils with result, "<anonymous>"
     End If
 
-    Set result to proc string_concat from StringCore with result, ":\n"
+    Set result to proc string_concat from StringUtils with result, ":\n"
 
     If cfg is not equal to 0:
         Let cfg_str be proc mir_cfg_to_string with cfg
-        Set result to proc string_concat from StringCore with result, cfg_str
+        Set result to proc string_concat from StringUtils with result, cfg_str
         proc deallocate from Layout with cfg_str
     End If
 
@@ -3126,7 +3255,7 @@ Process called "get_operand_variable_name" that takes function_ptr as Integer, o
         Let name_buffer be proc allocate from Layout with 64
         proc memory_set_byte from Memory with name_buffer, 0, 118  Note: 'v'
         proc memory_set_byte from Memory with name_buffer, 1, 95   Note: '_'
-        Let value_str be proc integer_to_string from StringCore with operand_value_id
+        Let value_str be proc integer_to_string from StringUtils with operand_value_id
         Note: Append value_id string after "v_"
         Return name_buffer
     End If

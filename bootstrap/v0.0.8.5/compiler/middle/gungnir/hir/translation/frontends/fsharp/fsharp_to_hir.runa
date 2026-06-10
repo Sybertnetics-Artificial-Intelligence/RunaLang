@@ -51,6 +51,7 @@ Dependencies:
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_parser.runa" as FSharpAST
+Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_lexer.runa" as FSharpLexer
 Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
@@ -103,7 +104,10 @@ Process called "create_fsharp_translator" takes ast_root as Integer returns Inte
     proc memory_set_int64 from Layout with translator, 40, 0   Note: error_message = null
     proc memory_set_int64 from Layout with translator, 48, 0   Note: has_error = false
 
-    Let arena be proc create_arena from Layout
+    Note: 1 MB initial arena; mmap-backed pages are committed lazily so the
+    Note: large initial_size costs nothing physical, and Layout arenas do not
+    Note: grow after creation so the capacity must cover a full translation run
+    Let arena be proc arena_create from Layout with 1048576
     proc memory_set_int64 from Layout with translator, 56, arena
 
     Return translator
@@ -121,7 +125,7 @@ Process called "destroy_fsharp_translator" takes translator as Integer returns I
 
     Let arena be proc memory_get_int64 from Layout with translator, 56
     If arena is not equal to 0:
-        proc destroy_arena from Layout with arena
+        proc arena_destroy from Layout with arena
     End If
 
     proc deallocate from Layout with translator
@@ -133,13 +137,12 @@ Note: HIR Node Creation Helpers
 Note: ============================================================================
 
 @Reasoning:
-Thin wrapper around HIR.create_hir_node that passes the arena from the translator's slot; centralizing the arena pickup means callers don't repeat the memory_get_int64 boilerplate.
+Thin wrapper around HIR.create_hir_node so every call site shares one construction path. HIR.create_hir_node takes (node_type, line, column) and allocates the canonical 104-byte HIRNode through Layout.allocate; the F# AST does not carry per-node source positions, so line and column are 0 (the documented unset sentinel). The translator parameter is kept in the signature so call sites remain uniform with the other helpers that do need translator state.
 @End Reasoning
 Process called "create_hir_node" takes translator as Integer, node_type as Integer returns Integer:
     Note: Create HIR node with specified type
 
-    Let arena be proc memory_get_int64 from Layout with translator, 56
-    Return proc create_hir_node from HIR with arena, node_type
+    Return proc create_hir_node from HIR with node_type, 0, 0
 End Process
 
 @Reasoning:
@@ -149,14 +152,14 @@ Process called "create_hir_binary_expression" takes translator as Integer, opera
     Note: Create HIR binary expression node
 
     Let arena be proc memory_get_int64 from Layout with translator, 56
-    Let node_size be 40  Note: HIRBinaryExpression: 5 fields × 8 bytes
+    Let node_size be 72  Note: HIRBinaryExpression: 5 fields × 8 bytes + parent slot at offset 64 (written by add_hir_node)
     Let node be proc arena_allocate from Layout with arena, node_size
 
     If node is equal to 0:
         Return 0
     End If
 
-    Let base_node be proc create_hir_node with translator, HIR_BINARY_EXPRESSION
+    Let base_node be proc create_hir_node with translator, HIR_BINARY_EXPRESSION from HIR
     proc memory_set_int64 from Layout with node, 0, base_node   Note: base
     proc memory_set_int64 from Layout with node, 8, operator    Note: operator
     proc memory_set_int64 from Layout with node, 16, left      Note: left
@@ -173,14 +176,14 @@ Process called "create_hir_call_expression" takes translator as Integer, callee 
     Note: Create HIR function call expression node
 
     Let arena be proc memory_get_int64 from Layout with translator, 56
-    Let node_size be 56  Note: HIRCallExpression: 7 fields × 8 bytes
+    Let node_size be 72  Note: HIRCallExpression: 7 fields × 8 bytes + parent slot at offset 64 (written by add_hir_node)
     Let node be proc arena_allocate from Layout with arena, node_size
 
     If node is equal to 0:
         Return 0
     End If
 
-    Let base_node be proc create_hir_node with translator, HIR_CALL_EXPRESSION
+    Let base_node be proc create_hir_node with translator, HIR_CALL_EXPRESSION from HIR
     proc memory_set_int64 from Layout with node, 0, base_node   Note: base
     proc memory_set_int64 from Layout with node, 8, callee     Note: callee
     proc memory_set_int64 from Layout with node, 16, arguments Note: arguments
@@ -201,14 +204,14 @@ Process called "create_hir_lambda_expression" takes translator as Integer, param
     Note: Create HIR lambda expression node
 
     Let arena be proc memory_get_int64 from Layout with translator, 56
-    Let node_size be 64  Note: HIRLambdaExpression: 8 fields × 8 bytes
+    Let node_size be 72  Note: HIRLambdaExpression: 8 fields × 8 bytes + parent slot at offset 64 (written by add_hir_node)
     Let node be proc arena_allocate from Layout with arena, node_size
 
     If node is equal to 0:
         Return 0
     End If
 
-    Let base_node be proc create_hir_node with translator, HIR_LAMBDA_EXPRESSION
+    Let base_node be proc create_hir_node with translator, HIR_LAMBDA_EXPRESSION from HIR
     proc memory_set_int64 from Layout with node, 0, base_node      Note: base
     proc memory_set_int64 from Layout with node, 8, parameters     Note: parameters
 
@@ -249,87 +252,126 @@ Process called "translate_expression" takes translator as Integer, fsharp_node a
     Let node_type be proc memory_get_int64 from Layout with fsharp_node, 0
 
     Note: Literal expressions
-    If node_type is equal to AST_LITERAL:
+    If node_type is equal to AST_LITERAL from FSharpAST:
         Return proc translate_literal with translator, fsharp_node
     End If
 
     Note: Identifier expressions
-    If node_type is equal to AST_IDENTIFIER:
+    If node_type is equal to AST_IDENTIFIER from FSharpAST:
         Return proc translate_identifier with translator, fsharp_node
     End If
 
     Note: Function application
-    If node_type is equal to AST_APPLICATION:
+    If node_type is equal to AST_APPLICATION from FSharpAST:
         Return proc translate_application with translator, fsharp_node
     End If
 
     Note: Lambda expressions
-    If node_type is equal to AST_LAMBDA:
+    If node_type is equal to AST_LAMBDA from FSharpAST:
         Return proc translate_lambda with translator, fsharp_node
     End If
 
     Note: Match expressions
-    If node_type is equal to AST_MATCH_EXPRESSION:
+    If node_type is equal to AST_MATCH_EXPRESSION from FSharpAST:
         Return proc translate_match_expression with translator, fsharp_node
     End If
 
     Note: If expressions
-    If node_type is equal to AST_IF_EXPRESSION:
+    If node_type is equal to AST_IF_EXPRESSION from FSharpAST:
         Return proc translate_if_expression with translator, fsharp_node
     End If
 
     Note: Let expressions
-    If node_type is equal to AST_LET_EXPRESSION:
+    If node_type is equal to AST_LET_EXPRESSION from FSharpAST:
         Return proc translate_let_expression with translator, fsharp_node
     End If
 
     Note: Pipeline expressions
-    If node_type is equal to AST_PIPE_EXPRESSION:
+    If node_type is equal to AST_PIPE_EXPRESSION from FSharpAST:
         Return proc translate_pipe_expression with translator, fsharp_node
     End If
 
     Note: List expressions
-    If node_type is equal to AST_LIST_EXPRESSION:
+    If node_type is equal to AST_LIST_EXPRESSION from FSharpAST:
         Return proc translate_list_expression with translator, fsharp_node
     End If
 
     Note: Array expressions
-    If node_type is equal to AST_ARRAY_EXPRESSION:
+    If node_type is equal to AST_ARRAY_EXPRESSION from FSharpAST:
         Return proc translate_array_expression with translator, fsharp_node
     End If
 
     Note: Record expressions
-    If node_type is equal to AST_RECORD_EXPRESSION:
+    If node_type is equal to AST_RECORD_EXPRESSION from FSharpAST:
         Return proc translate_record_expression with translator, fsharp_node
     End If
 
     Note: Tuple expressions
-    If node_type is equal to AST_TUPLE_EXPRESSION:
+    If node_type is equal to AST_TUPLE_EXPRESSION from FSharpAST:
         Return proc translate_tuple_expression with translator, fsharp_node
     End If
 
-    Note: Unit value
-    If node_type is equal to AST_UNIT:
-        Return proc create_hir_node with translator, HIR_UNIT_LITERAL
+    Note: Unit value. F# unit () carries no payload; HIR_LITERAL with the
+    Note: zero value_type tag (no typed payload) is its canonical representation.
+    If node_type is equal to AST_UNIT from FSharpAST:
+        Return proc create_hir_node with translator, HIR_LITERAL from HIR
     End If
 
     Note: Try expressions
-    If node_type is equal to AST_TRY_EXPRESSION:
+    If node_type is equal to AST_TRY_EXPRESSION from FSharpAST:
         Return proc translate_try_expression with translator, fsharp_node
     End If
 
     Note: While expressions
-    If node_type is equal to AST_WHILE_EXPRESSION:
+    If node_type is equal to AST_WHILE_EXPRESSION from FSharpAST:
         Return proc translate_while_expression with translator, fsharp_node
     End If
 
     Note: For expressions
-    If node_type is equal to AST_FOR_EXPRESSION:
+    If node_type is equal to AST_FOR_EXPRESSION from FSharpAST:
         Return proc translate_for_expression with translator, fsharp_node
+    End If
+
+    Note: Interpolated strings
+    If node_type is equal to AST_INTERPOLATED_STRING from FSharpAST:
+        Return proc translate_interpolated_string with translator, fsharp_node
     End If
 
     proc set_translation_error with translator, "Unsupported F# expression type"
     Return 0
+End Process
+
+@Reasoning:
+$"text {expr} text" translates to the canonical HIR_INTERPOLATED_STRING
+node (hir.runa 10009) - the dedicated interpolation shape the julia and
+rust backends and the MIR expression-lowering pass already consume. The
+contract those consumers read is a standard HIRNode whose children
+alternate HIR_LITERAL string segments and arbitrary expression nodes in
+source order; segment text lands in each literal's value slot. The
+parser's AST children already alternate AST_LITERAL segment carriers and
+hole expressions, so translation is a positional walk through
+translate_expression (the literal path recognises the segment token
+kinds and produces string-kind HIR literals).
+@End Reasoning
+Process called "translate_interpolated_string" takes translator as Integer, fsharp_node as Integer returns Integer:
+    Note: Translate F# interpolated string to HIR interpolated-string node
+
+    Let hir_node be proc create_hir_node with translator, HIR_INTERPOLATED_STRING from HIR
+
+    Let children be proc memory_get_int64 from Layout with fsharp_node, 16
+    Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
+
+    Let i be 0
+    While i is less than child_count:
+        Let part_node be proc list_get from List with children, i
+        Let hir_part be proc translate_expression with translator, part_node
+        If hir_part is not equal to 0:
+            proc add_hir_node from HIR with hir_node, hir_part
+        End If
+        Set i to i plus 1
+    End While
+
+    Return hir_node
 End Process
 
 @Reasoning:
@@ -340,47 +382,117 @@ Process called "translate_literal" takes translator as Integer, fsharp_node as I
 
     Let value be proc memory_get_int64 from Layout with fsharp_node, 8
 
-    Note: Create HIR literal node based on token type
-    Let token_type be proc get_token_type from value  Note: Assuming this function exists
+    Note: Create HIR literal node based on token type. AST_LITERAL nodes store
+    Note: the token at offset 8; the token's classification is read through the
+    Note: token accessor so that the literal payload extraction stays in one place.
+    Let token_type be proc get_token_type from FSharpLexer with value
 
-    If token_type is equal to TOKEN_INTEGER:
-        Let hir_node be proc create_hir_node with translator, HIR_INTEGER_LITERAL
-        proc set_hir_node_value with hir_node, value
+    If token_type is equal to TOKEN_INTEGER from FSharpLexer:
+        Let int_payload be proc get_token_value from FSharpLexer with value
+        Let hir_node be proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, int_payload, HIR_LITERAL_KIND_INTEGER from HIRNodes
         Return hir_node
     End If
 
-    If token_type is equal to TOKEN_FLOAT:
-        Set hir_node to proc create_hir_node with translator, HIR_FLOAT_LITERAL
-        proc set_hir_node_value with hir_node, value
+    If token_type is equal to TOKEN_FLOAT from FSharpLexer:
+        Let float_payload be proc get_token_value from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, float_payload, HIR_LITERAL_KIND_FLOAT from HIRNodes
         Return hir_node
     End If
 
-    If token_type is equal to TOKEN_STRING:
-        Set hir_node to proc create_hir_node with translator, HIR_STRING_LITERAL
-        proc set_hir_node_value with hir_node, value
+    If token_type is equal to TOKEN_STRING from FSharpLexer:
+        Let string_payload be proc get_token_text from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, string_payload, HIR_LITERAL_KIND_STRING from HIRNodes
         Return hir_node
     End If
 
-    If token_type is equal to TOKEN_CHAR:
-        Set hir_node to proc create_hir_node with translator, HIR_CHAR_LITERAL
-        proc set_hir_node_value with hir_node, value
+    If token_type is equal to TOKEN_CHAR from FSharpLexer:
+        Let char_payload be proc get_token_value from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, char_payload, HIR_LITERAL_KIND_INTEGER from HIRNodes
         Return hir_node
     End If
 
-    If token_type is equal to TOKEN_TRUE:
-        Set hir_node to proc create_hir_node with translator, HIR_BOOLEAN_LITERAL
-        proc set_hir_node_value with hir_node, 1
+    Note: Verbatim, triple-quoted, and byte strings carry cooked content
+    Note: in the lexeme exactly like regular strings
+    If token_type is equal to TOKEN_VERBATIM_STRING from FSharpLexer:
+        Set string_payload to proc get_token_text from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, string_payload, HIR_LITERAL_KIND_STRING from HIRNodes
         Return hir_node
     End If
 
-    If token_type is equal to TOKEN_FALSE:
-        Set hir_node to proc create_hir_node with translator, HIR_BOOLEAN_LITERAL
-        proc set_hir_node_value with hir_node, 0
+    If token_type is equal to TOKEN_TRIPLE_QUOTE_STRING from FSharpLexer:
+        Set string_payload to proc get_token_text from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, string_payload, HIR_LITERAL_KIND_STRING from HIRNodes
         Return hir_node
     End If
 
-    If token_type is equal to TOKEN_NULL:
-        Return proc create_hir_node with translator, HIR_NULL_LITERAL
+    If token_type is equal to TOKEN_BYTE_STRING from FSharpLexer:
+        Set string_payload to proc get_token_text from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, string_payload, HIR_LITERAL_KIND_STRING from HIRNodes
+        Return hir_node
+    End If
+
+    Note: Interpolated-string segment tokens carry cooked literal text in the
+    Note: lexeme exactly like regular strings; the continuation flag in the
+    Note: numeric payload is a lexer/parser protocol detail with no HIR meaning
+    If token_type is equal to TOKEN_INTERP_STRING_START from FSharpLexer:
+        Set string_payload to proc get_token_text from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, string_payload, HIR_LITERAL_KIND_STRING from HIRNodes
+        Return hir_node
+    End If
+
+    If token_type is equal to TOKEN_INTERP_STRING_MID from FSharpLexer:
+        Set string_payload to proc get_token_text from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, string_payload, HIR_LITERAL_KIND_STRING from HIRNodes
+        Return hir_node
+    End If
+
+    Note: Decimal literals carry IEEE-754 bits like floats; BigInteger and
+    Note: byte literals carry 64-bit integer payloads
+    If token_type is equal to TOKEN_DECIMAL from FSharpLexer:
+        Set float_payload to proc get_token_value from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, float_payload, HIR_LITERAL_KIND_FLOAT from HIRNodes
+        Return hir_node
+    End If
+
+    If token_type is equal to TOKEN_BIGINT from FSharpLexer:
+        Set int_payload to proc get_token_value from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, int_payload, HIR_LITERAL_KIND_INTEGER from HIRNodes
+        Return hir_node
+    End If
+
+    If token_type is equal to TOKEN_BYTE from FSharpLexer:
+        Set int_payload to proc get_token_value from FSharpLexer with value
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, int_payload, HIR_LITERAL_KIND_INTEGER from HIRNodes
+        Return hir_node
+    End If
+
+    If token_type is equal to TOKEN_TRUE from FSharpLexer:
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, 1, HIR_LITERAL_KIND_BOOLEAN from HIRNodes
+        Return hir_node
+    End If
+
+    If token_type is equal to TOKEN_FALSE from FSharpLexer:
+        Set hir_node to proc create_hir_node with translator, HIR_LITERAL from HIR
+        proc set_hir_node_value from HIR with hir_node, 0, HIR_LITERAL_KIND_BOOLEAN from HIRNodes
+        Return hir_node
+    End If
+
+    If token_type is equal to TOKEN_NULL from FSharpLexer:
+        Note: HIR_LITERAL with value_type tag 0 is the Null literal kind (hir.runa tags 1-4 cover the typed payloads)
+        Return proc create_hir_node with translator, HIR_LITERAL from HIR
     End If
 
     proc set_translation_error with translator, "Unsupported literal type"
@@ -388,20 +500,16 @@ Process called "translate_literal" takes translator as Integer, fsharp_node as I
 End Process
 
 @Reasoning:
-Identifier resolution looks up the name in the symbol_table; an unresolved identifier records a translation error but still returns a placeholder node so the AST traversal can continue. This lets one user-error not cascade into many.
+Identifiers become HIR_IDENTIFIER nodes carrying the name in the value slot. Symbol resolution is deliberately deferred: per the canonical HIRNode contract in hir.runa, symbol_id (offset 88) remains 0 until the resolver pass visits the node, so the translator does not need (and must not fake) a symbol table of its own.
 @End Reasoning
 Process called "translate_identifier" takes translator as Integer, fsharp_node as Integer returns Integer:
-    Note: Translate F# identifier to HIR variable reference
+    Note: Translate F# identifier to HIR identifier reference
 
     Let value be proc memory_get_int64 from Layout with fsharp_node, 8
-    Let identifier_name be proc get_token_text from value  Note: Assuming this function exists
+    Let identifier_name be proc get_token_text from FSharpLexer with value
 
-    Note: Look up symbol in symbol table
-    Let symbol be proc lookup_symbol with translator, identifier_name
-
-    Let hir_node be proc create_hir_node with translator, HIR_VARIABLE_REFERENCE
-    proc set_hir_node_value with hir_node, identifier_name
-    proc set_hir_node_symbol with hir_node, symbol
+    Let hir_node be proc create_hir_node with translator, HIR_IDENTIFIER from HIR
+    proc set_hir_node_value from HIR with hir_node, identifier_name, HIR_LITERAL_KIND_STRING from HIRNodes
 
     Return hir_node
 End Process
@@ -425,7 +533,7 @@ Process called "translate_application" takes translator as Integer, fsharp_node 
     Let hir_function be proc translate_expression with translator, function_node
 
     Note: Remaining children are arguments
-    Let hir_arguments be proc create_list from List
+    Let hir_arguments be proc list_create from List
     Let i be 1
     While i is less than child_count:
         Let arg_node be proc list_get from List with children, i
@@ -457,7 +565,7 @@ Process called "translate_lambda" takes translator as Integer, fsharp_node as In
     Let hir_body be proc translate_expression with translator, body_node
 
     Note: Translate parameters
-    Let hir_parameters be proc create_list from List
+    Let hir_parameters be proc list_create from List
     Let i be 0
     While i is less than body_index:
         Let param_node be proc list_get from List with children, i
@@ -489,20 +597,20 @@ Process called "translate_match_expression" takes translator as Integer, fsharp_
 
     Note: Create HIR match statement
     Let arena be proc memory_get_int64 from Layout with translator, 56
-    Let match_size be 48  Note: HIRMatchStatement: 6 fields × 8 bytes
+    Let match_size be 72  Note: HIRMatchStatement: 6 fields × 8 bytes + parent slot at offset 64 (written by add_hir_node)
     Let match_node be proc arena_allocate from Layout with arena, match_size
 
     If match_node is equal to 0:
         Return 0
     End If
 
-    Let base_node be proc create_hir_node with translator, HIR_MATCH_STATEMENT
+    Let base_node be proc create_hir_node with translator, HIR_MATCH_STATEMENT from HIR
     proc memory_set_int64 from Layout with match_node, 0, base_node     Note: base
     proc memory_set_int64 from Layout with match_node, 8, hir_expr      Note: expression
     proc memory_set_int64 from Layout with match_node, 16, 0            Note: expression_type = null
 
     Note: Translate match arms
-    Let hir_arms be proc create_list from List
+    Let hir_arms be proc list_create from List
     Let i be 1
     While i is less than child_count:
         Let case_node be proc list_get from List with children, i
@@ -535,14 +643,14 @@ Process called "translate_if_expression" takes translator as Integer, fsharp_nod
 
     Note: Create HIR if statement
     Let arena be proc memory_get_int64 from Layout with translator, 56
-    Let if_size be 32  Note: HIRIfStatement: 4 fields × 8 bytes
+    Let if_size be 72  Note: HIRIfStatement: 4 fields × 8 bytes + parent slot at offset 64 (written by add_hir_node)
     Let if_node be proc arena_allocate from Layout with arena, if_size
 
     If if_node is equal to 0:
         Return 0
     End If
 
-    Let base_node be proc create_hir_node with translator, HIR_IF_STATEMENT
+    Let base_node be proc create_hir_node with translator, HIR_IF_STATEMENT from HIR
     proc memory_set_int64 from Layout with if_node, 0, base_node        Note: base
 
     Note: Translate condition
@@ -584,63 +692,145 @@ Process called "translate_pattern" takes translator as Integer, fsharp_node as I
     Let node_type be proc memory_get_int64 from Layout with fsharp_node, 0
 
     Note: Variable pattern
-    If node_type is equal to AST_PATTERN_VARIABLE:
+    If node_type is equal to AST_PATTERN_VARIABLE from FSharpAST:
         Let value be proc memory_get_int64 from Layout with fsharp_node, 8
-        Let variable_name be proc get_token_text from value
+        Let variable_name be proc get_token_text from FSharpLexer with value
 
-        Let hir_node be proc create_hir_node with translator, HIR_VARIABLE_PATTERN
-        proc set_hir_node_value with hir_node, variable_name
+        Let hir_node be proc create_hir_node with translator, HIR_IDENTIFIER_PATTERN from HIR
+        proc set_hir_node_value from HIR with hir_node, variable_name, HIR_LITERAL_KIND_STRING from HIRNodes
         Return hir_node
     End If
 
     Note: Literal pattern
-    If node_type is equal to AST_PATTERN_LITERAL:
+    If node_type is equal to AST_PATTERN_LITERAL from FSharpAST:
         Set value to proc memory_get_int64 from Layout with fsharp_node, 8
         Return proc translate_literal with translator, fsharp_node
     End If
 
     Note: Wildcard pattern
-    If node_type is equal to AST_PATTERN_WILDCARD:
-        Return proc create_hir_node with translator, HIR_WILDCARD_PATTERN
+    If node_type is equal to AST_PATTERN_WILDCARD from FSharpAST:
+        Return proc create_hir_node with translator, HIR_WILDCARD_PATTERN from HIR
     End If
 
     Note: Constructor pattern
-    If node_type is equal to AST_PATTERN_CONSTRUCTOR:
+    If node_type is equal to AST_PATTERN_CONSTRUCTOR from FSharpAST:
         Return proc translate_constructor_pattern with translator, fsharp_node
     End If
 
     Note: Tuple pattern
-    If node_type is equal to AST_PATTERN_TUPLE:
+    If node_type is equal to AST_PATTERN_TUPLE from FSharpAST:
         Return proc translate_tuple_pattern with translator, fsharp_node
     End If
 
     Note: List pattern
-    If node_type is equal to AST_PATTERN_LIST:
+    If node_type is equal to AST_PATTERN_LIST from FSharpAST:
         Return proc translate_list_pattern with translator, fsharp_node
     End If
 
     Note: Array pattern
-    If node_type is equal to AST_PATTERN_ARRAY:
+    If node_type is equal to AST_PATTERN_ARRAY from FSharpAST:
         Return proc translate_array_pattern with translator, fsharp_node
     End If
 
     Note: Record pattern
-    If node_type is equal to AST_PATTERN_RECORD:
+    If node_type is equal to AST_PATTERN_RECORD from FSharpAST:
         Return proc translate_record_pattern with translator, fsharp_node
     End If
 
     Note: As pattern
-    If node_type is equal to AST_PATTERN_AS:
+    If node_type is equal to AST_PATTERN_AS from FSharpAST:
         Return proc translate_as_pattern with translator, fsharp_node
     End If
 
     Note: Guard pattern
-    If node_type is equal to AST_PATTERN_GUARD:
+    If node_type is equal to AST_PATTERN_GUARD from FSharpAST:
         Return proc translate_guard_pattern with translator, fsharp_node
+    End If
+
+    Note: Or pattern (| A | B alternatives sharing one arm body)
+    If node_type is equal to AST_PATTERN_OR from FSharpAST:
+        Return proc translate_or_pattern with translator, fsharp_node
+    End If
+
+    Note: Dynamic type-test pattern (:? TypeName [as binder])
+    If node_type is equal to AST_PATTERN_TYPE_TEST from FSharpAST:
+        Return proc translate_type_test_pattern with translator, fsharp_node
     End If
 
     proc set_translation_error with translator, "Unsupported F# pattern type"
     Return 0
+End Process
+
+@Reasoning:
+Or-patterns translate to the canonical HIR_OR_PATTERN alternative kind
+(hir.runa 14010): a standard HIRNode whose children are the alternative
+patterns in source order. The HIR matcher tries each alternative
+left-to-right against the same value and the arm body runs when any
+alternative matches - exactly F#'s semantics, so no arm duplication is
+needed. F# requires every alternative to bind the same variable set;
+enforcing that is the semantic analyzer's job (validate_pattern walks
+all alternatives), not the translator's.
+@End Reasoning
+Process called "translate_or_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
+    Note: Translate F# or-pattern to HIR alternative pattern
+
+    Let children be proc memory_get_int64 from Layout with fsharp_node, 16
+    Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
+
+    If child_count is less than 2:
+        proc set_translation_error with translator, "Or pattern requires at least two alternatives"
+        Return 0
+    End If
+
+    Let hir_node be proc create_hir_node with translator, HIR_OR_PATTERN from HIR
+
+    Let i be 0
+    While i is less than child_count:
+        Let alt_node be proc list_get from List with children, i
+        Let hir_alt be proc translate_pattern with translator, alt_node
+        If hir_alt is not equal to 0:
+            proc add_hir_node from HIR with hir_node, hir_alt
+        End If
+        Set i to i plus 1
+    End While
+
+    Return hir_node
+End Process
+
+@Reasoning:
+:? TypeName [as binder] translates to the canonical HIR_TYPE_PATTERN
+kind (hir.runa 14005, the type-checked pattern). The tested type's name
+lands in the node's value slot as a string (the same value-slot
+convention every other named HIR pattern uses) and the optional as-
+binder becomes an HIR_IDENTIFIER_PATTERN child, so consumers read
+[value = type name, child 0 = binding] without a separate accessor
+protocol. Catch clauses route through translate_catch_clause instead,
+which maps the same AST shape onto the shared catch-type convention.
+@End Reasoning
+Process called "translate_type_test_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
+    Note: Translate F# type-test pattern to HIR type pattern
+
+    Let value be proc memory_get_int64 from Layout with fsharp_node, 8
+    Let type_name be proc get_token_text from FSharpLexer with value
+    If type_name is equal to 0:
+        proc set_translation_error with translator, "Type-test pattern requires a type name"
+        Return 0
+    End If
+
+    Let hir_node be proc create_hir_node with translator, HIR_TYPE_PATTERN from HIR
+    proc set_hir_node_value from HIR with hir_node, type_name, HIR_LITERAL_KIND_STRING from HIRNodes
+
+    Let children be proc memory_get_int64 from Layout with fsharp_node, 16
+    Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
+    If child_count is greater than 0:
+        Let binder_node be proc list_get from List with children, 0
+        Let hir_binder be proc translate_pattern with translator, binder_node
+        If hir_binder is not equal to 0:
+            proc add_hir_node from HIR with hir_node, hir_binder
+        End If
+    End If
+
+    Return hir_node
 End Process
 
 @Reasoning:
@@ -659,14 +849,14 @@ Process called "translate_when_clause" takes translator as Integer, fsharp_node 
 
     Note: Create HIR when clause
     Let arena be proc memory_get_int64 from Layout with translator, 56
-    Let when_size be 48  Note: HIRWhenClause: 6 fields × 8 bytes
+    Let when_size be 72  Note: HIRWhenClause: 6 fields × 8 bytes + parent slot at offset 64 (written by add_hir_node)
     Let when_node be proc arena_allocate from Layout with arena, when_size
 
     If when_node is equal to 0:
         Return 0
     End If
 
-    Let base_node be proc create_hir_node with translator, HIR_WHEN_CLAUSE
+    Let base_node be proc create_hir_node with translator, HIR_WHEN_CLAUSE from HIR
     proc memory_set_int64 from Layout with when_node, 0, base_node      Note: base
 
     Note: Translate pattern
@@ -715,33 +905,54 @@ Process called "translate_declaration" takes translator as Integer, fsharp_node 
 
     Let node_type be proc memory_get_int64 from Layout with fsharp_node, 0
 
+    Note: Program root: a container of top-level declarations produced by
+    Note: parse_program; represented as a HIR_MODULE whose children are the
+    Note: translated declarations
+    If node_type is equal to AST_PROGRAM from FSharpAST:
+        Let hir_program be proc create_hir_node with translator, HIR_MODULE from HIRNodes
+
+        Let program_children be proc memory_get_int64 from Layout with fsharp_node, 16
+        Let program_count be proc memory_get_int64 from Layout with fsharp_node, 24
+        Let pi be 0
+        While pi is less than program_count:
+            Let program_child be proc list_get from List with program_children, pi
+            Let hir_decl be proc translate_declaration with translator, program_child
+            If hir_decl is not equal to 0:
+                proc add_hir_node from HIR with hir_program, hir_decl
+            End If
+            Set pi to pi plus 1
+        End While
+
+        Return hir_program
+    End If
+
     Note: Module declaration
-    If node_type is equal to AST_MODULE:
+    If node_type is equal to AST_MODULE from FSharpAST:
         Return proc translate_module_declaration with translator, fsharp_node
     End If
 
     Note: Namespace declaration
-    If node_type is equal to AST_NAMESPACE:
+    If node_type is equal to AST_NAMESPACE from FSharpAST:
         Return proc translate_namespace_declaration with translator, fsharp_node
     End If
 
     Note: Type declaration
-    If node_type is equal to AST_TYPE_DECLARATION:
+    If node_type is equal to AST_TYPE_DECLARATION from FSharpAST:
         Return proc translate_type_declaration with translator, fsharp_node
     End If
 
     Note: Let binding (function or value)
-    If node_type is equal to AST_LET_BINDING:
+    If node_type is equal to AST_LET_BINDING from FSharpAST:
         Return proc translate_let_binding with translator, fsharp_node
     End If
 
     Note: Value declaration
-    If node_type is equal to AST_VALUE_DECLARATION:
+    If node_type is equal to AST_VALUE_DECLARATION from FSharpAST:
         Return proc translate_value_declaration with translator, fsharp_node
     End If
 
     Note: Open statement
-    If node_type is equal to AST_OPEN:
+    If node_type is equal to AST_OPEN from FSharpAST:
         Return proc translate_open_statement with translator, fsharp_node
     End If
 
@@ -792,15 +1003,25 @@ Process called "translate_let_expression" takes translator as Integer, fsharp_no
     End If
 
     Note: Create HIR block to contain let statements
-    Let hir_block be proc create_hir_node with translator, HIR_BLOCK
+    Let hir_block be proc create_hir_node with translator, HIR_BLOCK_STATEMENT from HIR
 
-    Note: Translate let bindings
+    Note: Translate the children: AST_LET_BINDING children are bindings;
+    Note: a trailing non-binding child is the `in` body expression
     Let i be 0
     While i is less than child_count:
         Let binding_node be proc list_get from List with children, i
-        Let hir_binding be proc translate_let_binding with translator, binding_node
-        If hir_binding is not equal to 0:
-            proc add_hir_child with hir_block, hir_binding
+        Let binding_type be proc memory_get_int64 from Layout with binding_node, 0
+
+        If binding_type is equal to AST_LET_BINDING from FSharpAST:
+            Let hir_binding be proc translate_let_binding with translator, binding_node
+            If hir_binding is not equal to 0:
+                proc add_hir_node from HIR with hir_block, hir_binding
+            End If
+        Otherwise:
+            Let hir_body be proc translate_expression with translator, binding_node
+            If hir_body is not equal to 0:
+                proc add_hir_node from HIR with hir_block, hir_body
+            End If
         End If
         Set i to i plus 1
     End While
@@ -830,16 +1051,16 @@ Process called "translate_pipe_expression" takes translator as Integer, fsharp_n
     Let hir_right be proc translate_expression with translator, right_node
 
     Note: Convert pipeline to function application
-    If operator is equal to TOKEN_PIPE_RIGHT:  Note: |>
+    If operator is equal to TOKEN_PIPE_RIGHT from FSharpLexer:  Note: |>
         Note: x |> f becomes f(x)
-        Let hir_args be proc create_list from List
+        Let hir_args be proc list_create from List
         proc list_append from List with hir_args, hir_left
         Return proc create_hir_call_expression with translator, hir_right, hir_args
     End If
 
-    If operator is equal to TOKEN_PIPE_LEFT:   Note: <|
+    If operator is equal to TOKEN_PIPE_LEFT from FSharpLexer:   Note: <|
         Note: f <| x becomes f(x)
-        Set hir_args to proc create_list from List
+        Set hir_args to proc list_create from List
         proc list_append from List with hir_args, hir_right
         Return proc create_hir_call_expression with translator, hir_left, hir_args
     End If
@@ -854,7 +1075,10 @@ F# list literals [a; b; c] become HIR ListExpression with a list of element expr
 Process called "translate_list_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# list expression to HIR list literal
 
-    Let hir_node be proc create_hir_node with translator, HIR_LIST_LITERAL
+    Note: The canonical HIR surface represents both F# lists and arrays as
+    Note: HIR_ARRAY_LITERAL (hir.runa create_hir_list_literal constructs the
+    Note: same node type); element ordering and arity are fully preserved
+    Let hir_node be proc create_hir_node with translator, HIR_ARRAY_LITERAL from HIR
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -865,7 +1089,7 @@ Process called "translate_list_expression" takes translator as Integer, fsharp_n
         Let element_node be proc list_get from List with children, i
         Let hir_element be proc translate_expression with translator, element_node
         If hir_element is not equal to 0:
-            proc add_hir_child with hir_node, hir_element
+            proc add_hir_node from HIR with hir_node, hir_element
         End If
         Set i to i plus 1
     End While
@@ -879,7 +1103,7 @@ F# arrays [|a; b; c|] are contiguous mutable storage with O(1) indexing; distinc
 Process called "translate_array_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# array expression to HIR array literal
 
-    Let hir_node be proc create_hir_node with translator, HIR_ARRAY_LITERAL
+    Let hir_node be proc create_hir_node with translator, HIR_ARRAY_LITERAL from HIR
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -890,7 +1114,7 @@ Process called "translate_array_expression" takes translator as Integer, fsharp_
         Let element_node be proc list_get from List with children, i
         Let hir_element be proc translate_expression with translator, element_node
         If hir_element is not equal to 0:
-            proc add_hir_child with hir_node, hir_element
+            proc add_hir_node from HIR with hir_node, hir_element
         End If
         Set i to i plus 1
     End While
@@ -904,7 +1128,7 @@ F# records {Name = value; ...} are nominally-typed structures; HIR RecordExpress
 Process called "translate_record_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# record expression to HIR record constructor
 
-    Let hir_node be proc create_hir_node with translator, HIR_RECORD_CONSTRUCTOR
+    Let hir_node be proc create_hir_node with translator, HIR_RECORD_LITERAL from HIR
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -915,7 +1139,7 @@ Process called "translate_record_expression" takes translator as Integer, fsharp
         Let field_node be proc list_get from List with children, i
         Let hir_field be proc translate_field_assignment with translator, field_node
         If hir_field is not equal to 0:
-            proc add_hir_child with hir_node, hir_field
+            proc add_hir_node from HIR with hir_node, hir_field
         End If
         Set i to i plus 1
     End While
@@ -929,7 +1153,7 @@ F# tuples (a, b, c) are structurally-typed product types; HIR TupleExpression pr
 Process called "translate_tuple_expression" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# tuple expression to HIR tuple constructor
 
-    Let hir_node be proc create_hir_node with translator, HIR_TUPLE_CONSTRUCTOR
+    Let hir_node be proc create_hir_node with translator, HIR_TUPLE_LITERAL from HIR
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -940,7 +1164,7 @@ Process called "translate_tuple_expression" takes translator as Integer, fsharp_
         Let element_node be proc list_get from List with children, i
         Let hir_element be proc translate_expression with translator, element_node
         If hir_element is not equal to 0:
-            proc add_hir_child with hir_node, hir_element
+            proc add_hir_node from HIR with hir_node, hir_element
         End If
         Set i to i plus 1
     End While
@@ -964,14 +1188,14 @@ Process called "translate_try_expression" takes translator as Integer, fsharp_no
 
     Note: Create HIR try statement
     Let arena be proc memory_get_int64 from Layout with translator, 56
-    Let try_size be 32  Note: HIRTryStatement: 4 fields × 8 bytes
+    Let try_size be 72  Note: HIRTryStatement: 5 fields × 8 bytes (base, try_block, catch_clauses, catch_count, finally_block) + parent slot at offset 64 (written by add_hir_node)
     Let try_node be proc arena_allocate from Layout with arena, try_size
 
     If try_node is equal to 0:
         Return 0
     End If
 
-    Let base_node be proc create_hir_node with translator, HIR_TRY_STATEMENT
+    Let base_node be proc create_hir_node with translator, HIR_TRY_STATEMENT from HIR
     proc memory_set_int64 from Layout with try_node, 0, base_node       Note: base
 
     Note: Translate try body
@@ -979,14 +1203,23 @@ Process called "translate_try_expression" takes translator as Integer, fsharp_no
     Let hir_body be proc translate_expression with translator, body_node
     proc memory_set_int64 from Layout with try_node, 8, hir_body        Note: try_block
 
-    Note: Translate catch clauses
-    Let hir_catches be proc create_list from List
+    Note: Translate the remaining children: AST_PATTERN_GUARD children are
+    Note: with-handler arms; a trailing non-guard child is the finally
+    Note: expression appended by the parser
+    Let hir_catches be proc list_create from List
+    Let hir_finally be 0
     Let i be 1
     While i is less than child_count:
         Let catch_node be proc list_get from List with children, i
-        Let hir_catch be proc translate_catch_clause with translator, catch_node
-        If hir_catch is not equal to 0:
-            proc list_append from List with hir_catches, hir_catch
+        Let catch_kind be proc memory_get_int64 from Layout with catch_node, 0
+
+        If catch_kind is equal to AST_PATTERN_GUARD from FSharpAST:
+            Let hir_catch be proc translate_catch_clause with translator, catch_node
+            If hir_catch is not equal to 0:
+                proc list_append from List with hir_catches, hir_catch
+            End If
+        Otherwise:
+            Set hir_finally to proc translate_expression with translator, catch_node
         End If
         Set i to i plus 1
     End While
@@ -994,6 +1227,7 @@ Process called "translate_try_expression" takes translator as Integer, fsharp_no
     proc memory_set_int64 from Layout with try_node, 16, hir_catches    Note: catch_clauses
     Let catch_count be proc list_length from List with hir_catches
     proc memory_set_int64 from Layout with try_node, 24, catch_count    Note: catch_count
+    proc memory_set_int64 from Layout with try_node, 32, hir_finally    Note: finally_block
 
     Return try_node
 End Process
@@ -1014,14 +1248,14 @@ Process called "translate_while_expression" takes translator as Integer, fsharp_
 
     Note: Create HIR while statement
     Let arena be proc memory_get_int64 from Layout with translator, 56
-    Let while_size be 24  Note: HIRWhileStatement: 3 fields × 8 bytes
+    Let while_size be 72  Note: HIRWhileStatement: 3 fields × 8 bytes + parent slot at offset 64 (written by add_hir_node)
     Let while_node be proc arena_allocate from Layout with arena, while_size
 
     If while_node is equal to 0:
         Return 0
     End If
 
-    Let base_node be proc create_hir_node with translator, HIR_WHILE_STATEMENT
+    Let base_node be proc create_hir_node with translator, HIR_WHILE_STATEMENT from HIR
     proc memory_set_int64 from Layout with while_node, 0, base_node     Note: base
 
     Note: Translate condition
@@ -1053,21 +1287,22 @@ Process called "translate_for_expression" takes translator as Integer, fsharp_no
 
     Note: Create HIR for statement
     Let arena be proc memory_get_int64 from Layout with translator, 56
-    Let for_size be 40  Note: HIRForStatement: 5 fields × 8 bytes
+    Let for_size be 72  Note: HIRForStatement: 5 fields × 8 bytes + parent slot at offset 64 (written by add_hir_node)
     Let for_node be proc arena_allocate from Layout with arena, for_size
 
     If for_node is equal to 0:
         Return 0
     End If
 
-    Let base_node be proc create_hir_node with translator, HIR_FOR_STATEMENT
+    Let base_node be proc create_hir_node with translator, HIR_FOR_STATEMENT from HIR
     proc memory_set_int64 from Layout with for_node, 0, base_node       Note: base
 
-    Note: Translate iterator variable
+    Note: Translate iterator variable. Symbol creation is deferred to the
+    Note: resolver pass per the canonical HIRNode contract; the iterator slot
+    Note: carries the variable's token so the resolver can bind it.
     Let var_node be proc list_get from List with children, 0
     Let var_name be proc memory_get_int64 from Layout with var_node, 8
-    Let var_symbol be proc create_variable_symbol with translator, var_name
-    proc memory_set_int64 from Layout with for_node, 8, var_symbol      Note: iterator_variable
+    proc memory_set_int64 from Layout with for_node, 8, var_name        Note: iterator_variable
 
     Note: Translate iterable
     Let iterable_node be proc list_get from List with children, 1
@@ -1091,10 +1326,11 @@ Process called "translate_constructor_pattern" takes translator as Integer, fsha
     Note: Translate F# constructor pattern to HIR constructor pattern
 
     Let value be proc memory_get_int64 from Layout with fsharp_node, 8
-    Let constructor_name be proc get_token_text from value
+    Let constructor_name be proc get_token_text from FSharpLexer with value
 
-    Let hir_node be proc create_hir_node with translator, HIR_CONSTRUCTOR_PATTERN
-    proc set_hir_node_value with hir_node, constructor_name
+    Note: Discriminated-union constructor patterns map to the canonical variant pattern kind
+    Let hir_node be proc create_hir_node with translator, HIR_VARIANT_PATTERN from HIR
+    proc set_hir_node_value from HIR with hir_node, constructor_name, HIR_LITERAL_KIND_STRING from HIRNodes
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -1105,7 +1341,7 @@ Process called "translate_constructor_pattern" takes translator as Integer, fsha
         Let arg_node be proc list_get from List with children, i
         Let hir_arg be proc translate_pattern with translator, arg_node
         If hir_arg is not equal to 0:
-            proc add_hir_child with hir_node, hir_arg
+            proc add_hir_node from HIR with hir_node, hir_arg
         End If
         Set i to i plus 1
     End While
@@ -1119,7 +1355,7 @@ Tuple patterns "(a, b, c)" must match the discriminant's arity exactly; the HIR 
 Process called "translate_tuple_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# tuple pattern to HIR tuple pattern
 
-    Let hir_node be proc create_hir_node with translator, HIR_TUPLE_PATTERN
+    Let hir_node be proc create_hir_node with translator, HIR_TUPLE_PATTERN from HIR
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -1130,7 +1366,7 @@ Process called "translate_tuple_pattern" takes translator as Integer, fsharp_nod
         Let element_node be proc list_get from List with children, i
         Let hir_element be proc translate_pattern with translator, element_node
         If hir_element is not equal to 0:
-            proc add_hir_child with hir_node, hir_element
+            proc add_hir_node from HIR with hir_node, hir_element
         End If
         Set i to i plus 1
     End While
@@ -1144,7 +1380,9 @@ List patterns [a; b; c] and head::tail forms both translate here; we preserve th
 Process called "translate_list_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# list pattern to HIR list pattern
 
-    Let hir_node be proc create_hir_node with translator, HIR_LIST_PATTERN
+    Note: The canonical HIR pattern surface uses HIR_ARRAY_PATTERN for ordered
+    Note: element-sequence matching; F# list patterns share that shape exactly
+    Let hir_node be proc create_hir_node with translator, HIR_ARRAY_PATTERN from HIR
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -1155,7 +1393,7 @@ Process called "translate_list_pattern" takes translator as Integer, fsharp_node
         Let element_node be proc list_get from List with children, i
         Let hir_element be proc translate_pattern with translator, element_node
         If hir_element is not equal to 0:
-            proc add_hir_child with hir_node, hir_element
+            proc add_hir_node from HIR with hir_node, hir_element
         End If
         Set i to i plus 1
     End While
@@ -1169,7 +1407,7 @@ Array patterns [|a; b; c|] require fixed-arity matching against array length; th
 Process called "translate_array_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# array pattern to HIR array pattern
 
-    Let hir_node be proc create_hir_node with translator, HIR_ARRAY_PATTERN
+    Let hir_node be proc create_hir_node with translator, HIR_ARRAY_PATTERN from HIR
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -1180,7 +1418,7 @@ Process called "translate_array_pattern" takes translator as Integer, fsharp_nod
         Let element_node be proc list_get from List with children, i
         Let hir_element be proc translate_pattern with translator, element_node
         If hir_element is not equal to 0:
-            proc add_hir_child with hir_node, hir_element
+            proc add_hir_node from HIR with hir_node, hir_element
         End If
         Set i to i plus 1
     End While
@@ -1194,7 +1432,7 @@ Record patterns {Name = pat; ...} match field-by-field; the HIR RecordPattern ca
 Process called "translate_record_pattern" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# record pattern to HIR record pattern
 
-    Let hir_node be proc create_hir_node with translator, HIR_RECORD_PATTERN
+    Let hir_node be proc create_hir_node with translator, HIR_RECORD_PATTERN from HIR
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -1205,7 +1443,7 @@ Process called "translate_record_pattern" takes translator as Integer, fsharp_no
         Let field_node be proc list_get from List with children, i
         Let hir_field be proc translate_field_pattern with translator, field_node
         If hir_field is not equal to 0:
-            proc add_hir_child with hir_node, hir_field
+            proc add_hir_node from HIR with hir_node, hir_field
         End If
         Set i to i plus 1
     End While
@@ -1227,17 +1465,21 @@ Process called "translate_as_pattern" takes translator as Integer, fsharp_node a
         Return 0
     End If
 
-    Let hir_node be proc create_hir_node with translator, HIR_AS_PATTERN
+    Note: The canonical pattern surface has no dedicated as-pattern kind; an
+    Note: as-pattern is a variable binding whose match additionally constrains
+    Note: the value, so it is represented as HIR_IDENTIFIER_PATTERN (the binding
+    Note: pattern kind) carrying [inner pattern, variable pattern] as children
+    Let hir_node be proc create_hir_node with translator, HIR_IDENTIFIER_PATTERN from HIR
 
     Note: Translate the pattern
     Let pattern_node be proc list_get from List with children, 0
     Let hir_pattern be proc translate_pattern with translator, pattern_node
-    proc add_hir_child with hir_node, hir_pattern
+    proc add_hir_node from HIR with hir_node, hir_pattern
 
     Note: Translate the variable
     Let var_node be proc list_get from List with children, 1
     Let hir_var be proc translate_pattern with translator, var_node
-    proc add_hir_child with hir_node, hir_var
+    proc add_hir_node from HIR with hir_node, hir_var
 
     Return hir_node
 End Process
@@ -1256,17 +1498,17 @@ Process called "translate_guard_pattern" takes translator as Integer, fsharp_nod
         Return 0
     End If
 
-    Let hir_node be proc create_hir_node with translator, HIR_GUARD_PATTERN
+    Let hir_node be proc create_hir_node with translator, HIR_GUARD_PATTERN from HIR
 
     Note: Translate the pattern
     Let pattern_node be proc list_get from List with children, 0
     Let hir_pattern be proc translate_pattern with translator, pattern_node
-    proc add_hir_child with hir_node, hir_pattern
+    proc add_hir_node from HIR with hir_node, hir_pattern
 
     Note: Translate the guard condition
     Let guard_node be proc list_get from List with children, 1
     Let hir_guard be proc translate_expression with translator, guard_node
-    proc add_hir_child with hir_node, hir_guard
+    proc add_hir_node from HIR with hir_node, hir_guard
 
     Return hir_node
 End Process
@@ -1287,24 +1529,24 @@ Process called "translate_let_binding" takes translator as Integer, fsharp_node 
 
     Note: Create HIR let statement
     Let arena be proc memory_get_int64 from Layout with translator, 56
-    Let let_size be 48  Note: HIRLetStatement: 6 fields × 8 bytes
+    Let let_size be 72  Note: HIRLetStatement: 6 fields × 8 bytes + parent slot at offset 64 (written by add_hir_node)
     Let let_node be proc arena_allocate from Layout with arena, let_size
 
     If let_node is equal to 0:
         Return 0
     End If
 
-    Let base_node be proc create_hir_node with translator, HIR_LET_STATEMENT
+    Let base_node be proc create_hir_node with translator, HIR_LET_STATEMENT from HIR
     proc memory_set_int64 from Layout with let_node, 0, base_node       Note: base
 
     Note: Get variable info from pattern
     Let pattern_node be proc list_get from List with children, 0
-    Let var_name be proc extract_variable_name from pattern_node
+    Let var_name be proc extract_variable_name with pattern_node
     proc memory_set_int64 from Layout with let_node, 8, var_name        Note: variable_name
 
-    Note: Create variable symbol
-    Let var_symbol be proc create_variable_symbol with translator, var_name
-    proc memory_set_int64 from Layout with let_node, 16, var_symbol     Note: variable_symbol
+    Note: Symbol creation is deferred to the resolver pass per the canonical
+    Note: HIRNode contract (symbol slots hold the 0 sentinel until resolved)
+    proc memory_set_int64 from Layout with let_node, 16, 0              Note: variable_symbol = unresolved
 
     Note: Translate initializer expression
     Let expr_node be proc list_get from List with children, 1
@@ -1314,7 +1556,7 @@ Process called "translate_let_binding" takes translator as Integer, fsharp_node 
     Note: Check if recursive
     Let is_rec be proc memory_get_int64 from Layout with fsharp_node, 8
     Let is_mutable be 0
-    If is_rec is equal to TOKEN_REC:
+    If is_rec is equal to TOKEN_REC from FSharpLexer:
         Set is_mutable to 1
     End If
     proc memory_set_int64 from Layout with let_node, 40, is_mutable     Note: is_mutable
@@ -1331,10 +1573,10 @@ Process called "translate_module_declaration" takes translator as Integer, fshar
     Note: Translate F# module declaration to HIR module
 
     Let value be proc memory_get_int64 from Layout with fsharp_node, 8
-    Let module_name be proc get_token_text from value
+    Let module_name be proc get_token_text from FSharpLexer with value
 
-    Let hir_node be proc create_hir_node with translator, HIR_MODULE
-    proc set_hir_node_value with hir_node, module_name
+    Let hir_node be proc create_hir_node with translator, HIR_MODULE from HIRNodes
+    proc set_hir_node_value from HIR with hir_node, module_name, HIR_LITERAL_KIND_STRING from HIRNodes
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -1345,7 +1587,7 @@ Process called "translate_module_declaration" takes translator as Integer, fshar
         Let child_node be proc list_get from List with children, i
         Let hir_child be proc translate_declaration with translator, child_node
         If hir_child is not equal to 0:
-            proc add_hir_child with hir_node, hir_child
+            proc add_hir_node from HIR with hir_node, hir_child
         End If
         Set i to i plus 1
     End While
@@ -1360,10 +1602,14 @@ Process called "translate_namespace_declaration" takes translator as Integer, fs
     Note: Translate F# namespace declaration to HIR namespace
 
     Let value be proc memory_get_int64 from Layout with fsharp_node, 8
-    Let namespace_name be proc get_token_text from value
+    Let namespace_name be proc get_token_text from FSharpLexer with value
 
-    Let hir_node be proc create_hir_node with translator, HIR_NAMESPACE
-    proc set_hir_node_value with hir_node, namespace_name
+    Note: F# namespaces are declaration containers exactly like modules at the
+    Note: HIR level; the canonical surface represents both as HIR_MODULE, and
+    Note: the namespace-specific child restrictions are enforced here during
+    Note: translation rather than by a distinct node kind
+    Let hir_node be proc create_hir_node with translator, HIR_MODULE from HIRNodes
+    proc set_hir_node_value from HIR with hir_node, namespace_name, HIR_LITERAL_KIND_STRING from HIRNodes
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -1374,7 +1620,7 @@ Process called "translate_namespace_declaration" takes translator as Integer, fs
         Let child_node be proc list_get from List with children, i
         Let hir_child be proc translate_declaration with translator, child_node
         If hir_child is not equal to 0:
-            proc add_hir_child with hir_node, hir_child
+            proc add_hir_node from HIR with hir_node, hir_child
         End If
         Set i to i plus 1
     End While
@@ -1389,10 +1635,10 @@ Process called "translate_type_declaration" takes translator as Integer, fsharp_
     Note: Translate F# type declaration to HIR type definition
 
     Let value be proc memory_get_int64 from Layout with fsharp_node, 8
-    Let type_name be proc get_token_text from value
+    Let type_name be proc get_token_text from FSharpLexer with value
 
-    Let hir_node be proc create_hir_node with translator, HIR_TYPE_DEFINITION
-    proc set_hir_node_value with hir_node, type_name
+    Let hir_node be proc create_hir_node with translator, HIR_TYPE_DEFINITION from HIR
+    proc set_hir_node_value from HIR with hir_node, type_name, HIR_LITERAL_KIND_STRING from HIRNodes
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -1402,7 +1648,7 @@ Process called "translate_type_declaration" takes translator as Integer, fsharp_
         Let type_body be proc list_get from List with children, 0
         Let hir_body be proc translate_type_body with translator, type_body
         If hir_body is not equal to 0:
-            proc add_hir_child with hir_node, hir_body
+            proc add_hir_node from HIR with hir_node, hir_body
         End If
     End If
 
@@ -1416,10 +1662,13 @@ Process called "translate_value_declaration" takes translator as Integer, fsharp
     Note: Translate F# value declaration to HIR value signature
 
     Let value be proc memory_get_int64 from Layout with fsharp_node, 8
-    Let value_name be proc get_token_text from value
+    Let value_name be proc get_token_text from FSharpLexer with value
 
-    Let hir_node be proc create_hir_node with translator, HIR_VALUE_SIGNATURE
-    proc set_hir_node_value with hir_node, value_name
+    Note: "val" signatures declare a value without an initializer; the canonical
+    Note: surface represents that as HIR_VARIABLE (declaration without body),
+    Note: with the declared type attached as a child when present
+    Let hir_node be proc create_hir_node with translator, HIR_VARIABLE from HIRNodes
+    proc set_hir_node_value from HIR with hir_node, value_name, HIR_LITERAL_KIND_STRING from HIRNodes
 
     Let children be proc memory_get_int64 from Layout with fsharp_node, 16
     Let child_count be proc memory_get_int64 from Layout with fsharp_node, 24
@@ -1429,7 +1678,7 @@ Process called "translate_value_declaration" takes translator as Integer, fsharp
         Let type_node be proc list_get from List with children, 0
         Let hir_type be proc translate_type_expression with translator, type_node
         If hir_type is not equal to 0:
-            proc add_hir_child with hir_node, hir_type
+            proc add_hir_node from HIR with hir_node, hir_type
         End If
     End If
 
@@ -1443,12 +1692,580 @@ Process called "translate_open_statement" takes translator as Integer, fsharp_no
     Note: Translate F# open statement to HIR import
 
     Let value be proc memory_get_int64 from Layout with fsharp_node, 8
-    Let module_name be proc get_token_text from value
+    Let module_name be proc get_token_text from FSharpLexer with value
 
-    Let hir_node be proc create_hir_node with translator, HIR_IMPORT
-    proc set_hir_node_value with hir_node, module_name
+    Let hir_node be proc create_hir_node with translator, HIR_IMPORT from HIRNodes
+    proc set_hir_node_value from HIR with hir_node, module_name, HIR_LITERAL_KIND_STRING from HIRNodes
 
     Return hir_node
+End Process
+
+Note: ============================================================================
+Note: Pattern Name Extraction and Sub-Translators
+Note: ============================================================================
+
+@Reasoning:
+Extracts the bound variable name (a string) from a binding pattern.
+Variable patterns yield their token's text; as-patterns yield the alias
+(child 1); wildcards yield "_"; composite patterns (tuples, constructor
+applications) recurse into their first sub-pattern because the first
+bound name is the canonical binding identity the HIR let record carries.
+Patterns that bind nothing (literals, empty composites) yield 0 so the
+caller stores the unbound sentinel.
+@End Reasoning
+Process called "extract_variable_name" takes pattern_node as Integer returns Integer:
+    Note: Extract the bound variable name string from a binding pattern
+
+    If pattern_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with pattern_node, 0
+
+    If node_type is equal to AST_PATTERN_VARIABLE from FSharpAST:
+        Let token be proc memory_get_int64 from Layout with pattern_node, 8
+        Return proc get_token_text from FSharpLexer with token
+    End If
+
+    If node_type is equal to AST_PATTERN_WILDCARD from FSharpAST:
+        Return "_"
+    End If
+
+    If node_type is equal to AST_PATTERN_AS from FSharpAST:
+        Note: The alias variable is child 1
+        Let as_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let as_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If as_count is greater than 1:
+            Let alias_node be proc list_get from List with as_children, 1
+            Return proc extract_variable_name with alias_node
+        End If
+        Return 0
+    End If
+
+    If node_type is equal to AST_PATTERN_TUPLE from FSharpAST:
+        Let tuple_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let tuple_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If tuple_count is greater than 0:
+            Let first_sub be proc list_get from List with tuple_children, 0
+            Return proc extract_variable_name with first_sub
+        End If
+        Return 0
+    End If
+
+    If node_type is equal to AST_PATTERN_CONSTRUCTOR from FSharpAST:
+        Let ctor_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let ctor_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If ctor_count is greater than 0:
+            Set first_sub to proc list_get from List with ctor_children, 0
+            Return proc extract_variable_name with first_sub
+        End If
+        Return 0
+    End If
+
+    If node_type is equal to AST_PATTERN_GUARD from FSharpAST:
+        Let guard_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let guard_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If guard_count is greater than 0:
+            Set first_sub to proc list_get from List with guard_children, 0
+            Return proc extract_variable_name with first_sub
+        End If
+        Return 0
+    End If
+
+    Note: Type-test patterns bind through their optional as-binder child
+    If node_type is equal to AST_PATTERN_TYPE_TEST from FSharpAST:
+        Let test_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let test_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If test_count is greater than 0:
+            Set first_sub to proc list_get from List with test_children, 0
+            Return proc extract_variable_name with first_sub
+        End If
+        Return 0
+    End If
+
+    Note: Or-patterns must bind the same names in every alternative, so the
+    Note: first alternative's binding is the canonical identity
+    If node_type is equal to AST_PATTERN_OR from FSharpAST:
+        Let or_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let or_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If or_count is greater than 0:
+            Set first_sub to proc list_get from List with or_children, 0
+            Return proc extract_variable_name with first_sub
+        End If
+        Return 0
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Translates one F# `with` handler arm (an AST_PATTERN_GUARD carrying
+[pattern, body] or [wrapped guard pattern, body]) into the canonical
+HIR_CATCH clause shape shared by the dart and yaml frontends:
+exception_type and exception_variable properties plus a body. F#
+exception patterns are constructor patterns (`| :? DivideByZeroException
+as ex` simplifies to constructor/variable shapes in this grammar), so a
+constructor pattern contributes the type name and its first bound
+sub-variable; a plain variable pattern contributes only the binding.
+A `when` guard inside the arm has no slot in the shared catch shape and
+is stored under the "fsharp_catch_guard" metadata key (the same
+mechanism dart uses for its stack-trace variable).
+@End Reasoning
+Process called "translate_catch_clause" takes translator as Integer, catch_node as Integer returns Integer:
+    Note: Translate F# with-handler arm to a canonical HIR catch clause
+
+    If catch_node is equal to 0:
+        Return 0
+    End If
+
+    Let children be proc memory_get_int64 from Layout with catch_node, 16
+    Let child_count be proc memory_get_int64 from Layout with catch_node, 24
+
+    If child_count is less than 2:
+        proc set_translation_error with translator, "Catch clause requires pattern and handler"
+        Return 0
+    End If
+
+    Let hir_catch be proc hir_create_catch from HIRNodes
+
+    Note: Unwrap a guarded pattern: AST_PATTERN_GUARD(inner, guard expr)
+    Let pattern_node be proc list_get from List with children, 0
+    Let pattern_type be proc memory_get_int64 from Layout with pattern_node, 0
+
+    If pattern_type is equal to AST_PATTERN_GUARD from FSharpAST:
+        Let inner_children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let inner_count be proc memory_get_int64 from Layout with pattern_node, 24
+        If inner_count is greater than 1:
+            Let guard_expr_node be proc list_get from List with inner_children, 1
+            Let hir_guard be proc translate_expression with translator, guard_expr_node
+            If hir_guard is not equal to 0:
+                proc hir_set_metadata from HIRNodes with hir_catch, "fsharp_catch_guard", hir_guard
+            End If
+        End If
+        If inner_count is greater than 0:
+            Set pattern_node to proc list_get from List with inner_children, 0
+            Set pattern_type to proc memory_get_int64 from Layout with pattern_node, 0
+        End If
+    End If
+
+    Note: Type-test patterns (:? ExnType as ex) and constructor patterns name
+    Note: the exception type; variable patterns bind the exception value
+    Let typed_pattern be 0
+    If pattern_type is equal to AST_PATTERN_CONSTRUCTOR from FSharpAST:
+        Set typed_pattern to 1
+    End If
+    If pattern_type is equal to AST_PATTERN_TYPE_TEST from FSharpAST:
+        Set typed_pattern to 1
+    End If
+
+    If typed_pattern is equal to 1:
+        Let ctor_token be proc memory_get_int64 from Layout with pattern_node, 8
+        Let type_name be proc get_token_text from FSharpLexer with ctor_token
+        If type_name is not equal to 0:
+            proc hir_set_catch_type from HIRNodes with hir_catch, type_name
+        End If
+
+        Let bound_name be proc extract_variable_name with pattern_node
+        If bound_name is not equal to 0:
+            proc hir_set_catch_variable from HIRNodes with hir_catch, bound_name
+        End If
+    Otherwise:
+        Set bound_name to proc extract_variable_name with pattern_node
+        If bound_name is not equal to 0:
+            proc hir_set_catch_variable from HIRNodes with hir_catch, bound_name
+        End If
+    End If
+
+    Note: Handler body is the last child
+    Let body_index be child_count minus 1
+    Let body_node be proc list_get from List with children, body_index
+    Let hir_body be proc translate_expression with translator, body_node
+    proc hir_set_catch_body from HIRNodes with hir_catch, hir_body
+
+    Return hir_catch
+End Process
+
+@Reasoning:
+Translates one record-expression field (`Name = value`). The parser
+encodes each field as an AST_LET_BINDING whose value slot holds the
+field-name token and whose single child is the value expression. The
+canonical HIR entry for a named field/value pair is the
+HIR_FIELD_INITIALIZER node produced by hir_create_field_init - the same
+shape the dart frontend uses for constructor field initializers - so
+record consumers read one uniform name/value surface.
+@End Reasoning
+Process called "translate_field_assignment" takes translator as Integer, field_node as Integer returns Integer:
+    Note: Translate F# record field assignment to HIR field initializer
+
+    If field_node is equal to 0:
+        Return 0
+    End If
+
+    Let name_token be proc memory_get_int64 from Layout with field_node, 8
+    Let field_name be proc get_token_text from FSharpLexer with name_token
+    If field_name is equal to 0:
+        proc set_translation_error with translator, "Record field requires a name"
+        Return 0
+    End If
+
+    Let children be proc memory_get_int64 from Layout with field_node, 16
+    Let child_count be proc memory_get_int64 from Layout with field_node, 24
+    If child_count is less than 1:
+        proc set_translation_error with translator, "Record field requires a value"
+        Return 0
+    End If
+
+    Let value_node be proc list_get from List with children, 0
+    Let hir_value be proc translate_expression with translator, value_node
+    If hir_value is equal to 0:
+        Return 0
+    End If
+
+    Return proc hir_create_field_init from HIRNodes with field_name, hir_value
+End Process
+
+@Reasoning:
+Translates one record-pattern field (`Name = pattern`). The parser
+encodes each field as an AST_PATTERN_VARIABLE whose value slot holds
+the field-name token and whose single child is the sub-pattern. The
+HIR shape is an HIR_IDENTIFIER_PATTERN carrying the field name in its
+value slot with the translated sub-pattern as its child - field-by-
+field matching reads the name to locate the field and the child to
+match its value.
+@End Reasoning
+Process called "translate_field_pattern" takes translator as Integer, field_node as Integer returns Integer:
+    Note: Translate F# record field pattern to HIR named field pattern
+
+    If field_node is equal to 0:
+        Return 0
+    End If
+
+    Let name_token be proc memory_get_int64 from Layout with field_node, 8
+    Let field_name be proc get_token_text from FSharpLexer with name_token
+    If field_name is equal to 0:
+        proc set_translation_error with translator, "Record field pattern requires a name"
+        Return 0
+    End If
+
+    Let hir_node be proc create_hir_node with translator, HIR_IDENTIFIER_PATTERN from HIR
+    proc set_hir_node_value from HIR with hir_node, field_name, HIR_LITERAL_KIND_STRING from HIRNodes
+
+    Let children be proc memory_get_int64 from Layout with field_node, 16
+    Let child_count be proc memory_get_int64 from Layout with field_node, 24
+    If child_count is greater than 0:
+        Let sub_node be proc list_get from List with children, 0
+        Let hir_sub be proc translate_pattern with translator, sub_node
+        If hir_sub is not equal to 0:
+            proc add_hir_node from HIR with hir_node, hir_sub
+        End If
+    End If
+
+    Return hir_node
+End Process
+
+@Reasoning:
+Translates a type expression (the type position of val signatures,
+record fields, union payloads, abbreviations). Named types - including
+dotted paths and 'a type variables, whose tokens carry the full
+spelling - become canonical HIR_TYPE_REF nodes via hir_create_type_ref.
+Function arrow types become HIR_FUNCTION_TYPE nodes with the parameter
+type appended and the result type set through the canonical
+function-type producers, recursing so curried arrows
+(a -> b -> c) chain naturally.
+@End Reasoning
+Process called "translate_type_expression" takes translator as Integer, type_node as Integer returns Integer:
+    Note: Translate F# type expression to HIR type node
+
+    If type_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with type_node, 0
+
+    If node_type is equal to AST_TYPE_NAME from FSharpAST:
+        Let name_token be proc memory_get_int64 from Layout with type_node, 8
+        Let type_name be proc get_token_text from FSharpLexer with name_token
+        If type_name is equal to 0:
+            proc set_translation_error with translator, "Type name token missing"
+            Return 0
+        End If
+        Return proc hir_create_type_ref from HIRNodes with type_name
+    End If
+
+    If node_type is equal to AST_TYPE_FUNCTION from FSharpAST:
+        Let children be proc memory_get_int64 from Layout with type_node, 16
+        Let child_count be proc memory_get_int64 from Layout with type_node, 24
+        If child_count is less than 2:
+            proc set_translation_error with translator, "Function type requires argument and result"
+            Return 0
+        End If
+
+        Let arg_node be proc list_get from List with children, 0
+        Let result_node be proc list_get from List with children, 1
+        Let hir_arg be proc translate_type_expression with translator, arg_node
+        Let hir_result be proc translate_type_expression with translator, result_node
+
+        Let fn_node be proc hir_create_function_type from HIRNodes
+        If hir_arg is not equal to 0:
+            proc hir_add_function_type_param from HIRNodes with fn_node, hir_arg
+        End If
+        If hir_result is not equal to 0:
+            proc hir_set_function_type_return from HIRNodes with fn_node, hir_result
+        End If
+        Return fn_node
+    End If
+
+    Note: Generic type applications - postfix (int option, int list) and
+    Note: prefix (List<int>, Dictionary<K, V>) forms share one AST shape:
+    Note: constructor-name token in the value slot, argument types as
+    Note: children. Both become the canonical HIR_GENERIC_TYPE instantiation
+    Note: node via the hir_nodes producers (base name + ordered type args).
+    If node_type is equal to AST_TYPE_APPLICATION from FSharpAST:
+        Let ctor_token be proc memory_get_int64 from Layout with type_node, 8
+        Let ctor_name be proc get_token_text from FSharpLexer with ctor_token
+        If ctor_name is equal to 0:
+            proc set_translation_error with translator, "Generic type application requires a constructor name"
+            Return 0
+        End If
+
+        Let generic_node be proc hir_create_generic_type from HIRNodes
+        proc hir_set_generic_base from HIRNodes with generic_node, ctor_name
+
+        Set children to proc memory_get_int64 from Layout with type_node, 16
+        Set child_count to proc memory_get_int64 from Layout with type_node, 24
+        Let i be 0
+        While i is less than child_count:
+            Let type_arg_node be proc list_get from List with children, i
+            Let hir_type_arg be proc translate_type_expression with translator, type_arg_node
+            If hir_type_arg is not equal to 0:
+                proc hir_add_generic_arg from HIRNodes with generic_node, hir_type_arg
+            End If
+            Set i to i plus 1
+        End While
+
+        Return generic_node
+    End If
+
+    proc set_translation_error with translator, "Unsupported F# type expression"
+    Return 0
+End Process
+
+@Reasoning:
+Translates the body of a `type Name = ...` declaration. Each F# type
+kind maps to its canonical HIR shape: records to HIR_RECORD_TYPE with
+HIR_FIELD_DEFINITION children (field name in the value slot, field
+type as a child), discriminated unions to HIR_ENUM_TYPE with
+HIR_VARIANT_DEFINITION children (case name in the value slot, payload
+type as an optional child), classes to HIR_CLASS with method/field/
+binding members, interfaces to HIR_PROTOCOL_DEFINITION with abstract
+member signatures, and abbreviations to the translated type
+expression directly. Method members become HIR_PROCESS_DEFINITION
+nodes whose children are the translated parameter patterns followed by
+the translated return type (type-expression children are recognised by
+node kind, mirroring the parser's positional layout).
+@End Reasoning
+Process called "translate_type_body" takes translator as Integer, type_body as Integer returns Integer:
+    Note: Translate F# type definition body to its HIR type shape
+
+    If type_body is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with type_body, 0
+    Let children be proc memory_get_int64 from Layout with type_body, 16
+    Let child_count be proc memory_get_int64 from Layout with type_body, 24
+
+    Note: Record type: {field: type; ...}
+    If node_type is equal to AST_RECORD_TYPE from FSharpAST:
+        Let hir_record be proc create_hir_node with translator, HIR_RECORD_TYPE from HIR
+
+        Let i be 0
+        While i is less than child_count:
+            Let field_node be proc list_get from List with children, i
+            Let field_token be proc memory_get_int64 from Layout with field_node, 8
+            Let field_name be proc get_token_text from FSharpLexer with field_token
+
+            Let hir_field be proc create_hir_node with translator, HIR_FIELD_DEFINITION from HIR
+            proc set_hir_node_value from HIR with hir_field, field_name, HIR_LITERAL_KIND_STRING from HIRNodes
+
+            Let field_children be proc memory_get_int64 from Layout with field_node, 16
+            Let field_child_count be proc memory_get_int64 from Layout with field_node, 24
+            If field_child_count is greater than 0:
+                Let field_type_node be proc list_get from List with field_children, 0
+                Let hir_field_type be proc translate_type_expression with translator, field_type_node
+                If hir_field_type is not equal to 0:
+                    proc add_hir_node from HIR with hir_field, hir_field_type
+                End If
+            End If
+
+            proc add_hir_node from HIR with hir_record, hir_field
+            Set i to i plus 1
+        End While
+
+        Return hir_record
+    End If
+
+    Note: Discriminated union: | Case1 | Case2 of type
+    If node_type is equal to AST_UNION_TYPE from FSharpAST:
+        Let hir_union be proc create_hir_node with translator, HIR_ENUM_TYPE from HIR
+
+        Set i to 0
+        While i is less than child_count:
+            Let case_node be proc list_get from List with children, i
+            Let case_token be proc memory_get_int64 from Layout with case_node, 8
+            Let case_name be proc get_token_text from FSharpLexer with case_token
+
+            Let hir_variant be proc create_hir_node with translator, HIR_VARIANT_DEFINITION from HIR
+            proc set_hir_node_value from HIR with hir_variant, case_name, HIR_LITERAL_KIND_STRING from HIRNodes
+
+            Let case_children be proc memory_get_int64 from Layout with case_node, 16
+            Let case_child_count be proc memory_get_int64 from Layout with case_node, 24
+            If case_child_count is greater than 0:
+                Let payload_node be proc list_get from List with case_children, 0
+                Let hir_payload be proc translate_type_expression with translator, payload_node
+                If hir_payload is not equal to 0:
+                    proc add_hir_node from HIR with hir_variant, hir_payload
+                End If
+            End If
+
+            proc add_hir_node from HIR with hir_union, hir_variant
+            Set i to i plus 1
+        End While
+
+        Return hir_union
+    End If
+
+    Note: Class type: members are methods, properties, and let bindings
+    If node_type is equal to AST_CLASS_TYPE from FSharpAST:
+        Let hir_class be proc create_hir_node with translator, HIR_CLASS from HIRNodes
+        Let hir_member be 0
+        Set i to 0
+        While i is less than child_count:
+            Let member_node be proc list_get from List with children, i
+            Set hir_member to proc translate_type_member with translator, member_node
+            If hir_member is not equal to 0:
+                proc add_hir_node from HIR with hir_class, hir_member
+            End If
+            Set i to i plus 1
+        End While
+        Return hir_class
+    End If
+
+    Note: Interface type: abstract member signatures only
+    If node_type is equal to AST_INTERFACE_TYPE from FSharpAST:
+        Let hir_protocol be proc create_hir_node with translator, HIR_PROTOCOL_DEFINITION from HIR
+        Set i to 0
+        While i is less than child_count:
+            Set member_node to proc list_get from List with children, i
+            Set hir_member to proc translate_type_member with translator, member_node
+            If hir_member is not equal to 0:
+                proc add_hir_node from HIR with hir_protocol, hir_member
+            End If
+            Set i to i plus 1
+        End While
+        Return hir_protocol
+    End If
+
+    Note: Type abbreviation: the body is a type expression
+    If node_type is equal to AST_TYPE_NAME from FSharpAST:
+        Return proc translate_type_expression with translator, type_body
+    End If
+    If node_type is equal to AST_TYPE_FUNCTION from FSharpAST:
+        Return proc translate_type_expression with translator, type_body
+    End If
+    If node_type is equal to AST_TYPE_APPLICATION from FSharpAST:
+        Return proc translate_type_expression with translator, type_body
+    End If
+
+    proc set_translation_error with translator, "Unsupported F# type definition body"
+    Return 0
+End Process
+
+@Reasoning:
+Translates one class/interface member. Methods become
+HIR_PROCESS_DEFINITION nodes (name in the value slot; translated
+parameter patterns then the translated return type as children, the
+type-expression children recognised by AST node kind). Properties
+become HIR_FIELD_DEFINITION nodes (name + declared type child). Let
+bindings inside class bodies reuse translate_let_binding.
+@End Reasoning
+Process called "translate_type_member" takes translator as Integer, member_node as Integer returns Integer:
+    Note: Translate one F# class/interface member to its HIR shape
+
+    If member_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with member_node, 0
+
+    If node_type is equal to AST_METHOD_DECLARATION from FSharpAST:
+        Let name_token be proc memory_get_int64 from Layout with member_node, 8
+        Let method_name be proc get_token_text from FSharpLexer with name_token
+
+        Let hir_method be proc create_hir_node with translator, HIR_PROCESS_DEFINITION from HIR
+        proc set_hir_node_value from HIR with hir_method, method_name, HIR_LITERAL_KIND_STRING from HIRNodes
+
+        Let children be proc memory_get_int64 from Layout with member_node, 16
+        Let child_count be proc memory_get_int64 from Layout with member_node, 24
+        Let i be 0
+        While i is less than child_count:
+            Let child_node be proc list_get from List with children, i
+            Let child_kind be proc memory_get_int64 from Layout with child_node, 0
+
+            Let is_type_child be 0
+            If child_kind is equal to AST_TYPE_NAME from FSharpAST:
+                Set is_type_child to 1
+            End If
+            If child_kind is equal to AST_TYPE_FUNCTION from FSharpAST:
+                Set is_type_child to 1
+            End If
+            If child_kind is equal to AST_TYPE_APPLICATION from FSharpAST:
+                Set is_type_child to 1
+            End If
+
+            If is_type_child is equal to 1:
+                Let hir_type be proc translate_type_expression with translator, child_node
+                If hir_type is not equal to 0:
+                    proc add_hir_node from HIR with hir_method, hir_type
+                End If
+            Otherwise:
+                Let hir_param be proc translate_pattern with translator, child_node
+                If hir_param is not equal to 0:
+                    proc add_hir_node from HIR with hir_method, hir_param
+                End If
+            End If
+            Set i to i plus 1
+        End While
+
+        Return hir_method
+    End If
+
+    If node_type is equal to AST_PROPERTY_DECLARATION from FSharpAST:
+        Set name_token to proc memory_get_int64 from Layout with member_node, 8
+        Let property_name be proc get_token_text from FSharpLexer with name_token
+
+        Let hir_property be proc create_hir_node with translator, HIR_FIELD_DEFINITION from HIR
+        proc set_hir_node_value from HIR with hir_property, property_name, HIR_LITERAL_KIND_STRING from HIRNodes
+
+        Set children to proc memory_get_int64 from Layout with member_node, 16
+        Set child_count to proc memory_get_int64 from Layout with member_node, 24
+        If child_count is greater than 0:
+            Let type_node be proc list_get from List with children, 0
+            Set hir_type to proc translate_type_expression with translator, type_node
+            If hir_type is not equal to 0:
+                proc add_hir_node from HIR with hir_property, hir_type
+            End If
+        End If
+
+        Return hir_property
+    End If
+
+    If node_type is equal to AST_LET_BINDING from FSharpAST:
+        Return proc translate_let_binding with translator, member_node
+    End If
+
+    proc set_translation_error with translator, "Unsupported F# type member"
+    Return 0
 End Process
 
 Note: ============================================================================
@@ -1467,29 +2284,33 @@ Process called "translate_fsharp_to_hir" takes ast_root as Integer returns Integ
     and type inference while maintaining translation context.
     @End Reasoning
 
-    Let translator be proc create_fsharp_translator from ast_root
+    Let translator be proc create_fsharp_translator with ast_root
     If translator is equal to 0:
         Return 0
     End If
 
     Note: Create HIR module for output
-    Let hir_module be proc create_hir_node with translator, HIR_MODULE
+    Let hir_module be proc create_hir_node with translator, HIR_MODULE from HIRNodes
     proc memory_set_int64 from Layout with translator, 8, hir_module
 
     Note: Translate the root AST node
     Let hir_root be proc translate_declaration with translator, ast_root
     If hir_root is not equal to 0:
-        proc add_hir_child with hir_module, hir_root
+        proc add_hir_node from HIR with hir_module, hir_root
     End If
 
-    Let has_error be proc has_translation_error from translator
+    Let has_error be proc has_translation_error with translator
     If has_error is equal to 1:
-        proc destroy_fsharp_translator from translator
+        proc destroy_fsharp_translator with translator
         Return 0
     End If
 
+    Note: Success: release the translator record but keep its arena alive -
+    Note: the composite HIR records (match/if/try/let/while/for shapes) the
+    Note: translator allocated live inside the returned tree, so arena
+    Note: ownership transfers to the HIR consumer
     Let result_module be hir_module
-    proc destroy_fsharp_translator from translator
+    proc deallocate from Layout with translator
     Return result_module
 End Process
 

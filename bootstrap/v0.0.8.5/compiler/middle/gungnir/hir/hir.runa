@@ -128,6 +128,11 @@ Constant HIR_REFERENCE_TYPE as Integer is 13011      Note: Reference type (&T, &
 Constant HIR_POINTER_TYPE as Integer is 13012        Note: Raw pointer type (*T)
 Constant HIR_SLICE_TYPE as Integer is 13013          Note: Slice type ([T])
 Constant HIR_NEVER_TYPE as Integer is 13014          Note: Never type (!)
+Constant TYPE_INTEGER as Integer is 13015            Note: Resolved primitive Integer type kind (band extension 2026-06-09: specific primitive kinds so HIRTypeInfo.type_kind distinguishes Integer/Float/String/Boolean without re-reading type_name)
+Constant TYPE_FLOAT as Integer is 13016              Note: Resolved primitive Float type kind
+Constant TYPE_STRING as Integer is 13017             Note: Resolved primitive String type kind
+Constant TYPE_BOOLEAN as Integer is 13018            Note: Resolved primitive Boolean type kind
+Constant HIR_ENUM_TYPE as Integer is 13019           Note: Enum/variant type kind (variants stored in field_types list)
 
 Note: HIR Pattern Types (14000-14999)
 Constant HIR_IDENTIFIER_PATTERN as Integer is 14000  Note: Variable binding pattern
@@ -158,6 +163,26 @@ Constant HIR_LIFETIME_INFO as Integer is 16002       Note: Lifetime information
 Constant HIR_VISIBILITY_INFO as Integer is 16003     Note: Visibility (public, private, module)
 Constant HIR_MUTABILITY_INFO as Integer is 16004     Note: Mutability information
 Constant HIR_RESOLVED_SYMBOL as Integer is 16005     Note: Symbol resolution information
+
+Note: HIR Symbol Kinds (band added 2026-06-09)
+Note: Values are LOAD-BEARING: add_symbol_to_scope in hir_builder.runa routes
+Note: symbols to per-scope lists by these exact values (0/3 -> variables list,
+Note: 1 -> functions list, 2 -> types list), so this band intentionally uses
+Note: the small-enum convention already established by that routing code
+Note: rather than a 17000-range band.
+Constant SYMBOL_VARIABLE as Integer is 0             Note: Local/global variable symbol
+Constant SYMBOL_FUNCTION as Integer is 1             Note: Process/function symbol
+Constant SYMBOL_TYPE as Integer is 2                 Note: Type definition symbol
+Constant SYMBOL_PARAMETER as Integer is 3            Note: Process parameter symbol (resolved via variables list)
+Constant SYMBOL_FIELD as Integer is 4                Note: Struct/type field symbol (resolved via owning type's field_types list)
+
+Note: HIR Scope Kinds (band added 2026-06-09)
+Note: Stored at HIRScopeInfo offset 16. The root/module scope is created with
+Note: kind 0 (see create_hir_builder_context), so SCOPE_GLOBAL anchors the band.
+Constant SCOPE_GLOBAL as Integer is 0                Note: Root module/global scope
+Constant SCOPE_FUNCTION as Integer is 1              Note: Process body scope
+Constant SCOPE_BLOCK as Integer is 2                 Note: Lexical block scope (If/When/Unsafe blocks)
+Constant SCOPE_LOOP as Integer is 3                  Note: Loop body scope (While/For)
 
 Note: ============================================================================
 Note: HIR Data Structures
@@ -1251,6 +1276,40 @@ Process called "set_hir_node_type_info" takes node as Integer, type_info as Inte
     Return 1  Note: Success
 End Process
 
+Process called "set_hir_node_value" takes node as Integer, value as Integer, value_type as Integer returns Integer:
+    Note: Set the value payload and value type tag of a HIR node
+
+    @Reasoning:
+    Literal, identifier, and constructor nodes carry their payload in the
+    HIRNode value slot, with a companion value_type tag that records how
+    the payload must be interpreted (interned string pointer, raw integer,
+    float bits, boolean flag). The constructor zero-initializes both slots;
+    this is the canonical setter that the lowering passes and the
+    translation frontends (fsharp_to_hir and peers) use to fill them in
+    one call so the pair can never go out of sync.
+    @End Reasoning
+
+    @Implementation:
+    Per the HIRNode layout, value lives at byte offset 40 and value_type
+    at byte offset 48. Null-check the node pointer first; write both
+    int64 slots verbatim. Returns 1 on success, 0 on null node.
+    @End Implementation
+
+    @Security_Scope:
+    When value is a pointer (string payloads), the node references that
+    block from here on; the caller must keep it live for the node's
+    lifetime. Writing 0/0 is legal and means "clear the value binding".
+    @End Security_Scope
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 40, value
+    proc memory_set_int64 from Layout with node, 48, value_type
+    Return 1
+End Process
+
 Process called "get_hir_node_scope_id" takes node as Integer returns Integer:
     Note: Get scope ID from HIR node
 
@@ -1998,6 +2057,608 @@ Process called "add_element_to_hir_list" takes list_node as Integer, element as 
     proc memory_set_int64 from Layout with element, 64, list_node
 
     Return 1
+End Process
+
+Note: ============================================================================
+Note: Typed Literal and Collection Accessor Surface (Task #433)
+Note: ============================================================================
+
+Note:
+This section completes the literal family begun by create_hir_string_literal
+and create_hir_boolean_literal, and defines the canonical semantic accessors
+that translation backends use to read literal payloads and collection
+contents out of core HIR nodes.
+
+Literal model: every literal is a HIRNode of node_type HIR_LITERAL whose
+payload lives in the value slot (offset 40) and whose interpretation tag
+lives in the value_type slot (offset 48). The tag values are:
+  1 = string  (value is a pointer to a null-terminated string)
+  2 = boolean (value is 0 or 1)
+  3 = integer (value is a raw signed int64)
+  4 = float   (value is raw IEEE-754 bit pattern carried in an int64)
+Tags 1 and 2 were established by the existing creators; tags 3 and 4 are
+defined here and are the canonical completion of that scheme.
+
+Collection model: list literals are HIRNodes of node_type HIR_ARRAY_LITERAL
+whose elements List lives in the children slot (offset 24). Dictionary
+literals are HIRNodes of node_type HIR_DICTIONARY_LITERAL whose children
+slot holds a List of 16-byte entry blocks, each entry laid out as
+[key(0), value(8)] where key is a string pointer and value is a HIR node.
+
+Error convention: every accessor null-guards and kind-validates its input,
+returning 0 for null nodes, wrong-kind nodes, and absent payloads - the
+same sentinel convention used by the rest of this module.
+:End Note
+
+Constant HIR_DICTIONARY_LITERAL as Integer is 10019  Note: Typed dictionary literal (string keys to HIR node values)
+
+Constant HIR_LITERAL_KIND_STRING as Integer is 1     Note: value_type tag: string pointer payload
+Constant HIR_LITERAL_KIND_BOOLEAN as Integer is 2    Note: value_type tag: boolean 0/1 payload
+Constant HIR_LITERAL_KIND_INTEGER as Integer is 3    Note: value_type tag: raw int64 payload
+Constant HIR_LITERAL_KIND_FLOAT as Integer is 4      Note: value_type tag: IEEE-754 bits payload
+
+Process called "create_hir_integer_literal" takes value as Integer returns Integer:
+    Note: Create HIR integer literal expression node
+
+    @Reasoning:
+    Integer literals are typed constant expressions. Symmetric with
+    create_hir_string_literal and create_hir_boolean_literal so every
+    literal kind has a dedicated creator that fixes both the payload and
+    the value_type tag in one place. Translation frontends (swiftui_to_hir
+    and peers) construct numeric literals exclusively through this creator.
+    @End Reasoning
+
+    @Implementation:
+    1. Create base HIRNode of type HIR_LITERAL.
+    2. Store the raw int64 value at value slot offset 40.
+    3. Tag value_type at offset 48 with HIR_LITERAL_KIND_INTEGER.
+    4. Attach a HIR_BASIC_TYPE HIRTypeInfo at offset 72; if that
+       allocation fails the literal still returns, matching the sibling
+       creators' optional-type-info contract.
+    @End Implementation
+
+    Let lit_node be proc create_hir_node with HIR_LITERAL, 0, 0
+
+    If lit_node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with lit_node, 40, value
+    proc memory_set_int64 from Layout with lit_node, 48, HIR_LITERAL_KIND_INTEGER
+
+    Let type_info be proc create_hir_type_info with HIR_BASIC_TYPE
+    If type_info is not equal to 0:
+        proc memory_set_int64 from Layout with lit_node, 72, type_info
+    End If
+
+    Return lit_node
+End Process
+
+Process called "create_hir_float_literal" takes value as Integer returns Integer:
+    Note: Create HIR float literal expression node
+
+    @Reasoning:
+    Float literals carry their IEEE-754 bit pattern in an int64 slot - the
+    same convention string_to_float and float_to_string use across the
+    compiler, so the payload round-trips through HIR without conversion.
+    @End Reasoning
+
+    @Implementation:
+    1. Create base HIRNode of type HIR_LITERAL.
+    2. Store the float bit pattern verbatim at value slot offset 40.
+    3. Tag value_type at offset 48 with HIR_LITERAL_KIND_FLOAT.
+    4. Attach a HIR_BASIC_TYPE HIRTypeInfo at offset 72 (optional, as
+       with the sibling creators).
+    @End Implementation
+
+    Let lit_node be proc create_hir_node with HIR_LITERAL, 0, 0
+
+    If lit_node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with lit_node, 40, value
+    proc memory_set_int64 from Layout with lit_node, 48, HIR_LITERAL_KIND_FLOAT
+
+    Let type_info be proc create_hir_type_info with HIR_BASIC_TYPE
+    If type_info is not equal to 0:
+        proc memory_set_int64 from Layout with lit_node, 72, type_info
+    End If
+
+    Return lit_node
+End Process
+
+Process called "create_hir_null_literal" takes line as Integer, column as Integer returns Integer:
+    Note: Create HIR null literal expression node
+
+    @Reasoning:
+    Null literals complete the literal family for the translation frontends:
+    JSON null, SQL NULL, and YAML null/~ all lower to one canonical HIR shape.
+    HIR_LITERAL value_type tags 1-4 are claimed by String/Boolean/Integer/Float
+    payloads; Null is the fifth HIR_LITERAL kind and is represented by the
+    zero-initialized tag 0 with a zero payload, the design the YAML frontend
+    documented when it first inlined this construction. Centralising the
+    creator here keeps every frontend's null representation byte-identical.
+    @End Reasoning
+
+    @Implementation:
+    1. Create base HIRNode of type HIR_LITERAL at the given source position.
+    2. Store payload 0 at value slot offset 40 and tag 0 at value_type
+       offset 48 - null carries no payload, and tag 0 is its kind marker.
+    3. Allocate a HIRTypeInfo of kind HIR_OPTIONAL_TYPE and attach it via
+       set_hir_node_type_info so the type checker sees the none-value type.
+       If type-info allocation fails the literal still returns, matching
+       the sibling creators' optional-type-info contract.
+    @End Implementation
+
+    Let lit_node be proc create_hir_node with HIR_LITERAL, line, column
+
+    If lit_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Null payload and the zero value_type tag mark the Null literal kind
+    proc memory_set_int64 from Layout with lit_node, 40, 0
+    proc memory_set_int64 from Layout with lit_node, 48, 0
+
+    Note: Attach Optional type info so the type checker sees the none-value type
+    Let type_info be proc create_hir_type_info with HIR_OPTIONAL_TYPE
+    If type_info is not equal to 0:
+        proc set_hir_node_type_info with lit_node, type_info
+    End If
+
+    Return lit_node
+End Process
+
+Process called "create_hir_dictionary_literal" returns Integer:
+    Note: Create HIR dictionary literal expression node
+
+    @Reasoning:
+    Dictionary literals represent string-keyed compile-time maps. The
+    translation frontends use them as the structured interchange shape for
+    declarative UI trees (SwiftUI view dictionaries) and any other
+    key-to-node payload. The entries list is created eagerly, matching
+    create_hir_list_literal, so add_dictionary_entry never has to take a
+    lazy-create branch on a fresh literal.
+    @End Reasoning
+
+    @Implementation:
+    1. Create a HIRNode of type HIR_DICTIONARY_LITERAL.
+    2. Create a fresh List and store it at children slot offset 24.
+    Entries are appended as 16-byte [key, value] blocks by
+    add_dictionary_entry; child_count at offset 32 tracks the entry count.
+    @End Implementation
+
+    @Security_Scope:
+    Returns an owned pointer that owns its entries List and every entry
+    block appended later. Must be attached to a parent so the cleanup
+    walker can reach it.
+    @End Security_Scope
+
+    Let dict_node be proc create_hir_node with HIR_DICTIONARY_LITERAL, 0, 0
+
+    If dict_node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc create from List
+    proc memory_set_int64 from Layout with dict_node, 24, entries
+
+    Return dict_node
+End Process
+
+Process called "add_dictionary_entry" takes dict_node as Integer, key as Integer, value as Integer returns Integer:
+    Note: Add a key/value entry to a HIR dictionary literal
+
+    @Reasoning:
+    Dictionary entries pair a string key with an arbitrary HIR node value.
+    Each entry is materialised as a dedicated 16-byte block so consumers
+    can read key and value with two fixed-offset loads - the layout that
+    get_dictionary_entries consumers (translation backends) iterate.
+    @End Reasoning
+
+    @Implementation:
+    1. Null-check dict_node and key; validate node_type is
+       HIR_DICTIONARY_LITERAL so entries can never be attached to a
+       non-dictionary node.
+    2. Allocate a 16-byte entry block: key at offset 0, value at offset 8.
+    3. Read the entries List at children offset 24 (lazy-create if a
+       caller built the node without create_hir_dictionary_literal).
+    4. Append the entry block and increment child_count at offset 32.
+    Returns 1 on success, 0 on null/wrong-kind input or allocation failure.
+    A 0 value is legal (explicit null payload for the key).
+    @End Implementation
+
+    @Security_Scope:
+    Stores the key string pointer and value node pointer verbatim; both
+    must outlive the dictionary node. Ownership of the value node
+    transfers to the dictionary for cleanup-walk purposes.
+    @End Security_Scope
+
+    If dict_node is equal to 0:
+        Return 0
+    End If
+
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with dict_node, 0
+    If node_kind is not equal to HIR_DICTIONARY_LITERAL:
+        Return 0
+    End If
+
+    Let entry be proc allocate from Layout with 16
+    If entry is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with entry, 0, key
+    proc memory_set_int64 from Layout with entry, 8, value
+
+    Let entries be proc memory_get_int64 from Layout with dict_node, 24
+    If entries is equal to 0:
+        Set entries to proc create from List
+        proc memory_set_int64 from Layout with dict_node, 24, entries
+    End If
+
+    proc append from List with entries, entry
+
+    Let entry_count be proc memory_get_int64 from Layout with dict_node, 32
+    Set entry_count to entry_count plus 1
+    proc memory_set_int64 from Layout with dict_node, 32, entry_count
+
+    Return 1
+End Process
+
+Process called "add_list_element" takes list_node as Integer, element as Integer returns Integer:
+    Note: Add element to HIR list literal (canonical short name)
+
+    @Reasoning:
+    Canonical short-form name for appending to a list literal, paired with
+    add_dictionary_entry so the producer surface for the two collection
+    literals is symmetric. Delegates to add_element_to_hir_list, which
+    owns the append/count/parent bookkeeping.
+    @End Reasoning
+
+    @Implementation:
+    Direct delegation - one call, identical contract: returns 1 on
+    success, 0 if either argument is null.
+    @End Implementation
+
+    Return proc add_element_to_hir_list with list_node, element
+End Process
+
+Process called "get_list_elements" takes node as Integer returns Integer:
+    Note: Get the elements List of a HIR list literal
+
+    @Reasoning:
+    Canonical read accessor for list-literal contents. Backends iterate
+    the returned List with List.size/List.get_at; exposing the List
+    directly avoids per-element accessor calls while keeping the
+    children-slot offset private to this module.
+    @End Reasoning
+
+    @Implementation:
+    Null-guard, then validate node_type is HIR_ARRAY_LITERAL (offset 0);
+    wrong-kind nodes return 0 so a stray node can never be misread as a
+    list. On success return the children List pointer at offset 24
+    (0 if the literal was built without an elements list).
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is not equal to HIR_ARRAY_LITERAL:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with node, 24
+End Process
+
+Process called "get_dictionary_entries" takes node as Integer returns Integer:
+    Note: Get the entries List of a HIR dictionary literal
+
+    @Reasoning:
+    Canonical read accessor for dictionary-literal contents. The returned
+    List holds 16-byte entry blocks laid out [key(0), value(8)]; consumers
+    scan linearly and compare keys with string_equals. Linear scan is the
+    correct cost model here - translation dictionaries are small (UI node
+    property sets), so a hash structure would cost more than it saves.
+    @End Reasoning
+
+    @Implementation:
+    Null-guard, then validate node_type is HIR_DICTIONARY_LITERAL;
+    wrong-kind nodes return 0. On success return the children List
+    pointer at offset 24.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is not equal to HIR_DICTIONARY_LITERAL:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with node, 24
+End Process
+
+Process called "get_string_literal_value" takes node as Integer returns Integer:
+    Note: Get the string payload of a HIR string literal
+
+    @Reasoning:
+    Typed accessor pairing with create_hir_string_literal: returns the
+    raw string pointer only when the node really is a string-tagged
+    literal, so callers can emit the buffer directly without re-checking
+    the tag themselves.
+    @End Reasoning
+
+    @Implementation:
+    Null-guard; validate node_type is HIR_LITERAL and value_type (offset
+    48) is HIR_LITERAL_KIND_STRING; return the value slot (offset 40).
+    Wrong kind or wrong tag returns 0.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is not equal to HIR_LITERAL:
+        Return 0
+    End If
+
+    Let value_kind be proc memory_get_int64 from Layout with node, 48
+    If value_kind is not equal to HIR_LITERAL_KIND_STRING:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with node, 40
+End Process
+
+Process called "get_integer_literal_value" takes node as Integer returns Integer:
+    Note: Get the int64 payload of a HIR integer literal
+
+    @Reasoning:
+    Typed accessor pairing with create_hir_integer_literal. Returns the
+    raw signed integer payload. The 0 sentinel is shared with the error
+    convention; callers that must distinguish "literal 0" from "not an
+    integer literal" gate with is_integer_literal first.
+    @End Reasoning
+
+    @Implementation:
+    Null-guard; validate node_type HIR_LITERAL and value_type
+    HIR_LITERAL_KIND_INTEGER; return the value slot at offset 40.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is not equal to HIR_LITERAL:
+        Return 0
+    End If
+
+    Let value_kind be proc memory_get_int64 from Layout with node, 48
+    If value_kind is not equal to HIR_LITERAL_KIND_INTEGER:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with node, 40
+End Process
+
+Process called "get_float_literal_value" takes node as Integer returns Integer:
+    Note: Get the IEEE-754 bit payload of a HIR float literal
+
+    @Reasoning:
+    Typed accessor pairing with create_hir_float_literal. The returned
+    int64 carries the float's bit pattern unchanged, ready for
+    float_to_string or float arithmetic helpers.
+    @End Reasoning
+
+    @Implementation:
+    Null-guard; validate node_type HIR_LITERAL and value_type
+    HIR_LITERAL_KIND_FLOAT; return the value slot at offset 40.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is not equal to HIR_LITERAL:
+        Return 0
+    End If
+
+    Let value_kind be proc memory_get_int64 from Layout with node, 48
+    If value_kind is not equal to HIR_LITERAL_KIND_FLOAT:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with node, 40
+End Process
+
+Process called "get_boolean_literal_value" takes node as Integer returns Integer:
+    Note: Get the 0/1 payload of a HIR boolean literal
+
+    @Reasoning:
+    Typed accessor pairing with create_hir_boolean_literal. Returns 1 for
+    true literals and 0 for false literals; 0 is also the wrong-kind
+    sentinel, so callers needing the distinction gate with
+    is_boolean_literal first (the translation backends already do).
+    @End Reasoning
+
+    @Implementation:
+    Null-guard; validate node_type HIR_LITERAL and value_type
+    HIR_LITERAL_KIND_BOOLEAN; return the value slot at offset 40.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is not equal to HIR_LITERAL:
+        Return 0
+    End If
+
+    Let value_kind be proc memory_get_int64 from Layout with node, 48
+    If value_kind is not equal to HIR_LITERAL_KIND_BOOLEAN:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with node, 40
+End Process
+
+Process called "is_string_literal" takes node as Integer returns Integer:
+    Note: Predicate: is this node a string-tagged HIR literal
+
+    @Reasoning:
+    Kind predicates let dispatchers classify nodes without duplicating the
+    node_type/value_type pairing rules at every call site. This family is
+    the canonical classification surface for the literal model.
+    @End Reasoning
+
+    @Implementation:
+    Returns 1 when node_type is HIR_LITERAL and value_type is
+    HIR_LITERAL_KIND_STRING; 0 otherwise, including null input.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is not equal to HIR_LITERAL:
+        Return 0
+    End If
+
+    Let value_kind be proc memory_get_int64 from Layout with node, 48
+    If value_kind is equal to HIR_LITERAL_KIND_STRING:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_integer_literal" takes node as Integer returns Integer:
+    Note: Predicate: is this node an integer-tagged HIR literal
+
+    @Implementation:
+    Returns 1 when node_type is HIR_LITERAL and value_type is
+    HIR_LITERAL_KIND_INTEGER; 0 otherwise, including null input.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is not equal to HIR_LITERAL:
+        Return 0
+    End If
+
+    Let value_kind be proc memory_get_int64 from Layout with node, 48
+    If value_kind is equal to HIR_LITERAL_KIND_INTEGER:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_float_literal" takes node as Integer returns Integer:
+    Note: Predicate: is this node a float-tagged HIR literal
+
+    @Implementation:
+    Returns 1 when node_type is HIR_LITERAL and value_type is
+    HIR_LITERAL_KIND_FLOAT; 0 otherwise, including null input.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is not equal to HIR_LITERAL:
+        Return 0
+    End If
+
+    Let value_kind be proc memory_get_int64 from Layout with node, 48
+    If value_kind is equal to HIR_LITERAL_KIND_FLOAT:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_boolean_literal" takes node as Integer returns Integer:
+    Note: Predicate: is this node a boolean-tagged HIR literal
+
+    @Implementation:
+    Returns 1 when node_type is HIR_LITERAL and value_type is
+    HIR_LITERAL_KIND_BOOLEAN; 0 otherwise, including null input.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is not equal to HIR_LITERAL:
+        Return 0
+    End If
+
+    Let value_kind be proc memory_get_int64 from Layout with node, 48
+    If value_kind is equal to HIR_LITERAL_KIND_BOOLEAN:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_list_literal" takes node as Integer returns Integer:
+    Note: Predicate: is this node a HIR list literal
+
+    @Implementation:
+    Returns 1 when node_type is HIR_ARRAY_LITERAL; 0 otherwise,
+    including null input.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is equal to HIR_ARRAY_LITERAL:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_dictionary_literal" takes node as Integer returns Integer:
+    Note: Predicate: is this node a HIR dictionary literal
+
+    @Implementation:
+    Returns 1 when node_type is HIR_DICTIONARY_LITERAL; 0 otherwise,
+    including null input.
+    @End Implementation
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc memory_get_int64 from Layout with node, 0
+    If node_kind is equal to HIR_DICTIONARY_LITERAL:
+        Return 1
+    End If
+
+    Return 0
 End Process
 
 Note: End of HIR core type definitions
